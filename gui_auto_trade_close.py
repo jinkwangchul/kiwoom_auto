@@ -41,6 +41,7 @@ from runtime_io import read_json_dict
 from gui_auto_trade_runtime import parse_stock_folder_name
 from gui_auto_trade_table_loader import _selected_instance_stock_dirs
 from gui_toast import show_toast
+from gui_user_reason import user_reason_message
 from event_journal_production import append_production_event
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
@@ -874,10 +875,13 @@ def auto_trade_apply_selected_individual_liquidation_method(
                 f"개별청산 정책 설정: {minutes}분/{normalized_method}",
             )
         else:
-            reason = str(command_result.reason_code or "요청 실패")
+            reason = user_reason_message(
+                command_result.reason_code,
+                fallback="개별청산 요청을 처리하지 못했습니다.",
+            )
             transition = command_result.operation_result
             if transition is not None and hasattr(transition, "allowed"):
-                reason = f"정책 전환 차단:{reason}"
+                reason = f"현재 운영 상태에서는 변경할 수 없습니다: {reason}"
             failed.append(f"{code} {name}({reason})")
             failure_messages.append(reason)
 
@@ -886,7 +890,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
             QMessageBox.critical(
                 dialog_parent,
                 "개별청산 요청 오류",
-                "개별청산 요청을 Runtime에 반영하지 못했습니다.\n\n"
+                "개별청산 요청을 운영 상태에 반영하지 못했습니다.\n\n"
                 + "\n".join(failed),
             )
         return {
@@ -1200,7 +1204,7 @@ def auto_trade_cancel_selected_early_close(window) -> None:
         notify(blocked_message)
         return
 
-    states: list[tuple[Path, str, str]] = []
+    states: list[tuple[Path, str, str, str]] = []
     block_reasons: list[tuple[Path, str, str, str]] = []
 
     def inspect_recovery(stock_code: str, caller_name: str):
@@ -1220,7 +1224,7 @@ def auto_trade_cancel_selected_early_close(window) -> None:
                 (stock_dir, code, name, availability.reason_code)
             )
             continue
-        states.append((stock_dir, code, name))
+        states.append((stock_dir, code, name, availability.command_id))
 
     if block_reasons or not states:
         for stock_dir, code, name, reason in block_reasons:
@@ -1230,7 +1234,7 @@ def auto_trade_cancel_selected_early_close(window) -> None:
 
     completed: list[str] = []
     failed: list[tuple[Path, str, str, str]] = []
-    for stock_dir, code, name in states:
+    for stock_dir, code, name, expected_command_id in states:
         result = execute_early_close_cancel_command(
             window,
             stock_dir,
@@ -1238,6 +1242,7 @@ def auto_trade_cancel_selected_early_close(window) -> None:
             source="우클릭",
             project_root=PROJECT_ROOT,
             recovery_inspector=inspect_recovery,
+            expected_command_id=expected_command_id,
             irreversible_evidence_reader=_early_close_cancel_irreversible_evidence,
         )
         if not result.ok or not result.changed:

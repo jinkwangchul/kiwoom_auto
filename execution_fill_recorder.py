@@ -19,6 +19,8 @@ import shutil
 import threading
 import time
 from typing import Any
+
+from chejan_event_normalizer import resolve_execution_time
 from uuid import uuid4
 
 from event_journal_trade_observer import observe_execution_fill
@@ -254,6 +256,16 @@ def _received_at(event: dict[str, Any]) -> str:
     return _clean_text(event.get("received_at")) or _clean_text(raw_event.get("received_at"))
 
 
+def _broker_execution_time_raw(event: dict[str, Any]) -> str:
+    direct = _clean_text(event.get("broker_execution_time_raw"))
+    if direct:
+        return direct
+    raw_event = _as_dict(event.get("raw_event"))
+    raw_values = _as_dict(raw_event.get("fid_raw_values"))
+    values = _as_dict(raw_event.get("fid_values"))
+    return _clean_text(raw_values.get("908") or values.get("908"))
+
+
 def _required_text(event: dict[str, Any], field: str) -> str | None:
     value = _clean_text(event.get(field))
     if not value:
@@ -457,6 +469,12 @@ def _fill_record(
 ) -> dict[str, Any]:
     fill_id = _fill_id(event, event_type, received_at)
     execution_identity_source, execution_identity = _raw_event_identity(event)
+    time_evidence = resolve_execution_time(
+        event_type=event_type,
+        broker_execution_time_raw=_broker_execution_time_raw(event),
+        received_at=received_at,
+        execution_trade_date=result.get("execution_trade_date"),
+    )
     return {
         "fill_id": fill_id,
         "execution_identity_source": execution_identity_source,
@@ -468,6 +486,7 @@ def _fill_record(
         "order_id": _clean_text(result.get("order_id")),
         "order_queued_id": _clean_text(result.get("order_queued_id")),
         "execution_id": _clean_text(result.get("execution_id")),
+        "execution_process_id": _clean_text(result.get("execution_process_id")),
         "request_hash": _clean_text(result.get("request_hash")),
         "lock_id": _clean_text(result.get("lock_id")),
         "account_no": _clean_text(event.get("account_no")),
@@ -480,6 +499,7 @@ def _fill_record(
         "order_price": event.get("order_price"),
         "received_at": received_at,
         "recorded_at": recorded_at,
+        **time_evidence,
         "routine_instance_id": _clean_text(routine_instance_id),
         "normalized_event": deepcopy(event),
     }
@@ -647,6 +667,11 @@ def record_execution_fill(
                     "request_hash": fill_record["request_hash"],
                     "lock_id": fill_record["lock_id"],
                     "execution_id": fill_record["execution_id"],
+                    "execution_process_id": fill_record["execution_process_id"],
+                    "broker_execution_time_raw": fill_record["broker_execution_time_raw"],
+                    "broker_execution_datetime": fill_record["broker_execution_datetime"],
+                    "execution_time_source": fill_record["execution_time_source"],
+                    "execution_time_quality": fill_record["execution_time_quality"],
                     "filled_quantity": fill_record["filled_quantity"],
                     "filled_price": fill_record["filled_price"],
                     "fill_record": deepcopy(fill_record),

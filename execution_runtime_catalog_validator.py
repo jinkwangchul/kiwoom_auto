@@ -88,6 +88,22 @@ def validate_execution_runtime_catalog_preview(catalog_preview: Any) -> dict[str
         if not _text(catalog_preview.get(field)):
             issues.append(issue)
 
+    provenance = catalog_preview.get("provenance")
+    if provenance is not None and not isinstance(provenance, dict):
+        issues.append("PROVENANCE_MUST_BE_DICT")
+    elif isinstance(provenance, dict) and _text(provenance.get("execution_process_id")):
+        for field in (
+            "execution_process_id",
+            "child_sequence_index",
+            "child_sequence_total",
+            "child_kind",
+            "option_snapshot_hash",
+        ):
+            if provenance.get(field) in (None, ""):
+                issues.append(f"MISSING_PROVENANCE_{field.upper()}")
+        if provenance.get("child_sequence_index") != 1 or provenance.get("child_sequence_total") != 1:
+            issues.append("ONLY_SINGLE_CHILD_PROVENANCE_IS_SUPPORTED")
+
     return _result(
         valid=not issues,
         status=status if status in ALLOWED_STATUSES else "INVALID",

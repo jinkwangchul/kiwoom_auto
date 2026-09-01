@@ -1121,6 +1121,48 @@ class AutoTradeStartContractTest(unittest.TestCase):
         )
         self.assertNotIn("RECOVERY_", window.statusBarMessage.call_args.args[0])
 
+    def test_assigned_post_login_stock_is_blocked_before_operation_or_order_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "000660", "SK하이닉스", "inst-a", "지표추종매매A")
+            state_before = (stock[0] / "state.json").read_bytes()
+            window = _StartWindow([stock])
+            window.send_order = Mock()
+            window.filter_start_targets_by_recovery = Mock(
+                return_value={
+                    "allowed": False,
+                    "reason": "RECOVERY_STOCK_PENDING",
+                    "user_message": (
+                        "선택한 종목은 현재 로그인 세션에서 Recovery가 완료되지 않아 "
+                        "운영을 시작할 수 없습니다. 다음 로그인 Recovery 완료 후 운영 가능합니다."
+                    ),
+                    "eligible": (),
+                    "excluded_review": (),
+                    "blocked_target_details": (
+                        {
+                            "stock_code": "000660",
+                            "stock_name": "SK하이닉스",
+                            "reason": "RECOVERY_STOCK_PENDING",
+                            "display_label": "000660 SK하이닉스",
+                        },
+                    ),
+                }
+            )
+
+            result = auto_trade_start_selected_auto_trades(
+                window,
+                request_scope=START_REQUEST_SINGLE,
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual("RECOVERY_STOCK_PENDING", result["reason"])
+            self.assertEqual(state_before, (stock[0] / "state.json").read_bytes())
+            self.assertEqual([], window.recalculate_calls)
+            self.assertEqual((), participant_codes(window))
+            window.send_order.assert_not_called()
+            self.assertIn("운영을 시작할 수 없습니다", result["user_message"])
+            self.assertIn("다음 로그인 Recovery 완료 후", result["user_message"])
+
     def test_runtime_missing_isolated_as_review_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1522,9 +1564,11 @@ class AutoTradeStartContractTest(unittest.TestCase):
             )
 
         self.assertIn(
-            "005930 삼성전자의 Recovery가 아직 완료되지 않았습니다.",
+            "005930 삼성전자는 현재 로그인 세션에서 Recovery가 완료되지 않아 "
+            "운영을 시작할 수 없습니다.",
             stock_result["user_message"],
         )
+        self.assertIn("다음 로그인 Recovery 완료 후 운영 가능합니다.", stock_result["user_message"])
         self.assertNotIn("RECOVERY_STOCK_PENDING", stock_result["user_message"])
         self.assertEqual(
             "키움 서버에 로그인되어 있지 않습니다.\n로그인한 뒤 다시 시도하십시오.",

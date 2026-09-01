@@ -14,11 +14,11 @@ from typing import Callable
 
 from gui_auto_trade_policy import auto_trade_start_budget_current_running
 from gui_common_utils import safe_int_value
-from gui_main_table_loader import (
-    main_stock_fresh_market_information_state,
-    main_stock_resolved_starting_budget,
+from gui_main_table_loader import main_stock_configuration_market_information_state
+from gui_operation_environment import (
+    effective_amount_starting_budget,
+    starting_budget_defaults,
 )
-from gui_operation_environment import starting_budget_defaults
 from gui_review_utils import safe_float_value
 from gui_window_policy import persistent_feature_owner
 from runtime_io import read_json_dict
@@ -75,21 +75,40 @@ def _canonical_budget_host(window):
     return owner if owner is not None else window
 
 
-def fresh_budget_current_price(window, config_path: Path) -> float | None:
-    """Read the same fresh-session market source used by Main projection."""
+def configuration_budget_market_information_state(window, config_path: Path):
+    """Read Snapshot-or-Realtime evidence from the Configuration contract."""
 
     candidate = _canonical_budget_host(window)
-    fresh_state = main_stock_fresh_market_information_state(
+    return main_stock_configuration_market_information_state(
         candidate,
         stock_projection_for_config_path(Path(config_path)),
     )
+
+
+def _configuration_price_evidence(value: object) -> tuple[float | None, str]:
+    state_price = getattr(value, "last_price", None)
     current_price = safe_float_value(
-        getattr(fresh_state, "last_price", None)
-        if fresh_state is not None
-        else None,
+        state_price if state_price is not None else value,
         0.0,
     )
-    return current_price if current_price > 0 else None
+    source = str(getattr(value, "price_source", "") or "").strip().upper()
+    try:
+        source = str(
+            dict(getattr(value, "field_sources", ()) or ()).get(
+                "last_price",
+                source,
+            )
+        ).strip().upper()
+    except Exception:
+        pass
+    return (current_price if current_price > 0 else None), source
+
+
+def configuration_budget_current_price(window, config_path: Path) -> float | None:
+    price, _source = _configuration_price_evidence(
+        configuration_budget_market_information_state(window, config_path)
+    )
+    return price
 
 
 def inspect_budget_value_entry(
@@ -103,17 +122,13 @@ def inspect_budget_value_entry(
         if isinstance(request, BudgetValueChangeRequest)
         else Path(request)
     )
-    current_price = fresh_budget_current_price(window, Path(config_path))
-    if current_price is None:
-        return {
-            "allowed": False,
-            "reason": CURRENT_PRICE_UNAVAILABLE,
-            "current_price": None,
-        }
+    state = configuration_budget_market_information_state(window, Path(config_path))
+    current_price, price_source = _configuration_price_evidence(state)
     return {
         "allowed": True,
         "reason": "",
         "current_price": current_price,
+        "price_source": price_source,
     }
 
 
@@ -121,24 +136,16 @@ def _default_mode_value(
     window,
     config_path: Path,
     target_mode: str,
+    *,
+    configuration_price: object = None,
 ) -> int:
     defaults = starting_budget_defaults()
     if target_mode == BUDGET_MODE_QUANTITY:
         return max(1, safe_int_value(defaults.get("quantity"), 1))
 
-    config = read_json_dict(Path(config_path))
-    if not isinstance(config, dict):
-        config = {}
-    amount_config = {
-        **config,
-        "trade_amount_type": BUDGET_MODE_AMOUNT,
-        "buy_amount": 0,
-    }
-    amount = main_stock_resolved_starting_budget(
-        _canonical_budget_host(window),
-        stock_projection_for_config_path(Path(config_path)),
-        amount_config,
-        policy={"starting_budget_defaults": defaults},
+    amount = effective_amount_starting_budget(
+        configuration_price,
+        defaults["amount_multiplier"],
     )
     return max(0, safe_int_value(amount, 0))
 
@@ -148,7 +155,7 @@ def execute_budget_mode_change(
     request: BudgetModeChangeRequest,
     *,
     writer: Callable[..., dict[str, object]],
-    fresh_price_reader: Callable[[object, Path], object] | None = None,
+    configuration_price_reader: Callable[[object, Path], object] | None = None,
     current_running_reader: Callable[[object, str, dict[str, object], dict[str, object]], object]
     | None = None,
     default_value_reader: Callable[[object, Path, str], object] | None = None,
@@ -180,17 +187,26 @@ def execute_budget_mode_change(
             "reason_code": "BUDGET_MODE_UNCHANGED",
         }
 
-    price_reader = fresh_price_reader or (
-        lambda _window, path: fresh_budget_current_price(_window, path)
-    )
-    current_price = safe_float_value(price_reader(window, config_path), 0.0)
-    if current_price <= 0:
-        return {
-            **base_result,
-            "allowed": False,
-            "reason": CURRENT_PRICE_UNAVAILABLE,
-            "reason_code": CURRENT_PRICE_UNAVAILABLE,
-        }
+    current_price: float | None = None
+    price_source = ""
+    if target_mode == BUDGET_MODE_AMOUNT:
+        price_reader = configuration_price_reader or (
+            lambda _window, path: configuration_budget_market_information_state(
+                _window,
+                path,
+            )
+        )
+        current_price, price_source = _configuration_price_evidence(
+            price_reader(window, config_path)
+        )
+        if current_price is None:
+            return {
+                **base_result,
+                "allowed": False,
+                "reason": CURRENT_PRICE_UNAVAILABLE,
+                "reason_code": CURRENT_PRICE_UNAVAILABLE,
+                "price_source": price_source,
+            }
 
     stock_code = config_path.parent.name.partition("_")[0].strip()
     state = read_json_dict(config_path.parent / "state.json")
@@ -217,12 +233,19 @@ def execute_budget_mode_change(
             "current_price": current_price,
         }
 
-    value_reader = default_value_reader or (
-        lambda host, path, mode: _default_mode_value(host, path, mode)
-    )
     next_value = max(
         0,
-        safe_int_value(value_reader(window, config_path, target_mode), 0),
+        safe_int_value(
+            default_value_reader(window, config_path, target_mode)
+            if default_value_reader is not None
+            else _default_mode_value(
+                window,
+                config_path,
+                target_mode,
+                configuration_price=current_price,
+            ),
+            0,
+        ),
     )
     expected_mode = (
         config["trade_amount_type"]
@@ -248,6 +271,7 @@ def execute_budget_mode_change(
         "target_mode": target_mode,
         "current_running": current_running,
         "current_price": current_price,
+        "price_source": price_source,
         "value": next_value,
     }
     final_result["reason_code"] = str(

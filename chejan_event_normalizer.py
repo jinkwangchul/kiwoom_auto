@@ -9,7 +9,10 @@ or positions, connects Kiwoom event handlers, or calls SendOrder.
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import date, datetime
+import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 STAGE_NORMALIZED = "chejan_event_normalized"
@@ -104,10 +107,85 @@ def _event_type(order_status: str, filled_quantity: int | None, remaining_quanti
     return "ORDER_UNKNOWN", True
 
 
+def _seoul_datetime(value: Any) -> datetime | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    return parsed.astimezone(ZoneInfo("Asia/Seoul"))
+
+
+def _trade_date(value: Any) -> date | None:
+    text = _clean_text(value)
+    if re.fullmatch(r"\d{8}", text):
+        text = f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def resolve_execution_time(
+    *,
+    event_type: Any,
+    broker_execution_time_raw: Any,
+    received_at: Any,
+    execution_trade_date: Any = None,
+) -> dict[str, Any]:
+    """Resolve Broker time only with an explicit, non-contradictory trade date."""
+    raw = _clean_text(broker_execution_time_raw)
+    received = _seoul_datetime(received_at)
+    trade_day = _trade_date(execution_trade_date)
+    fill_event = _clean_text(event_type) in {"PARTIAL_FILL", "FULL_FILL"}
+    broker_clock_valid = bool(re.fullmatch(r"\d{6}(?:\d{2})?", raw))
+    hour = minute = second = -1
+    if broker_clock_valid:
+        hour, minute, second = int(raw[:2]), int(raw[2:4]), int(raw[4:6])
+        broker_clock_valid = hour < 24 and minute < 60 and second < 60
+
+    if (
+        fill_event
+        and broker_clock_valid
+        and trade_day is not None
+        and (received is None or received.date() == trade_day)
+    ):
+        broker_datetime = datetime(
+            trade_day.year,
+            trade_day.month,
+            trade_day.day,
+            hour,
+            minute,
+            second,
+            tzinfo=ZoneInfo("Asia/Seoul"),
+        )
+        return {
+            "broker_execution_time_raw": raw,
+            "broker_execution_datetime": broker_datetime.isoformat(),
+            "execution_time_source": "BROKER_FID_908",
+            "execution_time_quality": "EXACT",
+        }
+    if received is not None:
+        return {
+            "broker_execution_time_raw": raw,
+            "broker_execution_datetime": None,
+            "execution_time_source": "LOCAL_RECEIVED_AT",
+            "execution_time_quality": "APPROXIMATE",
+        }
+    return {
+        "broker_execution_time_raw": raw,
+        "broker_execution_datetime": None,
+        "execution_time_source": "NONE",
+        "execution_time_quality": "UNAVAILABLE",
+    }
+
+
 def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[str, Any]:
     """Normalize one raw Chejan event into an internal standard event dict."""
-    del context
-
     if not isinstance(raw_event, dict):
         return _blocked("raw_event must be a dict")
 
@@ -143,6 +221,20 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
     order_price = _parse_int(_fid(fid_values, "901"), "order_price", warnings)
 
     event_type, event_unresolved = _event_type(order_status or "", filled_quantity, remaining_quantity)
+    fid_raw_values = raw_event.get("fid_raw_values")
+    if not isinstance(fid_raw_values, dict):
+        fid_raw_values = fid_values
+    broker_execution_time_raw = _clean_text(_fid(fid_raw_values, "908"))
+    broker_execution_no = _clean_text(_fid(fid_values, "909")) or None
+    ctx = context if isinstance(context, dict) else {}
+    time_evidence = resolve_execution_time(
+        event_type=event_type,
+        broker_execution_time_raw=broker_execution_time_raw,
+        received_at=received_at,
+        execution_trade_date=ctx.get("execution_trade_date"),
+    )
+    if broker_execution_time_raw and not re.fullmatch(r"\d{6}(?:\d{2})?", broker_execution_time_raw):
+        warnings.append("broker_execution_time_raw could not be parsed")
     parse_unresolved = any("could not be parsed" in warning for warning in warnings)
     unresolved = bool(side_unresolved or event_unresolved or parse_unresolved)
 
@@ -166,6 +258,8 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
         "remaining_quantity": remaining_quantity,
         "order_price": order_price,
         "filled_price": filled_price,
+        "broker_execution_no": broker_execution_no,
+        **time_evidence,
         "request_hash": None,
         "lock_id": None,
         "execution_id": None,

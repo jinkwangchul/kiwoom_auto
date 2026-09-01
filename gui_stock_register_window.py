@@ -159,6 +159,7 @@ from gui_routine_service import (
     ensure_single_real_trade_routine_for_stock,
 )
 from gui_toast import show_toast
+from gui_user_reason import user_reason_message
 from gui_operation_ui_context import (
     refresh_auto_trade_views,
     sync_auto_trade_monitoring_universe,
@@ -2071,6 +2072,9 @@ class StockRegisterWindow(QDialog):
 
         selected_count = len(self.selected_registered_stocks())
         menu = QMenu(self)
+        set_tooltips_visible = getattr(menu, "setToolTipsVisible", None)
+        if callable(set_tooltips_visible):
+            set_tooltips_visible(True)
 
         action_select_all = menu.addAction("전체 선택")
         action_clear = menu.addAction("선택 해제")
@@ -2108,6 +2112,18 @@ class StockRegisterWindow(QDialog):
         action_assign.setEnabled(has_selected)
         action_unassign.setEnabled(has_selected)
         action_delete.setEnabled(selected_count == 1)
+        if not has_selected:
+            reason = "대상 종목을 선택하세요."
+            for action in (action_assign, action_unassign, action_delete):
+                action.setToolTip(reason)
+                action.setStatusTip(reason)
+        elif not routine_targets:
+            action_assign.setToolTip("추가할 수 있는 루틴이 없습니다.")
+            action_assign.setStatusTip("추가할 수 있는 루틴이 없습니다.")
+        if selected_count != 1:
+            reason = "초기화할 종목을 하나만 선택하세요."
+            action_delete.setToolTip(reason)
+            action_delete.setStatusTip(reason)
 
         selected_action = menu.exec_(self.stock_table.viewport().mapToGlobal(position))
         if selected_action is None:
@@ -2291,6 +2307,7 @@ class StockRegisterWindow(QDialog):
         allowed: list[tuple[str, str, str]] = []
         skipped_unassigned: list[str] = []
         blocked_items: list[dict[str, object]] = []
+        failure_details: list[tuple[str, str]] = []
 
         owner = persistent_feature_owner(self)
         for code, name in selected_stocks:
@@ -2298,6 +2315,7 @@ class StockRegisterWindow(QDialog):
             title = f"{code} {name}"
             if not routine_name and reasons and "연결 루틴이 없습니다." in reasons:
                 skipped_unassigned.append(title)
+                failure_details.append((title, "현재 등록된 루틴이 없습니다."))
                 continue
             if can_unassign:
                 allowed.append((code, name, routine_name))
@@ -2305,6 +2323,11 @@ class StockRegisterWindow(QDialog):
                 info = routine_action_guard_info(code, name)
                 info["reasons"] = reasons
                 blocked_items.append(info)
+                reason = next(
+                    (str(value).strip() for value in reasons if str(value).strip()),
+                    "현재 상태에서는 루틴에서 해제할 수 없습니다.",
+                )
+                failure_details.append((title, reason))
 
         if not allowed and not blocked_items:
             if skipped_unassigned:
@@ -2330,11 +2353,21 @@ class StockRegisterWindow(QDialog):
             if result.ok and result.changed:
                 ensure_single_real_trade_routine_for_stock(code, name)
                 removed_items.append(f"{code},{name}({routine_name})")
+            else:
+                failure_details.append(
+                    (
+                        f"{code} {name}",
+                        user_reason_message(
+                            getattr(result, "reason_code", ""),
+                            fallback="루틴 해제 저장을 완료하지 못했습니다.",
+                        ),
+                    )
+                )
 
         if removed_items:
             append_changelog(
                 "UPDATE",
-                "중앙 종목관리",
+                "종목 관리",
                 f"종목관리 루틴해제: {' / '.join(removed_items)} / runtime 폴더 유지",
             )
 
@@ -2346,10 +2379,14 @@ class StockRegisterWindow(QDialog):
             sync_auto_trade_monitoring_universe(self)
         refresh_auto_trade_views(self)
 
-        show_toast(
-            self,
-            f"루틴해제 {len(removed_items)}종목 | 해제불가 {len(blocked_items)}종목",
-        )
+        lines = [
+            f"루틴 해제 성공 {len(removed_items)}종목 / 실패 {len(failure_details)}종목"
+        ]
+        for label, reason in failure_details[:5]:
+            lines.append(f"- {label}: {reason}")
+        if len(failure_details) > 5:
+            lines.append(f"- 그 외 {len(failure_details) - 5}종목")
+        show_toast(self, "\n".join(lines))
 
     def delete_selected_stock(self) -> None:
         """

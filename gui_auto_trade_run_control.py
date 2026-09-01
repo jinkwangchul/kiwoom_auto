@@ -1167,7 +1167,7 @@ def auto_trade_operation_time_allowed(
 def startup_recovery_operation_block_message(action: str, reason: str = "") -> str:
     message = (
         f"{action}할 수 없습니다. "
-        "로그인, 계좌 선택 및 Recovery 완료 상태를 확인하십시오."
+        "로그인, 계좌 선택 및 현재 로그인 상태 확인 여부를 확인하십시오."
     )
     _code, separator, detail = str(reason or "").partition(":")
     clean_detail = detail.strip() if separator else ""
@@ -1403,7 +1403,7 @@ def _start_failure_user_message(
     if reasons & {"RUNTIME_MISSING", "RUNTIME_DAMAGED"}:
         return (
             "종목의 운영 상태 데이터를 읽을 수 없습니다.\n"
-            "검토관리에서 Runtime 상태를 확인하십시오."
+            "검토관리에서 저장 상태를 확인하십시오."
         )
     if reasons & {"STATE_SAVE_FAILED", "REVIEW_STATE_SAVE_FAILED"}:
         return (
@@ -1425,10 +1425,10 @@ _START_BLOCK_REASON_LABELS = {
     "FINAL_SESSION_ENDED": "시간운영 종료",
     "TIME_OPERATION_FINAL_END": "시간운영 종료",
     "REVIEW_REQUIRED": "검토관리 필요",
-    "RECOVERY_NOT_READY": "복구 준비 미완료",
-    "RECOVERY_STOCK_PENDING": "복구 준비 미완료",
-    "RECOVERY_STOCK_FAILED": "복구 실패",
-    "RECOVERY_STOCK_REVIEW_REQUIRED": "복구 검토 필요",
+    "RECOVERY_NOT_READY": "로그인 상태 확인 미완료",
+    "RECOVERY_STOCK_PENDING": "로그인 상태 확인 미완료",
+    "RECOVERY_STOCK_FAILED": "운영 상태 확인 실패",
+    "RECOVERY_STOCK_REVIEW_REQUIRED": "운영 상태 검토 필요",
     "EMERGENCY_STOPPED": "긴급정지",
     "CLOSE_LIQUIDATION_ACTIVE": "마감/청산 진행",
     "ALREADY_RUNNING": "이미 운영중",
@@ -1436,10 +1436,10 @@ _START_BLOCK_REASON_LABELS = {
 
 _START_BLOCK_REASON_SUMMARY_LABELS = {
     "REVIEW_REQUIRED": "검토관리",
-    "RECOVERY_NOT_READY": "복구 미완료",
-    "RECOVERY_STOCK_PENDING": "복구 미완료",
-    "RECOVERY_STOCK_FAILED": "복구 실패",
-    "RECOVERY_STOCK_REVIEW_REQUIRED": "복구 검토",
+    "RECOVERY_NOT_READY": "로그인 상태 확인 미완료",
+    "RECOVERY_STOCK_PENDING": "로그인 상태 확인 미완료",
+    "RECOVERY_STOCK_FAILED": "운영 상태 확인 실패",
+    "RECOVERY_STOCK_REVIEW_REQUIRED": "운영 상태 검토",
 }
 
 
@@ -1690,7 +1690,7 @@ def _single_start_failure_user_message(
     if reason in {"RUNTIME_MISSING", "RUNTIME_DAMAGED"}:
         return (
             f"{label}의 운영 상태 데이터를 읽을 수 없습니다.\n"
-            "검토관리에서 Runtime 상태를 확인하십시오."
+            "검토관리에서 저장 상태를 확인하십시오."
         )
     if reason in {
         "STATE_SAVE_FAILED",
@@ -1703,12 +1703,13 @@ def _single_start_failure_user_message(
         )
     if reason == "RECOVERY_STOCK_PENDING":
         return (
-            f"{label}의 Recovery가 아직 완료되지 않았습니다.\n"
-            "복구가 완료된 뒤 다시 시도하십시오."
+            f"{subject} 현재 로그인 상태 확인이 완료되지 않아 "
+            "운영을 시작할 수 없습니다.\n"
+            "다시 로그인한 후 운영 가능합니다."
         )
     if reason == "RECOVERY_STOCK_FAILED":
         return (
-            f"{label}의 Recovery에 실패했습니다.\n"
+            f"{label}의 운영 상태를 확인하지 못했습니다.\n"
             "검토관리에서 상태를 확인하십시오."
         )
     if reason == "NORMAL_ENDED":
@@ -2458,8 +2459,8 @@ def auto_trade_start_selected_auto_trades(
                 "ok": False,
                 "reason": "RECOVERY_CHECK_FAILED",
                 "user_message": (
-                    "복구 상태를 확인하는 중 오류가 발생했습니다.\n"
-                    "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
+                    "기존 운영 상태를 확인하는 중 오류가 발생했습니다.\n"
+                    "로그를 확인한 뒤 다시 로그인하십시오."
                 ),
                 "requested": requested,
                 "excluded_review": tuple(excluded_review),

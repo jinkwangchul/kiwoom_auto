@@ -87,6 +87,7 @@ def _result(
     order_id: str = "",
     request_hash: str = "",
     lock_id: str = "",
+    provenance: dict[str, Any] | None = None,
     checks: dict[str, str] | None = None,
     warnings: list[str] | None = None,
     issues: list[str] | None = None,
@@ -100,6 +101,7 @@ def _result(
         "order_id": order_id or None,
         "request_hash": request_hash or None,
         "lock_id": lock_id or None,
+        "provenance": deepcopy(provenance or {}),
         "runtime_targets": deepcopy(RUNTIME_TARGETS),
         "checks": deepcopy(checks or {}),
         "warnings": list(warnings or BASE_WARNINGS),
@@ -145,6 +147,23 @@ def build_execution_runtime_catalog_preview(
         )
 
     execution_request = _execution_request(execution_preview)
+    provenance = {
+        field: deepcopy(execution_request.get(field))
+        for field in (
+            "execution_process_id",
+            "child_sequence_index",
+            "child_sequence_total",
+            "child_kind",
+            "child_plan",
+            "option_snapshot_hash",
+            "process_record",
+            "source_kind",
+            "source_command_id",
+            "source_signal_id",
+            "execution_trade_date",
+        )
+        if execution_request.get(field) not in (None, "", {})
+    }
     execution_id = _value(execution_request.get("execution_id"), execution_preview.get("execution_id"))
     order_id = _value(
         execution_request.get("order_id"),
@@ -237,5 +256,6 @@ def build_execution_runtime_catalog_preview(
         order_id=order_id,
         request_hash=request_hash,
         lock_id=lock_id,
+        provenance=provenance,
         checks=checks,
     )

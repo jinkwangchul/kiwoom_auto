@@ -9,7 +9,18 @@ not write runtime files, and does not call SendOrder.
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from execution_provenance_contract import (
+    PROVENANCE_CONTRACT_VERSION,
+    build_execution_process_id,
+    build_option_snapshot,
+    build_process_plan,
+    build_single_child,
+    option_snapshot_hash,
+)
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -115,6 +126,49 @@ def build_execution_candidate(
     source_signal_id = _extract_source_signal_id(execution_request_preview)
     request_hash = _extract_request_hash(preview, request_hash_preview, execution_request_preview)
 
+    approved_at = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="milliseconds")
+    snapshot = build_option_snapshot(execution_request, approved_at=approved_at)
+    existing_process_id = _clean_text(execution_request.get("execution_process_id"))
+    snapshot_hash = (
+        _clean_text(execution_request.get("option_snapshot_hash"))
+        if existing_process_id
+        else ""
+    ) or option_snapshot_hash(snapshot)
+    execution_process_id = existing_process_id or build_execution_process_id(
+        order_id,
+        request_hash,
+        snapshot_hash,
+    )
+    child = build_single_child(execution_request)
+    child["execution_process_id"] = execution_process_id
+    child["option_snapshot_hash"] = snapshot_hash
+
+    process_record = None
+    if not existing_process_id:
+        process_record = {
+            "execution_process_id": execution_process_id,
+            "provenance_contract_version": PROVENANCE_CONTRACT_VERSION,
+            "approved_at": approved_at,
+            "source_kind": snapshot.get("source_kind"),
+            "source_signal_id": snapshot.get("source_signal_id"),
+            "source_command_id": snapshot.get("source_command_id"),
+            "option_snapshot": snapshot,
+            "option_snapshot_hash": snapshot_hash,
+            "process_plan": build_process_plan(execution_request),
+            "status": "APPROVED",
+            "source": "execution_candidate_service",
+        }
+        process_record = {
+            key: value for key, value in process_record.items() if value not in (None, "", {})
+        }
+
+    enriched_execution_request = deepcopy(execution_request)
+    enriched_execution_request.update(child)
+    if process_record is not None:
+        enriched_execution_request["process_record"] = deepcopy(process_record)
+    enriched_execution_request_preview = deepcopy(execution_request_preview)
+    enriched_execution_request_preview["execution_request"] = enriched_execution_request
+
     result = {
         "candidate": True,
         "candidate_stage": "candidate_created",
@@ -123,9 +177,15 @@ def build_execution_candidate(
         "blocked_reasons": [],
         "order_id": order_id,
         "source_signal_id": source_signal_id,
+        "source_kind": enriched_execution_request.get("source_kind"),
+        "source_command_id": enriched_execution_request.get("source_command_id"),
+        "execution_process_id": execution_process_id,
+        "option_snapshot_hash": snapshot_hash,
+        "process_record": deepcopy(process_record),
+        "child_contract": deepcopy(child),
         "request_hash_preview": request_hash,
         "lock_preview": deepcopy(lock_preview),
-        "execution_request_preview": deepcopy(execution_request_preview),
+        "execution_request_preview": enriched_execution_request_preview,
     }
     execution_intent = execution_request.get("execution_intent")
     if isinstance(execution_intent, dict):

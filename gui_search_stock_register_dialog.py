@@ -353,7 +353,7 @@ class SearchStockRegisterDialog(QDialog):
         if registered_items:
             append_changelog(
                 "ADD",
-                "중앙 종목관리",
+                "종목 관리",
                 f"종목 라이브러리 선택등록: {' / '.join(registered_items)}",
             )
 

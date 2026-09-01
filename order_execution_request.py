@@ -58,7 +58,13 @@ def _routine_provenance(order: dict[str, Any]) -> dict[str, Any]:
     intent = _as_dict(order.get("execution_intent"))
     provenance = _as_dict(order.get("order_provenance"))
     result: dict[str, Any] = {}
-    for field in ("routine_type", "routine_instance_id", "cycle_identity"):
+    for field in (
+        "routine_id",
+        "routine_name",
+        "routine_type",
+        "routine_instance_id",
+        "cycle_identity",
+    ):
         value = intent.get(field)
         if value in (None, ""):
             value = order.get(field)
@@ -67,6 +73,20 @@ def _routine_provenance(order: dict[str, Any]) -> dict[str, Any]:
         if value not in (None, ""):
             result[field] = value
     return result
+
+
+def _source_identity(order: dict[str, Any], source_signal_id: str) -> tuple[str, str]:
+    intent = _as_dict(order.get("execution_intent"))
+    order_intent = _as_dict(order.get("order_intent"))
+    source = _clean_text(order.get("source") or order_intent.get("source")).upper()
+    command_id = _clean_text(
+        order.get("source_command_id")
+        or order.get("command_id")
+        or intent.get("source_command_id")
+    )
+    if source == "OPERATION_COMMAND" or command_id:
+        return "OPERATION_COMMAND", command_id or source_signal_id
+    return "ROUTINE_SIGNAL", ""
 
 
 def build_execution_request_preview(
@@ -119,13 +139,14 @@ def build_execution_request_preview(
     lock_id = _clean_text(lock_preview_dict.get("lock_id"))
     order_id = _extract_order_id(order_dict, request_hash_dict)
     source_signal_id = _extract_source_signal_id(order_dict, request_hash_dict)
+    source_kind, source_command_id = _source_identity(order_dict, source_signal_id)
 
     if not lock_id:
         blocked_reasons.append("lock_id is required")
     if not order_id:
         blocked_reasons.append("order_id is required")
-    if not source_signal_id:
-        blocked_reasons.append("source_signal_id is required")
+    if not source_signal_id and not source_command_id:
+        blocked_reasons.append("source identity is required")
 
     unresolved = bool(blocked_reasons)
     execution_request = None
@@ -140,14 +161,20 @@ def build_execution_request_preview(
             "execution_id": _build_execution_id(order_id, lock_id, request_hash),
             "order_id": order_id,
             "source_signal_id": source_signal_id,
+            "source_kind": source_kind,
             "lock_id": lock_id,
             "request_hash": request_hash,
             "guard_snapshot": deepcopy(guard_dict),
             "request_preview": request_preview,
         }
+        if source_command_id:
+            execution_request["source_command_id"] = source_command_id
         execution_intent = order_dict.get("execution_intent")
         if isinstance(execution_intent, dict):
             execution_request["execution_intent"] = deepcopy(execution_intent)
+            trade_date = _clean_text(execution_intent.get("execution_trade_date"))
+            if trade_date:
+                execution_request["execution_trade_date"] = trade_date
         routine_provenance = _routine_provenance(order_dict)
         if routine_provenance:
             execution_request["routine_provenance"] = routine_provenance

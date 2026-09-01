@@ -25,6 +25,7 @@ from assignment_authorization_service import (
     execute_assignment_unassign,
     inspect_stock_unregister_availability,
 )
+from gui_user_reason import user_reason_message
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
@@ -35,11 +36,14 @@ def unregister_result_toast_text(
     blocked_count: int,
     blocked_names: list[str] | None = None,
 ) -> str:
-    del blocked_names
-    return (
-        f"종목해제 {max(int(success_count), 0)}종목"
-        f" | 해제불가 {max(int(blocked_count), 0)}종목"
-    )
+    success = max(int(success_count), 0)
+    failed = max(int(blocked_count), 0)
+    lines = [f"루틴 해제 성공 {success}종목 / 실패 {failed}종목"]
+    details = [str(value or "").strip() for value in blocked_names or () if str(value or "").strip()]
+    lines.extend(f"- {detail}" for detail in details[:5])
+    if len(details) > 5:
+        lines.append(f"- 그 외 {len(details) - 5}종목")
+    return "\n".join(lines)
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 
 def now_text() -> str:
@@ -110,6 +114,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
 
     immediate_items: list[dict[str, object]] = []
     blocked_items: list[dict[str, object]] = []
+    failure_details: list[str] = []
     seen: set[tuple[str, str]] = set()
 
     for stock_dir, code, name in selected:
@@ -132,6 +137,13 @@ def unregister_selected_auto_trade_stocks(window) -> None:
                 "instance_id": availability.current_instance_id,
                 "reasons": [availability.reason_code],
             }
+            failure_details.append(
+                f"{name or code}: "
+                + user_reason_message(
+                    availability.reason_code,
+                    fallback="현재 상태에서는 루틴에서 해제할 수 없습니다.",
+                )
+            )
         else:
             item = auto_trade_unregister_category(routine_name, stock_dir, code, name)
         category = str(item.get("category", "blocked"))
@@ -139,6 +151,17 @@ def unregister_selected_auto_trade_stocks(window) -> None:
             immediate_items.append(item)
         else:
             blocked_items.append(item)
+            if availability.allowed:
+                reasons = item.get("reasons", [])
+                reason = next(
+                    (
+                        str(value).strip()
+                        for value in reasons
+                        if str(value or "").strip()
+                    ),
+                    "현재 상태에서는 루틴에서 해제할 수 없습니다.",
+                )
+                failure_details.append(f"{name or code}: {reason}")
 
     process_items = immediate_items
     if not process_items:
@@ -147,12 +170,12 @@ def unregister_selected_auto_trade_stocks(window) -> None:
             unregister_result_toast_text(
                 0,
                 len(blocked_items),
-                [str(item.get("name", "")) for item in blocked_items],
+                failure_details,
             ),
         )
         return
     completed_items: list[str] = []
-    failed_names: list[str] = [str(item.get("name", "")) for item in blocked_items]
+    failed_names: list[str] = list(failure_details)
 
     for item in process_items:
         code = str(item.get("code", "")).strip()
@@ -172,14 +195,20 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         if result.ok and result.changed:
             completed_items.append(f"{code},{name}")
         elif not result.ok:
-            failed_names.append(name)
+            failed_names.append(
+                f"{name or code}: "
+                + user_reason_message(
+                    getattr(result, "reason_code", ""),
+                    fallback="루틴 해제 저장을 완료하지 못했습니다.",
+                )
+            )
 
     if not completed_items:
         show_toast(
             message_parent,
             unregister_result_toast_text(
                 0,
-                len(blocked_items),
+                len(failed_names),
                 failed_names,
             ),
         )
@@ -187,7 +216,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     append_changelog(
         "UPDATE",
         "종목 루틴 연결",
-        f"자동매매설정 창 루틴 등록해제: {' / '.join(completed_items)} / 중앙 종목관리 기준 갱신",
+        f"자동매매설정 창 루틴 등록해제: {' / '.join(completed_items)} / 종목 정보 갱신",
     )
 
     window.statusBar_message(f"루틴 등록해제 완료: {len(completed_items)}개")
@@ -197,7 +226,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         message_parent,
         unregister_result_toast_text(
             len(completed_items),
-            len(blocked_items),
+            len(failed_names),
             failed_names,
         ),
     )

@@ -73,6 +73,7 @@ class AutoTradeOperationHost(QObject):
         self._factory_reset_quiesced = False
         self._last_start_target_block_details = []
         self._current_session_operation_participant_stock_codes: set[str] = set()
+        recovery_gate = getattr(self._owner, "production_recovery_gate_for_stock", None)
         self._order_execution_boundary = AutoTradeOrderExecutionBoundary(
             AutoTradeOrderExecutionContext(
                 kiwoom_connected=self._kiwoom_connected,
@@ -102,6 +103,16 @@ class AutoTradeOperationHost(QObject):
                         "last_price",
                         None,
                     )
+                ),
+                production_recovery_gate_for_stock=(
+                    (
+                        lambda stock_code, caller_name: recovery_gate(
+                            stock_code,
+                            caller_name=caller_name,
+                        )
+                    )
+                    if callable(recovery_gate)
+                    else None
                 ),
             )
         )
@@ -411,6 +422,9 @@ class AutoTradeOperationHost(QObject):
 
     def fresh_monitoring_market_information_state(self, stock_code: str):
         return self._market_data_host.fresh_monitoring_market_information_state(stock_code)
+
+    def configuration_market_information_state(self, stock_code: str):
+        return self._market_data_host.configuration_market_information_state(stock_code)
 
     def high_resolution_market_data_snapshot(self):
         return self._market_data_host.high_resolution_market_data_snapshot()

@@ -242,6 +242,53 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
         self.assertEqual(150000, candidate["amount"])
         self.assertEqual(signal["execution_intent"], candidate["execution_intent"])
 
+    def test_multi_time_is_hash_only_while_multi_hoga_remains_single_candidate_metadata(self) -> None:
+        rules = self._rules()
+        base = rules["buy"]["execution"]["base"]
+        base.update(
+            {
+                "hoga_mode": "MULTI",
+                "hoga_up": 1,
+                "hoga_down": 1,
+                "point_mode": "MULTI_TIME",
+                "point_value": 1,
+                "point_unit": "MINUTE",
+                "point_range": "WITHIN",
+                "point_count": 3,
+            }
+        )
+
+        result = self._build(rules=rules, price=100)
+        intent = result["execution_intent"]
+
+        self.assertEqual("READY", result["status"])
+        self.assertEqual("MULTI", intent["hoga_mode"])
+        self.assertEqual(1, intent["hoga_up"])
+        self.assertEqual(1, intent["hoga_down"])
+        self.assertEqual(
+            {"approved_rule_hash", "runtime_state_hash", "calculation_hash", "policy_hash"},
+            set(intent["execution_snapshot"]),
+        )
+        for field in ("point_mode", "point_value", "point_unit", "point_range", "point_count"):
+            self.assertNotIn(field, intent)
+
+        candidate = signal_to_order_candidate(
+            {
+                "id": "SIGNAL-MULTI",
+                "routine": "지표추종매매",
+                "code": "005930",
+                "name": "삼성전자",
+                "signal": "BUY",
+                "status": "PENDING",
+                "execution_intent": {**intent, "source_signal_id": "SIGNAL-MULTI", "cycle_identity": "CYCLE-1"},
+            },
+            0,
+        )
+        self.assertIsInstance(candidate, dict)
+        self.assertEqual("CANDIDATE_READY", candidate["candidate_status"])
+        self.assertEqual("MULTI", candidate["hoga_mode"])
+        self.assertEqual("SIGNAL-MULTI", candidate["source_signal_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -332,7 +332,7 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
             data_quality="NORMAL",
         )
 
-    def test_snapshot_is_display_only_and_budget_waits_for_first_tick(self) -> None:
+    def test_snapshot_is_configuration_price_but_not_execution_price(self) -> None:
         self.market._initial_market_snapshot_states["005930"] = self._snapshot()
         display = self.market.monitoring_market_information_state("005930")
         actionable = self.market.fresh_monitoring_market_information_state(
@@ -354,18 +354,98 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
             "name": "삼성전자",
             "stock_path": "",
         }
-        fresh_price = self.market.fresh_monitoring_market_information_state
+        configuration_price = self.market.configuration_market_information_state
         with patch.object(
             self.market,
-            "fresh_monitoring_market_information_state",
-            side_effect=lambda code: fresh_price(code, now_dt=self._now(30)),
+            "configuration_market_information_state",
+            side_effect=lambda code: configuration_price(code, now_dt=self._now(30)),
         ):
-            display_budget = main_loader.main_stock_resolved_initial_buy_display(
+            display_budget = main_loader.main_stock_resolved_starting_budget(
                 window,
                 stock,
                 {"trade_amount_type": "QUANTITY", "buy_qty": 2},
             )
-        self.assertEqual("대기", display_budget["value_text"])
+        self.assertEqual(144_000, display_budget)
+
+    def test_configuration_price_prefers_current_session_realtime(self) -> None:
+        self.market._initial_market_snapshot_states["005930"] = self._snapshot()
+        self.market._high_resolution_market_states["005930"] = self._realtime(
+            day=30,
+            price=73_000,
+        )
+
+        state = self.market.configuration_market_information_state(
+            "005930",
+            now_dt=self._now(30),
+        )
+
+        self.assertEqual(73_000, state.last_price)
+        self.assertEqual("REALTIME", dict(state.field_sources)["last_price"])
+
+    def test_configuration_price_falls_back_from_stale_realtime_to_snapshot(self) -> None:
+        self.market._initial_market_snapshot_states["005930"] = self._snapshot()
+        self.market._high_resolution_market_states["005930"] = self._realtime(
+            day=29,
+            price=73_000,
+        )
+
+        state = self.market.configuration_market_information_state(
+            "005930",
+            now_dt=self._now(30),
+        )
+
+        self.assertEqual(72_000, state.last_price)
+        self.assertEqual("SNAPSHOT", dict(state.field_sources)["last_price"])
+
+    def test_configuration_price_rejects_stale_snapshot_identity(self) -> None:
+        snapshot = self._snapshot()
+        for field, value in (
+            ("connection_epoch", 6),
+            ("login_session_id", "SESSION-OLD"),
+        ):
+            with self.subTest(field=field):
+                payload = dict(snapshot.__dict__)
+                payload[field] = value
+                self.market._initial_market_snapshot_states["005930"] = (
+                    InitialMarketSnapshotState(**payload)
+                )
+                self.assertIsNone(
+                    self.market.configuration_market_information_state(
+                        "005930",
+                        now_dt=self._now(30),
+                    )
+                )
+
+    def test_configuration_price_rejects_previous_day_snapshot(self) -> None:
+        self.market._initial_market_snapshot_states["005930"] = self._snapshot()
+
+        self.assertIsNone(
+            self.market.configuration_market_information_state(
+                "005930",
+                now_dt=self._now(31),
+            )
+        )
+
+    def test_configuration_price_rejects_last_known_only_and_disconnected(self) -> None:
+        self.market._last_known_market_information_states["005930"] = SimpleNamespace(
+            stock_code="005930",
+            last_price=72_000,
+        )
+        self.assertIsNone(
+            self.market.configuration_market_information_state(
+                "005930",
+                now_dt=self._now(30),
+            )
+        )
+
+        self.market._initial_market_snapshot_states["005930"] = self._snapshot()
+        self.owner.kiwoom_api.connected = False
+        self.assertIsNone(
+            self.market.configuration_market_information_state(
+                "005930",
+                now_dt=self._now(30),
+            )
+        )
 
     def test_today_realtime_is_actionable_and_recalculates_budget(self) -> None:
         self.market._initial_market_snapshot_states["005930"] = self._snapshot()
@@ -381,11 +461,11 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
 
         window = SimpleNamespace(main_monitoring_auto_trade_operation_host=lambda: self.host)
         stock = {"code": "005930", "name": "삼성전자", "stock_path": ""}
-        fresh_price = self.market.fresh_monitoring_market_information_state
+        configuration_price = self.market.configuration_market_information_state
         with patch.object(
             self.market,
-            "fresh_monitoring_market_information_state",
-            side_effect=lambda code: fresh_price(code, now_dt=self._now(30)),
+            "configuration_market_information_state",
+            side_effect=lambda code: configuration_price(code, now_dt=self._now(30)),
         ):
             amount = main_loader.main_stock_resolved_starting_budget(
                 window,
@@ -522,10 +602,15 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
         }
 
         fresh_price = self.market.fresh_monitoring_market_information_state
+        configuration_price = self.market.configuration_market_information_state
         with patch.object(
             self.market,
             "fresh_monitoring_market_information_state",
             side_effect=lambda code: fresh_price(code, now_dt=self._now(30)),
+        ), patch.object(
+            self.market,
+            "configuration_market_information_state",
+            side_effect=lambda code: configuration_price(code, now_dt=self._now(30)),
         ):
             snapshot_budget = inspect_budget_value_entry(window, request)
             snapshot_ats = project_manual_ats_execution_order(
@@ -555,9 +640,12 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
                 session_phase=phase,
             )
 
-        self.assertEqual("CURRENT_PRICE_UNAVAILABLE", snapshot_budget["reason"])
+        self.assertTrue(snapshot_budget["allowed"])
+        self.assertEqual(72_000, snapshot_budget["current_price"])
+        self.assertEqual("SNAPSHOT", snapshot_budget["price_source"])
         self.assertEqual("ATS_CURRENT_PRICE_UNAVAILABLE", snapshot_ats["reason_code"])
         self.assertTrue(realtime_budget["allowed"])
+        self.assertEqual("REALTIME", realtime_budget["price_source"])
         self.assertEqual(73_000, realtime_ats["order"]["price"])
 
 

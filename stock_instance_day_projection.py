@@ -20,6 +20,7 @@ from candle_timeframe_aggregation import (
     read_canonical_bar_minutes,
 )
 from execution_queue_writer import read_execution_queue_records
+from execution_chart_read_model import project_execution_chart_read_model
 from manual_ats_runtime import manual_ats_runtime_selected_keys
 from market_evidence_store import market_window_hash
 from realized_pnl_ledger import read_realized_pnl_ledger
@@ -209,6 +210,18 @@ def _read_runtime_list(path: Path, field: str) -> tuple[list[dict[str, Any]], st
     return [deepcopy(item) for item in records], ""
 
 
+def _read_runtime_object(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.exists():
+        return {}, ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {}, f"RUNTIME_DATA_MALFORMED:{exc}"
+    if not isinstance(data, dict):
+        return {}, "RUNTIME_DATA_MALFORMED"
+    return deepcopy(data), ""
+
+
 def _record_trade_date(record: dict[str, Any]) -> str:
     text = str(record.get("received_at") or record.get("recorded_at") or "").strip()
     try:
@@ -372,7 +385,10 @@ def _open_position_projection(root: Path, stock_code: str) -> dict[str, Any]:
     if average is None or average < 0 or (quantity > 0 and average <= 0):
         return {**unavailable, "open_position_unavailable_reason": "POSITION_AVERAGE_PRICE_INVALID"}
     account_no = str(position.get("account_no") or "").strip()
-    if quantity > 0 or (root / "runtime" / "broker_holdings.json").exists():
+    # Position evidence is sufficient for this read-only display.  When broker
+    # holding evidence exists it becomes a mandatory reconciliation check, but
+    # opening the chart must not trigger a new account TR merely to create it.
+    if (root / "runtime" / "broker_holdings.json").exists():
         holdings, holding_error = _read_runtime_list(
             root / "runtime" / "broker_holdings.json",
             "holdings",
@@ -781,6 +797,51 @@ def project_stock_instance_day(
         evaluation_price=current_price_from_state(state),
         allow_candle_price_fallback=False,
     )
+    # Position evidence is intentionally re-read on every projection refresh.
+    # It must not inherit the bar-scoped PnL cache after an additional buy or a
+    # full sell.
+    open_position = _open_position_projection(root, stock_code)
+    projection_now = now or datetime.now(SEOUL_TIMEZONE)
+    if projection_now.tzinfo is None:
+        projection_now = projection_now.replace(tzinfo=SEOUL_TIMEZONE)
+    else:
+        projection_now = projection_now.astimezone(SEOUL_TIMEZONE)
+    current_day_position = str(trade_date or "") == projection_now.date().isoformat()
+    average_price = _finite_number(open_position.get("average_price"))
+    holding_quantity = _finite_number(open_position.get("holding_quantity"))
+    average_price_visible = bool(
+        current_day_position
+        and open_position.get("open_position_available") is True
+        and holding_quantity is not None
+        and holding_quantity > 0
+        and average_price is not None
+        and average_price > 0
+    )
+
+    fill_records, fill_error = _read_runtime_list(
+        root / "runtime" / "fills.json",
+        "fills",
+    )
+    execution_data, execution_error = _read_runtime_object(
+        root / "runtime" / "order_executions.json"
+    )
+    execution_chart = project_execution_chart_read_model(
+        fills=fill_records,
+        order_executions=execution_data,
+        queue_records=order_records,
+        stock_code=stock_code,
+        trade_date=trade_date,
+    )
+    diagnostics["actual_fill_diagnostics"] = execution_chart.get("diagnostics", [])
+    diagnostics["actual_fill_read_errors"] = [
+        error for error in (fill_error, execution_error) if error
+    ]
+    diagnostics["actual_fill_marker_count"] = len(
+        execution_chart.get("actual_fill_markers", [])
+    )
+    diagnostics["execution_process_rail_count"] = len(
+        execution_chart.get("execution_process_rails", [])
+    )
 
     return {
         "stock_code": str(stock_code or "").strip(),
@@ -804,6 +865,13 @@ def project_stock_instance_day(
         "current_status": current_status,
         "current_status_display": auto_trade_status_display(current_status),
         **cumulative_pnl,
+        "open_position_available": open_position.get("open_position_available") is True,
+        "holding_quantity": open_position.get("holding_quantity"),
+        "position_open_cost": open_position.get("open_position_cost"),
+        "position_account_no": open_position.get("position_account_no"),
+        "open_position_unavailable_reason": open_position.get("open_position_unavailable_reason"),
+        "average_price": average_price if average_price_visible else None,
+        "average_price_visible": average_price_visible,
         "candles": candles,
         "buy_signal_markers": [marker for marker in markers if marker["signal"] == "BUY"],
         "sell_signal_markers": [marker for marker in markers if marker["signal"] == "SELL"],
@@ -811,5 +879,10 @@ def project_stock_instance_day(
         "sell_signal_count": sum(1 for marker in markers if marker["signal"] == "SELL"),
         "actual_order_count": len(actual_orders),
         "actual_order_source": "runtime/order_queue.json:source_signal_id+send_order_called",
+        "actual_fill_markers": execution_chart.get("actual_fill_markers", []),
+        "actual_buy_fill_markers": execution_chart.get("actual_buy_fill_markers", []),
+        "actual_sell_fill_markers": execution_chart.get("actual_sell_fill_markers", []),
+        "execution_process_rails": execution_chart.get("execution_process_rails", []),
+        "actual_fill_source": "runtime/fills.json→runtime/order_executions.json→runtime/order_queue.json",
         "diagnostics": diagnostics,
     }

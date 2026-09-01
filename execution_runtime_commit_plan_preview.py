@@ -38,7 +38,10 @@ def _result(
     commit_ready: bool,
     planned_targets: dict[str, Any] | None = None,
     execution_record: dict[str, Any] | None = None,
+    process_record: dict[str, Any] | None = None,
     lock_record: dict[str, Any] | None = None,
+    append_requirements: dict[str, bool] | None = None,
+    idempotent_existing: bool = False,
     required_confirmations: dict[str, Any] | None = None,
     issues: list[Any] | None = None,
     warnings: list[Any] | None = None,
@@ -51,9 +54,12 @@ def _result(
         "runtime_write": False,
         "planned_targets": deepcopy(planned_targets or {}),
         "planned_records": {
+            "process": deepcopy(process_record),
             "execution": deepcopy(execution_record),
             "lock": deepcopy(lock_record),
         },
+        "append_requirements": deepcopy(append_requirements or {}),
+        "idempotent_existing": idempotent_existing,
         "required_confirmations": deepcopy(required_confirmations or {}),
         "issues": list(issues or []),
         "warnings": list(warnings or []),
@@ -126,7 +132,9 @@ def build_execution_runtime_commit_plan_preview(
         )
 
     execution_record = _as_dict(write_preview.get("execution_record_preview"))
+    process_record = _as_dict(write_preview.get("process_record_preview"))
     lock_record = _as_dict(write_preview.get("lock_record_preview"))
+    append_requirements = _as_dict(write_preview.get("append_requirements"))
     missing_records: list[str] = []
     if not execution_record:
         missing_records.append("MISSING_PLANNED_EXECUTION_RECORD")
@@ -147,7 +155,10 @@ def build_execution_runtime_commit_plan_preview(
         commit_ready=True,
         planned_targets=planned_targets,
         execution_record=execution_record,
+        process_record=process_record,
         lock_record=lock_record,
+        append_requirements=append_requirements,
+        idempotent_existing=write_preview.get("idempotent_existing") is True,
         required_confirmations=required_confirmations,
         issues=issues,
         warnings=warnings,

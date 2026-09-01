@@ -190,6 +190,54 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertFalse(pixmap.isNull())
         window.close()
 
+    def test_signal_marker_baseline_keeps_exact_time_price_order_and_title_counts(self) -> None:
+        buys = [
+            {
+                "signal_id": "BUY-LATE",
+                "signal_bar_time": "2026-08-10T09:10:00+09:00",
+                "signal_bar_close": 105,
+            },
+            {
+                "signal_id": "BUY-EARLY",
+                "signal_bar_time": "2026-08-10T09:05:00+09:00",
+                "signal_bar_close": 110,
+            },
+        ]
+        sells = [
+            {
+                "signal_id": "SELL-LATE",
+                "signal_bar_time": "2026-08-10T09:15:00+09:00",
+                "signal_bar_close": 103,
+            },
+            {
+                "signal_id": "SELL-EARLY",
+                "signal_bar_time": "2026-08-10T09:10:00+09:00",
+                "signal_bar_close": 105,
+            },
+        ]
+
+        window = self._window(_projection(buys=buys, sells=sells))
+
+        self.assertEqual(
+            [
+                ("2026-08-10T09:05:00+09:00", 110.0),
+                ("2026-08-10T09:10:00+09:00", 105.0),
+            ],
+            [(bar_time.isoformat(timespec="seconds"), price) for bar_time, price in window.chart.buy_series],
+        )
+        self.assertEqual(
+            [
+                ("2026-08-10T09:10:00+09:00", 105.0),
+                ("2026-08-10T09:15:00+09:00", 103.0),
+            ],
+            [(bar_time.isoformat(timespec="seconds"), price) for bar_time, price in window.chart.sell_series],
+        )
+        self.assertEqual(
+            "005930 삼성전자 / 지표추종-A / 수동운영 / 5분봉 / 매수 2 / 매도 2",
+            window.windowTitle(),
+        )
+        window.close()
+
     def test_scheduled_and_continuous_use_regular_fixed_axis_and_ignore_buy_end(self) -> None:
         candles = [
             {"bar_time": "2026-08-10T08:50:00+09:00", "close": 90},

@@ -59,6 +59,7 @@ def validate_execution_runtime_commit_plan_preview(plan_preview: Any) -> dict[st
     plan_warnings = plan_preview.get("warnings")
     planned_targets = plan_preview.get("planned_targets")
     planned_records = plan_preview.get("planned_records")
+    append_requirements = plan_preview.get("append_requirements")
 
     if plan_preview.get("plan_type") != PLAN_TYPE:
         issues.append("INVALID_PLAN_TYPE")
@@ -84,6 +85,8 @@ def validate_execution_runtime_commit_plan_preview(plan_preview: Any) -> dict[st
         planned_records = {}
     if not isinstance(plan_preview.get("required_confirmations"), dict):
         issues.append("REQUIRED_CONFIRMATIONS_MUST_BE_DICT")
+    if append_requirements is not None and not isinstance(append_requirements, dict):
+        issues.append("APPEND_REQUIREMENTS_MUST_BE_DICT")
     if not isinstance(plan_issues, list):
         issues.append("ISSUES_MUST_BE_LIST")
         plan_issues = []
@@ -106,6 +109,17 @@ def validate_execution_runtime_commit_plan_preview(plan_preview: Any) -> dict[st
                 },
             )
         )
+        if isinstance(append_requirements, dict) and append_requirements.get("process") is True:
+            issues.extend(
+                _record_issues(
+                    planned_records.get("process"),
+                    missing_issue="MISSING_PLANNED_PROCESS_RECORD",
+                    required_fields={
+                        "execution_process_id": "MISSING_PROCESS_RECORD_PROCESS_ID",
+                        "option_snapshot_hash": "MISSING_PROCESS_RECORD_SNAPSHOT_HASH",
+                    },
+                )
+            )
         issues.extend(
             _record_issues(
                 planned_records.get("lock"),

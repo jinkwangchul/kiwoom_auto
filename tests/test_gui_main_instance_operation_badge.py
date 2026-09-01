@@ -1810,7 +1810,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             parent=parent,
             message=(
                 "운영시작할 수 없습니다. "
-                "로그인, 계좌 선택 및 Recovery 완료 상태를 확인하십시오."
+                "로그인, 계좌 선택 및 현재 로그인 상태 확인 여부를 확인하십시오."
                 "\n\n원인: 보유수량 있음 + 현재가 확인 불가"
             ),
             duration_ms=2500,
@@ -2674,12 +2674,12 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             selected_account_no=Mock(return_value="12345678"),
         )
         cases = {
-            gui_windows.RECOVERY_NOT_STARTED: "Recovery가 완료되지 않았습니다.",
-            gui_windows.RECOVERY_IN_PROGRESS: "Recovery가 진행 중입니다.",
-            gui_windows.RECOVERY_ACCOUNT_FAILED: "계좌 Recovery에 실패했습니다.",
-            gui_windows.RECOVERY_STALE_SESSION: "현재 세션에서 사용할 수 없습니다.",
-            gui_windows.RECOVERY_STOCK_PENDING: "종목의 Recovery가 아직 완료되지 않았습니다.",
-            gui_windows.RECOVERY_STOCK_FAILED: "종목의 Recovery에 실패했습니다.",
+            gui_windows.RECOVERY_NOT_STARTED: "현재 로그인 상태 확인이 완료되지 않았습니다.",
+            gui_windows.RECOVERY_IN_PROGRESS: "기존 운영 상태를 확인하고 있습니다.",
+            gui_windows.RECOVERY_ACCOUNT_FAILED: "계좌의 운영 상태를 확인하지 못했습니다.",
+            gui_windows.RECOVERY_STALE_SESSION: "이전 로그인에서 확인한 운영 상태",
+            gui_windows.RECOVERY_STOCK_PENDING: "선택한 종목의 현재 로그인 상태 확인이 완료되지 않아",
+            gui_windows.RECOVERY_STOCK_FAILED: "선택한 종목의 운영 상태를 확인하지 못했습니다.",
         }
 
         for reason_code, expected in cases.items():
@@ -2713,8 +2713,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             decision,
         )
 
-        self.assertIn("Recovery 데이터를 읽을 수 없습니다.", message)
-        self.assertIn("복구를 다시 실행", message)
+        self.assertIn("운영 상태 확인 정보를 읽을 수 없습니다.", message)
+        self.assertIn("다시 로그인", message)
         self.assertNotIn("registry_error", message)
 
     def test_recovery_account_failure_uses_preserved_runtime_cause(self) -> None:
@@ -2737,7 +2737,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             decision,
         )
 
-        self.assertIn("Runtime 데이터를 읽을 수 없어", message)
+        self.assertIn("저장된 운영 상태를 읽을 수 없습니다", message)
         self.assertIn("검토관리", message)
         self.assertNotIn("DAMAGED_RUNTIME", message)
 
@@ -2762,7 +2762,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         )
 
         self.assertIn("운영 주기 실행을 시작하지 못했습니다.", message)
-        self.assertIn("Recovery를 다시 실행", message)
+        self.assertIn("다시 로그인", message)
         self.assertNotIn("RECOVERY_TIMER_START_FAILED", message)
 
     def test_time_policy_timer_exception_hides_internal_exception(self) -> None:

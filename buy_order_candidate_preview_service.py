@@ -119,6 +119,15 @@ def _execution_intent(signal: dict[str, Any], policy_result: dict[str, Any]) -> 
         "is_last_round": policy_result.get("is_last_round"),
         "unresolved": False,
         "execution_snapshot": deepcopy(_as_dict(policy_result.get("execution_snapshot"))),
+        "approved_execution_options": deepcopy(
+            _as_dict(policy_result.get("approved_execution_options"))
+        ),
+        "policy_name": policy_result.get("policy_type"),
+        "policy_version": POLICY_VERSION,
+        "execution_trade_date": _first_text(
+            signal,
+            ("signal_trade_date", "execution_trade_date", "trade_date"),
+        ),
         "account_no": evidence.get("account_no"),
         "system_budget_admission": {
             key: evidence.get(key)

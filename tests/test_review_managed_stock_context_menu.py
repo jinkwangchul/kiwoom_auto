@@ -15,6 +15,8 @@ class _Action:
     def __init__(self, text: str) -> None:
         self.label = text
         self.enabled = True
+        self.tooltip = ""
+        self.status_tip = ""
 
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
@@ -28,6 +30,12 @@ class _Action:
     def setProperty(self, _name: str, _value: object) -> None:
         pass
 
+    def setToolTip(self, text: str) -> None:
+        self.tooltip = str(text)
+
+    def setStatusTip(self, text: str) -> None:
+        self.status_tip = str(text)
+
 
 class _Menu:
     latest_root = None
@@ -38,6 +46,8 @@ class _Menu:
         self.label = label
         self.enabled = True
         self.entries = []
+        self.tooltip = ""
+        self.status_tip = ""
         self.root = root or self
         if root is None:
             _Menu.latest_root = self
@@ -61,8 +71,11 @@ class _Menu:
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
 
-    def setToolTip(self, _text: str) -> None:
-        pass
+    def setToolTip(self, text: str) -> None:
+        self.tooltip = str(text)
+
+    def setStatusTip(self, text: str) -> None:
+        self.status_tip = str(text)
 
     def exec_(self, _pos):
         return self._find_action(
@@ -401,6 +414,20 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "REVIEW_REQUIRED",
         )
         self.assertEqual(availability.reason_for("unregister"), "REVIEW_REQUIRED")
+
+    def test_review_disabled_actions_explain_user_reason_without_changing_policy(self) -> None:
+        menu, _callbacks = self._render("SCHEDULED", review=True)
+        entries = menu.top_entries()
+
+        for label in ("운영시작", "운영제외", "감시전용 전환", "등록해제", "간이차트"):
+            with self.subTest(label=label):
+                action = entries[label]
+                self.assertFalse(action.enabled)
+                self.assertEqual("검토가 필요한 종목입니다.", action.tooltip)
+                self.assertEqual(action.tooltip, action.status_tip)
+
+        self.assertTrue(entries["시간변경"].enabled)
+        self.assertTrue(entries["변경리셋"].enabled)
 
     def test_context_menu_open_close_is_read_only(self) -> None:
         menu, callbacks = self._render("SCHEDULED", review=True)

@@ -123,15 +123,15 @@ class StockInstanceChartLivePriceTests(unittest.TestCase):
         with patch.object(chart_window, "_today_trade_date", return_value=TODAY):
             return window.refresh_live_price_projection()
 
-    def test_off_keeps_canonical_projection_identical(self) -> None:
+    def test_price_signal_gate_off_keeps_current_price_marker_independent(self) -> None:
         window = self._window()
         canonical = list(window.chart.close_series)
 
         self.host.states["005930"] = _state()
-        self.assertFalse(self._refresh(window))
+        self.assertTrue(self._refresh(window))
 
         self.assertEqual(canonical, window.chart.close_series)
-        self.assertIsNone(window.chart.live_price_point)
+        self.assertEqual(70350.0, window.chart.live_price_point[1])
         self.assertEqual(1, self.provider.call_count)
 
     def test_on_projects_live_price_without_mutating_completed_candles(self) -> None:
@@ -148,18 +148,19 @@ class StockInstanceChartLivePriceTests(unittest.TestCase):
         self.assertEqual([], observed)
         self.assertEqual(1, self.provider.call_count)
 
-    def test_gate_transitions_apply_existing_state_then_remove_live_only(self) -> None:
+    def test_gate_transitions_do_not_control_chart_current_price(self) -> None:
         self.host.states["005930"] = _state(price=70400)
         window = self._window()
         canonical = list(window.chart.close_series)
 
+        self.assertEqual(70400.0, window.chart.live_price_point[1])
         self.host.gate_enabled = True
-        self.assertTrue(self._refresh(window))
+        self.assertFalse(self._refresh(window))
         self.assertEqual(70400.0, window.chart.live_price_point[1])
         self.host.gate_enabled = False
-        self.assertTrue(self._refresh(window))
+        self.assertFalse(self._refresh(window))
 
-        self.assertIsNone(window.chart.live_price_point)
+        self.assertEqual(70400.0, window.chart.live_price_point[1])
         self.assertEqual(canonical, window.chart.close_series)
         self.assertEqual(1, self.provider.call_count)
 

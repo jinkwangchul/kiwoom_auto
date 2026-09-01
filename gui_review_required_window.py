@@ -336,9 +336,9 @@ def build_review_operator_guidance(
             readiness_evidence
         )
     elif "SERVER_MISMATCH" in classification_upper or "서버" in classification_text:
-        block_reason = "서버와 Runtime 정보가 일치하지 않습니다."
-        action = "서버와 Runtime 상태의 일치를 확인한 뒤 상태재판정하세요."
-        condition = "서버와 Runtime이 일치하고 복귀 가능으로 확인되어야 합니다."
+        block_reason = "서버 정보와 저장된 운영 정보가 일치하지 않습니다."
+        action = "서버 정보와 저장된 운영 상태의 일치를 확인한 뒤 상태재판정하세요."
+        condition = "서버 정보와 저장된 운영 상태가 일치하고 복귀 가능으로 확인되어야 합니다."
     elif (
         holding_qty > 0
         or avg_price > 0
@@ -1738,7 +1738,7 @@ class GlobalReviewRequiredWindow(QDialog):
                 "service_calls": 0,
                 "skipped": skipped,
             }
-            show_toast(self, "현재 계좌와 일치하는 완료 Recovery가 없어 정합할 수 없습니다.")
+            show_toast(self, "현재 계좌의 로그인 상태 확인이 완료되지 않아 정합할 수 없습니다.")
             return
         if not targets:
             self.last_legacy_close_reconciliation_result = {
@@ -1778,11 +1778,10 @@ class GlobalReviewRequiredWindow(QDialog):
         confirmation = QMessageBox.question(
             self,
             "조기마감정합",
-            "현재 완료된 Recovery의 보유·미체결 정보를 기준으로 선택 종목의 "
+            "현재 로그인에서 확인한 보유·미체결 정보를 기준으로 선택 종목의 "
             "과거 조기마감 상태를 '조기마감 대상 없음'으로 정합합니다.\n\n"
             "검토상태, 긴급정지, 보유정보, 루틴, 운영상태는 변경하지 않습니다.\n\n"
             f"대상: {len(prepared)}개\n{target_lines}\n\n"
-            f"Recovery session: {getattr(identity, 'recovery_session_id', '')}\n"
             f"계좌: {str(handoff.get('account_display', '') or '')}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1808,7 +1807,7 @@ class GlobalReviewRequiredWindow(QDialog):
                 "service_calls": 0,
                 "skipped": skipped,
             }
-            show_toast(self, "확인 중 Recovery 정보가 변경되어 조기마감정합을 차단했습니다.")
+            show_toast(self, "확인 중 계좌 상태 정보가 변경되어 조기마감정합을 차단했습니다.")
             return
 
         counts = {
@@ -1877,7 +1876,7 @@ class GlobalReviewRequiredWindow(QDialog):
                 "reason": "COMPLETED_RECOVERY_HANDOFF_UNAVAILABLE",
                 "service_calls": 0,
             }
-            show_toast(self, "완료된 Recovery 보유정보가 없어 정합할 수 없습니다.")
+            show_toast(self, "서버에서 확인한 계좌 보유정보가 없어 정합할 수 없습니다.")
             return
         if not targets:
             self.last_position_reconciliation_result = {
@@ -1915,11 +1914,10 @@ class GlobalReviewRequiredWindow(QDialog):
         confirmation = QMessageBox.question(
             self,
             "보유정보정합",
-            "Broker Recovery 완료 보유정보를 기준으로 선택 종목의 "
+            "서버에서 확인한 계좌 보유정보를 기준으로 선택 종목의 "
             "보유수량/평단만 정합합니다.\n"
             "검토상태, 긴급정지, 마감 상태는 변경하지 않습니다.\n\n"
             f"대상: {len(prepared)}개\n{target_lines}\n\n"
-            f"Recovery session: {getattr(identity, 'recovery_session_id', '')}\n"
             f"계좌: {str(handoff.get('account_display', '') or '')}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1943,7 +1941,7 @@ class GlobalReviewRequiredWindow(QDialog):
                 "reason": "RECOVERY_HANDOFF_CHANGED_DURING_CONFIRMATION",
                 "service_calls": 0,
             }
-            show_toast(self, "확인 중 Recovery 보유정보가 변경되어 정합을 차단했습니다.")
+            show_toast(self, "확인 중 계좌 보유정보가 변경되어 정합을 차단했습니다.")
             return
 
         counts = {

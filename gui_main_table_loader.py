@@ -896,6 +896,45 @@ def main_stock_fresh_market_information_state(
     return market_state
 
 
+def main_stock_configuration_market_information_state(
+    window,
+    stock: dict[str, object],
+):
+    """Resolve current-session Snapshot-or-Realtime Configuration evidence."""
+
+    code = str(stock.get("code", "") or "").strip().upper().lstrip("A")
+    host_getter = getattr(window, "main_monitoring_auto_trade_operation_host", None)
+    if not code or not callable(host_getter):
+        return None
+    try:
+        host = host_getter()
+        state_getter = getattr(
+            host,
+            "configuration_market_information_state",
+            None,
+        )
+        fallback_is_fresh_realtime = not callable(state_getter)
+        if fallback_is_fresh_realtime:
+            state_getter = getattr(
+                host,
+                "fresh_monitoring_market_information_state",
+                None,
+            )
+        market_state = state_getter(code) if callable(state_getter) else None
+    except Exception:
+        return None
+    if not str(getattr(market_state, "login_session_id", "") or "").strip():
+        return None
+    if safe_float_value(getattr(market_state, "last_price", None), 0.0) <= 0:
+        return None
+    source = str(
+        dict(getattr(market_state, "field_sources", ()) or ()).get("last_price", "")
+    ).strip().upper()
+    if fallback_is_fresh_realtime and not source:
+        source = "REALTIME"
+    return market_state if source in {"SNAPSHOT", "REALTIME"} else None
+
+
 def main_stock_resolved_starting_budget(
     window,
     stock: dict[str, object],
@@ -903,16 +942,31 @@ def main_stock_resolved_starting_budget(
     *,
     policy: dict[str, object] | None = None,
 ) -> int | None:
-    fresh_state = main_stock_fresh_market_information_state(window, stock)
-    if fresh_state is None:
-        return None
-    last_price = safe_float_value(getattr(fresh_state, "last_price", None), 0.0)
     defaults = starting_budget_defaults(policy)
     mode = normalize_initial_buy_mode(config.get("trade_amount_type"))
     configured_value = safe_int_value(
         config.get("buy_qty") if mode == "QUANTITY" else config.get("buy_amount"),
         0,
     )
+    if mode == "AMOUNT" and configured_value > 0:
+        return configured_value
+
+    configuration_state = main_stock_configuration_market_information_state(
+        window,
+        stock,
+    )
+    if configuration_state is None:
+        return None
+    last_price = safe_float_value(
+        getattr(configuration_state, "last_price", None),
+        0.0,
+    )
+    price_source = str(
+        dict(getattr(configuration_state, "field_sources", ()) or ()).get(
+            "last_price",
+            "",
+        )
+    ).strip().upper()
     stock_key = str(stock.get("stock_path", "") or "").strip() or "|".join(
         (
             str(stock.get("code", "") or "").strip(),
@@ -920,8 +974,9 @@ def main_stock_resolved_starting_budget(
         )
     )
     signature = (
-        int(getattr(fresh_state, "connection_epoch", 0) or 0),
-        str(getattr(fresh_state, "login_session_id", "") or "").strip(),
+        int(getattr(configuration_state, "connection_epoch", 0) or 0),
+        str(getattr(configuration_state, "login_session_id", "") or "").strip(),
+        price_source,
         mode,
         configured_value,
         int(defaults["quantity"]),

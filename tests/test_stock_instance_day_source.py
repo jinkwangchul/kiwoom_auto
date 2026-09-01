@@ -444,6 +444,86 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
             projected["projection_status"],
         )
 
+    def test_actual_fill_delta_contract_keeps_cost_but_drops_time_and_order_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "fills.json").write_text(
+                json.dumps(
+                    {
+                        "fills": [
+                            {
+                                "fill_id": "FILL-2",
+                                "execution_identity_source": "fid_909",
+                                "execution_identity": "BROKER-EXEC-2",
+                                "broker_order_no": "BROKER-ORDER-1",
+                                "order_id": "ORDER-1",
+                                "order_queued_id": "ORDER-QUEUED-1",
+                                "execution_id": "EXECUTION-1",
+                                "account_no": "ACCOUNT-1",
+                                "code": "005930",
+                                "side": "BUY",
+                                "filled_quantity": 5,
+                                "filled_price": 1010,
+                                "received_at": "2026-08-10T09:31:00+09:00",
+                                "recorded_at": "2026-08-10T09:31:01+09:00",
+                            },
+                            {
+                                "fill_id": "FILL-1",
+                                "execution_identity_source": "fid_909",
+                                "execution_identity": "BROKER-EXEC-1",
+                                "broker_order_no": "BROKER-ORDER-1",
+                                "order_id": "ORDER-1",
+                                "order_queued_id": "ORDER-QUEUED-1",
+                                "execution_id": "EXECUTION-1",
+                                "account_no": "ACCOUNT-1",
+                                "code": "005930",
+                                "side": "BUY",
+                                "filled_quantity": 3,
+                                "filled_price": 1000,
+                                "received_at": "2026-08-10T09:30:00+09:00",
+                                "recorded_at": "2026-08-10T09:30:01+09:00",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            deltas, error = stock_instance_day_projection._actual_fill_deltas(
+                root,
+                "005930",
+                account_no="ACCOUNT-1",
+            )
+
+        self.assertEqual("", error)
+        self.assertEqual(
+            [
+                {
+                    "fill_id": "FILL-1",
+                    "side": "BUY",
+                    "quantity": 3,
+                    "price": 1000,
+                    "trade_date": "2026-08-10",
+                },
+                {
+                    "fill_id": "FILL-2",
+                    "side": "BUY",
+                    "quantity": 2,
+                    "price": 1010,
+                    "trade_date": "2026-08-10",
+                },
+            ],
+            deltas,
+        )
+        self.assertTrue(
+            all(
+                set(delta) == {"fill_id", "side", "quantity", "price", "trade_date"}
+                for delta in deltas
+            )
+        )
+
     def test_day_projection_classifies_empty_not_ready_and_rules_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

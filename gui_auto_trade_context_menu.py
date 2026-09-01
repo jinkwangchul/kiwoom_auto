@@ -46,6 +46,7 @@ from close_liquidation_command import (
     INDIVIDUAL_LIQUIDATION,
     inspect_close_liquidation_availability,
 )
+from gui_user_reason import user_reason_message
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -247,6 +248,22 @@ def inspect_stock_context_menu_availability(
         and not review_managed
     )
     reasons: dict[str, str] = {}
+    if not has_selection:
+        for action_key in (
+            "start",
+            "emergency_stop",
+            "exclusion",
+            "trade_permission",
+            "early_close",
+            "early_close_cancel",
+            "individual_liquidation",
+            "time_management",
+            "ats_settings",
+            "stock_register",
+            "unregister",
+            "chart",
+        ):
+            reasons[action_key] = "SELECT_STOCK_REQUIRED"
 
     exclusion_action = str(operation_exclusion_action or "").strip().lower()
     if not exclusion_action:
@@ -297,6 +314,8 @@ def inspect_stock_context_menu_availability(
         if stock_register_enabled is None
         else stock_register_enabled
     )
+    if not stock_register_allowed and "stock_register" not in reasons:
+        reasons["stock_register"] = "STOCK_REGISTER_UNAVAILABLE"
     unregister_allowed = bool(has_selection)
     if unregister_allowed and callable(callbacks.unregister_available):
         try:
@@ -589,6 +608,25 @@ def _new_stock_context_menu(parent) -> QMenu:
     return menu
 
 
+def _set_disabled_reason(entry, *, enabled: bool, reason_code: str, fallback: str) -> None:
+    """Describe a disabled menu entry without changing its enabled state."""
+
+    if entry is None or enabled:
+        return
+    message = user_reason_message(reason_code, fallback=fallback)
+    set_tool_tip = getattr(entry, "setToolTip", None)
+    if callable(set_tool_tip):
+        set_tool_tip(message)
+    set_status_tip = getattr(entry, "setStatusTip", None)
+    if callable(set_status_tip):
+        set_status_tip(message)
+    menu_action_getter = getattr(entry, "menuAction", None)
+    menu_action = menu_action_getter() if callable(menu_action_getter) else None
+    if menu_action is not None:
+        menu_action.setToolTip(message)
+        menu_action.setStatusTip(message)
+
+
 def selected_emergency_context_state(
     selected: Iterable[tuple[object, str, str]],
 ) -> tuple[bool, bool]:
@@ -851,7 +889,7 @@ def _add_ats_settings_menu(
     if method_state.get("ok") is not True:
         set_tool_tip = getattr(method_menu, "setToolTip", None)
         if callable(set_tool_tip):
-            set_tool_tip("INVALID_ATS_EXECUTION_METHOD")
+            set_tool_tip("저장된 주문방식을 확인할 수 없습니다.")
 
     ats_menu.addSeparator()
     action_market = ats_menu.addAction("시장가")
@@ -1089,6 +1127,97 @@ def show_monitor_stock_context_menu(
         menu.addSeparator()
         action_open_charts = menu.addAction("간이차트")
         action_open_charts.setEnabled(availability.chart_allowed)
+
+    _set_disabled_reason(
+        action_start,
+        enabled=availability.start_allowed,
+        reason_code=availability.reason_for("start"),
+        fallback="현재 선택한 종목은 운영을 시작할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        action_emergency_stop,
+        enabled=availability.emergency_stop_allowed,
+        reason_code=availability.reason_for("emergency_stop"),
+        fallback="현재 선택한 종목은 운영을 정지할 수 없습니다.",
+    )
+    exclusion_entry = action_set_exclusion or action_clear_exclusion
+    _set_disabled_reason(
+        exclusion_entry,
+        enabled=availability.exclusion_allowed,
+        reason_code=availability.reason_for("exclusion"),
+        fallback="현재 선택한 종목의 운영 제외 상태를 변경할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        action_trade_permission,
+        enabled=availability.trade_permission_allowed,
+        reason_code=availability.reason_for("trade_permission"),
+        fallback="현재 선택한 종목의 주문 권한을 변경할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        early_close["menu"],
+        enabled=(availability.early_close_allowed or availability.early_close_cancel_allowed),
+        reason_code=(
+            availability.reason_for("early_close")
+            or availability.reason_for("early_close_cancel")
+        ),
+        fallback="현재 선택한 종목은 조기마감 작업을 할 수 없습니다.",
+    )
+    for key in ("routine", "market", "current", "profit_loss", "carry"):
+        _set_disabled_reason(
+            early_close[key],
+            enabled=availability.early_close_allowed,
+            reason_code=availability.reason_for("early_close"),
+            fallback="현재 선택한 종목은 조기마감할 수 없습니다.",
+        )
+    _set_disabled_reason(
+        early_close["cancel"],
+        enabled=availability.early_close_cancel_allowed,
+        reason_code=availability.reason_for("early_close_cancel"),
+        fallback="현재 선택한 종목은 조기마감을 취소할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        individual["menu"],
+        enabled=availability.individual_liquidation_allowed,
+        reason_code=availability.reason_for("individual_liquidation"),
+        fallback="현재 선택한 종목은 개별청산할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        action_time_change,
+        enabled=availability.time_management_allowed,
+        reason_code=availability.reason_for("time_management"),
+        fallback="대상 종목을 선택하세요.",
+    )
+    _set_disabled_reason(
+        action_time_reset,
+        enabled=availability.time_management_allowed,
+        reason_code=availability.reason_for("time_management"),
+        fallback="대상 종목을 선택하세요.",
+    )
+    if ats_settings is not None:
+        _set_disabled_reason(
+            ats_settings["menu"],
+            enabled=availability.ats_settings_allowed and _menu_entry_enabled(ats_settings["menu"]),
+            reason_code=availability.reason_for("ats_settings"),
+            fallback="현재 선택한 종목의 ATS 설정을 변경할 수 없습니다.",
+        )
+    _set_disabled_reason(
+        action_stock_register,
+        enabled=availability.stock_register_allowed,
+        reason_code=availability.reason_for("stock_register"),
+        fallback="현재 선택한 종목은 등록할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        action_unregister,
+        enabled=availability.unregister_allowed,
+        reason_code=availability.reason_for("unregister"),
+        fallback="현재 선택한 종목은 루틴에서 해제할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        action_open_charts,
+        enabled=availability.chart_allowed,
+        reason_code=availability.reason_for("chart"),
+        fallback="대상 종목을 선택하세요.",
+    )
 
     chosen = menu.exec_(global_pos)
     if chosen is None:

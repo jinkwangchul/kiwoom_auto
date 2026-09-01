@@ -327,6 +327,7 @@ class AutoTradeOrderExecutionContext:
     current_orderable_cash: Callable[[], int | None] | None = None
     broker_holdings_path: Callable[[], Path] | None = None
     fresh_current_price: Callable[[str], int | float | None] | None = None
+    production_recovery_gate_for_stock: Callable[[str, str], object] | None = None
 
 
 class AutoTradeOrderExecutionBoundary:
@@ -700,7 +701,20 @@ class AutoTradeOrderExecutionBoundary:
     ) -> dict[str, object]:
         order_executions_path = order_executions_path or self._context.order_executions_path()
         order_locks_path = order_locks_path or self._context.order_locks_path()
-        del execution_preview_result
+        preview_result = (
+            execution_preview_result.get("preview_result")
+            if isinstance(execution_preview_result, dict)
+            else None
+        )
+        preview_result = preview_result if isinstance(preview_result, dict) else {}
+        approved_candidate = preview_result.get("candidate_result")
+        approved_queue_write_preview = (
+            execution_preview_result.get("queue_write_preview_result")
+            if isinstance(execution_preview_result, dict)
+            else None
+        )
+        if not isinstance(approved_queue_write_preview, dict):
+            approved_queue_write_preview = preview_result.get("queue_write_preview_result")
         runtime_files = self.ensure_execution_runtime_files_ready(
             order=order,
             guard=guard,
@@ -733,6 +747,8 @@ class AutoTradeOrderExecutionBoundary:
             guard,
             storage,
             confirmations=confirmations,
+            approved_candidate=approved_candidate,
+            approved_queue_write_preview=approved_queue_write_preview,
         )
         commit_plan = runtime_dry_run.get("commit_plan") if isinstance(runtime_dry_run, dict) else None
         if not isinstance(commit_plan, dict) or runtime_dry_run.get("status") != "READY":
@@ -786,7 +802,10 @@ class AutoTradeOrderExecutionBoundary:
             invalid_reasons.append("runtime commit status is not COMMITTED")
         if runtime_commit_result.get("committed") is not True:
             invalid_reasons.append("runtime committed flag is not true")
-        if runtime_commit_result.get("runtime_write") is not True:
+        if (
+            runtime_commit_result.get("runtime_write") is not True
+            and runtime_commit_result.get("idempotent") is not True
+        ):
             invalid_reasons.append("runtime_write flag is not true")
         if runtime_commit_result.get("read_back_verified") is not True:
             invalid_reasons.append("runtime read-back is not verified")
@@ -1019,6 +1038,40 @@ class AutoTradeOrderExecutionBoundary:
         execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
         request_preview = execution_request_dict.get("request_preview")
         return request_preview if isinstance(request_preview, dict) else {}
+
+    def production_recovery_block_reasons_for_order(
+        self,
+        order: Mapping[str, object],
+        *,
+        caller_name: str,
+    ) -> list[str]:
+        """Recheck current-session stock Recovery before a new order gains authority."""
+
+        request = self._order_request_preview(order)
+        order_action = str(
+            request.get("order_action") or order.get("order_action") or "NEW"
+        ).strip().upper()
+        if order_action != "NEW":
+            return []
+
+        callback = self._context.production_recovery_gate_for_stock
+        if not callable(callback):
+            # Non-production/unit contexts created before this guard remain compatible.
+            # Both production owners always provide the authoritative callback.
+            return []
+
+        code = normalize_stock_code(request.get("code") or order.get("code"))
+        if not code:
+            return ["RECOVERY_STOCK_CODE_MISSING"]
+        try:
+            decision = callback(code, str(caller_name or "EXECUTION_RECOVERY_GATE").strip())
+        except Exception:
+            return ["RECOVERY_GATE_UNAVAILABLE"]
+        if getattr(decision, "allowed", False) is True:
+            return []
+        return [
+            str(getattr(decision, "reason_code", "") or "RECOVERY_NOT_READY").strip()
+        ]
 
     def _broker_holdings_path(self) -> Path:
         callback = self._context.broker_holdings_path
@@ -1511,6 +1564,19 @@ class AutoTradeOrderExecutionBoundary:
                 "order_action": action,
                 "fresh_dispatch_preflight": True,
             }
+        recovery_reasons = self.production_recovery_block_reasons_for_order(
+            order,
+            caller_name="FINAL_DISPATCH_FRESH_PREFLIGHT",
+        )
+        if recovery_reasons:
+            return {
+                "ok": False,
+                "stage": "production_recovery_gate",
+                "blocked_reasons": recovery_reasons,
+                "side": side,
+                "order_action": action,
+                "fresh_dispatch_preflight": False,
+            }
         if side == "SELL":
             result = self._fresh_sell_dispatch_preflight(order, environment)
         elif side == "BUY":
@@ -1745,6 +1811,8 @@ class AutoTradeOrderExecutionBoundary:
     ) -> dict[str, object]:
         source_order_id = str(source_order.get("order_id") or source_order.get("id") or "").strip()
         source_signal_id = str(source_order.get("source_signal_id") or "").strip()
+        execution_process_id = str(source_order.get("execution_process_id") or "").strip()
+        option_snapshot_hash = str(source_order.get("option_snapshot_hash") or "").strip()
         broker_order_no = str(source_order.get("broker_order_no") or "").strip()
         account_no = str(source_order.get("account_no") or "").strip()
         code = str(source_order.get("code") or "").strip()
@@ -1789,6 +1857,20 @@ class AutoTradeOrderExecutionBoundary:
                 "source_order_id": source_order_id,
             },
         }
+        if execution_process_id:
+            execution_request.update(
+                {
+                    "execution_process_id": execution_process_id,
+                    "child_sequence_index": 1,
+                    "child_sequence_total": 1,
+                    "child_kind": "CANCEL",
+                    "child_plan": {
+                        "planned_quantity": remaining_quantity,
+                        "planned_price": 0,
+                    },
+                    "option_snapshot_hash": option_snapshot_hash,
+                }
+            )
         return {
             "write_preview": True,
             "write_stage": "order_queued_record_preview_created",
@@ -1807,6 +1889,21 @@ class AutoTradeOrderExecutionBoundary:
                 "request_hash": request_hash,
                 "lock_id": lock_id,
                 "execution_id": execution_id,
+                **(
+                    {
+                        "execution_process_id": execution_process_id,
+                        "child_sequence_index": 1,
+                        "child_sequence_total": 1,
+                        "child_kind": "CANCEL",
+                        "child_plan": {
+                            "planned_quantity": remaining_quantity,
+                            "planned_price": 0,
+                        },
+                        "option_snapshot_hash": option_snapshot_hash,
+                    }
+                    if execution_process_id
+                    else {}
+                ),
                 "execution_request": execution_request,
                 "queue_contract_version": "manual-cancel-1",
                 "send_order_called": False,
@@ -2182,6 +2279,12 @@ class AutoTradeOrderExecutionBoundary:
         return result
 
     def auto_trade_execution_block_reasons(self, order: dict[str, object]) -> list[str]:
+        recovery_reasons = self.production_recovery_block_reasons_for_order(
+            order,
+            caller_name="AUTO_TRADE_EXECUTION_ENABLE",
+        )
+        if recovery_reasons:
+            return recovery_reasons
         runtime = self.auto_trade_runtime_state_for_order(order)
         if runtime.get("found") is not True:
             return list(runtime.get("issues") or ["runtime stock state is not found"])

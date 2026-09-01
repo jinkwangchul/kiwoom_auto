@@ -749,6 +749,129 @@ class MarketDataHost(QObject):
             return None
         return state
 
+    def configuration_market_information_state(
+        self,
+        stock_code: str,
+        *,
+        now_dt: datetime | None = None,
+    ) -> MonitoringMarketInformationState | None:
+        """Return current-session price evidence for Configuration calculations.
+
+        This deliberately excludes process last-known and persisted prices.  A
+        valid same-day realtime Tick wins; otherwise a same-day Initial Snapshot
+        from the currently connected Broker session is allowed.
+        """
+
+        code = str(stock_code or "").strip()
+        if not code:
+            return None
+        session_getter = getattr(self.kiwoom_api, "broker_session_snapshot", None)
+        if not callable(session_getter):
+            return None
+        try:
+            broker_session = session_getter()
+            broker_identity = (
+                int(getattr(broker_session, "connection_epoch", 0) or 0),
+                str(getattr(broker_session, "login_session_id", "") or "").strip(),
+            )
+        except Exception:
+            return None
+        if (
+            getattr(broker_session, "connected", False) is not True
+            or not broker_identity[1]
+            or broker_identity != self._realtime_shadow_session_identity
+        ):
+            return None
+
+        current = now_dt or datetime.now(SEOUL_TIMEZONE)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=SEOUL_TIMEZONE)
+        else:
+            current = current.astimezone(SEOUL_TIMEZONE)
+
+        realtime = self.high_resolution_market_state(code)
+        if (
+            realtime is not None
+            and str(realtime.stock_code or "").strip() == code
+            and (
+                realtime.connection_epoch,
+                realtime.login_session_id,
+            )
+            == broker_identity
+        ):
+            try:
+                realtime_price = float(realtime.last_price)
+            except (TypeError, ValueError):
+                realtime_price = 0.0
+            market_datetime = parse_market_datetime(realtime.last_market_datetime)
+            if (
+                not isinstance(realtime.last_price, bool)
+                and isfinite(realtime_price)
+                and realtime_price > 0
+                and market_datetime is not None
+                and market_datetime.date() == current.date()
+            ):
+                state = self._current_session_market_information_state(code)
+                if (
+                    state is not None
+                    and dict(state.field_sources).get("last_price") == "REALTIME"
+                ):
+                    return state
+
+        snapshot = self.initial_market_snapshot_state(code)
+        if (
+            snapshot is None
+            or str(snapshot.stock_code or "").strip() != code
+            or (
+                snapshot.connection_epoch,
+                snapshot.login_session_id,
+            ) != broker_identity
+        ):
+            return None
+        if str(snapshot.source or "").strip().upper() != "SNAPSHOT":
+            return None
+        snapshot_datetime = parse_market_datetime(snapshot.received_at)
+        if snapshot_datetime is None or snapshot_datetime.date() != current.date():
+            return None
+        try:
+            snapshot_price = float(snapshot.current_price)
+        except (TypeError, ValueError):
+            return None
+        if (
+            isinstance(snapshot.current_price, bool)
+            or not isfinite(snapshot_price)
+            or snapshot_price <= 0
+        ):
+            return None
+
+        values = {
+            "last_price": snapshot.current_price,
+            "open_price": snapshot.open_price,
+            "high_price": snapshot.high_price,
+            "low_price": snapshot.low_price,
+            "change_rate": snapshot.change_rate,
+            "previous_day_volume_rate": snapshot.previous_day_volume_rate,
+            "execution_strength": snapshot.execution_strength,
+        }
+        return MonitoringMarketInformationState(
+            stock_code=code,
+            connection_epoch=broker_identity[0],
+            login_session_id=broker_identity[1],
+            last_price=values["last_price"],
+            open_price=values["open_price"],
+            high_price=values["high_price"],
+            low_price=values["low_price"],
+            change_rate=values["change_rate"],
+            previous_day_volume_rate=values["previous_day_volume_rate"],
+            execution_strength=values["execution_strength"],
+            snapshot_received_at=snapshot.received_at,
+            realtime_received_at="",
+            field_sources=tuple(
+                (field, "SNAPSHOT" if value is not None else "UNAVAILABLE")
+                for field, value in values.items()
+            ),
+        )
+
     def monitoring_market_information_state(
         self,
         stock_code: str,

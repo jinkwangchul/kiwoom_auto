@@ -483,6 +483,8 @@ def existing_chejan_record_result(
         "request_hash": _clean_text(record.get("request_hash")),
         "lock_id": _clean_text(record.get("lock_id")),
         "execution_id": _clean_text(record.get("execution_id")),
+        "execution_process_id": _clean_text(record.get("execution_process_id")),
+        "execution_trade_date": _clean_text(record.get("execution_trade_date")),
         "event_identity": _clean_text(matched_event.get("event_identity")),
         "event_identity_source": _clean_text(matched_event.get("event_identity_source")),
         "lifecycle_status": _clean_text(record.get("status")),
@@ -1158,6 +1160,12 @@ def record_chejan_event(
                         "event_identity": event_identity,
                         "event_identity_source": event_identity_source,
                         "execution_id": _clean_text(updated_record.get("execution_id")),
+                        "execution_process_id": _clean_text(
+                            updated_record.get("execution_process_id")
+                        ),
+                        "execution_trade_date": _clean_text(
+                            updated_record.get("execution_trade_date")
+                        ),
                         "request_hash": _clean_text(updated_record.get("request_hash")),
                         "lock_id": _clean_text(updated_record.get("lock_id")),
                         "lifecycle_status": _clean_text(updated_record.get("status")),
@@ -1187,6 +1195,12 @@ def record_chejan_event(
                 "event_identity": event_identity,
                 "event_identity_source": event_identity_source,
                 "execution_id": _clean_text(updated_record.get("execution_id")),
+                "execution_process_id": _clean_text(
+                    updated_record.get("execution_process_id")
+                ),
+                "execution_trade_date": _clean_text(
+                    updated_record.get("execution_trade_date")
+                ),
                 "request_hash": _clean_text(updated_record.get("request_hash")),
                 "lock_id": _clean_text(updated_record.get("lock_id")),
                 "lifecycle_status": _clean_text(updated_record.get("status")),
@@ -1232,6 +1246,8 @@ def record_chejan_event(
         "event_identity": mutation_state["event_identity"],
         "event_identity_source": mutation_state["event_identity_source"],
         "execution_id": mutation_state["execution_id"],
+        "execution_process_id": mutation_state.get("execution_process_id", ""),
+        "execution_trade_date": mutation_state.get("execution_trade_date", ""),
         "request_hash": mutation_state["request_hash"],
         "lock_id": mutation_state["lock_id"],
         "lifecycle_status": mutation_state["lifecycle_status"],

@@ -21,6 +21,7 @@ from chejan_event_recorder import (
     mark_chejan_reconciliation_state,
 )
 from execution_fill_recorder import find_existing_execution_fill_record, record_execution_fill
+from execution_provenance_contract import validate_process_record
 from operation_close_completion_check_service import (
     SOURCE_STARTUP_RECOVERY,
     check_global_close_completion_after_durable_update,
@@ -691,6 +692,20 @@ def assess_startup_recovery(
     positions = reads["positions"].get("items") or []
     holdings = reads["broker_holdings"].get("items") or []
     executions = reads["order_executions"].get("items") or []
+    executions_root = reads["order_executions"].get("data")
+    processes_value = (
+        executions_root.get("processes")
+        if isinstance(executions_root, dict) and "processes" in executions_root
+        else None
+    )
+    processes: list[dict[str, Any]] = []
+    if processes_value is not None:
+        if not isinstance(processes_value, list) or any(
+            not isinstance(item, dict) for item in processes_value
+        ):
+            invalid_reasons.append("order_executions.json.processes must contain only objects")
+        else:
+            processes = [dict(item) for item in processes_value]
     locks = reads["order_locks"].get("items") or []
     signals = reads["routine_signals"].get("items") or []
 
@@ -712,12 +727,25 @@ def assess_startup_recovery(
             queue_by_order_id[order_id] = order
 
     seen_execution_ids: set[str] = set()
+    process_by_id: dict[str, dict[str, Any]] = {}
+    process_child_counts: dict[str, int] = {}
+    for process in processes:
+        process_id = _clean_text(process.get("execution_process_id"))
+        for issue in validate_process_record(process):
+            invalid_reasons.append(f"{process_id or 'unknown process'}: {issue}")
+        if process_id in process_by_id:
+            invalid_reasons.append(f"duplicate execution process identity: {process_id}")
+        elif process_id:
+            process_by_id[process_id] = process
+
+    execution_by_id: dict[str, dict[str, Any]] = {}
     for execution in executions:
         execution_id = _clean_text(execution.get("execution_id"))
         if execution_id:
             if execution_id in seen_execution_ids:
                 invalid_reasons.append(f"duplicate runtime execution identity: {execution_id}")
             seen_execution_ids.add(execution_id)
+            execution_by_id[execution_id] = execution
         order_id = _clean_text(execution.get("order_id"))
         queue_order = queue_by_order_id.get(order_id)
         label = execution_id or order_id or "unknown execution"
@@ -727,12 +755,36 @@ def assess_startup_recovery(
         conflicts = _identity_conflicts(
             execution,
             queue_order,
-            ("order_id", "execution_id", "request_hash", "lock_id"),
+            (
+                "order_id",
+                "execution_id",
+                "request_hash",
+                "lock_id",
+                "execution_process_id",
+                "child_sequence_index",
+                "child_sequence_total",
+                "child_kind",
+                "option_snapshot_hash",
+            ),
         )
         if conflicts:
             invalid_reasons.append(
                 f"{label}: runtime execution/Queue identity mismatch ({', '.join(conflicts)})"
             )
+        process_id = _clean_text(execution.get("execution_process_id"))
+        if process_id:
+            process_child_counts[process_id] = process_child_counts.get(process_id, 0) + 1
+            owner = process_by_id.get(process_id)
+            if owner is None:
+                invalid_reasons.append(f"{label}: execution process owner missing")
+            elif _clean_text(execution.get("option_snapshot_hash")) != _clean_text(
+                owner.get("option_snapshot_hash")
+            ):
+                invalid_reasons.append(f"{label}: execution process snapshot hash mismatch")
+
+    for process_id in process_by_id:
+        if process_child_counts.get(process_id, 0) == 0:
+            invalid_reasons.append(f"{process_id}: execution process has no child execution")
 
     for fill in fills:
         fill_id = _clean_text(fill.get("fill_id")) or _identity_key(
@@ -745,6 +797,13 @@ def assess_startup_recovery(
         )
         if not _position_applied(position, fill):
             review_reasons.append(f"{fill_id}: Fill is not applied to internal Position")
+        fill_execution_id = _clean_text(fill.get("execution_id"))
+        fill_process_id = _clean_text(fill.get("execution_process_id"))
+        execution = execution_by_id.get(fill_execution_id)
+        if fill_process_id and execution is None:
+            invalid_reasons.append(f"{fill_id}: Fill execution reference missing")
+        elif fill_process_id and _clean_text(execution.get("execution_process_id")) != fill_process_id:
+            invalid_reasons.append(f"{fill_id}: Fill execution process reference mismatch")
 
     for lock in locks:
         lock_id = _clean_text(lock.get("lock_id") or lock.get("id") or "unknown lock")

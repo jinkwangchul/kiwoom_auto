@@ -39,6 +39,7 @@ BROKER_HOLDINGS_SCHEMA: dict[str, Any] = {
 ORDER_EXECUTIONS_SCHEMA: dict[str, Any] = {
     "version": 1,
     "updated_at": None,
+    "processes": [],
     "executions": [],
 }
 

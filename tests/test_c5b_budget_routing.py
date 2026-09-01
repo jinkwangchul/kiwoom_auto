@@ -48,10 +48,14 @@ class BudgetRoutingCommandTest(unittest.TestCase):
             last_price=70_000,
             login_session_id="SESSION-1",
             connection_epoch=1,
+            field_sources=(("last_price", "SNAPSHOT"),),
         )
         operation_host = SimpleNamespace(
-            fresh_monitoring_market_information_state=(
+            configuration_market_information_state=(
                 lambda _code: market if fresh else None
+            ),
+            fresh_monitoring_market_information_state=(
+                lambda _code: None
             ),
         )
         return SimpleNamespace(
@@ -83,7 +87,7 @@ class BudgetRoutingCommandTest(unittest.TestCase):
                 expected_fields={"trade_amount_type": "QUANTITY"},
             )
 
-    def test_mode_change_without_fresh_price_does_not_open_or_write(self) -> None:
+    def test_mode_change_without_configuration_price_does_not_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self._fixture(Path(temp_dir))
             writer = MagicMock()
@@ -132,9 +136,127 @@ class BudgetRoutingCommandTest(unittest.TestCase):
                 self._host(fresh=False),
                 BudgetValueChangeRequest(config_path),
             )
-            self.assertFalse(unavailable["allowed"])
-            self.assertEqual(CURRENT_PRICE_UNAVAILABLE, unavailable["reason"])
+            self.assertTrue(unavailable["allowed"])
+            self.assertEqual("", unavailable["reason"])
+            self.assertIsNone(unavailable["current_price"])
             self.assertEqual(before, config_path.read_bytes())
+
+            (config_path.parent / "state.json").write_text(
+                json.dumps({"current_price": 99_999}),
+                encoding="utf-8",
+            )
+            persisted_only = inspect_budget_value_entry(
+                self._host(fresh=False),
+                BudgetValueChangeRequest(config_path),
+            )
+            self.assertIsNone(persisted_only["current_price"])
+
+    def test_amount_to_quantity_does_not_resolve_price(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._fixture(Path(temp_dir))
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["trade_amount_type"] = "AMOUNT"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            writer = MagicMock(
+                return_value={"allowed": True, "changed": True, "reason": ""}
+            )
+            price_reader = MagicMock(return_value=None)
+
+            result = execute_budget_mode_change(
+                self._host(fresh=False),
+                BudgetModeChangeRequest(config_path, "QUANTITY"),
+                writer=writer,
+                configuration_price_reader=price_reader,
+            )
+
+            self.assertTrue(result["allowed"], result)
+            self.assertEqual(1, result["value"])
+            price_reader.assert_not_called()
+            writer.assert_called_once_with(
+                config_path,
+                mode="QUANTITY",
+                value=1,
+                expected_fields={"trade_amount_type": "AMOUNT"},
+            )
+
+    def test_quantity_to_amount_uses_snapshot_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._fixture(Path(temp_dir))
+            writer = MagicMock(
+                return_value={"allowed": True, "changed": True, "reason": ""}
+            )
+            state = SimpleNamespace(
+                last_price=70_000,
+                field_sources=(("last_price", "SNAPSHOT"),),
+            )
+            price_reader = MagicMock(return_value=state)
+            host = self._host()
+
+            result = execute_budget_mode_change(
+                host,
+                BudgetModeChangeRequest(config_path, "AMOUNT"),
+                writer=writer,
+                configuration_price_reader=price_reader,
+            )
+
+            self.assertTrue(result["allowed"], result)
+            self.assertEqual(105_000, result["value"])
+            self.assertEqual("SNAPSHOT", result["price_source"])
+            price_reader.assert_called_once_with(host, config_path)
+
+    def test_configuration_commands_issue_no_broker_or_order_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._fixture(Path(temp_dir))
+            host = self._host()
+            broker = SimpleNamespace(
+                CommRqData=MagicMock(),
+                SetRealReg=MagicMock(),
+                SendOrder=MagicMock(),
+                dynamicCall=MagicMock(),
+            )
+            host.kiwoom_api = broker
+            writer = MagicMock(
+                return_value={"allowed": True, "changed": True, "reason": ""}
+            )
+
+            result = execute_budget_mode_change(
+                host,
+                BudgetModeChangeRequest(config_path, "AMOUNT"),
+                writer=writer,
+            )
+            availability = inspect_budget_value_entry(
+                host,
+                BudgetValueChangeRequest(config_path),
+            )
+
+            self.assertTrue(result["allowed"], result)
+            self.assertTrue(availability["allowed"])
+            broker.CommRqData.assert_not_called()
+            broker.SetRealReg.assert_not_called()
+            broker.SendOrder.assert_not_called()
+            broker.dynamicCall.assert_not_called()
+
+    def test_quantity_to_amount_accepts_realtime_configuration_price(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._fixture(Path(temp_dir))
+            writer = MagicMock(
+                return_value={"allowed": True, "changed": True, "reason": ""}
+            )
+            state = SimpleNamespace(
+                last_price=71_000,
+                field_sources=(("last_price", "REALTIME"),),
+            )
+
+            result = execute_budget_mode_change(
+                self._host(),
+                BudgetModeChangeRequest(config_path, "AMOUNT"),
+                writer=writer,
+                configuration_price_reader=MagicMock(return_value=state),
+            )
+
+            self.assertTrue(result["allowed"], result)
+            self.assertEqual(106_500, result["value"])
+            self.assertEqual("REALTIME", result["price_source"])
 
     def test_settings_like_caller_uses_persistent_main_price_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

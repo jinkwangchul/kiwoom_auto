@@ -189,6 +189,22 @@ def _initial_order_queue() -> dict[str, Any]:
 
 
 def _candidate_duplicate_reason(order: dict[str, Any], orders: list[Any]) -> str | None:
+    execution_process_id = str(order.get("execution_process_id") or "").strip()
+    execution_id = str(order.get("execution_id") or "").strip()
+    if execution_process_id:
+        same_process = [
+            existing
+            for existing in orders
+            if isinstance(existing, dict)
+            and str(existing.get("execution_process_id") or "").strip()
+            == execution_process_id
+        ]
+        for existing in same_process:
+            if execution_id and str(existing.get("execution_id") or "").strip() == execution_id:
+                return "duplicate execution process child"
+        if same_process:
+            return "multiple execution process children are not supported"
+
     source_signal_id = _source_signal_id(order)
     if source_signal_id:
         for existing in orders:

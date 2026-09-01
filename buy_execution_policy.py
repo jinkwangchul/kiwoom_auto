@@ -327,6 +327,27 @@ def _result(
         "calculation_hash": calculation_hash,
         "policy_hash": policy_hash,
     }
+    approved_execution_options = {
+        field: approved_base.get(field)
+        for field in (
+            "hoga_mode",
+            "order_price_basis",
+            "hoga_up",
+            "hoga_down",
+            "point_mode",
+            "point_value",
+            "point_unit",
+            "point_range",
+            "point_count",
+            "ratio_left",
+            "ratio_right",
+            "ratio_direction",
+            "ratio_value",
+            "ratio_compare",
+            "ratio_count",
+        )
+        if approved_base.get(field) not in (None, "")
+    }
     system_evidence = evidence or {}
     return {
         "policy_type": POLICY_TYPE,
@@ -358,6 +379,7 @@ def _result(
         "projected_account_consumption": system_evidence.get("projected_account_consumption"),
         "system_total_budget_exceeded": system_evidence.get("system_total_budget_exceeded"),
         "execution_snapshot": snapshot,
+        "approved_execution_options": approved_execution_options,
     }
 
 

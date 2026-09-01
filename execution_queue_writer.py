@@ -718,6 +718,8 @@ def preview_execution_queue_write(
     if duplicate_reason:
         return _blocked("duplicate", duplicate_reason)
 
+    queue_execution_request = deepcopy(execution_request)
+    queue_execution_request.pop("process_record", None)
     record = {
         "id": _order_queued_id(order_id, request_hash),
         "status": "ORDER_QUEUED",
@@ -729,15 +731,32 @@ def preview_execution_queue_write(
         "request_hash": request_hash,
         "lock_id": execution_lock_id,
         "execution_id": execution_id,
-        "execution_request": deepcopy(execution_request),
+        "execution_request": queue_execution_request,
         "queue_contract_version": _clean_text(pending.get("queue_contract_version")) or "preview-1",
         "send_order_called": False,
         "execution_enabled": False,
         "blocked_reasons": [],
     }
-    for field in ("execution_intent", "routine_provenance"):
+    for field in (
+        "execution_intent",
+        "routine_provenance",
+        "child_plan",
+    ):
         value = execution_request.get(field)
         if isinstance(value, dict):
+            record[field] = deepcopy(value)
+    for field in (
+        "source_kind",
+        "source_command_id",
+        "execution_process_id",
+        "child_sequence_index",
+        "child_sequence_total",
+        "child_kind",
+        "option_snapshot_hash",
+        "execution_trade_date",
+    ):
+        value = execution_request.get(field)
+        if value not in (None, ""):
             record[field] = deepcopy(value)
 
     return {

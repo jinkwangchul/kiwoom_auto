@@ -46,6 +46,7 @@ from manual_ats_runtime import manual_ats_runtime_selected_keys
 from operation_command_service import (
     COMMAND_INDIVIDUAL_LIQUIDATION,
     IndividualLiquidationOverride,
+    MODE_EARLY_CLOSE,
     MODE_NORMAL,
     OperationCommandRequest,
     OperationCommandResult,
@@ -204,6 +205,7 @@ def inspect_close_liquidation_availability(
     requested_minutes: object = "",
     now_dt: datetime | None = None,
     recovery_inspector: Callable[[str, str], object | None] | None = None,
+    expected_command_id: str | None = None,
     irreversible_evidence_reader: (
         Callable[[Path, str, dict[str, object]], str] | None
     ) = None,
@@ -261,6 +263,54 @@ def inspect_close_liquidation_availability(
         "close_requested": close_requested,
         "command_id": command_id,
     }
+
+    # Cancelling a still-reversible policy request reduces risk; it is not an
+    # execution-enabling command.  Its authority is therefore the active
+    # request identity plus absence of irreversible execution evidence, not the
+    # shared Participant/Review/Emergency/Recovery gates used by requests.
+    if normalized_intent == EARLY_CLOSE_CANCEL:
+        if not close_requested:
+            return _blocked(reason_code="NOT_CANCELABLE", **common)
+        requested_at = str(state.get("early_close_requested_at") or "").strip()
+        command_mode = str(state.get("operation_command_mode") or "").strip().upper()
+        if (
+            not requested_at
+            or not command_id
+            or command_mode != MODE_EARLY_CLOSE
+        ):
+            return _blocked(reason_code="COMMAND_IDENTITY_MISSING", **common)
+        if (
+            expected_command_id is not None
+            and command_id != str(expected_command_id or "").strip()
+        ):
+            return _blocked(reason_code="COMMAND_IDENTITY_CHANGED", **common)
+        if irreversible_evidence_reader is not None:
+            try:
+                irreversible = str(
+                    irreversible_evidence_reader(stock_path, code, state) or ""
+                ).strip()
+            except Exception as exc:
+                irreversible = f"evidence_reader_error:{exc}"
+            if irreversible:
+                return _blocked(
+                    reason_code="NOT_CANCELABLE",
+                    evidence=(irreversible,),
+                    **common,
+                )
+        return CloseLiquidationAvailability(
+            True,
+            "",
+            normalized_intent,
+            code,
+            current_session_participant=participant,
+            review_required=review_required,
+            emergency_stopped=emergency_stopped,
+            recovery_blocked=False,
+            holding_qty=holding_qty,
+            close_requested=close_requested,
+            command_id=command_id,
+        )
+
     if review_required:
         return _blocked(reason_code="REVIEW_REQUIRED", **common)
     if emergency_stopped:
@@ -293,26 +343,7 @@ def inspect_close_liquidation_availability(
             **common,
         )
 
-    if normalized_intent == EARLY_CLOSE_CANCEL:
-        if not close_requested:
-            return _blocked(reason_code="NOT_CANCELABLE", **common)
-        requested_at = str(state.get("early_close_requested_at") or "").strip()
-        if not requested_at:
-            return _blocked(reason_code="COMMAND_IDENTITY_MISSING", **common)
-        if irreversible_evidence_reader is not None:
-            try:
-                irreversible = str(
-                    irreversible_evidence_reader(stock_path, code, state) or ""
-                ).strip()
-            except Exception as exc:
-                irreversible = f"evidence_reader_error:{exc}"
-            if irreversible:
-                return _blocked(
-                    reason_code="NOT_CANCELABLE",
-                    evidence=(irreversible,),
-                    **common,
-                )
-    elif normalized_intent == EARLY_CLOSE_REQUEST:
+    if normalized_intent == EARLY_CLOSE_REQUEST:
         if holding_qty <= 0:
             return _blocked(reason_code="NO_HOLDING", **common)
         if auto_trade_setting_liquidation_phase_active(
@@ -744,6 +775,7 @@ def execute_early_close_cancel_command(
     source: str,
     project_root: str | Path = PROJECT_ROOT,
     recovery_inspector: Callable[[str, str], object | None] | None = None,
+    expected_command_id: str | None = None,
     irreversible_evidence_reader: (
         Callable[[Path, str, dict[str, object]], str] | None
     ) = None,
@@ -757,6 +789,7 @@ def execute_early_close_cancel_command(
         code,
         intent=EARLY_CLOSE_CANCEL,
         recovery_inspector=recovery_inspector,
+        expected_command_id=expected_command_id,
         irreversible_evidence_reader=irreversible_evidence_reader,
     )
     if not availability.allowed:

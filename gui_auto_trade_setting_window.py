@@ -124,6 +124,7 @@ from gui_stock_name_tooltip import (
     install_persistent_stock_name_tooltips,
 )
 from gui_common_utils import safe_int_value, sanitize_path_part
+from gui_user_reason import user_reason_message, user_reason_messages
 from gui_stock_data import (
     STOCK_LIBRARY_EMPTY_SOURCE,
     append_base_stock,
@@ -407,6 +408,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self._last_market_snapshot_result: dict[str, object] = {}
         self._ranking_request_result: dict[str, object] = {}
         self._last_ranking_result: dict[str, object] = {}
+        self._last_assignment_result: object | None = None
+        self._last_assignment_base_registration_succeeded = False
 
         self._setup_ui()
         self.search_input.returnPressed.connect(
@@ -1047,6 +1050,14 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 )
                 if col == self.NAME_COLUMN:
                     item.setToolTip(self._stock_name_tooltip(value))
+                elif (
+                    col == self.REGISTRATION_STATUS_COLUMN
+                    and str(value or "").strip() == "검토관리"
+                ):
+                    item.setToolTip(
+                        "등록된 종목의 로컬 운영 데이터에 무결성 검토가 필요합니다. "
+                        "검토관리에서 상세 사유를 확인하세요."
+                    )
                 elif col == self.MARKET_COLUMN:
                     color = self.MARKET_TEXT_COLORS.get(str(value or ""))
                     if color:
@@ -1476,6 +1487,13 @@ class InstanceStockSearchRegisterDialog(QDialog):
         return None
 
     def _classification_text(self, code: str, name: str) -> str:
+        stock = self._registered_stock(code)
+        if stock is None:
+            # Review is a projection of an existing central Stock's local state.
+            # A library-only search row has no state.json yet, so treating that
+            # expected absence as damaged operation data is a false positive.
+            return "등록가능" if self._is_unassigned_target() else "등록대기"
+
         try:
             stock_dir = StockRepository(PROJECT_ROOT).resolve_stock_dir(code, name)
             state = read_json_dict(stock_dir / "state.json")
@@ -1486,10 +1504,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 return "검토관리"
         except Exception:
             pass
-
-        stock = self._registered_stock(code)
-        if stock is None:
-            return "등록가능" if self._is_unassigned_target() else "등록대기"
 
         assigned_instance_id = str(
             stock.get("assigned_routine_instance_id", "") or ""
@@ -1527,17 +1541,27 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     def on_result_table_context_menu(self, pos) -> None:
         menu = QMenu(self)
+        set_tooltips_visible = getattr(menu, "setToolTipsVisible", None)
+        if callable(set_tooltips_visible):
+            set_tooltips_visible(True)
         select_all_action = menu.addAction("전체선택")
         clear_selection_action = menu.addAction("선택해제")
         register_action = menu.addAction("선택등록")
         unregister_action = menu.addAction("등록해제")
         selected_rows = self.result_table.selectionModel().selectedRows()
         has_selection = bool(selected_rows)
-        unregister_action.setEnabled(
-            self._has_selected_routine_registered_stock()
-        )
+        unregister_enabled, unregister_reason = self._selected_unregister_action_state()
+        unregister_action.setEnabled(unregister_enabled)
         register_action.setEnabled(has_selection)
         clear_selection_action.setEnabled(has_selection)
+        if not has_selection:
+            selection_reason = user_reason_message("SELECT_STOCK_REQUIRED")
+            for action in (clear_selection_action, register_action, unregister_action):
+                action.setToolTip(selection_reason)
+                action.setStatusTip(selection_reason)
+        elif not unregister_enabled:
+            unregister_action.setToolTip(unregister_reason)
+            unregister_action.setStatusTip(unregister_reason)
         select_all_action.triggered.connect(lambda _checked=False: self.result_table.selectAll())
         clear_selection_action.triggered.connect(lambda _checked=False: self.result_table.clearSelection())
         register_action.triggered.connect(lambda _checked=False: self.register_selected_result_rows())
@@ -1616,11 +1640,14 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 return routine_name or assigned_instance_id
         return assigned_instance_id
 
-    def _has_selected_routine_registered_stock(self) -> bool:
+    def _selected_unregister_action_state(self) -> tuple[bool, str]:
         owner = persistent_feature_owner(self)
+        first_reason = ""
         for code, name in self._selected_result_stocks():
             routine_name = self._registered_routine_name_for_stock(code, name)
             if not routine_name:
+                if not first_reason:
+                    first_reason = user_reason_message("NO_CURRENT_ASSIGNMENT")
                 continue
             availability = inspect_stock_unregister_availability(
                 owner,
@@ -1629,8 +1656,17 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 name,
             )
             if availability.allowed:
-                return True
-        return False
+                return True, ""
+            if not first_reason:
+                first_reason = user_reason_message(
+                    getattr(availability, "reason_code", ""),
+                    fallback="현재 선택한 종목은 루틴에서 해제할 수 없습니다.",
+                )
+        return False, first_reason or "현재 선택한 종목은 루틴에서 해제할 수 없습니다."
+
+    def _has_selected_routine_registered_stock(self) -> bool:
+        enabled, _reason = self._selected_unregister_action_state()
+        return enabled
 
     def _find_result_row_by_stock_code(self, code: str) -> int:
         target_code = normalize_stock_code(code)
@@ -1690,8 +1726,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             return False
 
         allowed: list[tuple[str, str, str]] = []
-        skipped = 0
-        blocked: list[tuple[str, str, list[str]]] = []
+        failures: list[tuple[str, str, str]] = []
         seen_codes: set[str] = set()
         owner = persistent_feature_owner(self)
         for code, name in selected:
@@ -1706,23 +1741,30 @@ class InstanceStockSearchRegisterDialog(QDialog):
             )
             routine_name = self._registered_routine_name_for_stock(code, name)
             if not routine_name:
-                skipped += 1
+                failures.append(
+                    (code, name, user_reason_message("NO_CURRENT_ASSIGNMENT"))
+                )
                 continue
             if availability.allowed:
                 allowed.append((code, name, routine_name))
             else:
-                blocked.append((code, name, [availability.reason_code]))
+                failures.append(
+                    (
+                        code,
+                        name,
+                        user_reason_message(
+                            availability.reason_code,
+                            fallback="현재 상태에서는 루틴에서 해제할 수 없습니다.",
+                        ),
+                    )
+                )
 
         if not allowed:
-            if blocked:
-                self._toast(f"등록해제 차단 {len(blocked)}건")
-            else:
-                self._toast("등록해제할 종목이 없습니다.")
+            self._toast(self._unregister_result_message([], failures))
             return False
 
         succeeded: list[str] = []
         succeeded_names: list[str] = []
-        failed: list[str] = []
         for code, name, _routine_name in allowed:
             current = StockRepository(PROJECT_ROOT).find_by_code(code)
             expected_instance_id = str(
@@ -1741,21 +1783,45 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 succeeded.append(code)
                 succeeded_names.append(name)
             else:
-                failed.append(code)
+                failures.append(
+                    (
+                        code,
+                        name,
+                        user_reason_message(
+                            getattr(result, "reason_code", ""),
+                            fallback="등록해제 저장을 완료하지 못했습니다.",
+                        ),
+                    )
+                )
 
         if succeeded:
             self._refresh_parent_views(sync_monitoring_universe=True)
             for code in succeeded:
                 self._refresh_classification_for_stock(code)
 
-        parts: list[str] = []
-        if succeeded:
-            self._toast(f"등록해제 {len(succeeded)}건 | {', '.join(succeeded_names)}")
-            return True
-        if failed:
-            parts.append(f"처리불가 {len(failed)}건")
-        self._toast(" | ".join(parts) if parts else "등록해제할 종목이 없습니다.")
-        return False
+        self._toast(
+            self._unregister_result_message(
+                list(zip(succeeded, succeeded_names)),
+                failures,
+            )
+        )
+        return bool(succeeded)
+
+    @staticmethod
+    def _unregister_result_message(
+        succeeded: list[tuple[str, str]],
+        failures: list[tuple[str, str, str]],
+    ) -> str:
+        if succeeded and not failures:
+            return f"등록해제 {len(succeeded)}건 | {', '.join(name for _code, name in succeeded)}"
+        if not succeeded and not failures:
+            return "등록해제할 종목이 없습니다."
+        lines = [f"등록해제 성공 {len(succeeded)}건 / 실패 {len(failures)}건"]
+        for code, name, reason in failures[:5]:
+            lines.append(f"- {name or code}: {reason}")
+        if len(failures) > 5:
+            lines.append(f"- 그 외 {len(failures) - 5}건")
+        return "\n".join(lines)
 
     def _valid_library_stock(self, code: str, name: str) -> bool:
         library_stock = find_library_stock_by_code(code)
@@ -1787,9 +1853,12 @@ class InstanceStockSearchRegisterDialog(QDialog):
         *,
         needs_registration: bool,
     ) -> bool:
+        self._last_assignment_result = None
+        self._last_assignment_base_registration_succeeded = False
         instance_id, instance_name, definition_id, routine_type = target
         if needs_registration and not append_base_stock(code, name):
             return False
+        self._last_assignment_base_registration_succeeded = needs_registration
 
         from stock_assignment_registration_service import (
             register_unassigned_stock_to_instance,
@@ -1805,6 +1874,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             definition_id=definition_id,
             routine_type=routine_type,
         )
+        self._last_assignment_result = result
         if not result.success or not result.changed:
             return False
 
@@ -1823,6 +1893,31 @@ class InstanceStockSearchRegisterDialog(QDialog):
         )
         return True
 
+    def _assignment_failure_reason_text(self) -> str:
+        result = self._last_assignment_result
+        reason_code = str(getattr(result, "reason_code", "") or "").strip()
+        status = str(getattr(result, "status", "") or "").strip()
+        reason = reason_code or status
+        return user_reason_message(
+            reason,
+            fallback="종목 등록 저장을 완료하지 못했습니다.",
+        )
+
+    def _assignment_failure_message(self, *, base_registered: bool) -> str:
+        if base_registered:
+            title = "종목은 등록되었지만 현재 루틴에 추가하지 못했습니다."
+        else:
+            title = "선택한 종목을 현재 루틴에 추가하지 못했습니다."
+        return f"{title}\n사유: {self._assignment_failure_reason_text()}"
+
+    def _base_registration_completed_before_assignment_block(self) -> bool:
+        result = self._last_assignment_result
+        return bool(
+            self._last_assignment_base_registration_succeeded
+            and not bool(getattr(result, "changed", False))
+            and not bool(getattr(result, "reconciliation_required", False))
+        )
+
     def _register_stock_to_unassigned(
         self,
         code: str,
@@ -1837,6 +1932,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
     def _summary_toast_text(self, counts: dict[str, int]) -> str:
         labels = (
             ("new", "등록"),
+            ("deferred", "배정보류"),
             ("moved", "이동"),
             ("duplicate", "중복"),
             ("blocked", "차단"),
@@ -1868,6 +1964,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         move_targets: list[tuple[str, str]] = []
         counts = {
             "new": 0,
+            "deferred": 0,
             "duplicate": 0,
             "moved": 0,
             "move_cancelled": 0,
@@ -1917,7 +2014,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 "선택 종목 처리 결과",
                 "선택 종목 처리 결과\n\n"
                 f"등록 {len(new_targets)}건 | 이동 {len(move_targets)}건 | 중복 {counts['duplicate']}건 | 차단 {counts['blocked']}건\n\n"
-                f"다른 루틴에 등록된 {len(move_targets)}종목을 현재 루틴으로 이동하시겠습니까?",
+                f"다른 루틴에 등록된 {len(move_targets)}종목을 현재 등록 대상으로 변경하시겠습니까?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -1926,7 +2023,9 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 counts["move_cancelled"] = len(move_targets)
 
         changed = False
+        assignment_changed = False
         changed_codes: list[str] = []
+        assignment_failure_messages: list[str] = []
         for code, name, needs_registration in new_targets:
             if unassigned_target:
                 assigned = self._register_stock_to_unassigned(
@@ -1944,9 +2043,25 @@ class InstanceStockSearchRegisterDialog(QDialog):
             if assigned:
                 counts["new"] += 1
                 changed = True
+                assignment_changed = assignment_changed or not unassigned_target
                 changed_codes.append(code)
+            elif (
+                needs_registration
+                and self._base_registration_completed_before_assignment_block()
+            ):
+                counts["new"] += 1
+                counts["deferred"] += 1
+                changed = True
+                changed_codes.append(code)
+                assignment_failure_messages.append(
+                    self._assignment_failure_message(base_registered=True)
+                )
             else:
                 counts["failed"] += 1
+                if not unassigned_target:
+                    assignment_failure_messages.append(
+                        self._assignment_failure_message(base_registered=False)
+                    )
 
         if move_allowed:
             for code, name in move_targets:
@@ -1958,18 +2073,28 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 ):
                     counts["moved"] += 1
                     changed = True
+                    assignment_changed = True
                     changed_codes.append(code)
                 else:
                     counts["failed"] += 1
+                    assignment_failure_messages.append(
+                        self._assignment_failure_message(base_registered=False)
+                    )
 
         if changed:
             self._refresh_parent_views(
-                sync_monitoring_universe=not unassigned_target,
+                sync_monitoring_universe=assignment_changed,
             )
             for code in changed_codes:
                 self._refresh_classification_for_stock(code)
         if counts.get("move_cancelled") and not counts.get("new") and not changed:
             self._toast("등록 취소")
+        elif (
+            len(seen_codes) == 1
+            and len(assignment_failure_messages) == 1
+            and (counts.get("failed") == 1 or counts.get("deferred") == 1)
+        ):
+            self._toast(assignment_failure_messages[0])
         else:
             self._toast(self._summary_toast_text(counts))
         return changed
@@ -2016,7 +2141,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             return True
 
         if assigned_instance_id == instance_id:
-            self._toast("이미 같은 루틴에 지정된 종목입니다.")
+            self._toast("이미 등록된 종목입니다.")
             return False
 
         if assigned_instance_id and assigned_instance_id != instance_id:
@@ -2033,20 +2158,21 @@ class InstanceStockSearchRegisterDialog(QDialog):
             target,
             needs_registration=newly_registered,
         ):
-            if newly_registered:
-                self._toast("종목 등록에 실패했습니다.")
-            else:
-                self._toast("종목 지정에 실패했습니다.")
-            return False
+            base_registered = bool(
+                newly_registered
+                and self._base_registration_completed_before_assignment_block()
+            )
+            if base_registered:
+                self._refresh_parent_views()
+                self._refresh_classification_for_stock(code)
+            self._toast(
+                self._assignment_failure_message(base_registered=base_registered)
+            )
+            return base_registered
 
         self._refresh_parent_views(sync_monitoring_universe=True)
         self._refresh_classification_for_stock(code)
-        if newly_registered:
-            self._toast("종목 등록 및 지정이 완료됐습니다.")
-        elif assigned_instance_id:
-            self._toast("종목 지정이 변경됐습니다.")
-        else:
-            self._toast("종목 지정이 완료됐습니다.")
+        self._toast("종목 등록이 완료되었습니다.")
         return True
 
 
@@ -2169,7 +2295,7 @@ def auto_trade_register_historical_stock_to_original_instance(
             else ""
         )
         if assigned_instance_id == instance_id:
-            emit_toast("이미 같은 루틴에 지정된 종목입니다.")
+            emit_toast("이미 등록된 종목입니다.")
             return False
         if assigned_instance_id:
             emit_toast("중복 1건")
@@ -5651,7 +5777,7 @@ class AutoTradeSettingWindow(QDialog):
             self._last_time_policy_gui_minute_key = previous_minute_key
             self.statusBarMessage(
                 "시간정책 상태를 갱신하지 못했습니다. "
-                "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
+                "로그를 확인한 뒤 다시 로그인하십시오."
             )
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
@@ -9499,6 +9625,19 @@ class AutoTradeSettingWindow(QDialog):
             state = state_getter(stock_code) if callable(state_getter) else None
             return getattr(state, "last_price", None)
 
+        def production_recovery_gate_for_stock(stock_code: str, caller_name: str):
+            owner = persistent_feature_owner(self)
+            checker = getattr(owner, "production_recovery_gate_for_stock", None)
+            if not callable(checker):
+                raise RuntimeError("production recovery gate is unavailable")
+            return checker(stock_code, caller_name=caller_name)
+
+        owner_recovery_gate = getattr(
+            persistent_feature_owner(self),
+            "production_recovery_gate_for_stock",
+            None,
+        )
+
         context = AutoTradeOrderExecutionContext(
             kiwoom_connected=kiwoom_connected,
             account_numbers=account_numbers,
@@ -9535,6 +9674,11 @@ class AutoTradeSettingWindow(QDialog):
                 else None
             ),
             fresh_current_price=fresh_current_price,
+            production_recovery_gate_for_stock=(
+                production_recovery_gate_for_stock
+                if callable(owner_recovery_gate)
+                else None
+            ),
         )
         boundary = AutoTradeOrderExecutionBoundary(context)
         self._order_execution_boundary = boundary
@@ -9782,9 +9926,9 @@ class AutoTradeSettingWindow(QDialog):
         register_reasons: list[str] = []
         if len(target_instance_ids) > 1:
             register_target = None
-            register_reasons.append("대상 Instance가 여러 개입니다. 루틴 보기에서 선택하세요.")
+            register_reasons.append("대상 루틴이 여러 개입니다. 루틴 보기에서 선택하세요.")
         elif row_instance is None or register_target is None:
-            register_reasons.append("현재 존재하지 않는 과거 Instance입니다.")
+            register_reasons.append("현재 존재하지 않는 과거 루틴입니다.")
 
         unassign_decision = routine_unassign_decision(
             code,
@@ -9797,15 +9941,15 @@ class AutoTradeSettingWindow(QDialog):
         if relation_kind == CURRENT_STOCK_RELATION:
             convert_reasons.append("현재 등록종목은 등록전환 대상이 아닙니다.")
         elif len(target_instance_ids) > 1:
-            convert_reasons.append("대상 Instance가 여러 개입니다. 루틴 보기에서 선택하세요.")
+            convert_reasons.append("대상 루틴이 여러 개입니다. 루틴 보기에서 선택하세요.")
         elif row_instance is None:
-            convert_reasons.append("현재 존재하지 않는 과거 Instance입니다.")
+            convert_reasons.append("현재 존재하지 않는 과거 루틴입니다.")
         elif current_instance_id:
             current_instance = routine_instance_by_id(current_instance_id)
             current_name = str(
                 getattr(current_instance, "display_name", "") or current_instance_id
             ).strip()
-            convert_reasons.append(f"현재 '{current_name}' Instance에 등록되어 있습니다.")
+            convert_reasons.append(f"현재 '{current_name}' 루틴에 등록되어 있습니다.")
         elif self._routine_tree_stock_is_review_required(code, name):
             convert_reasons.append("검토관리 대상입니다.")
         else:
@@ -9826,7 +9970,7 @@ class AutoTradeSettingWindow(QDialog):
         if relation_kind == CURRENT_STOCK_RELATION:
             hide_reasons.append("표시삭제는 과거 종목 전용입니다.")
         elif canonical_historical:
-            hide_reasons.append("Canonical 과거실적 표시삭제 계약이 아직 연결되지 않았습니다.")
+            hide_reasons.append("저장된 과거실적은 현재 표시삭제할 수 없습니다.")
         elif not hide_enabled:
             hide_reasons.append("표시삭제 대상을 확인할 수 없습니다.")
 
@@ -9846,7 +9990,7 @@ class AutoTradeSettingWindow(QDialog):
                 else self._routine_tree_action_tooltip(
                     "등록해제 불가",
                     unassign_decision.user_reasons
-                    or ("현재 등록 Instance를 확인할 수 없습니다.",),
+                    or ("현재 등록된 루틴을 확인할 수 없습니다.",),
                 )
             )
         return {
@@ -10020,7 +10164,7 @@ class AutoTradeSettingWindow(QDialog):
         ).strip()
         instance_id = str(target.get("instance_id", "") or "").strip()
         if not code or not name or not instance_id:
-            show_toast(self, "등록해제 불가\n- 현재 등록 Instance를 확인할 수 없습니다.")
+            show_toast(self, "등록해제 불가\n- 현재 등록된 루틴을 확인할 수 없습니다.")
             return False
         relation_kind = self._routine_tree_stock_relation_kind(target)
         decision = routine_unassign_decision(
@@ -10059,7 +10203,18 @@ class AutoTradeSettingWindow(QDialog):
             intent=ASSIGNMENT_INTENT_UNASSIGN,
         )
         if not assignment_result.ok or not assignment_result.changed:
-            show_toast(self, "등록해제할 수 없는 종목입니다.\n검토관리에서 확인하세요.")
+            show_toast(
+                self,
+                self._routine_tree_action_tooltip(
+                    "등록해제 불가",
+                    (
+                        user_reason_message(
+                            getattr(assignment_result, "reason_code", ""),
+                            fallback="등록해제 저장을 완료하지 못했습니다.",
+                        ),
+                    ),
+                ),
+            )
             return False
 
         ensure_single_real_trade_routine_for_stock(code, name)
@@ -10587,6 +10742,23 @@ class AutoTradeSettingWindow(QDialog):
 
         order = read_result.get("order")
         order_dict = order if isinstance(order, dict) else {}
+        recovery_reasons = self.order_execution_boundary().production_recovery_block_reasons_for_order(
+            order_dict,
+            caller_name="MANUAL_EXECUTION_ENABLE",
+        )
+        if recovery_reasons:
+            result = {
+                "enabled": False,
+                "enable_stage": "production_recovery_gate",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": recovery_reasons,
+            }
+            self.show_execution_enable_result(result)
+            self.statusBarMessage("현재 로그인 상태 확인이 완료되지 않아 실주문 후보를 활성화할 수 없습니다.")
+            return
         enable_preview = preview_execution_enable(
             order_dict,
             {"operator_confirmed_for_execution_enable": True},
@@ -10873,6 +11045,24 @@ class AutoTradeSettingWindow(QDialog):
 
         order = read_result.get("order")
         order_dict = order if isinstance(order, dict) else {}
+        recovery_reasons = self.order_execution_boundary().production_recovery_block_reasons_for_order(
+            order_dict,
+            caller_name="MANUAL_REAL_READY",
+        )
+        if recovery_reasons:
+            result = {
+                "real_preflight_committed": False,
+                "preflight_stage": "production_recovery_gate",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": recovery_reasons,
+                "send_order_called": False,
+            }
+            self.show_real_preflight_result(result)
+            self.statusBarMessage("현재 로그인 상태 확인이 완료되지 않아 실주문 준비 상태를 점검할 수 없습니다.")
+            return
         guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=False)
         guard_reasons = self.real_preflight_guard_block_reasons(guard, include_operator=False)
         if guard_reasons:
@@ -11167,14 +11357,34 @@ class AutoTradeSettingWindow(QDialog):
             read_result = self.read_order_from_queue_by_id(order_id, ORDER_QUEUE_PATH)
             order = read_result.get("order") if isinstance(read_result, dict) else {}
             order_dict = order if isinstance(order, dict) else {"id": order_id}
+            recovery_reasons = self.order_execution_boundary().production_recovery_block_reasons_for_order(
+                order_dict,
+                caller_name="MANUAL_EXECUTION_PREVIEW",
+            )
+            if recovery_reasons:
+                user_reasons = user_reason_messages(
+                    recovery_reasons,
+                    fallback="현재 로그인 상태 확인이 완료되지 않아 주문 실행을 미리 확인할 수 없습니다.",
+                )
+                self.statusBarMessage("현재 로그인 상태 확인이 완료되지 않아 주문 실행을 미리 확인할 수 없습니다.")
+                QMessageBox.warning(
+                    self,
+                    "주문 실행 확인 불가",
+                    "\n".join(user_reasons),
+                )
+                return
             guard_preview = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=False)
             guard_reasons = self.real_preflight_guard_block_reasons(guard_preview, include_operator=False)
             if guard_reasons:
-                self.statusBarMessage("Execution Preview blocked: real trade guard is not ready")
+                user_reasons = user_reason_messages(
+                    guard_reasons,
+                    fallback="실주문 안전 조건을 확인할 수 없습니다.",
+                )
+                self.statusBarMessage("실주문 안전 조건이 준비되지 않아 주문 실행을 미리 확인할 수 없습니다.")
                 QMessageBox.warning(
                     self,
-                    "Execution Preview blocked",
-                    "\n".join(str(reason) for reason in guard_reasons),
+                    "주문 실행 확인 불가",
+                    "\n".join(user_reasons),
                 )
                 return
             if not self.confirm_execution_runtime_commit(
@@ -11184,7 +11394,7 @@ class AutoTradeSettingWindow(QDialog):
                 order_locks_path=ORDER_LOCKS_PATH,
                 queue_path=ORDER_QUEUE_PATH,
             ):
-                self.statusBarMessage("Execution Preview cancelled before runtime commit confirmation")
+                self.statusBarMessage("운영 상태 반영 확인 전에 주문 실행 확인을 취소했습니다.")
                 return
 
             guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=True)
@@ -11544,7 +11754,7 @@ class AutoTradeSettingWindow(QDialog):
                 "blocked_reasons": ["runtime commit result is required before runtime queue commit"],
             }
             self.show_manual_queue_commit_result(result)
-            self.statusBarMessage("Manual Queue commit blocked: runtime commit result is required")
+            self.statusBarMessage("운영 상태 반영 결과가 없어 주문을 저장할 수 없습니다.")
             return
 
         if not self.confirm_manual_queue_commit(queue_write_preview, queue_path, current_snapshot):
@@ -11574,6 +11784,25 @@ class AutoTradeSettingWindow(QDialog):
             }
             self.show_manual_queue_commit_result(result)
             self.statusBarMessage("Manual Queue commit blocked: readiness policy failed")
+            return
+
+        queued_record = queue_write_preview.get("order_queued_record_preview")
+        queued_record_dict = queued_record if isinstance(queued_record, dict) else {}
+        recovery_reasons = self.order_execution_boundary().production_recovery_block_reasons_for_order(
+            queued_record_dict,
+            caller_name="MANUAL_ORDER_QUEUE_COMMIT",
+        )
+        if recovery_reasons:
+            result = {
+                "manual_commit": False,
+                "commit_stage": "production_recovery_gate",
+                "next_stage": "BLOCKED",
+                "commit_result": None,
+                "changed": False,
+                "blocked_reasons": recovery_reasons,
+            }
+            self.show_manual_queue_commit_result(result)
+            self.statusBarMessage("현재 로그인 상태 확인이 완료되지 않아 주문을 저장할 수 없습니다.")
             return
 
         result = commit_execution_queue_manually(
@@ -12213,6 +12442,25 @@ class AutoTradeSettingWindow(QDialog):
             }
             self.show_manual_send_order_result(result)
             self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        recovery_reasons = self.order_execution_boundary().production_recovery_block_reasons_for_order(
+            order_dict,
+            caller_name="MANUAL_SEND_ORDER_PREVIEW",
+        )
+        if recovery_reasons:
+            result = {
+                "status": "BLOCKED",
+                "stage": "production_recovery_gate",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": recovery_reasons,
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("현재 로그인 상태 확인이 완료되지 않아 주문을 전송할 수 없습니다.")
             return
 
         environment = self.build_manual_send_order_environment(order_dict, queue_path)

@@ -177,11 +177,11 @@ def _unassign_user_reason(code: str, evidence: dict[str, Any]) -> str:
     if code == "STOCK_CODE_INVALID":
         return "종목코드가 올바르지 않습니다."
     if code == "STOCK_RECORD_MISSING":
-        return "중앙 종목정보를 찾지 못했습니다."
+        return "종목 등록 정보를 찾지 못했습니다."
     if code == "NO_CURRENT_ASSIGNMENT":
         return "현재 등록된 루틴이 없습니다."
     if code == "CURRENT_INSTANCE_MISMATCH":
-        return "화면의 Instance와 현재 등록 Instance가 일치하지 않습니다."
+        return "화면의 루틴과 현재 등록된 루틴이 일치하지 않습니다."
     if code == "ROUTINE_RELATION_MISMATCH":
         return "저장된 루틴 관계 정보가 서로 일치하지 않습니다."
     if code == "REVIEW_REQUIRED":
@@ -197,13 +197,13 @@ def _unassign_user_reason(code: str, evidence: dict[str, Any]) -> str:
     if code == "PENDING_INTEGRITY_UNKNOWN":
         return "미체결 데이터를 확인할 수 없습니다. 검토관리에서 확인이 필요합니다."
     if code == "UNKNOWN_STATUS":
-        return f"종목 상태를 해석할 수 없습니다: {evidence.get('raw_status', '')}"
+        return "종목 운영 상태를 해석할 수 없습니다."
     if code == "STOCK_RUNTIME_MISSING":
-        return "종목 Runtime 파일을 찾지 못했습니다."
+        return "종목 운영 상태 정보를 찾지 못했습니다."
     if code == "STOCK_RUNTIME_READ_ERROR":
-        return "종목 Runtime 파일을 읽지 못했습니다."
+        return "종목 운영 상태 정보를 읽지 못했습니다."
     if code == "STOCK_RUNTIME_RELATION_BROKEN":
-        return "종목 Runtime 관계가 손상되었습니다."
+        return "종목과 루틴의 저장 관계를 확인할 수 없습니다."
     return "등록해제할 수 없습니다."
 
 

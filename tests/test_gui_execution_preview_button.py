@@ -276,6 +276,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def _main_window_shell(self):
         window = create_qt_widget_shell(main_gui.MainWindow, QMainWindow)
+        window.production_recovery_gate_for_stock = lambda _code, *, caller_name: (
+            SimpleNamespace(
+                allowed=True,
+                reason_code="RECOVERY_STOCK_RESTORED",
+            )
+        )
         window._account_authentication_states = {}
         window._account_query_states = {}
         window.refresh_account_authentication_ui = lambda: None
@@ -652,6 +658,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "request_hash": "HASH_1",
                 "lock_id": "LOCK_1",
                 "execution_id": "EXEC_1",
+                "code": "003550",
+                "side": "BUY",
+                "order_action": "NEW",
             },
         }
 

@@ -1232,7 +1232,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         actions = context["actions"]
         self.assertFalse(actions["register"]["enabled"])
-        self.assertIn("대상 Instance가 여러 개", actions["register"]["tooltip"])
+        self.assertIn("대상 루틴이 여러 개", actions["register"]["tooltip"])
         self.assertFalse(actions["unassign"]["enabled"])
         self.assertEqual(
             "과거 종목은 현재 등록해제 대상이 아닙니다.",
@@ -1240,7 +1240,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         self.assertFalse(actions["convert"]["enabled"])
         self.assertFalse(actions["hide"]["enabled"])
-        self.assertIn("Canonical", actions["hide"]["tooltip"])
+        self.assertIn("저장된 과거실적", actions["hide"]["tooltip"])
 
     def test_deleted_historical_instance_disables_register_convert_and_unassign(self) -> None:
         window = self._window_harness()
@@ -1271,10 +1271,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         actions = context["actions"]
         self.assertFalse(actions["register"]["enabled"])
-        self.assertIn("현재 존재하지 않는 과거 Instance", actions["register"]["tooltip"])
+        self.assertIn("현재 존재하지 않는 과거 루틴", actions["register"]["tooltip"])
         self.assertFalse(actions["unassign"]["enabled"])
         self.assertFalse(actions["convert"]["enabled"])
-        self.assertIn("현재 존재하지 않는 과거 Instance", actions["convert"]["tooltip"])
+        self.assertIn("현재 존재하지 않는 과거 루틴", actions["convert"]["tooltip"])
         self.assertFalse(actions["hide"]["enabled"])
 
     def test_stock_context_menu_enables_tooltips_for_disabled_actions(self) -> None:
@@ -1887,7 +1887,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         register_row.assert_called_once_with(0)
 
-    def test_instance_stock_search_classification_fails_closed_for_missing_state(self) -> None:
+    def test_instance_stock_search_classification_only_reviews_registered_missing_state(self) -> None:
         metadata = {
             "row_kind": "instance",
             "definition_id": "indicator_follow",
@@ -1953,7 +1953,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 self.addCleanup(dialog.close)
 
                 self.assertEqual(
-                    "검토관리",
+                    "등록대기",
                     dialog._classification_text("111111", "검토종목"),
                 )
                 self.assertEqual(
@@ -1961,9 +1961,23 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     dialog._classification_text("222222", "이동종목"),
                 )
                 self.assertEqual(
-                    "검토관리",
+                    "등록대기",
                     dialog._classification_text("333333", "대기종목"),
                 )
+
+    def test_instance_stock_search_normal_unregistered_etf_is_not_review_managed(self) -> None:
+        dialog, _parent = self._instance_stock_search_dialog()
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(setting_window, "StockRepository") as repository,
+        ):
+            status = dialog._classification_text(
+                "0162Z0",
+                "RISE 삼성전자SK하이닉스채권혼합50",
+            )
+
+        self.assertEqual("등록대기", status)
+        repository.assert_not_called()
 
     def test_instance_stock_search_headers_sort_all_columns_without_losing_row_data(self) -> None:
         metadata = {
@@ -2405,7 +2419,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent.refresh_all.assert_called_once_with()
         self.assertEqual("등록대기", dialog.result_table.item(0, 3).text())
         self.assertEqual("A 인스턴스", dialog.result_table.item(1, 3).text())
-        toast.assert_called_with(dialog, "등록해제 1건 | 삼성전자")
+        toast.assert_called_with(
+            dialog,
+            "등록해제 성공 1건 / 실패 1건\n"
+            "- 현대차: 등록해제 저장을 완료하지 못했습니다.",
+        )
 
     def test_instance_stock_search_unregister_skips_review_required_stock(self) -> None:
         dialog, parent = self._instance_stock_search_dialog()
@@ -2435,7 +2453,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         inspect_unregister.assert_called_once()
         execute_unassign.assert_not_called()
         parent.refresh_all.assert_not_called()
-        toast.assert_called_once_with(dialog, "등록해제 차단 1건")
+        toast.assert_called_once_with(
+            dialog,
+            "등록해제 성공 0건 / 실패 1건\n"
+            "- 삼성전자: 검토가 필요한 종목입니다.",
+        )
 
     def test_instance_stock_search_context_register_without_selection_uses_toast(self) -> None:
         dialog, _parent = self._instance_stock_search_dialog()
@@ -2823,6 +2845,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
+            patch.object(setting_window, "sync_auto_trade_monitoring_universe") as sync_monitoring,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -2844,8 +2867,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             routine="지표추종매매",
         )
         ensure_routine.assert_called_once_with("005930", "삼성전자", "지표추종매매")
+        sync_monitoring.assert_called_once_with(dialog)
         parent.refresh_all.assert_called_once_with()
-        toast.assert_called_with(dialog, "종목 등록 및 지정이 완료됐습니다.")
+        toast.assert_called_with(
+            dialog,
+            "종목 등록이 완료되었습니다.",
+        )
 
     def test_instance_stock_search_double_click_assigns_unassigned_stock_only(self) -> None:
         dialog, _parent = self._instance_stock_search_dialog()
@@ -2870,6 +2897,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
+            patch.object(setting_window, "sync_auto_trade_monitoring_universe") as sync_monitoring,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -2885,7 +2913,77 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             operation_owner=_parent,
             routine_type="지표추종매매",
         )
-        toast.assert_called_with(dialog, "종목 지정이 완료됐습니다.")
+        sync_monitoring.assert_called_once_with(dialog)
+        toast.assert_called_with(dialog, "종목 등록이 완료되었습니다.")
+
+    def test_instance_stock_search_reports_recovery_reason_instead_of_designation_failure(self) -> None:
+        dialog, parent = self._instance_stock_search_dialog()
+        self._set_instance_stock_search_rows(dialog, [("000660", "SK하이닉스")])
+        registered = {
+            "code": "000660",
+            "name": "SK하이닉스",
+            "assigned_routine_instance_id": "",
+        }
+        with (
+            patch.object(
+                setting_window,
+                "find_library_stock_by_code",
+                return_value={"code": "000660", "name": "SK하이닉스"},
+            ),
+            patch.object(setting_window, "read_base_stocks", return_value=[registered]),
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(
+                    success=False,
+                    changed=False,
+                    status="REGISTRATION_FAILED",
+                    reason_code="RECOVERY_STOCK_PENDING",
+                ),
+            ),
+            patch.object(setting_window, "show_toast") as toast,
+        ):
+            self.assertFalse(dialog.register_or_assign_result_row(0))
+
+        parent.refresh_all.assert_not_called()
+        message = toast.call_args.args[1]
+        self.assertIn("선택한 종목을 현재 루틴에 추가하지 못했습니다", message)
+        self.assertIn("사유:", message)
+        self.assertIn("현재 로그인 상태 확인이 완료되지 않았습니다", message)
+        self.assertNotIn("RECOVERY_STOCK_PENDING", message)
+        self.assertNotIn("종목 지정에 실패", message)
+
+    def test_instance_stock_search_keeps_successful_base_registration_when_assignment_is_deferred(self) -> None:
+        dialog, parent = self._instance_stock_search_dialog()
+        self._set_instance_stock_search_rows(dialog, [("000660", "SK하이닉스")])
+        with (
+            patch.object(
+                setting_window,
+                "find_library_stock_by_code",
+                return_value={"code": "000660", "name": "SK하이닉스"},
+            ),
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(setting_window, "append_base_stock", return_value=True),
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(
+                    success=False,
+                    changed=False,
+                    status="REGISTRATION_FAILED",
+                    reason_code="RECOVERY_STOCK_PENDING",
+                ),
+            ),
+            patch.object(dialog, "_refresh_classification_for_stock") as refresh_status,
+            patch.object(setting_window, "show_toast") as toast,
+        ):
+            self.assertTrue(dialog.register_or_assign_result_row(0))
+
+        parent.refresh_all.assert_called_once_with()
+        refresh_status.assert_called_once_with("000660")
+        message = toast.call_args.args[1]
+        self.assertIn("종목은 등록되었지만 현재 루틴에 추가하지 못했습니다.", message)
+        self.assertIn("사유:", message)
+        self.assertIn("현재 로그인 상태 확인이 완료되지 않았습니다", message)
+        self.assertNotIn("RECOVERY_STOCK_PENDING", message)
 
     def test_instance_stock_search_double_click_skips_same_instance(self) -> None:
         dialog, parent = self._instance_stock_search_dialog()
@@ -2909,7 +3007,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         append_stock.assert_not_called()
         register_assignment.assert_not_called()
         parent.refresh_all.assert_not_called()
-        toast.assert_called_once_with(dialog, "이미 같은 루틴에 지정된 종목입니다.")
+        toast.assert_called_once_with(dialog, "이미 등록된 종목입니다.")
 
     def test_instance_stock_search_double_click_blocks_other_instance_without_confirmation(self) -> None:
         dialog, _parent = self._instance_stock_search_dialog()
@@ -7701,7 +7799,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         execute_unassign.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 1종목")
+        toast.assert_called_once_with(
+            window,
+            "루틴 해제 성공 0종목 / 실패 1종목\n- 005930 삼성전자: 검토관리",
+        )
 
     def test_stock_register_unassign_blocks_review_before_writer(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -7740,7 +7841,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         execute_unassign.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 1종목")
+        toast.assert_called_once_with(
+            window,
+            "루틴 해제 성공 0종목 / 실패 1종목\n- 005930 검토종목: 검토관리",
+        )
 
     def test_stock_register_delete_policy_blocks_review_with_common_helper(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -8226,7 +8330,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ensure_single.assert_any_call("222222", "가능2")
         changelog.assert_called_once()
         information.assert_not_called()
-        toast.assert_called_once_with(window, "루틴해제 2종목 | 해제불가 3종목")
+        toast.assert_called_once_with(
+            window,
+            "루틴 해제 성공 2종목 / 실패 3종목\n"
+            "- 333333 불가1: 차단\n"
+            "- 444444 불가2: 차단\n"
+            "- 555555 불가3: 차단",
+        )
 
     def test_stock_register_unassign_all_blocked_toasts_without_backend(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -8257,7 +8367,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         execute_unassign.assert_not_called()
         information.assert_not_called()
-        toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 2종목")
+        toast.assert_called_once_with(
+            window,
+            "루틴 해제 성공 0종목 / 실패 2종목\n"
+            "- 333333 불가1: 차단\n"
+            "- 444444 불가2: 차단",
+        )
 
     def test_stock_register_unassign_all_allowed_toasts_zero_blocked(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -8289,7 +8404,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertEqual(2, execute_unassign.call_count)
         information.assert_not_called()
-        toast.assert_called_once_with(window, "루틴해제 2종목 | 해제불가 0종목")
+        toast.assert_called_once_with(window, "루틴 해제 성공 2종목 / 실패 0종목")
 
     def test_plain_header_body_background_is_stock_table_opt_in_only(self) -> None:
         normal_table = QTableWidget(0, 1)
@@ -13777,7 +13892,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     allowed=False,
                     event_required=False,
                     review_required=False,
-                    user_reasons=("화면의 Instance와 현재 등록 Instance가 일치하지 않습니다.",),
+                    user_reasons=("화면의 루틴과 현재 등록된 루틴이 일치하지 않습니다.",),
                 ),
             ),
             patch.object(window, "_record_routine_unassign_blocked") as blocked_event,
@@ -13792,7 +13907,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         review.assert_called_once()
         toast.assert_called_once_with(
             window,
-            "등록해제 불가\n- 화면의 Instance와 현재 등록 Instance가 일치하지 않습니다.",
+            "등록해제 불가\n- 화면의 루틴과 현재 등록된 루틴이 일치하지 않습니다.",
         )
 
     def test_routine_tree_unregister_backend_failure_keeps_tree(self) -> None:
@@ -13826,7 +13941,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(
                 setting_window,
                 "execute_assignment_unassign",
-                return_value=SimpleNamespace(ok=False, changed=False),
+                return_value=SimpleNamespace(
+                    ok=False,
+                    changed=False,
+                    reason_code="HAS_HOLDING",
+                ),
             ) as execute_unassign,
             patch.object(setting_window, "show_toast") as toast,
         ):
@@ -13836,7 +13955,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         execute_unassign.assert_called_once()
         toast.assert_called_once_with(
             window,
-            "등록해제할 수 없는 종목입니다.\n검토관리에서 확인하세요.",
+            "등록해제 불가\n- 보유 수량이 있어 해제할 수 없습니다.",
         )
 
     def test_historical_stock_register_convert_uses_original_instance_backend(self) -> None:
@@ -13948,7 +14067,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         register_assignment.assert_not_called()
         parent.refresh_all.assert_not_called()
-        toast.assert_called_with(parent, "이미 같은 루틴에 지정된 종목입니다.")
+        toast.assert_called_with(parent, "이미 등록된 종목입니다.")
 
     def test_historical_stock_register_convert_respects_review_required_policy(self) -> None:
         parent = QWidget()

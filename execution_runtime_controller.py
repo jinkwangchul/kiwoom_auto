@@ -99,6 +99,9 @@ def run_execution_runtime_dry_run(
     guard: Any,
     storage: Any,
     confirmations: Any = None,
+    *,
+    approved_candidate: Any = None,
+    approved_queue_write_preview: Any = None,
 ) -> dict[str, Any]:
     """Build a runtime commit plan preview without committing anything."""
     if not isinstance(order, dict):
@@ -117,11 +120,27 @@ def run_execution_runtime_dry_run(
         return _pipeline_blocked_result(pipeline_result)
 
     pipeline = _as_dict(pipeline_result.get("pipeline"))
+    candidate = _as_dict(approved_candidate)
+    if approved_candidate is not None and (
+        candidate.get("candidate") is not True
+        or candidate.get("candidate_stage") != "candidate_created"
+    ):
+        return _base_result(
+            status="INVALID",
+            execution_preview=pipeline_result,
+            issues=["APPROVED_EXECUTION_CANDIDATE_REQUIRED"],
+        )
+    execution_request_preview = pipeline.get("execution_request_preview")
+    if candidate:
+        execution_request_preview = candidate.get("execution_request_preview")
+    queue_write_preview = _as_dict(approved_queue_write_preview)
+    if not queue_write_preview:
+        queue_write_preview = _queue_write_preview(order_snapshot, pipeline_result)
     catalog_orchestrator = run_execution_runtime_catalog_orchestrator_preview(
-        execution_request_preview=pipeline.get("execution_request_preview"),
+        execution_request_preview=execution_request_preview,
         lock_preview=pipeline.get("lock_preview"),
         request_hash_preview=pipeline.get("request_hash_preview"),
-        queue_write_preview_result=_queue_write_preview(order_snapshot, pipeline_result),
+        queue_write_preview_result=queue_write_preview,
         order_candidate=order_snapshot,
     )
     catalog_status = catalog_orchestrator.get("status")

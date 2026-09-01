@@ -20,6 +20,7 @@ from uuid import uuid4
 from execution_runtime_commit_plan_orchestrator import ORCHESTRATOR_TYPE
 from execution_runtime_commit_plan_validator import validate_execution_runtime_commit_plan_preview
 from execution_runtime_reader import read_order_executions, read_order_locks
+from execution_provenance_contract import same_payload
 
 
 SERVICE_TYPE = "EXECUTION_RUNTIME_COMMIT_SERVICE"
@@ -55,7 +56,9 @@ def _result(
     request_hash: str | None = None,
     lock_id: str | None = None,
     execution_record: dict[str, Any] | None = None,
+    process_record: dict[str, Any] | None = None,
     lock_record: dict[str, Any] | None = None,
+    idempotent: bool = False,
     order_executions_path: str | None = None,
     order_locks_path: str | None = None,
     backup_paths: dict[str, Any] | None = None,
@@ -76,7 +79,9 @@ def _result(
         "request_hash": request_hash,
         "lock_id": lock_id,
         "execution_record": deepcopy(execution_record) if isinstance(execution_record, dict) else {},
+        "process_record": deepcopy(process_record) if isinstance(process_record, dict) else {},
         "lock_record": deepcopy(lock_record) if isinstance(lock_record, dict) else {},
+        "idempotent": idempotent,
         "order_executions_path": order_executions_path,
         "order_locks_path": order_locks_path,
         "backup_paths": deepcopy(backup_paths or {}),
@@ -265,7 +270,11 @@ def _restore_backups(backup_paths: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 def _read_back_contains(path: Path, *, field: str, record: dict[str, Any], keys: tuple[str, ...]) -> bool:
-    read_result = read_order_executions(path) if field == "executions" else read_order_locks(path)
+    read_result = (
+        read_order_executions(path)
+        if field in {"executions", "processes"}
+        else read_order_locks(path)
+    )
     if read_result.get("ok") is not True:
         return False
     items = _as_dict(read_result.get("data")).get(field)
@@ -336,16 +345,50 @@ def commit_execution_runtime_plan(
     commit_plan = _as_dict(orchestrator.get("commit_plan"))
     planned_records = _as_dict(commit_plan.get("planned_records"))
     execution_record = deepcopy(_as_dict(planned_records.get("execution")))
+    process_record = deepcopy(_as_dict(planned_records.get("process")))
     lock_record = deepcopy(_as_dict(planned_records.get("lock")))
+    append_requirements = _as_dict(commit_plan.get("append_requirements"))
+    append_process = append_requirements.get("process") is True
+    append_execution = append_requirements.get("execution") is not False
+    append_lock = append_requirements.get("lock") is not False
     executions_data = deepcopy(_as_dict(executions_read.get("data")))
     locks_data = deepcopy(_as_dict(locks_read.get("data")))
+    processes = list(executions_data.get("processes") or [])
+
+    process_id = _text(
+        process_record.get("execution_process_id")
+        or execution_record.get("execution_process_id")
+    )
+    process_matches = [
+        item for item in processes
+        if isinstance(item, dict)
+        and _text(item.get("execution_process_id")) == process_id
+    ]
+    if process_id:
+        if append_process and process_matches:
+            return _result(
+                status=STATUS_BLOCKED,
+                order_executions_path=str(order_executions_target),
+                order_locks_path=str(order_locks_target),
+                issues=["EXECUTION_PROCESS_ID_CONFLICT"],
+            )
+        if not append_process and (
+            len(process_matches) != 1
+            or (process_record and not same_payload(process_matches[0], process_record))
+        ):
+            return _result(
+                status=STATUS_BLOCKED,
+                order_executions_path=str(order_executions_target),
+                order_locks_path=str(order_locks_target),
+                issues=["EXECUTION_PROCESS_OWNER_MISSING_OR_CONFLICTING"],
+            )
 
     execution_duplicate = _duplicate_issue(
         executions_data.get("executions"),
         fields=("execution_id", "request_hash", "order_id"),
         record=execution_record,
     )
-    if execution_duplicate:
+    if append_execution and execution_duplicate:
         return _result(
             status=STATUS_BLOCKED,
             order_executions_path=str(order_executions_target),
@@ -353,12 +396,26 @@ def commit_execution_runtime_plan(
             issues=[execution_duplicate],
         )
 
+    if not append_execution:
+        execution_matches = [
+            item for item in _as_list(executions_data.get("executions"))
+            if isinstance(item, dict)
+            and _text(item.get("execution_id")) == _text(execution_record.get("execution_id"))
+        ]
+        if len(execution_matches) != 1 or not same_payload(execution_matches[0], execution_record):
+            return _result(
+                status=STATUS_BLOCKED,
+                order_executions_path=str(order_executions_target),
+                order_locks_path=str(order_locks_target),
+                issues=["IDEMPOTENT_EXECUTION_PAYLOAD_CONFLICT"],
+            )
+
     lock_duplicate = _duplicate_issue(
         locks_data.get("locks"),
         fields=("lock_id", "request_hash", "order_id"),
         record=lock_record,
     )
-    if lock_duplicate:
+    if append_lock and lock_duplicate:
         return _result(
             status=STATUS_BLOCKED,
             order_executions_path=str(order_executions_target),
@@ -366,18 +423,39 @@ def commit_execution_runtime_plan(
             issues=[lock_duplicate],
         )
 
+    if not append_lock:
+        lock_matches = [
+            item for item in _as_list(locks_data.get("locks"))
+            if isinstance(item, dict)
+            and _text(item.get("lock_id")) == _text(lock_record.get("lock_id"))
+        ]
+        if len(lock_matches) != 1 or not same_payload(lock_matches[0], lock_record):
+            return _result(
+                status=STATUS_BLOCKED,
+                order_executions_path=str(order_executions_target),
+                order_locks_path=str(order_locks_target),
+                issues=["IDEMPOTENT_LOCK_PAYLOAD_CONFLICT"],
+            )
+
     backup_paths: dict[str, Any] = {}
+    any_write = append_process or append_execution or append_lock
     try:
-        if backup:
+        if backup and any_write:
             backup_paths = {
                 "order_executions": _make_backup(order_executions_target),
                 "order_locks": _make_backup(order_locks_target),
             }
 
-        executions_data["executions"] = list(executions_data.get("executions") or []) + [execution_record]
-        locks_data["locks"] = list(locks_data.get("locks") or []) + [lock_record]
-        _write_json_atomic(order_executions_target, executions_data)
-        _write_json_atomic(order_locks_target, locks_data)
+        if append_process:
+            executions_data["processes"] = processes + [process_record]
+        if append_execution:
+            executions_data["executions"] = list(executions_data.get("executions") or []) + [execution_record]
+        if append_lock:
+            locks_data["locks"] = list(locks_data.get("locks") or []) + [lock_record]
+        if append_process or append_execution:
+            _write_json_atomic(order_executions_target, executions_data)
+        if append_lock:
+            _write_json_atomic(order_locks_target, locks_data)
     except Exception as exc:
         rollback_attempted = bool(backup_paths)
         rollback_succeeded = False
@@ -411,6 +489,15 @@ def commit_execution_runtime_plan(
             record=lock_record,
             keys=("lock_id", "order_id", "request_hash"),
         )
+        and (
+            not process_id
+            or _read_back_contains(
+                order_executions_target,
+                field="processes",
+                record=process_record or process_matches[0],
+                keys=("execution_process_id", "option_snapshot_hash"),
+            )
+        )
     )
     if not read_back_verified:
         return _result(
@@ -422,6 +509,7 @@ def commit_execution_runtime_plan(
             request_hash=_text(execution_record.get("request_hash")),
             lock_id=_text(lock_record.get("lock_id")),
             execution_record=execution_record,
+            process_record=process_record,
             lock_record=lock_record,
             order_executions_path=str(order_executions_target),
             order_locks_path=str(order_locks_target),
@@ -431,14 +519,16 @@ def commit_execution_runtime_plan(
 
     return _result(
         status=STATUS_COMMITTED,
-        runtime_write=True,
+        runtime_write=any_write,
         committed=True,
         execution_id=_text(execution_record.get("execution_id")),
         order_id=_text(execution_record.get("order_id")),
         request_hash=_text(execution_record.get("request_hash")),
         lock_id=_text(lock_record.get("lock_id")),
         execution_record=execution_record,
+        process_record=process_record,
         lock_record=lock_record,
+        idempotent=not any_write,
         order_executions_path=str(order_executions_target),
         order_locks_path=str(order_locks_target),
         backup_paths=backup_paths,

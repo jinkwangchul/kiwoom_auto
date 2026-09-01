@@ -2964,7 +2964,9 @@ class KiwoomApi(QObject):
             "observed_fid_list": observed_fids,
             "fid_raw_values": fid_raw_values,
             "fid_values": fid_values,
-            "received_at": datetime.now().isoformat(sep=" ", timespec="milliseconds"),
+            "received_at": datetime.now().astimezone().isoformat(
+                sep=" ", timespec="milliseconds"
+            ),
         }
         if raw_event["gubun"] == "0":
             try:

@@ -253,13 +253,15 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         )
 
     def _dialog_host(self):
-        fresh_state = SimpleNamespace(
+        configuration_state = SimpleNamespace(
             connection_epoch=1,
             login_session_id="SESSION-1",
             last_price=70_000,
+            field_sources=(("last_price", "SNAPSHOT"),),
         )
         operation_host = SimpleNamespace(
-            fresh_monitoring_market_information_state=lambda _code: fresh_state,
+            configuration_market_information_state=lambda _code: configuration_state,
+            fresh_monitoring_market_information_state=lambda _code: None,
         )
         role_values = {
             gui_windows.ROUTINE_STOCK_CODE_ROLE: "005930",
@@ -287,7 +289,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         host._adjusted_buy_limit_for_start_budget = MagicMock(return_value=20_000)
         return host
 
-    def test_missing_fresh_price_blocks_dialog_entry_with_common_toast(self) -> None:
+    def test_missing_configuration_price_still_opens_direct_value_editor(self) -> None:
         unavailable_host = SimpleNamespace(
             fresh_monitoring_market_information_state=lambda _code: None,
         )
@@ -308,11 +310,12 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
                         self.stock_dir / "config.json",
                     )
 
-                dialog.assert_not_called()
-                toast.assert_called_once_with(
-                    host,
-                    "현재주가 수신 후 변경할 수 있습니다.",
+                dialog.assert_called_once()
+                self.assertIsNone(dialog.call_args.kwargs["current_price"])
+                self.assertFalse(
+                    dialog.call_args.kwargs["configuration_price_available"]
                 )
+                toast.assert_not_called()
 
     def test_dialog_cancel_has_no_runtime_commit(self) -> None:
         class CancelDialog:

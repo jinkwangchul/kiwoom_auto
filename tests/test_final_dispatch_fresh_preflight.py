@@ -63,6 +63,10 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
         )
         self.send_order = RecordingSendOrder()
         self.orderable_cash = 1_000_000
+        self.recovery_gate_decision = SimpleNamespace(
+            allowed=True,
+            reason_code="RECOVERY_STOCK_RESTORED",
+        )
         self.boundary = AutoTradeOrderExecutionBoundary(
             AutoTradeOrderExecutionContext(
                 kiwoom_connected=lambda: True,
@@ -82,6 +86,9 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
                 current_orderable_cash=lambda: self.orderable_cash,
                 broker_holdings_path=lambda: self.broker_holdings_path,
                 all_group_stock_dirs=lambda: [self.stock_dir],
+                production_recovery_gate_for_stock=lambda _code, _caller_name: (
+                    self.recovery_gate_decision
+                ),
             )
         )
 
@@ -235,6 +242,44 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
         self.assertEqual("send_call_result_recorded", result["executor_stage"])
         self.assertEqual(1, len(self.send_order.calls))
         self.assertTrue(result["fresh_dispatch_preflight_result"]["fresh_dispatch_preflight"])
+
+    def test_recovery_pending_blocks_new_send_order_before_broker_call(self) -> None:
+        record = self._record(side="SELL", quantity=1)
+        self._write_queue(record)
+        self._write_broker_holding(holding=1, available=1)
+        before = self.queue_path.read_bytes()
+        self.recovery_gate_decision = SimpleNamespace(
+            allowed=False,
+            reason_code="RECOVERY_STOCK_PENDING",
+        )
+
+        result = self.boundary.send_order_for_order_queued_automatically(record["id"])
+
+        self.assertEqual("auto_trade_runtime_state", result["stage"])
+        self.assertEqual(["RECOVERY_STOCK_PENDING"], result["blocked_reasons"])
+        self.assertEqual([], self.send_order.calls)
+        self.assertEqual(before, self.queue_path.read_bytes())
+
+    def test_recovery_pending_blocks_before_execution_enable_mutation(self) -> None:
+        record = self._record(side="BUY", quantity=1)
+        record["status"] = "EXECUTABLE"
+        self._write_queue(record)
+        before = self.queue_path.read_bytes()
+        self.recovery_gate_decision = SimpleNamespace(
+            allowed=False,
+            reason_code="RECOVERY_STOCK_PENDING",
+        )
+
+        with mock.patch(
+            "auto_trade_order_execution_boundary.commit_execution_enable"
+        ) as commit_enable:
+            result = self.boundary.process_executable_order_for_auto_trade(record["id"])
+
+        self.assertEqual("auto_trade_runtime_state", result["stage"])
+        self.assertEqual(["RECOVERY_STOCK_PENDING"], result["blocked_reasons"])
+        commit_enable.assert_not_called()
+        self.assertEqual([], self.send_order.calls)
+        self.assertEqual(before, self.queue_path.read_bytes())
 
 
 if __name__ == "__main__":

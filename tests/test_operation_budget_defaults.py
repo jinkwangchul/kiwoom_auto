@@ -371,7 +371,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
         authentication_states["12345678"] = "READY"
         self.assertEqual(main_loader.SERVER_AUTH_COMPLETE, main_loader.main_budget_display_auth_state(window))
-        self.assertEqual(("대기", "한도(대기)"), display_values())
+        self.assertEqual(("350,000원", "한도(900,000)"), display_values())
 
         fresh.value = SimpleNamespace(
             connection_epoch=7,
@@ -620,9 +620,11 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 connection_epoch=7,
                 login_session_id="SESSION-7",
                 last_price=12_345,
+                field_sources=(("last_price", "SNAPSHOT"),),
             )
             operation_host = SimpleNamespace(
-                fresh_monitoring_market_information_state=lambda _code: fresh_state,
+                configuration_market_information_state=lambda _code: fresh_state,
+                fresh_monitoring_market_information_state=lambda _code: None,
             )
             window = SimpleNamespace(
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
@@ -657,9 +659,11 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 connection_epoch=7,
                 login_session_id="SESSION-7",
                 last_price=7_270,
+                field_sources=(("last_price", "SNAPSHOT"),),
             )
             operation_host = SimpleNamespace(
-                fresh_monitoring_market_information_state=lambda _code: market_state,
+                configuration_market_information_state=lambda _code: market_state,
+                fresh_monitoring_market_information_state=lambda _code: None,
             )
             window = SimpleNamespace(
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
@@ -704,7 +708,9 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 "limit_minimum_multiplier": 25,
             }
 
+            configuration_reader = MagicMock(return_value=None)
             operation_host = SimpleNamespace(
+                configuration_market_information_state=configuration_reader,
                 fresh_monitoring_market_information_state=lambda _code: None,
             )
             window = SimpleNamespace(
@@ -731,8 +737,9 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 policy={"starting_budget_defaults": defaults},
             )
 
-            self.assertIsNone(recommended)
-            self.assertIsNone(minimum)
+            self.assertEqual(35_000_000, recommended)
+            self.assertEqual(8_800_000, minimum)
+            configuration_reader.assert_not_called()
             self.assertEqual(("금액", "350,000원"), (display["badge"], display["value_text"]))
             self.assertEqual(config, json.loads(config_path.read_text(encoding="utf-8")))
 
@@ -828,7 +835,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
         self.assertEqual(30_000, changed_value)
         self.assertEqual(24_000, changed_environment)
         self.assertEqual(26_000, reauthenticated)
-        self.assertEqual(6, calculator.call_count)
+        self.assertEqual(5, calculator.call_count)
         self.assertEqual(1, len(window._main_stock_resolved_starting_budget_cache))
 
     def test_first_fresh_price_refresh_preserves_waiting_limit_config(self) -> None:

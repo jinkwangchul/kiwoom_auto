@@ -40,6 +40,39 @@ def _write_stock(
 
 
 class ExecutionUniverseTest(unittest.TestCase):
+    def test_assigned_recovery_pending_stock_has_no_execution_authority_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = _write_stock(
+                root,
+                "000660_SKHynix",
+                state={
+                    "status": "STOPPED",
+                    "trade_started": False,
+                    "trade_enabled": False,
+                    "real_trade_enabled": True,
+                },
+                config={"assigned_routine_instance_id": "indicator-follow-a"},
+            )
+            window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner()
+            )
+            # The account Recovery may be complete while this post-login Stock is
+            # absent from the per-stock Registry. Operation Start owns that
+            # per-stock gate and therefore never registers this Stock as a
+            # current-session participant.
+            window.startup_recovery_session_ready = lambda refresh=False: True
+
+            snapshot = project_execution_universe(window, stock_dirs=[stock_dir])
+
+        entry = snapshot.entries[0]
+        self.assertFalse(entry.participant)
+        self.assertFalse(entry.persisted_trade_started)
+        self.assertFalse(entry.execution_member)
+        self.assertFalse(entry.execution_ready)
+        self.assertIn(NOT_CURRENT_SESSION_PARTICIPANT, entry.blockers)
+        self.assertEqual((), snapshot.execution_stock_codes)
+
     def test_trade_enabled_without_current_session_participant_is_not_member(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

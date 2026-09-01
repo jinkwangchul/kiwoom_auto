@@ -18,7 +18,12 @@ from gui_common_utils import safe_int_value
 from gui_order_utils import pending_order_side_quantities
 from gui_routine_registry import scan_group_records
 from gui_window_policy import persistent_feature_owner
-from production_recovery_state_registry import recovery_stock_is_review_required
+from production_recovery_state_registry import (
+    RECOVERY_CONTEXT_MISSING,
+    RECOVERY_NOT_STARTED,
+    RECOVERY_STOCK_PENDING,
+    recovery_stock_is_review_required,
+)
 from routine_instance_repository import RoutineInstanceRepository
 from runtime_io import read_json_dict
 from stock_repository import StockRepository, normalize_stock_code
@@ -38,6 +43,13 @@ _UNASSIGN_INTENTS = frozenset(
         ASSIGNMENT_INTENT_UNASSIGN,
         ASSIGNMENT_INTENT_REVIEW_RESOLUTION_UNASSIGN,
         ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+    }
+)
+_FIRST_ASSIGNMENT_RECOVERY_DEFERRED_REASONS = frozenset(
+    {
+        RECOVERY_CONTEXT_MISSING,
+        RECOVERY_NOT_STARTED,
+        RECOVERY_STOCK_PENDING,
     }
 )
 
@@ -302,12 +314,26 @@ def inspect_assignment_authorization(
             target_instance_id=target_id,
         )
 
-    if not review_resolution:
+    # Recovery gates execution-enabling Assignment changes.  Removing an
+    # Assignment is configuration-only and remains governed by the participant,
+    # Review/Emergency, identity, holding, pending-order, and integrity guards.
+    if clean_intent in _ASSIGN_INTENTS:
         recovery_blocked, recovery_reason, recovery_evidence = _recovery_block(
             owner,
             stock_code,
         )
-        if recovery_blocked:
+        state_status = str(state.get("status") or "").strip().upper()
+        # A first, stopped Assignment is configuration-only.  Missing/not-yet-
+        # admitted Recovery authority is deferred to Operation Start; explicit
+        # Recovery failure/review/integrity decisions remain blocking here.
+        deferred_first_assignment = bool(
+            recovery_blocked
+            and recovery_reason in _FIRST_ASSIGNMENT_RECOVERY_DEFERRED_REASONS
+            and clean_intent == ASSIGNMENT_INTENT_ASSIGN
+            and not current_id
+            and state_status == "STOPPED"
+        )
+        if recovery_blocked and not deferred_first_assignment:
             return _blocked(
                 reason_code=recovery_reason or "RECOVERY_BLOCKED",
                 stock_code=stock_code,

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import Mock
 from uuid import UUID
 
 from assignment_authorization_service import (
@@ -19,7 +20,11 @@ from assignment_authorization_service import (
     inspect_stock_unregister_availability,
 )
 from stock_repository import StockRepository
-from tests.participant_owner_fixture import attach_participant_owner, participant_owner
+from tests.participant_owner_fixture import (
+    attach_participant_owner,
+    participant_codes,
+    participant_owner,
+)
 
 
 CODE = "005930"
@@ -203,7 +208,7 @@ class AssignmentAuthorizationTest(unittest.TestCase):
         self.assertTrue(result.ok, result)
         self.assertTrue(result.changed)
 
-    def test_review_and_recovery_blocks_are_read_only(self) -> None:
+    def test_review_and_assign_recovery_blocks_are_read_only(self) -> None:
         self._set_state(status="REVIEW_REQUIRED", review_required=True)
         before_review = self._fingerprint()
         review = inspect_assignment_authorization(
@@ -247,9 +252,414 @@ class AssignmentAuthorizationTest(unittest.TestCase):
             NAME,
             expected_instance_id=INSTANCE_A,
         )
-        self.assertFalse(unregister.allowed)
-        self.assertEqual("RECOVERY_BLOCKED", unregister.reason_code)
+        self.assertTrue(unregister.allowed)
+        self.assertEqual("ALLOWED", unregister.reason_code)
         self.assertEqual(before_unregister, self._fingerprint())
+
+    def test_pending_recovery_allows_only_stopped_initial_assignment_without_broker_io(self) -> None:
+        holdings_request = Mock()
+        open_orders_request = Mock()
+        comm_rq_data = Mock()
+        send_order = Mock()
+        recovery_gate = Mock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                reason_code="RECOVERY_STOCK_PENDING",
+                evidence=("caller=ASSIGNMENT_AUTHORIZATION",),
+            )
+        )
+        recovery_owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=recovery_gate,
+            request_account_holdings_snapshot=holdings_request,
+            request_open_orders_snapshot=open_orders_request,
+            CommRqData=comm_rq_data,
+            SendOrder=send_order,
+        )
+
+        result = self._assign(INSTANCE_A, "", owner=recovery_owner)
+
+        self.assertTrue(result.ok, result)
+        self.assertTrue(result.changed)
+        self.assertEqual("ALLOWED", result.authorization.reason_code)
+        recovery_gate.assert_called_once_with(
+            CODE,
+            caller_name="ASSIGNMENT_AUTHORIZATION",
+        )
+        holdings_request.assert_not_called()
+        open_orders_request.assert_not_called()
+        comm_rq_data.assert_not_called()
+        send_order.assert_not_called()
+
+    def test_prelogin_recovery_absence_allows_stopped_initial_assignment_without_broker_io(self) -> None:
+        for reason_code in ("RECOVERY_CONTEXT_MISSING", "RECOVERY_NOT_STARTED"):
+            with self.subTest(reason_code=reason_code):
+                recovery_gate = Mock(
+                    return_value=SimpleNamespace(
+                        allowed=False,
+                        reason_code=reason_code,
+                        evidence=("login_session_id=", "account_no="),
+                    )
+                )
+                broker_calls = {
+                    name: Mock()
+                    for name in (
+                        "CommConnect",
+                        "request_account_holdings_snapshot",
+                        "request_open_orders_snapshot",
+                        "request_minute_candles",
+                        "SetRealReg",
+                        "SendOrder",
+                    )
+                }
+                owner = SimpleNamespace(
+                    _main_monitoring_auto_trade_operation_host=participant_owner(),
+                    production_recovery_gate_for_stock=recovery_gate,
+                    **broker_calls,
+                )
+
+                result = self._assign(INSTANCE_A, "", owner=owner)
+
+                self.assertTrue(result.ok, result)
+                self.assertTrue(result.changed)
+                self.assertEqual("ALLOWED", result.authorization.reason_code)
+                self.assertEqual((), participant_codes(owner))
+                self.assertFalse((self.root / "runtime" / "order_queue.json").exists())
+                recovery_gate.assert_called_once_with(
+                    CODE,
+                    caller_name="ASSIGNMENT_AUTHORIZATION",
+                )
+                for broker_call in broker_calls.values():
+                    broker_call.assert_not_called()
+
+                removed = execute_assignment_unassign(
+                    owner,
+                    self.root,
+                    CODE,
+                    NAME,
+                    expected_instance_id=INSTANCE_A,
+                    intent=ASSIGNMENT_INTENT_UNASSIGN,
+                )
+                self.assertTrue(removed.ok, removed)
+
+    def test_prelogin_first_assignment_preserves_local_safety_guards(self) -> None:
+        owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=lambda *_args, **_kwargs: SimpleNamespace(
+                allowed=False,
+                reason_code="RECOVERY_CONTEXT_MISSING",
+                evidence=(),
+            ),
+        )
+
+        self._set_state(status="REVIEW_REQUIRED", review_required=True)
+        review = self._assign(INSTANCE_A, "", owner=owner)
+        self.assertEqual("REVIEW_REQUIRED", review.reason_code)
+
+        self._set_state(
+            status="EMERGENCY_STOPPED",
+            review_required=False,
+            review_status="",
+        )
+        emergency = self._assign(INSTANCE_A, "", owner=owner)
+        self.assertEqual("EMERGENCY_STOP", emergency.reason_code)
+
+        self._set_state(
+            status="STOPPED",
+            holding_qty=1,
+            avg_price=1_000,
+            holding_amount=1_000,
+            review_required=False,
+            review_status="",
+            review_reason="",
+            review_location="",
+            review_detail="",
+        )
+        holding = self._assign(INSTANCE_A, "", owner=owner)
+        self.assertEqual("HAS_HOLDING", holding.reason_code)
+
+        self._set_state(holding_qty=0, avg_price=0, holding_amount=0)
+        self._write_json(
+            self.stock_dir / "orders.json",
+            {"orders": [{"side": "SELL", "status": "PENDING", "unfilled_qty": 1}]},
+        )
+        pending = self._assign(INSTANCE_A, "", owner=owner)
+        self.assertEqual("HAS_PENDING_ORDER", pending.reason_code)
+
+        self._write_json(self.stock_dir / "orders.json", {"orders": []})
+        missing_target = self._assign(str(UUID(int=1)), "", owner=owner)
+        self.assertEqual("TARGET_INSTANCE_MISSING", missing_target.reason_code)
+
+    def test_recovery_failure_and_review_decisions_still_block_first_assignment(self) -> None:
+        reasons = (
+            "RECOVERY_ACCOUNT_FAILED",
+            "RECOVERY_ACCOUNT_REVIEW_REQUIRED",
+            "RECOVERY_STOCK_FAILED",
+            "RECOVERY_STOCK_REVIEW_REQUIRED",
+        )
+        for reason_code in reasons:
+            with self.subTest(reason_code=reason_code):
+                owner = SimpleNamespace(
+                    _main_monitoring_auto_trade_operation_host=participant_owner(),
+                    production_recovery_gate_for_stock=lambda *_args, value=reason_code, **_kwargs: SimpleNamespace(
+                        allowed=False,
+                        reason_code=value,
+                        evidence=("explicit_recovery_decision",),
+                    ),
+                )
+                result = self._assign(INSTANCE_A, "", owner=owner)
+                self.assertFalse(result.ok)
+                self.assertEqual(reason_code, result.reason_code)
+                self.assertTrue(result.authorization.recovery_blocked)
+
+    def test_restored_recovery_keeps_normal_initial_assignment_contract(self) -> None:
+        recovery_gate = Mock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                reason_code="RECOVERY_COMPLETED",
+                evidence=(),
+            )
+        )
+        owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=recovery_gate,
+        )
+
+        result = self._assign(INSTANCE_A, "", owner=owner)
+
+        self.assertTrue(result.ok, result)
+        self.assertTrue(result.changed)
+        recovery_gate.assert_called_once_with(
+            CODE,
+            caller_name="ASSIGNMENT_AUTHORIZATION",
+        )
+
+    def test_pending_recovery_still_blocks_non_stopped_or_non_initial_assignment(self) -> None:
+        recovery_owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=lambda *_args, **_kwargs: SimpleNamespace(
+                allowed=False,
+                reason_code="RECOVERY_STOCK_PENDING",
+                evidence=(),
+            ),
+        )
+
+        self._set_state(status="MONITORING")
+        non_stopped = self._assign(INSTANCE_A, "", owner=recovery_owner)
+        self.assertFalse(non_stopped.ok)
+        self.assertEqual("RECOVERY_STOCK_PENDING", non_stopped.reason_code)
+
+        self._set_state(status="STOPPED")
+        self.assertTrue(self._assign(INSTANCE_A, "").ok)
+        reassignment = self._assign(
+            INSTANCE_B,
+            INSTANCE_A,
+            owner=recovery_owner,
+            intent=ASSIGNMENT_INTENT_REASSIGN,
+        )
+        self.assertFalse(reassignment.ok)
+        self.assertEqual("RECOVERY_STOCK_PENDING", reassignment.reason_code)
+
+    def test_failed_recovery_remains_an_assignment_blocker(self) -> None:
+        recovery_owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=lambda *_args, **_kwargs: SimpleNamespace(
+                allowed=False,
+                reason_code="RECOVERY_STOCK_FAILED",
+                evidence=("BROKER_ONLY_ORDER",),
+            ),
+        )
+
+        result = self._assign(INSTANCE_A, "", owner=recovery_owner)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("RECOVERY_STOCK_FAILED", result.reason_code)
+        self.assertTrue(result.authorization.recovery_blocked)
+
+    def test_pending_recovery_does_not_block_unassign_or_unregister(self) -> None:
+        recovery_gate = Mock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                reason_code="RECOVERY_STOCK_PENDING",
+                evidence=("fixture",),
+            )
+        )
+        broker_calls = {
+            name: Mock()
+            for name in (
+                "request_account_holdings_snapshot",
+                "request_open_orders_snapshot",
+                "CommRqData",
+                "SendOrder",
+            )
+        }
+        recovery_owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=recovery_gate,
+            **broker_calls,
+        )
+        self.assertTrue(self._assign(INSTANCE_A, "").ok)
+
+        unassigned = execute_assignment_unassign(
+            recovery_owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_A,
+            intent=ASSIGNMENT_INTENT_UNASSIGN,
+        )
+        self.assertTrue(unassigned.ok, unassigned)
+        self.assertTrue(unassigned.changed)
+
+        self.assertTrue(self._assign(INSTANCE_A, "").ok)
+        unregistered = execute_assignment_unassign(
+            recovery_owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_A,
+            intent=ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+        )
+        self.assertTrue(unregistered.ok, unregistered)
+        self.assertTrue(unregistered.changed)
+        recovery_gate.assert_not_called()
+        for broker_call in broker_calls.values():
+            broker_call.assert_not_called()
+
+    def test_missing_recovery_context_does_not_block_unassign_or_unregister(self) -> None:
+        context_missing_owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            startup_recovery_session_ready=lambda refresh=False: False,
+        )
+        self.assertTrue(self._assign(INSTANCE_A, "").ok)
+
+        unassigned = execute_assignment_unassign(
+            context_missing_owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_A,
+            intent=ASSIGNMENT_INTENT_UNASSIGN,
+        )
+        self.assertTrue(unassigned.ok, unassigned)
+
+        self.assertTrue(self._assign(INSTANCE_A, "").ok)
+        unregistered = execute_assignment_unassign(
+            context_missing_owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_A,
+            intent=ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+        )
+        self.assertTrue(unregistered.ok, unregistered)
+
+    def test_000660_pending_recovery_assignment_removal_lifecycle_has_no_broker_io(self) -> None:
+        code = "000660"
+        name = "SK하이닉스"
+        stock_dir = self.repository.ensure_stock_folder(code, name)
+        recovery_gate = Mock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                reason_code="RECOVERY_STOCK_PENDING",
+                evidence=("fixture=000660",),
+            )
+        )
+        broker_calls = {
+            name: Mock()
+            for name in (
+                "request_account_holdings_snapshot",
+                "request_open_orders_snapshot",
+                "CommRqData",
+                "SendOrder",
+            )
+        }
+        owner = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+            production_recovery_gate_for_stock=recovery_gate,
+            **broker_calls,
+        )
+
+        def assign() -> object:
+            return execute_assignment_change(
+                owner,
+                self.root,
+                code,
+                name,
+                instance_id=INSTANCE_A,
+                instance_name="지표추종매매A",
+                definition_id="sample",
+                routine_type="Sample",
+                expected_instance_id="",
+                intent=ASSIGNMENT_INTENT_ASSIGN,
+            )
+
+        assigned_for_unassign = assign()
+        unassigned = execute_assignment_unassign(
+            owner,
+            self.root,
+            code,
+            name,
+            expected_instance_id=INSTANCE_A,
+            intent=ASSIGNMENT_INTENT_UNASSIGN,
+        )
+        assigned_for_unregister = assign()
+        unregistered = execute_assignment_unassign(
+            owner,
+            self.root,
+            code,
+            name,
+            expected_instance_id=INSTANCE_A,
+            intent=ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+        )
+
+        self.assertTrue(assigned_for_unassign.ok, assigned_for_unassign)
+        self.assertTrue(unassigned.ok, unassigned)
+        self.assertTrue(assigned_for_unregister.ok, assigned_for_unregister)
+        self.assertTrue(unregistered.ok, unregistered)
+        saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual("", saved["assigned_routine_instance_id"])
+        self.assertFalse((self.root / "runtime" / "order_queue.json").exists())
+        self.assertEqual(2, recovery_gate.call_count)
+        for broker_call in broker_calls.values():
+            broker_call.assert_not_called()
+
+    def test_removal_still_blocks_review_emergency_and_assignment_mismatch(self) -> None:
+        self.assertTrue(self._assign(INSTANCE_A, "").ok)
+        self._set_state(status="REVIEW_REQUIRED", review_required=True)
+        review = inspect_assignment_authorization(
+            self.owner,
+            self.root,
+            CODE,
+            NAME,
+            intent=ASSIGNMENT_INTENT_UNASSIGN,
+            expected_instance_id=INSTANCE_A,
+        )
+        self.assertEqual("REVIEW_REQUIRED", review.reason_code)
+
+        self._set_state(
+            status="EMERGENCY_STOPPED",
+            review_required=False,
+            review_status="",
+        )
+        emergency = inspect_stock_unregister_availability(
+            self.owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_A,
+        )
+        self.assertEqual("EMERGENCY_STOP", emergency.reason_code)
+
+        self._set_state(status="STOPPED")
+        mismatch = inspect_stock_unregister_availability(
+            self.owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_B,
+        )
+        self.assertEqual("ASSIGNMENT_CHANGED", mismatch.reason_code)
 
     def test_pending_integrity_inspection_does_not_mark_review(self) -> None:
         self.assertTrue(self._assign(INSTANCE_A, "").ok)
@@ -361,6 +771,19 @@ class AssignmentAuthorizationTest(unittest.TestCase):
             expected_instance_id=INSTANCE_A,
         )
         self.assertEqual("HAS_PENDING_ORDER", pending.reason_code)
+
+        self._write_json(
+            self.stock_dir / "orders.json",
+            {"orders": [{"side": "SELL", "status": "PENDING", "unfilled_qty": 1}]},
+        )
+        sell_pending = inspect_stock_unregister_availability(
+            self.owner,
+            self.root,
+            CODE,
+            NAME,
+            expected_instance_id=INSTANCE_A,
+        )
+        self.assertEqual("HAS_PENDING_ORDER", sell_pending.reason_code)
 
     def test_missing_target_or_group_fails_before_journal(self) -> None:
         before = self._fingerprint()

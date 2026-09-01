@@ -1624,22 +1624,25 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         warning.assert_not_called()
         toast.assert_called_once_with(
             window,
-            "종목해제 1종목 | 해제불가 2종목",
+            "루틴 해제 성공 1종목 / 실패 2종목\n"
+            "- 보유종목: 현재 상태에서는 루틴에서 해제할 수 없습니다.\n"
+            "- 미체결종목: 현재 상태에서는 루틴에서 해제할 수 없습니다.",
         )
 
     def test_unregister_result_toast_text_contract(self) -> None:
         import gui_auto_trade_unregister as unregister
 
         self.assertEqual(
-            "종목해제 10종목 | 해제불가 0종목",
+            "루틴 해제 성공 10종목 / 실패 0종목",
             unregister.unregister_result_toast_text(10, 0, []),
         )
         self.assertEqual(
-            "종목해제 8종목 | 해제불가 2종목",
+            "루틴 해제 성공 8종목 / 실패 2종목\n- LG화학\n- SK하이닉스",
             unregister.unregister_result_toast_text(8, 2, ["LG화학", "SK하이닉스"]),
         )
         self.assertEqual(
-            "종목해제 0종목 | 해제불가 5종목",
+            "루틴 해제 성공 0종목 / 실패 5종목\n"
+            "- LG화학\n- SK하이닉스\n- 카카오게임즈\n- 셀트리온\n- KB금융",
             unregister.unregister_result_toast_text(
                 0,
                 5,
@@ -1647,15 +1650,16 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            "종목해제 0종목 | 해제불가 0종목",
+            "루틴 해제 성공 0종목 / 실패 0종목",
             unregister.unregister_result_toast_text(0, 0, []),
         )
         self.assertEqual(
-            "종목해제 8종목 | 해제불가 1종목",
+            "루틴 해제 성공 8종목 / 실패 1종목\n- LG화학",
             unregister.unregister_result_toast_text(8, 1, ["LG화학"]),
         )
         self.assertEqual(
-            "종목해제 8종목 | 해제불가 4종목",
+            "루틴 해제 성공 8종목 / 실패 4종목\n"
+            "- LG화학\n- SK하이닉스\n- 카카오게임즈\n- 셀트리온",
             unregister.unregister_result_toast_text(
                 8,
                 4,
@@ -1663,7 +1667,9 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            "종목해제 12종목 | 해제불가 6종목",
+            "루틴 해제 성공 12종목 / 실패 6종목\n"
+            "- LG화학\n- SK하이닉스\n- 카카오게임즈\n- 셀트리온\n- KB금융\n"
+            "- 그 외 1종목",
             unregister.unregister_result_toast_text(
                 12,
                 6,
@@ -1716,7 +1722,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         warning.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
-        toast.assert_called_once_with(window, "종목해제 1종목 | 해제불가 0종목")
+        toast.assert_called_once_with(window, "루틴 해제 성공 1종목 / 실패 0종목")
 
     def test_unregister_mixed_selection_sends_only_allowed_items_to_backend(self) -> None:
         import gui_auto_trade_unregister as unregister
@@ -1788,7 +1794,13 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         warning.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
-        toast.assert_called_once_with(window, "종목해제 1종목 | 해제불가 3종목")
+        toast.assert_called_once_with(
+            window,
+            "루틴 해제 성공 1종목 / 실패 3종목\n"
+            "- Running: 현재 상태에서는 루틴에서 해제할 수 없습니다.\n"
+            "- Emergency: 현재 상태에서는 루틴에서 해제할 수 없습니다.\n"
+            "- Review: 현재 상태에서는 루틴에서 해제할 수 없습니다.",
+        )
 
     def test_unregister_empty_selection_still_warns_in_all_scope(self) -> None:
         import gui_auto_trade_unregister as unregister
@@ -2111,7 +2123,15 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
         stock_dir.mkdir(parents=True)
         code, display_name = name.split("_", 1)
         (stock_dir / "state.json").write_text(
-            json.dumps({"status": "RUNNING", "holding_qty": 5, "trade_enabled": True}),
+            json.dumps(
+                {
+                    "status": "RUNNING",
+                    "holding_qty": 5,
+                    "trade_enabled": True,
+                    "operation_command_mode": MODE_EARLY_CLOSE,
+                    "operation_command_id": "early-command",
+                }
+            ),
             encoding="utf-8",
         )
         (stock_dir / "config.json").write_text("{}", encoding="utf-8")
@@ -2585,6 +2605,8 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         if cancelable:
             state.update(
                 {
+                    "operation_command_mode": MODE_EARLY_CLOSE,
+                    "operation_command_id": "early-command",
                     "early_close_requested_at": "2026-08-31 09:00:00",
                     "early_close_method": "시장가",
                     "early_close_source": "우클릭",

@@ -207,14 +207,17 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             host._write_stock_initial_buy_config = MagicMock()
             host.load_routine_table = MagicMock()
             host.routine_table = SimpleNamespace(item=lambda _row, _column: None)
+            host.main_monitoring_auto_trade_operation_host = lambda: SimpleNamespace(
+                configuration_market_information_state=lambda _code: SimpleNamespace(
+                    connection_epoch=7,
+                    login_session_id="SESSION-7",
+                    last_price=70_000,
+                    field_sources=(("last_price", "SNAPSHOT"),),
+                )
+            )
 
-            with patch.object(
-                gui_windows.MainWindow,
-                "_starting_budget_change_current_price",
-                return_value=70_000,
-            ):
-                gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
-                gui_windows.MainWindow.open_routine_stock_initial_buy_dialog(host, 0)
+            gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
+            gui_windows.MainWindow.open_routine_stock_initial_buy_dialog(host, 0)
 
             host._write_stock_initial_buy_config.assert_not_called()
             host._show_start_budget_mutation_blocked.assert_called_once_with(host)
@@ -500,10 +503,10 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         dialog._validate_and_accept()
 
         self.assertEqual({}, dialog.result)
-        self.assertTrue(dialog.validation_label.isHidden())
-        self.assertEqual("", dialog.validation_label.text())
+        self.assertFalse(dialog.validation_label.isHidden())
+        self.assertEqual("시작예산 금액을 확인하세요.", dialog.validation_label.text())
 
-    def test_quantity_budget_requires_fresh_current_price(self) -> None:
+    def test_quantity_budget_can_be_saved_without_configuration_price(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
             self.app.activeWindow(),
             stock_code="012210",
@@ -516,17 +519,18 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
 
         dialog._validate_and_accept()
 
-        self.assertEqual({}, dialog.result)
+        self.assertEqual(2, dialog.result["value"])
+        self.assertEqual("QUANTITY", dialog.result["mode"])
         self.assertTrue(dialog.validation_label.isHidden())
         self.assertEqual("", dialog.validation_label.text())
 
-    def test_quantity_budget_rejects_stale_display_price(self) -> None:
+    def test_quantity_budget_ignores_stale_display_price_and_saves(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
             self.app.activeWindow(),
             stock_code="012210",
             stock_name="삼미금속",
             current_price=8_870,
-            fresh_price_available=False,
+            configuration_price_available=False,
             config={"trade_amount_type": "QUANTITY", "buy_qty": 1},
         )
         self.addCleanup(dialog.deleteLater)
@@ -534,8 +538,8 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
 
         dialog._validate_and_accept()
 
-        self.assertEqual({}, dialog.result)
-        self.assertEqual("현재가 8,870원", dialog.current_price_label.text())
+        self.assertEqual(2, dialog.result["value"])
+        self.assertEqual("현재가 -", dialog.current_price_label.text())
         self.assertTrue(dialog.validation_label.isHidden())
         self.assertEqual("", dialog.validation_label.text())
 
@@ -641,28 +645,25 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
 
             table_item = MagicMock()
             host.routine_table = SimpleNamespace(item=lambda _row, _column: table_item)
-            with (
-                patch.object(
-                    gui_windows.MainWindow,
-                    "_starting_budget_change_current_price",
-                    return_value=70_000,
-                ),
-                patch.object(gui_windows, "refresh_auto_trade_views") as refresh_views,
-            ):
+            host.main_monitoring_auto_trade_operation_host = lambda: SimpleNamespace(
+                configuration_market_information_state=lambda _code: SimpleNamespace(
+                    connection_epoch=7,
+                    login_session_id="SESSION-7",
+                    last_price=70_000,
+                    field_sources=(("last_price", "SNAPSHOT"),),
+                )
+            )
+            with patch.object(gui_windows, "refresh_auto_trade_views") as refresh_views:
                 gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
                 gui_windows.MainWindow.open_routine_stock_initial_buy_dialog(host, 0)
 
             host._open_running_budget_adjustment_dialog.assert_called_once_with(0, path)
             host._stock_start_budget_locked.assert_called_once_with(path)
-            host._stock_default_initial_buy_value.assert_called_once_with(
-                path,
-                "AMOUNT",
-                window=host,
-            )
+            host._stock_default_initial_buy_value.assert_not_called()
             host._write_stock_initial_buy_config.assert_called_once_with(
                 path,
                 mode="AMOUNT",
-                value=100_000,
+                value=105_000,
                 expected_fields={"trade_amount_type": "QUANTITY"},
             )
             refresh_views.assert_called_once_with(host)

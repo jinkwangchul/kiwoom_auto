@@ -1409,6 +1409,7 @@ from gui_main_table_loader import (
     main_refresh_pnl_only,
     build_main_refresh_read_context,
     main_group_instance_relation_id,
+    main_stock_configuration_market_information_state,
     main_stock_fresh_market_information_state,
     main_stock_resolved_starting_budget,
     routine_instance_suggested_buy_limits,
@@ -1529,7 +1530,9 @@ from gui_toast import show_toast
 from gui_event_record_window import open_event_record_prototype
 from gui_stock_instance_chart_window import (
     CHART_OPEN_STOCK_CODE_COLOR,
+    clear_pending_stock_instance_chart_refreshes,
     open_stock_instance_chart,
+    queue_open_stock_instance_chart_refresh,
     stock_instance_chart_is_open,
 )
 from gui_window_policy import close_persistent_feature_windows
@@ -3415,16 +3418,19 @@ class RunningBudgetAdjustmentDialog(QDialog):
         minimum_amount: object = None,
         pending_adjustment: dict[str, object] | None = None,
         timing_selection_enabled: bool = True,
-        fresh_price_available: bool | None = None,
+        configuration_price_available: bool | None = None,
     ) -> None:
         super().__init__(owner)
         self.stock_code = str(stock_code or "").strip()
         self.stock_name = str(stock_name or "").strip()
-        self.current_price = safe_float_value(current_price, 0.0)
-        self.fresh_price_available = (
-            self.current_price > 0
-            if fresh_price_available is None
-            else bool(fresh_price_available)
+        resolved_current_price = safe_float_value(current_price, 0.0)
+        self.configuration_price_available = (
+            resolved_current_price > 0
+            if configuration_price_available is None
+            else bool(configuration_price_available)
+        )
+        self.current_price = (
+            resolved_current_price if self.configuration_price_available else 0.0
         )
         self.config = config if isinstance(config, dict) else {}
         resolved_minimum_amount = safe_int_value(minimum_amount, 0)
@@ -3722,8 +3728,6 @@ class RunningBudgetAdjustmentDialog(QDialog):
 
     def _validate_and_accept(self) -> None:
         value = self._input_value()
-        if not self.fresh_price_available:
-            return
         if value <= 0:
             self._show_validation_message("변경값을 입력하세요.")
             return
@@ -6303,13 +6307,13 @@ class MainWindow(QMainWindow):
                 status = "STALE"
                 reasons.append("STALE_RECOVERY_SESSION")
         labels = {
-            "NOT_STARTED": "복구 대기",
-            "COLLECTING": "Broker 상태 수집",
-            "RECONCILING": "Runtime 대조",
+            "NOT_STARTED": "로그인 상태 확인 대기",
+            "COLLECTING": "계좌 상태 확인",
+            "RECONCILING": "저장 상태 대조",
             "REVIEW_REQUIRED": "검토 필요",
-            "COMPLETED": "복구 완료",
-            "FAILED": "복구 실패",
-            "STALE": "복구 세션 만료",
+            "COMPLETED": "운영 상태 확인 완료",
+            "FAILED": "운영 상태 확인 실패",
+            "STALE": "로그인 상태 확인 만료",
         }
         self.auto_status_label.setText(
             f"전체 자동매매 상태: {labels.get(status, status)}"
@@ -6927,43 +6931,44 @@ class MainWindow(QMainWindow):
             evidence = tuple(getattr(decision, "evidence", ()) or ())
             if any(str(item).startswith("registry_error=") for item in evidence):
                 return (
-                    "Recovery 데이터를 읽을 수 없습니다. "
-                    "복구를 다시 실행한 후 운영을 시작하십시오."
+                    "운영 상태 확인 정보를 읽을 수 없습니다. "
+                    "다시 로그인한 후 운영을 시작하십시오."
                 )
             return (
-                "운영 시작에 필요한 Recovery 정보를 확인할 수 없습니다. "
-                "로그인과 계좌 선택 상태를 확인한 후 Recovery를 다시 실행하십시오."
+                "운영 시작에 필요한 현재 로그인 상태를 확인할 수 없습니다. "
+                "로그인과 계좌 선택 상태를 다시 확인하십시오."
             )
 
         messages = {
             RECOVERY_NOT_STARTED: (
-                "운영 시작 전에 Recovery가 완료되지 않았습니다. "
-                "로그인과 계좌 선택 후 Recovery를 완료하십시오."
+                "운영 시작 전에 현재 로그인 상태 확인이 완료되지 않았습니다. "
+                "로그인과 계좌 선택 상태를 확인하십시오."
             ),
             RECOVERY_IN_PROGRESS: (
-                "Recovery가 진행 중입니다. 복구가 완료된 후 다시 시도하십시오."
+                "기존 운영 상태를 확인하고 있습니다. 확인이 끝난 후 다시 시도하십시오."
             ),
             RECOVERY_ACCOUNT_REVIEW_REQUIRED: (
                 "복구가 필요한 종목이 남아 있습니다. "
                 "검토관리에서 해당 종목을 처리하십시오."
             ),
             RECOVERY_IDENTITY_MISMATCH: (
-                "현재 로그인 또는 계좌와 Recovery 정보가 일치하지 않습니다. "
-                "Recovery를 다시 실행하십시오."
+                "현재 로그인 또는 계좌 정보가 확인된 운영 상태와 일치하지 않습니다. "
+                "다시 로그인하십시오."
             ),
             RECOVERY_STALE_SESSION: (
-                "이전 Recovery 정보는 현재 세션에서 사용할 수 없습니다. "
-                "Recovery를 다시 실행하십시오."
+                "이전 로그인에서 확인한 운영 상태는 현재 사용할 수 없습니다. "
+                "다시 로그인하십시오."
             ),
             RECOVERY_STOCK_PENDING: (
-                "선택한 종목의 Recovery가 아직 완료되지 않았습니다."
+                "선택한 종목의 현재 로그인 상태 확인이 완료되지 않아 "
+                "운영을 시작할 수 없습니다. 다시 로그인한 후 운영하십시오."
             ),
             RECOVERY_STOCK_REVIEW_REQUIRED: (
                 "선택한 종목은 복구 검토 대상입니다. "
                 "검토관리에서 해당 종목을 처리하십시오."
             ),
             RECOVERY_STOCK_FAILED: (
-                "선택한 종목의 Recovery에 실패했습니다. "
+                "선택한 종목의 운영 상태를 확인하지 못했습니다. "
                 "검토관리에서 상태를 확인하십시오."
             ),
         }
@@ -6973,8 +6978,8 @@ class MainWindow(QMainWindow):
             ).strip()
             if failure_reason == "DAMAGED_RUNTIME":
                 return (
-                    "Runtime 데이터를 읽을 수 없어 Recovery에 실패했습니다. "
-                    "검토관리에서 Runtime 상태를 확인하십시오."
+                    "저장된 운영 상태를 읽을 수 없습니다. "
+                    "검토관리에서 상태를 확인하십시오."
                 )
             if failure_reason in {
                 "INCOMPLETE_BROKER_SNAPSHOT",
@@ -6985,26 +6990,26 @@ class MainWindow(QMainWindow):
             }:
                 return (
                     "계좌의 보유 또는 미체결 정보를 확인하지 못했습니다. "
-                    "키움 연결 상태를 확인한 후 Recovery를 다시 실행하십시오."
+                    "키움 연결 상태를 확인한 후 다시 로그인하십시오."
                 )
             if failure_reason == "RECOVERY_TIMER_START_FAILED":
                 return (
                     "운영 주기 실행을 시작하지 못했습니다. "
-                    "로그를 확인한 후 Recovery를 다시 실행하십시오."
+                    "로그를 확인한 후 다시 로그인하십시오."
                 )
             if failure_reason == "RECOVERY_NO_RESTORED_STOCK":
                 return (
-                    "Recovery가 완료된 운영 대상 종목이 없습니다. "
+                    "운영 상태 확인이 완료된 대상 종목이 없습니다. "
                     "검토관리에서 종목 상태를 확인하십시오."
                 )
             return (
-                "계좌 Recovery에 실패했습니다. "
-                "로그인과 계좌 상태를 확인한 후 Recovery를 다시 실행하십시오."
+                "계좌의 운영 상태를 확인하지 못했습니다. "
+                "로그인과 계좌 상태를 확인한 후 다시 로그인하십시오."
             )
         return messages.get(
             reason_code,
-            "운영 시작에 필요한 복구 상태를 확인할 수 없습니다. "
-            "로그인, 계좌 선택 및 Recovery 상태를 확인하십시오.",
+            "운영 시작에 필요한 현재 로그인 상태를 확인할 수 없습니다. "
+            "로그인과 계좌 선택 상태를 확인하십시오.",
         )
 
     def filter_start_targets_by_production_recovery(
@@ -7098,8 +7103,8 @@ class MainWindow(QMainWindow):
             labels = {
                 "RESUME_READY": "재개 가능",
                 "REVIEW_REQUIRED": "검토 필요",
-                "BLOCKED_RECOVERY": "복구 차단",
-                "INVALID_RUNTIME": "Runtime 손상",
+                "BLOCKED_RECOVERY": "운영 재개 차단",
+                "INVALID_RUNTIME": "저장 상태 손상",
             }
             self.auto_status_label.setText(
                 f"전체 자동매매 상태: {labels.get(status, status)}"
@@ -7194,16 +7199,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "운영 재개 차단",
-                detail + "\n\nRuntime evidence를 먼저 검토·복구해야 합니다.",
+                detail + "\n\n저장된 운영 상태를 먼저 검토하고 정상화해야 합니다.",
             )
             if result.get("operator_reconciliation", {}).get("summary", {}).get("total", 0):
                 self.open_review_required_window()
             return
 
-        message = detail + "\n\n현재 evidence를 기준으로 자동매매 운영을 재개하시겠습니까?"
+        message = detail + "\n\n현재 확인된 정보를 기준으로 자동매매 운영을 재개하시겠습니까?"
         answer = QMessageBox.question(
             self,
-            "Startup Recovery",
+            "자동매매 운영 재개",
             message,
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -8692,7 +8697,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "루틴 설정",
-                f"선택한 루틴을 Registry에서 찾지 못했습니다.\n루틴명: {definition.display_name}",
+                f"선택한 루틴을 등록 정보에서 찾지 못했습니다.\n루틴명: {definition.display_name}",
             )
             return
 
@@ -9206,10 +9211,8 @@ class MainWindow(QMainWindow):
             BudgetValueChangeRequest(Path(config_path)),
         )
         current_price = availability.get("current_price")
-        if availability.get("allowed") is not True:
-            show_toast(window, "현재주가 수신 후 변경할 수 있습니다.")
-            return None
-        return safe_float_value(current_price, 0.0)
+        resolved_price = safe_float_value(current_price, 0.0)
+        return resolved_price if resolved_price > 0 else None
 
     def _open_running_budget_adjustment_dialog(
         self,
@@ -9227,8 +9230,6 @@ class MainWindow(QMainWindow):
             self,
             config_path,
         )
-        if current_price is None:
-            return
         state = read_json_dict(config_path.parent / "state.json")
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
@@ -9273,7 +9274,10 @@ class MainWindow(QMainWindow):
                 pending_adjustment if isinstance(pending_adjustment, dict) else None
             ),
             timing_selection_enabled=opened_current_running,
-            fresh_price_available=True,
+            configuration_price_available=(
+                current_price is not None
+                and safe_float_value(current_price, 0.0) > 0
+            ),
         )
         self._running_budget_adjustment_dialog = dialog
         accepted = False
@@ -9413,17 +9417,17 @@ class MainWindow(QMainWindow):
     ) -> int | None:
         starting_budget = max(0, safe_int_value(value, 0))
         if str(mode or "").strip().upper() == "QUANTITY":
-            fresh_state = main_stock_fresh_market_information_state(
+            configuration_state = main_stock_configuration_market_information_state(
                 self,
                 self._stock_projection_for_config_path(config_path),
             )
-            fresh_price = (
-                getattr(fresh_state, "last_price", None)
-                if fresh_state is not None
+            configuration_price = (
+                getattr(configuration_state, "last_price", None)
+                if configuration_state is not None
                 else None
             )
             starting_budget = floor_money_to_won(
-                safe_float_value(fresh_price, 0.0) * starting_budget
+                safe_float_value(configuration_price, 0.0) * starting_budget
             )
         defaults = starting_budget_defaults()
         if starting_budget <= 0:
@@ -9706,14 +9710,6 @@ class MainWindow(QMainWindow):
                 target_mode=next_mode,
             ),
             writer=self._write_stock_initial_buy_config,
-            # Keep the existing UI notice owner while the command owns the
-            # read-only fresh-price contract and the mode transition.
-            fresh_price_reader=(
-                lambda host, path: MainWindow._starting_budget_change_current_price(
-                    host,
-                    path,
-                )
-            ),
             current_running_reader=(
                 lambda host, _code, _config, _state: (
                     getattr(
@@ -9723,19 +9719,9 @@ class MainWindow(QMainWindow):
                     )(config_path)
                 )
             ),
-            default_value_reader=(
-                lambda host, path, mode: getattr(
-                    host,
-                    "_stock_default_initial_buy_value",
-                    MainWindow._stock_default_initial_buy_value,
-                )(
-                    path,
-                    mode,
-                    window=host,
-                )
-            ),
         )
         if result.get("reason") == CURRENT_PRICE_UNAVAILABLE:
+            show_toast(self, "현재주가 수신 후 변경할 수 있습니다.")
             return
         if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
             self._show_start_budget_mutation_blocked(self)
@@ -11677,6 +11663,24 @@ class MainWindow(QMainWindow):
             window = None
         if window is not None:
             setattr(window, "last_chejan_record_result", self.last_chejan_record_result)
+        if not getattr(self, "_main_window_closing", False):
+            fill_result = chejan_result.get("fill_result")
+            position_result = chejan_result.get("position_result")
+            durable_fill_available = (
+                isinstance(fill_result, dict)
+                and fill_result.get("fill_recorded") is True
+            ) or isinstance(position_result, dict)
+            durable_holding_available = chejan_result.get("holding_recorded") is True
+            if durable_fill_available or durable_holding_available:
+                normalized_event = chejan_result.get("normalized_event")
+                normalized_code = (
+                    normalized_event.get("code")
+                    if isinstance(normalized_event, dict)
+                    else None
+                )
+                queue_open_stock_instance_chart_refresh(
+                    chejan_result.get("code") or normalized_code
+                )
 
     def _main_exit_warning_required(self, now_dt: datetime | None = None) -> bool:
         """Warn when this GUI session has an active operation lifecycle."""
@@ -11729,6 +11733,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._main_window_closing = True
+        clear_pending_stock_instance_chart_refreshes()
         MainWindow._clear_completed_recovery_handoff(self)
         monitoring_window = getattr(self, "market_data_monitoring_window", None)
         if monitoring_window is not None and not sip.isdeleted(monitoring_window):

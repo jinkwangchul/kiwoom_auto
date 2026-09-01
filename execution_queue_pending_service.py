@@ -114,8 +114,26 @@ def build_execution_queue_pending(
         "lock_preview": deepcopy(lock_preview),
         "execution_request_preview": deepcopy(execution_request_preview),
     }
-    for field in ("execution_intent", "routine_provenance"):
+    for field in (
+        "execution_intent",
+        "routine_provenance",
+        "process_record",
+        "child_plan",
+    ):
         value = execution_request.get(field)
         if isinstance(value, dict):
+            result[field] = deepcopy(value)
+    for field in (
+        "source_kind",
+        "source_command_id",
+        "execution_process_id",
+        "child_sequence_index",
+        "child_sequence_total",
+        "child_kind",
+        "option_snapshot_hash",
+        "execution_trade_date",
+    ):
+        value = execution_request.get(field)
+        if value not in (None, ""):
             result[field] = deepcopy(value)
     return result

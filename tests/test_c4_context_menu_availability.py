@@ -7,10 +7,39 @@ from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
 import gui_auto_trade_context_menu as context_menu
+from gui_user_reason import user_reason_message, user_reason_messages
 from tests.participant_owner_fixture import participant_owner
 
 
 class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
+    def test_user_reason_mapping_hides_internal_vocabulary(self) -> None:
+        messages = (
+            user_reason_message("RECOVERY_STOCK_PENDING"),
+            user_reason_message("CURRENTLY_RUNNING"),
+            user_reason_message("HAS_HOLDING"),
+            user_reason_message("HAS_PENDING_ORDER"),
+            user_reason_message("CURRENT_PRICE_UNAVAILABLE"),
+            *user_reason_messages(
+                ["RECOVERY_CONTEXT_MISSING: internal detail", "REVIEW_REQUIRED"]
+            ),
+        )
+        forbidden = (
+            "registry",
+            "canonical",
+            "recovery",
+            "instance",
+            "repository",
+            "writer",
+            "mutation",
+            "participant",
+            "current-session",
+            "authority",
+            "sot",
+            "runtime",
+        )
+        rendered = " ".join(messages).lower()
+        self.assertFalse(any(term in rendered for term in forbidden), rendered)
+
     def _target(self, root: str, *, review: bool):
         stock_dir = Path(root) / "stocks" / "111111_Test"
         stock_dir.mkdir(parents=True)

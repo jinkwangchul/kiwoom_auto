@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable
 import weakref
 
 from PyQt5 import sip
-from PyQt5.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+from PyQt5.QtCore import QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QFont,
@@ -20,6 +20,7 @@ from PyQt5.QtGui import (
     QPainterPath,
     QPalette,
     QPen,
+    QPolygonF,
 )
 from PyQt5.QtWidgets import (
     QApplication,
@@ -46,7 +47,7 @@ from gui_auto_trade_display import (
     profit_loss_value_color,
 )
 from gui_order_utils import DIRECTIONAL_NEUTRAL_COLOR, format_signed_money, format_signed_percent
-from stock_code_contract import normalize_stock_code
+from stock_code_contract import normalize_broker_stock_code, normalize_stock_code
 from stock_instance_day_projection import (
     CHART_PROJECTION_NO_DAY_DATA,
     CHART_PROJECTION_NOT_READY,
@@ -71,6 +72,10 @@ BUY_COLOR = QColor("#DC2626")
 SELL_COLOR = QColor("#2563EB")
 LINE_COLOR = QColor("#2F6BFF")
 LIVE_PRICE_COLOR = QColor("#059669")
+ACTUAL_BUY_FILL_COLOR = QColor("#16A34A")
+ACTUAL_SELL_FILL_COLOR = QColor("#F97316")
+AVERAGE_PRICE_COLOR = QColor("#F59E0B")
+PROCESS_RAIL_COLOR = QColor("#6B7280")
 CHART_OPEN_STOCK_CODE_COLOR = "#2563EB"
 BASE_CHART_START_TIME = "09:00:00"
 BASE_CHART_END_TIME = "15:30:00"
@@ -78,6 +83,9 @@ ProjectionProvider = Callable[[str, str], dict[str, Any]]
 ChartFactory = Callable[[QWidget], "StockInstanceCloseChart"]
 PROJECT_ROOT = Path(__file__).resolve().parent
 _OPEN_STOCK_INSTANCE_CHARTS: dict[str, "StockInstanceChartWindow"] = {}
+_PENDING_STOCK_INSTANCE_CHART_REFRESH_CODES: set[str] = set()
+_STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED = False
+_STOCK_INSTANCE_CHART_REFRESH_GENERATION = 0
 _COMMON_PNL_REFRESH_TIMER: QTimer | None = None
 _CHART_TILE_GAP = 8
 _CHART_TILE_FRAME_TOLERANCE = 12
@@ -402,6 +410,85 @@ def stock_instance_chart_is_open(stock_code: str) -> bool:
     if not reusable and _OPEN_STOCK_INSTANCE_CHARTS.get(registry_key) is existing:
         _OPEN_STOCK_INSTANCE_CHARTS.pop(registry_key, None)
     return reusable
+
+
+def _open_stock_instance_chart_for_refresh(
+    stock_code: object,
+) -> "StockInstanceChartWindow | None":
+    """Resolve a currently visible matching chart without creating one."""
+    canonical_code = normalize_broker_stock_code(stock_code)
+    if not canonical_code:
+        return None
+    for registry_key, window in list(_OPEN_STOCK_INSTANCE_CHARTS.items()):
+        window_code = normalize_broker_stock_code(
+            getattr(window, "stock_code", registry_key)
+        )
+        if window_code != canonical_code:
+            continue
+        try:
+            reusable = not sip.isdeleted(window) and window.isVisible()
+        except RuntimeError:
+            reusable = False
+        if reusable:
+            return window
+        if _OPEN_STOCK_INSTANCE_CHARTS.get(registry_key) is window:
+            _OPEN_STOCK_INSTANCE_CHARTS.pop(registry_key, None)
+    return None
+
+
+def _drain_pending_stock_instance_chart_refreshes(
+    generation: int | None = None,
+) -> int:
+    """Refresh each still-open invalidated stock chart at most once."""
+    global _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED
+    if (
+        generation is not None
+        and generation != _STOCK_INSTANCE_CHART_REFRESH_GENERATION
+    ):
+        return 0
+    pending_codes = set(_PENDING_STOCK_INSTANCE_CHART_REFRESH_CODES)
+    _PENDING_STOCK_INSTANCE_CHART_REFRESH_CODES.clear()
+    _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED = False
+    refreshed = 0
+    for stock_code in sorted(pending_codes):
+        window = _open_stock_instance_chart_for_refresh(stock_code)
+        if window is None:
+            continue
+        try:
+            window.refresh_projection(preserve_pnl_if_same_bar=True)
+        except RuntimeError:
+            # A WA_DeleteOnClose chart can disappear between registry lookup and call.
+            continue
+        refreshed += 1
+    return refreshed
+
+
+def queue_open_stock_instance_chart_refresh(stock_code: object) -> bool:
+    """Coalesce a read-only refresh for an already-open matching stock chart."""
+    global _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED
+    canonical_code = normalize_broker_stock_code(stock_code)
+    if not canonical_code or _open_stock_instance_chart_for_refresh(canonical_code) is None:
+        return False
+    _PENDING_STOCK_INSTANCE_CHART_REFRESH_CODES.add(canonical_code)
+    if not _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED:
+        _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED = True
+        generation = _STOCK_INSTANCE_CHART_REFRESH_GENERATION
+        QTimer.singleShot(
+            0,
+            lambda current_generation=generation: (
+                _drain_pending_stock_instance_chart_refreshes(current_generation)
+            ),
+        )
+    return True
+
+
+def clear_pending_stock_instance_chart_refreshes() -> None:
+    """Invalidate queued callbacks during application shutdown."""
+    global _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED
+    global _STOCK_INSTANCE_CHART_REFRESH_GENERATION
+    _PENDING_STOCK_INSTANCE_CHART_REFRESH_CODES.clear()
+    _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED = False
+    _STOCK_INSTANCE_CHART_REFRESH_GENERATION += 1
 
 
 def _refresh_chart_open_code_views(owner: QWidget | None = None) -> None:
@@ -906,8 +993,132 @@ def _build_window_title(
     )
 
 
+class ExecutionProcessRail(QWidget):
+    """Compact, read-only rows for persisted execution processes."""
+
+    processSelected = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("stockInstanceExecutionProcessRail")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.processes: list[dict[str, Any]] = []
+        self.selected_execution_process_id = ""
+        self._row_rects: list[tuple[QRectF, str]] = []
+        self.setFixedHeight(0)
+        self.hide()
+
+    @staticmethod
+    def _row_text(process: dict[str, Any]) -> str:
+        side = str(process.get("side") or "-").strip().upper()
+        option = str(process.get("option_summary") or "-").strip()
+        completed = _nonnegative_count(process.get("child_completed"), 0)
+        total = _nonnegative_count(process.get("child_total"), 0)
+        status = str(process.get("status") or "-").strip().upper()
+        status_text = {
+            "COMPLETED": "완료",
+            "PARTIAL": "부분체결",
+            "APPROVED": "승인",
+            "ORDERED": "주문",
+        }.get(status, status)
+        return f"{side} | {option} | {status_text} {completed}/{total}"
+
+    @staticmethod
+    def _tooltip_text(process: dict[str, Any]) -> str:
+        lines = [ExecutionProcessRail._row_text(process)]
+        source_kind = str(process.get("source_kind") or "").strip()
+        source_id = str(
+            process.get("source_signal_id")
+            or process.get("source_command_id")
+            or ""
+        ).strip()
+        if source_kind or source_id:
+            lines.append(f"근거: {' / '.join(part for part in (source_kind, source_id) if part)}")
+        children = process.get("children", [])
+        if isinstance(children, list):
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                index = child.get("child_sequence_index")
+                total = child.get("child_sequence_total")
+                kind = str(child.get("child_kind") or "-").strip()
+                status = str(child.get("status") or "-").strip()
+                fills = child.get("fill_ids", [])
+                fill_count = len(fills) if isinstance(fills, list) else 0
+                lines.append(f"{index}/{total} {kind} · {status} · Fill {fill_count}건")
+        return "\n".join(lines)
+
+    def set_processes(self, processes: Any) -> None:
+        self.processes = [
+            dict(item)
+            for item in processes
+            if isinstance(item, dict)
+            and str(item.get("execution_process_id") or "").strip()
+        ] if isinstance(processes, list) else []
+        valid_ids = {
+            str(item.get("execution_process_id") or "").strip()
+            for item in self.processes
+        }
+        if self.selected_execution_process_id not in valid_ids:
+            self.selected_execution_process_id = ""
+        if not self.processes:
+            self._row_rects = []
+            self.setFixedHeight(0)
+            self.hide()
+            return
+        self.setFixedHeight(min(86, 8 + (20 * len(self.processes))))
+        self.show()
+        self.update()
+
+    def select_process(self, execution_process_id: object) -> None:
+        process_id = str(execution_process_id or "").strip()
+        self.selected_execution_process_id = process_id
+        tooltip = ""
+        for process in self.processes:
+            if str(process.get("execution_process_id") or "").strip() == process_id:
+                tooltip = self._tooltip_text(process)
+                break
+        self.setToolTip(tooltip)
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), self.palette().base())
+        painter.setPen(QPen(self.palette().midlight().color(), 1))
+        painter.drawLine(0, 0, self.width(), 0)
+        self._row_rects = []
+        if not self.processes:
+            return
+        row_height = max(15.0, min(20.0, (self.height() - 6.0) / len(self.processes)))
+        font = QFont(self.font())
+        font.setPointSize(max(7, font.pointSize() - 1))
+        painter.setFont(font)
+        for index, process in enumerate(self.processes):
+            process_id = str(process.get("execution_process_id") or "").strip()
+            rect = QRectF(8, 3 + index * row_height, max(1, self.width() - 16), row_height)
+            self._row_rects.append((rect, process_id))
+            if process_id == self.selected_execution_process_id:
+                painter.fillRect(rect, QColor("#EFF6FF"))
+                painter.setPen(QPen(QColor("#2563EB"), 1))
+            else:
+                painter.setPen(PROCESS_RAIL_COLOR)
+            painter.drawText(rect.adjusted(5, 0, -5, 0), Qt.AlignLeft | Qt.AlignVCenter, self._row_text(process))
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        for rect, process_id in self._row_rects:
+            if rect.contains(event.pos()):
+                self.select_process(process_id)
+                self.processSelected.emit(process_id)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class StockInstanceCloseChart(QWidget):
     """Paint one day of close prices and canonical BUY/SELL markers."""
+
+    actualFillMarkerSelected = pyqtSignal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -917,6 +1128,13 @@ class StockInstanceCloseChart(QWidget):
         self.close_series: list[tuple[datetime, float]] = []
         self.buy_series: list[tuple[datetime, float]] = []
         self.sell_series: list[tuple[datetime, float]] = []
+        self.actual_buy_fill_series: list[tuple[datetime, float]] = []
+        self.actual_sell_fill_series: list[tuple[datetime, float]] = []
+        self.actual_fill_marker_records: list[dict[str, Any]] = []
+        self.process_rails: list[dict[str, Any]] = []
+        self.average_price: float | None = None
+        self.selected_actual_fill_marker_id = ""
+        self.selected_execution_process_id = ""
         self.live_price_point: tuple[datetime, float] | None = None
         self.live_price_data_quality = ""
         self.fixed_time_range: tuple[datetime, datetime] | None = None
@@ -957,6 +1175,9 @@ class StockInstanceCloseChart(QWidget):
         x_range_end: Any = None,
         visible_time_ranges: Any = None,
         timeframe_minutes: Any = None,
+        actual_fill_markers: Any = None,
+        process_rails: Any = None,
+        average_price: Any = None,
     ) -> None:
         self.close_series = self._series_from(
             candles,
@@ -973,6 +1194,29 @@ class StockInstanceCloseChart(QWidget):
             time_key="signal_bar_time",
             value_key="signal_bar_close",
         )
+        self.actual_fill_marker_records = []
+        if isinstance(actual_fill_markers, list):
+            for marker in actual_fill_markers:
+                if not isinstance(marker, dict):
+                    continue
+                occurred_at = parse_market_datetime(marker.get("occurred_at"))
+                price = _finite_number(marker.get("filled_price"))
+                side = str(marker.get("side") or "").strip().upper()
+                if occurred_at is None or price is None or price <= 0 or side not in {"BUY", "SELL"}:
+                    continue
+                normalized = dict(marker)
+                normalized["_occurred_at"] = occurred_at
+                normalized["_filled_price"] = price
+                self.actual_fill_marker_records.append(normalized)
+        self.actual_fill_marker_records.sort(
+            key=lambda marker: (
+                marker["_occurred_at"],
+                str(marker.get("fill_id") or ""),
+            )
+        )
+        self.process_rails = [dict(item) for item in process_rails if isinstance(item, dict)] if isinstance(process_rails, list) else []
+        projected_average = _finite_number(average_price)
+        self.average_price = projected_average if projected_average is not None and projected_average > 0 else None
         parsed_start = parse_market_datetime(x_range_start)
         parsed_end = parse_market_datetime(x_range_end)
         self.fixed_time_range = (
@@ -1007,6 +1251,21 @@ class StockInstanceCloseChart(QWidget):
             self.sell_series = [
                 item for item in self.sell_series if visible(item)
             ]
+            self.actual_fill_marker_records = [
+                marker
+                for marker in self.actual_fill_marker_records
+                if visible((marker["_occurred_at"], marker["_filled_price"]))
+            ]
+        self.actual_buy_fill_series = [
+            (marker["_occurred_at"], marker["_filled_price"])
+            for marker in self.actual_fill_marker_records
+            if marker.get("side") == "BUY"
+        ]
+        self.actual_sell_fill_series = [
+            (marker["_occurred_at"], marker["_filled_price"])
+            for marker in self.actual_fill_marker_records
+            if marker.get("side") == "SELL"
+        ]
         self.timeframe_minutes = (
             int(timeframe_minutes)
             if isinstance(timeframe_minutes, int)
@@ -1015,6 +1274,14 @@ class StockInstanceCloseChart(QWidget):
             else None
         )
         self.empty_message = str(empty_message or "표시할 기준봉 데이터가 없습니다.")
+        self.update()
+
+    def select_execution_process(self, execution_process_id: object) -> None:
+        process_id = str(execution_process_id or "").strip()
+        if self.selected_execution_process_id == process_id:
+            return
+        self.selected_execution_process_id = process_id
+        self.selected_actual_fill_marker_id = ""
         self.update()
 
     def set_live_price_projection(
@@ -1104,8 +1371,12 @@ class StockInstanceCloseChart(QWidget):
         values = [value for _bar_time, value in self.close_series]
         values.extend(value for _bar_time, value in self.buy_series)
         values.extend(value for _bar_time, value in self.sell_series)
+        values.extend(value for _bar_time, value in self.actual_buy_fill_series)
+        values.extend(value for _bar_time, value in self.actual_sell_fill_series)
         if self.live_price_point is not None:
             values.append(self.live_price_point[1])
+        if self.average_price is not None:
+            values.append(self.average_price)
         if not values:
             return None
         low = min(values)
@@ -1208,6 +1479,31 @@ class StockInstanceCloseChart(QWidget):
         painter.setBrush(color)
         painter.drawEllipse(point, 5.0, 5.0)
 
+    @staticmethod
+    def _draw_actual_fill_marker(
+        painter: QPainter,
+        point: QPointF,
+        color: QColor,
+        *,
+        selected: bool,
+    ) -> None:
+        if selected:
+            painter.setPen(QPen(color.darker(125), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(point, 7.0, 7.0)
+        painter.setPen(QPen(color.darker(120), 1))
+        painter.setBrush(color)
+        painter.drawPolygon(
+            QPolygonF(
+                [
+                    QPointF(point.x(), point.y() - 4.5),
+                    QPointF(point.x() + 4.5, point.y()),
+                    QPointF(point.x(), point.y() + 4.5),
+                    QPointF(point.x() - 4.5, point.y()),
+                ]
+            )
+        )
+
     @classmethod
     def _signal_label_text(cls, value: float) -> str:
         return cls._price_text(value)
@@ -1274,7 +1570,7 @@ class StockInstanceCloseChart(QWidget):
         painter.setPen(QPen(LIVE_PRICE_COLOR, 2))
         painter.setBrush(self.palette().base())
         painter.drawEllipse(point, 4.5, 4.5)
-        label = f"실시간 {self._price_text(price)}"
+        label = self._price_text(price)
         if self.live_price_data_quality == "UNCERTAIN":
             label += " (UNCERTAIN)"
         label_font = QFont(painter.font())
@@ -1290,6 +1586,28 @@ class StockInstanceCloseChart(QWidget):
         painter.drawText(
             QRectF(x, y, label_width, label_height),
             Qt.AlignLeft | Qt.AlignVCenter,
+            label,
+        )
+        painter.setFont(self.font())
+
+    def _draw_average_price_projection(self, painter: QPainter, plot: QRectF) -> None:
+        if self.average_price is None:
+            return
+        point = self.position_for(self._time_range()[0] if self._time_range() else None, self.average_price, plot)
+        if point is None:
+            return
+        y = point.y()
+        painter.setPen(QPen(AVERAGE_PRICE_COLOR, 1.5, Qt.DashLine))
+        painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+        label = f"평단 {self._price_text(self.average_price)}"
+        font = QFont(painter.font())
+        font.setPointSize(max(7, font.pointSize() - 1))
+        painter.setFont(font)
+        width = QFontMetrics(font).horizontalAdvance(label) + 8
+        painter.setPen(AVERAGE_PRICE_COLOR.darker(110))
+        painter.drawText(
+            QRectF(max(plot.left(), plot.right() - width), y - 18, width, 17),
+            Qt.AlignRight | Qt.AlignVCenter,
             label,
         )
         painter.setFont(self.font())
@@ -1348,6 +1666,8 @@ class StockInstanceCloseChart(QWidget):
                 painter.setBrush(LINE_COLOR)
                 painter.drawEllipse(points[0], 2.5, 2.5)
 
+        self._draw_average_price_projection(painter, plot)
+
         for bar_time, value in self.buy_series:
             point = self.position_for(bar_time, value, plot)
             if point is not None:
@@ -1372,7 +1692,50 @@ class StockInstanceCloseChart(QWidget):
                     SELL_COLOR,
                     above=False,
                 )
+        for marker in self.actual_fill_marker_records:
+            point = self.position_for(
+                marker.get("_occurred_at"),
+                marker.get("_filled_price"),
+                plot,
+            )
+            if point is None:
+                continue
+            process_id = str(marker.get("execution_process_id") or "").strip()
+            marker_id = str(marker.get("marker_id") or "").strip()
+            selected = bool(
+                marker_id == self.selected_actual_fill_marker_id
+                or (
+                    self.selected_execution_process_id
+                    and process_id == self.selected_execution_process_id
+                )
+            )
+            self._draw_actual_fill_marker(
+                painter,
+                point,
+                ACTUAL_BUY_FILL_COLOR if marker.get("side") == "BUY" else ACTUAL_SELL_FILL_COLOR,
+                selected=selected,
+            )
         self._draw_live_price_projection(painter, plot)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        plot = self._plot_rect()
+        nearest: tuple[float, dict[str, Any]] | None = None
+        for marker in self.actual_fill_marker_records:
+            point = self.position_for(marker.get("_occurred_at"), marker.get("_filled_price"), plot)
+            if point is None:
+                continue
+            distance = ((point.x() - event.pos().x()) ** 2 + (point.y() - event.pos().y()) ** 2) ** 0.5
+            if distance <= 9.0 and (nearest is None or distance < nearest[0]):
+                nearest = (distance, marker)
+        if nearest is not None:
+            marker = nearest[1]
+            self.selected_actual_fill_marker_id = str(marker.get("marker_id") or "").strip()
+            self.selected_execution_process_id = str(marker.get("execution_process_id") or "").strip()
+            self.update()
+            self.actualFillMarkerSelected.emit(dict(marker))
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 class StockInstanceChartWindow(QDialog):
     """Read-only common window backed only by project_stock_instance_day()."""
@@ -1431,6 +1794,16 @@ class StockInstanceChartWindow(QDialog):
         self.notice_label.setWordWrap(True)
         self.notice_label.setStyleSheet("color: #6B7280;")
         self.chart = (chart_factory or StockInstanceCloseChart)(self)
+        self.process_rail = ExecutionProcessRail(self)
+        self.fill_detail_label = QLabel()
+        self.fill_detail_label.setObjectName("stockInstanceActualFillDetail")
+        self.fill_detail_label.setWordWrap(True)
+        self.fill_detail_label.setStyleSheet("color: #374151; padding: 3px 8px;")
+        self.fill_detail_label.hide()
+        fill_selected = getattr(self.chart, "actualFillMarkerSelected", None)
+        if fill_selected is not None and callable(getattr(fill_selected, "connect", None)):
+            fill_selected.connect(self._on_actual_fill_marker_selected)
+        self.process_rail.processSelected.connect(self._on_execution_process_selected)
         self._setup_ui()
         self.refresh_projection()
         self._connect_operation_cycle_refresh()
@@ -1463,7 +1836,6 @@ class StockInstanceChartWindow(QDialog):
             if all(
                 callable(getattr(host, method_name, None))
                 for method_name in (
-                    "price_signal_observation_enabled",
                     "high_resolution_market_state",
                     "high_resolution_market_data_snapshot",
                 )
@@ -1501,8 +1873,6 @@ class StockInstanceChartWindow(QDialog):
         if host is None:
             return self._clear_live_price_projection()
         try:
-            if not bool(host.price_signal_observation_enabled()):
-                return self._clear_live_price_projection()
             snapshot = host.high_resolution_market_data_snapshot()
             state = host.high_resolution_market_state(self.stock_code)
         except Exception:
@@ -1901,9 +2271,61 @@ class StockInstanceChartWindow(QDialog):
         chart_panel.setObjectName("stockInstanceChartPanel")
         chart_layout = QVBoxLayout(chart_panel)
         chart_layout.setContentsMargins(14, 0, 12, 0)
+        chart_layout.setSpacing(0)
         chart_layout.addWidget(self.chart, 1)
+        chart_layout.addWidget(self.process_rail, 0)
+        chart_layout.addWidget(self.fill_detail_label, 0)
         root.addWidget(chart_panel, 1)
         self._update_operation_button_state()
+
+    @staticmethod
+    def _actual_fill_detail_text(marker: dict[str, Any]) -> str:
+        side = "매수" if str(marker.get("side") or "").upper() == "BUY" else "매도"
+        price = _finite_number(marker.get("filled_price"))
+        quantity = _nonnegative_count(marker.get("filled_quantity_delta"), 0)
+        occurred = parse_market_datetime(marker.get("occurred_at"))
+        occurred_text = occurred.strftime("%H:%M:%S") if occurred is not None else "-"
+        source = str(marker.get("execution_time_source") or "").strip().upper()
+        quality = str(marker.get("execution_time_quality") or "").strip().upper()
+        if source == "BROKER_FID_908":
+            time_basis = "Broker 체결시각"
+        elif source == "LOCAL_RECEIVED_AT":
+            time_basis = "Chejan 수신시각(근사)"
+        else:
+            time_basis = quality or "시간근거 없음"
+        option = str(marker.get("option_summary") or "").strip()
+        index = marker.get("child_sequence_index")
+        total = marker.get("child_sequence_total")
+        child = f"{index}/{total}" if index not in (None, "") and total not in (None, "") else "-"
+        order_no = str(marker.get("broker_order_no") or marker.get("order_id") or "-").strip()
+        identity = str(marker.get("execution_identity") or marker.get("execution_id") or "-").strip()
+        price_text = StockInstanceCloseChart._price_text(price) if price is not None else "-"
+        execution_text = f" · 실행 {option} {child}" if option else f" · 실행 {child}"
+        return (
+            f"{side} {price_text}원 · {occurred_text} · 수량 {quantity}"
+            f"{execution_text} · 시간근거 {time_basis} · 주문 {order_no} · 체결 {identity}"
+        )
+
+    def _on_actual_fill_marker_selected(self, marker: object) -> None:
+        if not isinstance(marker, dict):
+            return
+        process_id = str(marker.get("execution_process_id") or "").strip()
+        self.process_rail.select_process(process_id)
+        self.fill_detail_label.setText(self._actual_fill_detail_text(marker))
+        self.fill_detail_label.setToolTip(self.fill_detail_label.text())
+        self.fill_detail_label.show()
+
+    def _on_execution_process_selected(self, execution_process_id: str) -> None:
+        select = getattr(self.chart, "select_execution_process", None)
+        if callable(select):
+            select(execution_process_id)
+        for process in self.process_rail.processes:
+            if str(process.get("execution_process_id") or "").strip() != execution_process_id:
+                continue
+            self.fill_detail_label.setText(ExecutionProcessRail._tooltip_text(process).replace("\n", " · "))
+            self.fill_detail_label.setToolTip(ExecutionProcessRail._tooltip_text(process))
+            self.fill_detail_label.show()
+            break
 
     def _main_monitoring_window(self):
         return _main_monitoring_owner(persistent_feature_owner(self))
@@ -2063,6 +2485,10 @@ class StockInstanceChartWindow(QDialog):
         if not isinstance(data.get("buy_signal_markers", []), list):
             return True
         if not isinstance(data.get("sell_signal_markers", []), list):
+            return True
+        if not isinstance(data.get("actual_fill_markers", []), list):
+            return True
+        if not isinstance(data.get("execution_process_rails", []), list):
             return True
         diagnostics = data.get("diagnostics", {})
         if diagnostics not in ({}, None) and not isinstance(diagnostics, dict):
@@ -2248,6 +2674,14 @@ class StockInstanceChartWindow(QDialog):
         return start, end, visible_ranges
 
     def _apply_projection(self, data: dict[str, Any]) -> None:
+        selected_marker_id = str(
+            getattr(self.chart, "selected_actual_fill_marker_id", "") or ""
+        ).strip()
+        selected_process_id = str(
+            getattr(self.chart, "selected_execution_process_id", "")
+            or self.process_rail.selected_execution_process_id
+            or ""
+        ).strip()
         self.last_projection = data
         self.last_refresh_status = self._projection_refresh_status(data)
         stock_name = str(data.get("stock_name") or "").strip()
@@ -2301,7 +2735,53 @@ class StockInstanceChartWindow(QDialog):
             x_range_end=x_range_end,
             visible_time_ranges=visible_time_ranges,
             timeframe_minutes=bar_minutes,
+            actual_fill_markers=data.get("actual_fill_markers", []),
+            process_rails=data.get("execution_process_rails", []),
+            average_price=(
+                data.get("average_price")
+                if data.get("average_price_visible") is True
+                else None
+            ),
         )
+        self.process_rail.set_processes(data.get("execution_process_rails", []))
+        marker_by_id = {
+            str(marker.get("marker_id") or "").strip(): marker
+            for marker in getattr(self.chart, "actual_fill_marker_records", [])
+            if isinstance(marker, dict) and str(marker.get("marker_id") or "").strip()
+        }
+        valid_process_ids = {
+            str(process.get("execution_process_id") or "").strip()
+            for process in self.process_rail.processes
+            if str(process.get("execution_process_id") or "").strip()
+        }
+        selected_marker = marker_by_id.get(selected_marker_id)
+        if selected_marker is not None:
+            marker_process_id = str(
+                selected_marker.get("execution_process_id") or ""
+            ).strip()
+            restored_process_id = (
+                marker_process_id if marker_process_id in valid_process_ids else ""
+            )
+            self.chart.selected_actual_fill_marker_id = selected_marker_id
+            self.chart.selected_execution_process_id = restored_process_id
+            self.process_rail.select_process(restored_process_id)
+            self.fill_detail_label.setText(
+                self._actual_fill_detail_text(selected_marker)
+            )
+            self.fill_detail_label.setToolTip(self.fill_detail_label.text())
+            self.fill_detail_label.show()
+        elif selected_process_id in valid_process_ids:
+            self.chart.selected_actual_fill_marker_id = ""
+            self.chart.select_execution_process(selected_process_id)
+            self.process_rail.select_process(selected_process_id)
+            self._on_execution_process_selected(selected_process_id)
+        else:
+            self.chart.selected_actual_fill_marker_id = ""
+            self.chart.selected_execution_process_id = ""
+            self.process_rail.select_process("")
+            self.fill_detail_label.clear()
+            self.fill_detail_label.hide()
+            self.chart.update()
         if self.last_refresh_status == CHART_PROJECTION_VALID and self.chart.close_series:
             self._last_valid_projection_identity = self._projection_identity(data)
         else:
@@ -2418,8 +2898,6 @@ class StockInstanceChartWindow(QDialog):
                 "daily_realized_gross",
                 "completed_buy_cost",
                 "open_position_cost",
-                "holding_quantity",
-                "average_price",
                 "unrealized_pnl_at_bar_close",
                 "cumulative_pnl",
                 "cumulative_return_rate",

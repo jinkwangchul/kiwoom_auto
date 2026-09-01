@@ -88,6 +88,9 @@ def validate_execution_runtime_write_preview(write_preview_result: Any) -> dict[
 
     if not isinstance(write_preview_result.get("duplicate_checks"), dict):
         issues.append("DUPLICATE_CHECKS_MUST_BE_DICT")
+    append_requirements = write_preview_result.get("append_requirements")
+    if not isinstance(append_requirements, dict):
+        issues.append("APPEND_REQUIREMENTS_MUST_BE_DICT")
     if not isinstance(preview_issues, list):
         issues.append("ISSUES_MUST_BE_LIST")
         preview_issues = []
@@ -97,6 +100,17 @@ def validate_execution_runtime_write_preview(write_preview_result: Any) -> dict[
     warnings.extend(preview_warnings)
 
     if status == "READY":
+        if isinstance(append_requirements, dict) and append_requirements.get("process") is True:
+            issues.extend(
+                _check_record_fields(
+                    write_preview_result.get("process_record_preview"),
+                    missing_record_issue="MISSING_PROCESS_RECORD_PREVIEW",
+                    required_fields={
+                        "execution_process_id": "MISSING_PROCESS_RECORD_PROCESS_ID",
+                        "option_snapshot_hash": "MISSING_PROCESS_RECORD_SNAPSHOT_HASH",
+                    },
+                )
+            )
         issues.extend(
             _check_record_fields(
                 write_preview_result.get("execution_record_preview"),
