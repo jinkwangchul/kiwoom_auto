@@ -947,14 +947,17 @@ class IndicatorFollowControlTabMixin:
                 self.sell_method_select_b_check,
                 self.sell_method_select_c_check,
             ]
-            if any(check.isChecked() for check in checks):
-                return
             self._sell_method_select_guard = True
             try:
-                if source_check is not None:
+                if source_check is not None and source_check.isChecked():
+                    for check in checks:
+                        if check is not source_check:
+                            check.setChecked(False)
+                elif not any(check.isChecked() for check in checks) and source_check is not None:
                     source_check.setChecked(True)
-                else:
+                elif not any(check.isChecked() for check in checks):
                     self.sell_method_select_a_check.setChecked(True)
+                self._sell_method_selection_load_error = None
             finally:
                 self._sell_method_select_guard = False
 

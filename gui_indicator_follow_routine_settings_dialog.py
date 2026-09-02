@@ -2633,6 +2633,14 @@ class IndicatorFollowRoutineSettingsDialog(
 
             selected_sets = sell_ui.get("selected_sets", {})
             if isinstance(selected_sets, dict):
+                selected_count = sum(bool(selected_sets.get(key)) for key in ("a", "b", "c"))
+                if selected_count != 1:
+                    self._sell_method_selection_load_error = dict(selected_sets)
+                    result["skipped"].append({
+                        "name": "sell_ui.selected_sets",
+                        "reason": "exactly_one_sell_method_set_required",
+                    })
+                    selected_sets = {}
                 selected_set_names = {
                     "a": "sell_method_select_a_check",
                     "b": "sell_method_select_b_check",
@@ -2829,7 +2837,9 @@ class IndicatorFollowRoutineSettingsDialog(
                     "sell_signal_condition_c_",
                 ),
             },
-            "selected_sets": {
+            "selected_sets": dict(self._sell_method_selection_load_error)
+            if isinstance(getattr(self, "_sell_method_selection_load_error", None), dict)
+            else {
                 "a": bool(getattr(self, "sell_method_select_a_check", None).isChecked())
                 if getattr(self, "sell_method_select_a_check", None) is not None
                 else False,

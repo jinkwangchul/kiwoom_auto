@@ -36,6 +36,14 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         build_indicator_follow_buy_intent = None
 
+try:
+    from routine_sell_execution import build_indicator_follow_sell_intent  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from .routine_sell_execution import build_indicator_follow_sell_intent  # type: ignore
+    except Exception:  # pragma: no cover
+        build_indicator_follow_sell_intent = None
+
 
 try:
     from routine_macd_engine import (  # type: ignore
@@ -287,9 +295,10 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
     signal = evaluate_indicator_follow_routine(candles, config, context)
     result = signal_to_dict(signal)
     cycle = context.get("cycle")
+    signal_side = str(result.get("signal") or "").strip().upper()
     if isinstance(cycle, dict):
         result["cycle"] = dict(cycle)
-        if str(result.get("signal") or "").strip().upper() == "BUY":
+        if signal_side == "BUY":
             if str(cycle.get("status") or "").strip().lower() == "unresolved":
                 result["signal"] = None
                 result["reason"] = "매매사이클 체결 상태를 확인할 수 없어 BUY를 차단합니다."
@@ -323,6 +332,30 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
                         result["buy_execution_blocked"] = True
                         result["buy_execution_blocked_reason"] = execution.get("reason")
                         result["buy_execution_policy_status"] = "BLOCKED"
+        elif signal_side == "SELL":
+            if not callable(build_indicator_follow_sell_intent):
+                result["signal"] = None
+                result["sell_execution_blocked"] = True
+                result["sell_execution_blocked_reason"] = "SELL_EXECUTION_BRIDGE_IMPORT_FAILED"
+                result["sell_execution_policy_status"] = "BLOCKED"
+            else:
+                execution = build_indicator_follow_sell_intent(
+                    sell_signal_result=result,
+                    context=context,
+                )
+                if execution.get("status") == "READY":
+                    result["execution_intent"] = execution.get("execution_intent")
+                    result["sell_execution_policy_status"] = "READY"
+                else:
+                    result["signal"] = None
+                    result["sell_execution_blocked"] = True
+                    result["sell_execution_blocked_reason"] = execution.get("reason")
+                    result["sell_execution_policy_status"] = "BLOCKED"
+    elif signal_side == "SELL":
+        result["signal"] = None
+        result["sell_execution_blocked"] = True
+        result["sell_execution_blocked_reason"] = "CYCLE_PROJECTION_UNRESOLVED"
+        result["sell_execution_policy_status"] = "BLOCKED"
     result["routine"] = ROUTINE_NAME
     result["execution_enabled"] = EXECUTION_ENABLED
     result["engine"] = _ENGINE_SOURCE

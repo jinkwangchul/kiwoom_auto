@@ -989,7 +989,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             }
             self._write_rules(rules_path, current_rules)
             original_ui_state = deepcopy(self.ui_state)
-            self.ui_state["sell_ui"]["selected_sets"] = {"a": True, "b": True, "c": False}
+            self.ui_state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": False}
             self.ui_state["sell_ui"]["setting_a"] = {
                 "perform1_title_combo": "\ub2e8\uc77c\ud638\uac00",
                 "perform1_single_combo": "\uc8fc\ubb38\uac00",
@@ -1035,7 +1035,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                     "sell.method.setting_c",
                 ],
             )
-            self.assertEqual(saved["sell"]["method"]["selected_sets"], ["setting_a", "setting_b"])
+            self.assertEqual(saved["sell"]["method"]["selected_sets"], ["setting_a"])
             self.assertEqual(saved["sell"]["method"]["setting_a"]["perform1_single_combo"], "\uc8fc\ubb38\uac00")
             self.assertFalse(saved["sell"]["method"]["setting_b"]["runtime_write"])
             self.assertFalse(saved["sell"]["method"]["setting_c"]["send_order"])

@@ -3770,7 +3770,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
     def test_sell_method_candidates_use_method_policy_namespace(self):
         state = deepcopy(self.ui_state)
-        state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": True}
+        state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": False}
         state["sell_ui"]["setting_a"] = {
             "perform1_title_combo": "\ub2e8\uc77c\ud638\uac00",
             "perform1_single_combo": "\uc8fc\ubb38\uac00",
@@ -3791,13 +3791,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             deepcopy(self.current_rules),
         )
         candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
-        method_candidates = candidates["sell"]["method_policy_candidates"]
+        method_candidates = candidates.get("sell", {}).get("method_policy_candidates", {})
 
-        self.assertEqual(method_candidates["sell.method.selected_sets"]["value"], ["setting_a", "setting_c"])
+        self.assertEqual(method_candidates["sell.method.selected_sets"]["value"], ["setting_a"])
         self.assertEqual(method_candidates["sell.method.setting_a"]["candidate_type"], "set_method_policy")
         self.assertEqual(method_candidates["sell.method.setting_b"]["candidate_type"], "set_method_policy")
         self.assertEqual(method_candidates["sell.method.setting_c"]["candidate_type"], "set_method_policy")
-        self.assertTrue(method_candidates["sell.method.setting_a"]["value"]["preview_only"])
+        self.assertFalse(method_candidates["sell.method.setting_a"]["value"]["preview_only"])
+        self.assertTrue(method_candidates["sell.method.setting_a"]["value"]["execution_connected"])
         self.assertFalse(method_candidates["sell.method.setting_b"]["value"]["runtime_write"])
         self.assertFalse(method_candidates["sell.method.setting_c"]["value"]["send_order"])
         self.assertIn("sell.method.selected_sets", result["mapped_paths"])
@@ -3805,6 +3806,26 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         session = self.mapper.build_rule_approval_session(result)
         self.assertEqual(session["candidate_types"]["sell.method.selected_sets"], "set_method_policy")
         self.assertEqual(session["candidate_types"]["sell.method.setting_a"], "set_method_policy")
+
+    def test_sell_method_multiple_selected_sets_fail_closed_in_mapper(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": True}
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+        method_candidates = candidates.get("sell", {}).get("method_policy_candidates", {})
+
+        self.assertEqual(
+            ["setting_a", "setting_c"],
+            method_candidates["sell.method.selected_sets"]["value"],
+        )
+        self.assertIn(
+            "sell method selected_sets must select exactly one of setting_a/setting_b/setting_c",
+            result["validation_warnings"],
+        )
 
     def test_sell_method_approval_apply_and_commit_preview_touch_only_method_namespace(self):
         state = deepcopy(self.ui_state)

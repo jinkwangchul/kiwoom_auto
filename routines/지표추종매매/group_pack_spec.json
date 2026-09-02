@@ -6,6 +6,7 @@
     "routines/지표추종매매/routine.py",
     "routines/지표추종매매/rules.json",
     "routines/지표추종매매/routine_buy_execution.py",
+    "routines/지표추종매매/routine_sell_execution.py",
     "routines/지표추종매매/routine_condition_engine.py",
     "routines/지표추종매매/routine_cycle_projection.py",
     "routines/지표추종매매/routine_macd_engine.py",

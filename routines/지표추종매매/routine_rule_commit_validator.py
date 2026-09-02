@@ -115,6 +115,38 @@ def validate_committed_rules(
 
     add_check("json_root_dict", isinstance(post_rules, dict))
     add_check("buy_conditions_exists", _path_exists(post_rules, "buy.groups[0].conditions"))
+    if _path_exists(post_rules, "sell.method.selected_sets"):
+        selected_sets = _get_path(post_rules, "sell.method.selected_sets")
+        selected_sets_valid = (
+            isinstance(selected_sets, list)
+            and len(selected_sets) == 1
+            and selected_sets[0] in {"setting_a", "setting_b", "setting_c"}
+        )
+        add_check(
+            "sell_method_exactly_one_selected_set",
+            selected_sets_valid,
+            str(selected_sets),
+        )
+        selected_setting_valid = (
+            selected_sets_valid
+            and _path_exists(post_rules, f"sell.method.{selected_sets[0]}")
+            and isinstance(_get_path(post_rules, f"sell.method.{selected_sets[0]}"), dict)
+        )
+        add_check(
+            "sell_method_selected_setting_exists",
+            selected_setting_valid,
+            str(selected_sets),
+        )
+        if not selected_sets_valid:
+            add_unexpected(
+                "sell.method.selected_sets",
+                "exactly one supported SELL method set is required",
+            )
+        elif not selected_setting_valid:
+            add_unexpected(
+                f"sell.method.{selected_sets[0]}",
+                "selected SELL method setting is required",
+            )
 
     pre_buy_groups = deepcopy(pre_rules.get("buy", {}).get("groups"))
     post_buy_groups = deepcopy(post_rules.get("buy", {}).get("groups"))

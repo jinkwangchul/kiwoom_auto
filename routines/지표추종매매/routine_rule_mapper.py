@@ -836,9 +836,13 @@ def _selected_sell_method_sets(value: Any) -> list[str] | None:
     return selected
 
 
-def _build_sell_method_policy_candidates(sell_ui: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _build_sell_method_policy_candidates(
+    sell_ui: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, dict[str, Any]]:
     candidates: dict[str, dict[str, Any]] = {}
-    selected_sets = _selected_sell_method_sets(sell_ui.get("selected_sets"))
+    raw_selected_sets = sell_ui.get("selected_sets")
+    selected_sets = _selected_sell_method_sets(raw_selected_sets)
     if selected_sets is not None:
         candidates[SELL_METHOD_SELECTED_SETS_PATH] = {
             "path": SELL_METHOD_SELECTED_SETS_PATH,
@@ -850,14 +854,18 @@ def _build_sell_method_policy_candidates(sell_ui: dict[str, Any]) -> dict[str, d
             "runtime_write": False,
             "send_order": False,
         }
+        if len(selected_sets) != 1:
+            warnings.append("sell method selected_sets must select exactly one of setting_a/setting_b/setting_c")
+    elif raw_selected_sets is not None:
+        warnings.append("sell method selected_sets must select exactly one of setting_a/setting_b/setting_c")
 
     for ui_key, path in _SELL_METHOD_SETTING_PATHS.items():
         setting = sell_ui.get(ui_key)
         if not isinstance(setting, dict) or not setting:
             continue
         value = deepcopy(setting)
-        value["preview_only"] = True
-        value["execution_connected"] = False
+        value["preview_only"] = False
+        value["execution_connected"] = True
         value["runtime_write"] = False
         value["send_order"] = False
         candidates[path] = {
@@ -1608,7 +1616,7 @@ def build_engine_rules_preview_from_ui_state(
         }
 
     sell_ui = _as_dict(state.get("sell_ui"))
-    sell_method_candidates = _build_sell_method_policy_candidates(sell_ui)
+    sell_method_candidates = _build_sell_method_policy_candidates(sell_ui, validation_warnings)
     if sell_method_candidates:
         method_preview = preview_rules.setdefault("sell", {}).setdefault("method", {})
         if isinstance(method_preview, dict):
