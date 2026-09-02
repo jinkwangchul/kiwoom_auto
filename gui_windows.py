@@ -92,6 +92,7 @@ ACCOUNT_MEMOS_SETTINGS_KEY = "ui/account_memos"
 ACCOUNT_HISTORY_SETTINGS_KEY = "ui/known_accounts"
 TOTAL_BUDGET_ROUNDING_SETTINGS_KEY = "ui/total_budget_digit_alignment"
 BUDGET_WARNING_SETTINGS_KEY = "ui/budget_warning_enabled"
+START_BUDGET_APPLY_LIMIT_SETTINGS_KEY = "ui/start_budget_apply_limit_checked"
 BUFFER_RESPONSE_EVALUATION_FACTORS = ("손익비율", "손익금액", "투입금액")
 BUFFER_RESPONSE_SORT_DIRECTIONS = ("높은순", "낮은순")
 BUFFER_RESPONSE_ACTION_MODES = ("조기마감", "즉시청산", "구간마감")
@@ -1600,6 +1601,11 @@ from routine_instance_registry import (
     validate_routine_limit_response_policy,
 )
 from routine_instance_repository import RoutineInstanceRepository
+from routine_package_contract import (
+    SETTINGS_ROLE,
+    RoutineContractError,
+    load_routine_callable,
+)
 from stock_repository import (
     STOCK_CONFIG_EXPECTED_MISSING,
     STOCK_CONFIG_WRITE_CONCURRENT_UPDATE_RETRY_EXHAUSTED,
@@ -3177,7 +3183,6 @@ class _MarketDataMonitoringWindow(QDialog):
     MINIMUM_WIDTH = 550
     MINIMUM_HEIGHT = 580
     REALTIME_ROWS = (
-        ("price_signal", "가격신호"),
         ("broker_connected", "Broker 연결"),
         ("connection_epoch", "Connection Epoch"),
         ("login_session_id", "Login Session"),
@@ -3224,7 +3229,7 @@ class _MarketDataMonitoringWindow(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
-        root.addWidget(self._create_section("Realtime / 가격신호", self.REALTIME_ROWS))
+        root.addWidget(self._create_section("Realtime", self.REALTIME_ROWS))
         root.addWidget(self._create_section("TR Governor", self.TR_ROWS))
         compact_minimum_height = max(
             self.MINIMUM_HEIGHT,
@@ -3319,11 +3324,6 @@ class _MarketDataMonitoringWindow(QDialog):
             "tr_governor_metrics_snapshot",
             None,
         )
-        gate_getter = getattr(
-            self._operation_host,
-            "price_signal_observation_enabled",
-            None,
-        )
         try:
             market = market_getter() if callable(market_getter) else None
         except Exception:
@@ -3332,12 +3332,6 @@ class _MarketDataMonitoringWindow(QDialog):
             tr_metrics = tr_getter() if callable(tr_getter) else None
         except Exception:
             tr_metrics = None
-        try:
-            gate_enabled = bool(gate_getter()) if callable(gate_getter) else False
-        except Exception:
-            gate_enabled = False
-
-        self._set_value("price_signal", "ON" if gate_enabled else "OFF")
         received_count = int(getattr(market, "received_tick_count", 0) or 0)
         tick_rate = "-"
         if (
@@ -3419,6 +3413,7 @@ class RunningBudgetAdjustmentDialog(QDialog):
         pending_adjustment: dict[str, object] | None = None,
         timing_selection_enabled: bool = True,
         configuration_price_available: bool | None = None,
+        apply_limit_checked: bool = False,
     ) -> None:
         super().__init__(owner)
         self.stock_code = str(stock_code or "").strip()
@@ -3603,9 +3598,7 @@ class RunningBudgetAdjustmentDialog(QDialog):
         root.addSpacing(9)
 
         self.apply_limit_checkbox = QCheckBox("한도금액에 새 설정값 적용")
-        self.apply_limit_checkbox.setChecked(
-            bool(self.pending_adjustment and self.pending_adjustment.get("apply_limit"))
-        )
+        self.apply_limit_checkbox.setChecked(bool(apply_limit_checked))
         limit_row = QHBoxLayout()
         limit_row.setContentsMargins(checkbox_indent, 0, 0, 0)
         limit_row.addWidget(self.apply_limit_checkbox)
@@ -3730,6 +3723,11 @@ class RunningBudgetAdjustmentDialog(QDialog):
         value = self._input_value()
         if value <= 0:
             self._show_validation_message("변경값을 입력하세요.")
+            return
+        if not self.configuration_price_available or self.current_price <= 0:
+            self._show_validation_message(
+                MainWindow._start_budget_price_unavailable_message()
+            )
             return
         if value > 99_999_999:
             self._show_validation_message("99,999,999까지 입력할 수 있습니다.")
@@ -4003,7 +4001,6 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
         self.btn_review_required = QPushButton()
-        self.btn_price_signal_observation = QPushButton("가격신호 OFF")
         self.btn_market_data_monitoring = QPushButton("모니터링")
         self.btn_group_pack_register = QPushButton("그룹등록")
         self.btn_main_visible_early_close = QPushButton("조기마감")
@@ -4030,7 +4027,6 @@ class MainWindow(QMainWindow):
             getattr(market_data_observed, "connect", None)
         ):
             market_data_observed.connect(self._on_main_market_data_observed)
-        self._update_main_price_signal_observation_button()
         operation_host.operation_cycle_completed.connect(
             self._on_main_operation_cycle_completed
         )
@@ -4815,11 +4811,6 @@ class MainWindow(QMainWindow):
             MainWindow._update_main_routine_filter_badges(self)
         MainWindow._style_main_top_action_buttons(self)
         routine_header_layout.addWidget(
-            self.btn_price_signal_observation,
-            0,
-            Qt.AlignRight | Qt.AlignVCenter,
-        )
-        routine_header_layout.addWidget(
             self.btn_market_data_monitoring,
             0,
             Qt.AlignRight | Qt.AlignVCenter,
@@ -4910,10 +4901,6 @@ class MainWindow(QMainWindow):
     def _style_main_top_action_buttons(self) -> None:
         reference_button = getattr(self, "_main_routine_valid_button", None)
         for button, object_name in (
-            (
-                self.btn_price_signal_observation,
-                "mainPriceSignalObservationButton",
-            ),
             (self.btn_market_data_monitoring, "mainMarketDataMonitoringButton"),
             (self.btn_group_pack_register, "mainGroupPackRegisterButton"),
             (self.btn_main_visible_early_close, "mainVisibleEarlyCloseButton"),
@@ -6098,9 +6085,6 @@ class MainWindow(QMainWindow):
         self.btn_emergency_stop.doubleClicked.connect(self.on_emergency_stop_clicked)
         self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
-        self.btn_price_signal_observation.clicked.connect(
-            self.toggle_price_signal_observation
-        )
         self.btn_market_data_monitoring.clicked.connect(
             self.open_market_data_monitoring_window
         )
@@ -8394,6 +8378,33 @@ class MainWindow(QMainWindow):
         )
         MainWindow._apply_main_budget_warning_badge_style(self, clean_enabled)
 
+    def start_budget_apply_limit_checked(self) -> bool:
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is None:
+            return False
+        raw_value = settings.value(START_BUDGET_APPLY_LIMIT_SETTINGS_KEY, False)
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return bool(raw_value)
+        return str(raw_value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+    def set_start_budget_apply_limit_checked(self, checked: bool) -> None:
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is None:
+            return
+        settings.setValue(
+            START_BUDGET_APPLY_LIMIT_SETTINGS_KEY,
+            bool(checked),
+        )
+        settings.sync()
+
     def _apply_main_budget_warning_badge_style(self, enabled: bool) -> None:
         button = getattr(self, "budget_warning_toggle_button", None)
         if button is not None:
@@ -8701,15 +8712,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        settings_ui = str(routine_record.settings_ui or "").strip().lower()
-        if settings_ui != "indicator_follow":
-            QMessageBox.information(
-                self,
-                "\ub8e8\ud2f4 \uc124\uc815",
-                f"\uc120\ud0dd\ud55c \ub8e8\ud2f4\uc758 \uc124\uc815\ucc3d\uc774 \uc544\uc9c1 \uc5f0\uacb0\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.\\n\ub8e8\ud2f4\uba85: {routine_record.name}",
-            )
-            return
-
         rules_path = instance.rules_path if instance is not None else routine_record.rules_path
         if not rules_path.exists():
             QMessageBox.warning(
@@ -8720,17 +8722,16 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
-        except Exception as exc:
+            settings_dialog = load_routine_callable(definition, SETTINGS_ROLE)
+        except RoutineContractError as exc:
             QMessageBox.critical(
                 self,
                 "\uc124\uc815\ucc3d \ub85c\ub4dc \uc2e4\ud328",
-                "gui_indicator_follow_routine_settings_dialog.py \ud30c\uc77c\uc744 \ubd88\ub7ec\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.\\n"
-                f"{exc}",
+                f"\uc120\ud0dd\ud55c \ub8e8\ud2f4\uc758 \uc124\uc815\ucc3d\uc744 \ubd88\ub7ec\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.\\n{exc}",
             )
             return
 
-        dialog = IndicatorFollowRoutineSettingsDialog(
+        dialog = settings_dialog(
             rules_path=rules_path,
             routine_path=routine_record.path,
             routine_name=instance.display_name if instance is not None else routine_record.name,
@@ -8943,7 +8944,7 @@ class MainWindow(QMainWindow):
         }:
             message = "종목 한도 설정이 변경되어 적용하지 않았습니다."
         else:
-            message = "종목 한도를 변경하지 못했습니다."
+            message = "한도금액을 저장하지 못했습니다."
         show_toast(window, message, duration_ms=2500)
 
     @staticmethod
@@ -9022,16 +9023,6 @@ class MainWindow(QMainWindow):
             running_adjustment_authorized
             and decision.get("current_running") is True
         )
-        if (
-            bool(apply_limit)
-            and decision.get("current_running") is True
-            and not authorized_running_write
-        ):
-            return {
-                **decision,
-                "allowed": False,
-                "reason": "START_BUDGET_MUTATION_BLOCKED",
-            }
         if decision.get("allowed") is not True and not authorized_running_write:
             return decision
         if authorized_running_write:
@@ -9041,31 +9032,18 @@ class MainWindow(QMainWindow):
                 "reason": "",
                 "running_adjustment_authorized": True,
             }
-        limit_changed = False
-        if bool(apply_limit):
-            limit_amount = safe_int_value(adjusted_limit_amount, 0)
-            if limit_amount <= 0:
-                return {
-                    **decision,
-                    "allowed": False,
-                    "reason": "INVALID_ADJUSTED_LIMIT",
-                }
-            enabled_value, amount_value, source_value = canonical_stock_buy_limit_values(
-                enabled=True,
-                amount=limit_amount,
-                source=BUY_LIMIT_SOURCE_RECOMMENDED,
-            )
-            limit_changed = bool(
-                config.get("buy_limit_enabled") != enabled_value
-                or config.get("buy_limit_amount") != amount_value
-                or config.get("buy_limit_source") != source_value
-            )
-            next_config["buy_limit_enabled"] = enabled_value
-            next_config["buy_limit_amount"] = amount_value
-            next_config["buy_limit_source"] = source_value
-        if decision.get("changed") is not True and not limit_changed:
-            return {**decision, "limit_changed": False}
-        patch = {
+        limit_requested = bool(apply_limit)
+        limit_enabled = bool(config.get("buy_limit_enabled", False))
+        limit_amount = safe_int_value(adjusted_limit_amount, 0)
+        limit_write_requested = bool(
+            limit_requested and limit_enabled and limit_amount > 0
+        )
+        limit_failure_reason = (
+            "INVALID_ADJUSTED_LIMIT"
+            if limit_requested and limit_enabled and limit_amount <= 0
+            else ""
+        )
+        budget_patch = {
             "trade_amount_type": normalized_mode,
             (
                 "buy_amount" if normalized_mode == "AMOUNT" else "buy_qty"
@@ -9074,32 +9052,51 @@ class MainWindow(QMainWindow):
             ],
             "updated_at": stock_now_text(),
         }
-        if bool(apply_limit):
-            patch.update(
-                {
-                    "buy_limit_enabled": next_config["buy_limit_enabled"],
-                    "buy_limit_amount": next_config["buy_limit_amount"],
-                    "buy_limit_source": next_config["buy_limit_source"],
-                }
-            )
-        domain_field_keys = tuple(key for key in patch if key != "updated_at")
+        budget_field_keys = tuple(
+            key for key in budget_patch if key != "updated_at"
+        )
         if expected_fields is None:
             expected_fields = MainWindow._stock_config_expected_fields(
                 config,
-                domain_field_keys,
+                (
+                    *budget_field_keys,
+                    *(
+                        (
+                            "buy_limit_enabled",
+                            "buy_limit_amount",
+                            "buy_limit_source",
+                        )
+                        if limit_requested
+                        else ()
+                    ),
+                ),
             )
+        budget_expected_fields = {
+            key: expected_fields.get(key)
+            for key in budget_field_keys
+            if key in expected_fields
+        }
         repository, canonical_stock_code = MainWindow._stock_config_repository_target(
             config_path
         )
         if repository is None:
             persistence_result = MainWindow._invalid_stock_config_write_result(
-                domain_field_keys
+                budget_field_keys
             )
-        else:
+        elif decision.get("changed") is True:
             persistence_result = repository.patch_stock_config(
                 canonical_stock_code,
-                patch,
-                expected_fields=expected_fields,
+                budget_patch,
+                expected_fields=budget_expected_fields,
+            )
+        else:
+            persistence_result = StockConfigWriteResult(
+                ok=True,
+                changed=False,
+                field_keys=budget_field_keys,
+                conflict_detected=False,
+                read_back_verified=True,
+                reason_code="",
             )
         if not persistence_result.ok:
             return {
@@ -9111,12 +9108,43 @@ class MainWindow(QMainWindow):
                 "written": False,
                 "config_write_result": persistence_result,
             }
+        limit_changed = False
+        limit_write_result = None
+        if limit_write_requested:
+            limit_expected_fields = {
+                key: expected_fields.get(key)
+                for key in (
+                    "buy_limit_enabled",
+                    "buy_limit_amount",
+                    "buy_limit_source",
+                )
+                if key in expected_fields
+            }
+            limit_write_result = MainWindow._write_stock_buy_limit_config(
+                config_path,
+                enabled=limit_enabled,
+                amount=limit_amount,
+                source=BUY_LIMIT_SOURCE_RECOMMENDED,
+                expected_fields=limit_expected_fields,
+            )
+            if limit_write_result.ok:
+                limit_changed = bool(limit_write_result.changed)
+            else:
+                limit_failure_reason = str(limit_write_result.reason_code or "").strip()
         return {
             **decision,
             "changed": bool(decision.get("changed")) or limit_changed,
             "limit_changed": limit_changed,
-            "written": persistence_result.changed,
+            "limit_requested": limit_requested,
+            "limit_applied": bool(
+                limit_write_requested
+                and limit_write_result is not None
+                and limit_write_result.ok
+            ),
+            "limit_reason": limit_failure_reason,
+            "written": bool(persistence_result.changed or limit_changed),
             "config_write_result": persistence_result,
+            "limit_write_result": limit_write_result,
         }
 
     @staticmethod
@@ -9214,6 +9242,10 @@ class MainWindow(QMainWindow):
         resolved_price = safe_float_value(current_price, 0.0)
         return resolved_price if resolved_price > 0 else None
 
+    @staticmethod
+    def _start_budget_price_unavailable_message() -> str:
+        return "현재 주가를 확인한 후 변경할 수 있습니다."
+
     def _open_running_budget_adjustment_dialog(
         self,
         row: int,
@@ -9230,6 +9262,12 @@ class MainWindow(QMainWindow):
             self,
             config_path,
         )
+        if current_price is None:
+            show_toast(
+                self,
+                MainWindow._start_budget_price_unavailable_message(),
+            )
+            return
         state = read_json_dict(config_path.parent / "state.json")
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
@@ -9278,6 +9316,7 @@ class MainWindow(QMainWindow):
                 current_price is not None
                 and safe_float_value(current_price, 0.0) > 0
             ),
+            apply_limit_checked=MainWindow.start_budget_apply_limit_checked(self),
         )
         self._running_budget_adjustment_dialog = dialog
         accepted = False
@@ -9289,6 +9328,21 @@ class MainWindow(QMainWindow):
             self._running_budget_adjustment_dialog = None
             dialog.deleteLater()
         if not accepted or not request:
+            return
+
+        MainWindow.set_start_budget_apply_limit_checked(
+            self,
+            bool(request.get("apply_limit", False)),
+        )
+
+        if MainWindow._starting_budget_change_current_price(
+            self,
+            config_path,
+        ) is None:
+            show_toast(
+                self,
+                MainWindow._start_budget_price_unavailable_message(),
+            )
             return
 
         current_config = read_json_dict(config_path)
@@ -9322,9 +9376,6 @@ class MainWindow(QMainWindow):
                 mode=current_mode,
                 value=requested_value,
             )
-            if adjusted_limit_amount is None:
-                show_toast(self, "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.")
-                return
 
         expected_fields = MainWindow._start_budget_config_expected_fields(
             display_config,
@@ -9371,7 +9422,6 @@ class MainWindow(QMainWindow):
                     runtime_committed=True,
                 )
                 return
-            success_message = "기본예산 변경 요청을 저장했습니다."
         else:
             write_result = self._write_stock_initial_buy_config(
                 config_path,
@@ -9403,6 +9453,13 @@ class MainWindow(QMainWindow):
                         runtime_committed=False,
                     )
                 return
+        if bool(request.get("apply_limit", False)):
+            success_message = (
+                "기본예산과 한도금액을 변경했습니다."
+                if bool(write_result.get("limit_applied"))
+                else "기본예산을 변경했습니다. 한도금액은 기존 설정을 유지합니다."
+            )
+        else:
             success_message = "기본예산을 변경했습니다."
         if opened_current_running or bool(write_result.get("changed")):
             refresh_auto_trade_views(self)
@@ -9415,16 +9472,16 @@ class MainWindow(QMainWindow):
         mode: str,
         value: int,
     ) -> int | None:
+        configuration_state = main_stock_configuration_market_information_state(
+            self,
+            self._stock_projection_for_config_path(config_path),
+        )
+        if configuration_state is None:
+            return None
         starting_budget = max(0, safe_int_value(value, 0))
         if str(mode or "").strip().upper() == "QUANTITY":
-            configuration_state = main_stock_configuration_market_information_state(
-                self,
-                self._stock_projection_for_config_path(config_path),
-            )
             configuration_price = (
                 getattr(configuration_state, "last_price", None)
-                if configuration_state is not None
-                else None
             )
             starting_budget = floor_money_to_won(
                 safe_float_value(configuration_price, 0.0) * starting_budget
@@ -9445,6 +9502,46 @@ class MainWindow(QMainWindow):
         ):
             return None
         return adjusted_limit_amount
+
+    @staticmethod
+    def _adjusted_buy_limit_failure_reason(
+        window,
+        config_path: Path,
+        *,
+        mode: str,
+        value: int,
+    ) -> str:
+        configuration_state = main_stock_configuration_market_information_state(
+            window,
+            MainWindow._stock_projection_for_config_path(config_path),
+        )
+        if configuration_state is None:
+            return CURRENT_PRICE_UNAVAILABLE
+        starting_budget = max(0, safe_int_value(value, 0))
+        if str(mode or "").strip().upper() == "QUANTITY":
+            starting_budget = floor_money_to_won(
+                safe_float_value(
+                    getattr(configuration_state, "last_price", None),
+                    0.0,
+                )
+                * starting_budget
+            )
+        if starting_budget <= 0:
+            return "INVALID_STARTING_BUDGET"
+        defaults = starting_budget_defaults()
+        adjusted_limit_amount = suggested_buy_limit(
+            starting_budget,
+            defaults["limit_recommended_multiplier"],
+            align_digits=stock_limit_digit_alignment_enabled(),
+        )
+        if adjusted_limit_amount is None:
+            return "LIMIT_DEFAULTS_INVALID"
+        total_budget = _system_total_budget_amount()
+        if total_budget is None:
+            return "TOTAL_BUDGET_UNAVAILABLE"
+        if adjusted_limit_amount > total_budget:
+            return "RECOMMENDED_BUY_LIMIT_EXCEEDS_TOTAL_BUDGET"
+        return "INVALID_STARTING_BUDGET"
 
     def _stock_start_budget_locked(self, config_path: Path) -> bool:
         target_path = Path(config_path)
@@ -9531,6 +9628,11 @@ class MainWindow(QMainWindow):
             return None
         if window is None:
             return None
+        if main_stock_configuration_market_information_state(
+            window,
+            MainWindow._stock_projection_for_config_path(target_path),
+        ) is None:
+            return None
         starting_budget = main_stock_resolved_starting_budget(
             window,
             MainWindow._stock_projection_for_config_path(target_path),
@@ -9541,6 +9643,52 @@ class MainWindow(QMainWindow):
             starting_budget,
             defaults[multiplier_key],
             align_digits=stock_limit_digit_alignment_enabled(),
+        )
+
+    @staticmethod
+    def _stock_suggested_buy_limit_failure_reason(
+        config_path: Path,
+        *,
+        window=None,
+    ) -> str:
+        config = read_json_dict(Path(config_path))
+        if not isinstance(config, dict) or not config:
+            return "INVALID_STARTING_BUDGET"
+        if window is None:
+            return CURRENT_PRICE_UNAVAILABLE
+        configuration_state = main_stock_configuration_market_information_state(
+            window,
+            MainWindow._stock_projection_for_config_path(Path(config_path)),
+        )
+        if configuration_state is None:
+            return CURRENT_PRICE_UNAVAILABLE
+        return "INVALID_STARTING_BUDGET"
+
+    @staticmethod
+    def _stock_buy_limit_failure_message(reason_code: object) -> str:
+        return {
+            CURRENT_PRICE_UNAVAILABLE: (
+                "현재 주가를 확인할 수 없어 권장한도를 계산하지 못했습니다."
+            ),
+            "TOTAL_BUDGET_UNAVAILABLE": (
+                "전체예산을 확인할 수 없어 한도를 계산하지 못했습니다."
+            ),
+            "RECOMMENDED_BUY_LIMIT_EXCEEDS_TOTAL_BUDGET": (
+                "권장한도가 전체예산을 초과합니다."
+            ),
+            "MINIMUM_BUY_LIMIT_EXCEEDS_TOTAL_BUDGET": (
+                "최소한도가 전체예산을 초과합니다."
+            ),
+            "INVALID_STARTING_BUDGET": (
+                "기본예산을 확인할 수 없어 권장한도를 계산하지 못했습니다."
+            ),
+            "LIMIT_DEFAULTS_INVALID": (
+                "최소한도를 계산하지 못해 한도를 적용하지 않았습니다."
+            ),
+            "WRITE_FAILED": "한도금액을 저장하지 못했습니다.",
+        }.get(
+            str(reason_code or "").strip(),
+            "한도금액을 저장하지 못했습니다.",
         )
 
     def handle_routine_stock_operation_double_click(self, row: int) -> bool:
@@ -9721,7 +9869,10 @@ class MainWindow(QMainWindow):
             ),
         )
         if result.get("reason") == CURRENT_PRICE_UNAVAILABLE:
-            show_toast(self, "현재주가 수신 후 변경할 수 있습니다.")
+            show_toast(
+                self,
+                MainWindow._start_budget_price_unavailable_message(),
+            )
             return
         if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
             self._show_start_budget_mutation_blocked(self)
@@ -9836,6 +9987,15 @@ class MainWindow(QMainWindow):
         config_path = self._stock_config_path_for_routine_row(row)
         if config_path is None:
             return
+        if MainWindow._starting_budget_change_current_price(
+            self,
+            config_path,
+        ) is None:
+            show_toast(
+                self,
+                MainWindow._start_budget_price_unavailable_message(),
+            )
+            return
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
@@ -9928,30 +10088,60 @@ class MainWindow(QMainWindow):
             window=self,
         )
         if recommended is None:
+            reason_code = MainWindow._stock_suggested_buy_limit_failure_reason(
+                config_path,
+                window=self,
+            )
             show_toast(
                 self,
-                "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.",
+                MainWindow._stock_buy_limit_failure_message(reason_code),
             )
             return
         total_budget = _system_total_budget_amount()
-        if recommended <= 0 or total_budget is None:
+        if recommended <= 0:
+            show_toast(
+                self,
+                MainWindow._stock_buy_limit_failure_message(
+                    "INVALID_STARTING_BUDGET"
+                ),
+            )
+            return
+        if total_budget is None:
+            show_toast(
+                self,
+                MainWindow._stock_buy_limit_failure_message(
+                    "TOTAL_BUDGET_UNAVAILABLE"
+                ),
+            )
             return
         minimum_amount = self._stock_suggested_buy_limit(
             config_path,
             minimum=True,
             window=self,
         )
+        if minimum_amount is None:
+            show_toast(
+                self,
+                MainWindow._stock_buy_limit_failure_message(
+                    "LIMIT_DEFAULTS_INVALID"
+                ),
+            )
+            return
         if minimum_amount is not None and minimum_amount > total_budget:
             show_toast(
                 self,
-                "최소한도가 전체예산을 초과합니다.",
+                MainWindow._stock_buy_limit_failure_message(
+                    "MINIMUM_BUY_LIMIT_EXCEEDS_TOTAL_BUDGET"
+                ),
                 duration_ms=2500,
             )
             return
         if recommended > total_budget:
             show_toast(
                 self,
-                "권장한도가 전체예산을 초과 합니다",
+                MainWindow._stock_buy_limit_failure_message(
+                    "RECOMMENDED_BUY_LIMIT_EXCEEDS_TOTAL_BUDGET"
+                ),
                 duration_ms=2500,
             )
             self.start_routine_stock_buy_limit_edit(
@@ -10043,14 +10233,31 @@ class MainWindow(QMainWindow):
             minimum=True,
             window=self,
         )
+        if minimum_amount is None:
+            reason_code = MainWindow._stock_suggested_buy_limit_failure_reason(
+                config_path,
+                window=self,
+            )
+            show_toast(
+                self,
+                MainWindow._stock_buy_limit_failure_message(reason_code),
+            )
+            close_editor()
+            return
         total_budget = _system_total_budget_amount()
         if total_budget is None:
+            show_toast(
+                self,
+                MainWindow._stock_buy_limit_failure_message(
+                    "TOTAL_BUDGET_UNAVAILABLE"
+                ),
+            )
             close_editor()
             return
         if amount > total_budget:
             show_toast(
                 self,
-                "입력값이 전체예산을 초과합니다.",
+                "입력한 한도금액이 전체예산을 초과합니다.",
                 duration_ms=2500,
             )
             restore_after_invalid_input()
@@ -10076,10 +10283,10 @@ class MainWindow(QMainWindow):
                 config_path,
                 **writer_kwargs,
             )
-        except Exception as exc:
+        except Exception:
             show_toast(
                 self,
-                f"종목 한도를 변경하지 못했습니다.\n{exc}",
+                "한도금액을 저장하지 못했습니다.",
                 duration_ms=2500,
             )
             return
@@ -11527,20 +11734,6 @@ class MainWindow(QMainWindow):
             host = AutoTradeOperationHost(self)
             self._main_monitoring_auto_trade_operation_host = host
         return host
-
-    def _update_main_price_signal_observation_button(self) -> bool:
-        host = self.main_monitoring_auto_trade_operation_host()
-        enabled = bool(host.price_signal_observation_enabled())
-        self.btn_price_signal_observation.setText(
-            "가격신호 ON" if enabled else "가격신호 OFF"
-        )
-        return enabled
-
-    def toggle_price_signal_observation(self) -> bool:
-        host = self.main_monitoring_auto_trade_operation_host()
-        current = bool(host.price_signal_observation_enabled())
-        host.set_price_signal_observation_enabled(not current)
-        return self._update_main_price_signal_observation_button()
 
     def open_market_data_monitoring_window(self) -> QDialog:
         window = getattr(self, "market_data_monitoring_window", None)

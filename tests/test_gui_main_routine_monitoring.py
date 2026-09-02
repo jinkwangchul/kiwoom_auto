@@ -216,60 +216,264 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             metrics.horizontalAdvance("가" * 10),
         )
 
-    def test_valid_summary_uses_projected_relation_stock_rows(self) -> None:
-        group = SimpleNamespace(
-            group_id="group-a",
-            instances=(
-                SimpleNamespace(instance_id="inst-a"),
-                SimpleNamespace(instance_id="inst-b"),
+    def test_valid_summary_changes_structure_but_preserves_status_totals(self) -> None:
+        groups = (
+            SimpleNamespace(
+                group_id="group-a",
+                instances=(
+                    SimpleNamespace(instance_id="inst-a"),
+                    SimpleNamespace(instance_id="inst-b"),
+                ),
+            ),
+            SimpleNamespace(
+                group_id="group-b",
+                instances=(SimpleNamespace(instance_id="inst-c"),),
+            ),
+            SimpleNamespace(
+                group_id="group-c",
+                instances=(SimpleNamespace(instance_id="inst-d"),),
             ),
         )
         relation_counts = {
             gui_main_table_loader.main_group_instance_relation_id(
                 "group-a", "inst-a"
-            ): {"stocks": [{}] * 4},
+            ): {"stocks": [{}] * 2},
             gui_main_table_loader.main_group_instance_relation_id(
                 "group-a", "inst-b"
-            ): {"stocks": [{}] * 6},
+            ): {"stocks": [{}] * 2},
+            gui_main_table_loader.main_group_instance_relation_id(
+                "group-b", "inst-c"
+            ): {"stocks": []},
+            gui_main_table_loader.main_group_instance_relation_id(
+                "group-c", "inst-d"
+            ): {"stocks": []},
         }
         instance_counts = {
-            "inst-a": {"waiting": 4, "review": 2},
-            "inst-b": {"waiting": 6, "review": 4},
+            "inst-a": {
+                "registered": 3,
+                "operation_running": 2,
+                "waiting": 1,
+                "excluded": 0,
+                "review": 0,
+            },
+            "inst-b": {
+                "registered": 2,
+                "operation_running": 0,
+                "waiting": 2,
+                "excluded": 0,
+                "review": 0,
+            },
+            "inst-c": {
+                "registered": 3,
+                "operation_running": 0,
+                "waiting": 2,
+                "excluded": 1,
+                "review": 0,
+            },
+            "inst-d": {
+                "registered": 2,
+                "operation_running": 0,
+                "waiting": 0,
+                "excluded": 1,
+                "review": 1,
+            },
+        }
+        window = SimpleNamespace(
+            _main_routine_valid_only=False,
+            _update_main_routine_summary=MagicMock(),
+        )
+        definitions = [SimpleNamespace(definition_id=f"def-{index}") for index in range(3)]
+        instances = [
+            SimpleNamespace(instance_id=f"inst-{suffix}", definition_id="def-0")
+            for suffix in ("a", "b", "c", "d")
+        ]
+
+        def summary(valid_only: bool):
+            window._main_routine_valid_only = valid_only
+            gui_main_table_loader._update_main_routine_summary(
+                window,
+                definitions,
+                instances,
+                instance_counts,
+                group_projection=groups,
+                relation_counts=relation_counts,
+            )
+            return window._update_main_routine_summary.call_args.args[0]
+
+        all_projection = summary(False)
+        valid_projection = summary(True)
+        self.assertEqual(
+            (
+                ("group", "그룹", 3),
+                ("routine", "루틴", 4),
+                ("stock", "종목", 10),
+                ("operation", "운영", 2),
+                ("waiting", "대기", 5),
+                ("excluded", "제외", 2),
+                ("review", "검토", 1),
+            ),
+            all_projection["count_badges"],
+        )
+        self.assertEqual(
+            (
+                ("group", "그룹", 1),
+                ("routine", "루틴", 2),
+                ("stock", "종목", 4),
+                ("operation", "운영", 2),
+                ("waiting", "대기", 5),
+                ("excluded", "제외", 2),
+                ("review", "검토", 1),
+            ),
+            valid_projection["count_badges"],
+        )
+
+    def test_status_filter_counts_do_not_flow_back_into_structure_badges(self) -> None:
+        groups = (
+            SimpleNamespace(
+                group_id="group-a",
+                instances=(
+                    SimpleNamespace(instance_id="inst-a"),
+                    SimpleNamespace(instance_id="inst-b"),
+                ),
+            ),
+            SimpleNamespace(
+                group_id="group-b",
+                instances=(SimpleNamespace(instance_id="inst-c"),),
+            ),
+            SimpleNamespace(
+                group_id="group-c",
+                instances=(SimpleNamespace(instance_id="inst-d"),),
+            ),
+        )
+        definitions = [SimpleNamespace(definition_id=f"def-{index}") for index in range(3)]
+        instances = [
+            SimpleNamespace(instance_id=f"inst-{suffix}", definition_id="def-0")
+            for suffix in ("a", "b", "c", "d")
+        ]
+        instance_counts = {
+            "inst-a": {
+                "registered": 2,
+                "operation_running": 1,
+                "waiting": 1,
+                "excluded": 0,
+                "review": 0,
+            },
+            "inst-b": {
+                "registered": 2,
+                "operation_running": 0,
+                "waiting": 1,
+                "excluded": 1,
+                "review": 0,
+            },
+            "inst-c": {
+                "registered": 3,
+                "operation_running": 0,
+                "waiting": 0,
+                "excluded": 2,
+                "review": 1,
+            },
+            "inst-d": {
+                "registered": 3,
+                "operation_running": 0,
+                "waiting": 0,
+                "excluded": 2,
+                "review": 1,
+            },
+        }
+        relation_id_a = gui_main_table_loader.main_group_instance_relation_id(
+            "group-a", "inst-a"
+        )
+        relation_id_b = gui_main_table_loader.main_group_instance_relation_id(
+            "group-a", "inst-b"
+        )
+        relation_id_c = gui_main_table_loader.main_group_instance_relation_id(
+            "group-b", "inst-c"
+        )
+        relation_id_d = gui_main_table_loader.main_group_instance_relation_id(
+            "group-c", "inst-d"
+        )
+        structure_relation_counts = {
+            relation_id_a: {"stocks": [{}, {}]},
+            relation_id_b: {"stocks": [{}, {}]},
+            relation_id_c: {"stocks": []},
+            relation_id_d: {"stocks": []},
+        }
+        visible_counts_by_scope = {
+            "all": (2, 2, 0, 0),
+            "operation": (1, 0, 0, 0),
+            "waiting": (1, 1, 0, 0),
+            "excluded": (0, 1, 0, 0),
+        }
+        expected_visible_count = {
+            "all": 4,
+            "operation": 1,
+            "waiting": 2,
+            "excluded": 1,
         }
         window = SimpleNamespace(
             _main_routine_valid_only=True,
             _update_main_routine_summary=MagicMock(),
         )
 
-        gui_main_table_loader._update_main_routine_summary(
-            window,
-            [SimpleNamespace(definition_id="indicator_follow")],
-            [
-                SimpleNamespace(
-                    instance_id="inst-a", definition_id="indicator_follow"
-                ),
-                SimpleNamespace(
-                    instance_id="inst-b", definition_id="indicator_follow"
-                ),
-            ],
-            instance_counts,
-            group_projection=(group,),
-            relation_counts=relation_counts,
-        )
+        for scope, visible_counts in visible_counts_by_scope.items():
+            with self.subTest(valid_only=True, scope=scope):
+                visible_relation_counts = {
+                    relation_id_a: {"stocks": [{}] * visible_counts[0]},
+                    relation_id_b: {"stocks": [{}] * visible_counts[1]},
+                    relation_id_c: {"stocks": [{}] * visible_counts[2]},
+                    relation_id_d: {"stocks": [{}] * visible_counts[3]},
+                }
+                gui_main_table_loader._update_main_routine_summary(
+                    window,
+                    definitions,
+                    instances,
+                    instance_counts,
+                    group_projection=groups,
+                    relation_counts=visible_relation_counts,
+                    structure_relation_counts=structure_relation_counts,
+                )
+                projection = window._update_main_routine_summary.call_args.args[0]
+                badge_values = {
+                    key: value for key, _label, value in projection["count_badges"]
+                }
+                self.assertEqual(
+                    {"group": 1, "routine": 2, "stock": 4},
+                    {
+                        key: badge_values[key]
+                        for key in ("group", "routine", "stock")
+                    },
+                )
+                self.assertEqual(expected_visible_count[scope], sum(visible_counts))
 
-        projection = window._update_main_routine_summary.call_args.args[0]
-        self.assertEqual(
-            (
-                ("group", "그룹", 1),
-                ("routine", "루틴", 2),
-                ("stock", "종목", 10),
-                ("operation", "운영", 0),
-                ("waiting", "대기", 10),
-                ("excluded", "제외", 0),
-                ("review", "검토", 6),
-            ),
-            projection["count_badges"],
-        )
+        window._main_routine_valid_only = False
+        for scope, visible_counts in visible_counts_by_scope.items():
+            with self.subTest(valid_only=False, scope=scope):
+                visible_relation_counts = {
+                    relation_id_a: {"stocks": [{}] * visible_counts[0]},
+                    relation_id_b: {"stocks": [{}] * visible_counts[1]},
+                    relation_id_c: {"stocks": [{}] * visible_counts[2]},
+                    relation_id_d: {"stocks": [{}] * visible_counts[3]},
+                }
+                gui_main_table_loader._update_main_routine_summary(
+                    window,
+                    definitions,
+                    instances,
+                    instance_counts,
+                    group_projection=groups,
+                    relation_counts=visible_relation_counts,
+                    structure_relation_counts=structure_relation_counts,
+                )
+                projection = window._update_main_routine_summary.call_args.args[0]
+                badge_values = {
+                    key: value for key, _label, value in projection["count_badges"]
+                }
+                self.assertEqual(
+                    {"group": 3, "routine": 4, "stock": 10},
+                    {
+                        key: badge_values[key]
+                        for key in ("group", "routine", "stock")
+                    },
+                )
     def test_market_early_close_runtime_drives_stock_status_method_and_liquidation(self) -> None:
         requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
         state = {
@@ -3786,7 +3990,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual("UNSET", row["buy_limit_source"])
             toast.assert_called_once_with(
                 window,
-                "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.",
+                "현재 주가를 확인할 수 없어 권장한도를 계산하지 못했습니다.",
             )
             window.load_routine_table.assert_not_called()
             window.start_routine_stock_buy_limit_edit.assert_not_called()
@@ -4403,11 +4607,20 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window._open_running_budget_adjustment_dialog = MagicMock()
             window._stock_start_budget_locked = MagicMock(return_value=False)
             window._stock_default_initial_buy_value = MagicMock(return_value=1)
+            configuration_state = SimpleNamespace(
+                last_price=70_000,
+                login_session_id="SESSION-1",
+                field_sources=(("last_price", "SNAPSHOT"),),
+            )
+            window.main_monitoring_auto_trade_operation_host = lambda: SimpleNamespace(
+                configuration_market_information_state=lambda _code: configuration_state,
+            )
             window._write_stock_initial_buy_config = MagicMock(
                 return_value={"allowed": True, "changed": True, "reason": ""}
             )
             window.load_routine_table = MagicMock()
             window.refresh_auto_trade_assignment_views = MagicMock()
+            window._stock_suggested_buy_limit = MagicMock(return_value=1)
 
             for disabled_level in ("routine", "group"):
                 window._main_routine_display_level = disabled_level
@@ -4485,6 +4698,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
             window.load_routine_table = MagicMock()
             window.refresh_auto_trade_assignment_views = MagicMock()
+            window._stock_suggested_buy_limit = MagicMock(return_value=1)
 
             window.finish_routine_stock_buy_limit_edit(save=True)
 

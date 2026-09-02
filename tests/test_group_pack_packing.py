@@ -32,14 +32,45 @@ class GroupPackPackingTest(unittest.TestCase):
             "settings_ui": "indicator_follow",
             "module_name": "indicator_follow_routine",
             "rules_file": "rules.json",
+            "locators": {
+                "evaluation": {"file": "routine.py", "callable": "evaluate"},
+                "settings": {
+                    "project_file": "gui_indicator_follow_routine_settings_dialog.py",
+                    "callable": "Dialog",
+                },
+                "rule_mapper": {"file": "routine_rule_mapper.py"},
+                "execution_admission": {
+                    "file": "routine.py",
+                    "callable": "evaluate_execution_admission",
+                },
+                "final_safety": {
+                    "file": "routine.py",
+                    "callable": "evaluate_final_real_order_safety",
+                },
+            },
         }
+        routine_code = b"""\
+def evaluate(context):
+    return None
+
+def _allow(subject, rules, routine_identity, rules_identity):
+    return {
+        'allowed': True,
+        'routine_identity': routine_identity,
+        'rules_identity': rules_identity,
+    }
+
+evaluate_execution_admission = _allow
+evaluate_final_real_order_safety = _allow
+"""
         files = {
             "routines/지표추종매매/routine.json": (
                 json.dumps(routine_json, ensure_ascii=False, indent=2) + "\n"
             ).encode("utf-8"),
-            "routines/지표추종매매/routine.py": b"ENABLED = True\n",
+            "routines/지표추종매매/routine.py": routine_code,
+            "routines/지표추종매매/routine_rule_mapper.py": b"MAPPER = True\n",
             "routines/지표추종매매/rules.json": b"{}\n",
-            "gui_indicator_follow_routine_settings_dialog.py": b"DIALOG = True\n",
+            "gui_indicator_follow_routine_settings_dialog.py": b"class Dialog:\n    pass\n",
         }
         for relative, data in files.items():
             path = root.joinpath(*Path(relative).parts)
@@ -150,6 +181,24 @@ class GroupPackPackingTest(unittest.TestCase):
 
         self.assertFalse(valid)
         self.assertIn("보호된 저장 위치", error)
+
+    def test_locator_target_missing_from_spec_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group, _second, _files = self._source_project(root)
+            spec_path = root / "routines" / "지표추종매매" / "group_pack_spec.json"
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            spec["files"].remove("routines/지표추종매매/routine_rule_mapper.py")
+            spec_path.write_text(
+                json.dumps(spec, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            valid, error = validate_group_pack_source(group.group_id, project_root=root)
+
+        self.assertFalse(valid)
+        self.assertIn("locator", error)
+        self.assertIn("routine_rule_mapper.py", error)
 
     def test_validation_failure_leaves_no_partial_zip(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -19,12 +19,13 @@ from decision_trace_contract import (
     resolve_live_trace_mode,
 )
 from decision_trace_snapshot_service import (
-    DEFAULT_ENGINE_BUNDLE_FILES,
     DecisionTraceSnapshotService,
     compute_engine_bundle_identity,
 )
 from decision_trace_writer import DecisionTraceWriter
 from market_evidence_store import MarketEvidenceStore
+from routine_instance_registry import routine_definition_by_id, routine_instance_by_id
+from routine_package_contract import routine_trace_contract
 
 
 LOGGER = logging.getLogger(__name__)
@@ -106,30 +107,42 @@ class _EngineIdentityCache:
     def __init__(self, project_root: Path) -> None:
         self.project_root = Path(project_root)
         self._lock = threading.RLock()
-        self._signature: tuple[tuple[str, int, int], ...] | None = None
-        self._identity: dict[str, Any] | None = None
+        self._cache: dict[tuple[tuple[str, int, int], ...], dict[str, Any]] = {}
 
-    def get(self) -> dict[str, Any]:
+    def get(self, bundle_files: tuple[Path, ...]) -> dict[str, Any]:
         signature: list[tuple[str, int, int]] = []
-        for relative in DEFAULT_ENGINE_BUNDLE_FILES:
-            stat = (self.project_root / relative).stat()
-            signature.append((relative, stat.st_size, stat.st_mtime_ns))
+        for path in bundle_files:
+            resolved = Path(path).resolve()
+            stat = resolved.stat()
+            signature.append((str(resolved), stat.st_size, stat.st_mtime_ns))
         frozen = tuple(signature)
         with self._lock:
-            if self._signature != frozen or self._identity is None:
-                self._identity = compute_engine_bundle_identity(project_root=self.project_root)
-                self._signature = frozen
-            return deepcopy(self._identity)
+            if frozen not in self._cache:
+                self._cache[frozen] = compute_engine_bundle_identity(
+                    bundle_files,
+                    project_root=self.project_root,
+                )
+            return deepcopy(self._cache[frozen])
 
 
 class DecisionObservationCollector:
     """In-memory collector passed through the existing routine context."""
 
-    def __init__(self, *, trace_id: str, trace_level: str, initial_rules: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        trace_id: str,
+        trace_level: str,
+        initial_rules: Any = None,
+        engine_bundle_files: tuple[Path, ...] = (),
+        rules_excluded_keys: tuple[str, ...] = (),
+    ) -> None:
         self.trace_id = trace_id
         self.trace_level = trace_level
         self.capture_details = trace_level == "DIAGNOSTIC"
         self.effective_rules = initial_rules if isinstance(initial_rules, dict) else None
+        self.engine_bundle_files = tuple(engine_bundle_files)
+        self.rules_excluded_keys = tuple(rules_excluded_keys)
         self.conditions: list[dict[str, Any]] = []
         self.groups: list[dict[str, Any]] = []
         self.indicator_snapshots: list[dict[str, Any]] = []
@@ -180,6 +193,7 @@ class ProductionDecisionTraceObserver:
         trace_id_factory: Callable[[], str] = new_trace_id,
     ) -> None:
         root = Path(project_root) if project_root is not None else Path(__file__).resolve().parent
+        self.project_root = root
         self.writer = writer or DecisionTraceWriter()
         self.snapshot_service = snapshot_service or DecisionTraceSnapshotService()
         self.market_store = market_store or MarketEvidenceStore()
@@ -194,6 +208,7 @@ class ProductionDecisionTraceObserver:
         stock_code: str,
         routine_instance_id: str,
         routine_name: str,
+        definition_id: str = "",
         initial_rules: Any = None,
     ) -> DecisionObservationCollector:
         level = self.mode_provider.mode_for(
@@ -202,10 +217,30 @@ class ProductionDecisionTraceObserver:
             routine_name=routine_name,
             now=self._now_factory(),
         )
+        engine_files: tuple[Path, ...] = ()
+        excluded_keys: tuple[str, ...] = ()
+        try:
+            instance = routine_instance_by_id(
+                routine_instance_id,
+                project_root=self.project_root,
+            )
+            resolved_definition_id = str(
+                definition_id or getattr(instance, "definition_id", "") or ""
+            ).strip()
+            definition = routine_definition_by_id(
+                resolved_definition_id,
+                project_root=self.project_root,
+            )
+            if definition is not None:
+                engine_files, excluded_keys = routine_trace_contract(definition)
+        except Exception:
+            pass
         return DecisionObservationCollector(
             trace_id=self._trace_id_factory(),
             trace_level=level,
             initial_rules=initial_rules,
+            engine_bundle_files=engine_files,
+            rules_excluded_keys=excluded_keys,
         )
 
     def append_decision(
@@ -233,13 +268,19 @@ class ProductionDecisionTraceObserver:
             market = self.market_store.save_window(candles)
             if not market.get("saved") and not market.get("duplicate"):
                 return self._failed(f"market evidence unavailable: {market.get('error')}", started)
-            rules_saved = self.snapshot_service.save_rules(rules)
+            if collector.rules_excluded_keys:
+                rules_saved = self.snapshot_service.save_rules(
+                    rules,
+                    excluded_keys=collector.rules_excluded_keys,
+                )
+            else:
+                rules_saved = self.snapshot_service.save_rules(rules)
             if not rules_saved.get("saved") and not rules_saved.get("duplicate"):
                 return self._failed(f"rules snapshot unavailable: {rules_saved.get('error')}", started)
             settings_saved = self.snapshot_service.save_settings(context.get("stock_config", {}))
             if not settings_saved.get("saved") and not settings_saved.get("duplicate"):
                 return self._failed(f"settings snapshot unavailable: {settings_saved.get('error')}", started)
-            engine_identity = self._engine_identity.get()
+            engine_identity = self._engine_identity.get(collector.engine_bundle_files)
             rules_hash = str(rules_saved.get("hash") or "")
             conditions = self._finalize_conditions(collector.conditions, rules_hash)
             groups = self._finalize_groups(collector.groups, rules_hash)

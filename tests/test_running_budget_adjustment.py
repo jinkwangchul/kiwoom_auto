@@ -27,6 +27,21 @@ from runtime_io import read_json_dict
 from tests.participant_owner_fixture import attach_participant_owner, participant_owner
 
 
+class _UiPreferenceSettings:
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+        self.sync_count = 0
+
+    def value(self, key: str, default=None):
+        return self.values.get(key, default)
+
+    def setValue(self, key: str, value: object) -> None:
+        self.values[key] = value
+
+    def sync(self) -> None:
+        self.sync_count += 1
+
+
 class RunningBudgetAdjustmentContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -104,6 +119,46 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         self.assertTrue(buy["changed"], buy)
         self.assertEqual(STATE_APPLIED, running_budget_adjustment_snapshot(self.stock_dir)["state"])
         self.assertEqual(200, self._project()[0]["buy_amount"])
+
+    def test_checked_limit_without_evidence_keeps_budget_request_and_prior_limit(self) -> None:
+        result = self._commit(
+            policy="IMMEDIATE",
+            apply_limit=True,
+            adjusted_limit_amount=None,
+        )
+        self.assertTrue(result["ok"], result)
+        adjustment = running_budget_adjustment_snapshot(self.stock_dir)
+        self.assertTrue(adjustment["apply_limit"])
+        self.assertIsNone(adjustment["adjusted_limit_amount"])
+
+        projected, evidence = self._project()
+        self.assertEqual(200, projected["buy_amount"])
+        self.assertTrue(projected["buy_limit_enabled"])
+        self.assertEqual(10_000, projected["buy_limit_amount"])
+        self.assertFalse(evidence["limit_recalculated"])
+
+    def test_checked_limit_never_enables_disabled_limit(self) -> None:
+        config = read_json_dict(self.stock_dir / "config.json")
+        config.update(
+            {
+                "buy_limit_enabled": False,
+                "buy_limit_amount": None,
+                "buy_limit_source": None,
+            }
+        )
+        self._write(self.stock_dir / "config.json", config)
+        result = self._commit(
+            policy="IMMEDIATE",
+            apply_limit=True,
+            adjusted_limit_amount=20_000,
+        )
+        self.assertTrue(result["ok"], result)
+
+        projected, evidence = self._project()
+        self.assertEqual(200, projected["buy_amount"])
+        self.assertFalse(projected["buy_limit_enabled"])
+        self.assertIsNone(projected["buy_limit_amount"])
+        self.assertFalse(evidence["limit_recalculated"])
 
     def test_next_cycle_buy_before_sell_uses_old_then_sell_buy_uses_new(self) -> None:
         result = self._commit(policy="NEXT_CYCLE")
@@ -198,12 +253,16 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
                 adjusted_limit_amount=20_000,
             )["ok"]
         )
+        persisted = read_json_dict(self.stock_dir / "config.json")
+        persisted["buy_limit_amount"] = 20_000
+        persisted["buy_limit_source"] = "RECOMMENDED"
+        self._write(self.stock_dir / "config.json", persisted)
         projected, evidence = self._project()
         self.assertTrue(projected["buy_limit_enabled"])
         self.assertEqual(20_000, projected["buy_limit_amount"])
         self.assertEqual("RECOMMENDED", projected["buy_limit_source"])
         self.assertTrue(evidence["apply_limit"])
-        self.assertEqual(10_000, read_json_dict(self.stock_dir / "config.json")["buy_limit_amount"])
+        self.assertEqual(20_000, read_json_dict(self.stock_dir / "config.json")["buy_limit_amount"])
 
     def test_persisted_pending_request_is_restored_from_existing_state_owner(self) -> None:
         self.assertTrue(self._commit(policy="NEXT_CYCLE")["ok"])
@@ -252,7 +311,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             observed,
         )
 
-    def _dialog_host(self):
+    def _dialog_host(self, *, settings=None):
         configuration_state = SimpleNamespace(
             connection_epoch=1,
             login_session_id="SESSION-1",
@@ -281,6 +340,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             },
             main_monitoring_auto_trade_operation_host=lambda: operation_host,
             parent=lambda: None,
+            _account_memo_settings=settings,
         )
         host._write_stock_initial_buy_config = MethodType(
             gui_windows.MainWindow._write_stock_initial_buy_config,
@@ -289,7 +349,175 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         host._adjusted_buy_limit_for_start_budget = MagicMock(return_value=20_000)
         return host
 
-    def test_missing_configuration_price_still_opens_direct_value_editor(self) -> None:
+    def test_apply_limit_preference_round_trips_through_existing_qsettings(self) -> None:
+        settings = _UiPreferenceSettings()
+        host = self._dialog_host(settings=settings)
+
+        self.assertFalse(gui_windows.MainWindow.start_budget_apply_limit_checked(host))
+        gui_windows.MainWindow.set_start_budget_apply_limit_checked(host, True)
+        self.assertTrue(gui_windows.MainWindow.start_budget_apply_limit_checked(host))
+        gui_windows.MainWindow.set_start_budget_apply_limit_checked(host, False)
+        self.assertFalse(gui_windows.MainWindow.start_budget_apply_limit_checked(host))
+        self.assertEqual(
+            False,
+            settings.values[gui_windows.START_BUDGET_APPLY_LIMIT_SETTINGS_KEY],
+        )
+        self.assertEqual(2, settings.sync_count)
+
+    def test_apply_limit_preference_survives_running_state_and_timing_changes(self) -> None:
+        cases = (
+            (False, False, True, "PRE_OPERATION", False),
+            (False, True, False, "PRE_OPERATION", True),
+            (True, False, True, "IMMEDIATE", False),
+            (True, False, True, "NEXT_CYCLE", True),
+            (True, True, False, "IMMEDIATE", False),
+        )
+        for running, initial, selected, timing, reopen_running in cases:
+            with self.subTest(
+                running=running,
+                initial=initial,
+                selected=selected,
+                timing=timing,
+                reopen_running=reopen_running,
+            ):
+                settings = _UiPreferenceSettings()
+                host = self._dialog_host(settings=settings)
+                gui_windows.MainWindow.set_start_budget_apply_limit_checked(
+                    host,
+                    initial,
+                )
+                captured_open: dict[str, object] = {}
+
+                class AcceptedDialog:
+                    result = {
+                        "mode": "AMOUNT",
+                        "value": 300,
+                        "apply_timing": timing,
+                        "apply_limit": selected,
+                    }
+                    requested_at = "2026-09-02 10:00:00"
+
+                    def __init__(self, *_args, **kwargs):
+                        captured_open.update(kwargs)
+
+                    def exec_(self):
+                        return gui_windows.QDialog.Accepted
+
+                    def deleteLater(self):
+                        pass
+
+                with (
+                    patch.object(
+                        gui_windows,
+                        "RunningBudgetAdjustmentDialog",
+                        AcceptedDialog,
+                    ),
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_start_budget_current_running",
+                        return_value=running,
+                    ),
+                    patch.object(
+                        gui_windows.MainWindow,
+                        "_starting_budget_change_current_price",
+                        side_effect=(70_000, None),
+                    ),
+                    patch.object(gui_windows, "show_toast"),
+                ):
+                    gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                        host,
+                        0,
+                        self.stock_dir / "config.json",
+                    )
+
+                self.assertEqual(initial, captured_open["apply_limit_checked"])
+                self.assertEqual(
+                    selected,
+                    gui_windows.MainWindow.start_budget_apply_limit_checked(host),
+                )
+
+                captured_reopen: dict[str, object] = {}
+
+                class CancelDialog:
+                    result = {}
+
+                    def __init__(self, *_args, **kwargs):
+                        captured_reopen.update(kwargs)
+
+                    def exec_(self):
+                        return gui_windows.QDialog.Rejected
+
+                    def deleteLater(self):
+                        pass
+
+                with (
+                    patch.object(
+                        gui_windows,
+                        "RunningBudgetAdjustmentDialog",
+                        CancelDialog,
+                    ),
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_start_budget_current_running",
+                        return_value=reopen_running,
+                    ),
+                    patch.object(
+                        gui_windows.MainWindow,
+                        "_starting_budget_change_current_price",
+                        return_value=70_000,
+                    ),
+                ):
+                    gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                        host,
+                        0,
+                        self.stock_dir / "config.json",
+                    )
+
+                self.assertEqual(selected, captured_reopen["apply_limit_checked"])
+
+    def test_cancel_keeps_apply_limit_preference_when_pending_request_differs(self) -> None:
+        settings = _UiPreferenceSettings()
+        host = self._dialog_host(settings=settings)
+        gui_windows.MainWindow.set_start_budget_apply_limit_checked(host, True)
+        self.assertTrue(
+            self._commit(
+                policy="NEXT_CYCLE",
+                apply_limit=False,
+            )["ok"]
+        )
+        captured: dict[str, object] = {}
+
+        class CancelDialog:
+            result = {}
+
+            def __init__(self, *_args, **kwargs):
+                captured.update(kwargs)
+
+            def exec_(self):
+                return gui_windows.QDialog.Rejected
+
+            def deleteLater(self):
+                pass
+
+        with (
+            patch.object(gui_windows, "RunningBudgetAdjustmentDialog", CancelDialog),
+            patch.object(
+                gui_windows,
+                "auto_trade_start_budget_current_running",
+                return_value=True,
+            ),
+        ):
+            gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                host,
+                0,
+                self.stock_dir / "config.json",
+            )
+
+        self.assertFalse(captured["pending_adjustment"]["apply_limit"])
+        self.assertTrue(captured["apply_limit_checked"])
+        self.assertTrue(gui_windows.MainWindow.start_budget_apply_limit_checked(host))
+
+    def test_missing_configuration_price_blocks_direct_value_editor(self) -> None:
         unavailable_host = SimpleNamespace(
             fresh_monitoring_market_information_state=lambda _code: None,
         )
@@ -310,12 +538,56 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
                         self.stock_dir / "config.json",
                     )
 
-                dialog.assert_called_once()
-                self.assertIsNone(dialog.call_args.kwargs["current_price"])
-                self.assertFalse(
-                    dialog.call_args.kwargs["configuration_price_available"]
+                dialog.assert_not_called()
+                toast.assert_called_once_with(
+                    host,
+                    "현재 주가를 확인한 후 변경할 수 있습니다.",
                 )
-                toast.assert_not_called()
+
+    def test_dialog_save_rechecks_current_session_price_before_mutation(self) -> None:
+        class AcceptedDialog:
+            result = {
+                "mode": "AMOUNT",
+                "value": 300,
+                "apply_timing": "PRE_OPERATION",
+                "apply_limit": False,
+            }
+            requested_at = "2026-09-02 10:00:00"
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                return gui_windows.QDialog.Accepted
+
+            def deleteLater(self):
+                pass
+
+        config_path = self.stock_dir / "config.json"
+        before = config_path.read_bytes()
+        host = self._dialog_host()
+        with (
+            patch.object(
+                gui_windows.MainWindow,
+                "_starting_budget_change_current_price",
+                side_effect=(70_000, None),
+            ),
+            patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
+            patch.object(gui_windows, "commit_running_budget_adjustment") as commit,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                host,
+                0,
+                config_path,
+            )
+
+        self.assertEqual(before, config_path.read_bytes())
+        commit.assert_not_called()
+        toast.assert_called_once_with(
+            host,
+            "현재 주가를 확인한 후 변경할 수 있습니다.",
+        )
 
     def test_dialog_cancel_has_no_runtime_commit(self) -> None:
         class CancelDialog:
@@ -455,7 +727,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
             patch.object(gui_windows, "auto_trade_start_budget_current_running", return_value=False),
             patch.object(gui_windows, "commit_running_budget_adjustment") as commit,
-            patch.object(gui_windows, "show_toast"),
+            patch.object(gui_windows, "show_toast") as toast,
         ):
             gui_windows.MainWindow._open_running_budget_adjustment_dialog(
                 host,
@@ -498,7 +770,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
             patch.object(gui_windows, "auto_trade_start_budget_current_running", return_value=False),
             patch.object(gui_windows, "commit_running_budget_adjustment") as commit,
-            patch.object(gui_windows, "show_toast"),
+            patch.object(gui_windows, "show_toast") as toast,
             patch.object(
                 gui_windows.CanonicalStockConfigRepository,
                 "patch_stock_config",
@@ -520,10 +792,60 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         self.assertEqual("RECOMMENDED", saved["buy_limit_source"])
         host._adjusted_buy_limit_for_start_budget.assert_called_once()
         commit.assert_not_called()
-        config_patch.assert_called_once()
-        persisted_patch = config_patch.call_args.args[2]
-        self.assertEqual(300, persisted_patch["buy_amount"])
-        self.assertEqual(20_000, persisted_patch["buy_limit_amount"])
+        self.assertEqual(2, config_patch.call_count)
+        budget_patch = config_patch.call_args_list[0].args[2]
+        limit_patch = config_patch.call_args_list[1].args[2]
+        self.assertEqual(300, budget_patch["buy_amount"])
+        self.assertEqual(20_000, limit_patch["buy_limit_amount"])
+        self.assertEqual(
+            "기본예산과 한도금액을 변경했습니다.",
+            toast.call_args.args[1],
+        )
+
+    def test_non_running_limit_recalculation_failure_keeps_budget_change(self) -> None:
+        class AcceptedDialog:
+            result = {
+                "mode": "AMOUNT",
+                "value": 300,
+                "apply_timing": "PRE_OPERATION",
+                "apply_limit": True,
+            }
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                return gui_windows.QDialog.Accepted
+
+            def deleteLater(self):
+                pass
+
+        host = self._dialog_host()
+        host._adjusted_buy_limit_for_start_budget.return_value = None
+        with (
+            patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
+            patch.object(
+                gui_windows,
+                "auto_trade_start_budget_current_running",
+                return_value=False,
+            ),
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                host,
+                0,
+                self.stock_dir / "config.json",
+            )
+
+        saved = read_json_dict(self.stock_dir / "config.json")
+        self.assertEqual(300, saved["buy_amount"])
+        self.assertTrue(saved["buy_limit_enabled"])
+        self.assertEqual(10_000, saved["buy_limit_amount"])
+        self.assertEqual("MANUAL", saved["buy_limit_source"])
+        self.assertEqual(
+            "기본예산을 변경했습니다. 한도금액은 기존 설정을 유지합니다.",
+            toast.call_args.args[1],
+        )
 
     def test_non_running_same_budget_field_conflict_fails_closed(self) -> None:
         config_path = self.stock_dir / "config.json"
@@ -930,13 +1252,18 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
                 adjusted_limit_amount=6_000_000,
             )["ok"]
         )
+        persisted_config = dict(config)
+        persisted_config["buy_amount"] = 60_000
+        persisted_config["buy_limit_amount"] = 6_000_000
+        persisted_config["buy_limit_source"] = "RECOMMENDED"
+        self._write(config_path, persisted_config)
         state = read_json_dict(self.stock_dir / "state.json")
         display, evidence = project_running_budget_adjustment_display_config(
-            config,
+            persisted_config,
             state,
         )
         execution, execution_evidence = project_running_budget_adjustment_config(
-            config,
+            persisted_config,
             state,
         )
         self.assertEqual(60_000, display["buy_amount"])
@@ -952,7 +1279,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             signal_id="sell-for-next-cycle",
         )
         execution, _ = project_running_budget_adjustment_config(
-            config,
+            persisted_config,
             read_json_dict(self.stock_dir / "state.json"),
         )
         self.assertEqual(60_000, execution["buy_amount"])

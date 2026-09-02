@@ -17,6 +17,7 @@ import zipfile
 
 from logical_group_registry import LogicalGroupRecord, LogicalGroupRepository
 from routine_instance_registry import routine_definition_by_id
+from routine_package_contract import validate_routine_definition_capabilities
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -299,6 +300,12 @@ def register_group_pack(
         if definition_name != inspection.base_name:
             raise GroupPackValidationError(
                 "Group Pack base_name이 Routine Definition 표시명과 일치하지 않습니다."
+            )
+        capability = validate_routine_definition_capabilities(definition)
+        if capability.get("ok") is not True:
+            raise GroupPackValidationError(
+                "설치한 Routine capability를 확인할 수 없습니다: "
+                + ", ".join(capability.get("errors", []))
             )
         created = group_repository.create_group(
             inspection.definition_id,

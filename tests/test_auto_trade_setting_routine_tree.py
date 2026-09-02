@@ -1096,7 +1096,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 group_id="group-a",
                 rules_path=rules_path,
             )
-            definition = SimpleNamespace(display_name="지표추종매매")
+            definition = SimpleNamespace(
+                definition_id="indicator_follow",
+                display_name="지표추종매매",
+            )
             group = SimpleNamespace(display_name="지표추종매매 그룹")
             registered = SimpleNamespace(instance_id="inst-b")
             owner = SimpleNamespace()
@@ -1112,10 +1115,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 patch.object(setting_window, "routine_instance_by_id", return_value=instance),
                 patch.object(setting_window, "routine_definition_by_id", return_value=definition),
                 patch.object(setting_window, "group_record_by_id", return_value=group),
-                patch(
-                    "gui_indicator_follow_routine_settings_dialog.register_routine_instance_snapshot",
-                    return_value=registered,
-                ) as clone_snapshot,
+                patch.object(
+                    setting_window,
+                    "load_routine_callable",
+                    return_value=MagicMock(return_value=registered),
+                ) as locator_loader,
             ):
                 self.assertTrue(
                     setting_window.clone_routine_instance_with_existing_policy(
@@ -1123,6 +1127,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                         metadata,
                     )
                 )
+            clone_snapshot = locator_loader.return_value
             args = clone_snapshot.call_args.args
             kwargs = clone_snapshot.call_args.kwargs
             rules_result = kwargs["rules_provider"]()
@@ -1527,10 +1532,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "routine_definition_by_id",
                     return_value=definition,
                 ),
-                patch(
-                    "gui_indicator_follow_routine_settings_dialog.IndicatorFollowRoutineSettingsDialog",
-                    return_value=dialog,
-                ) as dialog_type,
+                patch.object(
+                    setting_window,
+                    "load_routine_callable",
+                    return_value=MagicMock(return_value=dialog),
+                ) as locator_loader,
             ):
                 setting_window.open_routine_settings_dialog_for_owner(
                     owner,
@@ -1543,6 +1549,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     registration=True,
                 )
 
+        dialog_type = locator_loader.return_value
         self.assertEqual(
             "지표추종복사",
             dialog_type.call_args.kwargs["routine_name"],

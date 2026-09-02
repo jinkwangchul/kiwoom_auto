@@ -10,6 +10,7 @@
     "routines/지표추종매매/routine_cycle_projection.py",
     "routines/지표추종매매/routine_macd_engine.py",
     "routines/지표추종매매/routine_rule_mapper.py",
+    "routines/지표추종매매/routine_rule_commit_validator.py",
     "gui_indicator_follow_routine_settings_dialog.py",
     "gui_indicator_follow_common_widgets.py",
     "gui_indicator_follow_control_tab.py",

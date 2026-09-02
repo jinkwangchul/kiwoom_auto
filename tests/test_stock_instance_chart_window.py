@@ -34,6 +34,7 @@ def _projection(
     operation_start_time: str = "09:00:00",
     operation_end_time: str = "13:30:00",
     ats_session_ranges: list[dict[str, str]] | None = None,
+    nxt_available: bool | None = False,
     cumulative_pnl: float | None = 154_000.0,
     cumulative_return_rate: float | None = 3.25,
     pnl_available: bool = True,
@@ -76,6 +77,7 @@ def _projection(
         "operation_end_buy_time": operation_end_time,
         "operation_time": "09:00~13:30",
         "ats_session_ranges": ats_session_ranges or [],
+        "nxt_available": nxt_available,
         "current_status": "RUNNING",
         "current_status_display": "매수/매도",
         "cumulative_pnl": cumulative_pnl,
@@ -285,29 +287,126 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                 raw_candle_count=0,
             ))
             labels = window.chart._x_axis_label_points(QRectF(70, 34, 600, 300))
-            self.assertEqual("09:00", labels[0][0].strftime("%H:%M"))
-            self.assertEqual("15:30", labels[-1][0].strftime("%H:%M"))
+            self.assertEqual(
+                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"],
+                [bar_time.strftime("%H:%M") for bar_time, _x in labels],
+            )
             self.assertEqual([], window.chart.close_series)
             self.assertEqual("표시할 기준봉 데이터가 없습니다.", window.chart.empty_message)
             window.close()
 
-    def test_selected_ats_ranges_extend_regular_axis(self) -> None:
+    def test_fixed_axis_labels_use_clock_hours_and_exact_session_boundaries(self) -> None:
         cases = (
-            ([], "09:00", "15:30"),
-            ([{"start_time": "08:00:00", "end_time": "08:50:00"}], "08:00", "15:30"),
-            ([{"start_time": "15:40:00", "end_time": "19:50:00"}], "09:00", "19:50"),
-            ([
-                {"start_time": "08:00:00", "end_time": "08:50:00"},
-                {"start_time": "15:40:00", "end_time": "19:50:00"},
-            ], "08:00", "19:50"),
+            (
+                "2026-08-10T09:00:00+09:00",
+                "2026-08-10T15:30:00+09:00",
+                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"],
+            ),
+            (
+                "2026-08-10T08:00:00+09:00",
+                "2026-08-10T20:00:00+09:00",
+                [
+                    "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00",
+                    "15:00", "16:00", "17:00", "18:00", "19:00", "20:00",
+                ],
+            ),
+            (
+                "2026-08-10T09:25:00+09:00",
+                "2026-08-10T15:30:00+09:00",
+                ["09:25", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"],
+            ),
+            (
+                "2026-08-10T09:00:00+09:00",
+                "2026-08-10T15:00:00+09:00",
+                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],
+            ),
         )
-        for ranges, expected_start, expected_end in cases:
-            with self.subTest(ranges=ranges):
-                window = self._window(_projection(ats_session_ranges=ranges))
+        for start, end, expected in cases:
+            with self.subTest(start=start, end=end):
+                chart = StockInstanceCloseChart()
+                chart.set_projection([], [], [], x_range_start=start, x_range_end=end)
+                labels = chart._x_axis_label_points(QRectF(70, 34, 600, 300))
+                self.assertEqual(
+                    expected,
+                    [bar_time.strftime("%H:%M") for bar_time, _x in labels],
+                )
+                chart.close()
+
+    def test_hourly_axis_labels_do_not_change_time_to_x_mapping(self) -> None:
+        chart = StockInstanceCloseChart()
+        chart.set_projection(
+            [{"bar_time": "2026-08-10T12:15:00+09:00", "close": 100}],
+            [{"signal_bar_time": "2026-08-10T12:15:00+09:00", "signal_bar_close": 100}],
+            [],
+            x_range_start="2026-08-10T09:00:00+09:00",
+            x_range_end="2026-08-10T15:30:00+09:00",
+            actual_fill_markers=[
+                {
+                    "fill_id": "fill-1",
+                    "side": "BUY",
+                    "occurred_at": "2026-08-10T12:15:00+09:00",
+                    "filled_price": 100,
+                }
+            ],
+        )
+        plot = QRectF(70, 34, 600, 300)
+        point = chart.position_for("2026-08-10T12:15:00+09:00", 100, plot)
+        self.assertIsNotNone(point)
+        self.assertAlmostEqual(plot.left() + plot.width() * 0.5, point.x())
+        self.assertEqual("12:15", chart.close_series[0][0].strftime("%H:%M"))
+        self.assertEqual("12:15", chart.buy_series[0][0].strftime("%H:%M"))
+        self.assertEqual("12:15", chart.actual_buy_fill_series[0][0].strftime("%H:%M"))
+        chart.close()
+
+    def test_market_capability_alone_selects_regular_or_nxt_axis(self) -> None:
+        cases = (
+            (False, "SCHEDULED", [], "09:00:00", "13:30:00", "09:00", "15:30"),
+            (False, "CONTINUOUS", [
+                {"start_time": "08:00:00", "end_time": "08:50:00"},
+                {"start_time": "16:00:00", "end_time": "20:00:00"},
+            ], "10:10:00", "12:45:00", "09:00", "15:30"),
+            (True, "SCHEDULED", [], "09:00:00", "13:30:00", "08:00", "20:00"),
+            (True, "CONTINUOUS", [], "10:10:00", "12:45:00", "08:00", "20:00"),
+            (True, "CONTINUOUS", [
+                {"start_time": "08:00:00", "end_time": "08:50:00"},
+            ], "09:00:00", "13:30:00", "08:00", "20:00"),
+            (True, "CONTINUOUS", [
+                {"start_time": "16:00:00", "end_time": "20:00:00"},
+            ], "10:10:00", "12:45:00", "08:00", "20:00"),
+            (True, "CONTINUOUS", [
+                {"start_time": "08:00:00", "end_time": "08:50:00"},
+                {"start_time": "16:00:00", "end_time": "20:00:00"},
+            ], "09:00:00", "13:30:00", "08:00", "20:00"),
+        )
+        for nxt, mode, ranges, operation_start, operation_end, expected_start, expected_end in cases:
+            with self.subTest(nxt=nxt, mode=mode, ranges=ranges):
+                window = self._window(_projection(
+                    nxt_available=nxt,
+                    operation_mode=mode,
+                    operation_start_time=operation_start,
+                    operation_end_time=operation_end,
+                    ats_session_ranges=ranges,
+                ))
                 start, end = window.chart.fixed_time_range
                 self.assertEqual(expected_start, start.strftime("%H:%M"))
                 self.assertEqual(expected_end, end.strftime("%H:%M"))
                 window.close()
+
+    def test_empty_nxt_chart_keeps_full_hourly_market_axis(self) -> None:
+        window = self._window(_projection(
+            candles=[],
+            buys=[],
+            sells=[],
+            nxt_available=True,
+            raw_candle_count=0,
+        ))
+        labels = window.chart._x_axis_label_points(QRectF(70, 34, 600, 300))
+        self.assertEqual(
+            [f"{hour:02d}:00" for hour in range(8, 21)],
+            [bar_time.strftime("%H:%M") for bar_time, _x in labels],
+        )
+        self.assertEqual("표시할 기준봉 데이터가 없습니다.", window.chart.empty_message)
+        window.close()
 
     def test_missing_timeframe_candles_split_only_across_session_gap(self) -> None:
         candles = [
@@ -322,11 +421,48 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             buys=[],
             sells=[],
             bar_minutes=5,
+            nxt_available=True,
             ats_session_ranges=[{"start_time": "08:00:00", "end_time": "08:50:00"}],
             raw_candle_count=len(candles),
         ))
         self.assertEqual([2, 2], [len(segment) for segment in window.chart._line_segments()])
         self.assertNotIn(999.0, [close for _bar_time, close in window.chart.close_series])
+        window.close()
+
+    def test_nxt_session_gaps_have_exactly_two_dashed_bridge_pairs(self) -> None:
+        candles = [
+            {"bar_time": "2026-08-10T08:45:00+09:00", "close": 100},
+            {"bar_time": "2026-08-10T09:00:00+09:00", "close": 101},
+            {"bar_time": "2026-08-10T10:00:00+09:00", "close": 102},
+            {"bar_time": "2026-08-10T10:01:00+09:00", "close": 103},
+            {"bar_time": "2026-08-10T15:25:00+09:00", "close": 104},
+            {"bar_time": "2026-08-10T16:00:00+09:00", "close": 105},
+            {"bar_time": "2026-08-10T17:00:00+09:00", "close": 106},
+            {"bar_time": "2026-08-10T17:01:00+09:00", "close": 107},
+        ]
+        window = self._window(_projection(
+            candles=candles,
+            buys=[],
+            sells=[],
+            nxt_available=True,
+            raw_candle_count=len(candles),
+        ))
+
+        self.assertEqual([1, 4, 3], [len(segment) for segment in window.chart._line_segments()])
+        self.assertEqual(
+            [("08:45", "09:00"), ("15:25", "16:00")],
+            [
+                (bridge[0][0].strftime("%H:%M"), bridge[1][0].strftime("%H:%M"))
+                for bridge in window.chart._session_gap_bridge_segments()
+            ],
+        )
+        painter = Mock()
+        window.chart._draw_session_gap_bridges(painter, QRectF(70, 34, 600, 300))
+        bridge_pen = painter.setPen.call_args.args[0]
+        self.assertEqual(chart_window.SESSION_GAP_BRIDGE_COLOR, bridge_pen.color())
+        self.assertEqual(2, bridge_pen.width())
+        self.assertEqual(Qt.DashLine, bridge_pen.style())
+        self.assertEqual(2, painter.drawPath.call_count)
         window.close()
 
     def test_missing_bucket_connects_existing_same_session_points_without_fake_candle(self) -> None:

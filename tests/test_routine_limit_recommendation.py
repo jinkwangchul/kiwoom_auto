@@ -480,7 +480,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             )
             toast.assert_called_once_with(
                 host,
-                "권장한도가 전체예산을 초과 합니다",
+                "권장한도가 전체예산을 초과합니다.",
                 duration_ms=2500,
             )
             host.start_routine_stock_buy_limit_edit.assert_called_once_with(
@@ -524,7 +524,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
         manual_host.refresh_auto_trade_assignment_views.assert_called_once_with()
         toast.assert_called_once_with(
             manual_host,
-            "입력값이 전체예산을 초과합니다.",
+            "입력한 한도금액이 전체예산을 초과합니다.",
             duration_ms=2500,
         )
         warning.assert_not_called()

@@ -1961,7 +1961,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_visible_early_close_button_reuses_top_summary_badge_font(self) -> None:
         window = SimpleNamespace()
-        window.btn_price_signal_observation = QPushButton("가격신호 OFF")
         window.btn_market_data_monitoring = QPushButton("모니터링")
         window.btn_group_pack_register = QPushButton("그룹등록")
         window.btn_main_visible_early_close = QPushButton("조기마감")
@@ -2017,7 +2016,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             early_close_metrics.boundingRect("조기마감").height(),
         )
         self.assertEqual(28, window.btn_main_visible_early_close.minimumHeight())
-        self.assertEqual(28, window.btn_price_signal_observation.minimumHeight())
         self.assertEqual(28, window.btn_market_data_monitoring.minimumHeight())
         self.assertEqual(28, window.btn_group_pack_register.minimumHeight())
         self.assertEqual(
@@ -2029,15 +2027,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window.btn_group_pack_register.styleSheet(),
         )
         self.assertEqual(
-            ["가격신호 OFF", "모니터링", "그룹등록", "조기마감"],
-            [header_layout.itemAt(index).widget().text() for index in range(2, 6)],
+            ["모니터링", "그룹등록", "조기마감"],
+            [header_layout.itemAt(index).widget().text() for index in range(2, 5)],
         )
-        self.assertIs(window.btn_group_pack_register, header_layout.itemAt(4).widget())
-        self.assertIs(window.btn_main_visible_early_close, header_layout.itemAt(5).widget())
-        self.assertEqual(
-            "mainPriceSignalObservationButton",
-            window.btn_price_signal_observation.objectName(),
-        )
+        self.assertIs(window.btn_group_pack_register, header_layout.itemAt(3).widget())
+        self.assertIs(window.btn_main_visible_early_close, header_layout.itemAt(4).widget())
         self.assertEqual(
             "mainMarketDataMonitoringButton",
             window.btn_market_data_monitoring.objectName(),
@@ -2046,35 +2040,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             "color: #2563eb; font-weight: bold;",
             window.btn_main_visible_early_close.styleSheet(),
         )
-
-    def test_price_signal_header_toggle_uses_operation_host_as_only_state(self) -> None:
-        state = {"enabled": False}
-        host = SimpleNamespace(
-            price_signal_observation_enabled=Mock(
-                side_effect=lambda: state["enabled"]
-            ),
-            set_price_signal_observation_enabled=Mock(
-                side_effect=lambda enabled: state.update(enabled=bool(enabled))
-            ),
-        )
-        window = SimpleNamespace(
-            btn_price_signal_observation=QPushButton("가격신호 OFF"),
-            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
-        )
-        window._update_main_price_signal_observation_button = lambda: (
-            gui_windows.MainWindow._update_main_price_signal_observation_button(window)
-        )
-
-        for expected in (True, False) * 6:
-            actual = gui_windows.MainWindow.toggle_price_signal_observation(window)
-            self.assertEqual(expected, actual)
-            self.assertEqual(
-                "가격신호 ON" if expected else "가격신호 OFF",
-                window.btn_price_signal_observation.text(),
-            )
-
-        self.assertEqual(12, host.set_price_signal_observation_enabled.call_count)
-        self.assertFalse(hasattr(window, "_price_signal_observation_enabled"))
 
     def test_market_data_monitoring_entry_reuses_one_window(self) -> None:
         monitoring_window = Mock()

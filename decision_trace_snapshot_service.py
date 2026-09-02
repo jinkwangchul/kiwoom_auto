@@ -19,7 +19,6 @@ SNAPSHOT_SCHEMA_VERSION = "decision_trace_snapshot_v1"
 
 RULE_EXCLUDED_KEYS = frozenset(
     {
-        "indicator_follow_ui_state",
         "description",
         "note",
         "warnings",
@@ -47,13 +46,7 @@ SETTINGS_ALLOWED_KEYS = frozenset(
         "total_budget",
     }
 )
-DEFAULT_ENGINE_BUNDLE_FILES = (
-    "routines/지표추종매매/routine.py",
-    "routines/지표추종매매/routine_macd_engine.py",
-    "engines/indicator_engine.py",
-    "engines/condition_engine.py",
-    "engines/signal_result.py",
-)
+DEFAULT_ENGINE_BUNDLE_FILES: tuple[str, ...] = ()
 
 _SNAPSHOT_LOCK = threading.RLock()
 
@@ -99,9 +92,17 @@ def content_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def normalize_rules(value: Any) -> dict[str, Any]:
+def normalize_rules(
+    value: Any,
+    *,
+    excluded_keys: Iterable[str] = (),
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("rules must be an object")
+
+    excluded = RULE_EXCLUDED_KEYS | frozenset(
+        str(item).strip().lower() for item in excluded_keys if str(item).strip()
+    )
 
     def visit(item: Any) -> Any:
         if isinstance(item, dict):
@@ -109,7 +110,7 @@ def normalize_rules(value: Any) -> dict[str, Any]:
             for key, child in item.items():
                 text = str(key)
                 lowered = text.lower()
-                if lowered in RULE_EXCLUDED_KEYS or lowered.startswith("preview_") or lowered.startswith("pending_"):
+                if lowered in excluded or lowered.startswith("preview_") or lowered.startswith("pending_"):
                     continue
                 result[text] = visit(child)
             return result
@@ -164,8 +165,13 @@ class DecisionTraceSnapshotService:
         self.evidence_root = Path(evidence_root)
         self._now_factory = now_factory
 
-    def save_rules(self, rules: dict[str, Any]) -> dict[str, Any]:
-        payload = normalize_rules(rules)
+    def save_rules(
+        self,
+        rules: dict[str, Any],
+        *,
+        excluded_keys: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        payload = normalize_rules(rules, excluded_keys=excluded_keys)
         return self._save("rules", payload)
 
     def save_settings(self, settings: dict[str, Any]) -> dict[str, Any]:

@@ -42,13 +42,14 @@ class OrderCandidateExecutionIntentTest(unittest.TestCase):
         self.assertEqual(intent, result["order_intent"])
         self.assertFalse(result["execution_enabled"])
 
-    def test_phase_and_round_contract_is_validated(self):
+    def test_routine_owned_provenance_is_not_interpreted(self):
         result = engine.build_order_candidate_from_execution_intent(
             self._intent(buy_phase="BASE", buy_round=2)
         )
 
-        self.assertEqual("EXECUTION_INTENT_INVALID", result["candidate_status"])
-        self.assertIn("EXECUTION_INTENT_PHASE_ROUND_MISMATCH", result["candidate_issues"])
+        self.assertEqual("CANDIDATE_READY", result["candidate_status"])
+        self.assertEqual("BASE", result["order_intent"]["buy_phase"])
+        self.assertEqual(2, result["order_intent"]["buy_round"])
 
     def test_market_intent_does_not_require_limit_price(self):
         result = engine.build_order_candidate_from_execution_intent(
@@ -75,24 +76,34 @@ class OrderCandidateExecutionIntentTest(unittest.TestCase):
         self.assertEqual("entry_quantity", result["budget_source"])
         self.assertFalse(result["execution_enabled"])
 
-    def test_live_same_round_is_duplicate_but_cancelled_round_can_retry(self):
+    def test_queue_deduplicates_common_execution_identity_not_routine_round(self):
         candidate = {
             "source_signal_id": "signal-2",
+            "execution_process_id": "process-1",
+            "execution_id": "child-1",
             "status": "PENDING",
             "execution_intent": self._intent(),
         }
         live = {
             "source_signal_id": "signal-1",
+            "execution_process_id": "process-1",
+            "execution_id": "child-1",
             "status": "PENDING",
             "execution_intent": self._intent(),
         }
-        cancelled = dict(live, status="CANCELLED")
+        unrelated_round = {
+            "source_signal_id": "signal-3",
+            "status": "PENDING",
+            "execution_intent": self._intent(buy_round=2),
+        }
 
         self.assertEqual(
-            "duplicate live routine buy round",
+            "duplicate execution process child",
             order_queue._candidate_duplicate_reason(candidate, [live]),
         )
-        self.assertIsNone(order_queue._candidate_duplicate_reason(candidate, [cancelled]))
+        self.assertIsNone(
+            order_queue._candidate_duplicate_reason(unrelated_round, [live])
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -234,10 +235,11 @@ class MarketDataHostSeparationTests(unittest.TestCase):
 
     def test_monitoring_and_execution_target_sync_are_independent(self) -> None:
         self.market.sync_monitoring_targets(("005930", "006400"))
-        self.owner.kiwoom_api.request_initial_market_snapshot.assert_called_once_with(
-            ("005930", "006400"),
-            callback=self.market._on_initial_market_snapshot_result,
+        snapshot_call = (
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args
         )
+        self.assertEqual((("005930", "006400"),), snapshot_call.args)
+        self.assertTrue(callable(snapshot_call.kwargs.get("callback")))
         self.owner.kiwoom_api.sync_realtime_monitoring_registration.assert_called_once_with(
             ("005930", "006400")
         )
@@ -266,6 +268,255 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             self.owner.kiwoom_api.request_initial_market_snapshot.call_count,
         )
 
+    def test_new_218410_valid_snapshot_enables_configuration_price(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        callback = self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+            "callback"
+        ]
+
+        callback(self._snapshot_result(stock_code="218410", current_price=45_000))
+
+        state = self.market.configuration_market_information_state("218410")
+        self.assertIsNotNone(state)
+        self.assertEqual(45_000, state.last_price)
+        self.assertEqual("SNAPSHOT", dict(state.field_sources)["last_price"])
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.market.sync_monitoring_targets(("218410",))
+        self.assertEqual(
+            1, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+
+    def test_enqueue_failure_restores_retry_eligibility(self) -> None:
+        self.owner.kiwoom_api.request_initial_market_snapshot.return_value = {
+            "ok": False,
+            "status": "FAILED",
+        }
+
+        self.market.sync_monitoring_targets(("218410",))
+
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.owner.kiwoom_api.request_initial_market_snapshot.return_value = {
+            "ok": True,
+            "status": "ENQUEUED",
+        }
+        self.market.sync_monitoring_targets(("218410",))
+        self.assertEqual(
+            2, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+
+    def test_partial_batch_enqueue_failure_keeps_success_batch_inflight(self) -> None:
+        self.owner.kiwoom_api.request_initial_market_snapshot.return_value = {
+            "ok": False,
+            "status": "ENQUEUED",
+            "batches": [
+                {"ok": True, "stock_codes": ["000660"]},
+                {"ok": False, "stock_codes": ["218410"]},
+            ],
+        }
+
+        self.market.sync_monitoring_targets(("000660", "218410"))
+
+        self.assertIn(
+            "000660", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+
+    def test_request_exception_restores_retry_eligibility(self) -> None:
+        self.owner.kiwoom_api.request_initial_market_snapshot.side_effect = [
+            RuntimeError("enqueue failed"),
+            {"ok": True, "status": "ENQUEUED"},
+        ]
+
+        failed = self.market.sync_monitoring_targets(("218410",))
+
+        self.assertFalse(failed["ok"])
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.market.sync_monitoring_targets(("218410",))
+        self.assertEqual(
+            2, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+
+    def test_empty_snapshot_restores_retry_eligibility(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        callback = self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+            "callback"
+        ]
+
+        callback(self._snapshot_result(stock_code="218410", rows=[]))
+
+        self.assertIsNone(
+            self.market.configuration_market_information_state("218410")
+        )
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.market.sync_monitoring_targets(("218410",))
+        self.assertEqual(
+            2, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+
+    def test_tooltip_does_not_claim_price_receipt_without_valid_evidence(self) -> None:
+        tooltip = main_loader.main_stock_row_tooltip_from_projection(
+            {
+                "market": "KOSDAQ",
+                "stock_code": "218410",
+                "stock_name": "RFHIC",
+                "current_price": None,
+            }
+        )
+
+        self.assertIn("현재가 -", tooltip)
+        self.assertNotIn("주가 수신 완료", tooltip)
+
+    def test_timeout_snapshot_restores_retry_eligibility(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        callback = self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+            "callback"
+        ]
+
+        callback(
+            {
+                "ok": False,
+                "type": "initial_market_snapshot",
+                "stock_codes": ["218410"],
+                "error_kind": "TIMEOUT",
+            }
+        )
+
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.market.sync_monitoring_targets(("218410",))
+        self.assertEqual(
+            2, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+
+    def test_malformed_or_zero_snapshot_restores_retry_eligibility(self) -> None:
+        for bad_price in (0, "not-a-price"):
+            with self.subTest(price=bad_price):
+                owner = _Owner()
+                host = AutoTradeOperationHost(owner)
+                market = host.market_data_host()
+                self.addCleanup(host.shutdown)
+                market.sync_monitoring_targets(("218410",))
+                callback = owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+                    "callback"
+                ]
+
+                callback(
+                    self._snapshot_result(
+                        stock_code="218410",
+                        current_price=bad_price,
+                    )
+                )
+
+                self.assertIsNone(
+                    market.configuration_market_information_state("218410")
+                )
+                self.assertNotIn(
+                    "218410", market._initial_snapshot_requested_stock_codes
+                )
+                market.sync_monitoring_targets(("218410",))
+                self.assertEqual(
+                    2, owner.kiwoom_api.request_initial_market_snapshot.call_count
+                )
+
+    def test_failed_snapshot_retries_once_then_success_is_stable(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        first_callback = (
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+                "callback"
+            ]
+        )
+        first_callback(self._snapshot_result(stock_code="218410", rows=[]))
+        self.market.sync_monitoring_targets(("218410",))
+        second_callback = (
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+                "callback"
+            ]
+        )
+
+        second_callback(
+            self._snapshot_result(stock_code="218410", current_price=45_000)
+        )
+        for _ in range(3):
+            self.market.sync_monitoring_targets(("218410",))
+
+        state = self.market.configuration_market_information_state("218410")
+        self.assertEqual(45_000, state.last_price)
+        self.assertEqual(
+            2, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+
+    def test_snapshot_retry_is_bounded_without_polling(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        for expected_call_count in (1, 2):
+            callback = (
+                self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+                    "callback"
+                ]
+            )
+            callback(self._snapshot_result(stock_code="218410", rows=[]))
+            self.market.sync_monitoring_targets(("218410",))
+            self.assertEqual(
+                min(expected_call_count + 1, 2),
+                self.owner.kiwoom_api.request_initial_market_snapshot.call_count,
+            )
+        self.assertEqual(
+            2,
+            self.market._initial_snapshot_request_attempts_by_stock["218410"],
+        )
+
+    def test_stale_callback_cannot_release_new_session_inflight_marker(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        old_callback = (
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+                "callback"
+            ]
+        )
+        self.owner.kiwoom_api.snapshot.connection_epoch = 8
+        self.owner.kiwoom_api.snapshot.login_session_id = "SESSION-8"
+        self.owner.kiwoom_api.broker_session_snapshot = Mock(
+            return_value=SimpleNamespace(
+                connected=True,
+                connection_epoch=8,
+                login_session_id="SESSION-8",
+            )
+        )
+        self.market.sync_monitoring_targets(("218410",))
+        new_callback = (
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+                "callback"
+            ]
+        )
+
+        old_callback(self._snapshot_result(stock_code="218410", current_price=1))
+
+        self.assertIn(
+            "218410", self.market._initial_snapshot_requested_stock_codes
+        )
+        self.assertIsNone(self.market.initial_market_snapshot_state("218410"))
+        new_callback(
+            self._snapshot_result(
+                stock_code="218410",
+                current_price=45_000,
+                epoch=8,
+                session_id="SESSION-8",
+            )
+        )
+        self.assertEqual(
+            45_000,
+            self.market.configuration_market_information_state("218410").last_price,
+        )
+
     def test_new_target_requests_snapshot_and_removed_target_rejects_pending_result(self) -> None:
         self.market.sync_monitoring_targets(("005930",))
         self.market.sync_monitoring_targets(("005930", "006400"))
@@ -279,6 +530,29 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             self._snapshot_result(stock_code="006400", current_price=65000)
         )
         self.assertIsNone(self.market.initial_market_snapshot_state("006400"))
+
+    def test_removed_valid_target_readd_starts_new_bounded_lifecycle(self) -> None:
+        self.market.sync_monitoring_targets(("218410",))
+        callback = self.owner.kiwoom_api.request_initial_market_snapshot.call_args.kwargs[
+            "callback"
+        ]
+        callback(self._snapshot_result(stock_code="218410", current_price=45_000))
+        self.assertIsNotNone(self.market.initial_market_snapshot_state("218410"))
+
+        self.market.sync_monitoring_targets(())
+        self.assertIsNone(self.market.initial_market_snapshot_state("218410"))
+        self.assertNotIn(
+            "218410", self.market._initial_snapshot_request_attempts_by_stock
+        )
+        self.market.sync_monitoring_targets(("218410",))
+
+        self.assertEqual(
+            2, self.owner.kiwoom_api.request_initial_market_snapshot.call_count
+        )
+        self.assertEqual(
+            1,
+            self.market._initial_snapshot_request_attempts_by_stock["218410"],
+        )
 
     def test_session_transition_still_drops_last_known_for_removed_target(self) -> None:
         self.market.sync_monitoring_targets(("005930",))
@@ -417,6 +691,9 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.assertIsNone(
             self.market.fresh_monitoring_market_information_state("005930")
         )
+        self.assertIsNone(
+            self.market.configuration_market_information_state("005930")
+        )
         last_known = self.market.monitoring_market_information_state("005930")
         self.assertEqual(
             (70000, 69000, 71000, 68000, 1.25, -12.43, 117.2),
@@ -497,30 +774,33 @@ class MarketDataHostSeparationTests(unittest.TestCase):
     def _snapshot_result(
         *,
         stock_code: str = "005930",
-        current_price: int = 70000,
+        current_price: object = 70000,
         high_price: int = 71000,
         epoch: int = 7,
         session_id: str = "SESSION-7",
+        rows: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
+        snapshot_rows = rows if rows is not None else [
+            {
+                "stock_code": stock_code,
+                "current_price": current_price,
+                "open_price": 69000,
+                "high_price": high_price,
+                "low_price": 68000,
+                "change_rate": 1.25,
+                "previous_day_volume_rate": -12.43,
+                "execution_strength": 117.2,
+                "cumulative_volume": 123456,
+            }
+        ]
         return {
             "ok": True,
             "type": "initial_market_snapshot",
+            "stock_codes": [stock_code],
             "connection_epoch": epoch,
             "login_session_id": session_id,
-            "snapshot_received_at": "2026-08-20T10:14:59+09:00",
-            "rows": [
-                {
-                    "stock_code": stock_code,
-                    "current_price": current_price,
-                    "open_price": 69000,
-                    "high_price": high_price,
-                    "low_price": 68000,
-                    "change_rate": 1.25,
-                    "previous_day_volume_rate": -12.43,
-                    "execution_strength": 117.2,
-                    "cumulative_volume": 123456,
-                }
-            ],
+            "snapshot_received_at": datetime.now().astimezone().isoformat(),
+            "rows": snapshot_rows,
         }
 
     def test_stale_session_tick_does_not_mutate_current_state(self) -> None:

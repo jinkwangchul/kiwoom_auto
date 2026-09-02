@@ -106,6 +106,15 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
                     side_effect=lambda path: path,
                 ),
                 patch(
+                    "routine_signal_probe.routine_instance_by_id",
+                    side_effect=lambda instance_id, **_kwargs: SimpleNamespace(
+                        instance_id=instance_id,
+                        definition_id=("def-a" if instance_id == "inst-a" else "def-b"),
+                        display_name=("루틴 A" if instance_id == "inst-a" else "루틴 B"),
+                        enabled=True,
+                    ),
+                ),
+                patch(
                     "routine_signal_probe.probe_routine_for_stock",
                     side_effect=fake_probe,
                 ),

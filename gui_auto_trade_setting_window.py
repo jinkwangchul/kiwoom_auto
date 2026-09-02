@@ -2587,6 +2587,11 @@ from routine_instance_registry import (
     routine_definition_by_id,
     routine_instance_by_id,
 )
+from routine_package_contract import (
+    SETTINGS_ROLE,
+    RoutineContractError,
+    load_routine_callable,
+)
 from routine_instance_repository import RoutineInstanceRepository
 from stock_repository import (
     STOCK_CONFIG_DELETE_FIELD,
@@ -4357,9 +4362,14 @@ def clone_routine_instance_with_existing_policy(
         except Exception as exc:
             return {"success": False, "rules": {}, "error": str(exc)}
 
-    from gui_indicator_follow_routine_settings_dialog import (
-        register_routine_instance_snapshot,
-    )
+    try:
+        register_routine_instance_snapshot = load_routine_callable(
+            definition,
+            SETTINGS_ROLE,
+            callable_key="registration_callable",
+        )
+    except RoutineContractError:
+        return False
 
     return register_routine_instance_snapshot(
         owner,
@@ -4396,15 +4406,6 @@ def open_routine_settings_dialog_for_owner(
             QMessageBox.warning(owner, "루틴 설정", "선택한 루틴을 확인할 수 없습니다.")
             return
 
-    settings_ui = str(definition.settings_ui or "").strip().lower()
-    if settings_ui != "indicator_follow":
-        QMessageBox.information(
-            owner,
-            "루틴 설정",
-            f"선택한 루틴의 설정창이 아직 연결되지 않았습니다.\n루틴명: {definition.display_name}",
-        )
-        return
-
     rules_path = (
         definition.package_dir / definition.default_rules_file
         if registration
@@ -4419,13 +4420,12 @@ def open_routine_settings_dialog_for_owner(
         return
 
     try:
-        from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
-    except Exception as exc:
+        settings_dialog = load_routine_callable(definition, SETTINGS_ROLE)
+    except RoutineContractError as exc:
         QMessageBox.critical(
             owner,
             "설정창 로드 실패",
-            "gui_indicator_follow_routine_settings_dialog.py 파일을 불러오지 못했습니다.\n"
-            f"{exc}",
+            f"선택한 루틴의 설정창을 불러오지 못했습니다.\n{exc}",
         )
         return
 
@@ -4435,7 +4435,7 @@ def open_routine_settings_dialog_for_owner(
         or metadata.get("definition_name", "")
         or definition.display_name
     ).strip()
-    dialog = IndicatorFollowRoutineSettingsDialog(
+    dialog = settings_dialog(
         rules_path=rules_path,
         routine_path=definition.package_dir,
         routine_name=registration_display_name if registration else instance.display_name,

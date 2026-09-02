@@ -19,6 +19,10 @@ from group_pack_registration import (
 )
 from logical_group_registry import LogicalGroupRecord, LogicalGroupRepository
 from routine_instance_registry import RoutineDefinitionRecord, routine_definition_by_id
+from routine_package_contract import (
+    required_locator_files,
+    validate_routine_definition_capabilities,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -128,6 +132,19 @@ def inspect_group_pack_source(
                 absolute_path=absolute_path,
                 sha256=_sha256_file(absolute_path),
             )
+        )
+    required_files = set(required_locator_files(definition))
+    missing_locator_files = sorted(required_files - {item.relative_path for item in files})
+    if missing_locator_files:
+        raise GroupPackValidationError(
+            "Routine locator 파일이 Group Pack spec에서 누락되었습니다: "
+            + ", ".join(missing_locator_files)
+        )
+    capability = validate_routine_definition_capabilities(definition)
+    if capability.get("ok") is not True:
+        raise GroupPackValidationError(
+            "Routine capability를 확인할 수 없습니다: "
+            + ", ".join(capability.get("errors", []))
         )
     files.sort(key=lambda item: item.relative_path.casefold())
     return GroupPackSourceInspection(

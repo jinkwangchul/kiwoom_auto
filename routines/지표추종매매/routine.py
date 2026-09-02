@@ -96,6 +96,65 @@ EXECUTION_ENABLED = False
 ROUTINE_TYPE = "INDICATOR_FOLLOW"
 
 
+def _gate_result(
+    allowed: bool,
+    reason: str,
+    routine_identity: dict[str, Any],
+    rules_identity: str,
+) -> dict[str, Any]:
+    return {
+        "allowed": bool(allowed),
+        "reason": reason,
+        "reasons": [] if allowed else [reason],
+        "routine_identity": dict(routine_identity),
+        "rules_identity": rules_identity,
+    }
+
+
+def evaluate_execution_admission(
+    *,
+    subject: dict[str, Any],
+    rules: dict[str, Any],
+    routine_identity: dict[str, Any],
+    rules_identity: str,
+) -> dict[str, Any]:
+    """Apply this routine's candidate-admission rule."""
+    del subject
+    principle = rules.get("principle") if isinstance(rules, dict) else None
+    allowed = (
+        isinstance(principle, dict)
+        and principle.get("execution_enabled") is True
+    )
+    return _gate_result(
+        allowed,
+        "ROUTINE_EXECUTION_ENABLED" if allowed else "ROUTINE_EXECUTION_DISABLED",
+        routine_identity,
+        rules_identity,
+    )
+
+
+def evaluate_final_real_order_safety(
+    *,
+    subject: dict[str, Any],
+    rules: dict[str, Any],
+    routine_identity: dict[str, Any],
+    rules_identity: str,
+) -> dict[str, Any]:
+    """Re-evaluate this routine's real-order rule from current effective rules."""
+    del subject
+    safety = rules.get("safety") if isinstance(rules, dict) else None
+    allowed = (
+        isinstance(safety, dict)
+        and safety.get("real_order_allowed") is True
+    )
+    return _gate_result(
+        allowed,
+        "ROUTINE_REAL_ORDER_ALLOWED" if allowed else "ROUTINE_REAL_ORDER_NOT_ALLOWED",
+        routine_identity,
+        rules_identity,
+    )
+
+
 def project_cycle_context(
     *,
     code: str,

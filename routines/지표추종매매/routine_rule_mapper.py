@@ -629,6 +629,26 @@ def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
     return True
 
 
+def _set_buy_execution_policy_value(
+    root: dict[str, Any],
+    path: str,
+    value: dict[str, Any],
+) -> bool:
+    if path not in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
+        return False
+    buy = root.get("buy")
+    if not isinstance(buy, dict):
+        return False
+    execution = buy.get("execution")
+    if execution is None:
+        execution = {}
+        buy["execution"] = execution
+    if not isinstance(execution, dict):
+        return False
+    execution[path.rsplit(".", 1)[-1]] = deepcopy(value)
+    return True
+
+
 def _has_ui_value(values: dict[str, Any], keys: tuple[str, ...]) -> bool:
     for key in keys:
         value = values.get(key)
@@ -1558,7 +1578,11 @@ def build_engine_rules_preview_from_ui_state(
 
     buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, validation_warnings)
     if buy_execution_base_candidate:
-        _set_path_value(preview_rules, BUY_EXECUTION_BASE_PATH, buy_execution_base_candidate["value"])
+        _set_buy_execution_policy_value(
+            preview_rules,
+            BUY_EXECUTION_BASE_PATH,
+            buy_execution_base_candidate["value"],
+        )
         preview_candidates.setdefault("execution", {})["base"] = buy_execution_base_candidate
 
     buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(
@@ -1567,7 +1591,11 @@ def build_engine_rules_preview_from_ui_state(
         legacy_base=execution_base,
     )
     if buy_execution_repeat_candidate:
-        _set_path_value(preview_rules, BUY_EXECUTION_REPEAT_PATH, buy_execution_repeat_candidate["value"])
+        _set_buy_execution_policy_value(
+            preview_rules,
+            BUY_EXECUTION_REPEAT_PATH,
+            buy_execution_repeat_candidate["value"],
+        )
         preview_candidates.setdefault("execution", {})["repeat"] = buy_execution_repeat_candidate
 
     rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, validation_warnings)
@@ -1894,9 +1922,11 @@ def build_rule_approval_session_fingerprint(
     }
     candidate_hash = _stable_hash(candidate_payload)
     current_rule_target_hash = _stable_hash(target_payload)
+    current_rules_hash = _stable_hash(rules)
     fingerprint_payload = {
         "candidate_hash": candidate_hash,
         "current_rule_target_hash": current_rule_target_hash,
+        "current_rules_hash": current_rules_hash,
     }
     return {
         "mode": "approval_candidate_fingerprint",
@@ -1905,6 +1935,7 @@ def build_rule_approval_session_fingerprint(
         "candidate_types": candidate_paths,
         "candidate_hash": candidate_hash,
         "current_rule_target_hash": current_rule_target_hash,
+        "current_rules_hash": current_rules_hash,
         "fingerprint": _stable_hash(fingerprint_payload),
     }
 
@@ -2063,6 +2094,8 @@ def build_rule_approval_session(
 
     return {
         "mode": "approval_session",
+        "routine": "지표추종매매",
+        "routine_key": "indicator_follow",
         "session_status": "ACTIVE",
         "decisions": decisions,
         "candidate_types": candidate_types,
@@ -2655,7 +2688,11 @@ def apply_approved_rule_patch_preview(
             if not isinstance(value, dict):
                 skipped_patches.append(_apply_skipped(patch, "execution policy value is not a dict"))
                 continue
-            if not _set_path_value(applied_rules_preview, target_path, value):
+            if not _set_buy_execution_policy_value(
+                applied_rules_preview,
+                target_path,
+                value,
+            ):
                 skipped_patches.append(_apply_skipped(patch, "target execution policy path is not writable"))
                 continue
 
@@ -3219,6 +3256,8 @@ def evaluate_rule_commit_gate_from_saved_session(
 
     return {
         "mode": "rule_commit_gate",
+        "routine": "지표추종매매",
+        "routine_key": "indicator_follow",
         "stage": "RULE_COMMIT_GATE",
         "commit_allowed": commit_allowed,
         "blocked_reasons": blocked_reasons,
@@ -3429,7 +3468,11 @@ def approve_engine_rule_candidates(
         if not candidate_value:
             skipped_paths.append(BUY_EXECUTION_BASE_PATH)
             warnings.append("BUY execution base approval skipped: value is not available")
-        elif _set_path_value(approved_rules, BUY_EXECUTION_BASE_PATH, candidate_value):
+        elif _set_buy_execution_policy_value(
+            approved_rules,
+            BUY_EXECUTION_BASE_PATH,
+            candidate_value,
+        ):
             applied_paths.append(BUY_EXECUTION_BASE_PATH)
         else:
             skipped_paths.append(BUY_EXECUTION_BASE_PATH)
@@ -3441,7 +3484,11 @@ def approve_engine_rule_candidates(
         if not candidate_value:
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
             warnings.append("BUY execution repeat approval skipped: value is not available")
-        elif _set_path_value(approved_rules, BUY_EXECUTION_REPEAT_PATH, candidate_value):
+        elif _set_buy_execution_policy_value(
+            approved_rules,
+            BUY_EXECUTION_REPEAT_PATH,
+            candidate_value,
+        ):
             applied_paths.append(BUY_EXECUTION_REPEAT_PATH)
         else:
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)

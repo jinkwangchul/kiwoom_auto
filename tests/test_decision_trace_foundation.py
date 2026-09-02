@@ -231,9 +231,16 @@ class DecisionTraceFoundationTests(unittest.TestCase):
             "indicator_follow_ui_state": {"state": {"x": 999}},
             "buy": {"groups": [{"conditions": [], "name": "A"}], "description": "changed", "enabled": True},
         }
-        self.assertEqual(content_hash(normalize_rules(first)), content_hash(normalize_rules(second)))
+        excluded = ("indicator_follow_ui_state",)
+        self.assertEqual(
+            content_hash(normalize_rules(first, excluded_keys=excluded)),
+            content_hash(normalize_rules(second, excluded_keys=excluded)),
+        )
         changed = {"buy": {"enabled": False, "groups": [{"name": "A", "conditions": []}]}}
-        self.assertNotEqual(content_hash(normalize_rules(first)), content_hash(normalize_rules(changed)))
+        self.assertNotEqual(
+            content_hash(normalize_rules(first, excluded_keys=excluded)),
+            content_hash(normalize_rules(changed, excluded_keys=excluded)),
+        )
 
     def test_settings_hash_excludes_runtime_context(self) -> None:
         first = {

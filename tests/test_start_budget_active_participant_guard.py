@@ -331,6 +331,11 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
 
         self.assertEqual("AMOUNT", dialog.mode)
+        self.assertEqual("숫자 입력", dialog.value_edit.placeholderText())
+        self.assertEqual(
+            "한도금액에 새 설정값 적용",
+            dialog.apply_limit_checkbox.text(),
+        )
         label_texts = [label.text() for label in dialog.findChildren(gui_windows.QLabel)]
         self.assertNotIn("005930 삼성전자", label_texts)
         self.assertEqual("현재가 30,000원", dialog.current_price_label.text())
@@ -399,6 +404,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
 
         self.assertEqual("QUANTITY", dialog.mode)
+        self.assertEqual("숫자 입력", dialog.value_edit.placeholderText())
         self.assertIn("63,000원", dialog.current_reference_label.text())
         dialog.value_edit.setText("52")
         self.assertIn("156,000원", dialog.changed_reference_label.text())
@@ -439,6 +445,47 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         dialog._validate_and_accept()
         self.assertEqual("PRE_OPERATION", dialog.result["apply_timing"])
         self.assertEqual(25, dialog.result["value"])
+
+    def test_zero_quantity_uses_existing_value_display_without_prefilling_input(self) -> None:
+        dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="005930",
+            stock_name="삼성전자",
+            current_price=45_000,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 0},
+            timing_selection_enabled=False,
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual("0주", dialog._value_text(dialog.current_value))
+        self.assertEqual("-", dialog.current_reference_label.text())
+        self.assertEqual("", dialog.value_edit.text())
+        self.assertEqual("숫자 입력", dialog.value_edit.placeholderText())
+        self.assertIn(
+            "0주",
+            [label.text() for label in dialog.findChildren(gui_windows.QLabel)],
+        )
+
+    def test_zero_amount_uses_existing_value_display_without_prefilling_input(self) -> None:
+        dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="005930",
+            stock_name="삼성전자",
+            current_price=45_000,
+            config={"trade_amount_type": "AMOUNT", "buy_amount": 0},
+            minimum_amount=67_500,
+            timing_selection_enabled=False,
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual("0원", dialog._value_text(dialog.current_value))
+        self.assertEqual("-", dialog.current_reference_label.text())
+        self.assertEqual("", dialog.value_edit.text())
+        self.assertEqual("숫자 입력", dialog.value_edit.placeholderText())
+        self.assertIn(
+            "0원",
+            [label.text() for label in dialog.findChildren(gui_windows.QLabel)],
+        )
 
     def test_amount_budget_requires_environment_minimum_amount(self) -> None:
         for value in (4_000, 13_304):
@@ -494,7 +541,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             self.app.activeWindow(),
             stock_code="012210",
             stock_name="삼미금속",
-            current_price=0,
+            current_price=30_000,
             config={"trade_amount_type": "AMOUNT", "buy_amount": 30_000},
         )
         self.addCleanup(dialog.deleteLater)
@@ -506,7 +553,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         self.assertFalse(dialog.validation_label.isHidden())
         self.assertEqual("시작예산 금액을 확인하세요.", dialog.validation_label.text())
 
-    def test_quantity_budget_can_be_saved_without_configuration_price(self) -> None:
+    def test_quantity_budget_cannot_be_saved_without_configuration_price(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
             self.app.activeWindow(),
             stock_code="012210",
@@ -519,12 +566,14 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
 
         dialog._validate_and_accept()
 
-        self.assertEqual(2, dialog.result["value"])
-        self.assertEqual("QUANTITY", dialog.result["mode"])
-        self.assertTrue(dialog.validation_label.isHidden())
-        self.assertEqual("", dialog.validation_label.text())
+        self.assertEqual({}, dialog.result)
+        self.assertFalse(dialog.validation_label.isHidden())
+        self.assertEqual(
+            "현재 주가를 확인한 후 변경할 수 있습니다.",
+            dialog.validation_label.text(),
+        )
 
-    def test_quantity_budget_ignores_stale_display_price_and_saves(self) -> None:
+    def test_quantity_budget_rejects_stale_display_price(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
             self.app.activeWindow(),
             stock_code="012210",
@@ -538,12 +587,15 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
 
         dialog._validate_and_accept()
 
-        self.assertEqual(2, dialog.result["value"])
+        self.assertEqual({}, dialog.result)
         self.assertEqual("현재가 -", dialog.current_price_label.text())
-        self.assertTrue(dialog.validation_label.isHidden())
-        self.assertEqual("", dialog.validation_label.text())
+        self.assertFalse(dialog.validation_label.isHidden())
+        self.assertEqual(
+            "현재 주가를 확인한 후 변경할 수 있습니다.",
+            dialog.validation_label.text(),
+        )
 
-    def test_running_budget_dialog_rehydrates_pending_policy_and_limit_choice(self) -> None:
+    def test_running_budget_dialog_rehydrates_policy_but_uses_limit_preference(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
             self.app.activeWindow(),
             stock_code="005930",
@@ -556,13 +608,31 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                 "apply_limit": True,
                 "state": "WAIT_SELL",
             },
+            apply_limit_checked=False,
         )
         self.addCleanup(dialog.deleteLater)
 
         self.assertEqual("60,000", dialog.value_edit.text())
         self.assertFalse(dialog.immediate_checkbox.isChecked())
         self.assertTrue(dialog.next_cycle_checkbox.isChecked())
-        self.assertTrue(dialog.apply_limit_checkbox.isChecked())
+        self.assertFalse(dialog.apply_limit_checkbox.isChecked())
+
+        preferred_dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="005930",
+            stock_name="삼성전자",
+            current_price=30000,
+            config={"trade_amount_type": "AMOUNT", "buy_amount": 60000},
+            pending_adjustment={
+                "requested_value": 60000,
+                "apply_policy": "NEXT_CYCLE",
+                "apply_limit": False,
+                "state": "WAIT_SELL",
+            },
+            apply_limit_checked=True,
+        )
+        self.addCleanup(preferred_dialog.deleteLater)
+        self.assertTrue(preferred_dialog.apply_limit_checkbox.isChecked())
 
     def test_running_budget_dialog_spacing_and_checkbox_indent_are_aligned(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(

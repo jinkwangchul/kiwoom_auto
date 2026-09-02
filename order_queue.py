@@ -29,17 +29,6 @@ SIGNAL_QUEUE_PATH = RUNTIME_DIR / "routine_signals.json"
 ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
 
 VALID_SIGNALS = {"BUY", "SELL"}
-TERMINAL_ORDER_STATUSES = {
-    "FILLED",
-    "CANCELLED",
-    "CANCELED",
-    "PARTIAL_CANCELLED",
-    "BROKER_REJECTED",
-    "SEND_CALL_REJECTED",
-    "REJECTED",
-    "BLOCKED",
-    "INVALID",
-}
 
 
 try:
@@ -109,29 +98,6 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
 
 def _source_signal_id(order: dict[str, Any]) -> str:
     return str(order.get("source_signal_id", "") or "").strip()
-
-
-def _execution_round_key(order: dict[str, Any]) -> tuple[str, str, str, int] | None:
-    intent = order.get("execution_intent")
-    if not isinstance(intent, dict) or _norm(intent.get("side")) != "BUY":
-        return None
-    routine_type = _norm(intent.get("routine_type"))
-    routine_instance_id = str(intent.get("routine_instance_id") or "").strip()
-    buy_round = intent.get("buy_round")
-    cycle_identity = str(intent.get("cycle_identity") or "").strip()
-    if (
-        routine_type != "INDICATOR_FOLLOW"
-        or not routine_instance_id
-        or not isinstance(buy_round, int)
-        or isinstance(buy_round, bool)
-        or buy_round <= 0
-    ):
-        return None
-    if buy_round == 1:
-        cycle_identity = "PENDING_BASE"
-    elif not cycle_identity:
-        return None
-    return routine_type, routine_instance_id, cycle_identity, buy_round
 
 
 def _queue_result(
@@ -216,15 +182,6 @@ def _candidate_duplicate_reason(order: dict[str, Any], orders: list[Any]) -> str
         for existing in orders:
             if isinstance(existing, dict) and _order_dedupe_key(existing) == key:
                 return "duplicate legacy candidate key"
-    execution_key = _execution_round_key(order)
-    if execution_key is not None:
-        for existing in orders:
-            if not isinstance(existing, dict):
-                continue
-            if _norm(existing.get("status")) in TERMINAL_ORDER_STATUSES:
-                continue
-            if _execution_round_key(existing) == execution_key:
-                return "duplicate live routine buy round"
     return None
 
 

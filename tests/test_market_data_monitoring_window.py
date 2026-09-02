@@ -13,7 +13,6 @@ from tests.qt_test_support import flush_deferred_deletes
 
 class _MonitoringHost:
     def __init__(self) -> None:
-        self.gate_enabled = False
         self.market = SimpleNamespace(
             connection_epoch=7,
             login_session_id="SESSION-7",
@@ -51,9 +50,6 @@ class _MonitoringHost:
         self.CommRqData = Mock()
         self.SetRealReg = Mock()
         self.SetRealRemove = Mock()
-
-    def price_signal_observation_enabled(self) -> bool:
-        return self.gate_enabled
 
     def high_resolution_market_data_snapshot(self):
         return self.market
@@ -109,16 +105,15 @@ class MarketDataMonitoringWindowTests(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertFalse(sip.isdeleted(second))
 
-    def test_snapshot_gate_tick_rate_quality_and_tr_metrics_are_displayed(self) -> None:
+    def test_snapshot_tick_rate_quality_and_tr_metrics_are_displayed(self) -> None:
         window = _MarketDataMonitoringWindow(self.parent, self.host)
         window._refresh_timer.stop()
         window._last_tick_rate_count = 10
         window._last_tick_rate_monotonic = 100.0
-        self.host.gate_enabled = True
         self.host.market.received_tick_count = 15
         window.refresh_snapshot(now_monotonic=102.0)
 
-        self.assertEqual("ON", window.value_text("price_signal"))
+        self.assertEqual("", window.value_text("price_signal"))
         self.assertEqual("2.5", window.value_text("tick_rate"))
         self.assertEqual("UNCERTAIN", window.value_text("data_quality"))
         self.assertEqual("15", window.value_text("received_tick_count"))

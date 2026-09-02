@@ -19,8 +19,10 @@
 # - 실주문 연결 금지
 # - rules.json 저장 금지
 
+import hashlib
 import json
 import sys
+import tempfile
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -72,7 +74,13 @@ from gui_window_policy import (
     persistent_feature_root,
 )
 import rule_approval_session_file_service as rule_approval_session_file_service
-from routine_instance_registry import load_persisted_routine_instances, load_routine_definitions
+import rule_apply_commit_service as rule_apply_commit_service
+import rule_commit_dry_run_service as rule_commit_dry_run_service
+from routine_instance_registry import (
+    load_persisted_routine_instances,
+    load_routine_definitions,
+    routine_instance_by_id,
+)
 from routine_instance_repository import RoutineInstanceRepository
 from event_journal_production import append_production_event
 
@@ -504,6 +512,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self._last_saved_rule_approval_session_decisions = None
         self._last_rule_approval_session_save_result = {}
         self._rule_approval_save_button = None
+        self._rule_approval_apply_button = None
         self._rule_approval_controls_box = QGroupBox("Rule Candidate Approval Preview Controls")
         self._rule_approval_controls_layout = QGridLayout(self._rule_approval_controls_box)
         self._rule_approval_controls_box.setVisible(False)
@@ -785,6 +794,16 @@ class IndicatorFollowRoutineSettingsDialog(
 
     def save_edit_settings_and_close(self):
         result = self.save_indicator_follow_ui_state_to_rules()
+        pending_writer = getattr(self, "save_indicator_follow_rule_pending_to_rules", None)
+        if result.get("success") is True and callable(pending_writer):
+            pending_result = pending_writer()
+            result["pending_save_result"] = pending_result
+            if pending_result.get("success") is not True:
+                result["success"] = False
+                result["error"] = (
+                    pending_result.get("error")
+                    or "설정 변경안 저장에 실패했습니다."
+                )
         if result.get("success") is True:
             _refresh_routine_assignment_views(self)
             self.close()
@@ -1016,6 +1035,7 @@ class IndicatorFollowRoutineSettingsDialog(
     def _clear_rule_approval_controls_layout(self):
         self._rule_approval_decision_widgets = {}
         self._rule_approval_save_button = None
+        self._rule_approval_apply_button = None
         layout = getattr(self, "_rule_approval_controls_layout", None)
         if layout is None or not hasattr(layout, "count"):
             return
@@ -1048,7 +1068,9 @@ class IndicatorFollowRoutineSettingsDialog(
             box.setVisible(False)
             return
 
-        notice = QLabel("미리보기 전용: 선택한 decision은 저장/적용되지 않으며 rules.json을 변경하지 않습니다.")
+        notice = QLabel(
+            "변경사항별 승인 상태를 저장한 뒤, 승인된 변경사항만 설정에 적용할 수 있습니다."
+        )
         if hasattr(notice, "setWordWrap"):
             notice.setWordWrap(True)
         layout.addWidget(notice, 0, 0, 1, 4)
@@ -1105,12 +1127,39 @@ class IndicatorFollowRoutineSettingsDialog(
 
         save_button = QPushButton("승인 검토 상태 저장")
         save_button.setToolTip(
-            "현재 승인 검토 상태(decision)만 저장합니다.\nrules.json은 변경되지 않습니다."
+            "현재 승인 검토 상태만 저장하며 아직 설정에는 적용하지 않습니다."
         )
         save_button.clicked.connect(self._handle_rule_approval_session_save_clicked)
+        apply_button = QPushButton("승인한 변경사항 적용")
+        apply_button.setToolTip(
+            "저장된 승인 상태를 다시 검증한 뒤 승인된 변경사항만 적용합니다."
+        )
+        apply_handler = getattr(self, "_handle_approved_rule_commit_clicked", None)
+        if callable(apply_handler):
+            apply_button.clicked.connect(apply_handler)
+        status_reader = getattr(
+            self,
+            "_approval_session_file_status_with_dirty",
+            None,
+        )
+        approval_file_saved = (
+            callable(status_reader)
+            and status_reader().get("saved") is True
+        )
+        apply_allowed = bool(
+            getattr(self, "settings_mode", "") == "edit"
+            and getattr(self, "instance_id", "")
+            and not getattr(self, "_rule_approval_session_dirty", False)
+            and approval_file_saved
+        )
+        set_enabled = getattr(apply_button, "setEnabled", None)
+        if callable(set_enabled):
+            set_enabled(apply_allowed)
         save_row = len(decisions) + 2
+        layout.addWidget(apply_button, save_row, 2)
         layout.addWidget(save_button, save_row, 3)
         self._rule_approval_save_button = save_button
+        self._rule_approval_apply_button = apply_button
 
         box.setVisible(True)
 
@@ -1495,6 +1544,15 @@ class IndicatorFollowRoutineSettingsDialog(
             validation = mapper.validate_rule_approval_session_for_preview(session, rules, preview)
             allowed, reason = self._rule_approval_session_save_allowed(session, validation)
             if allowed:
+                session = deepcopy(session)
+                session["routine"] = str(
+                    getattr(self, "definition_display_name", "")
+                    or getattr(self, "routine_name", "")
+                    or "지표추종매매"
+                ).strip()
+                session["routine_key"] = str(
+                    getattr(self, "definition_id", "") or "indicator_follow"
+                ).strip()
                 save_result = rule_approval_session_file_service.save_rule_approval_session(
                     session,
                     self._rule_approval_session_path(),
@@ -1527,6 +1585,254 @@ class IndicatorFollowRoutineSettingsDialog(
             display_view = self._rule_pipeline_display_view(pipeline_preview)
             self._render_rule_validation_preview(display_view)
             return display_view
+
+    @staticmethod
+    def _rule_file_sha256(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest().upper()
+
+    def _effective_rule_instance(self):
+        instance_id = str(getattr(self, "instance_id", "") or "").strip()
+        if not instance_id:
+            return None, "등록된 루틴의 설정에서만 변경사항을 적용할 수 있습니다."
+        instance = routine_instance_by_id(
+            instance_id,
+            project_root=Path(__file__).resolve().parent,
+        )
+        if instance is None or instance.rules_path is None:
+            return None, "적용할 루틴 설정을 확인할 수 없습니다."
+        try:
+            path_matches = Path(instance.rules_path).resolve() == Path(self.rules_path).resolve()
+        except Exception:
+            path_matches = False
+        if not path_matches:
+            return None, "적용할 루틴 설정 경로가 일치하지 않습니다."
+        definition_id = str(getattr(self, "definition_id", "") or "").strip()
+        if definition_id and str(instance.definition_id or "").strip() != definition_id:
+            return None, "적용할 루틴 유형이 일치하지 않습니다."
+        return instance, ""
+
+    def _restore_rule_commit_after_failed_verification(self, commit_result):
+        backup_path = commit_result.get("backup_path") if isinstance(commit_result, dict) else None
+        if not backup_path or not Path(self.rules_path).exists():
+            return {
+                "ok": False,
+                "blocked_reasons": ["변경 전 설정 복구 자료를 확인할 수 없습니다."],
+            }
+        return rule_apply_commit_service.restore_rules_from_backup(
+            self.rules_path,
+            backup_path,
+            {
+                "allowed_rules_path": str(Path(self.rules_path).resolve()),
+                "expected_current_file_sha256": self._rule_file_sha256(self.rules_path),
+            },
+        )
+
+    def commit_saved_approved_rule_changes(
+        self,
+        *,
+        manual_rule_commit_confirmed=False,
+        dry_run_workspace=None,
+    ):
+        """Apply one saved approval session to this instance's effective rules."""
+        result = {
+            "ok": False,
+            "committed": False,
+            "stage": "RULE_PRODUCTION_COMMIT_BLOCKED",
+            "instance_id": str(getattr(self, "instance_id", "") or "").strip(),
+            "rules_path": str(getattr(self, "rules_path", "") or ""),
+            "blocked_reasons": [],
+        }
+        if manual_rule_commit_confirmed is not True:
+            result["blocked_reasons"] = ["사용자 적용 확인이 필요합니다."]
+            return result
+        if getattr(self, "_rule_approval_session_dirty", False):
+            result["blocked_reasons"] = ["변경된 승인 상태를 먼저 저장하세요."]
+            return result
+
+        instance, instance_error = self._effective_rule_instance()
+        if instance is None:
+            result["blocked_reasons"] = [instance_error]
+            return result
+
+        rules_path = Path(self.rules_path)
+        session_path = self._rule_approval_session_path()
+        try:
+            current_rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        except Exception:
+            result["blocked_reasons"] = ["현재 설정을 다시 읽을 수 없습니다."]
+            return result
+        if not isinstance(current_rules, dict):
+            result["blocked_reasons"] = ["현재 설정 형식을 확인할 수 없습니다."]
+            return result
+
+        mapper = self._load_indicator_follow_rule_mapper()
+        preview = mapper.build_engine_rules_preview_from_ui_state(
+            self.collect_indicator_follow_ui_state(),
+            deepcopy(current_rules),
+        )
+        session_load = rule_approval_session_file_service.load_rule_approval_session(
+            session_path
+        )
+        saved_session = session_load.get("session") if session_load.get("ok") else None
+        if not isinstance(saved_session, dict):
+            result["blocked_reasons"] = ["저장된 승인 상태를 확인할 수 없습니다."]
+            return result
+
+        workspace_context = None
+        try:
+            if dry_run_workspace is None:
+                workspace_context = tempfile.TemporaryDirectory(
+                    prefix="indicator_rule_commit_"
+                )
+                workspace = Path(workspace_context.name) / "workspace"
+            else:
+                workspace = Path(dry_run_workspace)
+            dry_run_result = rule_commit_dry_run_service.run_rule_commit_dry_run(
+                rules_path,
+                session_path,
+                workspace,
+                {
+                    "preview_result": preview,
+                    "definition_id": str(getattr(self, "definition_id", "") or "").strip(),
+                    "approval_session_dirty": False,
+                    "manual_rule_commit_confirmed": True,
+                    "write_report": False,
+                    "preserve_workspace_on_failure": False,
+                    "preserve_workspace_on_success": False,
+                },
+            )
+        except Exception:
+            result["blocked_reasons"] = ["승인된 변경사항의 사전 검증을 실행하지 못했습니다."]
+            return result
+        finally:
+            if workspace_context is not None:
+                workspace_context.cleanup()
+        result["dry_run_result"] = dry_run_result
+        if dry_run_result.get("ok") is not True:
+            result["blocked_reasons"] = ["승인된 변경사항의 사전 검증을 통과하지 못했습니다."]
+            return result
+
+        try:
+            commit_base_rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        except Exception:
+            result["blocked_reasons"] = ["적용 직전 현재 설정을 다시 읽을 수 없습니다."]
+            return result
+        if not isinstance(commit_base_rules, dict):
+            result["blocked_reasons"] = ["적용 직전 현재 설정 형식을 확인할 수 없습니다."]
+            return result
+
+        commit_gate = mapper.evaluate_rule_commit_gate_from_saved_session(
+            commit_base_rules,
+            preview,
+            session_path,
+            {
+                "expected_rules_hash": mapper._stable_hash(commit_base_rules),
+                "approval_session_dirty": False,
+                "manual_rule_commit_confirmed": True,
+            },
+        )
+        result["commit_gate"] = commit_gate
+        if commit_gate.get("commit_allowed") is not True:
+            result["blocked_reasons"] = ["승인 이후 설정이 달라져 적용하지 않았습니다."]
+            return result
+
+        pipeline = mapper.build_rule_pipeline_preview(
+            commit_base_rules,
+            preview,
+            saved_session,
+        )
+        apply_preview = pipeline.get("apply_preview", {})
+        commit_result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+            rules_path,
+            apply_preview,
+            commit_gate,
+            {
+                "allowed_rules_path": str(rules_path.resolve()),
+                "expected_file_sha256": self._rule_file_sha256(rules_path),
+                "expected_rules_hash": mapper._stable_hash(commit_base_rules),
+            },
+        )
+        result["commit_result"] = commit_result
+        if commit_result.get("ok") is not True:
+            if commit_result.get("write_completed") is True:
+                result["rollback_result"] = (
+                    self._restore_rule_commit_after_failed_verification(commit_result)
+                )
+            result["blocked_reasons"] = ["승인된 변경사항을 적용하지 못했습니다."]
+            return result
+
+        try:
+            read_back = json.loads(rules_path.read_text(encoding="utf-8"))
+        except Exception:
+            read_back = None
+        expected_rules = apply_preview.get("applied_rules_preview")
+        instance_after, _instance_after_error = self._effective_rule_instance()
+        read_back_checks = {
+            "expected_rules": isinstance(read_back, dict) and read_back == expected_rules,
+            "expected_hash": (
+                isinstance(read_back, dict)
+                and mapper._stable_hash(read_back) == commit_result.get("post_rules_hash")
+            ),
+            "expected_instance_identity": (
+                instance_after is not None
+                and str(instance_after.instance_id) == str(instance.instance_id)
+                and Path(instance_after.rules_path).resolve() == rules_path.resolve()
+            ),
+        }
+        result["read_back_checks"] = read_back_checks
+        if not all(read_back_checks.values()):
+            result["rollback_result"] = (
+                self._restore_rule_commit_after_failed_verification(commit_result)
+            )
+            result["blocked_reasons"] = ["적용 후 설정 확인이 일치하지 않아 변경 전 상태로 복구했습니다."]
+            return result
+
+        self.rules_data = read_back
+        self.rules = read_back
+        result.update(
+            {
+                "ok": True,
+                "committed": True,
+                "stage": "RULE_PRODUCTION_COMMIT",
+                "blocked_reasons": [],
+                "post_rules_hash": commit_result.get("post_rules_hash"),
+                "applied_patches": commit_result.get("applied_patches", []),
+            }
+        )
+        return result
+
+    def _handle_approved_rule_commit_clicked(self, _checked=False):
+        answer = QMessageBox.question(
+            self,
+            "설정 적용",
+            "승인한 변경사항을 실제 루틴 설정에 적용하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return {
+                "ok": False,
+                "committed": False,
+                "stage": "RULE_PRODUCTION_COMMIT_CANCELLED",
+                "blocked_reasons": ["사용자가 적용을 취소했습니다."],
+            }
+        result = self.commit_saved_approved_rule_changes(
+            manual_rule_commit_confirmed=True,
+        )
+        if result.get("ok") is True:
+            QMessageBox.information(
+                self,
+                "설정 적용",
+                "승인한 변경사항을 적용했습니다.",
+            )
+            self.load_rules()
+        else:
+            QMessageBox.warning(
+                self,
+                "설정 적용 실패",
+                str((result.get("blocked_reasons") or ["변경사항을 적용하지 못했습니다."])[0]),
+            )
+        return result
 
     def _handle_rule_approval_decision_changed(self, path, decision):
         try:
@@ -1944,6 +2250,18 @@ class IndicatorFollowRoutineSettingsDialog(
         }
         self._refresh_rule_approval_controls(approval_and_patch_preview.get("session", {}))
         self._render_rule_validation_preview(approval_and_patch_preview)
+        validation_window = getattr(self, "validation_tab", None)
+        if validation_window is not None:
+            set_title = getattr(validation_window, "setWindowTitle", None)
+            if callable(set_title):
+                set_title("설정 변경 검토")
+            resize = getattr(validation_window, "resize", None)
+            if callable(resize):
+                resize(1100, 720)
+            for method_name in ("show", "raise_", "activateWindow"):
+                method = getattr(validation_window, method_name, None)
+                if callable(method):
+                    method()
 
     def _read_ui_widget_value(self, name):
         widget = getattr(self, name, None)

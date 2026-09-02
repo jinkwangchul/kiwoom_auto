@@ -136,8 +136,8 @@ class BudgetRoutingCommandTest(unittest.TestCase):
                 self._host(fresh=False),
                 BudgetValueChangeRequest(config_path),
             )
-            self.assertTrue(unavailable["allowed"])
-            self.assertEqual("", unavailable["reason"])
+            self.assertFalse(unavailable["allowed"])
+            self.assertEqual(CURRENT_PRICE_UNAVAILABLE, unavailable["reason"])
             self.assertIsNone(unavailable["current_price"])
             self.assertEqual(before, config_path.read_bytes())
 
@@ -151,7 +151,7 @@ class BudgetRoutingCommandTest(unittest.TestCase):
             )
             self.assertIsNone(persisted_only["current_price"])
 
-    def test_amount_to_quantity_does_not_resolve_price(self) -> None:
+    def test_amount_to_quantity_without_configuration_price_does_not_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self._fixture(Path(temp_dir))
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -161,9 +161,38 @@ class BudgetRoutingCommandTest(unittest.TestCase):
                 return_value={"allowed": True, "changed": True, "reason": ""}
             )
             price_reader = MagicMock(return_value=None)
+            host = self._host(fresh=False)
 
             result = execute_budget_mode_change(
-                self._host(fresh=False),
+                host,
+                BudgetModeChangeRequest(config_path, "QUANTITY"),
+                writer=writer,
+                configuration_price_reader=price_reader,
+            )
+
+            self.assertFalse(result["allowed"], result)
+            self.assertEqual(CURRENT_PRICE_UNAVAILABLE, result["reason"])
+            price_reader.assert_called_once_with(host, config_path)
+            writer.assert_not_called()
+
+    def test_amount_to_quantity_uses_snapshot_once_and_default_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._fixture(Path(temp_dir))
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["trade_amount_type"] = "AMOUNT"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            writer = MagicMock(
+                return_value={"allowed": True, "changed": True, "reason": ""}
+            )
+            state = SimpleNamespace(
+                last_price=70_000,
+                field_sources=(("last_price", "SNAPSHOT"),),
+            )
+            price_reader = MagicMock(return_value=state)
+            host = self._host()
+
+            result = execute_budget_mode_change(
+                host,
                 BudgetModeChangeRequest(config_path, "QUANTITY"),
                 writer=writer,
                 configuration_price_reader=price_reader,
@@ -171,7 +200,8 @@ class BudgetRoutingCommandTest(unittest.TestCase):
 
             self.assertTrue(result["allowed"], result)
             self.assertEqual(1, result["value"])
-            price_reader.assert_not_called()
+            self.assertEqual("SNAPSHOT", result["price_source"])
+            price_reader.assert_called_once_with(host, config_path)
             writer.assert_called_once_with(
                 config_path,
                 mode="QUANTITY",

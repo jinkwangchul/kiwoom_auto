@@ -74,6 +74,34 @@ def _active_adjustment(
     return adjustment
 
 
+def _project_recalculated_limit(
+    projected: dict[str, object],
+    adjustment: Mapping[str, object],
+) -> bool:
+    """Project only the amount while preserving the prior enable contract."""
+
+    if not bool(adjustment.get("apply_limit", False)):
+        return False
+    previous_limit = adjustment.get("previous_limit")
+    previous_enabled = bool(
+        previous_limit.get("buy_limit_enabled", False)
+        if isinstance(previous_limit, Mapping)
+        else projected.get("buy_limit_enabled", False)
+    )
+    limit_amount = _positive_int(adjustment.get("adjusted_limit_amount"))
+    persisted_amount = _positive_int(projected.get("buy_limit_amount"))
+    if (
+        not previous_enabled
+        or limit_amount is None
+        or persisted_amount != limit_amount
+    ):
+        return False
+    projected["buy_limit_enabled"] = previous_enabled
+    projected["buy_limit_amount"] = limit_amount
+    projected["buy_limit_source"] = "RECOMMENDED"
+    return True
+
+
 def project_running_budget_adjustment_config(
     config: Mapping[str, object],
     state: Mapping[str, object],
@@ -137,18 +165,7 @@ def project_running_budget_adjustment_config(
 
     projected["trade_amount_type"] = mode
     projected["buy_amount" if mode == "AMOUNT" else "buy_qty"] = requested_value
-    if bool(adjustment.get("apply_limit", False)):
-        limit_amount = _positive_int(adjustment.get("adjusted_limit_amount"))
-        if limit_amount is None:
-            return dict(config), {
-                "active": True,
-                "applied": False,
-                "state": adjustment_state,
-                "reason": "INVALID_LIMIT_PROJECTION",
-            }
-        projected["buy_limit_enabled"] = True
-        projected["buy_limit_amount"] = limit_amount
-        projected["buy_limit_source"] = "RECOMMENDED"
+    limit_recalculated = _project_recalculated_limit(projected, adjustment)
 
     return projected, {
         "active": True,
@@ -158,6 +175,7 @@ def project_running_budget_adjustment_config(
         "mode": mode,
         "requested_value": requested_value,
         "apply_limit": bool(adjustment.get("apply_limit", False)),
+        "limit_recalculated": limit_recalculated,
         "reason": "RUNTIME_BUDGET_PROJECTED",
     }
 
@@ -190,12 +208,7 @@ def project_running_budget_adjustment_display_config(
 
     projected["trade_amount_type"] = mode
     projected["buy_amount" if mode == "AMOUNT" else "buy_qty"] = requested_value
-    if bool(adjustment.get("apply_limit", False)):
-        limit_amount = _positive_int(adjustment.get("adjusted_limit_amount"))
-        if limit_amount is not None:
-            projected["buy_limit_enabled"] = True
-            projected["buy_limit_amount"] = limit_amount
-            projected["buy_limit_source"] = "RECOMMENDED"
+    _project_recalculated_limit(projected, adjustment)
     return projected, {
         "active": True,
         "hydrated": True,
@@ -242,9 +255,6 @@ def commit_running_budget_adjustment(
         return {"ok": False, "reason": "INVALID_CURRENT_VALUE"}
     if not bool(state.get("trade_enabled", False)) or not session_identity:
         return {"ok": False, "reason": "OPERATION_SESSION_NOT_ACTIVE"}
-    if apply_limit and limit_amount is None:
-        return {"ok": False, "reason": "LIMIT_EVIDENCE_UNAVAILABLE"}
-
     timestamp = str(confirmed_at or "").strip() or _now_text()
     request_timestamp = str(requested_at or "").strip() or timestamp
     adjustment = {

@@ -14,6 +14,7 @@ from runtime_io import read_json_dict
 from stock_repository import (
     STOCK_CONFIG_WRITE_FIELD_CONFLICT,
     STOCK_CONFIG_WRITE_INVALID_CONFIG,
+    StockConfigWriteResult,
 )
 
 
@@ -57,7 +58,7 @@ class BudgetLimitCanonicalWriterTest(unittest.TestCase):
             "reason": "",
         }
 
-    def test_budget_and_limit_are_one_patch_and_preserve_inactive_value(self) -> None:
+    def test_budget_and_limit_use_independent_patches_and_preserve_inactive_value(self) -> None:
         expected = gui_windows.MainWindow._start_budget_config_expected_fields(
             self.config,
             mode="AMOUNT",
@@ -90,13 +91,116 @@ class BudgetLimitCanonicalWriterTest(unittest.TestCase):
             )
 
         self.assertTrue(result["allowed"], result)
-        canonical_patch.assert_called_once()
-        persisted_patch = canonical_patch.call_args.args[2]
-        self.assertEqual(200_000, persisted_patch["buy_amount"])
-        self.assertEqual(2_000_000, persisted_patch["buy_limit_amount"])
+        self.assertEqual(2, canonical_patch.call_count)
+        budget_patch = canonical_patch.call_args_list[0].args[2]
+        limit_patch = canonical_patch.call_args_list[1].args[2]
+        self.assertEqual(200_000, budget_patch["buy_amount"])
+        self.assertNotIn("buy_limit_amount", budget_patch)
+        self.assertEqual(2_000_000, limit_patch["buy_limit_amount"])
+        self.assertNotIn("buy_amount", limit_patch)
         saved = read_json_dict(self.config_path)
         self.assertEqual(7, saved["buy_qty"])
         self.assertEqual({"owner": "fixture"}, saved["unrelated"])
+
+    def test_checked_recalculation_preserves_disabled_limit_contract(self) -> None:
+        disabled = dict(self.config)
+        disabled.update(
+            {
+                "buy_limit_enabled": False,
+                "buy_limit_amount": None,
+                "buy_limit_source": None,
+            }
+        )
+        self._write(disabled)
+        with patch.object(
+            gui_windows,
+            "auto_trade_start_budget_mutation_decision",
+            return_value=self._decision(changed=True),
+        ):
+            result = gui_windows.MainWindow._write_stock_initial_buy_config(
+                self.host,
+                self.config_path,
+                mode="AMOUNT",
+                value=200_000,
+                apply_limit=True,
+                adjusted_limit_amount=2_000_000,
+            )
+
+        saved = read_json_dict(self.config_path)
+        self.assertTrue(result["allowed"], result)
+        self.assertFalse(result["limit_applied"])
+        self.assertFalse(saved["buy_limit_enabled"])
+        self.assertIsNone(saved["buy_limit_amount"])
+        self.assertIsNone(saved["buy_limit_source"])
+        self.assertEqual(200_000, saved["buy_amount"])
+
+    def test_limit_evidence_failure_does_not_block_budget_patch(self) -> None:
+        with patch.object(
+            gui_windows,
+            "auto_trade_start_budget_mutation_decision",
+            return_value=self._decision(changed=True),
+        ):
+            result = gui_windows.MainWindow._write_stock_initial_buy_config(
+                self.host,
+                self.config_path,
+                mode="AMOUNT",
+                value=200_000,
+                apply_limit=True,
+                adjusted_limit_amount=None,
+            )
+
+        saved = read_json_dict(self.config_path)
+        self.assertTrue(result["allowed"], result)
+        self.assertFalse(result["limit_applied"])
+        self.assertEqual("INVALID_ADJUSTED_LIMIT", result["limit_reason"])
+        self.assertEqual(200_000, saved["buy_amount"])
+        self.assertTrue(saved["buy_limit_enabled"])
+        self.assertEqual(1_000_000, saved["buy_limit_amount"])
+        self.assertEqual("MANUAL", saved["buy_limit_source"])
+
+    def test_limit_writer_conflict_keeps_successful_budget_patch(self) -> None:
+        conflict = StockConfigWriteResult(
+            ok=False,
+            changed=False,
+            field_keys=(
+                "buy_limit_enabled",
+                "buy_limit_amount",
+                "buy_limit_source",
+            ),
+            conflict_detected=True,
+            read_back_verified=False,
+            reason_code=STOCK_CONFIG_WRITE_FIELD_CONFLICT,
+        )
+        with (
+            patch.object(
+                gui_windows,
+                "auto_trade_start_budget_mutation_decision",
+                return_value=self._decision(changed=True),
+            ),
+            patch.object(
+                gui_windows.MainWindow,
+                "_write_stock_buy_limit_config",
+                return_value=conflict,
+            ),
+        ):
+            result = gui_windows.MainWindow._write_stock_initial_buy_config(
+                self.host,
+                self.config_path,
+                mode="AMOUNT",
+                value=200_000,
+                apply_limit=True,
+                adjusted_limit_amount=2_000_000,
+            )
+
+        saved = read_json_dict(self.config_path)
+        self.assertTrue(result["allowed"], result)
+        self.assertFalse(result["limit_applied"])
+        self.assertEqual(
+            STOCK_CONFIG_WRITE_FIELD_CONFLICT,
+            result["limit_reason"],
+        )
+        self.assertEqual(200_000, saved["buy_amount"])
+        self.assertEqual(1_000_000, saved["buy_limit_amount"])
 
     def test_quantity_patch_preserves_inactive_amount(self) -> None:
         with patch.object(

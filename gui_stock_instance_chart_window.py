@@ -71,6 +71,7 @@ from gui_window_policy import (
 BUY_COLOR = QColor("#DC2626")
 SELL_COLOR = QColor("#2563EB")
 LINE_COLOR = QColor("#2F6BFF")
+SESSION_GAP_BRIDGE_COLOR = QColor("#9CA3AF")
 LIVE_PRICE_COLOR = QColor("#059669")
 ACTUAL_BUY_FILL_COLOR = QColor("#16A34A")
 ACTUAL_SELL_FILL_COLOR = QColor("#F97316")
@@ -79,6 +80,13 @@ PROCESS_RAIL_COLOR = QColor("#6B7280")
 CHART_OPEN_STOCK_CODE_COLOR = "#2563EB"
 BASE_CHART_START_TIME = "09:00:00"
 BASE_CHART_END_TIME = "15:30:00"
+NXT_CHART_START_TIME = "08:00:00"
+NXT_CHART_END_TIME = "20:00:00"
+NXT_MARKET_SESSION_TIMES = (
+    (NXT_CHART_START_TIME, "08:50:00"),
+    (BASE_CHART_START_TIME, BASE_CHART_END_TIME),
+    ("16:00:00", NXT_CHART_END_TIME),
+)
 ProjectionProvider = Callable[[str, str], dict[str, Any]]
 ChartFactory = Callable[[QWidget], "StockInstanceCloseChart"]
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1011,6 +1019,7 @@ class ExecutionProcessRail(QWidget):
     @staticmethod
     def _row_text(process: dict[str, Any]) -> str:
         side = str(process.get("side") or "-").strip().upper()
+        side_text = {"BUY": "매수", "SELL": "매도"}.get(side, side)
         option = str(process.get("option_summary") or "-").strip()
         completed = _nonnegative_count(process.get("child_completed"), 0)
         total = _nonnegative_count(process.get("child_total"), 0)
@@ -1021,7 +1030,7 @@ class ExecutionProcessRail(QWidget):
             "APPROVED": "승인",
             "ORDERED": "주문",
         }.get(status, status)
-        return f"{side} | {option} | {status_text} {completed}/{total}"
+        return f"{side_text} | {option} | {status_text} {completed}/{total}"
 
     @staticmethod
     def _tooltip_text(process: dict[str, Any]) -> str:
@@ -1319,15 +1328,8 @@ class StockInstanceCloseChart(QWidget):
         if not self.close_series:
             return []
 
-        session_ranges = list(self.visible_time_ranges)
-        if not session_ranges and self.fixed_time_range is not None:
-            session_ranges = [self.fixed_time_range]
-
         def session_index(bar_time: datetime) -> int:
-            for index, (start, end) in enumerate(session_ranges):
-                if start <= bar_time <= end:
-                    return index
-            return -1
+            return self._session_index_for(bar_time)
 
         segments: list[list[tuple[datetime, float]]] = []
         current: list[tuple[datetime, float]] = []
@@ -1347,6 +1349,50 @@ class StockInstanceCloseChart(QWidget):
         if current:
             segments.append(current)
         return segments
+
+    def _session_index_for(self, bar_time: datetime) -> int:
+        session_ranges = list(self.visible_time_ranges)
+        if not session_ranges and self.fixed_time_range is not None:
+            session_ranges = [self.fixed_time_range]
+        for index, (start, end) in enumerate(session_ranges):
+            if start <= bar_time <= end:
+                return index
+        return -1
+
+    def _session_gap_bridge_segments(
+        self,
+    ) -> list[list[tuple[datetime, float]]]:
+        solid_segments = self._line_segments()
+        bridges: list[list[tuple[datetime, float]]] = []
+        for previous, following in zip(solid_segments, solid_segments[1:]):
+            if not previous or not following:
+                continue
+            previous_item = previous[-1]
+            following_item = following[0]
+            previous_session = self._session_index_for(previous_item[0])
+            following_session = self._session_index_for(following_item[0])
+            if (
+                previous_item[0].date() == following_item[0].date()
+                and previous_session >= 0
+                and following_session == previous_session + 1
+            ):
+                bridges.append([previous_item, following_item])
+        return bridges
+
+    def _draw_session_gap_bridges(self, painter: QPainter, plot: QRectF) -> None:
+        painter.setPen(QPen(SESSION_GAP_BRIDGE_COLOR, 2, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        for segment in self._session_gap_bridge_segments():
+            points = [
+                point
+                for bar_time, value in segment
+                if (point := self.position_for(bar_time, value, plot)) is not None
+            ]
+            if len(points) != 2:
+                continue
+            path = QPainterPath(points[0])
+            path.lineTo(points[1])
+            painter.drawPath(path)
 
     def _plot_rect(self) -> QRectF:
         return QRectF(
@@ -1394,10 +1440,17 @@ class StockInstanceCloseChart(QWidget):
         minimum_time, maximum_time = time_range
         time_span = (maximum_time - minimum_time).total_seconds()
         if self.fixed_time_range is not None:
-            label_times = [
-                minimum_time + (maximum_time - minimum_time) * (index / 4)
-                for index in range(5)
-            ]
+            label_times = [minimum_time]
+            next_hour = minimum_time.replace(
+                minute=0,
+                second=0,
+                microsecond=0,
+            ) + timedelta(hours=1)
+            while next_hour < maximum_time:
+                label_times.append(next_hour)
+                next_hour += timedelta(hours=1)
+            if label_times[-1] != maximum_time:
+                label_times.append(maximum_time)
         elif len(self.close_series) == 1:
             label_times = [self.close_series[0][0]]
         else:
@@ -1665,6 +1718,8 @@ class StockInstanceCloseChart(QWidget):
             if len(points) == 1:
                 painter.setBrush(LINE_COLOR)
                 painter.drawEllipse(points[0], 2.5, 2.5)
+
+        self._draw_session_gap_bridges(painter, plot)
 
         self._draw_average_price_projection(painter, plot)
 
@@ -2521,7 +2576,7 @@ class StockInstanceChartWindow(QDialog):
         trade_date = str(data.get("trade_date") or "").strip()
         _start, _end, visible_ranges = cls._chart_display_time_range(
             trade_date,
-            data.get("ats_session_ranges", []),
+            data.get("nxt_available") is True,
         )
         if not visible_ranges:
             return False
@@ -2642,36 +2697,29 @@ class StockInstanceChartWindow(QDialog):
     @staticmethod
     def _chart_display_time_range(
         trade_date: str,
-        ats_session_ranges: Any,
+        nxt_available: Any,
     ) -> tuple[
         datetime | None,
         datetime | None,
         list[tuple[datetime, datetime]],
     ]:
-        start = parse_market_datetime(f"{trade_date}T{BASE_CHART_START_TIME}")
-        end = parse_market_datetime(f"{trade_date}T{BASE_CHART_END_TIME}")
-        if start is None or end is None or start >= end:
-            return None, None, []
-        visible_ranges = [(start, end)]
-        if not isinstance(ats_session_ranges, list):
-            return start, end, visible_ranges
-        for session in ats_session_ranges:
-            if not isinstance(session, dict):
-                continue
-            session_start = parse_market_datetime(
-                f"{trade_date}T{str(session.get('start_time') or '').strip()}"
-            )
-            session_end = parse_market_datetime(
-                f"{trade_date}T{str(session.get('end_time') or '').strip()}"
-            )
+        session_times = (
+            NXT_MARKET_SESSION_TIMES
+            if nxt_available is True
+            else ((BASE_CHART_START_TIME, BASE_CHART_END_TIME),)
+        )
+        visible_ranges: list[tuple[datetime, datetime]] = []
+        for start_time, end_time in session_times:
+            session_start = parse_market_datetime(f"{trade_date}T{start_time}")
+            session_end = parse_market_datetime(f"{trade_date}T{end_time}")
             if session_start is None or session_end is None:
                 continue
             if session_end <= session_start:
                 session_end += timedelta(days=1)
             visible_ranges.append((session_start, session_end))
-            start = min(start, session_start)
-            end = max(end, session_end)
-        return start, end, visible_ranges
+        if not visible_ranges:
+            return None, None, []
+        return visible_ranges[0][0], visible_ranges[-1][1], visible_ranges
 
     def _apply_projection(self, data: dict[str, Any]) -> None:
         selected_marker_id = str(
@@ -2724,7 +2772,7 @@ class StockInstanceChartWindow(QDialog):
         empty_message = self._empty_chart_message(data)
         x_range_start, x_range_end, visible_time_ranges = self._chart_display_time_range(
             projected_trade_date,
-            data.get("ats_session_ranges", []),
+            data.get("nxt_available") is True,
         )
         self.chart.set_projection(
             candles,
@@ -2841,7 +2889,7 @@ class StockInstanceChartWindow(QDialog):
         error_message = "데이터 손상 또는 조회 오류로 차트를 표시할 수 없습니다."
         x_range_start, x_range_end, visible_time_ranges = self._chart_display_time_range(
             self.trade_date,
-            [],
+            self.last_projection.get("nxt_available") is True,
         )
         self.chart.set_projection(
             [],

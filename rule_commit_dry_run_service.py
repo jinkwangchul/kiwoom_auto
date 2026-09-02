@@ -11,13 +11,14 @@ import json
 import shutil
 import uuid
 from copy import deepcopy
-from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import Any
 
 import rule_apply_commit_service
 import rule_approval_session_file_service
 import rule_commit_report_service
+from routine_instance_registry import routine_definition_by_id
+from routine_package_contract import RULE_MAPPER_ROLE, load_routine_module
 
 
 def _stable_hash(value: Any) -> str:
@@ -41,15 +42,11 @@ def _load_json_dict(path: Path, label: str) -> tuple[dict[str, Any] | None, str 
     return data, None
 
 
-def _load_mapper_module():
-    project_root = Path(__file__).resolve().parent
-    mapper_path = next((project_root / "routines").glob("*/routine_rule_mapper.py"))
-    spec = spec_from_file_location("routine_rule_mapper_for_dry_run", mapper_path)
-    module = module_from_spec(spec)
-    if spec.loader is None:
-        raise ImportError(f"failed to load mapper: {mapper_path}")
-    spec.loader.exec_module(module)
-    return module
+def _load_mapper_module(definition_id: str):
+    definition = routine_definition_by_id(definition_id)
+    if definition is None:
+        raise ImportError(f"routine definition is unavailable: {definition_id}")
+    return load_routine_module(definition, RULE_MAPPER_ROLE)
 
 
 def _blocked(
@@ -237,7 +234,20 @@ def run_rule_commit_dry_run(
         return _finalize_blocked(result, workspace, source_rules_path, pre_actual_file_sha256, context_copy)
 
     try:
-        mapper = _load_mapper_module()
+        session_load = rule_approval_session_file_service.load_rule_approval_session(
+            temp_session_path
+        )
+        saved_session = session_load.get("session")
+        if session_load.get("ok") is not True or not isinstance(saved_session, dict):
+            raise ValueError("saved approval session is unavailable")
+        definition_id = str(
+            context_copy.get("definition_id")
+            or saved_session.get("routine_key")
+            or ""
+        ).strip()
+        if not definition_id:
+            raise ValueError("routine definition identity is required")
+        mapper = _load_mapper_module(definition_id)
         preview_result = context_copy.get("preview_result")
         if not isinstance(preview_result, dict):
             ui_state = context_copy.get("ui_state")

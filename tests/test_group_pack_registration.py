@@ -30,13 +30,42 @@ class GroupPackRegistrationTest(unittest.TestCase):
                 "settings_ui": "indicator_follow",
                 "module_name": "indicator_follow_routine",
                 "rules_file": "rules.json",
+                "locators": {
+                    "evaluation": {"file": "routine.py", "callable": "evaluate"},
+                    "settings": {"file": "settings.py", "callable": "Dialog"},
+                    "rule_mapper": {"file": "routine_rule_mapper.py"},
+                    "execution_admission": {
+                        "file": "routine.py",
+                        "callable": "evaluate_execution_admission",
+                    },
+                    "final_safety": {
+                        "file": "routine.py",
+                        "callable": "evaluate_final_real_order_safety",
+                    },
+                },
             },
             ensure_ascii=False,
             indent=2,
         ).encode("utf-8")
+        routine_code = b"""\
+def evaluate(context):
+    return None
+
+def _allow(subject, rules, routine_identity, rules_identity):
+    return {
+        'allowed': True,
+        'routine_identity': routine_identity,
+        'rules_identity': rules_identity,
+    }
+
+evaluate_execution_admission = _allow
+evaluate_final_real_order_safety = _allow
+"""
         return {
             "routines/indicator_follow/routine.json": routine_json,
-            "routines/indicator_follow/routine.py": b"ENABLED = True\n",
+            "routines/indicator_follow/routine.py": routine_code,
+            "routines/indicator_follow/settings.py": b"class Dialog:\n    pass\n",
+            "routines/indicator_follow/routine_rule_mapper.py": b"MAPPER = True\n",
             "routines/indicator_follow/rules.json": b"{}\n",
         }
 
@@ -99,7 +128,7 @@ class GroupPackRegistrationTest(unittest.TestCase):
         self.assertEqual(["지표추종매매", "지표추종매매_1"], [g.display_name for g in groups])
         self.assertEqual(first_mtime, second_mtime)
         self.assertEqual((), second.installed_files)
-        self.assertEqual(3, len(second.reused_files))
+        self.assertEqual(5, len(second.reused_files))
         self.assertTrue(registry_valid)
 
     def test_lowest_deleted_slot_is_reused(self) -> None:
@@ -204,6 +233,21 @@ class GroupPackRegistrationTest(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertFalse(routines_exists)
         self.assertFalse(groups_exists)
+
+    def test_missing_locator_target_fails_closed_and_rolls_back_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = self._payload()
+            del payload["routines/indicator_follow/routine_rule_mapper.py"]
+            pack = self._write_pack(root, payload=payload)
+
+            result = register_group_pack(pack, project_root=root)
+
+        self.assertFalse(result.success)
+        self.assertEqual("PACK_REGISTRATION_FAILED", result.error_code)
+        self.assertIn("routine locator file does not exist", result.error)
+        self.assertFalse((root / "routines").exists())
+        self.assertFalse((root / "groups").exists())
 
     def test_registered_definition_can_create_disabled_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

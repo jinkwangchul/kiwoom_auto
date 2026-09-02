@@ -687,14 +687,14 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self.assertEqual(self.dialog._rule_approval_save_button.text, "승인 검토 상태 저장")
         self.assertEqual(
             self.dialog._rule_approval_save_button.tooltip,
-            "현재 승인 검토 상태(decision)만 저장합니다.\nrules.json은 변경되지 않습니다.",
+            "현재 승인 검토 상태만 저장하며 아직 설정에는 적용하지 않습니다.",
         )
         button_texts = [
             widget.text
             for widget, _row, _column, _span in self.dialog._rule_approval_controls_layout.widgets
             if isinstance(widget, _FakeButton)
         ]
-        self.assertEqual(button_texts, ["승인 검토 상태 저장"])
+        self.assertEqual(button_texts, ["승인한 변경사항 적용", "승인 검토 상태 저장"])
         self.assertFalse(any("Commit" in text or "커밋" in text for text in button_texts))
 
     def test_approval_controls_show_preview_only_notice(self) -> None:
@@ -707,7 +707,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         ]
 
         self.assertIn(
-            "미리보기 전용: 선택한 decision은 저장/적용되지 않으며 rules.json을 변경하지 않습니다.",
+            "변경사항별 승인 상태를 저장한 뒤, 승인된 변경사항만 설정에 적용할 수 있습니다.",
             labels,
         )
 

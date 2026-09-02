@@ -32,5 +32,40 @@
                     "note":  "현재 routine.py는 자동 인식 및 구조 전환용 더미입니다. 실제 매매 실행은 메인 엔진 안정화 후 별도 연결합니다."
                 },
     "settings_ui":  "indicator_follow",
+    "locators":  {
+                     "evaluation":  {
+                                         "file":  "routine.py",
+                                         "callable":  "evaluate"
+                                     },
+                     "settings":  {
+                                       "project_file":  "gui_indicator_follow_routine_settings_dialog.py",
+                                       "callable":  "IndicatorFollowRoutineSettingsDialog",
+                                       "registration_callable":  "register_routine_instance_snapshot"
+                                   },
+                     "rule_mapper":  {
+                                          "file":  "routine_rule_mapper.py"
+                                      },
+                     "rule_commit_validator":  {
+                                                     "file":  "routine_rule_commit_validator.py",
+                                                     "callable":  "validate_committed_rules"
+                                                 },
+                     "execution_admission":  {
+                                                   "file":  "routine.py",
+                                                   "callable":  "evaluate_execution_admission"
+                                               },
+                     "final_safety":  {
+                                            "file":  "routine.py",
+                                            "callable":  "evaluate_final_real_order_safety"
+                                        }
+                 },
+    "decision_trace":  {
+                            "engine_files":  [
+                                                 "routine.py",
+                                                 "routine_macd_engine.py"
+                                             ],
+                            "rules_excluded_keys":  [
+                                                          "indicator_follow_ui_state"
+                                                      ]
+                        },
     "rules_file":  "rules.json"
 }

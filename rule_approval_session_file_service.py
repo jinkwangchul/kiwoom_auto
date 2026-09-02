@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""File service for indicator-follow rule approval sessions.
+"""File service for routine-owned rule approval sessions.
 
 This service stores only approval decisions and fingerprint metadata. It never
 applies rules, writes rules.json, or connects to any engine/runtime pipeline.
@@ -7,13 +7,15 @@ applies rules, writes rules.json, or connects to any engine/runtime pipeline.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from routine_instance_registry import routine_definition_by_id
+from routine_package_contract import RULE_MAPPER_ROLE, load_routine_module
 
 
 ALLOWED_DECISIONS = {
@@ -41,15 +43,11 @@ def _blocked(stage: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _load_mapper_module():
-    project_root = Path(__file__).resolve().parent
-    mapper_path = next((project_root / "routines").glob("*/routine_rule_mapper.py"))
-    spec = importlib.util.spec_from_file_location("routine_rule_mapper_for_session_file", mapper_path)
-    module = importlib.util.module_from_spec(spec)
-    if spec.loader is None:
-        raise ImportError(f"failed to load mapper: {mapper_path}")
-    spec.loader.exec_module(module)
-    return module
+def _load_mapper_module(definition_id: str):
+    definition = routine_definition_by_id(definition_id)
+    if definition is None:
+        raise ImportError(f"routine definition is unavailable: {definition_id}")
+    return load_routine_module(definition, RULE_MAPPER_ROLE)
 
 
 def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
@@ -91,11 +89,15 @@ def _validate_session_for_save(session: Any) -> tuple[dict[str, Any], list[str] 
     normalized_types = {str(path): str(candidate_type) for path, candidate_type in candidate_types.items()}
     if set(normalized_decisions.keys()) != set(normalized_types.keys()):
         return {}, ["session decisions and candidate_types paths must match"]
+    routine = str(session.get("routine") or "").strip()
+    routine_key = str(session.get("routine_key") or "").strip()
+    if not routine or not routine_key:
+        return {}, ["session routine identity is required"]
     payload = {
-        "mode": "indicator_follow_rule_approval_session",
+        "mode": "routine_rule_approval_session",
         "version": 1,
-        "routine": str(session.get("routine") or "지표추종매매"),
-        "routine_key": str(session.get("routine_key") or "indicator_follow"),
+        "routine": routine,
+        "routine_key": routine_key,
         "saved_at": _now_iso(),
         "fingerprint": fingerprint,
         "decisions": normalized_decisions,
@@ -176,7 +178,10 @@ def restore_saved_rule_approval_session(
             "warnings": [],
         }
     try:
-        mapper = _load_mapper_module()
+        definition_id = str(saved_session.get("routine_key") or "").strip()
+        if not definition_id:
+            raise ValueError("saved session routine identity is required")
+        mapper = _load_mapper_module(definition_id)
         restored = mapper.restore_rule_approval_session_for_preview(
             deepcopy(saved_session),
             deepcopy(current_rules) if isinstance(current_rules, dict) else {},

@@ -21,6 +21,7 @@ from candle_timeframe_aggregation import (
 )
 from execution_queue_writer import read_execution_queue_records
 from execution_chart_read_model import project_execution_chart_read_model
+from gui_stock_data import STOCK_LIBRARY_READY, load_stock_library_snapshot
 from manual_ats_runtime import manual_ats_runtime_selected_keys
 from market_evidence_store import market_window_hash
 from realized_pnl_ledger import read_realized_pnl_ledger
@@ -39,6 +40,7 @@ from state_policy import (
     seconds_from_hhmmss,
 )
 from stock_repository import StockRepository
+from stock_code_contract import normalize_broker_stock_code
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -60,6 +62,20 @@ def _finite_number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _stock_nxt_availability(stock_code: object, root: Path) -> bool | None:
+    """Read the verified Kiwoom Master Library capability without fallback."""
+    snapshot = load_stock_library_snapshot(root)
+    if snapshot.state != STOCK_LIBRARY_READY:
+        return None
+    code = normalize_broker_stock_code(stock_code)
+    for record in snapshot.records:
+        if normalize_broker_stock_code(record.get("code")) != code:
+            continue
+        value = record.get("nxt_available")
+        return value if value is True or value is False else None
+    return None
 
 
 def _json_file_malformed(path: Path, *, list_field: str | None = None) -> bool:
@@ -781,6 +797,7 @@ def project_stock_instance_day(
         root,
     )
     ats_session_ranges = _selected_ats_session_ranges(config, state, root)
+    nxt_available = _stock_nxt_availability(stock_code, root)
     instance_name = str(
         getattr(instance, "display_name", "")
         or config.get("routine_instance_name")
@@ -862,6 +879,7 @@ def project_stock_instance_day(
             else f"{operation_start_time[:5]}~{operation_end_buy_time[:5]}"
         ),
         "ats_session_ranges": ats_session_ranges,
+        "nxt_available": nxt_available,
         "current_status": current_status,
         "current_status_display": auto_trade_status_display(current_status),
         **cumulative_pnl,

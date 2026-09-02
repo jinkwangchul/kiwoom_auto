@@ -4,7 +4,7 @@
 STEP 6-B: 루틴 evaluate() 연결 확인용 안전 프로브 + 신호큐 저장본.
 
 역할:
-- 중앙 stocks/의 운영 대상별 routine.py를 import한다.
+- 중앙 stocks/의 운영 대상별 metadata-declared evaluation entry를 import한다.
 - 종목에 연결된 루틴 인스턴스 기준으로 evaluate(context)를 호출한다.
 - 결과를 runtime/routine_signal_probe.log에 기록한다.
 - BUY/SELL 신호만 runtime/routine_signals.json 큐에 저장한다.
@@ -20,7 +20,6 @@ STEP 6-B: 루틴 evaluate() 연결 확인용 안전 프로브 + 신호큐 저장
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 from datetime import datetime
@@ -42,6 +41,7 @@ from event_journal_production import (
     observe_production_exception,
 )
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
+from routine_package_contract import EVALUATION_ROLE, load_routine_module
 from gui_operation_ui_context import actionable_current_price
 from order_candidate_engine import read_reference_price
 from running_budget_adjustment import (
@@ -221,31 +221,19 @@ def _load_instance_rules(routine_instance_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _load_routine_module(routine_dir: Path):
-    routine_file = routine_dir / "routine.py"
-    if not routine_file.exists():
-        raise FileNotFoundError(f"routine.py 없음: {routine_file}")
+def _load_routine_module(definition: Any):
+    return load_routine_module(definition, EVALUATION_ROLE)
 
-    module_name = "runtime_probe_" + routine_dir.name.replace("-", "_").replace(" ", "_")
-    spec = importlib.util.spec_from_file_location(module_name, routine_file)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"routine.py 로드 실패: {routine_file}")
 
-    module = importlib.util.module_from_spec(spec)
-    routine_path_text = str(routine_dir.resolve())
-    added_to_path = False
-    if routine_path_text not in sys.path:
-        sys.path.insert(0, routine_path_text)
-        added_to_path = True
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        if added_to_path:
-            try:
-                sys.path.remove(routine_path_text)
-            except ValueError:
-                pass
-    return module
+def _definition_for_package_dir(routine_dir: Path):
+    target = Path(routine_dir).resolve()
+    for definition in load_routine_definitions():
+        try:
+            if definition.package_dir.resolve() == target:
+                return definition
+        except OSError:
+            continue
+    raise RuntimeError("routine definition is unavailable for package directory")
 
 
 def _is_trade_watch_target(state: dict[str, Any]) -> bool:
@@ -452,6 +440,7 @@ def probe_routine_for_stock(
                         stock_code=code,
                         routine_instance_id=routine_instance_id,
                         routine_name=routine_name,
+                        definition_id=str(stock_config.get("routine_definition_id") or "").strip(),
                         initial_rules=instance_rules,
                     )
                     if trace_collector is not None:
@@ -672,7 +661,9 @@ def probe_selected_routine_once(
         stock_dirs = []
 
     try:
-        routine_module = _load_routine_module(Path(routine_dir))
+        routine_module = _load_routine_module(
+            _definition_for_package_dir(Path(routine_dir))
+        )
     except Exception as exc:
         observe_production_exception(
             type(exc),
@@ -871,12 +862,43 @@ def probe_execution_stock_for_committed_bar(
             "name": name,
         }
 
+    routine_instance = routine_instance_by_id(
+        instance_id,
+        project_root=PROJECT_ROOT,
+    )
+    if (
+        routine_instance is None
+        or str(routine_instance.definition_id or "").strip() != definition_id
+    ):
+        _observe_routine_contract_failure(
+            scope=f"routine_assignment:{code}",
+            reason_code="ROUTINE_INSTANCE_UNRESOLVED",
+            routine_name=routine_name or definition_id,
+            stock_code=code,
+            stock_name=name,
+        )
+        return {
+            "signal": "ERROR",
+            "reason": "ROUTINE_INSTANCE_UNRESOLVED",
+            "routine": routine_name,
+            "code": code,
+            "name": name,
+        }
+    if routine_instance.enabled is not True:
+        return {
+            "signal": "SKIP",
+            "reason": "ROUTINE_INSTANCE_DISABLED",
+            "routine": routine_name or routine_instance.display_name,
+            "code": code,
+            "name": name,
+        }
+
     if not routine_name:
         routine_name = definition.display_name
     try:
         routine_module = module_cache.get(definition_id)
         if routine_module is None:
-            routine_module = _load_routine_module(definition.package_dir)
+            routine_module = _load_routine_module(definition)
             module_cache[definition_id] = routine_module
     except Exception as exc:
         observe_production_exception(

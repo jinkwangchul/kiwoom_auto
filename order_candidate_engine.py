@@ -279,14 +279,12 @@ def build_order_intent_for_candidate(side: str, candidate: dict[str, Any]) -> di
     if clean_side == "BUY":
         intent["budget_source"] = candidate.get("budget_source")
         intent["unresolved_reason"] = (
-            "indicator_follow_ui_state is not read during order candidate generation; "
-            "buy UI order method and hoga remain unresolved"
+            "signal payload does not provide a complete routine-owned execution intent"
         )
     elif clean_side == "SELL":
         intent["holding_source"] = candidate.get("holding_source")
         intent["unresolved_reason"] = (
-            "routine signal payload does not identify sell setting A/B/C source; "
-            "sell UI order method and hoga remain unresolved"
+            "signal payload does not provide a complete routine-owned execution intent"
         )
     else:
         intent["unresolved_reason"] = "unsupported signal side for order intent"
@@ -306,40 +304,27 @@ def build_buy_candidate(signal: dict[str, Any], config: dict[str, Any], state: d
 
 
 def build_order_candidate_from_execution_intent(execution_intent: dict[str, Any]) -> dict[str, Any]:
-    """Validate a routine-owned execution intent without recalculating strategy.
-
-    This additive boundary does not replace ``build_order_candidate`` yet. The
-    routine owns BUY phase, round, budget, and quantity; the common candidate
-    layer only validates their order-facing shape.
-    """
+    """Validate only the common order-facing shape of a routine-owned intent."""
     intent = dict(execution_intent) if isinstance(execution_intent, dict) else {}
     issues: list[str] = []
     side = _norm(intent.get("side"))
-    phase = _norm(intent.get("buy_phase"))
-    round_value = intent.get("buy_round")
     quantity = intent.get("quantity")
     budget = intent.get("budget")
     price_basis = _norm(intent.get("price_basis"))
     price = intent.get("price")
     hoga = _norm(intent.get("hoga"))
-    hoga_mode = _norm(intent.get("hoga_mode"))
-    routine_type = _norm(intent.get("routine_type"))
     routine_instance_id = str(intent.get("routine_instance_id") or "").strip()
     source_signal_id = str(intent.get("source_signal_id") or "").strip()
-    cycle_identity = str(intent.get("cycle_identity") or "").strip()
-    confirmed_previous_round = intent.get("confirmed_previous_round")
 
-    if side != "BUY":
-        issues.append("EXECUTION_INTENT_SIDE_NOT_BUY")
-    if phase not in {"BASE", "REPEAT"}:
-        issues.append("EXECUTION_INTENT_BUY_PHASE_INVALID")
-    if not isinstance(round_value, int) or isinstance(round_value, bool) or round_value <= 0:
-        issues.append("EXECUTION_INTENT_BUY_ROUND_INVALID")
-    elif (phase == "BASE" and round_value != 1) or (phase == "REPEAT" and round_value < 2):
-        issues.append("EXECUTION_INTENT_PHASE_ROUND_MISMATCH")
+    if side not in {"BUY", "SELL"}:
+        issues.append("EXECUTION_INTENT_SIDE_INVALID")
     if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
         issues.append("EXECUTION_INTENT_QUANTITY_INVALID")
-    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget <= 0:
+    if budget is not None and (
+        not isinstance(budget, (int, float))
+        or isinstance(budget, bool)
+        or budget <= 0
+    ):
         issues.append("EXECUTION_INTENT_BUDGET_INVALID")
     if price_basis not in {"ORDER_PRICE", "CURRENT_PRICE", "MARKET"}:
         issues.append("EXECUTION_INTENT_PRICE_BASIS_INVALID")
@@ -353,26 +338,13 @@ def build_order_candidate_from_execution_intent(execution_intent: dict[str, Any]
         price_basis in {"ORDER_PRICE", "CURRENT_PRICE"} and hoga != "LIMIT"
     ):
         issues.append("EXECUTION_INTENT_PRICE_HOGA_MISMATCH")
-    if hoga_mode not in {"SINGLE", "MULTI"}:
-        issues.append("EXECUTION_INTENT_HOGA_MODE_INVALID")
-    if routine_type != "INDICATOR_FOLLOW":
-        issues.append("EXECUTION_INTENT_ROUTINE_TYPE_INVALID")
     if not routine_instance_id:
         issues.append("EXECUTION_INTENT_ROUTINE_INSTANCE_ID_MISSING")
     if not source_signal_id:
         issues.append("EXECUTION_INTENT_SOURCE_SIGNAL_ID_MISSING")
-    if not cycle_identity:
-        issues.append("EXECUTION_INTENT_CYCLE_IDENTITY_MISSING")
-    if (
-        not isinstance(confirmed_previous_round, int)
-        or isinstance(confirmed_previous_round, bool)
-        or confirmed_previous_round < 0
-        or (isinstance(round_value, int) and confirmed_previous_round != round_value - 1)
-    ):
-        issues.append("EXECUTION_INTENT_CONFIRMED_PREVIOUS_ROUND_INVALID")
 
     ready = not issues
-    return {
+    result = {
         "candidate_status": "CANDIDATE_READY" if ready else "EXECUTION_INTENT_INVALID",
         "candidate_reason": (
             "루틴 실행의도 주문후보 검증 완료"
@@ -380,7 +352,7 @@ def build_order_candidate_from_execution_intent(execution_intent: dict[str, Any]
             else "루틴 실행의도 형식 검증 실패"
         ),
         "candidate_issues": issues,
-        "order_type": "BUY_SIGNAL_CANDIDATE" if ready else "UNDECIDED",
+        "order_type": f"{side}_SIGNAL_CANDIDATE" if ready else "UNDECIDED",
         "quantity": quantity if ready else None,
         "quantity_estimated": quantity if ready else None,
         "amount": budget if ready else None,
@@ -388,12 +360,15 @@ def build_order_candidate_from_execution_intent(execution_intent: dict[str, Any]
         "budget_source": "execution_intent",
         "price_basis": price_basis,
         "hoga": hoga,
-        "hoga_mode": hoga_mode,
-        "buy_phase": phase,
-        "buy_round": round_value,
         "order_intent": intent,
         "execution_enabled": False,
     }
+    # Preserve routine-owned opaque facts for downstream provenance without
+    # interpreting any strategy field. Common candidate fields keep priority.
+    for field, value in intent.items():
+        if field not in result:
+            result[field] = value
+    return result
 
 
 def build_sell_candidate(signal: dict[str, Any], config: dict[str, Any], state: dict[str, Any], price: float | None) -> dict[str, Any]:

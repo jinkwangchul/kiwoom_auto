@@ -125,8 +125,11 @@ def inspect_budget_value_entry(
     state = configuration_budget_market_information_state(window, Path(config_path))
     current_price, price_source = _configuration_price_evidence(state)
     return {
-        "allowed": True,
-        "reason": "",
+        "allowed": current_price is not None,
+        "reason": "" if current_price is not None else CURRENT_PRICE_UNAVAILABLE,
+        "reason_code": (
+            "" if current_price is not None else CURRENT_PRICE_UNAVAILABLE
+        ),
         "current_price": current_price,
         "price_source": price_source,
     }
@@ -187,26 +190,23 @@ def execute_budget_mode_change(
             "reason_code": "BUDGET_MODE_UNCHANGED",
         }
 
-    current_price: float | None = None
-    price_source = ""
-    if target_mode == BUDGET_MODE_AMOUNT:
-        price_reader = configuration_price_reader or (
-            lambda _window, path: configuration_budget_market_information_state(
-                _window,
-                path,
-            )
+    price_reader = configuration_price_reader or (
+        lambda _window, path: configuration_budget_market_information_state(
+            _window,
+            path,
         )
-        current_price, price_source = _configuration_price_evidence(
-            price_reader(window, config_path)
-        )
-        if current_price is None:
-            return {
-                **base_result,
-                "allowed": False,
-                "reason": CURRENT_PRICE_UNAVAILABLE,
-                "reason_code": CURRENT_PRICE_UNAVAILABLE,
-                "price_source": price_source,
-            }
+    )
+    current_price, price_source = _configuration_price_evidence(
+        price_reader(window, config_path)
+    )
+    if current_price is None:
+        return {
+            **base_result,
+            "allowed": False,
+            "reason": CURRENT_PRICE_UNAVAILABLE,
+            "reason_code": CURRENT_PRICE_UNAVAILABLE,
+            "price_source": price_source,
+        }
 
     stock_code = config_path.parent.name.partition("_")[0].strip()
     state = read_json_dict(config_path.parent / "state.json")

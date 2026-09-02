@@ -18,6 +18,7 @@ import routine_signal_order_bridge
 import routine_signal_probe
 import routine_signal_queue
 import stock_instance_day_projection
+from gui_stock_data import STOCK_LIBRARY_READY
 
 
 def _raw_candles(count: int, *, day: str = "2026-08-10") -> list[dict[str, object]]:
@@ -47,6 +48,55 @@ def _opt10080_rows(candles: list[dict[str, object]]) -> list[dict[str, object]]:
         }
         for candle in reversed(candles)
     ]
+
+
+class StockNxtCapabilityProjectionTests(unittest.TestCase):
+    def test_verified_library_is_the_only_nxt_capability_source(self) -> None:
+        cases = (
+            (
+                STOCK_LIBRARY_READY,
+                ({"code": "005930", "nxt_available": True},),
+                "A005930",
+                True,
+            ),
+            (
+                STOCK_LIBRARY_READY,
+                ({"code": "005930", "nxt_available": False},),
+                "005930",
+                False,
+            ),
+            (
+                STOCK_LIBRARY_READY,
+                ({"code": "005930", "nxt_available": None},),
+                "005930",
+                None,
+            ),
+            (
+                "FAILED",
+                ({"code": "005930", "nxt_available": True},),
+                "005930",
+                None,
+            ),
+            (
+                STOCK_LIBRARY_READY,
+                ({"code": "000660", "nxt_available": True},),
+                "005930",
+                None,
+            ),
+        )
+        for state, records, stock_code, expected in cases:
+            with self.subTest(state=state, records=records, stock_code=stock_code):
+                snapshot = SimpleNamespace(state=state, records=records)
+                with patch.object(
+                    stock_instance_day_projection,
+                    "load_stock_library_snapshot",
+                    return_value=snapshot,
+                ):
+                    actual = stock_instance_day_projection._stock_nxt_availability(
+                        stock_code,
+                        Path("unused"),
+                    )
+                self.assertIs(expected, actual)
 
 
 class CandleDayPersistenceTests(unittest.TestCase):

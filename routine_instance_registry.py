@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -50,6 +51,8 @@ class RoutineDefinitionRecord:
     default_rules_file: str
     package_enabled: bool
     source_name: str
+    locators: dict[str, dict[str, Any]] = field(default_factory=dict)
+    decision_trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -344,6 +347,16 @@ def _definition_from_package(package_dir: Path) -> tuple[RoutineDefinitionRecord
         default_rules_file=str(meta.get("rules_file") or "rules.json").strip() or "rules.json",
         package_enabled=_safe_bool(meta.get("enabled"), True),
         source_name=display_name,
+        locators=(
+            deepcopy(meta.get("locators"))
+            if isinstance(meta.get("locators"), dict)
+            else {}
+        ),
+        decision_trace=(
+            deepcopy(meta.get("decision_trace"))
+            if isinstance(meta.get("decision_trace"), dict)
+            else {}
+        ),
     ), None
 
 

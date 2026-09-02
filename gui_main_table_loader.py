@@ -2226,7 +2226,7 @@ def _main_routine_summary_projection(
         for count in instance_counts.values()
     )
     displayed_stock_count = (
-        max(0, registered - review)
+        max(0, registered)
         if stock_badge_count is None
         else max(0, int(stock_badge_count))
     )
@@ -2289,10 +2289,16 @@ def _update_main_routine_summary(
     *,
     group_projection=None,
     relation_counts: dict[str, dict[str, object]] | None = None,
+    structure_relation_counts: dict[str, dict[str, object]] | None = None,
 ) -> None:
     update = getattr(window, "_update_main_routine_summary", None)
     if callable(update):
         valid_projection = bool(getattr(window, "_main_routine_valid_only", False))
+        structure_counts = (
+            structure_relation_counts
+            if structure_relation_counts is not None
+            else relation_counts
+        )
         valid_instance_ids = {
             str(getattr(instance, "instance_id", "") or "").strip()
             for instance in instances
@@ -2339,7 +2345,7 @@ def _update_main_routine_summary(
             for projected_group in projected_groups
             for projected_instance in projected_group.instances
             if bool(
-                (relation_counts or {}).get(
+                (structure_counts or {}).get(
                     main_group_instance_relation_id(
                         projected_group.group_id,
                         projected_instance.instance_id,
@@ -2363,7 +2369,7 @@ def _update_main_routine_summary(
         valid_projected_relations = len(valid_relation_ids)
         valid_stock_count = (
             sum(
-                len((relation_counts or {}).get(relation_id, {}).get("stocks", ()))
+                len((structure_counts or {}).get(relation_id, {}).get("stocks", ()))
                 for relation_id in valid_relation_ids
             )
             if valid_projection and projection_supplied
@@ -2420,6 +2426,16 @@ def _main_routine_effective_stock_scope(window) -> str:
     return stock_scope
 
 
+def _main_routine_structure_stock_scope(window) -> str:
+    """Return the status-filter-independent scope for top structure badges."""
+
+    return (
+        "normal"
+        if bool(getattr(window, "_main_routine_valid_only", False))
+        else "all"
+    )
+
+
 def main_refresh_pnl_only(window) -> None:
     """Refresh monitoring stock/instance PnL without rebuilding either table."""
     static_cache = _main_pnl_refresh_static_cache(window)
@@ -2447,11 +2463,29 @@ def main_refresh_pnl_only(window) -> None:
         instances,
         tuple(static_cache.get("stocks", ())),
     )
+    stock_scope = _main_routine_effective_stock_scope(window)
     relation_counts = (
         _projected_group_relation_counts(
             window,
             group_projection,
-            _main_routine_effective_stock_scope(window),
+            stock_scope,
+            static_data=static_cache,
+            state_by_stock_dir=state_by_stock_dir,
+            state_issue_by_stock_dir=state_issue_by_stock_dir,
+            pnl_by_code=pnl_by_code,
+        )
+        if any(projected_group.instances for projected_group in group_projection)
+        else {}
+    )
+    structure_scope = _main_routine_structure_stock_scope(window)
+    structure_relation_counts = (
+        relation_counts
+        if not bool(getattr(window, "_main_routine_valid_only", False))
+        or stock_scope == structure_scope
+        else _projected_group_relation_counts(
+            window,
+            group_projection,
+            structure_scope,
             static_data=static_cache,
             state_by_stock_dir=state_by_stock_dir,
             state_issue_by_stock_dir=state_issue_by_stock_dir,
@@ -2467,6 +2501,7 @@ def main_refresh_pnl_only(window) -> None:
         instance_counts,
         group_projection=group_projection,
         relation_counts=relation_counts,
+        structure_relation_counts=structure_relation_counts,
     )
     changed = False
     for row in range(window.routine_table.rowCount()):
@@ -3445,6 +3480,17 @@ def main_load_routine_table(window) -> None:
         group_projection,
         stock_scope,
     )
+    structure_scope = _main_routine_structure_stock_scope(window)
+    structure_relation_counts = (
+        relation_counts
+        if not bool(getattr(window, "_main_routine_valid_only", False))
+        or stock_scope == structure_scope
+        else _projected_group_relation_counts(
+            window,
+            group_projection,
+            structure_scope,
+        )
+    )
     trade_counts_by_code = current_stock_trade_counts_by_code()
     stock_tooltip_metadata_by_code = _stock_library_tooltip_metadata_by_code()
     total_budget = read_system_total_budget_for_recalculation()
@@ -3740,6 +3786,7 @@ def main_load_routine_table(window) -> None:
         instance_counts,
         group_projection=group_projection,
         relation_counts=relation_counts,
+        structure_relation_counts=structure_relation_counts,
     )
 
     sort_column = getattr(window, "_main_routine_sort_column", -1)

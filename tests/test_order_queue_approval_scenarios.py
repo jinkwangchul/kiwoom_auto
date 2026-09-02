@@ -135,12 +135,17 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         )
 
     def _consume(self) -> dict:
-        return routine_signal_consumer.consume_pending_routine_signals_dry_run(
-            limit=None,
-            mark_previewed=True,
-            write_order_queue=True,
-            apply_approval=True,
-        )
+        with patch.object(
+            routine_signal_consumer,
+            "evaluate_routine_gate",
+            return_value={"allowed": True, "reason": "", "rules_identity": "test"},
+        ):
+            return routine_signal_consumer.consume_pending_routine_signals_dry_run(
+                limit=None,
+                mark_previewed=True,
+                write_order_queue=True,
+                apply_approval=True,
+            )
 
     def _single_order(self) -> dict:
         data = json.loads(self.order_queue_path.read_text(encoding="utf-8"))
@@ -337,6 +342,11 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
 
     def test_buy_candidate_keeps_execution_disabled(self) -> None:
         self._setup_stock(holding_qty=0, entry_amount=1000)
+        routine_rules_path = self.root / "routine_instances" / "ROUTINE-1" / "rules.json"
+        self._write_json(
+            routine_rules_path,
+            {"principle": {"execution_enabled": True}},
+        )
         self._write_json(
             self.stock_dir / "state.json",
             {

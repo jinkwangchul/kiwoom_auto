@@ -1480,7 +1480,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         service.assert_not_called()
         window.commit_execution_runtime_for_preview.assert_not_called()
         commit_service.assert_not_called()
-        self.assertTrue(any("cancelled" in message for message in window.messages))
+        self.assertTrue(any("취소" in message for message in window.messages))
 
     def test_execution_preview_confirmation_is_only_source_of_operator_confirmed(self) -> None:
         window = self._window_for_queue_commit()

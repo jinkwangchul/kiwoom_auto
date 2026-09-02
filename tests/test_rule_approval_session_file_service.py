@@ -133,7 +133,7 @@ class RuleApprovalSessionFileServiceTest(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertTrue(result["saved"])
-            self.assertEqual(data["mode"], "indicator_follow_rule_approval_session")
+            self.assertEqual(data["mode"], "routine_rule_approval_session")
             self.assertEqual(data["routine"], "지표추종매매")
             self.assertEqual(data["routine_key"], "indicator_follow")
             self.assertEqual(data["decisions"]["buy.groups[0].conditions"], "APPROVED")

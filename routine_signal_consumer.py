@@ -9,7 +9,6 @@ but it never mutates orders.json, calls an executor, or sends an order.
 
 from __future__ import annotations
 
-import json
 from typing import Any, Iterable
 
 from routine_signal_order_bridge import (
@@ -21,6 +20,10 @@ from routine_signal_queue import (
     STATUS_ERROR,
     STATUS_PREVIEWED,
     update_signal_status,
+)
+from routine_package_contract import (
+    EXECUTION_ADMISSION_ROLE,
+    evaluate_routine_gate,
 )
 
 try:
@@ -91,6 +94,35 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
             str(order.get("code", "")),
             str(order.get("side", "")),
         ]
+    )
+
+
+def routine_execution_intent_admission(
+    signal: dict[str, Any],
+) -> dict[str, Any]:
+    """Ask the assigned routine to admit candidate generation."""
+    execution_intent = signal.get("execution_intent")
+    intent = execution_intent if isinstance(execution_intent, dict) else {}
+    instance_id = str(
+        signal.get("routine_instance_id")
+        or intent.get("routine_instance_id")
+        or ""
+    ).strip()
+    if not instance_id:
+        # Legacy/reference candidates remain preview-only and unresolved; they
+        # do not participate in routine-owned execution admission.
+        if not intent or intent.get("unresolved") is True:
+            return {
+                "allowed": True,
+                "reason": "LEGACY_UNRESOLVED_PREVIEW_ONLY",
+                "routine_identity": {},
+                "rules_identity": None,
+            }
+        return {"allowed": False, "reason": "ROUTINE_INSTANCE_ID_MISSING"}
+    return evaluate_routine_gate(
+        instance_id=instance_id,
+        role=EXECUTION_ADMISSION_ROLE,
+        subject=signal,
     )
 
 
@@ -255,10 +287,17 @@ def _build_order_queue_candidates_for_signals(
     created_orders: list[dict[str, Any]] = []
     duplicates = 0
     ignored = 0
+    execution_switch_blocked = 0
 
     for signal in signals:
         if not isinstance(signal, dict):
             ignored += 1
+            continue
+
+        admission = routine_execution_intent_admission(signal)
+        if admission.get("allowed") is not True:
+            ignored += 1
+            execution_switch_blocked += 1
             continue
 
         order = signal_to_order_candidate(signal, len(orders) + 1)
@@ -378,6 +417,7 @@ def _build_order_queue_candidates_for_signals(
         "orders_created": int(append_result.get("orders_created", len(created_orders)) or 0),
         "duplicates": duplicates + int(append_result.get("duplicates", 0) or 0),
         "ignored": ignored,
+        "execution_switch_blocked": execution_switch_blocked,
         "approval_checked": approval_checked,
         "approved": approved,
         "blocked": approval_blocked,

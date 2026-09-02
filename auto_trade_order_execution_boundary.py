@@ -67,6 +67,7 @@ from kiwoom_screen_allocator import project_order_default_screen_no
 from kiwoom_send_order_safety_gate import evaluate_kiwoom_send_order_safety
 from order_queued_review_service import review_order_queued_record
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
+from routine_package_contract import FINAL_SAFETY_ROLE, evaluate_routine_gate
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1564,6 +1565,16 @@ class AutoTradeOrderExecutionBoundary:
                 "order_action": action,
                 "fresh_dispatch_preflight": True,
             }
+        rule_safety_reasons = self.routine_real_order_block_reasons(order)
+        if rule_safety_reasons:
+            return {
+                "ok": False,
+                "stage": "routine_real_order_safety",
+                "blocked_reasons": rule_safety_reasons,
+                "side": side,
+                "order_action": action,
+                "fresh_dispatch_preflight": False,
+            }
         recovery_reasons = self.production_recovery_block_reasons_for_order(
             order,
             caller_name="FINAL_DISPATCH_FRESH_PREFLIGHT",
@@ -1592,6 +1603,47 @@ class AutoTradeOrderExecutionBoundary:
         result["side"] = side
         result["order_action"] = action
         return result
+
+    def routine_real_order_block_reasons(
+        self,
+        order: dict[str, object],
+    ) -> list[str]:
+        """Fail closed on the routine-owned final safety contract."""
+        execution_intent = order.get("execution_intent")
+        intent = execution_intent if isinstance(execution_intent, dict) else {}
+        order_provenance = order.get("order_provenance")
+        provenance = order_provenance if isinstance(order_provenance, dict) else {}
+        routine_marker = str(
+            intent.get("routine_instance_id")
+            or provenance.get("routine_instance_id")
+            or order.get("routine_instance_id")
+            or intent.get("routine_type")
+            or provenance.get("routine_type")
+            or order.get("routine")
+            or ""
+        ).strip()
+        if not routine_marker:
+            return []
+
+        instance_id = str(
+            intent.get("routine_instance_id")
+            or provenance.get("routine_instance_id")
+            or order.get("routine_instance_id")
+            or ""
+        ).strip()
+        if not instance_id:
+            return ["routine instance identity is unavailable"]
+        result = evaluate_routine_gate(
+            instance_id=instance_id,
+            role=FINAL_SAFETY_ROLE,
+            subject=order,
+        )
+        if result.get("allowed") is True:
+            return []
+        reasons = result.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            return [str(item) for item in reasons]
+        return [str(result.get("reason") or "routine final safety is unavailable")]
 
     def send_order_identity_from_record(self, record: dict[str, object]) -> dict[str, object]:
         return {
@@ -2279,6 +2331,9 @@ class AutoTradeOrderExecutionBoundary:
         return result
 
     def auto_trade_execution_block_reasons(self, order: dict[str, object]) -> list[str]:
+        rule_safety_reasons = self.routine_real_order_block_reasons(order)
+        if rule_safety_reasons:
+            return rule_safety_reasons
         recovery_reasons = self.production_recovery_block_reasons_for_order(
             order,
             caller_name="AUTO_TRADE_EXECUTION_ENABLE",

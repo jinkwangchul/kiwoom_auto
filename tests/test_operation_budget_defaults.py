@@ -737,9 +737,9 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 policy={"starting_budget_defaults": defaults},
             )
 
-            self.assertEqual(35_000_000, recommended)
-            self.assertEqual(8_800_000, minimum)
-            configuration_reader.assert_not_called()
+            self.assertIsNone(recommended)
+            self.assertIsNone(minimum)
+            self.assertEqual(2, configuration_reader.call_count)
             self.assertEqual(("금액", "350,000원"), (display["badge"], display["value_text"]))
             self.assertEqual(config, json.loads(config_path.read_text(encoding="utf-8")))
 
@@ -960,9 +960,19 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     return_value=False,
                 ),
             ):
+                configuration_state = SimpleNamespace(
+                    last_price=1,
+                    login_session_id="SESSION-1",
+                    field_sources=(("last_price", "SNAPSHOT"),),
+                )
+                window = SimpleNamespace(
+                    main_monitoring_auto_trade_operation_host=lambda: SimpleNamespace(
+                        configuration_market_information_state=lambda _code: configuration_state,
+                    )
+                )
                 recommendation = gui_windows.MainWindow._stock_suggested_buy_limit(
                     config_path,
-                    window=SimpleNamespace(),
+                    window=window,
                 )
 
             self.assertEqual(50_000_000, recommendation)
@@ -1441,11 +1451,14 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             )
             host._routine_buy_limit_edit_filter = QObject()
 
-            host.start_routine_stock_buy_limit_edit(0)
+            with patch.object(gui_windows, "show_toast") as toast:
+                host.start_routine_stock_buy_limit_edit(0)
 
-            self.assertIsNotNone(host._routine_stock_buy_limit_editor)
-            self.assertEqual("750000", host._routine_stock_buy_limit_editor.text())
-            host._routine_stock_buy_limit_editor.deleteLater()
+            self.assertIsNone(host.__dict__.get("_routine_stock_buy_limit_editor"))
+            toast.assert_called_once_with(
+                host,
+                "현재 주가를 확인한 후 변경할 수 있습니다.",
+            )
             table.close()
 
     def test_initial_budget_entry_opens_shared_dialog_without_current_price(self) -> None:
@@ -1600,12 +1613,26 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             )
             table.close()
 
-    def test_limit_save_uses_offline_config_writer_when_price_is_unavailable(self) -> None:
+    def test_limit_save_without_configuration_price_does_not_write(self) -> None:
+        temp_dir = self.enterContext(tempfile.TemporaryDirectory())
+        config_path = Path(temp_dir) / "005930_삼성전자" / "config.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "trade_amount_type": "QUANTITY",
+                    "buy_qty": 1,
+                    "buy_limit_enabled": False,
+                    "buy_limit_amount": None,
+                }
+            ),
+            encoding="utf-8",
+        )
         editor = QLineEdit("750000")
         host = SimpleNamespace(
             _routine_stock_buy_limit_editor=editor,
             _routine_stock_buy_limit_edit_finishing=False,
-            _routine_stock_buy_limit_editor_config_path="C:/temp/config.json",
+            _routine_stock_buy_limit_editor_config_path=str(config_path),
             routine_table=SimpleNamespace(
                 _editing_stock_buy_limit_path="stock",
                 viewport=lambda: SimpleNamespace(update=MagicMock()),
@@ -1622,17 +1649,47 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             gui_windows,
             "_system_total_budget_amount",
             return_value=2_000_000,
-        ):
+        ), patch.object(gui_windows, "show_toast") as toast:
             gui_windows.MainWindow.finish_routine_stock_buy_limit_edit(host, save=True)
 
-        host._write_stock_buy_limit_config.assert_called_once_with(
-            Path("C:/temp/config.json"),
-            enabled=True,
-            amount=750_000,
-            source=BUY_LIMIT_SOURCE_MANUAL,
+        host._write_stock_buy_limit_config.assert_not_called()
+        toast.assert_called_once_with(
+            host,
+            "현재 주가를 확인할 수 없어 권장한도를 계산하지 못했습니다.",
         )
-        host.refresh_auto_trade_assignment_views.assert_called_once_with()
         self.assertEqual([], host.kiwoom_api.method_calls)
+
+    def test_limit_save_reports_unavailable_total_budget(self) -> None:
+        editor = QLineEdit("750000")
+        host = SimpleNamespace(
+            _routine_stock_buy_limit_editor=editor,
+            _routine_stock_buy_limit_edit_finishing=False,
+            _routine_stock_buy_limit_editor_config_path="C:/temp/config.json",
+            routine_table=SimpleNamespace(
+                _editing_stock_buy_limit_path="stock",
+                viewport=lambda: SimpleNamespace(update=MagicMock()),
+            ),
+            _parse_buy_limit_amount=gui_windows.MainWindow._parse_buy_limit_amount,
+            _stock_suggested_buy_limit=MagicMock(return_value=400_000),
+            _write_stock_buy_limit_config=MagicMock(),
+            load_routine_table=MagicMock(),
+        )
+
+        with patch.object(
+            gui_windows,
+            "_system_total_budget_amount",
+            return_value=None,
+        ), patch.object(gui_windows, "show_toast") as toast:
+            gui_windows.MainWindow.finish_routine_stock_buy_limit_edit(
+                host,
+                save=True,
+            )
+
+        host._write_stock_buy_limit_config.assert_not_called()
+        toast.assert_called_once_with(
+            host,
+            "전체예산을 확인할 수 없어 한도를 계산하지 못했습니다.",
+        )
 
     def test_unchanged_configured_limit_does_not_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1659,7 +1716,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 _parse_buy_limit_amount=(
                     gui_windows.MainWindow._parse_buy_limit_amount
                 ),
-                _stock_suggested_buy_limit=MagicMock(return_value=None),
+                _stock_suggested_buy_limit=MagicMock(return_value=400_000),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
                 refresh_auto_trade_assignment_views=MagicMock(),
@@ -1697,7 +1754,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 _parse_buy_limit_amount=(
                     gui_windows.MainWindow._parse_buy_limit_amount
                 ),
-                _stock_suggested_buy_limit=MagicMock(return_value=None),
+                _stock_suggested_buy_limit=MagicMock(return_value=400_000),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
                 refresh_auto_trade_assignment_views=MagicMock(),
@@ -2001,7 +2058,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     host.load_routine_table.assert_not_called()
                     toast.assert_called_once_with(
                         host,
-                        "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.",
+                        "현재 주가를 확인할 수 없어 권장한도를 계산하지 못했습니다.",
                     )
                 else:
                     host._write_stock_buy_limit_config.assert_called_once_with(
@@ -2012,6 +2069,189 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     )
                     host.refresh_auto_trade_assignment_views.assert_called_once()
                     toast.assert_not_called()
+
+    def test_unconfigured_amount_limit_reports_general_calculation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "012210_삼미금속" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "trade_amount_type": "AMOUNT",
+                        "buy_amount": 500_000,
+                        "buy_limit_enabled": False,
+                        "buy_limit_amount": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            host = SimpleNamespace(
+                _stock_config_path_for_routine_row=MagicMock(
+                    return_value=config_path
+                ),
+                finish_routine_instance_buy_limit_edit=MagicMock(),
+                finish_routine_stock_buy_limit_edit=MagicMock(),
+                _stock_suggested_buy_limit=MagicMock(return_value=None),
+                _write_stock_buy_limit_config=MagicMock(),
+                load_routine_table=MagicMock(),
+                start_routine_stock_buy_limit_edit=MagicMock(),
+            )
+
+            with patch.object(gui_windows, "show_toast") as toast:
+                gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
+                    host,
+                    0,
+                )
+
+            host._write_stock_buy_limit_config.assert_not_called()
+            toast.assert_called_once_with(
+                host,
+                "현재 주가를 확인할 수 없어 권장한도를 계산하지 못했습니다.",
+            )
+
+    def test_unconfigured_limit_reports_unavailable_total_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "012210_삼미금속" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "trade_amount_type": "AMOUNT",
+                        "buy_amount": 500_000,
+                        "buy_limit_enabled": False,
+                        "buy_limit_amount": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            host = SimpleNamespace(
+                _stock_config_path_for_routine_row=MagicMock(
+                    return_value=config_path
+                ),
+                finish_routine_instance_buy_limit_edit=MagicMock(),
+                finish_routine_stock_buy_limit_edit=MagicMock(),
+                _stock_suggested_buy_limit=MagicMock(return_value=50_000_000),
+                _write_stock_buy_limit_config=MagicMock(),
+                load_routine_table=MagicMock(),
+                start_routine_stock_buy_limit_edit=MagicMock(),
+            )
+
+            with patch.object(
+                gui_windows,
+                "_system_total_budget_amount",
+                return_value=None,
+            ), patch.object(gui_windows, "show_toast") as toast:
+                gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
+                    host,
+                    0,
+                )
+
+            host._write_stock_buy_limit_config.assert_not_called()
+            host.start_routine_stock_buy_limit_edit.assert_not_called()
+            toast.assert_called_once_with(
+                host,
+                "전체예산을 확인할 수 없어 한도를 계산하지 못했습니다.",
+            )
+
+    def test_unconfigured_limit_blocks_when_minimum_cannot_be_calculated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "012210_삼미금속" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "trade_amount_type": "QUANTITY",
+                        "buy_qty": 1,
+                        "buy_limit_enabled": False,
+                        "buy_limit_amount": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            broker = MagicMock()
+            host = SimpleNamespace(
+                _stock_config_path_for_routine_row=MagicMock(
+                    return_value=config_path
+                ),
+                finish_routine_instance_buy_limit_edit=MagicMock(),
+                finish_routine_stock_buy_limit_edit=MagicMock(),
+                _stock_suggested_buy_limit=MagicMock(
+                    side_effect=(800_000, None)
+                ),
+                _write_stock_buy_limit_config=MagicMock(),
+                load_routine_table=MagicMock(),
+                start_routine_stock_buy_limit_edit=MagicMock(),
+                kiwoom_api=broker,
+            )
+
+            with patch.object(
+                gui_windows,
+                "_system_total_budget_amount",
+                return_value=2_000_000,
+            ), patch.object(gui_windows, "show_toast") as toast:
+                gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
+                    host,
+                    0,
+                )
+
+            host._write_stock_buy_limit_config.assert_not_called()
+            toast.assert_called_once_with(
+                host,
+                "최소한도를 계산하지 못해 한도를 적용하지 않았습니다.",
+            )
+            self.assertEqual([], broker.method_calls)
+
+    def test_explicit_amount_limit_requires_configuration_price(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "012210_삼미금속" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "trade_amount_type": "AMOUNT",
+                        "buy_amount": 10_000,
+                        "buy_limit_enabled": False,
+                        "buy_limit_amount": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            broker = MagicMock()
+            operation_host = SimpleNamespace(
+                configuration_market_information_state=lambda _code: None,
+            )
+            host = SimpleNamespace(
+                _stock_config_path_for_routine_row=MagicMock(
+                    return_value=config_path
+                ),
+                finish_routine_instance_buy_limit_edit=MagicMock(),
+                finish_routine_stock_buy_limit_edit=MagicMock(),
+                _stock_suggested_buy_limit=(
+                    gui_windows.MainWindow._stock_suggested_buy_limit
+                ),
+                _write_stock_buy_limit_config=MagicMock(),
+                load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
+                main_monitoring_auto_trade_operation_host=lambda: operation_host,
+                kiwoom_api=broker,
+            )
+
+            with patch.object(
+                gui_windows,
+                "_system_total_budget_amount",
+                return_value=2_000_000,
+            ), patch.object(gui_windows, "show_toast") as toast:
+                gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
+                    host,
+                    0,
+                )
+
+            host._write_stock_buy_limit_config.assert_not_called()
+            toast.assert_called_once_with(
+                host,
+                "현재 주가를 확인할 수 없어 권장한도를 계산하지 못했습니다.",
+            )
+            self.assertEqual([], broker.method_calls)
 
     def test_unconfigured_limit_double_click_reports_real_recommendation_over_total(
         self,
@@ -2080,7 +2320,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             host.load_routine_table.assert_not_called()
             toast.assert_called_once_with(
                 host,
-                "권장한도가 전체예산을 초과 합니다",
+                "권장한도가 전체예산을 초과합니다.",
                 duration_ms=2500,
             )
             host.start_routine_stock_buy_limit_edit.assert_called_once_with(

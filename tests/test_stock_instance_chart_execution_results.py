@@ -25,7 +25,11 @@ from execution_chart_read_model import (
     project_execution_chart_read_model,
 )
 from execution_provenance_contract import option_snapshot_hash
-from gui_stock_instance_chart_window import StockInstanceChartWindow, StockInstanceCloseChart
+from gui_stock_instance_chart_window import (
+    ExecutionProcessRail,
+    StockInstanceChartWindow,
+    StockInstanceCloseChart,
+)
 
 
 TRADE_DATE = "2026-09-01"
@@ -382,6 +386,40 @@ class ExecutionChartUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_process_rail_localizes_side_without_mutating_internal_contract(self) -> None:
+        cases = (("BUY", "매수"), ("SELL", "매도"))
+        for raw_side, displayed_side in cases:
+            with self.subTest(raw_side=raw_side):
+                process = {
+                    "side": raw_side,
+                    "option_summary": "단일 주문",
+                    "status": "COMPLETED",
+                    "child_completed": 1,
+                    "child_total": 1,
+                    "children": [],
+                }
+                row_text = ExecutionProcessRail._row_text(process)
+                tooltip_text = ExecutionProcessRail._tooltip_text(process)
+                self.assertEqual(
+                    f"{displayed_side} | 단일 주문 | 완료 1/1",
+                    row_text,
+                )
+                self.assertNotIn(raw_side, tooltip_text)
+                self.assertEqual(raw_side, process["side"])
+
+                fill_marker = {
+                    "side": raw_side,
+                    "filled_price": 40_250,
+                    "filled_quantity_delta": 1,
+                    "occurred_at": f"{TRADE_DATE}T09:30:00+09:00",
+                }
+                fill_detail = StockInstanceChartWindow._actual_fill_detail_text(
+                    fill_marker
+                )
+                self.assertTrue(fill_detail.startswith(displayed_side))
+                self.assertNotIn(raw_side, fill_detail)
+                self.assertEqual(raw_side, fill_marker["side"])
 
     def test_signal_and_actual_fill_series_remain_distinct_at_same_coordinate(self) -> None:
         chart = StockInstanceCloseChart()

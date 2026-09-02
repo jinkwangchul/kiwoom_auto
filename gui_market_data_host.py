@@ -139,6 +139,7 @@ class MarketDataHost(QObject):
 
     MAX_PENDING_SHADOW_COMPARISONS = 512
     MAX_RAW_TICK_QUEUE_DEPTH = 512
+    MAX_INITIAL_SNAPSHOT_ATTEMPTS_PER_SESSION = 2
 
     @staticmethod
     def _registration_shadow_targets(registration: object) -> tuple[str, ...]:
@@ -175,7 +176,10 @@ class MarketDataHost(QObject):
             str, InitialMarketSnapshotState
         ] = {}
         self._monitoring_target_stock_codes: tuple[str, ...] = ()
+        # In-flight only.  A completed request is represented by an actual
+        # valid InitialMarketSnapshotState, not by this deduplication marker.
         self._initial_snapshot_requested_stock_codes: set[str] = set()
+        self._initial_snapshot_request_attempts_by_stock: dict[str, int] = {}
         self._raw_tick_received_count_by_stock: dict[str, int] = {}
         self._raw_tick_processed_count_by_stock: dict[str, int] = {}
         self._raw_tick_uncertain_stock_codes: set[str] = set()
@@ -342,6 +346,7 @@ class MarketDataHost(QObject):
             for code in removed:
                 self._initial_market_snapshot_states.pop(code, None)
                 self._initial_snapshot_requested_stock_codes.discard(code)
+                self._initial_snapshot_request_attempts_by_stock.pop(code, None)
                 self._high_resolution_market_states.pop(code, None)
                 self._raw_tick_received_count_by_stock.pop(code, None)
                 self._raw_tick_processed_count_by_stock.pop(code, None)
@@ -354,6 +359,9 @@ class MarketDataHost(QObject):
                 code
                 for code in targets
                 if code not in self._initial_snapshot_requested_stock_codes
+                and self.initial_market_snapshot_state(code) is None
+                and self._initial_snapshot_request_attempts_by_stock.get(code, 0)
+                < self.MAX_INITIAL_SNAPSHOT_ATTEMPTS_PER_SESSION
             )
             request_snapshot = getattr(
                 self.kiwoom_api,
@@ -362,10 +370,54 @@ class MarketDataHost(QObject):
             )
             if requested_identity[1] and new_snapshot_codes and callable(request_snapshot):
                 self._initial_snapshot_requested_stock_codes.update(new_snapshot_codes)
-                snapshot_result = request_snapshot(
-                    new_snapshot_codes,
-                    callback=self._on_initial_market_snapshot_result,
-                )
+                for code in new_snapshot_codes:
+                    self._initial_snapshot_request_attempts_by_stock[code] = (
+                        self._initial_snapshot_request_attempts_by_stock.get(code, 0) + 1
+                    )
+
+                def handle_snapshot_result(
+                    result: dict[str, object],
+                    *,
+                    expected_identity=requested_identity,
+                    fallback_codes=new_snapshot_codes,
+                ) -> None:
+                    self._on_initial_market_snapshot_result(
+                        result,
+                        expected_identity=expected_identity,
+                        requested_stock_codes=fallback_codes,
+                    )
+
+                try:
+                    snapshot_result = request_snapshot(
+                        new_snapshot_codes,
+                        callback=handle_snapshot_result,
+                    )
+                except Exception:
+                    self._initial_snapshot_requested_stock_codes.difference_update(
+                        new_snapshot_codes
+                    )
+                    raise
+                if not isinstance(snapshot_result, dict):
+                    self._initial_snapshot_requested_stock_codes.difference_update(
+                        new_snapshot_codes
+                    )
+                elif snapshot_result.get("ok") is not True:
+                    batches = snapshot_result.get("batches")
+                    failed_codes = {
+                        str(code or "").strip()
+                        for batch in (batches if isinstance(batches, list) else ())
+                        if isinstance(batch, dict) and batch.get("ok") is not True
+                        for code in (batch.get("stock_codes") or ())
+                        if str(code or "").strip()
+                    }
+                    if failed_codes:
+                        self._initial_snapshot_requested_stock_codes.difference_update(
+                            failed_codes
+                        )
+                    elif not isinstance(batches, list) or not batches:
+                        self._initial_snapshot_requested_stock_codes.difference_update(
+                            new_snapshot_codes
+                        )
 
             result = sync(targets)
             registration = result.get("snapshot") if isinstance(result, dict) else None
@@ -398,22 +450,70 @@ class MarketDataHost(QObject):
                 "error": str(exc),
             }
 
-    def _on_initial_market_snapshot_result(self, result: dict[str, object]) -> None:
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            return
-        identity = (
-            int(result.get("connection_epoch") or 0),
-            str(result.get("login_session_id") or "").strip(),
+    def _on_initial_market_snapshot_result(
+        self,
+        result: dict[str, object],
+        *,
+        expected_identity: tuple[int, str] | None = None,
+        requested_stock_codes: object = (),
+    ) -> None:
+        identity = expected_identity or (
+            int(result.get("connection_epoch") or 0)
+            if isinstance(result, dict)
+            else 0,
+            str(result.get("login_session_id") or "").strip()
+            if isinstance(result, dict)
+            else "",
         )
         if identity != self._realtime_shadow_session_identity:
             return
+        result_codes = (
+            result.get("stock_codes")
+            if isinstance(result, dict) and result.get("stock_codes") is not None
+            else requested_stock_codes
+        )
+        if not result_codes and isinstance(result, dict):
+            result_rows = result.get("rows")
+            if isinstance(result_rows, list):
+                result_codes = tuple(
+                    row.get("stock_code")
+                    for row in result_rows
+                    if isinstance(row, dict)
+                )
+        completed_codes = {
+            str(code or "").strip()
+            for code in (result_codes or ())
+            if str(code or "").strip()
+        }
+        self._initial_snapshot_requested_stock_codes.difference_update(completed_codes)
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return
         received_at = str(result.get("snapshot_received_at") or "").strip()
+        received_datetime = parse_market_datetime(received_at)
+        current = datetime.now(SEOUL_TIMEZONE)
+        if (
+            received_datetime is None
+            or received_datetime.date() != current.date()
+        ):
+            return
         rows = result.get("rows") if isinstance(result.get("rows"), list) else ()
         for row in rows:
             if not isinstance(row, dict):
                 continue
             stock_code = str(row.get("stock_code") or "").strip()
             if stock_code not in self._monitoring_target_stock_codes:
+                continue
+            if completed_codes and stock_code not in completed_codes:
+                continue
+            try:
+                current_price = float(row.get("current_price"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(row.get("current_price"), bool)
+                or not isfinite(current_price)
+                or current_price <= 0
+            ):
                 continue
             self._initial_market_snapshot_states[stock_code] = InitialMarketSnapshotState(
                 stock_code=stock_code,
@@ -992,6 +1092,7 @@ class MarketDataHost(QObject):
         self._initial_market_snapshot_states.clear()
         self._monitoring_target_stock_codes = ()
         self._initial_snapshot_requested_stock_codes.clear()
+        self._initial_snapshot_request_attempts_by_stock.clear()
         self._raw_tick_received_count_by_stock.clear()
         self._raw_tick_processed_count_by_stock.clear()
         self._raw_tick_uncertain_stock_codes.clear()
