@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from PyQt5.QtCore import QEvent, QObject, Qt
 from PyQt5.QtGui import (
@@ -190,6 +190,8 @@ class StockContextMenuCallbacks:
     trade_permission_label: Callable[[], str] | None = None
     trade_permission_available: Callable[[], bool] | None = None
     toggle_trade_permission: Callable[[], None] | None = None
+    mock_create: Callable[[], None] | None = None
+    mock_actions: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1014,63 @@ def show_monitor_stock_context_menu(
     """Show the monitoring stock-row profile with the shared menu form."""
 
     menu = _new_stock_context_menu(parent)
+    mock_context: dict[str, Any] = {}
+    if callable(callbacks.mock_actions):
+        try:
+            projected = callbacks.mock_actions()
+        except Exception:
+            projected = {}
+        if isinstance(projected, dict):
+            mock_context = projected
+    if mock_context.get("current") is True:
+        mock_menu = menu.addMenu("모의검증")
+        action_mock_start = mock_menu.addAction("운영시작")
+        action_mock_early = mock_menu.addAction("조기마감")
+        action_mock_immediate = mock_menu.addAction("즉시청산")
+        mock_menu.addSeparator()
+        action_mock_tax = mock_menu.addAction("모의세금 0.20%")
+        action_mock_tax.setCheckable(True)
+        action_mock_tax.setChecked(bool(mock_context.get("tax_enabled") is True))
+        action_mock_event = mock_menu.addAction("모의 이벤트")
+        action_mock_review = mock_menu.addAction("모의검토관리")
+        action_mock_reset = mock_menu.addAction("종목리셋")
+        mock_menu.addSeparator()
+        action_mock_return = mock_menu.addAction("모의검증 종료/복귀")
+        action_mock_start.setEnabled(bool(mock_context.get("can_start")))
+        action_mock_early.setEnabled(bool(mock_context.get("can_early_close")))
+        action_mock_immediate.setEnabled(bool(mock_context.get("can_immediate")))
+        action_mock_tax.setEnabled(bool(mock_context.get("can_tax")))
+        action_mock_reset.setEnabled(bool(mock_context.get("can_reset")))
+        action_mock_return.setEnabled(bool(mock_context.get("can_return")))
+        menu._mock_validation_actions = {
+            "start": action_mock_start,
+            "early_close": action_mock_early,
+            "immediate_liquidation": action_mock_immediate,
+            "tax": action_mock_tax,
+            "event": action_mock_event,
+            "review": action_mock_review,
+            "reset": action_mock_reset,
+            "return": action_mock_return,
+        }
+        chosen = menu.exec_(global_pos)
+        dispatch = {
+            action_mock_start: mock_context.get("start"),
+            action_mock_early: mock_context.get("early_close"),
+            action_mock_immediate: mock_context.get("immediate_liquidation"),
+            action_mock_event: mock_context.get("event"),
+            action_mock_review: mock_context.get("review"),
+            action_mock_reset: mock_context.get("reset"),
+            action_mock_return: mock_context.get("return"),
+        }
+        if chosen == action_mock_tax and action_mock_tax.isEnabled():
+            callback = mock_context.get("set_tax")
+            if callable(callback):
+                callback(action_mock_tax.isChecked())
+            return
+        callback = dispatch.get(chosen)
+        if callable(callback) and chosen is not None and chosen.isEnabled():
+            callback()
+        return
     operation_policy = _context_menu_operation_policy()
     targets = list(selected_targets or [])
     exclusion_action = str(operation_exclusion_action or "").strip().lower()
@@ -1110,6 +1169,12 @@ def show_monitor_stock_context_menu(
             availability.ats_settings_allowed
             and _menu_entry_enabled(ats_settings["menu"])
         )
+
+    action_mock_create = None
+    if callbacks.mock_create is not None:
+        menu.addSeparator()
+        action_mock_create = menu.addAction("모의검증")
+        action_mock_create.setEnabled(has_selection)
 
     action_stock_register = None
     action_unregister = None
@@ -1236,6 +1301,7 @@ def show_monitor_stock_context_menu(
     allow(action_stock_register, availability.stock_register_allowed)
     allow(action_unregister, availability.unregister_allowed)
     allow(action_open_charts, availability.chart_allowed)
+    allow(action_mock_create, has_selection)
     allow(action_time_change, availability.time_management_allowed)
     allow(action_time_reset, availability.time_management_allowed)
     if _menu_entry_enabled(early_close["menu"]):
@@ -1364,6 +1430,8 @@ def show_monitor_stock_context_menu(
         callbacks.unregister()
     elif action_open_charts is not None and chosen == action_open_charts:
         callbacks.open_charts()
+    elif action_mock_create is not None and chosen == action_mock_create:
+        callbacks.mock_create()
     elif _dispatch_early_close_action(
         chosen,
         early_close,

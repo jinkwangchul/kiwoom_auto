@@ -2444,6 +2444,7 @@ from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
 )
+from mock_validation_ui_projection import mock_operation_start_exclusion_reason
 from gui_auto_trade_unregister import (
     unregister_selected_auto_trade_stocks,
 )
@@ -6037,6 +6038,15 @@ class AutoTradeSettingWindow(QDialog):
 
     def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_start_targets(self)
+
+    def operation_start_exclusion_reason(
+        self,
+        target: tuple[Path, str, str],
+    ) -> str | None:
+        return mock_operation_start_exclusion_reason(
+            persistent_feature_owner(self),
+            target,
+        )
 
     def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         snapshot = auto_trade_initial_read_snapshot(self)

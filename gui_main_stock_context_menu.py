@@ -31,9 +31,17 @@ from gui_auto_trade_status_ops import (
     auto_trade_finalize_operation_mode_result,
     auto_trade_reset_schedule_times_for_targets,
     auto_trade_set_selected_stock_operation_exclusions,
+    execute_auto_trade_stock_operation_exclusion,
+    inspect_auto_trade_operation_exclusion_availability,
 )
 from gui_auto_trade_unregister import unregister_selected_auto_trade_stocks
-from assignment_authorization_service import inspect_stock_unregister_availability
+from assignment_authorization_service import (
+    ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+    ASSIGNMENT_INTENT_UNASSIGN,
+    execute_assignment_unassign,
+    inspect_assignment_authorization,
+    inspect_stock_unregister_availability,
+)
 from gui_main_emergency_ops import (
     execute_selected_emergency_stop,
 )
@@ -54,7 +62,12 @@ from gui_auto_trade_context_menu import (
 from gui_config_utils import default_config
 from gui_schedule_window import ScheduleOperationDialog
 from gui_auto_trade_integrity import (
+    inspect_stock_review_state,
     is_operation_excluded,
+)
+from gui_auto_trade_policy import (
+    auto_trade_setting_current_session_trade_started,
+    auto_trade_setting_trade_started,
 )
 from gui_main_table_loader import (
     ROUTINE_INSTANCE_ID_ROLE,
@@ -334,6 +347,17 @@ class MainMonitoringStockOperationAdapter:
     def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_start_targets(self)
 
+    def operation_start_exclusion_reason(
+        self,
+        target: tuple[Path, str, str],
+    ) -> str | None:
+        provider = getattr(
+            self._window,
+            "operation_start_exclusion_reason",
+            None,
+        )
+        return provider(target) if callable(provider) else None
+
     def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_running_registered_operation_targets(self)
 
@@ -568,6 +592,122 @@ def main_monitoring_unregister_available(
     )
 
 
+def _mock_entry_allowed(window, target: MainMonitoringStockTarget) -> tuple[bool, str]:
+    state = read_json_dict(target.stock_dir / "state.json")
+    if inspect_stock_review_state(target.stock_dir, loaded_state=state).review_required:
+        return False, "현재 실제 운영 검토가 필요한 종목은 모의검증에 편입할 수 없습니다."
+    if auto_trade_setting_current_session_trade_started(
+        window,
+        auto_trade_setting_trade_started(state),
+        target.code,
+    ):
+        return False, "현재 실제 자동매매 운영 중인 종목은 모의검증에 편입할 수 없습니다."
+    return True, ""
+
+
+def _begin_main_mock_validation(window, target: MainMonitoringStockTarget) -> None:
+    allowed, reason = _mock_entry_allowed(window, target)
+    if not allowed:
+        from PyQt5.QtWidgets import QMessageBox
+
+        QMessageBox.information(window, "모의검증", reason)
+        return
+    window.begin_mock_validation(target)
+
+
+def _main_mock_return(window, target: MainMonitoringStockTarget) -> None:
+    destination = window.choose_mock_validation_return_destination(target.code)
+    if not destination:
+        return
+    config = read_json_dict(target.stock_dir / "config.json")
+    expected_instance_id = str(
+        config.get("routine_instance_id")
+        or config.get("assigned_routine_instance_id")
+        or ""
+    ).strip()
+    production_target = (target.stock_dir, target.code, target.name)
+
+    if destination in {"WAITING", "EXCLUDED"}:
+        requested_excluded = destination == "EXCLUDED"
+
+        def preflight():
+            return inspect_auto_trade_operation_exclusion_availability(
+                window, production_target, requested_excluded
+            ).as_dict()
+
+        def execute():
+            return execute_auto_trade_stock_operation_exclusion(
+                window, production_target, requested_excluded
+            )
+    else:
+        intent = (
+            ASSIGNMENT_INTENT_UNASSIGN
+            if destination == "UNASSIGNED"
+            else ASSIGNMENT_INTENT_STOCK_UNREGISTER
+        )
+
+        def preflight():
+            return inspect_assignment_authorization(
+                window,
+                PROJECT_ROOT,
+                target.code,
+                target.name,
+                intent=intent,
+                expected_instance_id=expected_instance_id,
+            )
+
+        def execute():
+            return execute_assignment_unassign(
+                window,
+                PROJECT_ROOT,
+                target.code,
+                target.name,
+                expected_instance_id=expected_instance_id,
+                intent=intent,
+            )
+    result = window.mock_validation_ui_actions.return_to_production(
+        target.code,
+        destination=destination,
+        preflight=preflight,
+        execute=execute,
+    )
+    if result.get("ok") is True:
+        window.refresh_auto_trade_assignment_views()
+        window.statusBar().showMessage("모의검증 종료 및 복귀가 완료되었습니다.", 5000)
+    else:
+        window.statusBar().showMessage(
+            f"모의검증 복귀 실패: {result.get('reason') or '확인 필요'}",
+            7000,
+        )
+
+
+def _main_mock_context(window, target: MainMonitoringStockTarget) -> dict[str, object]:
+    host = getattr(window, "mock_validation_host", None)
+    if host is None:
+        return {"current": False, "state": ""}
+    try:
+        state = dict(window.mock_validation_context_state(target.code))
+    except Exception:
+        # A real MainWindow with unreadable Mock membership fails closed so
+        # Production mutation actions do not appear for an uncertain stock.
+        return {"current": True, "state": "", "context_error": True}
+    if state.get("current") is not True:
+        return state
+    state.update(
+        {
+            "start": lambda: window.start_mock_validation_stock(target.code),
+            "early_close": lambda: window.early_close_mock_validation_stock(target.code),
+            "immediate_liquidation": lambda: window.immediate_liquidate_mock_validation_stock(target.code),
+            "set_tax": lambda enabled: window.set_mock_validation_tax(target.code, enabled),
+            "event": lambda: window.open_mock_validation_event_window(target.code),
+            "review": lambda: window.open_mock_validation_review_window(target.code),
+            "reset": lambda: window._reset_mock_validation_from_review(target.code),
+            "return": lambda: _main_mock_return(window, target),
+        }
+    )
+    return state
+
+
 def show_main_monitoring_stock_context_menu(window, position) -> bool:
     item = window.routine_table.itemAt(position)
     if item is None:
@@ -687,6 +827,8 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         ),
         unregister=lambda: unregister_selected_auto_trade_stocks(adapter),
         unregister_available=lambda: main_monitoring_unregister_available(adapter),
+        mock_create=lambda: _begin_main_mock_validation(window, context_target),
+        mock_actions=lambda: _main_mock_context(window, context_target),
     )
     show_monitor_stock_context_menu(
         window,

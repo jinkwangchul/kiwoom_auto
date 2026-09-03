@@ -1672,6 +1672,16 @@ def _single_start_failure_user_message(
         )
     if reason == "ALREADY_RUNNING":
         return f"{subject} 이미 운영 중입니다."
+    if reason == "MOCK_VALIDATION_ACTIVE":
+        return f"{subject} 모의검증 중이므로 실운영을 시작할 수 없습니다."
+    if reason in {
+        "MOCK_MEMBERSHIP_CHECK_FAILED",
+        "OPERATION_START_EXCLUSION_CHECK_FAILED",
+    }:
+        return (
+            f"{label}의 모의검증 상태를 확인하지 못했습니다.\n"
+            "상태를 다시 확인한 뒤 실운영을 시작하십시오."
+        )
     if reason == "MISSING_REQUIRED_SETTINGS":
         return (
             f"{label}의 필수 운영 설정이 완료되지 않았습니다.\n"
@@ -2144,6 +2154,24 @@ def auto_trade_start_selected_auto_trades(
         seen_stock_keys.add(key)
         unique_selected.append((Path(stock_dir), str(code), str(name)))
     selected = unique_selected
+    selected_for_reporting = list(selected)
+    selected, start_exclusions = _partition_operation_start_targets(
+        window,
+        selected,
+    )
+    if start_exclusions and not selected:
+        result = _operation_start_all_excluded_payload(
+            start_exclusions,
+            selected_for_reporting,
+        )
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected_for_reporting,
+            request_source=source,
+        )
+        _show_start_failure_once(window, result)
+        return result
 
     unique_running: list[tuple[Path, str, str]] = []
     running_keys: set[str] = set()
@@ -2154,7 +2182,7 @@ def auto_trade_start_selected_auto_trades(
         running_keys.add(key)
         unique_running.append((Path(stock_dir), str(code), str(name)))
     already_running_targets = tuple(unique_running)
-    reporting_selected = list(already_running_targets) + list(selected)
+    reporting_selected = list(already_running_targets) + selected_for_reporting
     start_request_context_targets = (
         reporting_selected if already_running_targets else selected
     )
@@ -2307,7 +2335,7 @@ def auto_trade_start_selected_auto_trades(
     review_checker = getattr(window, "start_target_is_review_isolated", None)
     candidate_targets: list[tuple[Path, str, str]] = []
     excluded_review: list[str] = []
-    blocked_target_details: list[dict[str, object]] = []
+    blocked_target_details: list[dict[str, object]] = list(start_exclusions)
     for stock_dir, code, name in selected:
         isolated = (
             bool(review_checker(stock_dir, code))
@@ -3130,6 +3158,94 @@ def _operation_start_target_results(
     return tuple(normalized)
 
 
+def _partition_operation_start_targets(
+    host: object,
+    targets: list[tuple[Path, str, str]],
+) -> tuple[list[tuple[Path, str, str]], tuple[dict[str, object], ...]]:
+    """Apply an optional host-owned, read-only start exclusion contract."""
+
+    provider = getattr(host, "operation_start_exclusion_reason", None)
+    if not callable(provider):
+        return list(targets), ()
+
+    allowed: list[tuple[Path, str, str]] = []
+    excluded: list[dict[str, object]] = []
+    for target in targets:
+        stock_dir, code, name = target
+        try:
+            reason = str(provider(target) or "").strip()
+        except Exception:
+            LOGGER.exception("운영시작 제외조건 확인 실패: %s %s", code, name)
+            reason = "OPERATION_START_EXCLUSION_CHECK_FAILED"
+        if not reason:
+            allowed.append(target)
+            continue
+        excluded.append(
+            {
+                "stock_code": str(code),
+                "stock_name": str(name),
+                "stock_dir": str(Path(stock_dir)),
+                "reason": reason,
+                "display_label": f"{code} {name}".strip(),
+                "status": "BLOCKED",
+            }
+        )
+    return allowed, tuple(excluded)
+
+
+def _merge_operation_start_exclusions(
+    payload: dict[str, object] | None,
+    exclusions: tuple[dict[str, object], ...],
+    *,
+    requested_targets: list[tuple[Path, str, str]],
+) -> dict[str, object]:
+    result = dict(payload or {})
+    if not exclusions:
+        return result
+    existing = tuple(
+        item
+        for item in result.get("blocked_target_details", ()) or ()
+        if isinstance(item, dict)
+    )
+    result["blocked_target_details"] = existing + exclusions
+    result["blocked_count"] = len(result["blocked_target_details"])
+    result["excluded_operation_start_count"] = len(exclusions)
+    result["requested"] = tuple(
+        f"{code} {name}".strip()
+        for _stock_dir, code, name in requested_targets
+    )
+    result["requested_count"] = len(requested_targets)
+    return result
+
+
+def _operation_start_all_excluded_payload(
+    exclusions: tuple[dict[str, object], ...],
+    targets: list[tuple[Path, str, str]],
+) -> dict[str, object]:
+    reasons = {
+        str(item.get("reason") or "").strip()
+        for item in exclusions
+        if str(item.get("reason") or "").strip()
+    }
+    reason = next(iter(reasons)) if len(reasons) == 1 else "NO_STARTABLE_TARGETS"
+    return _merge_operation_start_exclusions(
+        {
+            "ok": False,
+            "reason": reason or "NO_STARTABLE_TARGETS",
+            "user_message": (
+                "모의검증 중인 종목은 실운영을 시작할 수 없습니다."
+                if reasons == {"MOCK_VALIDATION_ACTIVE"}
+                else "운영시작 제외조건을 확인하지 못해 안전하게 차단했습니다."
+            ),
+            "completed": (),
+            "started_count": 0,
+            "failed_count": 0,
+        },
+        exclusions,
+        requested_targets=targets,
+    )
+
+
 def _operation_start_command_result(
     payload: dict[str, object] | None,
     *,
@@ -3192,6 +3308,10 @@ def _execute_full_operation_start(
     running_targets = list(host.running_registered_operation_targets())
     selected_targets = list(host.registered_operation_start_targets())
     requested_targets = list(selected_targets)
+    selected_targets, start_exclusions = _partition_operation_start_targets(
+        host,
+        selected_targets,
+    )
     running_keys = {
         str(code or "").strip() or str(Path(stock_dir).resolve())
         for stock_dir, code, _name in running_targets
@@ -3216,16 +3336,25 @@ def _execute_full_operation_start(
             status_message = getattr(host, "statusBarMessage", None)
             if callable(status_message):
                 status_message(
-                    "운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요."
+                    "모의검증 중인 종목은 실운영을 시작할 수 없습니다."
+                    if start_exclusions
+                    else "운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요."
                 )
-            payload = {
-                "ok": False,
-                "reason": "NO_STARTABLE_TARGETS",
-                "requested": (),
-                "requested_count": 0,
-                "started_count": 0,
-                "blocked_count": 0,
-            }
+            payload = (
+                _operation_start_all_excluded_payload(
+                    start_exclusions,
+                    requested_targets,
+                )
+                if start_exclusions
+                else {
+                    "ok": False,
+                    "reason": "NO_STARTABLE_TARGETS",
+                    "requested": (),
+                    "requested_count": 0,
+                    "started_count": 0,
+                    "blocked_count": 0,
+                }
+            )
         else:
             requested_targets = requested_targets or list(running_targets)
             payload = {
@@ -3247,6 +3376,11 @@ def _execute_full_operation_start(
                 "excluded_review_count": 0,
                 "excluded_validation_count": 0,
             }
+            payload = _merge_operation_start_exclusions(
+                payload,
+                start_exclusions,
+                requested_targets=requested_targets,
+            )
             summary_presenter(host, payload)
         host.update_global_operation_button_state()
         return _operation_start_command_result(payload, intent=resolved_intent)
@@ -3259,6 +3393,11 @@ def _execute_full_operation_start(
     if running_targets:
         start_kwargs["already_running_targets"] = running_targets
     payload = start_backend(host, **start_kwargs)
+    payload = _merge_operation_start_exclusions(
+        payload,
+        start_exclusions,
+        requested_targets=requested_targets,
+    )
 
     parent_refreshed = False
     parent_getter = getattr(host, "parent", None)
@@ -3301,11 +3440,41 @@ def execute_operation_start_command(
         )
 
     selective_kwargs: dict[str, object] = {}
-    if request.selected_targets:
-        selective_kwargs["selected_targets"] = list(request.selected_targets)
+    selective_targets = list(request.selected_targets)
+    exclusion_provider = getattr(host, "operation_start_exclusion_reason", None)
+    if not selective_targets and callable(exclusion_provider):
+        selected_getter = getattr(host, "selected_stock_infos", None)
+        try:
+            selective_targets = (
+                list(selected_getter()) if callable(selected_getter) else []
+            )
+        except Exception:
+            LOGGER.exception("선택 운영시작 대상 확인 실패")
+            selective_targets = []
+    requested_targets = list(selective_targets)
+    selective_targets, start_exclusions = _partition_operation_start_targets(
+        host,
+        selective_targets,
+    )
+    if start_exclusions and not selective_targets:
+        return _operation_start_command_result(
+            _operation_start_all_excluded_payload(
+                start_exclusions,
+                requested_targets,
+            ),
+            intent=OperationStartIntent.SELECTIVE_START,
+        )
+    if selective_targets:
+        selective_kwargs["selected_targets"] = selective_targets
     if request.source and request.source != "auto_trade_context_menu":
         selective_kwargs["source"] = request.source
     payload = selective_backend(host, **selective_kwargs)
+    if start_exclusions:
+        payload = _merge_operation_start_exclusions(
+            payload,
+            start_exclusions,
+            requested_targets=requested_targets,
+        )
     return _operation_start_command_result(
         payload
         or {

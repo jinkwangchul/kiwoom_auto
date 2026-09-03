@@ -116,6 +116,7 @@ from gui_main_routine_selection import (
     routine_instance_checked,
     sync_routine_selection_state,
 )
+from mock_validation_ui_projection import current_mock_projections
 
 
 ROUTINE_MONITORING_HEADERS = (
@@ -1857,6 +1858,7 @@ def _instance_stock_counts(
         dynamic_stocks.append(
             (stock, inspection.state, inspection.review_required)
         )
+    mock_codes = _current_mock_stock_codes(window)
     for stock, state, review_required in dynamic_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
         if stock_paths is not None and stock_path not in stock_paths:
@@ -1866,6 +1868,8 @@ def _instance_stock_counts(
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
         stock_identity = normalize_stock_code(code) or stock_path
+        if stock_identity in mock_codes:
+            continue
         if stock_identity in seen_stock_identities:
             continue
         seen_stock_identities.add(stock_identity)
@@ -2381,8 +2385,7 @@ def _update_main_routine_summary(
             if valid_projection
             else None
         )
-        update(
-            _main_routine_summary_projection(
+        projection = _main_routine_summary_projection(
                 definitions,
                 instances,
                 instance_counts,
@@ -2406,7 +2409,32 @@ def _update_main_routine_summary(
                 ),
                 stock_badge_count=valid_stock_count,
             )
+        if _mock_host(window) is not None:
+            mock_count = len(_current_mock_stock_codes(window))
+            projection["count_badges"] = tuple(projection["count_badges"]) + (
+                ("mock", "모의", mock_count),
+            )
+            projection["counts_text"] = f"{projection['counts_text']}  모의({mock_count})"
+        update(projection)
+
+
+def _mock_host(window):
+    return getattr(window, "mock_validation_host", None) if window is not None else None
+
+
+def _current_mock_stock_codes(window) -> frozenset[str]:
+    host = _mock_host(window)
+    getter = getattr(host, "current_stock_codes", None)
+    if not callable(getter):
+        return frozenset()
+    try:
+        return frozenset(
+            code
+            for code in (normalize_stock_code(value) for value in getter())
+            if code
         )
+    except Exception:
+        return frozenset()
 
 
 def _main_routine_effective_stock_scope(window) -> str:
@@ -2418,7 +2446,7 @@ def _main_routine_effective_stock_scope(window) -> str:
     if stock_scope == "review":
         stock_scope = "all"
     if stock_scope not in {
-        "normal", "all", "operation", "waiting", "excluded"
+        "normal", "all", "operation", "waiting", "excluded", "mock"
     }:
         stock_scope = "normal"
     if bool(getattr(window, "_main_routine_valid_only", False)) and stock_scope == "all":
@@ -2434,6 +2462,96 @@ def _main_routine_structure_stock_scope(window) -> str:
         if bool(getattr(window, "_main_routine_valid_only", False))
         else "all"
     )
+
+
+def _load_mock_routine_table(window) -> None:
+    """Render one stock-centric row per current Mock session."""
+
+    host = _mock_host(window)
+    repository = getattr(host, "repository", None)
+    rows = current_mock_projections(repository) if repository is not None else ()
+    _clear_routine_table_cell_widgets(window.routine_table)
+    clear_spans = getattr(window.routine_table, "clearSpans", None)
+    if callable(clear_spans):
+        clear_spans()
+    window.routine_table.setRowCount(0)
+    window.routine_table.setRowCount(len(rows))
+    for row, projection in enumerate(rows):
+        code = str(projection.get("stock_code", "") or "")
+        name = str(projection.get("stock_name", "") or "")
+        instance_ids = tuple(projection.get("routine_instance_ids", ()) or ())
+        instance_id = str(instance_ids[0]) if instance_ids else ""
+        instance_summary = str(projection.get("routine_summary", "") or "-")
+        state_label = str(projection.get("state_label", "") or "-")
+        operation_state = str(projection.get("operation_state", "") or "-")
+        culprit = str(projection.get("review_culprit", "") or "-")
+        holding = int(projection.get("holding_qty", 0) or 0)
+        pnl = projection.get("net_pnl", 0)
+        values = [
+            f"{code} {name}",
+            state_label,
+            str(len(instance_ids)),
+            "모의",
+            operation_state,
+            culprit,
+            f"{holding:,}주",
+            "-",
+            f"{float(pnl):+,.0f}원",
+            "-",
+        ]
+        display_tokens = tuple({"text": value} for value in values)
+        tooltip = (
+            f"모의검증 종목: {code} {name}\n"
+            f"상태: {state_label}\n"
+            f"루틴: {instance_summary}\n"
+            f"보유: {holding:,}주 / 손익: {float(pnl):+,.0f}원"
+        )
+        if projection.get("review_required"):
+            tooltip += (
+                f"\n검토 사유: {projection.get('review_reason') or '-'}"
+                f"\n원인 루틴: {culprit}"
+            )
+        for column, value in enumerate(values):
+            item = SortableTableWidgetItem(value)
+            item.setData(ROUTINE_ROW_KIND_ROLE, ROUTINE_ROW_STOCK)
+            item.setData(ROUTINE_GROUP_ID_ROLE, "mock_validation")
+            item.setData(ROUTINE_GROUP_PATH_ROLE, "")
+            item.setData(ROUTINE_DEFINITION_ID_ROLE, "indicator_follow")
+            item.setData(ROUTINE_INSTANCE_ID_ROLE, instance_id)
+            item.setData(ROUTINE_STOCK_CODE_ROLE, code)
+            item.setData(ROUTINE_STOCK_NAME_ROLE, name)
+            item.setData(ROUTINE_STOCK_PATH_ROLE, projection.get("stock_path", ""))
+            item.setData(ROUTINE_STOCK_VALUES_ROLE, values)
+            item.setData(ROUTINE_STOCK_DISPLAY_ROLE, display_tokens)
+            item.setData(ROUTINE_STOCK_METRICS_ROLE, ())
+            item.setData(ROUTINE_STOCK_PROFIT_LED_ROLE, "gray")
+            item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, True)
+            item.setData(
+                ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "mock_validation": True,
+                    "validation_session_id": projection.get("validation_session_id", ""),
+                    "state": projection.get("state", ""),
+                },
+            )
+            if column == 0:
+                item.setToolTip(tooltip)
+            window.routine_table.setItem(row, column, item)
+        set_row_height = getattr(window.routine_table, "setRowHeight", None)
+        if callable(set_row_height):
+            set_row_height(row, ROUTINE_STOCK_ROW_HEIGHT)
+    updater = getattr(window, "_update_main_routine_summary", None)
+    if callable(updater):
+        definitions, instances = _main_pnl_refresh_routine_metadata(window)
+        counts = _instance_stock_counts(window=window, stock_scope="normal")
+        projection = _main_routine_summary_projection(definitions, instances, counts)
+        projection["count_badges"] = tuple(projection["count_badges"]) + (
+            ("mock", "모의", len(rows)),
+        )
+        projection["counts_text"] = f"{projection['counts_text']}  모의({len(rows)})"
+        updater(projection)
 
 
 def main_refresh_pnl_only(window) -> None:
@@ -2464,6 +2582,8 @@ def main_refresh_pnl_only(window) -> None:
         tuple(static_cache.get("stocks", ())),
     )
     stock_scope = _main_routine_effective_stock_scope(window)
+    if stock_scope == "mock":
+        stock_scope = "normal"
     relation_counts = (
         _projected_group_relation_counts(
             window,
@@ -3457,6 +3577,9 @@ def main_load_routine_table(window) -> None:
     """
     _invalidate_main_pnl_refresh_cache(window)
     stock_scope = _main_routine_effective_stock_scope(window)
+    if stock_scope == "mock":
+        _load_mock_routine_table(window)
+        return
     instance_counts = _instance_stock_counts(
         window=window,
         stock_scope=stock_scope,

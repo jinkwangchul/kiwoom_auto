@@ -27,3 +27,25 @@ REALTIME_SHADOW_FIDS = (
     REALTIME_PREVIOUS_DAY_VOLUME_RATE_FID,
     REALTIME_EXECUTION_STRENGTH_FID,
 )
+
+# Installed KOA StudioSA 2.34 ``koarealtime.dat`` Real Type
+# "주식호가잔량" plus the installed KOAStudioSA FID dictionary.
+# These remain separate from REALTIME_SHADOW_FIDS because they feed only the
+# isolated Mock Validation market-data stream.
+REALTIME_ORDERBOOK_TYPE = "주식호가잔량"
+REALTIME_ORDERBOOK_TIME_FID = 21  # 호가시간
+REALTIME_ASK_PRICE_FIDS = tuple(range(41, 51))  # 매도호가 1~10
+REALTIME_BID_PRICE_FIDS = tuple(range(51, 61))  # 매수호가 1~10
+REALTIME_ASK_QTY_FIDS = tuple(range(61, 71))  # 매도호가수량 1~10
+REALTIME_BID_QTY_FIDS = tuple(range(71, 81))  # 매수호가수량 1~10
+REALTIME_TOTAL_ASK_QTY_FID = 121  # 매도호가총잔량
+REALTIME_TOTAL_BID_QTY_FID = 125  # 매수호가총잔량
+REALTIME_ORDERBOOK_FIDS = (
+    REALTIME_ORDERBOOK_TIME_FID,
+    *REALTIME_ASK_PRICE_FIDS,
+    *REALTIME_BID_PRICE_FIDS,
+    *REALTIME_ASK_QTY_FIDS,
+    *REALTIME_BID_QTY_FIDS,
+    REALTIME_TOTAL_ASK_QTY_FID,
+    REALTIME_TOTAL_BID_QTY_FID,
+)

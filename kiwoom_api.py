@@ -57,10 +57,13 @@ from kiwoom_realtime_fids import (
     REALTIME_HIGH_PRICE_FID,
     REALTIME_LOW_PRICE_FID,
     REALTIME_OPEN_PRICE_FID,
+    REALTIME_ORDERBOOK_FIDS,
+    REALTIME_ORDERBOOK_TYPE,
     REALTIME_PREVIOUS_DAY_VOLUME_RATE_FID,
     REALTIME_SHADOW_FIDS,
     REALTIME_TRADE_VOLUME_FID,
 )
+from mock_validation_market_data import normalize_mock_orderbook_snapshot
 from kiwoom_realtime_shadow import (
     RealtimeShadowBar,
     RealtimeShadowBarBuilder,
@@ -145,6 +148,28 @@ class RealtimeShadowRegistrationSnapshot:
     screen_batches: tuple[RealtimeShadowScreenBatch, ...]
     last_error: str
     shadow_target_stock_codes: tuple[str, ...] | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MockOrderbookScreenBatch:
+    screen_no: str
+    owner: str
+    stock_codes: tuple[str, ...]
+    raw_registration_result: Any = None
+
+
+@dataclass(frozen=True)
+class MockOrderbookRegistrationSnapshot:
+    active: bool
+    connection_epoch: int
+    login_session_id: str
+    target_stock_codes: tuple[str, ...]
+    fid_list: tuple[int, ...]
+    screen_batches: tuple[MockOrderbookScreenBatch, ...]
+    last_error: str
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -387,6 +412,7 @@ class KiwoomApi(QObject):
     bar_committed = pyqtSignal(object)
     realtime_shadow_tick_received = pyqtSignal(object)
     realtime_shadow_bar_completed = pyqtSignal(object)
+    mock_orderbook_received = pyqtSignal(object)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
@@ -576,6 +602,8 @@ class KiwoomApi(QObject):
         self._realtime_shadow_builder = RealtimeShadowBarBuilder()
         self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
         self._realtime_receive_sequence = 0
+        self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot()
+        self._mock_orderbook_receive_sequence = 0
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -698,6 +726,46 @@ class KiwoomApi(QObject):
     ) -> RealtimeShadowRegistrationSnapshot:
         self._ensure_realtime_shadow_state()
         return self._realtime_shadow_registration
+
+    @staticmethod
+    def _empty_mock_orderbook_snapshot(
+        *,
+        connection_epoch: int = 0,
+        login_session_id: str = "",
+        last_error: str = "",
+    ) -> MockOrderbookRegistrationSnapshot:
+        return MockOrderbookRegistrationSnapshot(
+            active=False,
+            connection_epoch=int(connection_epoch or 0),
+            login_session_id=str(login_session_id or ""),
+            target_stock_codes=(),
+            fid_list=tuple(REALTIME_ORDERBOOK_FIDS),
+            screen_batches=(),
+            last_error=str(last_error or ""),
+        )
+
+    def _ensure_mock_orderbook_state(self) -> None:
+        state = self.__dict__
+        if "_screen_allocator" not in state:
+            self._screen_allocator = KiwoomScreenAllocator()
+        if "_mock_orderbook_receive_sequence" not in state:
+            self._mock_orderbook_receive_sequence = 0
+        if not isinstance(
+            state.get("_mock_orderbook_registration"),
+            MockOrderbookRegistrationSnapshot,
+        ):
+            self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot()
+
+    def _next_mock_orderbook_receive_sequence(self) -> int:
+        self._ensure_mock_orderbook_state()
+        self._mock_orderbook_receive_sequence += 1
+        return self._mock_orderbook_receive_sequence
+
+    def mock_orderbook_registration_snapshot(
+        self,
+    ) -> MockOrderbookRegistrationSnapshot:
+        self._ensure_mock_orderbook_state()
+        return self._mock_orderbook_registration
 
     def commit_realtime_primary_bar(
         self,
@@ -1034,6 +1102,206 @@ class KiwoomApi(QObject):
             self._screen_allocator.release(batch.owner, batch.screen_no)
         return errors
 
+    def sync_mock_orderbook_registration(self, stock_codes: object) -> dict[str, Any]:
+        """Synchronize one Mock-only orderbook subscription per stock code."""
+
+        self._ensure_mock_orderbook_state()
+        session = self.broker_session_snapshot()
+        if not (
+            session.api_available
+            and session.connected
+            and session.login_session_id
+        ):
+            self.clear_mock_orderbook_registration(
+                remove_from_broker=False,
+                reason="MOCK_ORDERBOOK_BROKER_SESSION_NOT_READY",
+            )
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "BROKER_SESSION_NOT_READY",
+                "snapshot": self._mock_orderbook_registration,
+            }
+
+        candidates = (
+            stock_codes
+            if isinstance(stock_codes, (list, tuple, set, frozenset))
+            else ()
+        )
+        normalized_targets = {
+            normalize_stock_code(code)
+            for code in candidates
+            if normalize_stock_code(code)
+        }
+        unsupported_targets = tuple(
+            sorted(
+                code
+                for code in normalized_targets
+                if not is_broker_action_stock_code(code)
+            )
+        )
+        targets = tuple(
+            sorted(
+                code
+                for code in normalized_targets
+                if code not in unsupported_targets
+            )
+        )
+        current = self._mock_orderbook_registration
+        if (
+            current.active
+            and current.connection_epoch == session.connection_epoch
+            and current.login_session_id == session.login_session_id
+            and current.target_stock_codes == targets
+            and current.fid_list == tuple(REALTIME_ORDERBOOK_FIDS)
+        ):
+            return {
+                "ok": True,
+                "changed": False,
+                "active": True,
+                "reason_code": "MOCK_ORDERBOOK_UNCHANGED",
+                "unsupported_stock_codes": unsupported_targets,
+                "snapshot": current,
+            }
+
+        had_registration = bool(current.screen_batches)
+        if had_registration:
+            clear_result = self.clear_mock_orderbook_registration(
+                remove_from_broker=True,
+                reason="MOCK_ORDERBOOK_TARGET_REPLACED",
+            )
+            if clear_result.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "changed": True,
+                    "active": False,
+                    "reason_code": "MOCK_ORDERBOOK_REPLACEMENT_CLEAR_FAILED",
+                    "errors": tuple(clear_result.get("errors", ())),
+                    "snapshot": self._mock_orderbook_registration,
+                }
+        if not targets:
+            return {
+                "ok": True,
+                "changed": had_registration,
+                "active": False,
+                "reason_code": "MOCK_ORDERBOOK_EMPTY_TARGET",
+                "unsupported_stock_codes": unsupported_targets,
+                "snapshot": self._mock_orderbook_registration,
+            }
+
+        fid_text = ";".join(str(fid) for fid in REALTIME_ORDERBOOK_FIDS)
+        registered: list[MockOrderbookScreenBatch] = []
+        try:
+            for offset in range(0, len(targets), 100):
+                codes = targets[offset:offset + 100]
+                owner = f"mock_orderbook:{session.connection_epoch}:{offset // 100}"
+                lease = self._screen_allocator.claim(REALTIME, owner)
+                batch = MockOrderbookScreenBatch(
+                    screen_no=lease.screen_no,
+                    owner=owner,
+                    stock_codes=codes,
+                )
+                registered.append(batch)
+                raw_result = self._control.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    lease.screen_no,
+                    ";".join(codes),
+                    fid_text,
+                    "0",
+                )
+                registered[-1] = MockOrderbookScreenBatch(
+                    screen_no=lease.screen_no,
+                    owner=owner,
+                    stock_codes=codes,
+                    raw_registration_result=raw_result,
+                )
+        except Exception as exc:
+            self._clear_mock_orderbook_batches(
+                registered,
+                remove_from_broker=True,
+            )
+            self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot(
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                last_error=str(exc),
+            )
+            return {
+                "ok": False,
+                "changed": True,
+                "active": False,
+                "reason_code": "MOCK_ORDERBOOK_REGISTRATION_FAILED",
+                "error": str(exc),
+                "snapshot": self._mock_orderbook_registration,
+            }
+
+        self._mock_orderbook_registration = MockOrderbookRegistrationSnapshot(
+            active=True,
+            connection_epoch=session.connection_epoch,
+            login_session_id=session.login_session_id,
+            target_stock_codes=targets,
+            fid_list=tuple(REALTIME_ORDERBOOK_FIDS),
+            screen_batches=tuple(registered),
+            last_error="",
+        )
+        return {
+            "ok": True,
+            "changed": True,
+            "active": True,
+            "reason_code": "MOCK_ORDERBOOK_REGISTER_CALL_RETURNED",
+            "unsupported_stock_codes": unsupported_targets,
+            "snapshot": self._mock_orderbook_registration,
+        }
+
+    def clear_mock_orderbook_registration(
+        self,
+        *,
+        remove_from_broker: bool | None = None,
+        reason: str = "MOCK_ORDERBOOK_CLEARED",
+    ) -> dict[str, Any]:
+        self._ensure_mock_orderbook_state()
+        current = self._mock_orderbook_registration
+        batches = list(current.screen_batches)
+        if remove_from_broker is None:
+            remove_from_broker = bool(self._connected and self._control is not None)
+        errors = self._clear_mock_orderbook_batches(
+            batches,
+            remove_from_broker=bool(remove_from_broker),
+        )
+        self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot(
+            connection_epoch=int(getattr(self, "_connection_epoch", 0) or 0),
+            login_session_id=str(getattr(self, "_login_session_id", "") or ""),
+            last_error="; ".join(errors),
+        )
+        return {
+            "ok": not errors,
+            "changed": bool(batches),
+            "active": False,
+            "reason_code": reason if not errors else "MOCK_ORDERBOOK_CLEAR_FAILED",
+            "errors": tuple(errors),
+            "snapshot": self._mock_orderbook_registration,
+        }
+
+    def _clear_mock_orderbook_batches(
+        self,
+        batches: list[MockOrderbookScreenBatch],
+        *,
+        remove_from_broker: bool,
+    ) -> list[str]:
+        errors: list[str] = []
+        for batch in batches:
+            if remove_from_broker and self._control is not None:
+                try:
+                    self._control.dynamicCall(
+                        "SetRealRemove(QString, QString)",
+                        batch.screen_no,
+                        "ALL",
+                    )
+                except Exception as exc:
+                    errors.append(str(exc))
+            self._screen_allocator.release(batch.owner, batch.screen_no)
+        return errors
+
     def _observe_connected_state(self, connected: bool, *, reason: str) -> bool:
         connected = bool(connected)
         if connected:
@@ -1072,6 +1340,16 @@ class KiwoomApi(QObject):
             reset_shadow(
                 remove_from_broker=False,
                 reason="REALTIME_SHADOW_SESSION_INVALIDATED",
+            )
+        reset_mock_orderbook = getattr(
+            self,
+            "clear_mock_orderbook_registration",
+            None,
+        )
+        if callable(reset_mock_orderbook):
+            reset_mock_orderbook(
+                remove_from_broker=False,
+                reason="MOCK_ORDERBOOK_SESSION_INVALIDATED",
             )
         self._connected = False
         self._login_session_id = ""
@@ -2901,6 +3179,10 @@ class KiwoomApi(QObject):
                 remove_from_broker=False,
                 reason="REALTIME_SHADOW_NEW_SESSION",
             )
+            self.clear_mock_orderbook_registration(
+                remove_from_broker=False,
+                reason="MOCK_ORDERBOOK_NEW_SESSION",
+            )
             account_payload = ";".join(self.account_numbers())
             self._establish_login_session(account_payload=account_payload)
             self.last_login_message = "login succeeded"
@@ -2983,6 +3265,9 @@ class KiwoomApi(QObject):
         self._ensure_realtime_shadow_state()
         stock_code = str(args[0] or "").strip()
         real_type = str(args[1] or "").strip()
+        if real_type == REALTIME_ORDERBOOK_TYPE:
+            self._on_receive_mock_orderbook(stock_code)
+            return
         registration = self._realtime_shadow_registration
         if (
             not registration.active
@@ -3046,6 +3331,50 @@ class KiwoomApi(QObject):
                 target_name=stock_code,
                 reason_code="REALTIME_SHADOW_TICK_FAILED",
                 failure_scope=f"realtime_shadow_tick:{stock_code}",
+            )
+
+    def _on_receive_mock_orderbook(self, stock_code: str) -> None:
+        """Emit a Mock-only immutable orderbook without Production mutation."""
+
+        self._ensure_mock_orderbook_state()
+        code = normalize_stock_code(stock_code)
+        registration = self._mock_orderbook_registration
+        if (
+            not registration.active
+            or not code
+            or code not in registration.target_stock_codes
+        ):
+            return
+        session = self.broker_session_snapshot()
+        if (
+            not session.connected
+            or session.connection_epoch != registration.connection_epoch
+            or session.login_session_id != registration.login_session_id
+        ):
+            return
+        try:
+            values = {
+                fid: self._control.dynamicCall(
+                    "GetCommRealData(QString, int)",
+                    stock_code,
+                    fid,
+                )
+                for fid in REALTIME_ORDERBOOK_FIDS
+            }
+            snapshot = normalize_mock_orderbook_snapshot(
+                stock_code=code,
+                raw_values=values,
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                receive_sequence=self._next_mock_orderbook_receive_sequence(),
+                received_at=datetime.now().astimezone(),
+            )
+            if snapshot is not None:
+                self.mock_orderbook_received.emit(snapshot)
+        except Exception as exc:
+            self._mock_orderbook_registration = replace(
+                registration,
+                last_error=str(exc),
             )
 
     def _on_receive_msg(self, *args: Any) -> None:

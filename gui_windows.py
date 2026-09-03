@@ -1528,7 +1528,7 @@ from routine_limit_response_service import (
 )
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
-from gui_event_record_window import open_event_record_prototype
+from gui_event_record_window import EventRecordPrototypeWindow, open_event_record_prototype
 from gui_stock_instance_chart_window import (
     CHART_OPEN_STOCK_CODE_COLOR,
     clear_pending_stock_instance_chart_refreshes,
@@ -1596,6 +1596,7 @@ from routine_instance_registry import (
     ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS,
     ROUTINE_LIMIT_RESPONSE_SORT_DIRECTIONS,
     default_routine_limit_response_policy,
+    load_persisted_routine_instances,
     routine_definition_by_id,
     routine_instance_by_id,
     validate_routine_limit_response_policy,
@@ -1670,6 +1671,15 @@ from production_recovery_state_registry import (
 from startup_runtime_initializer import initialize_pristine_startup_runtime
 from operation_command_service import MODE_EARLY_CLOSE
 from close_liquidation_transition_service import POLICY_MARKET
+from mock_validation_contract import MockValidationError
+from mock_validation_host import MockValidationHost
+from mock_validation_operation_lifecycle import mock_validation_end_eligibility
+from mock_validation_reference_snapshot import build_mock_reference_snapshot
+from mock_validation_ui_actions import MockValidationUIActions
+from mock_validation_ui_projection import (
+    MockEventReaderAdapter,
+    mock_operation_start_exclusion_reason,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -4006,10 +4016,19 @@ class MainWindow(QMainWindow):
         self.btn_main_visible_early_close = QPushButton("조기마감")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
+        self._mock_validation_ui_enabled = True
 
         self._setup_ui()
         self._apply_main_control_window_width()
         self._connect_events()
+        self.mock_validation_host = MockValidationHost(
+            self.kiwoom_api,
+            project_root=PROJECT_ROOT,
+            projection_changed=self._on_mock_validation_projection_changed,
+        )
+        self.mock_validation_ui_actions = MockValidationUIActions(
+            self.mock_validation_host
+        )
         operation_host = self.main_monitoring_auto_trade_operation_host()
         self._pending_main_market_information_codes: set[str] = set()
         self._main_market_information_refresh_timer = QTimer(self)
@@ -4039,6 +4058,7 @@ class MainWindow(QMainWindow):
         self._pnl_refresh_timer = QTimer(self)
         self._pnl_refresh_timer.setInterval(PNL_REFRESH_INTERVAL_MS)
         self._pnl_refresh_timer.timeout.connect(lambda: main_refresh_pnl_only(self))
+        self._pnl_refresh_timer.timeout.connect(self._process_mock_validation_host_cycle)
         self._pnl_refresh_timer.start()
         append_owner_event_once(
             self,
@@ -4957,7 +4977,7 @@ class MainWindow(QMainWindow):
         ) // 2
         label_slot_width = max(
             metrics.horizontalAdvance(text)
-            for text in ("그룹", "루틴", "종목", "운영", "대기", "제외", "검토")
+            for text in ("그룹", "루틴", "종목", "운영", "대기", "제외", "검토", "모의")
         )
         number_slot_width = routine_aggregate_number_slot_width(summary_font)
         badge_height = max(
@@ -5013,7 +5033,7 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(valid_separator)
         self._main_routine_summary_valid_separator = valid_separator
-        for key, label_text in (
+        badge_specs = [
             ("group", "그룹"),
             ("routine", "루틴"),
             ("stock", "종목"),
@@ -5021,7 +5041,10 @@ class MainWindow(QMainWindow):
             ("waiting", "대기"),
             ("excluded", "제외"),
             ("review", "검토"),
-        ):
+        ]
+        if bool(getattr(self, "_mock_validation_ui_enabled", False)):
+            badge_specs.append(("mock", "모의"))
+        for key, label_text in badge_specs:
             badge = (
                 getattr(self, "btn_review_required", None)
                 if key == "review"
@@ -5140,9 +5163,9 @@ class MainWindow(QMainWindow):
             self._assign_main_routine_stock_scope("all", True)
             self._set_main_routine_display_level("stock")
             return
-        if clean_key in {"operation", "waiting", "excluded"}:
+        if clean_key in {"operation", "waiting", "excluded", "mock"}:
             self._set_main_routine_display_level("stock")
-            self._set_main_routine_stock_scope(clean_key, checked)
+            self._set_main_routine_stock_scope(clean_key, True if clean_key == "mock" else checked)
 
     def _update_main_routine_summary_badge_styles(self) -> None:
         buttons = getattr(self, "_main_routine_summary_count_buttons", {})
@@ -5158,6 +5181,7 @@ class MainWindow(QMainWindow):
             "waiting": level == "stock" and scope == "waiting",
             "excluded": level == "stock" and scope == "excluded",
             "review": MainWindow._review_required_window_is_open(self),
+            "mock": level == "stock" and scope == "mock",
         }
         for key, button in buttons.items():
             active = bool(active_by_key.get(key, False))
@@ -5521,7 +5545,7 @@ class MainWindow(QMainWindow):
             getattr(self, "_main_routine_stock_scope", "all") or "all"
         ).strip().lower()
         return scope if scope in {
-            "all", "normal", "operation", "waiting", "excluded"
+            "all", "normal", "operation", "waiting", "excluded", "mock"
         } else "all"
 
     def _assign_main_routine_stock_scope(
@@ -5531,13 +5555,13 @@ class MainWindow(QMainWindow):
     ) -> None:
         clean_scope = str(scope or "").strip().lower()
         if clean_scope not in {
-            "all", "normal", "operation", "waiting", "excluded"
+            "all", "normal", "operation", "waiting", "excluded", "mock"
         }:
             clean_scope = "all"
         current_scope = MainWindow._current_main_routine_stock_scope(self)
         if bool(enabled):
             target_scope = clean_scope
-        elif clean_scope in {"operation", "waiting", "excluded"}:
+        elif clean_scope in {"operation", "waiting", "excluded", "mock"}:
             target_scope = "all"
         else:
             target_scope = clean_scope
@@ -5552,11 +5576,309 @@ class MainWindow(QMainWindow):
         enabled: bool,
     ) -> None:
         MainWindow._assign_main_routine_stock_scope(self, scope, enabled)
+        MainWindow._apply_mock_scope_button_isolation(self)
         self._update_main_routine_filter_badges()
         self._reload_main_routine_table_preserving_view()
 
     def _set_main_routine_excluded_only(self, enabled: bool) -> None:
         MainWindow._set_main_routine_stock_scope(self, "excluded", enabled)
+
+    def _apply_mock_scope_button_isolation(self) -> None:
+        """Keep Production bottom commands inert while the Mock overlay is open."""
+
+        mock_scope = MainWindow._current_main_routine_stock_scope(self) == "mock"
+        buttons = tuple(
+            button
+            for button in (
+                getattr(self, "btn_start", None),
+                getattr(self, "btn_main_visible_early_close", None),
+                getattr(self, "btn_emergency_stop", None),
+            )
+            if button is not None
+        )
+        if not buttons:
+            return
+        if not hasattr(self, "_mock_scope_original_tooltips"):
+            self._mock_scope_original_tooltips = {
+                id(button): button.toolTip() for button in buttons
+            }
+        if mock_scope:
+            for button in buttons:
+                button.setEnabled(False)
+                button.setToolTip("모의 종목은 우클릭 모의 메뉴에서 조작합니다.")
+            return
+        for button in buttons:
+            button.setToolTip(self._mock_scope_original_tooltips.get(id(button), ""))
+        self.update_global_operation_button_state()
+        self.update_emergency_button_state()
+        self.btn_main_visible_early_close.setEnabled(
+            bool(self._visible_monitoring_early_close_targets())
+        )
+
+    def _on_mock_validation_projection_changed(self) -> None:
+        if not hasattr(self, "routine_table"):
+            return
+        try:
+            self.load_routine_table()
+            MainWindow._apply_mock_scope_button_isolation(self)
+        except Exception:
+            LOGGER.exception("Mock validation projection refresh failed")
+
+    def _process_mock_validation_host_cycle(self) -> None:
+        host = getattr(self, "mock_validation_host", None)
+        processor = getattr(host, "process_due_cycles", None)
+        if not callable(processor):
+            return
+        try:
+            processor()
+        except Exception:
+            # A Mock failure must never escape the shared UI timer callback.
+            LOGGER.exception("Mock validation host cycle failed")
+
+    def _select_mock_validation_instances(self, target) -> list[object] | None:
+        instances = load_persisted_routine_instances(project_root=PROJECT_ROOT)
+        eligible: list[tuple[object, bool]] = []
+        unsupported: list[object] = []
+        for instance in instances:
+            definition = routine_definition_by_id(
+                str(getattr(instance, "definition_id", "") or ""),
+                project_root=PROJECT_ROOT,
+            )
+            supported = bool(
+                definition is not None
+                and str(getattr(definition, "definition_id", "") or "").strip()
+                == "indicator_follow"
+                and Path(getattr(instance, "rules_path", "") or "").is_file()
+            )
+            if supported:
+                eligible.append(
+                    (
+                        instance,
+                        str(getattr(instance, "instance_id", "") or "").strip()
+                        == str(target.routine_instance_id or "").strip(),
+                    )
+                )
+            else:
+                unsupported.append(instance)
+        if not eligible:
+            QMessageBox.information(
+                self,
+                "모의검증",
+                "현재 모의검증 실행 어댑터를 지원하는 루틴이 없습니다.",
+            )
+            return None
+        dialog = QDialog(self)
+        dialog.setWindowTitle("모의검증 루틴 선택")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"{target.code} {target.name}에서 검증할 루틴을 선택하세요."))
+        checkboxes: list[tuple[QCheckBox, object]] = []
+        for instance, checked in eligible:
+            checkbox = QCheckBox(
+                str(getattr(instance, "display_name", "") or getattr(instance, "instance_id", ""))
+            )
+            checkbox.setChecked(checked)
+            checkbox.setToolTip(str(getattr(instance, "instance_id", "") or ""))
+            layout.addWidget(checkbox)
+            checkboxes.append((checkbox, instance))
+        for instance in unsupported:
+            checkbox = QCheckBox(
+                str(getattr(instance, "display_name", "") or getattr(instance, "instance_id", ""))
+            )
+            checkbox.setEnabled(False)
+            checkbox.setToolTip("현재 모의검증 실행 어댑터 미지원")
+            layout.addWidget(checkbox)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("확인")
+        buttons.button(QDialogButtonBox.Cancel).setText("취소")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        selected = [instance for checkbox, instance in checkboxes if checkbox.isChecked()]
+        if not selected:
+            QMessageBox.information(self, "모의검증", "루틴을 1개 이상 선택하세요.")
+            return None
+        return selected
+
+    def begin_mock_validation(self, target) -> bool:
+        host = getattr(self, "mock_validation_host", None)
+        actions = getattr(self, "mock_validation_ui_actions", None)
+        if host is None or actions is None:
+            QMessageBox.warning(self, "모의검증", "모의검증 실행 기반을 사용할 수 없습니다.")
+            return False
+        if host.current_session(target.code) is not None:
+            QMessageBox.information(self, "모의검증", "이미 진행 중인 모의검증 종목입니다.")
+            return False
+        selected = self._select_mock_validation_instances(target)
+        if not selected:
+            return False
+        rules_by_instance_id = {
+            str(getattr(instance, "instance_id", "") or ""): read_json_dict(
+                Path(getattr(instance, "rules_path", ""))
+            )
+            for instance in selected
+        }
+        snapshot_records = [
+            {
+                "routine_instance_id": str(getattr(instance, "instance_id", "") or ""),
+                "routine_definition_id": str(getattr(instance, "definition_id", "") or ""),
+                "routine_type": "INDICATOR_FOLLOW",
+                "routine_instance_name": str(getattr(instance, "display_name", "") or ""),
+                "group_id": str(getattr(instance, "group_id", "") or ""),
+            }
+            for instance in selected
+        ]
+        try:
+            snapshot = build_mock_reference_snapshot(
+                stock={
+                    "code": target.code,
+                    "name": target.name,
+                    "stock_path": str(target.stock_dir.resolve()),
+                },
+                routine_instances=snapshot_records,
+                rules_by_instance_id=rules_by_instance_id,
+            )
+            actions.create_waiting_session(snapshot)
+        except Exception as exc:
+            QMessageBox.warning(self, "모의검증", f"모의검증 종목을 만들지 못했습니다.\n사유: {exc}")
+            return False
+        show_toast(self, "모의검증 대기 종목으로 등록했습니다.")
+        return True
+
+    def mock_validation_context_state(self, stock_code: str) -> dict[str, object]:
+        host = getattr(self, "mock_validation_host", None)
+        document = host.current_session(stock_code) if host is not None else None
+        if document is None:
+            return {"current": False, "state": ""}
+        state = str(document["session"].get("state", "") or "")
+        return_eligibility = mock_validation_end_eligibility(document)
+        return {
+            "current": True,
+            "state": state,
+            "tax_enabled": bool(document["session"].get("mock_tax_enabled") is True),
+            "can_start": state == "WAITING",
+            "can_early_close": state == "RUNNING",
+            "can_immediate": state in {"RUNNING", "CLOSING"},
+            "can_tax": state == "WAITING",
+            "can_reset": state == "REVIEW_STOPPED",
+            "can_return": return_eligibility.get("eligible") is True,
+        }
+
+    def _mock_action_result(self, title: str, operation) -> None:
+        try:
+            result = operation()
+        except Exception as exc:
+            QMessageBox.warning(self, title, f"처리하지 못했습니다.\n사유: {exc}")
+            return
+        self.statusBar().showMessage(f"{title}: {result.get('status', '완료') if isinstance(result, dict) else '완료'}", 5000)
+
+    def start_mock_validation_stock(self, stock_code: str) -> None:
+        self._mock_action_result(
+            "모의 운영시작",
+            lambda: self.mock_validation_ui_actions.start(stock_code),
+        )
+
+    def early_close_mock_validation_stock(self, stock_code: str) -> None:
+        self._mock_action_result(
+            "모의 조기마감",
+            lambda: self.mock_validation_ui_actions.early_close(stock_code),
+        )
+
+    def immediate_liquidate_mock_validation_stock(self, stock_code: str) -> None:
+        if QMessageBox.question(
+            self,
+            "모의 즉시청산",
+            "선택한 모의 종목을 즉시 시장가 청산하시겠습니까?",
+        ) != QMessageBox.Yes:
+            return
+        self._mock_action_result(
+            "모의 즉시청산",
+            lambda: self.mock_validation_ui_actions.immediate_liquidation(stock_code),
+        )
+
+    def set_mock_validation_tax(self, stock_code: str, enabled: bool) -> None:
+        self._mock_action_result(
+            "모의세금",
+            lambda: self.mock_validation_ui_actions.set_tax(stock_code, enabled),
+        )
+
+    def open_mock_validation_event_window(self, stock_code: str) -> None:
+        document = self.mock_validation_host.current_session(stock_code)
+        if document is None:
+            return
+        current = getattr(self, "mock_validation_event_window", None)
+        if current is not None and not sip.isdeleted(current):
+            current.close()
+        window = EventRecordPrototypeWindow(
+            self,
+            reader=MockEventReaderAdapter(
+                self.mock_validation_host.repository,
+                document["session"]["validation_session_id"],
+            ),
+        )
+        window.setWindowTitle("모의검증 이벤트")
+        window.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.mock_validation_event_window = window
+        window.show()
+
+    def open_mock_validation_review_window(self, stock_code: str) -> None:
+        document = self.mock_validation_host.current_session(stock_code)
+        if document is None:
+            return
+        review = document.get("review", {})
+        dialog = QDialog(self)
+        dialog.setWindowTitle("모의검토관리")
+        layout = QVBoxLayout(dialog)
+        values = (
+            ("종목", f"{document['session']['stock_code']} {document['session']['stock_name']}"),
+            ("세션", document["session"]["validation_session_id"]),
+            ("상태", document["session"]["state"]),
+            ("사유", review.get("review_reason") or "-"),
+            ("원인 루틴", review.get("source_routine_instance_id") or "-"),
+            ("발생시각", review.get("occurred_at") or "-"),
+        )
+        for label, value in values:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(str(label)))
+            detail = QLabel(str(value))
+            detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            row.addWidget(detail, 1)
+            layout.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        reset_button = buttons.addButton("종목리셋", QDialogButtonBox.ActionRole)
+        reset_button.setEnabled(document["session"]["state"] == "REVIEW_STOPPED")
+        reset_button.clicked.connect(lambda: self._reset_mock_validation_from_review(stock_code, dialog))
+        buttons.rejected.connect(dialog.reject)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.exec_()
+
+    def _reset_mock_validation_from_review(self, stock_code: str, dialog: QDialog | None = None) -> None:
+        if QMessageBox.question(self, "모의 종목리셋", "현재 모의 실행상태를 초기화하시겠습니까?") != QMessageBox.Yes:
+            return
+        self._mock_action_result(
+            "모의 종목리셋",
+            lambda: self.mock_validation_ui_actions.reset(stock_code),
+        )
+        if dialog is not None:
+            dialog.accept()
+
+    def choose_mock_validation_return_destination(self, stock_code: str) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("모의검증 종료/복귀")
+        dialog.setText("모의검증 종료 후 복귀할 상태를 선택하세요.")
+        destinations = {
+            dialog.addButton("운영대기", QMessageBox.AcceptRole): "WAITING",
+            dialog.addButton("운영제외", QMessageBox.ActionRole): "EXCLUDED",
+            dialog.addButton("미지정", QMessageBox.ActionRole): "UNASSIGNED",
+            dialog.addButton("등록해제", QMessageBox.DestructiveRole): "UNREGISTERED",
+        }
+        cancel = dialog.addButton("취소", QMessageBox.RejectRole)
+        dialog.setDefaultButton(cancel)
+        dialog.exec_()
+        return destinations.get(dialog.clickedButton(), "")
 
     def _set_main_routine_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
@@ -6843,6 +7165,12 @@ class MainWindow(QMainWindow):
             "reason": str(getattr(decision, "reason_code", "") or "RECOVERY_NOT_READY"),
             "user_message": self.production_recovery_block_user_message(decision),
         }
+
+    def operation_start_exclusion_reason(
+        self,
+        target: tuple[Path, str, str],
+    ) -> str | None:
+        return mock_operation_start_exclusion_reason(self, target)
 
     def routine_recovery_block_message(self, action: str) -> str:
         """Format a routine-operation block without exposing recovery internals."""
@@ -8223,6 +8551,7 @@ class MainWindow(QMainWindow):
             self.update_emergency_button_state()
             self.update_review_required_button_text()
             self.update_global_operation_button_state()
+            MainWindow._apply_mock_scope_button_isolation(self)
         finally:
             self._main_refresh_read_context = previous_context
 
@@ -11935,6 +12264,10 @@ class MainWindow(QMainWindow):
         timer = getattr(self, "_pnl_refresh_timer", None)
         if timer is not None:
             timer.stop()
+        mock_host = getattr(self, "mock_validation_host", None)
+        dispose_mock = getattr(mock_host, "dispose", None)
+        if callable(dispose_mock):
+            dispose_mock()
         host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
         shutdown = getattr(host, "shutdown", None)
         if callable(shutdown):
