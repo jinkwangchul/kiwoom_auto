@@ -22,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from execution_provenance_contract import plan_generation
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -86,6 +88,13 @@ def _norm(value: Any) -> str:
 
 
 def _order_dedupe_key(order: dict[str, Any]) -> str:
+    child_identity = _process_child_identity(order)
+    if child_identity is not None:
+        process_id, generation, execution_id, index, total = child_identity
+        return (
+            f"PROCESS_CHILD|{process_id}|{generation}|"
+            f"{execution_id}|{index}|{total}"
+        )
     return "|".join(
         [
             str(order.get("source_signal_id", "")),
@@ -98,6 +107,33 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
 
 def _source_signal_id(order: dict[str, Any]) -> str:
     return str(order.get("source_signal_id", "") or "").strip()
+
+
+def _process_child_identity(order: dict[str, Any]) -> tuple[str, int, str, int, int] | None:
+    process_id = str(order.get("execution_process_id") or "").strip()
+    execution_id = str(order.get("execution_id") or "").strip()
+    index = order.get("child_sequence_index")
+    total = order.get("child_sequence_total")
+    try:
+        generation = plan_generation(order.get("plan_generation"))
+    except ValueError:
+        return None
+    if (
+        process_id
+        and execution_id
+        and isinstance(index, int)
+        and not isinstance(index, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and 0 < index <= total
+    ):
+        return process_id, generation, execution_id, index, total
+    return None
+
+
+def order_candidate_dedupe_key(order: dict[str, Any]) -> str:
+    """Return the legacy key or a provenance-aware child identity key."""
+    return _order_dedupe_key(order)
 
 
 def _queue_result(
@@ -165,11 +201,30 @@ def _candidate_duplicate_reason(order: dict[str, Any], orders: list[Any]) -> str
             and str(existing.get("execution_process_id") or "").strip()
             == execution_process_id
         ]
+        child_identity = _process_child_identity(order)
         for existing in same_process:
             if execution_id and str(existing.get("execution_id") or "").strip() == execution_id:
                 return "duplicate execution process child"
         if same_process:
-            return "multiple execution process children are not supported"
+            if child_identity is None:
+                return "execution process child identity is incomplete"
+            _, child_generation, _, child_index, child_total = child_identity
+            for existing in same_process:
+                existing_identity = _process_child_identity(existing)
+                if existing_identity is None:
+                    return "execution process mixes legacy and child records"
+                _, existing_generation, _, existing_index, existing_total = existing_identity
+                if (
+                    existing_generation == child_generation
+                    and existing_total != child_total
+                ):
+                    return "execution process child total mismatch"
+                if (
+                    existing_generation == child_generation
+                    and existing_index == child_index
+                ):
+                    return "duplicate execution process child sequence"
+            return None
 
     source_signal_id = _source_signal_id(order)
     if source_signal_id:
@@ -262,7 +317,17 @@ def append_order_candidates(
         if not isinstance(after_orders, list):
             return {"write_stage": "legacy_candidate_verify", "blocked_reasons": ["orders must be a list after append"]}
         for candidate in created:
-            if _candidate_duplicate_reason(candidate, [item for item in after_orders if item is not candidate]) is None:
+            child_identity = _process_child_identity(candidate)
+            if child_identity is not None:
+                matches = [
+                    item for item in after_orders
+                    if isinstance(item, dict) and _process_child_identity(item) == child_identity
+                ]
+                if len(matches) != 1:
+                    return {
+                        "write_stage": "legacy_candidate_verify",
+                        "blocked_reasons": ["appended process child identity must appear exactly once"],
+                    }
                 continue
             matches = [
                 item for item in after_orders
@@ -496,6 +561,26 @@ def signal_to_order_candidate(signal: dict[str, Any], index: int) -> dict[str, A
     _normalize_quantity_fields(order)
     order["execution_enabled"] = False
     return order
+
+
+def signal_to_order_candidates(signal: dict[str, Any], start_index: int) -> list[dict[str, Any]]:
+    """Expand one durable signal into its planned generic order candidates."""
+    intents = signal.get("execution_intents")
+    if not isinstance(intents, list) or not intents:
+        candidate = signal_to_order_candidate(signal, start_index)
+        return [candidate] if isinstance(candidate, dict) else []
+    candidates: list[dict[str, Any]] = []
+    for offset, intent in enumerate(intents):
+        if not isinstance(intent, dict):
+            return []
+        child_signal = deepcopy(signal)
+        child_signal["execution_intent"] = deepcopy(intent)
+        child_signal.pop("execution_intents", None)
+        candidate = signal_to_order_candidate(child_signal, start_index + offset)
+        if not isinstance(candidate, dict):
+            return []
+        candidates.append(candidate)
+    return candidates
 
 
 def build_order_queue_from_signals() -> dict[str, Any]:

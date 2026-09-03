@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from account_auto_trade_budget_consumption import (
     canonical_buy_candidate_amount,
+    project_time_slice_buy_budget,
     project_account_auto_trade_budget_consumption,
     project_system_total_budget_buy_admission,
 )
@@ -1177,7 +1178,36 @@ class AutoTradeOrderExecutionBoundary:
             original,
             execution_method=execution_method,
         )
+        current_evidence_required = any(
+            isinstance(source, Mapping)
+            and source.get("final_current_price_evidence_required") is True
+            for source in (
+                original,
+                original.get("execution_intent"),
+                original.get("order_intent"),
+            )
+        )
         if price_basis != "CURRENT_PRICE":
+            if current_evidence_required:
+                final_price, price_reason = self._fresh_current_price(original.get("code"))
+                if final_price is None:
+                    return {
+                        "ok": False,
+                        "applied": False,
+                        "stage": "eligibility_current_price_pre_hash_unavailable",
+                        "price_basis": price_basis,
+                        "order": original,
+                        "blocked_reasons": [price_reason],
+                    }
+                return {
+                    "ok": True,
+                    "applied": False,
+                    "stage": "eligibility_current_price_pre_hash_validated",
+                    "price_basis": price_basis,
+                    "validated_current_price": final_price,
+                    "order": original,
+                    "blocked_reasons": [],
+                }
             return {
                 "ok": True,
                 "applied": False,
@@ -1479,6 +1509,22 @@ class AutoTradeOrderExecutionBoundary:
         orders, queue_reason = self._load_queue_orders_for_fresh_preflight(queue_path)
         if queue_reason:
             return {"ok": False, "stage": "fresh_buy_queue_evidence", "blocked_reasons": [queue_reason]}
+        intent = order.get("execution_intent")
+        if isinstance(intent, dict) and intent.get("execution_mode") in {"MULTI_TIME", "MULTI_RATIO"}:
+            try:
+                fills = json.loads(queue_path.with_name("fills.json").read_text(encoding="utf-8"))["fills"]
+                if not isinstance(fills, list) or any(not isinstance(fill, dict) for fill in fills):
+                    raise ValueError("fills ledger must contain objects")
+                round_admission = project_time_slice_buy_budget(
+                    order=order, order_records=orders, fill_records=fills,
+                    candidate_amount=requested_exposure,
+                )
+            except (OSError, ValueError, KeyError) as exc:
+                round_admission = {"available": False, "admitted": False, "reason": str(exc)}
+            if round_admission.get("admitted") is not True:
+                return {"ok": False, "stage": "fresh_buy_time_slice_round_budget",
+                        "blocked_reasons": [round_admission.get("reason") or "TIME_SLICE budget unavailable"],
+                        "round_budget_admission": round_admission}
         other_orders = [item for item in orders if not self._same_order_identity(item, order)]
         account_no = str(environment.get("selected_account_no") or "").strip()
         recovery = production_recovery_registry.snapshot()
@@ -1860,15 +1906,16 @@ class AutoTradeOrderExecutionBoundary:
         source_order: dict[str, object],
         *,
         queue_revision: object,
+        cancel_evidence: dict[str, object] | None = None,
     ) -> dict[str, object]:
         source_order_id = str(source_order.get("order_id") or source_order.get("id") or "").strip()
         source_signal_id = str(source_order.get("source_signal_id") or "").strip()
         execution_process_id = str(source_order.get("execution_process_id") or "").strip()
         option_snapshot_hash = str(source_order.get("option_snapshot_hash") or "").strip()
         broker_order_no = str(source_order.get("broker_order_no") or "").strip()
-        account_no = str(source_order.get("account_no") or "").strip()
-        code = str(source_order.get("code") or "").strip()
-        side = str(source_order.get("side") or "").strip().upper()
+        account_no, _account_reason = _queue_order_account(source_order)
+        code = _queue_order_code(source_order)
+        side = _queue_order_side(source_order)
         remaining_quantity = int(source_order.get("remaining_quantity") or 0)
         suffix = uuid4().hex[:12]
         order_id = f"{source_order_id}_CANCEL_{suffix}"
@@ -1889,6 +1936,12 @@ class AutoTradeOrderExecutionBoundary:
         request_hash = hashlib.sha256(
             json.dumps(hash_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        child_plan = {
+            "planned_quantity": remaining_quantity,
+            "planned_price": 0,
+        }
+        if isinstance(cancel_evidence, dict) and cancel_evidence:
+            child_plan["cancel_evidence"] = deepcopy(cancel_evidence)
         execution_request = {
             "execution_id": execution_id,
             "order_id": order_id,
@@ -1916,10 +1969,7 @@ class AutoTradeOrderExecutionBoundary:
                     "child_sequence_index": 1,
                     "child_sequence_total": 1,
                     "child_kind": "CANCEL",
-                    "child_plan": {
-                        "planned_quantity": remaining_quantity,
-                        "planned_price": 0,
-                    },
+                    "child_plan": deepcopy(child_plan),
                     "option_snapshot_hash": option_snapshot_hash,
                 }
             )
@@ -1947,10 +1997,7 @@ class AutoTradeOrderExecutionBoundary:
                         "child_sequence_index": 1,
                         "child_sequence_total": 1,
                         "child_kind": "CANCEL",
-                        "child_plan": {
-                            "planned_quantity": remaining_quantity,
-                            "planned_price": 0,
-                        },
+                        "child_plan": deepcopy(child_plan),
                         "option_snapshot_hash": option_snapshot_hash,
                     }
                     if execution_process_id
@@ -1969,8 +2016,147 @@ class AutoTradeOrderExecutionBoundary:
                 "order_type": "LIMIT",
                 "order_action": "CANCEL",
                 "cancel_source_order_id": source_order_id,
+                **(
+                    {"cancel_evidence": deepcopy(cancel_evidence)}
+                    if isinstance(cancel_evidence, dict) and cancel_evidence
+                    else {}
+                ),
             },
         }
+
+
+    def queue_open_order_cancel_automatically(
+        self,
+        order_queued_id: str,
+        *,
+        expected_account_no: str,
+        expected_code: str,
+        expected_side: str,
+        expected_broker_order_no: str,
+        cancel_evidence: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Queue one identity-pinned CANCEL through the existing final send gate."""
+        queued_id = str(order_queued_id or "").strip()
+        account_no = str(expected_account_no or "").strip()
+        code = str(expected_code or "").strip()
+        side = str(expected_side or "").strip().upper()
+        broker_order_no = str(expected_broker_order_no or "").strip()
+        result: dict[str, object] = {
+            "ok": False,
+            "order_queued_id": queued_id,
+            "cancel_requested": 0,
+            "cancel_pending": 0,
+            "blocked_reasons": [],
+            "send_result": {},
+        }
+        blocked = result["blocked_reasons"]
+        if not queued_id:
+            blocked.append("order_queued_id is required")
+        if not account_no:
+            blocked.append("expected_account_no is required")
+        if not code:
+            blocked.append("expected_code is required")
+        if side not in {"BUY", "SELL"}:
+            blocked.append("expected_side must be BUY or SELL")
+        if not broker_order_no:
+            blocked.append("expected_broker_order_no is required")
+        if blocked:
+            return result
+
+        queue_path = self._context.order_queue_path()
+        _data, orders, issues = self._queue_data_for_manual_order_action(queue_path)
+        if issues:
+            blocked.extend(issues)
+            return result
+        source_order = next(
+            (
+                item
+                for item in orders
+                if isinstance(item, dict)
+                and str(item.get("id") or "").strip() == queued_id
+            ),
+            None,
+        )
+        if not isinstance(source_order, dict):
+            blocked.append("source order is unavailable")
+            return result
+        source_account_no, source_account_reason = _queue_order_account(source_order)
+        if source_account_reason or source_account_no != account_no:
+            blocked.append("source order account identity changed")
+        if _queue_order_code(source_order) != code:
+            blocked.append("source order stock identity changed")
+        if _queue_order_side(source_order) != side:
+            blocked.append("source order side identity changed")
+        if str(source_order.get("broker_order_no") or "").strip() != broker_order_no:
+            blocked.append("source order broker identity changed")
+        if _queue_order_action(source_order) not in {"NEW", "MODIFY"}:
+            blocked.append("source order action is not cancelable")
+        if str(source_order.get("status") or "").strip().upper() not in _CANCELABLE_BROKER_OPEN_STATUSES:
+            blocked.append("source order lifecycle is not broker-confirmed open")
+        remaining_quantity, quantity_reason = _queue_remaining_quantity(source_order)
+        if remaining_quantity is None:
+            blocked.append(quantity_reason)
+        elif remaining_quantity <= 0:
+            blocked.append("source order has no remaining quantity")
+        if source_order.get("manual_reconciliation_required") is True:
+            blocked.append("source order requires reconciliation")
+        if blocked:
+            return result
+        duplicate_reason = self._pending_cancel_duplicate_reason(orders, broker_order_no)
+        if duplicate_reason:
+            result["ok"] = True
+            result["cancel_pending"] = 1
+            return result
+
+        snapshot = self.queue_file_snapshot(queue_path)
+        preview = self._build_manual_cancel_order_queued_preview(
+            deepcopy(source_order),
+            queue_revision=snapshot.get("revision"),
+            cancel_evidence=deepcopy(cancel_evidence) if isinstance(cancel_evidence, dict) else None,
+        )
+        current_snapshot = self.queue_file_snapshot(queue_path)
+        if snapshot.get("sha256") != current_snapshot.get("sha256"):
+            blocked.append("queue file changed before cancel commit")
+            return result
+        commit_result = commit_execution_queue_write(
+            preview,
+            queue_path,
+            context={
+                "manual_queue_write_confirmed": True,
+                "manual_pending_cancel_confirmed": True,
+            },
+            expected_revision=current_snapshot.get("revision"),
+        )
+        if (
+            commit_result.get("committed") is not True
+            or commit_result.get("post_write_verified") is not True
+        ):
+            blocked.extend(
+                list(commit_result.get("blocked_reasons") or ["cancel queue commit failed"])
+            )
+            return result
+        cancel_record = preview["order_queued_record_preview"]
+        send_result = self.send_order_for_order_queued_automatically(
+            str(cancel_record.get("id") or ""),
+            queue_path=queue_path,
+            source_order=source_order,
+        )
+        result["send_result"] = send_result
+        if (
+            send_result.get("queue_result_recorded") is True
+            or send_result.get("send_order_called") is True
+        ):
+            result["cancel_requested"] = 1
+            result["ok"] = True
+        else:
+            blocked.extend(
+                list(
+                    send_result.get("blocked_reasons")
+                    or send_result.get("issues")
+                    or ["cancel SendOrder pipeline blocked"]
+                )
+            )
+        return result
 
 
     def queue_pending_order_cancellations_for_stock_automatically(
@@ -3005,7 +3191,12 @@ class AutoTradeOrderExecutionBoundary:
             "send_order_result": send_order_result,
         }
 
-    def auto_process_executable_orders_for_real_trade(self, *, limit: int = 5) -> dict[str, object]:
+    def auto_process_executable_orders_for_real_trade(
+        self,
+        *,
+        limit: int = 5,
+        order_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, object]:
         queue_path = self._context.order_queue_path()
         try:
             data = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -3015,6 +3206,11 @@ class AutoTradeOrderExecutionBoundary:
         if not isinstance(orders, list):
             return {"processed": 0, "blocked": 1, "results": [], "blocked_reasons": ["order_queue orders must be a list"]}
 
+        target_order_ids = {
+            str(value or "").strip()
+            for value in (order_ids or [])
+            if str(value or "").strip()
+        }
         results: list[dict[str, object]] = []
         processed = 0
         blocked = 0
@@ -3023,6 +3219,8 @@ class AutoTradeOrderExecutionBoundary:
                 break
             record = item if isinstance(item, dict) else {}
             if record.get("status") != "EXECUTABLE":
+                continue
+            if target_order_ids and str(record.get("id") or "").strip() not in target_order_ids:
                 continue
             result = self.process_executable_order_for_auto_trade(str(record.get("id") or ""))
             results.append(result)

@@ -325,9 +325,22 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self.assertEqual("HASH_1", fill["request_hash"])
             self.assertEqual("LOCK_1", fill["lock_id"])
             self.assertEqual("EXEC_1", fill["execution_id"])
+            self.assertEqual(0, fill["plan_generation"])
             self.assertEqual(3, fill["filled_quantity"])
             self.assertEqual(1000, fill["filled_price"])
             self.assertEqual(fill, result["fill_record"])
+
+    def test_plan_generation_is_preserved_in_fill_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            result = self._record_fill(
+                path,
+                result=self._event_record_result(plan_generation=2),
+            )
+
+            self.assertTrue(result["fill_recorded"], result)
+            self.assertEqual(2, self._read_json(path)["fills"][0]["plan_generation"])
 
     def test_live_chejan_context_records_without_manual_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

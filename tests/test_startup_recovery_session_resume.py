@@ -388,6 +388,123 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             self.assertEqual("REVIEW_REQUIRED", result["status"])
             self.assertIn("SIG_1", " ".join(result["review_reasons"]))
 
+    def test_valid_pending_multi_time_plan_is_not_an_unfinished_signal_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._runtime(root)
+            process_id = "PROCESS-TIME-1"
+            signal_id = "SIG-TIME-1"
+            intents = []
+            for index, scheduled_at in enumerate(
+                ("2026-09-02T10:00:00.000", "2026-09-02T10:00:30.000"),
+                start=1,
+            ):
+                intents.append(
+                    {
+                        "execution_id": f"EXEC-TIME-{index}",
+                        "execution_process_id": process_id,
+                        "source_signal_id": signal_id,
+                        "plan_generation": 0,
+                        "child_sequence_index": index,
+                        "child_sequence_total": 2,
+                        "child_kind": "TIME_SLICE",
+                        "child_plan": {
+                            "planned_quantity": 1,
+                            "scheduled_at": scheduled_at,
+                        },
+                        "execution_mode": "MULTI_TIME",
+                    }
+                )
+            self._write(
+                paths["routine_signals_path"],
+                "signals",
+                [
+                    {
+                        "id": signal_id,
+                        "status": "PENDING",
+                        "execution_intents": intents,
+                    }
+                ],
+            )
+
+            result = assess_startup_recovery(**paths)
+
+            self.assertEqual("RESUME_READY", result["status"])
+            self.assertNotIn(signal_id, " ".join(result["review_reasons"]))
+
+    def test_invalid_pending_multi_time_plan_still_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._runtime(root)
+            self._write(
+                paths["routine_signals_path"],
+                "signals",
+                [
+                    {
+                        "id": "SIG-TIME-BROKEN",
+                        "status": "PENDING",
+                        "execution_intents": [
+                            {
+                                "execution_id": "EXEC-TIME-1",
+                                "execution_process_id": "PROCESS-TIME-1",
+                                "source_signal_id": "SIG-TIME-BROKEN",
+                                "plan_generation": 0,
+                                "child_sequence_index": 1,
+                                "child_sequence_total": 1,
+                                "child_kind": "TIME_SLICE",
+                                "child_plan": {"planned_quantity": 1},
+                                "execution_mode": "MULTI_TIME",
+                            }
+                        ],
+                    }
+                ],
+            )
+
+            result = assess_startup_recovery(**paths)
+
+            self.assertEqual("REVIEW_REQUIRED", result["status"])
+            self.assertIn("SIG-TIME-BROKEN", " ".join(result["review_reasons"]))
+
+    def test_valid_pending_multi_ratio_plan_is_not_an_unfinished_signal_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._runtime(root)
+            signal_id = "SIG-RATIO-1"
+            process_id = "PROCESS-RATIO-1"
+            ratio_plan = {
+                "ratio_left": "ORDER_PRICE",
+                "ratio_right": "CURRENT_PRICE",
+                "ratio_direction": "UP",
+                "ratio_value": 0.15,
+                "ratio_compare": ">=",
+                "planned_child_count": 2,
+            }
+            intents = [
+                {
+                    "execution_id": f"EXEC-RATIO-{index}",
+                    "execution_process_id": process_id,
+                    "source_signal_id": signal_id,
+                    "plan_generation": 0,
+                    "child_sequence_index": index,
+                    "child_sequence_total": 2,
+                    "child_kind": "RATIO_SLICE",
+                    "child_plan": {"planned_quantity": 1, "ratio_step_index": index},
+                    "execution_mode": "MULTI_RATIO",
+                    "multi_ratio_plan": ratio_plan,
+                }
+                for index in (1, 2)
+            ]
+            self._write(
+                paths["routine_signals_path"],
+                "signals",
+                [{"id": signal_id, "status": "PENDING", "execution_intents": intents}],
+            )
+
+            result = assess_startup_recovery(**paths)
+
+            self.assertEqual("RESUME_READY", result["status"])
+            self.assertNotIn(signal_id, " ".join(result["review_reasons"]))
+
     def test_start_and_timer_are_blocked_before_recovery_completion(self) -> None:
         with TemporaryProjectRoot() as layout:
             stock_dir = create_stock_fixture(layout)

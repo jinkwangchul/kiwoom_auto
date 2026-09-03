@@ -781,6 +781,7 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
         "point_unit": _point_unit_token(base.get("time_unit_combo")),
         "point_range": _range_token(base.get("time_range_combo")),
         "point_count": _safe_int(base.get("time_count_line")),
+        "time_order_price_basis": _price_basis_token(base.get("time_order_combo")),
         "ratio_left": _price_basis_token(base.get("ratio_left_combo") or base.get("time_order_combo")),
         "ratio_right": _price_basis_token(base.get("ratio_right_combo")),
         "ratio_direction": _direction_token(base.get("ratio_direction_combo")),
@@ -793,6 +794,83 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
         "operation": "set_execution_policy",
         "value": value,
     }
+
+
+def _build_buy_exit_policy(exit_state: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    """Normalize the BUY repeat-exit controls into the execution rule.
+
+    The controls are optional; only checked rows become executable policy
+    conditions.  The policy is deliberately attached to the existing BUY
+    execution base so no new writer or runtime state is introduced.
+    """
+    if not isinstance(exit_state, dict) or not exit_state:
+        return None
+    conditions: list[dict[str, Any]] = []
+    if _truthy_ui(exit_state.get("buy_exit_count_check")):
+        value = _safe_int(exit_state.get("buy_exit_count_line"))
+        if value is None or value <= 0:
+            warnings.append("buy exit count is not numeric")
+        else:
+            conditions.append({
+                "condition_type": "COUNT",
+                "target_repeat_generations": value,
+                "initial_generation_included": False,
+            })
+    if _truthy_ui(exit_state.get("buy_exit_time_check")):
+        value = _safe_float(exit_state.get("buy_exit_time_line"))
+        unit = _point_unit_token(exit_state.get("buy_exit_time_unit_combo"))
+        unit_ms = {"SECOND": 1000, "MINUTE": 60_000, "BAR": None}.get(unit)
+        if value is None or value <= 0 or unit is None or (unit != "BAR" and unit_ms is None):
+            warnings.append("buy exit time is invalid")
+        else:
+            condition: dict[str, Any] = {
+                "condition_type": "TIME",
+                "configured_value": value,
+                "configured_unit": unit,
+                "anchor": "FIRST_REPEAT_GENERATION_AT",
+            }
+            if unit_ms is not None:
+                duration = value * unit_ms
+                if float(duration).is_integer():
+                    condition["duration_ms"] = int(duration)
+                else:
+                    warnings.append("buy exit time duration is invalid")
+                    condition = {}
+            if condition:
+                conditions.append(condition)
+    if _truthy_ui(exit_state.get("buy_exit_price_check")):
+        left = _price_basis_token(exit_state.get("buy_exit_price_left_combo"))
+        right = _price_basis_token(exit_state.get("buy_exit_price_right_combo"))
+        direction = _direction_token(exit_state.get("buy_exit_price_direction_combo"))
+        compare = _ratio_compare_token(exit_state.get("buy_exit_price_compare_combo"))
+        threshold = _safe_float(exit_state.get("buy_exit_price_value_line"))
+        if left not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"} \
+                or right not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"} \
+                or direction not in {"UP", "DOWN", "BOTH"} \
+                or compare not in {"WITHIN", "OUTSIDE", ">=", "<=", "==", "!=", ">", "<"} \
+                or threshold is None or threshold <= 0:
+            warnings.append("buy exit price policy is invalid")
+        else:
+            conditions.append({
+                "condition_type": "PRICE",
+                "left_source": left,
+                "right_source": right,
+                "direction": direction,
+                "compare": compare,
+                "threshold_percent": threshold,
+                "orientation": "LEFT_VALUE_RELATIVE_TO_RIGHT_BASE",
+            })
+    if not conditions:
+        return None
+    policy = {
+        "policy": "BUY_REPEAT_EXIT",
+        "enabled": True,
+        "logic": "OR",
+        "conditions": conditions,
+        "completion_behavior": "BLOCK_FUTURE_BUY_ROUNDS",
+    }
+    policy["snapshot_hash"] = _stable_hash(policy)
+    return policy
 
 
 def _build_buy_execution_repeat_candidate(
@@ -1585,6 +1663,53 @@ def build_engine_rules_preview_from_ui_state(
         preview_candidates.setdefault("filters", {})["composite"] = buy_composite_filter_candidate
 
     buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, validation_warnings)
+    buy_exit_policy = _build_buy_exit_policy(_as_dict(buy_ui.get("exit")), validation_warnings)
+    # Situation timeout belongs to the existing base execution policy and
+    # therefore follows the same Pending/Approval/Commit path.
+    situation = _as_dict(buy_ui.get("situation"))
+    old_base = _as_dict(_as_dict(_as_dict(source_rules.get("buy")).get("execution")).get("base"))
+    if not buy_execution_base_candidate and old_base and ("type_combo" in situation or buy_exit_policy is not None):
+        buy_execution_base_candidate = {"path": BUY_EXECUTION_BASE_PATH,
+            "operation": "set_execution_policy", "value": deepcopy(old_base)}
+    if buy_execution_base_candidate:
+        value = buy_execution_base_candidate["value"]
+        if "type_combo" not in situation and "unfilled_timeout_policy" in old_base:
+            value["unfilled_timeout_policy"] = deepcopy(old_base["unfilled_timeout_policy"])
+        if "type_combo" not in situation and "buy_price_reset_policy" in old_base:
+            value["buy_price_reset_policy"] = deepcopy(old_base["buy_price_reset_policy"])
+        elif situation.get("type_combo") == "미체결":
+            value["unfilled_timeout_policy"] = {
+                "policy": "CANCEL_PENDING_ORDER", "enabled": True, "action": "CANCEL",
+                "scope": {"매회": "EACH", "일괄": "BATCH"}.get(situation.get("unfilled_scope_combo")),
+                "configured_value": _safe_float(situation.get("unfilled_time_line")),
+                "configured_unit": _point_unit_token(situation.get("unfilled_unit_combo")),
+                "anchor": "BROKER_ACCEPTED_AT",
+            }
+        elif "type_combo" in situation:
+            # Price reset/cancel is still reserved; do not retain an active
+            # timeout from a previously selected situation page.
+            value["unfilled_timeout_policy"] = {"policy": "CANCEL_PENDING_ORDER", "enabled": False}
+        if situation.get("type_combo") == "가격비교" and situation.get("action_combo") == "매수리셋":
+            value["buy_price_reset_policy"] = {
+                "policy": "BUY_PRICE_CHANGE_RESET",
+                "enabled": True,
+                "action": "RESET",
+                "left_source": _price_basis_token(situation.get("left_combo")),
+                "right_source": _price_basis_token(situation.get("right_combo")),
+                "direction": _direction_token(situation.get("direction_combo")),
+                "threshold_percent": _safe_float(situation.get("ratio_line")),
+                "compare": _ratio_compare_token(situation.get("compare_combo")),
+            }
+        elif "type_combo" in situation:
+            value["buy_price_reset_policy"] = {
+                "policy": "BUY_PRICE_CHANGE_RESET", "enabled": False,
+            }
+        if buy_exit_policy is not None:
+            value["buy_exit_policy"] = deepcopy(buy_exit_policy)
+        elif "exit" in buy_ui and "buy_exit_policy" in old_base:
+            # Preserve an existing canonical policy when this UI snapshot did
+            # not include editable exit controls.
+            value["buy_exit_policy"] = deepcopy(old_base["buy_exit_policy"])
     if buy_execution_base_candidate:
         _set_buy_execution_policy_value(
             preview_rules,
@@ -1680,11 +1805,10 @@ def build_engine_rules_preview_from_ui_state(
     if not buy_execution_repeat_candidate:
         postponed.append("repeat buy mapping is postponed")
     postponed.extend([
-        "situation response mapping is postponed",
+        "situation price response mapping is postponed",
         "additional feature mapping is postponed",
         "cycle setting mapping is postponed",
         "exit condition mapping is postponed",
-        "pending order policy mapping is postponed",
         "completion policy mapping is postponed",
     ])
 

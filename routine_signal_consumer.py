@@ -9,7 +9,10 @@ but it never mutates orders.json, calls an executor, or sends an order.
 
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import datetime
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from routine_signal_order_bridge import (
     dry_run_order_manager_for_signal_with_payload_preview,
@@ -17,7 +20,9 @@ from routine_signal_order_bridge import (
 )
 from routine_signal_queue import (
     STATUS_BLOCKED,
+    STATUS_DONE,
     STATUS_ERROR,
+    STATUS_PENDING,
     STATUS_PREVIEWED,
     update_signal_status,
 )
@@ -27,11 +32,19 @@ from routine_package_contract import (
 )
 
 try:
-    from order_queue import append_order_candidates, read_order_queue, signal_to_order_candidate
+    from order_queue import (
+        append_order_candidates,
+        order_candidate_dedupe_key,
+        read_order_queue,
+        signal_to_order_candidate,
+        signal_to_order_candidates,
+    )
 except Exception:  # pragma: no cover
     append_order_candidates = None
+    order_candidate_dedupe_key = None
     read_order_queue = None
     signal_to_order_candidate = None
+    signal_to_order_candidates = None
 
 try:
     from order_approval_engine import evaluate_order_approval
@@ -87,6 +100,8 @@ def _preview_metadata_for_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _order_dedupe_key(order: dict[str, Any]) -> str:
+    if callable(order_candidate_dedupe_key):
+        return order_candidate_dedupe_key(order)
     return "|".join(
         [
             str(order.get("source_signal_id", "")),
@@ -97,11 +112,37 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
     )
 
 
+def _is_deferred_child_signal(signal: Any) -> bool:
+    if not isinstance(signal, dict):
+        return False
+    intents = signal.get("execution_intents")
+    return (
+        isinstance(intents, list)
+        and bool(intents)
+        and {
+            (
+                str(item.get("execution_mode") or "").strip().upper(),
+                str(item.get("child_kind") or "").strip().upper(),
+            )
+            for item in intents
+            if isinstance(item, dict)
+        }
+        in ({("MULTI_TIME", "TIME_SLICE")}, {("MULTI_RATIO", "RATIO_SLICE")})
+        and all(isinstance(item, dict) for item in intents)
+    )
+
+
 def routine_execution_intent_admission(
     signal: dict[str, Any],
 ) -> dict[str, Any]:
     """Ask the assigned routine to admit candidate generation."""
     execution_intent = signal.get("execution_intent")
+    execution_intents = signal.get("execution_intents")
+    if not isinstance(execution_intent, dict) and isinstance(execution_intents, list):
+        execution_intent = next(
+            (item for item in execution_intents if isinstance(item, dict)),
+            None,
+        )
     intent = execution_intent if isinstance(execution_intent, dict) else {}
     instance_id = str(
         signal.get("routine_instance_id")
@@ -255,7 +296,12 @@ def _build_order_queue_candidates_for_signals(
     apply_approval: bool = False,
 ) -> dict[str, Any]:
     """Append order candidates for selected PENDING signals only."""
-    if not callable(read_order_queue) or not callable(append_order_candidates) or not callable(signal_to_order_candidate):
+    if not (
+        callable(read_order_queue)
+        and callable(append_order_candidates)
+        and callable(signal_to_order_candidate)
+        and callable(signal_to_order_candidates)
+    ):
         return {
             "ok": False,
             "orders_created": 0,
@@ -300,20 +346,19 @@ def _build_order_queue_candidates_for_signals(
             execution_switch_blocked += 1
             continue
 
-        order = signal_to_order_candidate(signal, len(orders) + 1)
-        if order is None:
+        signal_orders = signal_to_order_candidates(signal, len(orders) + 1)
+        if not signal_orders:
             ignored += 1
             continue
-
-        order["execution_enabled"] = False
-        key = _order_dedupe_key(order)
-        if key in existing_keys:
-            duplicates += 1
-            continue
-
-        orders.append(order)
-        created_orders.append(order)
-        existing_keys.add(key)
+        for order in signal_orders:
+            order["execution_enabled"] = False
+            key = _order_dedupe_key(order)
+            if key in existing_keys:
+                duplicates += 1
+                continue
+            orders.append(order)
+            created_orders.append(order)
+            existing_keys.add(key)
 
     approval_checked = 0
     approved = 0
@@ -321,6 +366,9 @@ def _build_order_queue_candidates_for_signals(
     approval_results: list[dict[str, Any]] = []
 
     if apply_approval and callable(evaluate_order_approval):
+        provenance_approved_at = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(
+            timespec="milliseconds"
+        )
         for order in created_orders:
             result = evaluate_order_approval(order)
             try:
@@ -334,6 +382,12 @@ def _build_order_queue_candidates_for_signals(
             order["approval_status"] = result.get("approval_status", "")
             order["approval_reason"] = result.get("approval_reason", "")
             order["execution_enabled"] = False
+            execution_intent = order.get("execution_intent")
+            if (
+                isinstance(execution_intent, dict)
+                and execution_intent.get("execution_process_owner_required") is True
+            ):
+                execution_intent["provenance_approved_at"] = provenance_approved_at
             if approval_status == "APPROVED":
                 order["status"] = "APPROVED"
                 approved += 1
@@ -429,8 +483,499 @@ def _build_order_queue_candidates_for_signals(
         "policy_blocked": int(append_result.get("policy_blocked", 0) or 0),
         "policy_errors": int(append_result.get("policy_errors", 0) or 0),
         "policy_results": append_result.get("policy_results", []),
+        "executable_order_ids": [
+            str(item.get("order_id") or "").strip()
+            for item in append_result.get("policy_results", [])
+            if isinstance(item, dict)
+            and str(item.get("after_status") or "").upper() == "EXECUTABLE"
+            and str(item.get("order_id") or "").strip()
+        ],
         "append_result": append_result,
     }
+
+
+def enqueue_replanned_execution_intents(
+    signal: Any,
+    execution_intents: Any,
+    *,
+    apply_approval: bool = True,
+) -> dict[str, Any]:
+    """Re-enter a safe in-memory replan through the existing generic pipeline."""
+    signal_record = dict(signal) if isinstance(signal, dict) else {}
+    intents = [dict(item) for item in execution_intents] if isinstance(execution_intents, list) else []
+    if not signal_record or not intents or any(not item for item in intents):
+        return {"ok": False, "reason": "REPLAN_SIGNAL_OR_INTENTS_INVALID", "executable_order_ids": []}
+    source_signal_id = str(signal_record.get("id") or "").strip()
+    process_ids = {str(item.get("execution_process_id") or "").strip() for item in intents}
+    source_ids = {str(item.get("source_signal_id") or "").strip() for item in intents}
+    if (
+        not source_signal_id
+        or source_ids != {source_signal_id}
+        or len(process_ids) != 1
+        or "" in process_ids
+    ):
+        return {"ok": False, "reason": "REPLAN_IDENTITY_INVALID", "executable_order_ids": []}
+    prepared = dict(signal_record)
+    prepared["status"] = "PENDING"
+    prepared["execution_intent"] = deepcopy(intents[0])
+    prepared["execution_intents"] = deepcopy(intents)
+    return _build_order_queue_candidates_for_signals(
+        [prepared],
+        apply_approval=apply_approval,
+    )
+
+
+def enqueue_price_reset_generation(
+    proposal: Any,
+    *,
+    apply_approval: bool = True,
+) -> dict[str, Any]:
+    """Persist one reset generation and re-enter the existing generic child pipeline."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal = dict(item.get("signal")) if isinstance(item.get("signal"), dict) else {}
+    intents = [dict(value) for value in item.get("execution_intents", []) if isinstance(value, dict)]
+    signal_id = str(signal.get("id") or "").strip()
+    if not signal_id or not intents or len(intents) != len(item.get("execution_intents", [])):
+        return {"ok": False, "reason": "PRICE_RESET_PROPOSAL_INVALID", "executable_order_ids": []}
+    metadata = {
+        "execution_intent": deepcopy(intents[0]),
+        "execution_intents": deepcopy(intents),
+        "price_reset_plan_generation": item.get("plan_generation"),
+        "price_reset_source_snapshot_hash": item.get("trigger_snapshot_hash"),
+    }
+    persisted = update_signal_status(signal_id, STATUS_PENDING, metadata=metadata)
+    if persisted.get("ok") is not True:
+        return {
+            "ok": False,
+            "reason": persisted.get("reason") or "PRICE_RESET_SIGNAL_UPDATE_FAILED",
+            "signal_status_update": persisted,
+            "executable_order_ids": [],
+        }
+    mode = str(intents[0].get("execution_mode") or "SINGLE_ORDER").strip().upper()
+    if mode in {"MULTI_TIME", "MULTI_RATIO"}:
+        return {
+            "ok": True,
+            "orders_created": 0,
+            "deferred": True,
+            "signal_status_update": persisted,
+            "executable_order_ids": [],
+        }
+    result = enqueue_replanned_execution_intents(
+        signal,
+        intents,
+        apply_approval=apply_approval,
+    )
+    result["signal_status_update"] = persisted
+    if result.get("ok") is not True:
+        return result
+    completed = update_signal_status(
+        signal_id,
+        STATUS_PREVIEWED,
+        metadata={
+            "price_reset_plan_generation": item.get("plan_generation"),
+            "price_reset_source_snapshot_hash": item.get("trigger_snapshot_hash"),
+        },
+    )
+    result["signal_completion_update"] = completed
+    if completed.get("ok") is not True:
+        result["ok"] = False
+        result["reason"] = completed.get("reason") or "PRICE_RESET_SIGNAL_COMPLETION_FAILED"
+    return result
+
+
+def enqueue_repeat_sell_generation(
+    proposal: Any,
+    *,
+    apply_approval: bool = True,
+) -> dict[str, Any]:
+    """Persist one follow-up SELL generation through the canonical signal writer."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal = dict(item.get("signal")) if isinstance(item.get("signal"), dict) else {}
+    intents = [
+        dict(value)
+        for value in item.get("execution_intents", [])
+        if isinstance(value, dict)
+    ]
+    signal_id = str(signal.get("id") or "").strip()
+    if (
+        not signal_id
+        or not intents
+        or len(intents) != len(item.get("execution_intents", []))
+        or any(value.get("repeat_generation") is not True for value in intents)
+    ):
+        return {
+            "ok": False,
+            "reason": "SELL_REPEAT_PROPOSAL_INVALID",
+            "executable_order_ids": [],
+        }
+    metadata = {
+        "execution_intent": deepcopy(intents[0]),
+        "execution_intents": deepcopy(intents),
+        "repeat_plan_generation": item.get("plan_generation"),
+        "repeat_source_snapshot_hash": item.get("repeat_source_snapshot_hash"),
+    }
+    persisted = update_signal_status(signal_id, STATUS_PENDING, metadata=metadata)
+    if persisted.get("ok") is not True:
+        return {
+            "ok": False,
+            "reason": persisted.get("reason") or "SELL_REPEAT_SIGNAL_UPDATE_FAILED",
+            "signal_status_update": persisted,
+            "executable_order_ids": [],
+        }
+    mode = str(intents[0].get("execution_mode") or "SINGLE_ORDER").strip().upper()
+    if mode in {"MULTI_TIME", "MULTI_RATIO"}:
+        return {
+            "ok": True,
+            "orders_created": 0,
+            "deferred": True,
+            "signal_status_update": persisted,
+            "executable_order_ids": [],
+        }
+    result = enqueue_replanned_execution_intents(
+        signal,
+        intents,
+        apply_approval=apply_approval,
+    )
+    result["signal_status_update"] = persisted
+    if result.get("ok") is not True:
+        return result
+    completed = update_signal_status(
+        signal_id,
+        STATUS_PREVIEWED,
+        metadata={
+            "repeat_plan_generation": item.get("plan_generation"),
+            "repeat_source_snapshot_hash": item.get("repeat_source_snapshot_hash"),
+        },
+    )
+    result["signal_completion_update"] = completed
+    if completed.get("ok") is not True:
+        result["ok"] = False
+        result["reason"] = completed.get("reason") or "SELL_REPEAT_SIGNAL_COMPLETION_FAILED"
+    return result
+
+
+def record_repeat_sell_exit(proposal: Any) -> dict[str, Any]:
+    """Persist repeat-exit evidence through the existing canonical signal writer."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal_id = str(item.get("source_signal_id") or "").strip()
+    process_id = str(item.get("execution_process_id") or "").strip()
+    snapshot_hash = str(item.get("exit_source_snapshot_hash") or "").strip()
+    snapshot = item.get("exit_source_snapshot")
+    if (
+        not signal_id
+        or not process_id
+        or not snapshot_hash
+        or not isinstance(snapshot, dict)
+        or str(snapshot.get("snapshot_hash") or "").strip() != snapshot_hash
+    ):
+        return {"ok": False, "reason": "SELL_REPEAT_EXIT_PROPOSAL_INVALID"}
+    evidence = {
+        "policy": "SELL_REPEAT_EXIT",
+        "execution_process_id": process_id,
+        "source_signal_id": signal_id,
+        "exit_condition_type": item.get("exit_condition_type"),
+        "exit_condition_types": deepcopy(item.get("exit_condition_types") or []),
+        "exit_triggered_at": item.get("exit_triggered_at"),
+        "exit_source_snapshot_hash": snapshot_hash,
+        "exit_source_snapshot": deepcopy(snapshot),
+        "evaluated_generation": item.get("evaluated_generation"),
+        "reason": item.get("reason") or "SELL_REPEAT_EXIT_CONDITION_MATCHED",
+    }
+    status = str(item.get("signal_status") or STATUS_PREVIEWED).strip().upper()
+    return update_signal_status(
+        signal_id,
+        status,
+        metadata={"sell_repeat_exit_evidence": evidence},
+    )
+
+
+def record_buy_repeat_exit_completion(proposal: Any) -> dict[str, Any]:
+    """Persist BUY phase-completion evidence through the canonical signal writer."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal_id = str(item.get("source_signal_id") or "").strip()
+    process_id = str(item.get("execution_process_id") or "").strip()
+    routine_instance_id = str(item.get("routine_instance_id") or "").strip()
+    cycle_identity = str(item.get("cycle_identity") or "").strip()
+    snapshot_hash = str(item.get("exit_source_snapshot_hash") or "").strip()
+    snapshot = item.get("exit_source_snapshot")
+    if not signal_id or not process_id or not routine_instance_id or not cycle_identity \
+            or not snapshot_hash or not isinstance(snapshot, dict) \
+            or str(snapshot.get("snapshot_hash") or "").strip() != snapshot_hash:
+        return {"ok": False, "reason": "BUY_REPEAT_EXIT_PROPOSAL_INVALID"}
+    evidence = {
+        "policy": "BUY_REPEAT_EXIT",
+        "execution_process_id": process_id,
+        "source_signal_id": signal_id,
+        "routine_instance_id": routine_instance_id,
+        "cycle_identity": cycle_identity,
+        "exit_condition_type": item.get("exit_condition_type"),
+        "exit_condition_types": deepcopy(item.get("exit_condition_types") or []),
+        "exit_triggered_at": item.get("exit_triggered_at"),
+        "evaluated_buy_round": item.get("evaluated_generation"),
+        "repeat_completed_count": item.get("repeat_completed_count"),
+        "repeat_started_at": item.get("repeat_started_at"),
+        "exit_source_snapshot_hash": snapshot_hash,
+        "exit_source_snapshot": deepcopy(snapshot),
+        "reason": item.get("reason") or "BUY_REPEAT_EXIT_CONDITION_MATCHED",
+        "cancel_required": item.get("cancel_required") is True,
+        "cancel_effect_confirmed": item.get("cancel_effect_confirmed") is True,
+        "buy_phase_completed": item.get("buy_phase_completed") is True,
+    }
+    status = str(item.get("signal_status") or STATUS_PREVIEWED).strip().upper()
+    return update_signal_status(signal_id, status, metadata={"buy_exit_evidence": evidence})
+
+
+def enqueue_final_residual_sell_exit(
+    proposal: Any,
+    *,
+    apply_approval: bool = True,
+) -> dict[str, Any]:
+    """Persist and enqueue one final residual MARKET SELL via canonical paths."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal = dict(item.get("signal")) if isinstance(item.get("signal"), dict) else {}
+    intents = [
+        dict(value)
+        for value in item.get("execution_intents", [])
+        if isinstance(value, dict)
+    ]
+    signal_id = str(signal.get("id") or "").strip()
+    process_id = str(item.get("execution_process_id") or "").strip()
+    action_hash = str(item.get("final_residual_exit_action_hash") or "").strip()
+    exit_hash = str(item.get("repeat_exit_source_snapshot_hash") or "").strip()
+    valid = (
+        bool(signal_id and process_id and action_hash and exit_hash)
+        and len(intents) == 1
+        and len(intents) == len(item.get("execution_intents", []))
+        and intents[0].get("final_residual_exit") is True
+        and str(intents[0].get("side") or "").strip().upper() == "SELL"
+        and str(intents[0].get("execution_mode") or "").strip().upper()
+        == "SINGLE_ORDER"
+        and str(intents[0].get("hoga") or "").strip().upper() == "MARKET"
+        and str(intents[0].get("price_basis") or "").strip().upper() == "MARKET"
+        and intents[0].get("price") is None
+        and str(intents[0].get("source_signal_id") or "").strip() == signal_id
+        and str(intents[0].get("execution_process_id") or "").strip() == process_id
+        and str(intents[0].get("final_residual_exit_action_hash") or "").strip()
+        == action_hash
+        and str(intents[0].get("repeat_exit_source_snapshot_hash") or "").strip()
+        == exit_hash
+    )
+    if not valid:
+        return {
+            "ok": False,
+            "reason": "SELL_FINAL_RESIDUAL_EXIT_PROPOSAL_INVALID",
+            "executable_order_ids": [],
+        }
+
+    requested_evidence = {
+        "policy": "SELL_FINAL_RESIDUAL_MARKET_EXIT",
+        "status": "REQUESTED",
+        "execution_process_id": process_id,
+        "source_signal_id": signal_id,
+        "repeat_exit_source_snapshot_hash": exit_hash,
+        "final_residual_exit_action_hash": action_hash,
+        "final_residual_exit_source_snapshot_hash": item.get(
+            "final_residual_exit_source_snapshot_hash"
+        ),
+        "plan_generation": item.get("plan_generation"),
+        "requested_quantity": item.get("latest_sellable_quantity"),
+        "execution_ids": [intents[0].get("execution_id")],
+        "resulting_holding_zero_confirmed": False,
+    }
+    persisted = update_signal_status(
+        signal_id,
+        STATUS_PENDING,
+        metadata={
+            "execution_intent": deepcopy(intents[0]),
+            "execution_intents": deepcopy(intents),
+            "final_residual_exit_evidence": requested_evidence,
+        },
+    )
+    if persisted.get("ok") is not True:
+        return {
+            "ok": False,
+            "reason": persisted.get("reason")
+            or "SELL_FINAL_RESIDUAL_EXIT_SIGNAL_UPDATE_FAILED",
+            "signal_status_update": persisted,
+            "executable_order_ids": [],
+        }
+
+    result = enqueue_replanned_execution_intents(
+        signal,
+        intents,
+        apply_approval=apply_approval,
+    )
+    result["signal_status_update"] = persisted
+    if result.get("ok") is not True:
+        return result
+
+    created_orders = (
+        result.get("append_result", {}).get("created_orders", [])
+        if isinstance(result.get("append_result"), dict)
+        else []
+    )
+    queued_evidence = deepcopy(requested_evidence)
+    queued_evidence.update(
+        {
+            "status": "ORDER_QUEUED",
+            "order_ids": [
+                str(order.get("id") or order.get("order_id") or "").strip()
+                for order in created_orders
+                if isinstance(order, dict)
+                and str(order.get("id") or order.get("order_id") or "").strip()
+            ],
+        }
+    )
+    completed = update_signal_status(
+        signal_id,
+        STATUS_PREVIEWED,
+        metadata={"final_residual_exit_evidence": queued_evidence},
+    )
+    result["signal_completion_update"] = completed
+    if completed.get("ok") is not True:
+        result["ok"] = False
+        result["reason"] = completed.get("reason") or (
+            "SELL_FINAL_RESIDUAL_EXIT_SIGNAL_COMPLETION_FAILED"
+        )
+    return result
+
+
+def record_final_residual_sell_exit_completion(proposal: Any) -> dict[str, Any]:
+    """Record holding-zero confirmation with the existing signal writer."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal_id = str(item.get("source_signal_id") or "").strip()
+    process_id = str(item.get("execution_process_id") or "").strip()
+    action_hash = str(item.get("final_residual_exit_action_hash") or "").strip()
+    exit_hash = str(item.get("repeat_exit_source_snapshot_hash") or "").strip()
+    if (
+        not signal_id
+        or not process_id
+        or not action_hash
+        or not exit_hash
+        or item.get("resulting_holding_zero_confirmed") is not True
+    ):
+        return {
+            "ok": False,
+            "reason": "SELL_FINAL_RESIDUAL_EXIT_COMPLETION_INVALID",
+        }
+    evidence = {
+        "policy": "SELL_FINAL_RESIDUAL_MARKET_EXIT",
+        "status": "HOLDING_ZERO_CONFIRMED",
+        "execution_process_id": process_id,
+        "source_signal_id": signal_id,
+        "repeat_exit_source_snapshot_hash": exit_hash,
+        "final_residual_exit_action_hash": action_hash,
+        "final_execution_id": item.get("final_execution_id"),
+        "final_order_id": item.get("final_order_id"),
+        "completed_at": item.get("completed_at"),
+        "reason": item.get("reason"),
+        "resulting_holding_zero_confirmed": True,
+    }
+    return update_signal_status(
+        signal_id,
+        STATUS_DONE,
+        metadata={"final_residual_exit_evidence": evidence},
+    )
+
+
+def enqueue_scheduled_time_slice(
+    proposal: Any,
+    *,
+    apply_approval: bool = True,
+) -> dict[str, Any]:
+    """Send one due TIME_SLICE through the existing generic candidate pipeline."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal = dict(item.get("signal")) if isinstance(item.get("signal"), dict) else {}
+    intents = item.get("execution_intents")
+    if (
+        not signal
+        or not isinstance(intents, list)
+        or len(intents) != 1
+        or not isinstance(intents[0], dict)
+        or str(intents[0].get("execution_mode") or "").strip().upper() != "MULTI_TIME"
+        or str(intents[0].get("child_kind") or "").strip().upper() != "TIME_SLICE"
+    ):
+        return {"ok": False, "reason": "TIME_SLICE_PROPOSAL_INVALID", "executable_order_ids": []}
+    signal["status"] = "PENDING"
+    signal["execution_intent"] = deepcopy(intents[0])
+    signal["execution_intents"] = [deepcopy(intents[0])]
+    result = _build_order_queue_candidates_for_signals(
+        [signal],
+        apply_approval=apply_approval,
+    )
+    if result.get("ok") is not True or item.get("complete_after_enqueue") is not True:
+        return result
+    if int(result.get("orders_created", 0) or 0) == 0 and int(result.get("duplicates", 0) or 0) == 0:
+        # Admission may reject a due child without enqueueing anything. Keep
+        # the durable plan pending so recovery cannot mistake it for complete.
+        return result
+    signal_id = str(signal.get("id") or "").strip()
+    if not signal_id:
+        result["ok"] = False
+        result["reason"] = "TIME_SLICE_SIGNAL_ID_MISSING"
+        return result
+    status_result = update_signal_status(
+        signal_id,
+        STATUS_PREVIEWED,
+        metadata={
+            "time_slice_plan_complete": True,
+            "time_slice_last_child_sequence_index": intents[0].get("child_sequence_index"),
+        },
+    )
+    result["signal_status_update"] = status_result
+    if status_result.get("ok") is not True:
+        result["ok"] = False
+        result["reason"] = status_result.get("reason") or "TIME_SLICE_SIGNAL_STATUS_UPDATE_FAILED"
+    return result
+
+
+def enqueue_eligible_ratio_slice(
+    proposal: Any,
+    *,
+    apply_approval: bool = True,
+) -> dict[str, Any]:
+    """Send one eligible RATIO_SLICE through the existing generic pipeline."""
+    item = dict(proposal) if isinstance(proposal, dict) else {}
+    signal = dict(item.get("signal")) if isinstance(item.get("signal"), dict) else {}
+    intents = item.get("execution_intents")
+    if (
+        not signal
+        or not isinstance(intents, list)
+        or len(intents) != 1
+        or not isinstance(intents[0], dict)
+        or str(intents[0].get("execution_mode") or "").strip().upper() != "MULTI_RATIO"
+        or str(intents[0].get("child_kind") or "").strip().upper() != "RATIO_SLICE"
+    ):
+        return {"ok": False, "reason": "RATIO_SLICE_PROPOSAL_INVALID", "executable_order_ids": []}
+    signal["status"] = "PENDING"
+    signal["execution_intent"] = deepcopy(intents[0])
+    signal["execution_intents"] = [deepcopy(intents[0])]
+    result = _build_order_queue_candidates_for_signals(
+        [signal],
+        apply_approval=apply_approval,
+    )
+    if result.get("ok") is not True or item.get("complete_after_enqueue") is not True:
+        return result
+    signal_id = str(signal.get("id") or "").strip()
+    if not signal_id:
+        result["ok"] = False
+        result["reason"] = "RATIO_SLICE_SIGNAL_ID_MISSING"
+        return result
+    if int(result.get("orders_created", 0) or 0) == 0 and int(result.get("duplicates", 0) or 0) == 0:
+        return result
+    status_result = update_signal_status(
+        signal_id,
+        STATUS_PREVIEWED,
+        metadata={
+            "ratio_slice_plan_complete": True,
+            "ratio_slice_last_child_sequence_index": intents[0].get("child_sequence_index"),
+        },
+    )
+    result["signal_status_update"] = status_result
+    if status_result.get("ok") is not True:
+        result["ok"] = False
+        result["reason"] = status_result.get("reason") or "RATIO_SLICE_SIGNAL_STATUS_UPDATE_FAILED"
+    return result
 
 
 def consume_pending_routine_signals_dry_run(
@@ -446,6 +991,7 @@ def consume_pending_routine_signals_dry_run(
         allowed_stock_codes=allowed_stock_codes,
         signal_cutoff_by_stock_code=signal_cutoff_by_stock_code,
     )
+    signals = [signal for signal in signals if not _is_deferred_child_signal(signal)]
     clean_limit = _clean_limit(limit)
     if clean_limit is not None:
         signals = signals[:clean_limit]
@@ -556,6 +1102,7 @@ def consume_pending_routine_signals_dry_run(
             "policy_executable": int(order_queue_result.get("policy_executable", 0) or 0),
             "policy_blocked": int(order_queue_result.get("policy_blocked", 0) or 0),
             "policy_errors": int(order_queue_result.get("policy_errors", 0) or 0),
+            "executable_order_ids": list(order_queue_result.get("executable_order_ids") or []),
         },
         "order_queue": order_queue_result,
         "status_updates": status_update_results,

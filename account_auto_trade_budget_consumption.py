@@ -312,6 +312,11 @@ def project_account_auto_trade_budget_consumption(
 
         reservations: dict[str, tuple[int, str, dict[str, Any]]] = {}
         for order in orders:
+            if _order_action(order) == "CANCEL":
+                # Control orders do not consume BUY budget; the original
+                # broker-open order remains the reservation until its effect
+                # evidence updates that order's lifecycle.
+                continue
             status = _text(order.get("status")).upper()
             side = _order_side(order)
             if side != "BUY":
@@ -342,9 +347,14 @@ def project_account_auto_trade_budget_consumption(
             if not source_signal_id:
                 continue
             rank = _LIFECYCLE_RANK[status]
-            previous = reservations.get(source_signal_id)
+            # A signal can own several independent child reservations. Only
+            # projections of the SAME execution may collapse to one lifecycle.
+            intent = _as_dict(order.get("execution_intent"))
+            execution_id = _text(order.get("execution_id") or intent.get("execution_id"))
+            reservation_key = f"execution:{execution_id}" if execution_id else f"signal:{source_signal_id}"
+            previous = reservations.get(reservation_key)
             if previous is None or rank > previous[0]:
-                reservations[source_signal_id] = (rank, status, order)
+                reservations[reservation_key] = (rank, status, order)
 
         open_buy_reservation = 0
         open_buy_order_count = 0
@@ -385,3 +395,100 @@ def project_account_auto_trade_budget_consumption(
         "open_buy_order_count": open_buy_order_count,
         "reason": "",
     }
+
+
+def project_time_slice_buy_budget(
+    *,
+    order: Mapping[str, Any],
+    order_records: list[dict[str, Any]],
+    fill_records: list[dict[str, Any]],
+    candidate_amount: object,
+) -> dict[str, Any]:
+    """Recheck an immutable deferred BUY round ceiling using Queue/Fill facts.
+
+    Open predecessor orders wait (including their reserved unfilled amount).
+    Terminal partial cancellation consumes only the confirmed cumulative Fill
+    cost, never the original requested quantity. No writes or quantity scaling.
+    """
+    from chejan_event_recorder import _fill_ledger_summary
+
+    intent = _as_dict(order.get("execution_intent")) or dict(order)
+    if intent.get("side") != "BUY" or intent.get("execution_mode") not in {"MULTI_TIME", "MULTI_RATIO"}:
+        return {"available": True, "admitted": True, "reason": "NOT_APPLICABLE"}
+    try:
+        plan_key = "multi_ratio_plan" if intent.get("execution_mode") == "MULTI_RATIO" else "multi_time_plan"
+        plan = _as_dict(intent.get(plan_key))
+        budget = _integer(plan.get("approved_round_budget"), field="approved round budget", minimum=1)
+        amount = _integer(candidate_amount, field="due BUY amount", minimum=1)
+        process_id = _text(intent.get("execution_process_id"))
+        signal_id = _text(intent.get("source_signal_id"))
+        own_id = _text(intent.get("execution_id"))
+        if not process_id or not signal_id or not own_id:
+            raise ValueError("TIME_SLICE_BUY_IDENTITY_MISSING")
+        consumed = Decimal(0)
+        reserved = 0
+        grouped: dict[str, dict[str, Any]] = {}
+        for record in order_records:
+            if _order_action(record) == "CANCEL":
+                continue
+            other = _as_dict(record.get("execution_intent"))
+            pid = _text(record.get("execution_process_id") or other.get("execution_process_id"))
+            if pid != process_id:
+                continue
+            eid = _text(record.get("execution_id") or other.get("execution_id"))
+            if not eid:
+                raise ValueError("TIME_SLICE_BUY_QUEUE_IDENTITY_MISSING")
+            if eid == own_id:
+                continue
+            if (
+                _text(record.get("source_signal_id") or other.get("source_signal_id")) != signal_id
+                or other.get("buy_round") != intent.get("buy_round")
+                or other.get(plan_key) != plan
+                or _order_side(record) != "BUY"
+                or _record_account(record) != _text(intent.get("account_no"))
+                or _order_code(record) != _order_code(dict(order))
+            ):
+                raise ValueError("TIME_SLICE_BUY_ROUND_IDENTITY_MISMATCH")
+            status = _text(record.get("status")).upper()
+            if (status in _AMBIGUOUS_SEND_STATUSES or record.get("manual_reconciliation_required") is True
+                    or record.get("send_uncertain") is True):
+                raise ValueError("TIME_SLICE_BUY_SEND_UNCERTAIN")
+            previous = grouped.get(eid)
+            if previous is None or _LIFECYCLE_RANK.get(status, -1) > _LIFECYCLE_RANK.get(_text(previous.get("status")), -1):
+                grouped[eid] = record
+        for record in grouped.values():
+            status = _text(record.get("status")).upper()
+            if status not in _LIFECYCLE_RANK:
+                raise ValueError("TIME_SLICE_BUY_LIFECYCLE_UNKNOWN")
+            summary = _fill_ledger_summary(fill_records, record)
+            if summary["duplicate_execution_identities"] or summary["out_of_order_fill_identities"] or summary["broker_order_mismatches"]:
+                raise ValueError("TIME_SLICE_BUY_FILL_IDENTITY_MISMATCH")
+            cumulative = _integer(record.get("cumulative_filled_quantity", 0), field="cumulative fill quantity")
+            if cumulative != summary["fills_summed_quantity"]:
+                raise ValueError("TIME_SLICE_BUY_QUEUE_FILL_MISMATCH")
+            original_quantity = record.get("original_order_quantity") or record.get("quantity") or _request_preview(record).get("quantity")
+            if status == "FILLED" and cumulative != _integer(original_quantity, field="filled order quantity", minimum=1):
+                raise ValueError("TIME_SLICE_BUY_FILLED_QUANTITY_MISMATCH")
+            if cumulative:
+                average = summary["fills_weighted_average_price"]
+                if average is None or average <= 0:
+                    raise ValueError("TIME_SLICE_BUY_FILL_PRICE_MISSING")
+                consumed += Decimal(str(average)) * cumulative
+            if status in _OPEN_BROKER_STATUSES:
+                reserved += _order_quantity(record, status=status) * _order_price(record)
+            elif status not in _TERMINAL_STATUSES | {"BLOCKED", "BLOCKED_POLICY"}:
+                reserved += canonical_buy_candidate_amount(record)
+        # Round consumption is historical BUY fill cost, not current holdings:
+        # selling some holdings must not reopen this round's spending ceiling.
+        remaining = Decimal(budget) - consumed - reserved
+        return {
+            "available": True, "admitted": reserved == 0 and Decimal(amount) <= remaining,
+            "waiting": reserved > 0,
+            "reason": "TIME_SLICE_BUY_OPEN_ORDER_PENDING" if reserved else (
+                "TIME_SLICE_BUY_ROUND_BUDGET_EXCEEDED" if Decimal(amount) > remaining else ""),
+            "approved_round_budget": budget, "consumed_amount": float(consumed),
+            "open_buy_reservation": reserved, "remaining_round_budget": float(remaining),
+            "candidate_buy_amount": amount,
+        }
+    except (ValueError, TypeError, KeyError) as exc:
+        return {"available": False, "admitted": False, "reason": str(exc)}

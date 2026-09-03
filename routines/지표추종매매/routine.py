@@ -29,12 +29,14 @@ except Exception:  # pragma: no cover
         project_indicator_follow_cycle = None
 
 try:
-    from routine_buy_execution import build_indicator_follow_buy_intent  # type: ignore
+    from routine_buy_execution import build_indicator_follow_buy_intent, inspect_buy_time_slice_continuation, inspect_buy_execution_support  # type: ignore
 except Exception:  # pragma: no cover
     try:
-        from .routine_buy_execution import build_indicator_follow_buy_intent  # type: ignore
+        from .routine_buy_execution import build_indicator_follow_buy_intent, inspect_buy_time_slice_continuation, inspect_buy_execution_support  # type: ignore
     except Exception:  # pragma: no cover
         build_indicator_follow_buy_intent = None
+        inspect_buy_time_slice_continuation = None
+        inspect_buy_execution_support = None
 
 try:
     from routine_sell_execution import build_indicator_follow_sell_intent  # type: ignore
@@ -127,12 +129,20 @@ def evaluate_execution_admission(
     rules_identity: str,
 ) -> dict[str, Any]:
     """Apply this routine's candidate-admission rule."""
-    del subject
     principle = rules.get("principle") if isinstance(rules, dict) else None
     allowed = (
         isinstance(principle, dict)
         and principle.get("execution_enabled") is True
     )
+    if allowed:
+        reason = (inspect_buy_execution_support(subject=subject, rules=rules)
+                  if callable(inspect_buy_execution_support) else "BUY_EXECUTION_SUPPORT_UNAVAILABLE")
+        if reason:
+            return _gate_result(False, reason, routine_identity, rules_identity)
+    if allowed and callable(inspect_buy_time_slice_continuation):
+        reason = inspect_buy_time_slice_continuation(subject=subject, rules=rules, project_root=Path(__file__).resolve().parents[2])
+        if reason:
+            return _gate_result(False, reason, routine_identity, rules_identity)
     return _gate_result(
         allowed,
         "ROUTINE_EXECUTION_ENABLED" if allowed else "ROUTINE_EXECUTION_DISABLED",
@@ -149,18 +159,79 @@ def evaluate_final_real_order_safety(
     rules_identity: str,
 ) -> dict[str, Any]:
     """Re-evaluate this routine's real-order rule from current effective rules."""
-    del subject
     safety = rules.get("safety") if isinstance(rules, dict) else None
     allowed = (
         isinstance(safety, dict)
         and safety.get("real_order_allowed") is True
     )
+    if allowed:
+        reason = (inspect_buy_execution_support(subject=subject, rules=rules)
+                  if callable(inspect_buy_execution_support) else "BUY_EXECUTION_SUPPORT_UNAVAILABLE")
+        if reason:
+            return _gate_result(False, reason, routine_identity, rules_identity)
+    if allowed and callable(inspect_buy_time_slice_continuation):
+        reason = inspect_buy_time_slice_continuation(subject=subject, rules=rules, project_root=Path(__file__).resolve().parents[2])
+        if reason:
+            return _gate_result(False, reason, routine_identity, rules_identity)
     return _gate_result(
         allowed,
         "ROUTINE_REAL_ORDER_ALLOWED" if allowed else "ROUTINE_REAL_ORDER_NOT_ALLOWED",
         routine_identity,
         rules_identity,
     )
+
+
+def _matching_buy_exit_evidence(
+    records: Any,
+    *,
+    code: str,
+    routine_instance_id: str,
+    cycle_identity: str,
+) -> list[dict[str, Any]]:
+    """Return only completion evidence owned by this exact BUY cycle."""
+    if not isinstance(records, list) or not str(cycle_identity or "").strip():
+        return []
+    expected_code = str(code or "").strip()
+    expected_routine = str(routine_instance_id or "").strip()
+    expected_cycle = str(cycle_identity or "").strip()
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict) or str(record.get("code") or "").strip() != expected_code:
+            continue
+        evidence = record.get("buy_exit_evidence")
+        if not isinstance(evidence, dict) or evidence.get("buy_phase_completed") is not True:
+            continue
+        record_id = str(record.get("id") or "").strip()
+        intents = [item for item in record.get("execution_intents", []) if isinstance(item, dict)]
+        direct_intent = record.get("execution_intent")
+        if isinstance(direct_intent, dict) and direct_intent not in intents:
+            intents.append(direct_intent)
+        record_routine_ids = {
+            str(record.get("routine_instance_id") or "").strip(),
+            *(str(item.get("routine_instance_id") or "").strip() for item in intents),
+        }
+        record_routine_ids.discard("")
+        record_cycle_ids = {
+            str(record.get("cycle_identity") or "").strip(),
+            *(str(item.get("cycle_identity") or "").strip() for item in intents),
+        }
+        record_cycle_ids.discard("")
+        record_process_ids = {
+            str(item.get("execution_process_id") or "").strip()
+            for item in intents
+            if str(item.get("execution_process_id") or "").strip()
+        }
+        if (
+            record_routine_ids != {expected_routine}
+            or record_cycle_ids != {expected_cycle}
+            or str(evidence.get("routine_instance_id") or "").strip() != expected_routine
+            or str(evidence.get("cycle_identity") or "").strip() != expected_cycle
+            or str(evidence.get("source_signal_id") or "").strip() != record_id
+            or str(evidence.get("execution_process_id") or "").strip() not in record_process_ids
+        ):
+            continue
+        candidates.append(evidence)
+    return candidates
 
 
 def project_cycle_context(
@@ -184,13 +255,35 @@ def project_cycle_context(
             "cycle_ended": False,
             "unresolved_reason": "CYCLE_PROJECTION_IMPORT_FAILED",
         }
-    return project_indicator_follow_cycle(
+    projection = project_indicator_follow_cycle(
         code=code,
         routine_instance_id=routine_instance_id,
         order_queue=order_queue,
         fills=fills,
         positions=positions,
     )
+    # BUY phase completion is canonical signal evidence written by the
+    # existing consumer.  Project it read-only into the cycle so a future BUY
+    # signal is blocked without introducing another runtime writer/state file.
+    try:
+        signals_path = Path(__file__).resolve().parents[2] / "runtime" / "routine_signals.json"
+        root = json.loads(signals_path.read_text(encoding="utf-8"))
+        records = root.get("signals") if isinstance(root, dict) else None
+        current_cycle_identity = str(projection.get("cycle_identity") or "").strip()
+        if isinstance(records, list) and current_cycle_identity:
+            candidates = _matching_buy_exit_evidence(
+                records,
+                code=code,
+                routine_instance_id=routine_instance_id,
+                cycle_identity=current_cycle_identity,
+            )
+            if candidates:
+                evidence = candidates[-1]
+                projection["buy_phase_completed"] = True
+                projection["buy_exit_evidence"] = evidence
+    except Exception:
+        pass
+    return projection
 
 
 def get_routine_info() -> dict[str, Any]:
@@ -304,6 +397,11 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
                 result["reason"] = "매매사이클 체결 상태를 확인할 수 없어 BUY를 차단합니다."
                 result["buy_execution_blocked"] = True
                 result["buy_execution_blocked_reason"] = cycle.get("unresolved_reason")
+            elif cycle.get("buy_phase_completed") is True or cycle.get("buy_exit_evidence"):
+                result["signal"] = None
+                result["buy_execution_blocked"] = True
+                result["buy_execution_blocked_reason"] = "BUY_PHASE_COMPLETED"
+                result["buy_execution_policy_status"] = "BLOCKED"
             else:
                 confirmed_round = cycle.get("confirmed_buy_round")
                 cumulative_amount = cycle.get("cumulative_filled_buy_amount")
@@ -326,6 +424,9 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
                     )
                     if execution.get("status") == "READY":
                         result["execution_intent"] = execution.get("execution_intent")
+                        execution_intents = execution.get("execution_intents")
+                        if isinstance(execution_intents, list) and execution_intents:
+                            result["execution_intents"] = execution_intents
                         result["buy_execution_policy_status"] = "READY"
                     else:
                         result["signal"] = None
@@ -345,6 +446,9 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
                 )
                 if execution.get("status") == "READY":
                     result["execution_intent"] = execution.get("execution_intent")
+                    execution_intents = execution.get("execution_intents")
+                    if isinstance(execution_intents, list) and execution_intents:
+                        result["execution_intents"] = execution_intents
                     result["sell_execution_policy_status"] = "READY"
                 else:
                     result["signal"] = None

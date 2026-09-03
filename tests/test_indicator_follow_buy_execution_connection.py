@@ -9,8 +9,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+import order_queue
+import routine_signal_consumer
 import routine_signal_queue
-from order_queue import signal_to_order_candidate
+from execution_preview_service import preview_execution_for_order
+from order_queue import signal_to_order_candidate, signal_to_order_candidates
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -242,52 +245,197 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
         self.assertEqual(150000, candidate["amount"])
         self.assertEqual(signal["execution_intent"], candidate["execution_intent"])
 
-    def test_multi_time_is_hash_only_while_multi_hoga_remains_single_candidate_metadata(self) -> None:
-        rules = self._rules()
+    def test_multi_hoga_materializes_one_process_with_balanced_children(self) -> None:
+        rules = self._rules(price_basis="ORDER_PRICE")
         base = rules["buy"]["execution"]["base"]
         base.update(
             {
                 "hoga_mode": "MULTI",
                 "hoga_up": 1,
                 "hoga_down": 1,
-                "point_mode": "MULTI_TIME",
-                "point_value": 1,
-                "point_unit": "MINUTE",
-                "point_range": "WITHIN",
-                "point_count": 3,
             }
         )
 
-        result = self._build(rules=rules, price=100)
-        intent = result["execution_intent"]
+        result = self._build(
+            rules=rules,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 10},
+            price=9_000,
+            actionable_price=None,
+        )
+        intents = result["execution_intents"]
 
         self.assertEqual("READY", result["status"])
-        self.assertEqual("MULTI", intent["hoga_mode"])
-        self.assertEqual(1, intent["hoga_up"])
-        self.assertEqual(1, intent["hoga_down"])
-        self.assertEqual(
-            {"approved_rule_hash", "runtime_state_hash", "calculation_hash", "policy_hash"},
-            set(intent["execution_snapshot"]),
-        )
-        for field in ("point_mode", "point_value", "point_unit", "point_range", "point_count"):
-            self.assertNotIn(field, intent)
+        self.assertEqual([0, 1, -1], [item["child_plan"]["hoga_offset_ticks"] for item in intents])
+        self.assertEqual([9_000, 9_010, 8_990], [item["price"] for item in intents])
+        self.assertEqual([4, 3, 3], [item["quantity"] for item in intents])
+        self.assertEqual([36_000, 27_030, 26_970], [item["budget"] for item in intents])
+        self.assertEqual(90_000, sum(item["budget"] for item in intents))
+        self.assertLessEqual(sum(item["budget"] for item in intents), 90_000)
 
-        candidate = signal_to_order_candidate(
-            {
-                "id": "SIGNAL-MULTI",
-                "routine": "지표추종매매",
-                "code": "005930",
-                "name": "삼성전자",
-                "signal": "BUY",
-                "status": "PENDING",
-                "execution_intent": {**intent, "source_signal_id": "SIGNAL-MULTI", "cycle_identity": "CYCLE-1"},
-            },
-            0,
+    def test_multi_hoga_fails_closed_when_round_budget_or_quantity_is_insufficient(self) -> None:
+        symmetric = self._rules(price_basis="ORDER_PRICE")
+        symmetric["buy"]["execution"]["base"].update(
+            {"hoga_mode": "MULTI", "hoga_up": 1, "hoga_down": 1}
         )
-        self.assertIsInstance(candidate, dict)
-        self.assertEqual("CANDIDATE_READY", candidate["candidate_status"])
-        self.assertEqual("MULTI", candidate["hoga_mode"])
-        self.assertEqual("SIGNAL-MULTI", candidate["source_signal_id"])
+        too_few = self._build(
+            rules=symmetric,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 2},
+            price=10_000,
+            actionable_price=None,
+        )
+        upward = self._rules(price_basis="ORDER_PRICE")
+        upward["buy"]["execution"]["base"].update(
+            {"hoga_mode": "MULTI", "hoga_up": 1, "hoga_down": 0}
+        )
+        over_budget = self._build(
+            rules=upward,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 2},
+            price=10_000,
+            actionable_price=None,
+        )
+
+        self.assertEqual("BUY_MULTI_HOGA_QUANTITY_BELOW_CHILD_COUNT", too_few["reason"])
+        self.assertEqual("BUY_MULTI_HOGA_ROUND_BUDGET_EXCEEDED", over_budget["reason"])
+
+    def test_multi_hoga_requires_order_price_and_queue_expands_unique_children(self) -> None:
+        realtime_rules = self._rules(price_basis="CURRENT_PRICE")
+        realtime_rules["buy"]["execution"]["base"].update(
+            {"hoga_mode": "MULTI", "hoga_up": 1, "hoga_down": 1}
+        )
+        blocked = self._build(
+            rules=realtime_rules,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 3},
+            price=10_000,
+        )
+        self.assertEqual("BUY_MULTI_HOGA_ORDER_PRICE_REQUIRED", blocked["reason"])
+
+        rules = self._rules(price_basis="ORDER_PRICE")
+        rules["buy"]["execution"]["base"].update(
+            {"hoga_mode": "MULTI", "hoga_up": 1, "hoga_down": 1}
+        )
+        routine = _load_module("routine.py", "indicator_follow_buy_multi_hoga_routine_test")
+        routine.evaluate_indicator_follow_routine = lambda candles, config, context: {"raw": True}
+        routine.signal_to_dict = lambda signal: {"signal": "BUY", "reason": "indicator"}
+        evaluated = routine.evaluate(
+            {
+                "candles": [],
+                "rules": rules,
+                "cycle": self._cycle(),
+                "stock_config": {"trade_amount_type": "QUANTITY", "buy_qty": 3},
+                "reference_price": 10_000,
+                "routine_instance_id": "INSTANCE_A",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_path = Path(tmpdir) / "routine_signals.json"
+            with mock.patch.object(routine_signal_queue, "QUEUE_PATH", queue_path):
+                queued = routine_signal_queue.enqueue_routine_signal(
+                    evaluated,
+                    routine="지표추종매매",
+                    code="005930",
+                    name="삼성전자",
+                    tick_key="TICK_MULTI",
+                )
+            signal = json.loads(queue_path.read_text(encoding="utf-8"))["signals"][0]
+            candidates = signal_to_order_candidates(signal, 1)
+
+        intents = signal["execution_intents"]
+        self.assertEqual("queued", queued["status"])
+        self.assertEqual(3, len(intents))
+        self.assertEqual({signal["id"]}, {item["source_signal_id"] for item in intents})
+        self.assertEqual(1, len({item["execution_process_id"] for item in intents}))
+        self.assertEqual(3, len({item["execution_id"] for item in intents}))
+        self.assertEqual(3, len(candidates))
+        self.assertTrue(all(item["candidate_status"] == "CANDIDATE_READY" for item in candidates))
+        self.assertEqual([10_000, 10_010, 9_990], [item["price"] for item in candidates])
+        self.assertEqual([10_000, 10_010, 9_990], [item["amount"] for item in candidates])
+        self.assertEqual([1, 2, 3], [item["child_sequence_index"] for item in intents])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            order_path = Path(tmpdir) / "order_queue.json"
+            with mock.patch.object(order_queue, "ORDER_QUEUE_PATH", order_path):
+                first = order_queue.append_order_candidates(candidates, backup=False)
+                replay = order_queue.append_order_candidates(candidates, backup=False)
+        self.assertEqual(3, first["orders_created"])
+        self.assertEqual(0, replay["orders_created"])
+        self.assertEqual(3, replay["duplicates"])
+
+        captured: list[dict] = []
+
+        def append_candidates(values):
+            captured.extend(values)
+            return {
+                "ok": True,
+                "orders_created": len(values),
+                "duplicates": 0,
+                "order_queue_written": True,
+                "created_orders": values,
+            }
+
+        policy = mock.Mock(
+            return_value={
+                "ok": True,
+                "reason": "",
+                "policy_checked": 3,
+                "policy_executable": 3,
+                "policy_blocked": 0,
+                "policy_errors": 0,
+                "policy_results": [{"status": "EXECUTABLE"}] * 3,
+            }
+        )
+        with mock.patch.object(
+            routine_signal_consumer,
+            "evaluate_routine_gate",
+            return_value={"allowed": True, "reason": "ROUTINE_EXECUTION_ENABLED"},
+        ), mock.patch.object(
+            routine_signal_consumer,
+            "read_order_queue",
+            return_value={"orders": []},
+        ), mock.patch.object(
+            routine_signal_consumer,
+            "append_order_candidates",
+            side_effect=append_candidates,
+        ), mock.patch.object(
+            routine_signal_consumer,
+            "_apply_operation_policy_to_created_orders",
+            policy,
+        ):
+            production = routine_signal_consumer._build_order_queue_candidates_for_signals(
+                [signal],
+                apply_approval=True,
+            )
+
+        self.assertEqual(3, production["orders_created"])
+        self.assertEqual(3, production["approved"])
+        self.assertEqual(3, production["policy_executable"])
+        self.assertTrue(all(item["approval_status"] == "APPROVED" for item in captured))
+        self.assertTrue(all(item["execution_enabled"] is False for item in captured))
+        policy.assert_called_once()
+
+        previews = []
+        for order in captured:
+            order["status"] = "REAL_READY"
+            order["execution_enabled"] = True
+            previews.append(
+                preview_execution_for_order(
+                    order,
+                    {
+                        "operator_confirmed": True,
+                        "real_trade_enabled": True,
+                        "account_no": "12345678",
+                    },
+                )
+            )
+        self.assertTrue(all(item["ok"] for item in previews), previews)
+        execution_candidates = [item["candidate_result"] for item in previews]
+        self.assertEqual(
+            1,
+            len({item["execution_process_id"] for item in execution_candidates}),
+        )
+        self.assertEqual(
+            3,
+            len({item["child_contract"]["execution_id"] for item in execution_candidates}),
+        )
 
 
 if __name__ == "__main__":

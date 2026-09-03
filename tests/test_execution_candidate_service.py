@@ -161,6 +161,56 @@ class ExecutionCandidateServiceTest(unittest.TestCase):
         self.assertEqual(original_approval, approval_result)
         self.assertEqual(original_context, context)
 
+    def test_preplanned_process_child_contract_is_preserved(self) -> None:
+        preview = self._preview_result()
+        request = preview["pipeline_result"]["pipeline"]["execution_request_preview"]["execution_request"]
+        request.update(
+            {
+                "execution_id": "EXEC_CHILD_PROCESS_001",
+                "execution_process_id": "EXEC_PROCESS_MULTI_1",
+                "child_sequence_index": 1,
+                "child_sequence_total": 5,
+                "child_kind": "HOGA_LEVEL",
+                "child_plan": {
+                    "planned_quantity": 3,
+                    "planned_price": 81_000,
+                    "hoga_offset_ticks": 0,
+                },
+                "execution_intent": {
+                    "side": "SELL",
+                    "routine_type": "INDICATOR_FOLLOW",
+                    "routine_instance_id": "INSTANCE-1",
+                    "source_signal_id": "SIG_1",
+                    "execution_mode": "MULTI_HOGA",
+                    "execution_process_owner_required": True,
+                    "provenance_approved_at": "2026-09-02T10:00:00+09:00",
+                    "planned_total_quantity": 13,
+                    "hoga_mode": "MULTI",
+                    "hoga_up": 2,
+                    "hoga_down": 2,
+                    "quantity": 3,
+                    "price_basis": "ORDER_PRICE",
+                    "price": 81_000,
+                    "hoga": "LIMIT",
+                },
+            }
+        )
+
+        result = build_execution_candidate(preview, self._approval_result())
+
+        self.assertTrue(result["candidate"], result)
+        self.assertEqual("EXEC_PROCESS_MULTI_1", result["execution_process_id"])
+        self.assertEqual("EXEC_CHILD_PROCESS_001", result["child_contract"]["execution_id"])
+        self.assertEqual("HOGA_LEVEL", result["child_contract"]["child_kind"])
+        self.assertEqual(1, result["child_contract"]["child_sequence_index"])
+        self.assertEqual(5, result["child_contract"]["child_sequence_total"])
+        self.assertEqual(0, result["child_contract"]["child_plan"]["hoga_offset_ticks"])
+        self.assertEqual(13, result["process_record"]["process_plan"]["planned_total_quantity"])
+        self.assertEqual(
+            "MULTI_HOGA",
+            result["process_record"]["option_snapshot"]["execution_mode"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

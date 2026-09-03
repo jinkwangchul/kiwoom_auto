@@ -21,7 +21,7 @@ from chejan_event_recorder import (
     mark_chejan_reconciliation_state,
 )
 from execution_fill_recorder import find_existing_execution_fill_record, record_execution_fill
-from execution_provenance_contract import validate_process_record
+from execution_provenance_contract import validate_child_set, validate_process_record
 from operation_close_completion_check_service import (
     SOURCE_STARTUP_RECOVERY,
     check_global_close_completion_after_durable_update,
@@ -97,6 +97,59 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except Exception:
         return 0
+
+
+def _is_durable_pending_deferred_child_plan(signal: Any) -> bool:
+    """Recognize a structurally complete deferred-child plan during startup audit."""
+    if not isinstance(signal, dict):
+        return False
+    signal_id = _clean_text(signal.get("id"))
+    intents = signal.get("execution_intents")
+    if not signal_id or not isinstance(intents, list) or not intents:
+        return False
+    modes = {
+        (
+            _clean_text(intent.get("execution_mode")).upper(),
+            _clean_text(intent.get("child_kind")).upper(),
+        )
+        for intent in intents
+        if isinstance(intent, dict)
+    }
+    if (
+        any(not isinstance(intent, dict) for intent in intents)
+        or modes not in ({("MULTI_TIME", "TIME_SLICE")}, {("MULTI_RATIO", "RATIO_SLICE")})
+        or any(
+            _clean_text(intent.get("source_signal_id")) != signal_id
+            for intent in intents
+        )
+    ):
+        return False
+    process_ids = {
+        _clean_text(intent.get("execution_process_id")) for intent in intents
+    }
+    if len(process_ids) != 1 or "" in process_ids or validate_child_set(intents):
+        return False
+    if modes == {("MULTI_TIME", "TIME_SLICE")}:
+        for intent in intents:
+            child_plan = _as_dict(intent.get("child_plan"))
+            scheduled_at = _clean_text(child_plan.get("scheduled_at"))
+            try:
+                datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+    else:
+        plan_hashes = {
+            json.dumps(
+                _as_dict(intent.get("multi_ratio_plan")),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for intent in intents
+        }
+        if len(plan_hashes) != 1 or plan_hashes == {"{}"}:
+            return False
+    return True
 
 
 def _read_json(path: str | Path) -> tuple[dict[str, Any] | None, str]:
@@ -761,6 +814,7 @@ def assess_startup_recovery(
                 "request_hash",
                 "lock_id",
                 "execution_process_id",
+                "plan_generation",
                 "child_sequence_index",
                 "child_sequence_total",
                 "child_kind",
@@ -820,6 +874,8 @@ def assess_startup_recovery(
         signal_id = _clean_text(signal.get("id")) or "unknown signal"
         signal_status = _clean_text(signal.get("status")).upper()
         if signal_status in {"PENDING", "PREVIEWED", "READY", "ORDER_QUEUED", "ERROR"}:
+            if signal_status == "PENDING" and _is_durable_pending_deferred_child_plan(signal):
+                continue
             review_reasons.append(
                 f"{signal_id}: unfinished routine signal status {signal_status or 'UNKNOWN'}"
             )

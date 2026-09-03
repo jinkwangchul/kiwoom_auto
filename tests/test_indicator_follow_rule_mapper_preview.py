@@ -198,7 +198,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self._build_preview()
 
         self.assertEqual(result["validation_warnings"], [])
-        self.assertEqual(len(result["postponed"]), 8)
+        self.assertEqual(len(result["postponed"]), 7)
         self.assertEqual(len(result["legacy_notices"]), 2)
         self.assertEqual(result["warnings"], result["validation_warnings"] + result["postponed"])
         self.assertTrue(all("legacy" not in warning.lower() for warning in result["warnings"]))
@@ -3573,6 +3573,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "point_unit": "MINUTE",
             "point_range": "WITHIN",
             "point_count": 4,
+            "time_order_price_basis": "CURRENT_PRICE",
             "ratio_left": "ORDER_PRICE",
             "ratio_right": "AVG_PRICE",
             "ratio_direction": "UP",

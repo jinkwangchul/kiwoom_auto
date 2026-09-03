@@ -37,7 +37,7 @@ STEP 6-B: 루틴 신호 큐 저장 모듈.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import msvcrt
@@ -48,6 +48,8 @@ import threading
 import time
 from typing import Any, Callable
 from uuid import uuid4
+
+from execution_provenance_contract import materialize_execution_intent_children
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -84,6 +86,41 @@ _DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _materialize_time_slice_schedule(
+    execution_intents: list[dict[str, Any]],
+    *,
+    created_at: str,
+) -> list[dict[str, Any]]:
+    modes = {
+        str(item.get("execution_mode") or "").strip().upper()
+        for item in execution_intents
+    }
+    if modes != {"MULTI_TIME"}:
+        return execution_intents
+    try:
+        anchor = datetime.fromisoformat(created_at)
+    except ValueError as exc:
+        raise ValueError("TIME_SLICE_SCHEDULE_ANCHOR_INVALID") from exc
+    materialized: list[dict[str, Any]] = []
+    for item in execution_intents:
+        intent = deepcopy(item)
+        child_plan = intent.get("child_plan")
+        if not isinstance(child_plan, dict):
+            raise ValueError("TIME_SLICE_CHILD_PLAN_INVALID")
+        offset = child_plan.get("scheduled_offset_ms")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("TIME_SLICE_OFFSET_INVALID")
+        scheduled_at = anchor + timedelta(milliseconds=offset)
+        child_plan = deepcopy(child_plan)
+        child_plan["schedule_anchor_at"] = created_at
+        child_plan["scheduled_at"] = scheduled_at.isoformat(timespec="milliseconds")
+        intent["child_plan"] = child_plan
+        intent["schedule_anchor_at"] = created_at
+        intent["scheduled_at"] = child_plan["scheduled_at"]
+        materialized.append(intent)
+    return materialized
 
 
 def _empty_queue() -> dict[str, Any]:
@@ -474,9 +511,27 @@ def enqueue_routine_signal(
                 record[field] = value
         if isinstance(result.get("execution_intent"), dict):
             record["execution_intent"] = deepcopy(result["execution_intent"])
+        if isinstance(result.get("execution_intents"), list) and result["execution_intents"]:
+            record["execution_intents"] = deepcopy(result["execution_intents"])
 
         dedupe_key = _make_dedupe_key(record)
         for old in signals:
+            # A deferred BUY plan still owns its round between terminal child
+            # orders. Do not admit a second signal simply because no child is
+            # open at this instant. This is inside the existing queue lock.
+            old_intent = old.get("execution_intent") or {}
+            new_intent = record.get("execution_intent") or {}
+            if (
+                signal == "BUY" and old.get("status") == STATUS_PENDING
+                and old.get("code") == code
+                and isinstance(old_intent, dict) and isinstance(new_intent, dict)
+                and old_intent.get("side") == "BUY"
+                and old_intent.get("execution_mode") in {"MULTI_TIME", "MULTI_RATIO"}
+                and old_intent.get("routine_instance_id") == new_intent.get("routine_instance_id")
+                and isinstance(old.get("execution_intents"), list) and old["execution_intents"]
+            ):
+                return False, {"status": "duplicate", "reason": "BUY_DEFERRED_PLAN_PENDING",
+                               "path": str(QUEUE_PATH), "id": old.get("id", "")}
             if _make_dedupe_key(old) == dedupe_key:
                 return False, {
                     "status": "duplicate",
@@ -491,6 +546,23 @@ def enqueue_routine_signal(
         )
         existing_ids = {str(item.get("id", "")) for item in signals}
         record["id"] = base_id if base_id not in existing_ids else f"{base_id}_{uuid4().hex[:8]}"
+        execution_intents = record.get("execution_intents")
+        if isinstance(execution_intents, list) and execution_intents:
+            for execution_intent in execution_intents:
+                if not isinstance(execution_intent, dict):
+                    raise ValueError("execution_intents must contain only objects")
+                if not str(execution_intent.get("cycle_identity") or "").strip():
+                    execution_intent["cycle_identity"] = f"CYCLE_{record['id']}"
+            execution_intents = _materialize_time_slice_schedule(
+                execution_intents,
+                created_at=created_at,
+            )
+            materialized = materialize_execution_intent_children(
+                execution_intents,
+                source_signal_id=record["id"],
+            )
+            record["execution_intents"] = materialized
+            record["execution_intent"] = deepcopy(materialized[0])
         execution_intent = record.get("execution_intent")
         if isinstance(execution_intent, dict) and not str(
             execution_intent.get("source_signal_id") or ""

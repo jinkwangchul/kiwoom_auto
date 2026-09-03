@@ -365,6 +365,7 @@ class ExecutionProvenancePersistenceTest(unittest.TestCase):
                     "order_queued_id": "ORDER_QUEUED_1",
                     "execution_id": "EXEC_1",
                     "execution_process_id": "PROCESS_1",
+                    "plan_generation": 2,
                     "execution_trade_date": "2026-09-01",
                     "request_hash": "HASH_1",
                     "lock_id": "LOCK_1",
@@ -375,6 +376,7 @@ class ExecutionProvenancePersistenceTest(unittest.TestCase):
             )
             self.assertTrue(result["fill_recorded"])
             self.assertEqual("PROCESS_1", result["fill_record"]["execution_process_id"])
+            self.assertEqual(2, result["fill_record"]["plan_generation"])
             self.assertEqual("EXACT", result["fill_record"]["execution_time_quality"])
 
     def test_fid_908_malformed_uses_received_at_approximation(self) -> None:

@@ -114,6 +114,34 @@ class ExecutionRuntimeWritePreviewTest(unittest.TestCase):
     def _existing_executions(self) -> dict:
         return default_order_executions_data()
 
+    def test_plan_generation_is_preserved_in_execution_record(self) -> None:
+        catalog = self._catalog()
+        catalog["provenance"] = {
+            "execution_process_id": "PROCESS_1",
+            "plan_generation": 2,
+            "child_sequence_index": 1,
+            "child_sequence_total": 1,
+            "child_kind": "HOGA_LEVEL",
+            "child_plan": {"planned_quantity": 1, "hoga_offset_ticks": 0},
+            "option_snapshot_hash": "SNAPSHOT_HASH_1",
+        }
+
+        existing_executions = self._existing_executions()
+        existing_executions["processes"].append(
+            {
+                "execution_process_id": "PROCESS_1",
+                "option_snapshot_hash": "SNAPSHOT_HASH_1",
+            }
+        )
+        result = build_execution_runtime_write_preview(
+            catalog,
+            existing_order_executions_data=existing_executions,
+            existing_order_locks_data=default_order_locks_data(),
+        )
+
+        self.assertEqual("READY", result["status"], result)
+        self.assertEqual(2, result["execution_record_preview"]["plan_generation"])
+
     def _existing_locks(self) -> dict:
         return default_order_locks_data()
 

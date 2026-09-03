@@ -764,6 +764,12 @@ class AutoTradeOperationHost(QObject):
             **kwargs,
         )
 
+    def queue_open_order_cancel_automatically(self, *args, **kwargs):
+        return self._order_execution_boundary.queue_open_order_cancel_automatically(
+            *args,
+            **kwargs,
+        )
+
     def process_executable_order_for_auto_trade(self, *args, **kwargs):
         return self._order_execution_boundary.process_executable_order_for_auto_trade(
             *args,

@@ -145,6 +145,7 @@ def _execution_record(catalog: dict[str, Any]) -> dict[str, Any]:
     provenance = _as_dict(catalog.get("provenance"))
     for field in (
         "execution_process_id",
+        "plan_generation",
         "child_sequence_index",
         "child_sequence_total",
         "child_kind",

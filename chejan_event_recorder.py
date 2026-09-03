@@ -484,6 +484,7 @@ def existing_chejan_record_result(
         "lock_id": _clean_text(record.get("lock_id")),
         "execution_id": _clean_text(record.get("execution_id")),
         "execution_process_id": _clean_text(record.get("execution_process_id")),
+        "plan_generation": record.get("plan_generation", 0),
         "execution_trade_date": _clean_text(record.get("execution_trade_date")),
         "event_identity": _clean_text(matched_event.get("event_identity")),
         "event_identity_source": _clean_text(matched_event.get("event_identity_source")),
@@ -780,6 +781,7 @@ def _apply_acceptance(
     event_identity: str,
     received_at: str,
 ) -> None:
+    first_broker_accepted_at = _clean_text(record.get("broker_accepted_at")) or received_at
     record.update(
         {
             "status": "BROKER_ACCEPTED",
@@ -787,7 +789,7 @@ def _apply_acceptance(
             "broker_result_known": True,
             "broker_accepted": True,
             "broker_rejected": False,
-            "broker_accepted_at": received_at,
+            "broker_accepted_at": first_broker_accepted_at,
             "broker_accept_event_id": _event_id(event_identity),
             "send_uncertain": False,
             "manual_reconciliation_required": False,
@@ -1163,6 +1165,7 @@ def record_chejan_event(
                         "execution_process_id": _clean_text(
                             updated_record.get("execution_process_id")
                         ),
+                        "plan_generation": updated_record.get("plan_generation", 0),
                         "execution_trade_date": _clean_text(
                             updated_record.get("execution_trade_date")
                         ),
@@ -1198,6 +1201,7 @@ def record_chejan_event(
                 "execution_process_id": _clean_text(
                     updated_record.get("execution_process_id")
                 ),
+                "plan_generation": updated_record.get("plan_generation", 0),
                 "execution_trade_date": _clean_text(
                     updated_record.get("execution_trade_date")
                 ),
@@ -1247,6 +1251,7 @@ def record_chejan_event(
         "event_identity_source": mutation_state["event_identity_source"],
         "execution_id": mutation_state["execution_id"],
         "execution_process_id": mutation_state.get("execution_process_id", ""),
+        "plan_generation": mutation_state.get("plan_generation", 0),
         "execution_trade_date": mutation_state.get("execution_trade_date", ""),
         "request_hash": mutation_state["request_hash"],
         "lock_id": mutation_state["lock_id"],

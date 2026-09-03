@@ -42,6 +42,7 @@ from event_journal_production import (
 )
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
 from routine_package_contract import EVALUATION_ROLE, load_routine_module
+from gui_stock_data import find_library_stock_by_code
 from gui_operation_ui_context import actionable_current_price
 from order_candidate_engine import read_reference_price
 from running_budget_adjustment import (
@@ -420,6 +421,14 @@ def probe_routine_for_stock(
                 "routine_instance_id": routine_instance_id,
                 "routine_type": routine_type,
             }
+            library_stock = find_library_stock_by_code(code)
+            if isinstance(library_stock, dict):
+                classification = str(library_stock.get("classification") or "").strip()
+                market = str(library_stock.get("market") or "").strip()
+                if classification:
+                    context["instrument_classification"] = classification
+                if market:
+                    context["market"] = market
             if isinstance(account_budget_context, dict):
                 context["account_budget"] = dict(account_budget_context)
             provenance = {

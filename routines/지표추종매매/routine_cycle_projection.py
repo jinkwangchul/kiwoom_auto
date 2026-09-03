@@ -230,14 +230,45 @@ def project_indicator_follow_cycle(
     if position_issue:
         return _unresolved(position_issue)
 
+    # The canonical queue retains the source candidate beside its dispatch
+    # projection. Collapse only an explicit order_id -> source id link with
+    # identical execution/provenance; unrelated alias collisions still block.
+    dispatch_by_source: dict[str, list[dict[str, Any]]] = {}
+    for item in orders:
+        if isinstance(item, dict) and isinstance(item.get("execution_request"), dict):
+            dispatch_by_source.setdefault(_clean(item.get("order_id")), []).append(item)
+    projected_orders: list[dict[str, Any]] = []
+    aliases_by_projection: dict[int, list[str]] = {}
+    for item in orders:
+        if not isinstance(item, dict):
+            return _unresolved("ORDER_QUEUE_ENTRY_INVALID", holding_qty=holding_qty, avg_price=avg_price)
+        projected = item
+        matches = dispatch_by_source.get(_clean(item.get("id")), [])
+        if len(matches) == 1:
+            dispatch = matches[0]
+            identity_fields = (
+                "routine_type", "routine_instance_id", "side", "cycle_identity",
+                "source_signal_id", "execution_process_id", "execution_id",
+                "buy_phase", "buy_round", "child_kind", "child_sequence_index",
+                "child_sequence_total", "plan_generation", "quantity",
+            )
+            if (_clean(item.get("execution_id"))
+                    and item.get("execution_id") == dispatch.get("execution_id")
+                    and all(_order_intent(item).get(key) == _order_intent(dispatch).get(key)
+                            for key in identity_fields)):
+                projected = dispatch
+        aliases_by_projection.setdefault(id(projected), []).extend(_order_aliases(item))
+        if not any(projected is previous for previous in projected_orders):
+            projected_orders.append(projected)
+
     alias_map: dict[str, dict[str, Any]] = {}
     ambiguous_aliases: set[str] = set()
     target_orders: list[dict[str, Any]] = []
-    for raw_order in orders:
+    for raw_order in projected_orders:
         if not isinstance(raw_order, dict):
             return _unresolved("ORDER_QUEUE_ENTRY_INVALID", holding_qty=holding_qty, avg_price=avg_price)
         order = raw_order
-        for alias in _order_aliases(order):
+        for alias in aliases_by_projection[id(order)]:
             if alias in alias_map and alias_map[alias] is not order:
                 ambiguous_aliases.add(alias)
             else:
@@ -271,6 +302,7 @@ def project_indicator_follow_cycle(
         if pending_identity and pending_identity not in pending_buy_order_identities:
             pending_buy_order_identities.append(pending_identity)
     cumulative_by_order: dict[str, int] = {}
+    round_processes: dict[int, tuple[str, str, str]] = {}
     ledger_qty = 0
     active = False
     confirmed_round = 0
@@ -331,6 +363,7 @@ def project_indicator_follow_cycle(
                             return _unresolved("BASE_CYCLE_BOUNDARY_UNRESOLVED", holding_qty=holding_qty, avg_price=avg_price)
                         active = True
                         confirmed_round = 0
+                        round_processes = {}
                         cumulative_buy_amount = 0.0
                         filled_buy_amount_by_round = {}
                         last_buy_identity = None
@@ -338,11 +371,23 @@ def project_indicator_follow_cycle(
                         partial_sell = False
                         cycle_ended = False
                     expected_round = confirmed_round + 1
-                    if planned_round != expected_round:
+                    process_identity = (
+                        _clean(intent.get("execution_process_id")),
+                        _clean(intent.get("source_signal_id")),
+                        _clean(intent.get("cycle_identity")),
+                    )
+                    same_round_child = (
+                        planned_round == confirmed_round
+                        and all(process_identity)
+                        and round_processes.get(planned_round) == process_identity
+                        and intent.get("child_kind") in {"HOGA_LEVEL", "TIME_SLICE", "RATIO_SLICE"}
+                    )
+                    if planned_round != expected_round and not same_round_child:
                         return _unresolved("BUY_ROUND_SEQUENCE_MISMATCH", holding_qty=holding_qty, avg_price=avg_price)
                     if phase != ("BASE" if planned_round == 1 else "REPEAT"):
                         return _unresolved("BUY_PHASE_ROUND_MISMATCH", holding_qty=holding_qty, avg_price=avg_price)
                     confirmed_round = planned_round
+                    round_processes[planned_round] = process_identity
                     last_buy_identity = order_key
                     if cycle_identity is None:
                         cycle_identity = _clean(intent.get("cycle_identity")) or order_key

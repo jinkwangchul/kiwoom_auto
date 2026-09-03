@@ -487,6 +487,7 @@ def _fill_record(
         "order_queued_id": _clean_text(result.get("order_queued_id")),
         "execution_id": _clean_text(result.get("execution_id")),
         "execution_process_id": _clean_text(result.get("execution_process_id")),
+        "plan_generation": result.get("plan_generation", 0),
         "request_hash": _clean_text(result.get("request_hash")),
         "lock_id": _clean_text(result.get("lock_id")),
         "account_no": _clean_text(event.get("account_no")),

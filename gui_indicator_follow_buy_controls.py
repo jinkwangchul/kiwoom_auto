@@ -602,6 +602,11 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             # 제한시간 비활성 조건을 유지하기 위한 안전 참조.
             self._buy_cycle_time_combo = cycle_time_combo
             self._buy_cycle_situation_combo = cycle_situation_combo
+            self.buy_cycle_column_widget = cycle_column
+            cycle_column.setEnabled(False)
+            cycle_column.setToolTip("현재 지원되지 않는 설정입니다.")
+            for widget in cycle_column.findChildren(QWidget):
+                widget.setToolTip("현재 지원되지 않는 설정입니다.")
 
             # 이탈조건 박스가 별도 호출에서 이미 만들어졌거나 이후 만들어지는 경우를 모두 처리한다.
             # 로컬 클로저 참조가 아니라 등록된 updater를 호출해 제한시간 활성조건을 동기화한다.

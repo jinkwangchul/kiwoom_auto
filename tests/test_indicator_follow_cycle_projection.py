@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 import unittest
 
 
@@ -12,6 +13,19 @@ SPEC = importlib.util.spec_from_file_location("indicator_follow_cycle_projection
 assert SPEC is not None and SPEC.loader is not None
 projection = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(projection)
+
+ROUTINE_DIR = MODULE_PATH.parent
+ROUTINE_SPEC = importlib.util.spec_from_file_location(
+    "indicator_follow_routine_cycle_identity_test",
+    ROUTINE_DIR / "routine.py",
+)
+assert ROUTINE_SPEC is not None and ROUTINE_SPEC.loader is not None
+routine_module = importlib.util.module_from_spec(ROUTINE_SPEC)
+sys.path.insert(0, str(ROUTINE_DIR))
+try:
+    ROUTINE_SPEC.loader.exec_module(routine_module)
+finally:
+    sys.path.remove(str(ROUTINE_DIR))
 
 
 class IndicatorFollowCycleProjectionTest(unittest.TestCase):
@@ -94,6 +108,20 @@ class IndicatorFollowCycleProjectionTest(unittest.TestCase):
         self.assertFalse(result["active"])
         self.assertEqual(0, result["confirmed_buy_round"])
 
+    def test_sibling_children_confirm_one_round_and_sum_actual_fills(self):
+        for kind in ("TIME_SLICE", "HOGA_LEVEL"):
+            with self.subTest(kind=kind):
+                orders = [self._order(f"Q{i}") for i in (1, 2, 3)]
+                for order in orders:
+                    order["execution_intent"].update(execution_process_id="PROCESS", source_signal_id="SIGNAL", cycle_identity="CYCLE", child_kind=kind)
+                fills = [self._fill(f"Q{i}", cumulative=q, price=100, timestamp=f"2026-08-07 09:3{i}:00") for i, q in ((1, 4), (2, 3), (3, 3))]
+                result = self._project(orders, fills, 10)
+                self.assertEqual("resolved", result["status"], result)
+                self.assertEqual(1, result["confirmed_buy_round"])
+                self.assertEqual(1000, result["cumulative_filled_buy_amount"])
+                orders[1]["execution_intent"]["execution_process_id"] = "OTHER"
+                self.assertEqual("BUY_ROUND_SEQUENCE_MISMATCH", self._project(orders, fills, 10)["unresolved_reason"])
+
     def test_base_first_fill_confirms_round_one(self) -> None:
         result = self._project(
             [self._order("Q1")],
@@ -105,6 +133,20 @@ class IndicatorFollowCycleProjectionTest(unittest.TestCase):
         self.assertEqual(1, result["confirmed_buy_round"])
         self.assertEqual(300, result["cumulative_filled_buy_amount"])
         self.assertEqual("Q1", result["last_buy_order_identity"])
+
+    def test_source_candidate_and_dispatch_are_one_execution_not_pending_twice(self):
+        from copy import deepcopy
+        source = self._order("SOURCE", status="EXECUTABLE")
+        source.pop("broker_order_no")
+        dispatch = deepcopy(source)
+        dispatch.update(id="DISPATCH", order_id="SOURCE", status="FILLED",
+                        broker_order_no="BRK_DISPATCH", execution_request={})
+        fill = self._fill("DISPATCH", cumulative=4, price=100)
+        result = self._project([source, dispatch], [fill], 4)
+        self.assertEqual("resolved", result["status"], result)
+        self.assertEqual([], result["pending_buy_rounds"])
+        dispatch["execution_intent"]["buy_round"] = 2
+        self.assertEqual("unresolved", self._project([source, dispatch], [fill], 4)["status"])
 
     def test_same_order_partial_fills_keep_round_and_use_delta_amount(self) -> None:
         result = self._project(
@@ -251,6 +293,44 @@ class IndicatorFollowCycleProjectionTest(unittest.TestCase):
         result = self._project([order], [self._fill("Q1", cumulative=1, price=100)], 1)
         self.assertEqual("unresolved", result["status"])
         self.assertEqual("BUY_PROVENANCE_INCOMPLETE", result["unresolved_reason"])
+
+    def test_buy_exit_evidence_is_scoped_to_exact_cycle_and_process(self) -> None:
+        def record(cycle: str, process: str) -> dict:
+            signal_id = f"SIGNAL-{cycle}"
+            return {
+                "id": signal_id,
+                "code": "005930",
+                "routine_instance_id": "INSTANCE_A",
+                "cycle_identity": cycle,
+                "execution_intents": [{
+                    "routine_instance_id": "INSTANCE_A",
+                    "cycle_identity": cycle,
+                    "execution_process_id": process,
+                }],
+                "buy_exit_evidence": {
+                    "buy_phase_completed": True,
+                    "routine_instance_id": "INSTANCE_A",
+                    "cycle_identity": cycle,
+                    "source_signal_id": signal_id,
+                    "execution_process_id": process,
+                },
+            }
+
+        old = record("CYCLE-A", "PROCESS-A")
+        current = record("CYCLE-B", "PROCESS-B")
+        matches = routine_module._matching_buy_exit_evidence(
+            [old, current], code="005930", routine_instance_id="INSTANCE_A",
+            cycle_identity="CYCLE-B",
+        )
+        self.assertEqual([current["buy_exit_evidence"]], matches)
+        self.assertEqual([], routine_module._matching_buy_exit_evidence(
+            [old], code="005930", routine_instance_id="INSTANCE_A",
+            cycle_identity="CYCLE-B",
+        ))
+        self.assertEqual([], routine_module._matching_buy_exit_evidence(
+            [current], code="005930", routine_instance_id="OTHER-INSTANCE",
+            cycle_identity="CYCLE-B",
+        ))
 
 
 if __name__ == "__main__":

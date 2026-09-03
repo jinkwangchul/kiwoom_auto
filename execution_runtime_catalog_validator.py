@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from execution_provenance_contract import validate_child_contract
 from execution_runtime_catalog_preview import CATALOG_TYPE
 
 
@@ -101,8 +102,18 @@ def validate_execution_runtime_catalog_preview(catalog_preview: Any) -> dict[str
         ):
             if provenance.get(field) in (None, ""):
                 issues.append(f"MISSING_PROVENANCE_{field.upper()}")
-        if provenance.get("child_sequence_index") != 1 or provenance.get("child_sequence_total") != 1:
-            issues.append("ONLY_SINGLE_CHILD_PROVENANCE_IS_SUPPORTED")
+        child_issues = validate_child_contract(
+            {
+                "execution_process_id": provenance.get("execution_process_id"),
+                "execution_id": catalog_preview.get("execution_id"),
+                "plan_generation": provenance.get("plan_generation"),
+                "child_sequence_index": provenance.get("child_sequence_index"),
+                "child_sequence_total": provenance.get("child_sequence_total"),
+                "child_kind": provenance.get("child_kind"),
+                "child_plan": provenance.get("child_plan"),
+            }
+        )
+        issues.extend(f"INVALID_CHILD_PROVENANCE:{issue}" for issue in child_issues)
 
     return _result(
         valid=not issues,

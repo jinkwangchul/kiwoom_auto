@@ -205,6 +205,18 @@ class AccountAutoTradeBudgetConsumptionTests(unittest.TestCase):
             )
         self.assertFalse(result["available"])
 
+    def test_same_signal_children_reserve_independently_and_terminal_sibling_does_not_hide_open(self):
+        first = self._order(quantity=4, price=100, broker_order_no="ONE")
+        second = self._order(quantity=3, price=110, broker_order_no="TWO")
+        for index, order in enumerate((first, second), 1):
+            order["source_signal_id"] = "SAME_SIGNAL"
+            order["execution_id"] = f"CHILD_{index}"
+        result = self._project([], [first, second])
+        self.assertEqual(730, result["open_buy_reservation"])
+        first["status"] = "FILLED"
+        result = self._project([], [first, second])
+        self.assertEqual(330, result["open_buy_reservation"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,15 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def plan_generation(value: Any) -> int:
+    """Read the optional generation field; legacy records belong to generation 0."""
+    if value in (None, ""):
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("INVALID_PLAN_GENERATION")
+    return value
+
+
 def canonical_normalize(value: Any) -> Any:
     """Return a JSON-stable copy while removing absent optional values."""
     if isinstance(value, dict):
@@ -111,7 +120,7 @@ def build_option_snapshot(execution_request: Any, *, approved_at: str) -> dict[s
         ),
         "source_kind": source_kind,
         "side": intent.get("side") or _as_dict(request.get("request_preview")).get("side"),
-        "execution_mode": "SINGLE",
+        "execution_mode": intent.get("execution_mode") or "SINGLE",
         "policy_name": intent.get("policy_name"),
         "policy_version": intent.get("policy_version"),
         "policy_hash": policy_evidence.get("policy_hash"),
@@ -120,6 +129,7 @@ def build_option_snapshot(execution_request: Any, *, approved_at: str) -> dict[s
         "calculation_hash": policy_evidence.get("calculation_hash"),
         "buy_phase": intent.get("buy_phase"),
         "buy_round": intent.get("buy_round"),
+        "unfilled_timeout_policy": intent.get("unfilled_timeout_policy"),
     }
     if source_kind == SOURCE_OPERATION_COMMAND:
         snapshot["source_command_id"] = request.get("source_command_id")
@@ -141,10 +151,15 @@ def build_process_plan(execution_request: Any) -> dict[str, Any]:
     request = _as_dict(execution_request)
     intent = _as_dict(request.get("execution_intent"))
     request_preview = _as_dict(request.get("request_preview"))
+    multi_plan = (_as_dict(intent.get("multi_time_plan")) or _as_dict(intent.get("multi_hoga_plan"))
+                  or _as_dict(intent.get("multi_ratio_plan")))
     return canonical_normalize(
         {
-            "approved_budget": intent.get("budget"),
-            "planned_total_quantity": intent.get("quantity", request_preview.get("quantity")),
+            "approved_budget": multi_plan.get("approved_round_budget", intent.get("budget")),
+            "planned_total_quantity": intent.get(
+                "planned_total_quantity",
+                intent.get("quantity", request_preview.get("quantity")),
+            ),
             "price_basis": intent.get("price_basis"),
             "execution_trade_date": (
                 intent.get("execution_trade_date") or request.get("execution_trade_date")
@@ -170,6 +185,103 @@ def build_single_child(execution_request: Any) -> dict[str, Any]:
             },
         }
     )
+
+
+def build_execution_child(execution_request: Any) -> dict[str, Any]:
+    """Preserve a validated preplanned child, otherwise build the legacy child."""
+    request = _as_dict(execution_request)
+    child_plan = request.get("child_plan")
+    has_preplanned_child = any(
+        request.get(field) not in (None, "")
+        for field in (
+            "child_sequence_index",
+            "child_sequence_total",
+            "child_kind",
+            "child_plan",
+        )
+    )
+    if not has_preplanned_child:
+        return build_single_child(request)
+    return canonical_normalize(
+        {
+            "execution_id": request.get("execution_id"),
+            "plan_generation": plan_generation(request.get("plan_generation")),
+            "child_sequence_index": request.get("child_sequence_index"),
+            "child_sequence_total": request.get("child_sequence_total"),
+            "child_kind": request.get("child_kind"),
+            "child_plan": deepcopy(child_plan) if isinstance(child_plan, dict) else child_plan,
+        }
+    )
+
+
+def materialize_execution_intent_children(
+    execution_intents: Any,
+    *,
+    source_signal_id: Any,
+    execution_process_id: Any = None,
+    plan_generation_value: Any = None,
+) -> list[dict[str, Any]]:
+    """Assign one process identity and unique child identities to a plan."""
+    if not isinstance(execution_intents, list) or not execution_intents:
+        raise ValueError("EXECUTION_INTENT_CHILDREN_REQUIRED")
+    signal_id = _text(source_signal_id)
+    if not signal_id:
+        raise ValueError("SOURCE_SIGNAL_ID_REQUIRED")
+    intents = [deepcopy(_as_dict(item)) for item in execution_intents]
+    if any(not item for item in intents):
+        raise ValueError("EXECUTION_INTENT_CHILD_INVALID")
+
+    total = len(intents)
+    indexes = {item.get("child_sequence_index") for item in intents}
+    totals = {item.get("child_sequence_total") for item in intents}
+    if total > 1 or any(item.get("child_kind") == "HOGA_LEVEL" for item in intents):
+        if indexes != set(range(1, total + 1)) or totals != {total}:
+            raise ValueError("EXECUTION_INTENT_CHILD_SEQUENCE_INVALID")
+
+    first = intents[0]
+    generations = {
+        plan_generation(
+            plan_generation_value
+            if plan_generation_value not in (None, "")
+            else item.get("plan_generation")
+        )
+        for item in intents
+    }
+    if len(generations) != 1:
+        raise ValueError("EXECUTION_INTENT_PLAN_GENERATION_MISMATCH")
+    generation = next(iter(generations))
+    process_digest = stable_hash(
+        {
+            "source_signal_id": signal_id,
+            "routine_type": first.get("routine_type"),
+            "routine_instance_id": first.get("routine_instance_id"),
+            "cycle_identity": first.get("cycle_identity"),
+            "side": first.get("side"),
+            "execution_mode": first.get("execution_mode"),
+            "sell_method_set": first.get("sell_method_set"),
+            "multi_hoga_plan": first.get("multi_hoga_plan"),
+            "multi_time_plan": first.get("multi_time_plan"),
+            "multi_ratio_plan": first.get("multi_ratio_plan"),
+            "unfilled_timeout_policy": first.get("unfilled_timeout_policy"),
+        }
+    )[:24].upper()
+    requested_process_id = _text(execution_process_id)
+    process_id = requested_process_id or f"EXEC_PROCESS_{process_digest}"
+    for index, intent in enumerate(intents, start=1):
+        existing_signal_id = _text(intent.get("source_signal_id"))
+        if existing_signal_id and existing_signal_id != signal_id:
+            raise ValueError("EXECUTION_INTENT_SOURCE_SIGNAL_ID_MISMATCH")
+        existing_process_id = _text(intent.get("execution_process_id"))
+        if existing_process_id and existing_process_id != process_id:
+            raise ValueError("EXECUTION_INTENT_PROCESS_ID_MISMATCH")
+        intent["source_signal_id"] = signal_id
+        intent["execution_process_id"] = process_id
+        intent["plan_generation"] = generation
+        intent["execution_id"] = (
+            f"EXEC_CHILD_{stable_hash(process_id)[:16].upper()}"
+            f"_G{generation:03d}_{index:03d}"
+        )
+    return intents
 
 
 def build_execution_process_id(order_id: Any, request_hash: Any, snapshot_hash: Any) -> str:
@@ -206,6 +318,10 @@ def validate_child_contract(value: Any) -> list[str]:
     if not child:
         return ["CHILD_CONTRACT_MUST_BE_OBJECT"]
     issues: list[str] = []
+    try:
+        plan_generation(child.get("plan_generation"))
+    except ValueError:
+        issues.append("INVALID_PLAN_GENERATION")
     for field in ("execution_process_id", "execution_id", "child_kind"):
         if not _text(child.get(field)):
             issues.append(f"MISSING_{field.upper()}")
@@ -232,14 +348,22 @@ def validate_child_set(children: Any) -> list[str]:
     for child in normalized:
         issues.extend(validate_child_contract(child))
     process_ids = {_text(child.get("execution_process_id")) for child in normalized}
-    totals = {child.get("child_sequence_total") for child in normalized}
-    indexes = {child.get("child_sequence_index") for child in normalized}
     if len(process_ids) != 1:
         issues.append("CHILD_PROCESS_ID_MISMATCH")
-    if totals != {len(normalized)}:
-        issues.append("CHILD_SEQUENCE_TOTAL_MISMATCH")
-    if indexes != set(range(1, len(normalized) + 1)):
-        issues.append("CHILD_SEQUENCE_GAP_OR_DUPLICATE")
+    by_generation: dict[int, list[dict[str, Any]]] = {}
+    for child in normalized:
+        try:
+            generation = plan_generation(child.get("plan_generation"))
+        except ValueError:
+            continue
+        by_generation.setdefault(generation, []).append(child)
+    for generation, generation_children in by_generation.items():
+        totals = {child.get("child_sequence_total") for child in generation_children}
+        indexes = {child.get("child_sequence_index") for child in generation_children}
+        if totals != {len(generation_children)}:
+            issues.append(f"CHILD_SEQUENCE_TOTAL_MISMATCH_GENERATION_{generation}")
+        if indexes != set(range(1, len(generation_children) + 1)):
+            issues.append(f"CHILD_SEQUENCE_GAP_OR_DUPLICATE_GENERATION_{generation}")
     return issues
 
 

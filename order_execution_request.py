@@ -157,8 +157,12 @@ def build_execution_request_preview(
         if request_preview is None:
             request_preview = {}
 
+        intent = _as_dict(order_dict.get("execution_intent"))
+        planned_execution_id = _clean_text(
+            order_dict.get("execution_id") or intent.get("execution_id")
+        )
         execution_request = {
-            "execution_id": _build_execution_id(order_id, lock_id, request_hash),
+            "execution_id": planned_execution_id or _build_execution_id(order_id, lock_id, request_hash),
             "order_id": order_id,
             "source_signal_id": source_signal_id,
             "source_kind": source_kind,
@@ -175,6 +179,18 @@ def build_execution_request_preview(
             trade_date = _clean_text(execution_intent.get("execution_trade_date"))
             if trade_date:
                 execution_request["execution_trade_date"] = trade_date
+        for field in (
+            "execution_process_id",
+            "plan_generation",
+            "child_sequence_index",
+            "child_sequence_total",
+            "child_kind",
+            "child_plan",
+            "option_snapshot_hash",
+        ):
+            value = order_dict.get(field, intent.get(field))
+            if value not in (None, ""):
+                execution_request[field] = deepcopy(value)
         routine_provenance = _routine_provenance(order_dict)
         if routine_provenance:
             execution_request["routine_provenance"] = routine_provenance

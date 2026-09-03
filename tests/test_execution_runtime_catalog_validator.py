@@ -92,6 +92,39 @@ class ExecutionRuntimeCatalogValidatorTests(TestCase):
         self.assertEqual(result["issues"], [])
         self.assertEqual(result["warnings"], [])
 
+    def test_valid_generation_one_multi_child_provenance(self):
+        catalog = self._ready_catalog()
+        catalog["provenance"] = {
+            "execution_process_id": "PROCESS_1",
+            "plan_generation": 1,
+            "child_sequence_index": 2,
+            "child_sequence_total": 3,
+            "child_kind": "HOGA_LEVEL",
+            "child_plan": {"planned_quantity": 2, "hoga_offset_ticks": 1},
+            "option_snapshot_hash": "SNAPSHOT_HASH_1",
+        }
+
+        result = validate_execution_runtime_catalog_preview(catalog)
+
+        self.assertTrue(result["valid"], result)
+
+    def test_invalid_negative_plan_generation_is_rejected(self):
+        catalog = self._ready_catalog()
+        catalog["provenance"] = {
+            "execution_process_id": "PROCESS_1",
+            "plan_generation": -1,
+            "child_sequence_index": 1,
+            "child_sequence_total": 1,
+            "child_kind": "HOGA_LEVEL",
+            "child_plan": {"planned_quantity": 2, "hoga_offset_ticks": 0},
+            "option_snapshot_hash": "SNAPSHOT_HASH_1",
+        }
+
+        result = validate_execution_runtime_catalog_preview(catalog)
+
+        self.assertFalse(result["valid"])
+        self.assertIn("INVALID_CHILD_PROVENANCE:INVALID_PLAN_GENERATION", result["issues"])
+
     def test_valid_blocked_catalog(self):
         result = validate_execution_runtime_catalog_preview(self._blocked_catalog())
 

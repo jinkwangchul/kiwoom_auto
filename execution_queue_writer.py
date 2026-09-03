@@ -749,6 +749,7 @@ def preview_execution_queue_write(
         "source_kind",
         "source_command_id",
         "execution_process_id",
+        "plan_generation",
         "child_sequence_index",
         "child_sequence_total",
         "child_kind",

@@ -695,6 +695,22 @@ class IndicatorFollowBuyMethodControlsMixin:
         self._buy_additional_active_state_updaters.append(update_additional_active_state_local)
         update_additional_active_state_local()
 
+        unsupported_message = "현재 지원되지 않는 설정입니다."
+        self.buy_additional_setting_label.setToolTip(unsupported_message)
+        self.buy_price_compare_skip_row_widget.setEnabled(False)
+        self.buy_price_compare_skip_row_widget.setToolTip(unsupported_message)
+        self.buy_additional_active_row_widget.setEnabled(False)
+        self.buy_additional_active_row_widget.setToolTip(unsupported_message)
+        self.buy_additional_active_detail_row_widget.setEnabled(False)
+        self.buy_additional_active_detail_row_widget.setToolTip(unsupported_message)
+        for row in (
+            self.buy_price_compare_skip_row_widget,
+            self.buy_additional_active_row_widget,
+            self.buy_additional_active_detail_row_widget,
+        ):
+            for widget in row.findChildren(QWidget):
+                widget.setToolTip(unsupported_message)
+
     def _build_situation_response_section(self, layout, make_combo, make_line, make_label):
         self.buy_situation_response_label = QLabel("▶상황변화대응")
         self.buy_situation_response_label.setFixedHeight(26)

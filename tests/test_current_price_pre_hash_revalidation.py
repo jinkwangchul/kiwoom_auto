@@ -274,6 +274,34 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
                 self.assertEqual([], self.price_calls)
                 self.assertEqual(order, result["order"])
 
+    def test_ratio_trigger_current_price_requires_fresh_pre_hash_evidence(self) -> None:
+        order = self._order(price_basis="ORDER_PRICE", price=10_000)
+        order["execution_intent"]["final_current_price_evidence_required"] = True
+
+        result = self.boundary.finalize_current_price_before_hash(
+            order,
+            queue_path=self.queue_path,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("eligibility_current_price_pre_hash_validated", result["stage"])
+        self.assertEqual(12_000, result["validated_current_price"])
+        self.assertEqual([CODE], self.price_calls)
+        self.assertEqual(10_000, result["order"]["price"])
+
+    def test_ratio_trigger_current_price_blocks_when_fresh_evidence_is_missing(self) -> None:
+        self.current_price = None
+        order = self._order(price_basis="ORDER_PRICE", price=10_000)
+        order["execution_intent"]["final_current_price_evidence_required"] = True
+
+        result = self.boundary.finalize_current_price_before_hash(
+            order,
+            queue_path=self.queue_path,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("eligibility_current_price_pre_hash_unavailable", result["stage"])
+
     def test_ats_current_price_result_is_reused_without_second_market_data_read(self) -> None:
         order = self._order(price_basis="ORDER_PRICE", price=10_000, budget=150_000)
         self._write_queue(order)

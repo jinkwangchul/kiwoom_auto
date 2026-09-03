@@ -151,6 +151,7 @@ def build_execution_runtime_catalog_preview(
         field: deepcopy(execution_request.get(field))
         for field in (
             "execution_process_id",
+            "plan_generation",
             "child_sequence_index",
             "child_sequence_total",
             "child_kind",

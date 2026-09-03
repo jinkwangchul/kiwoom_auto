@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from math import isfinite
 from typing import Any
 
 def _path_exists(data: dict[str, Any], path: str) -> bool:
@@ -115,6 +116,57 @@ def validate_committed_rules(
 
     add_check("json_root_dict", isinstance(post_rules, dict))
     add_check("buy_conditions_exists", _path_exists(post_rules, "buy.groups[0].conditions"))
+    timeout_path = "buy.execution.base.unfilled_timeout_policy"
+    if _path_exists(post_rules, timeout_path):
+        policy = _get_path(post_rules, timeout_path)
+        valid = isinstance(policy, dict) and policy.get("enabled") is False
+        if isinstance(policy, dict) and policy.get("enabled") is True:
+            value = policy.get("configured_value")
+            valid = (policy.get("policy") == "CANCEL_PENDING_ORDER" and policy.get("action") == "CANCEL"
+                     and policy.get("scope") in {"EACH", "BATCH"}
+                     and policy.get("configured_unit") in {"SECOND", "MINUTE", "BAR"}
+                     and isinstance(value, (int, float)) and not isinstance(value, bool)
+                     and isfinite(value) and value >= 0)
+        add_check("buy_unfilled_timeout_policy_valid", valid)
+        if not valid:
+            add_unexpected(timeout_path, "invalid BUY timeout/cancel policy")
+    reset_path = "buy.execution.base.buy_price_reset_policy"
+    if _path_exists(post_rules, reset_path):
+        policy = _get_path(post_rules, reset_path)
+        valid = isinstance(policy, dict) and policy.get("enabled") is False
+        if isinstance(policy, dict) and policy.get("enabled") is True:
+            threshold = policy.get("threshold_percent")
+            valid = (
+                policy.get("policy") == "BUY_PRICE_CHANGE_RESET"
+                and policy.get("action") == "RESET"
+                and policy.get("left_source") in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                and policy.get("right_source") in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                and policy.get("direction") in {"UP", "DOWN", "BOTH"}
+                and policy.get("compare") in {">=", "<=", "WITHIN", "OUTSIDE"}
+                and isinstance(threshold, (int, float))
+                and not isinstance(threshold, bool)
+                and isfinite(threshold)
+                and threshold > 0
+            )
+        add_check("buy_price_reset_policy_valid", valid)
+        if not valid:
+            add_unexpected(reset_path, "invalid BUY price-reset policy")
+    exit_path = "buy.execution.base.buy_exit_policy"
+    if _path_exists(post_rules, exit_path):
+        policy = _get_path(post_rules, exit_path)
+        valid = isinstance(policy, dict) and policy.get("enabled") is False
+        if isinstance(policy, dict) and policy.get("enabled") is True:
+            conditions = policy.get("conditions")
+            valid = (
+                policy.get("policy") == "BUY_REPEAT_EXIT"
+                and policy.get("logic") == "OR"
+                and policy.get("completion_behavior") == "BLOCK_FUTURE_BUY_ROUNDS"
+                and isinstance(conditions, list) and bool(conditions)
+                and all(isinstance(item, dict) and item.get("condition_type") in {"COUNT", "TIME", "PRICE"} for item in conditions)
+            )
+        add_check("buy_exit_policy_valid", valid)
+        if not valid:
+            add_unexpected(exit_path, "invalid BUY repeat-exit policy")
     if _path_exists(post_rules, "sell.method.selected_sets"):
         selected_sets = _get_path(post_rules, "sell.method.selected_sets")
         selected_sets_valid = (

@@ -15,10 +15,10 @@ from zoneinfo import ZoneInfo
 
 from execution_provenance_contract import (
     PROVENANCE_CONTRACT_VERSION,
+    build_execution_child,
     build_execution_process_id,
     build_option_snapshot,
     build_process_plan,
-    build_single_child,
     option_snapshot_hash,
 )
 
@@ -126,7 +126,10 @@ def build_execution_candidate(
     source_signal_id = _extract_source_signal_id(execution_request_preview)
     request_hash = _extract_request_hash(preview, request_hash_preview, execution_request_preview)
 
-    approved_at = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="milliseconds")
+    intent = _as_dict(execution_request.get("execution_intent"))
+    approved_at = _clean_text(intent.get("provenance_approved_at")) or datetime.now(
+        ZoneInfo("Asia/Seoul")
+    ).isoformat(timespec="milliseconds")
     snapshot = build_option_snapshot(execution_request, approved_at=approved_at)
     existing_process_id = _clean_text(execution_request.get("execution_process_id"))
     snapshot_hash = (
@@ -139,12 +142,13 @@ def build_execution_candidate(
         request_hash,
         snapshot_hash,
     )
-    child = build_single_child(execution_request)
+    child = build_execution_child(execution_request)
     child["execution_process_id"] = execution_process_id
     child["option_snapshot_hash"] = snapshot_hash
 
     process_record = None
-    if not existing_process_id:
+    process_owner_required = intent.get("execution_process_owner_required") is True
+    if not existing_process_id or process_owner_required:
         process_record = {
             "execution_process_id": execution_process_id,
             "provenance_contract_version": PROVENANCE_CONTRACT_VERSION,
