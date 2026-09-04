@@ -78,7 +78,6 @@ def evaluate_execution_broker_dispatch_open_policy(
         "real_broker_dispatch_enabled": _as_dict(environment_flags).get("real_broker_dispatch_enabled") is True,
         "kiwoom_connected": _as_dict(environment_flags).get("kiwoom_connected") is True,
         "account_selected": _as_dict(environment_flags).get("account_selected") is True,
-        "real_trade_enabled": _as_dict(environment_flags).get("real_trade_enabled") is True,
     }
 
     if not isinstance(send_order_entrypoint_orchestrator_result, dict):
@@ -143,9 +142,6 @@ def evaluate_execution_broker_dispatch_open_policy(
         issues.append("KIWOOM_CONNECTED_NOT_TRUE")
     if not environment_checks["account_selected"]:
         issues.append("ACCOUNT_SELECTED_NOT_TRUE")
-    if not environment_checks["real_trade_enabled"]:
-        issues.append("REAL_TRADE_ENABLED_NOT_TRUE")
-
     if issues:
         return _result(
             status=STATUS_BLOCKED,

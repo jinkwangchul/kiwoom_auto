@@ -154,10 +154,6 @@ def evaluate_execution_approval(
     issues: list[str] = []
     if operator.get("operator_confirmed") is not True:
         issues.append("operator_context.operator_confirmed is not true")
-    if operator.get("real_trade_enabled") is not True:
-        issues.append("operator_context.real_trade_enabled is not true")
-    if operator.get("real_trade_guard_ok") is not True:
-        issues.append("operator_context.real_trade_guard_ok is not true")
     if policy_allowed is not True:
         issues.append(policy_issue or "approval policy rejected")
     if operator.get("emergency_stop") is True or runtime.get("emergency_stop") is True:
@@ -169,8 +165,6 @@ def evaluate_execution_approval(
             "readiness": deepcopy(readiness_approval),
             "policy": deepcopy(policy),
             "operator_confirmed": operator.get("operator_confirmed") is True,
-            "real_trade_enabled": operator.get("real_trade_enabled") is True,
-            "real_trade_guard_ok": operator.get("real_trade_guard_ok") is True,
         }
     )
 

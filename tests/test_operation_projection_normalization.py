@@ -186,7 +186,7 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
                     liquidation_text=liquidation_text,
                 )
 
-    def test_continuous_active_ignores_real_trade_permission_for_display_only(self) -> None:
+    def test_continuous_active_uses_current_single_production_display(self) -> None:
         state = {
             "status": "MONITORING",
             "trade_enabled": True,
@@ -213,7 +213,7 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
                 category="operation",
                 mode="CONTINUOUS",
                 state=state,
-                config={"real_trade_enabled": False},
+                config={},
                 current_session=True,
                 now_dt=datetime(2026, 8, 26, 10, 0),
             )
@@ -225,15 +225,14 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
 
         guard = evaluate_final_execution_guard(
             order={"status": "REAL_READY", "execution_enabled": True},
-            guard={"operator_confirmed": True, "real_trade_enabled": False},
+            guard={"operator_confirmed": True},
             execution_preview={
                 "unresolved": False,
                 "hoga_preview": {"unresolved": False},
                 "order_type_preview": {"unresolved": False},
             },
         )
-        self.assertIs(guard["ok"], False)
-        self.assertIn("guard.real_trade_enabled is not true", guard["blocked_reasons"])
+        self.assertIs(guard["ok"], True)
 
     def test_stale_early_close_metadata_is_read_only_and_does_not_split_views(self) -> None:
         state = {

@@ -33,7 +33,6 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
                 {
                     "routine": "Strategy",
                     "operation_mode": "CONTINUOUS",
-                    "real_trade_enabled": False,
                 }
             ),
             encoding="utf-8",
@@ -79,7 +78,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         )
         return window
 
-    def test_central_stock_is_recalculated_and_persisted_as_monitoring(self) -> None:
+    def test_central_stock_without_current_policy_transition_remains_running(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
             window = self._window([stock_dir])
@@ -97,10 +96,10 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             state = read_json_dict(stock_dir / "state.json")
 
         self.assertEqual(
-            {"changed": 1, "unchanged": 0, "protected": 0, "failed": 0},
+            {"changed": 0, "unchanged": 1, "protected": 0, "failed": 0},
             result,
         )
-        self.assertEqual("MONITORING", state["status"])
+        self.assertEqual("RUNNING", state["status"])
 
     def test_emergency_status_precedes_disabled_trade_display(self) -> None:
         state = {
@@ -121,9 +120,14 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
 
         self.assertEqual("긴급정지", display_status)
 
-    def test_recalculated_state_unblocks_mode_change_and_unregister(self) -> None:
+    def test_stopped_state_allows_mode_change_and_unregister(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state["status"] = "STOPPED"
+            state["trade_enabled"] = False
+            state_path.write_text(json.dumps(state), encoding="utf-8")
             window = self._window([stock_dir])
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
@@ -132,16 +136,16 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
             ):
-                status_ops.auto_trade_recalculate_all_status_by_operation_policy(
-                    window,
-                    "test reconciliation",
-                )
                 mode_changed = status_ops.auto_trade_update_stock_operation_mode(
                     window,
                     stock_dir,
                     "111111",
                     "Stock",
                     "SCHEDULED",
+                    {
+                        "start_time": "09:00:00",
+                        "end_buy_time": "13:30:00",
+                    },
                 )
                 unregister = auto_trade_unregister_category(
                     "Strategy",
@@ -559,6 +563,10 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
     def test_write_without_matching_read_back_is_reported_as_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state["signal_probe_only"] = True
+            state_path.write_text(json.dumps(state), encoding="utf-8")
             window = self._window([stock_dir])
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),

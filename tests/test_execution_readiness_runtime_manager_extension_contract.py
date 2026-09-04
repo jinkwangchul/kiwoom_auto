@@ -78,7 +78,6 @@ class ExecutionReadinessRuntimeManagerExtensionContractTest(unittest.TestCase):
             "source": "contract",
             "guard": {
                 "operator_confirmed": True,
-                "real_trade_enabled": True,
                 "account_no": "12345678",
             },
         }

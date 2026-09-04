@@ -64,7 +64,6 @@ class RoutineInstanceRecord:
     persisted: bool
     source: str
     enabled: bool
-    real_trade_allowed: bool
     description: str = ""
     buy_limit_enabled: bool = False
     buy_limit_amount: int | None = None
@@ -616,7 +615,6 @@ def _persisted_instance_from_directory(
         persisted=True,
         source=PERSISTED_INSTANCE_SOURCE,
         enabled=enabled,
-        real_trade_allowed=False,
         description=str(metadata.get("description") or "").strip(),
         buy_limit_enabled=buy_limit_enabled,
         buy_limit_amount=buy_limit_amount,
@@ -701,7 +699,6 @@ def load_routine_instance_registry(
             persisted=False,
             source=LEGACY_INSTANCE_SOURCE,
             enabled=definition.package_enabled,
-            real_trade_allowed=False,
         )
         for definition in registry.definitions
     ]

@@ -441,7 +441,6 @@ class ExecutionSellRepeatTest(unittest.TestCase):
             stock_name="삼성전자",
             stock_dir=Path("unused"),
             execution_ready=True,
-            real_trade_enabled=True,
             signal_probe_only=False,
         )
         snapshot = SimpleNamespace(entries=(entry,))
@@ -807,7 +806,6 @@ class ExecutionSellRepeatTest(unittest.TestCase):
             stock_name="삼성전자",
             stock_dir=Path("unused"),
             execution_ready=True,
-            real_trade_enabled=True,
             signal_probe_only=False,
         )
         snapshot = SimpleNamespace(entries=(entry,))
@@ -848,7 +846,6 @@ class ExecutionSellRepeatTest(unittest.TestCase):
             stock_name="삼성전자",
             stock_dir=Path("unused"),
             execution_ready=True,
-            real_trade_enabled=True,
             signal_probe_only=False,
         )
         snapshot = SimpleNamespace(entries=(entry,))

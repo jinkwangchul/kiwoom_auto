@@ -94,8 +94,6 @@ class ExecutionPipelineE2EContractAuditTest(unittest.TestCase):
     def _guard(self) -> dict[str, object]:
         return {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
-            "real_trade_guard_ok": True,
             "account_no": "12345678",
         }
 
@@ -166,8 +164,6 @@ class ExecutionPipelineE2EContractAuditTest(unittest.TestCase):
             readiness,
             {
                 "operator_confirmed": True,
-                "real_trade_enabled": True,
-                "real_trade_guard_ok": True,
                 "emergency_stop": False,
             },
             {

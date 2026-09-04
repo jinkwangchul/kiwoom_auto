@@ -177,7 +177,6 @@ class RealOrderPreflightServiceTest(unittest.TestCase):
 
     def test_preview_guard_fields_are_blocked(self) -> None:
         cases = [
-            {"real_trade_enabled": False},
             {"kiwoom_logged_in": False},
             {"account_selected": False},
             {"account_no": ""},
@@ -189,6 +188,17 @@ class RealOrderPreflightServiceTest(unittest.TestCase):
 
                 self.assertFalse(result["real_preflight_preview"])
                 self.assertEqual("guard", result["preflight_stage"])
+
+    def test_preview_ignores_legacy_real_trade_values(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = preview_real_order_preflight(self._order(), guard, self._context())
+                self.assertTrue(result["real_preflight_preview"])
 
     def test_preview_manual_or_operator_context_is_required(self) -> None:
         result = preview_real_order_preflight(self._order(), self._guard(), {"operator_confirmed": True})

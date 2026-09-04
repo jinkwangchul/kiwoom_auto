@@ -65,9 +65,6 @@ def evaluate_final_execution_guard(
     if not _truthy(guard_dict.get("operator_confirmed")):
         blocked_reasons.append("guard.operator_confirmed is not true")
 
-    if not _truthy(guard_dict.get("real_trade_enabled")):
-        blocked_reasons.append("guard.real_trade_enabled is not true")
-
     hoga_preview = _as_dict(preview_dict.get("hoga_preview"))
     if bool(hoga_preview.get("unresolved", True)):
         blocked_reasons.append("hoga_preview is unresolved")

@@ -94,7 +94,6 @@ class B5PolicyOverrideCanonicalWritersTest(unittest.TestCase):
             "start_time": "09:00:00",
             "end_buy_time": "13:30:00",
             "operation_excluded": False,
-            "real_trade_enabled": False,
             "routine": "RoutineA",
             "assigned_routine_instance_id": "instance-a",
             "routine_assignment_history": [{"instance_id": "instance-a"}],
@@ -149,7 +148,6 @@ class B5PolicyOverrideCanonicalWritersTest(unittest.TestCase):
                 "buy_limit_amount": 900_000,
                 "operation_mode": "CONTINUOUS",
                 "operation_excluded": True,
-                "real_trade_enabled": True,
                 "assigned_routine_instance_id": "instance-b",
                 "routine_assignment_history": [{"instance_id": "instance-b"}],
             }
@@ -172,7 +170,7 @@ class B5PolicyOverrideCanonicalWritersTest(unittest.TestCase):
         self.assertEqual(900_000, saved["buy_limit_amount"])
         self.assertEqual("CONTINUOUS", saved["operation_mode"])
         self.assertTrue(saved["operation_excluded"])
-        self.assertTrue(saved["real_trade_enabled"])
+        self.assertNotIn("real_trade_enabled", saved)
         self.assertEqual("instance-b", saved["assigned_routine_instance_id"])
         self.assertEqual([{"instance_id": "instance-b"}], saved["routine_assignment_history"])
         self.assertEqual(1, canonical_patch.call_count)

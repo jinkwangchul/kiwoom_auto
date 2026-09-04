@@ -263,7 +263,7 @@ class AtsExecutionMethodContractTest(unittest.TestCase):
             )["order"]
             result = preview_execution_for_real_ready_order(
                 order["id"],
-                {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"},
+                {"operator_confirmed": True, "account_no": "12345678"},
                 queue_path,
                 order_override=effective,
             )
@@ -363,7 +363,7 @@ class AtsExecutionMethodContractTest(unittest.TestCase):
             ), patch.object(
                 boundary,
                 "build_real_preflight_guard_from_gui",
-                return_value={"operator_confirmed": True, "real_trade_enabled": True},
+                return_value={"operator_confirmed": True},
             ), patch.object(
                 boundary, "real_preflight_guard_block_reasons", return_value=[]
             ), patch.object(
@@ -400,7 +400,7 @@ class AtsExecutionMethodContractTest(unittest.TestCase):
             self.assertEqual("execution_preview", result["stage"])
             preview_call.assert_called_once_with(
                 executable["id"],
-                {"operator_confirmed": True, "real_trade_enabled": True},
+                {"operator_confirmed": True},
                 root / "queue.json",
                 order_override=effective,
             )

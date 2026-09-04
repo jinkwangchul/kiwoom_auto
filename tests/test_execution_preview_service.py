@@ -116,30 +116,17 @@ class ExecutionPreviewServiceTest(unittest.TestCase):
         self.assertFalse(result["approval_result"]["approved"])
         self.assertEqual("preview_result", result["approval_result"]["approval_stage"])
 
-    def test_approval_reflects_real_trade_guard_context(self) -> None:
+    def test_approval_ignores_retired_real_trade_guard_context(self) -> None:
         guard = self._guard()
         guard["real_trade_guard_ok"] = False
 
         result = preview_execution_for_order(self._order(), guard)
 
         self.assertTrue(result["summary"]["ok"])
-        self.assertFalse(result["approval_result"]["approved"])
-        self.assertEqual("real_trade_guard", result["approval_result"]["approval_stage"])
-        self.assertFalse(result["candidate_result"]["candidate"])
-        self.assertIn(
-            "approval_result.approved is not true",
-            result["candidate_result"]["blocked_reasons"],
-        )
-        self.assertFalse(result["queue_pending_result"]["queue_pending"])
-        self.assertIn(
-            "candidate_result.candidate is not true",
-            result["queue_pending_result"]["blocked_reasons"],
-        )
-        self.assertFalse(result["queue_write_preview_result"]["write_preview"])
-        self.assertIn(
-            "queue_pending_result.queue_pending is not true",
-            result["queue_write_preview_result"]["blocked_reasons"],
-        )
+        self.assertTrue(result["approval_result"]["approved"])
+        self.assertTrue(result["candidate_result"]["candidate"])
+        self.assertTrue(result["queue_pending_result"]["queue_pending"])
+        self.assertTrue(result["queue_write_preview_result"]["write_preview"])
 
     def test_input_dicts_are_not_mutated(self) -> None:
         order = self._order()

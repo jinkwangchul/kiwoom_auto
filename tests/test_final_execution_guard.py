@@ -70,14 +70,16 @@ class FinalExecutionGuardTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("guard.operator_confirmed is not true", result["blocked_reasons"])
 
-    def test_real_trade_enabled_false_blocks(self) -> None:
-        guard = self._guard()
-        guard["real_trade_enabled"] = False
-
-        result = evaluate_final_execution_guard(self._order(), guard, self._preview())
-
-        self.assertFalse(result["ok"])
-        self.assertIn("guard.real_trade_enabled is not true", result["blocked_reasons"])
+    def test_legacy_real_trade_values_do_not_change_final_guard(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = evaluate_final_execution_guard(self._order(), guard, self._preview())
+                self.assertTrue(result["ok"])
 
     def test_hoga_unresolved_blocks(self) -> None:
         preview = self._preview()

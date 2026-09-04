@@ -470,7 +470,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window.show_manual_queue_commit_result = lambda result: window.commit_reports.append(result)
         parent = self._prepare_parent_account()
         self._bind_window_parent(window, parent)
-        window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
+        window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({}, "test_config")
         window.read_order_from_queue_by_id = lambda order_id, queue_path: {
             "ok": True,
             "order": {"id": str(order_id), "code": "005930"},
@@ -538,7 +538,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window.parent = lambda: parent
         window.__dict__.pop("_order_execution_boundary", None)
         window.order_execution_boundary().real_preflight_stock_config_for_order = (
-            lambda order: ({"real_trade_enabled": True}, "test_config")
+            lambda order: ({}, "test_config")
         )
 
     def _write_broker_holding(
@@ -637,7 +637,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         parent.account_combo = _FakeAccountCombo()
         main_gui.MainWindow.refresh_kiwoom_accounts(parent)
         self._bind_window_parent(window, parent)
-        window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
+        window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({}, "test_config")
         return window
 
     def _queue_write_preview_result(self) -> dict[str, object]:
@@ -788,7 +788,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "kiwoom_logged_in": True,
             "account_selected": True,
             "account_no": "12345678",
-            "real_trade_enabled": True,
         }
 
         flags = gui.AutoTradeSettingWindow.execution_runtime_environment_flags(
@@ -812,7 +811,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "kiwoom_logged_in": False,
             "account_selected": True,
             "account_no": "12345678",
-            "real_trade_enabled": True,
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             flags = gui.AutoTradeSettingWindow.execution_runtime_environment_flags(
@@ -861,7 +859,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def _real_preflight_guard(self) -> dict[str, object]:
         return {
-            "real_trade_enabled": True,
             "kiwoom_logged_in": True,
             "account_selected": True,
             "account_no": "12345678",
@@ -1405,14 +1402,15 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertIn("Execution Preview는 자동 실행되지 않습니다.", text)
         self.assertIn("Queue 저장이 아닙니다.", text)
         self.assertIn("order_id: ORDER_EXEC_1", text)
-        self.assertIn("guard.real_trade_enabled: True", text)
+        self.assertIn("guard.operator_confirmed: True", text)
+        self.assertNotIn("guard.real_trade_enabled", text)
         self.assertIn("before_sha256: HASH_BEFORE", text)
 
     def test_real_ready_order_id_runs_read_only_preview_and_reporter(self) -> None:
         window = self._window_for_queue_commit()
         window.reports = []
         window.show_execution_preview_report = lambda report: window.reports.append(report)
-        guard = {"operator_confirmed": True, "real_trade_enabled": True}
+        guard = {"operator_confirmed": True}
         queue_write_preview = self._queue_write_preview_result()
         preview_result = {
             "ok": True,
@@ -1527,7 +1525,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         }
         guard = {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
             "account_no": "12345678",
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1581,7 +1578,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         }
         guard = {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
             "account_no": "12345678",
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1793,7 +1789,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         }
         guard = {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
             "account_no": "12345678",
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1826,7 +1821,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window = self._window_for_queue_commit()
         window.reports = []
         window.show_execution_preview_report = lambda report: window.reports.append(report)
-        guard = {"operator_confirmed": True, "real_trade_enabled": True}
+        guard = {"operator_confirmed": True}
         preview_result = {
             "ok": True,
             "read_result": {"ok": True, "order": {"id": "ORDER_1"}},
@@ -1874,7 +1869,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window = self._window_for_queue_commit()
         window.reports = []
         window.show_execution_preview_report = lambda report: window.reports.append(report)
-        guard = {"operator_confirmed": True, "real_trade_enabled": True}
+        guard = {"operator_confirmed": True}
         preview_result = {
             "ok": False,
             "read_result": {"ok": False, "blocked_reasons": ["blocked"]},
@@ -1922,7 +1917,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window = self._window_for_queue_commit()
         window.reports = []
         window.show_execution_preview_report = lambda report: window.reports.append(report)
-        guard = {"operator_confirmed": True, "real_trade_enabled": True}
+        guard = {"operator_confirmed": True}
         blocked_preview = {
             "ok": False,
             "read_result": {
@@ -1957,7 +1952,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window = self._window_for_queue_commit()
         window.reports = []
         window.show_execution_preview_report = lambda report: window.reports.append(report)
-        guard = {"operator_confirmed": True, "real_trade_enabled": True}
+        guard = {"operator_confirmed": True}
         blocked_preview = {
             "ok": False,
             "read_result": {
@@ -2294,7 +2289,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (stock_dir / "config.json").write_text(
-                json.dumps({"real_trade_enabled": True}, ensure_ascii=False),
+                json.dumps({}, ensure_ascii=False),
                 encoding="utf-8",
             )
             (stock_dir / "state.json").write_text(
@@ -2302,7 +2297,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
                     },
@@ -2437,7 +2431,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (stock_dir / "config.json").write_text(
-                json.dumps({"real_trade_enabled": True}, ensure_ascii=False),
+                json.dumps({}, ensure_ascii=False),
                 encoding="utf-8",
             )
             (stock_dir / "state.json").write_text(
@@ -2445,7 +2439,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": True,
                         "review_required": False,
                     },
@@ -2543,10 +2536,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_auto_trade_runtime_state_blocks_unsafe_flags(self) -> None:
         cases = [
-            ({"status": "RUNNING", "trade_enabled": False, "real_trade_enabled": True}, "trade_enabled is not true"),
-            ({"status": "RUNNING", "trade_enabled": True, "real_trade_enabled": False}, "real_trade_enabled is not true"),
-            ({"status": "RUNNING", "trade_enabled": True, "real_trade_enabled": True, "review_required": True}, "review_required is true"),
-            ({"status": "EMERGENCY_STOPPED", "trade_enabled": True, "real_trade_enabled": True}, "auto trade status is not RUNNING"),
+            ({"status": "RUNNING", "trade_enabled": False}, "trade_enabled is not true"),
+            ({"status": "RUNNING", "trade_enabled": True, "review_required": True}, "review_required is true"),
+            ({"status": "EMERGENCY_STOPPED", "trade_enabled": True}, "auto trade status is not RUNNING"),
         ]
         for state_update, expected_reason in cases:
             with self.subTest(expected_reason=expected_reason), tempfile.TemporaryDirectory() as temp_dir:
@@ -2557,7 +2549,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 state = {
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                     "signal_probe_only": False,
                     "review_required": False,
                 }
@@ -2593,13 +2584,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             routine_dir = gui.Path(tmp) / "routine"
             stock_dir = routine_dir / "003550_LG"
             stock_dir.mkdir(parents=True)
-            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "config.json").write_text(json.dumps({}), encoding="utf-8")
             (stock_dir / "state.json").write_text(
                 json.dumps(
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
                     }
@@ -2644,13 +2634,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             routine_dir = gui.Path(tmp) / "routine"
             stock_dir = routine_dir / "003550_LG"
             stock_dir.mkdir(parents=True)
-            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "config.json").write_text(json.dumps({}), encoding="utf-8")
             (stock_dir / "state.json").write_text(
                 json.dumps(
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
                     }
@@ -2698,13 +2687,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             routine_dir = gui.Path(tmp) / "routine"
             stock_dir = routine_dir / "003550_LG"
             stock_dir.mkdir(parents=True)
-            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "config.json").write_text(json.dumps({}), encoding="utf-8")
             (stock_dir / "state.json").write_text(
                 json.dumps(
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
                     }
@@ -2754,13 +2742,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             routine_dir = gui.Path(tmp) / "routine"
             stock_dir = routine_dir / "003550_LG"
             stock_dir.mkdir(parents=True)
-            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "config.json").write_text(json.dumps({}), encoding="utf-8")
             (stock_dir / "state.json").write_text(
                 json.dumps(
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
                     }

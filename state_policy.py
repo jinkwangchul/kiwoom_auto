@@ -276,30 +276,6 @@ def operation_mode_check_text(current_mode: object, target_mode: str) -> str:
     return "✓" if normalize_operation_mode(current_mode) == target_mode else ""
 
 
-def real_trade_enabled(config: dict[str, object] | None) -> bool:
-    """
-    실주문 권한 여부를 반환한다.
-
-    대안 B 정책:
-    - 동일 종목은 여러 루틴에 배정 가능하다.
-    - 실제 주문 가능 루틴은 종목당 1개만 허용한다.
-    - False 인 루틴은 감시/신호 확인 전용이다.
-    """
-    if not isinstance(config, dict):
-        return True
-    value = config.get("real_trade_enabled", True)
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    return text not in ("false", "0", "no", "n", "off", "감시전용")
-
-
-def trade_permission_display(config: dict[str, object] | None) -> tuple[str, str, str]:
-    if real_trade_enabled(config):
-        return "실주문", "#0F766E", "실주문 루틴: 이 종목의 실제 매수/매도 주문 가능"
-    return "감시전용", "#6B7280", "감시전용 루틴: 신호/상태 확인만 수행하며 실제 주문은 차단"
-
-
 def normalized_hhmmss_or_empty(value: object) -> str:
     text = str(value or "").strip()
     if not text:
@@ -836,9 +812,6 @@ def scheduled_status_for_now(config: dict[str, object], now_dt: datetime | None 
 def start_status_by_operation_mode(config: dict[str, object]) -> tuple[str, str, str]:
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
 
-    if not real_trade_enabled(config):
-        return "MONITORING", mode, "감시전용 루틴: 실주문 차단"
-
     if mode == "CONTINUOUS":
         status = manual_status_for_now(config=config)
         return status, mode, f"수동 운영 시간정책 기준 시작 상태 결정: {auto_trade_status_display(status)}"
@@ -856,8 +829,6 @@ def operation_mode_recalculation_target_status(current_status: object) -> str | 
 
 def status_after_operation_mode_change(mode: str, config: dict[str, object]) -> str:
     normalized_mode = normalize_operation_mode(mode)
-    if not real_trade_enabled(config):
-        return "MONITORING"
     if normalized_mode == "CONTINUOUS":
         return manual_status_for_now(config=config)
     return scheduled_status_for_now(config)

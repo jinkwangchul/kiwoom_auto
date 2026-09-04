@@ -68,7 +68,7 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertFalse(metadata["enabled"])
         self.assertEqual(12_000_000, metadata["buy_limit_amount"])
         self.assertEqual(rules, saved_rules)
-        self.assertFalse(result.instance.real_trade_allowed)
+        self.assertFalse(hasattr(result.instance, "real_trade_allowed"))
 
     def test_clone_style_create_uses_new_id_without_copying_stock_assignment(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

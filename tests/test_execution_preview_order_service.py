@@ -44,7 +44,6 @@ class ExecutionPreviewOrderServiceTest(unittest.TestCase):
     def _guard(self, *, operator_confirmed: bool = True) -> dict:
         return {
             "operator_confirmed": operator_confirmed,
-            "real_trade_enabled": True,
             "account_no": "12345678",
         }
 

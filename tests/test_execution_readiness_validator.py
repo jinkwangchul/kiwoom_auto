@@ -60,8 +60,6 @@ class ExecutionReadinessValidatorTest(unittest.TestCase):
     def _guard(self, **overrides: object) -> dict[str, object]:
         result: dict[str, object] = {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
-            "real_trade_guard_ok": True,
             "account_no": "12345678",
         }
         result.update(overrides)

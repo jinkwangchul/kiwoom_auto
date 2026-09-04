@@ -48,7 +48,6 @@ class OperationPolicyGateSingleOrderTests(unittest.TestCase):
         state = {
             "status": "MONITORING",
             "trade_enabled": True,
-            "real_trade_enabled": False,
             "buy_enabled": False,
             "sell_enabled": False,
         }

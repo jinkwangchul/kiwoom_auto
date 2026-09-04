@@ -97,7 +97,6 @@ class ExecutionFinalSendGateReadinessPolicyContractTest(unittest.TestCase):
 
     def _guard(self, **overrides: object) -> dict[str, object]:
         guard = {
-            "real_trade_enabled": True,
             "kiwoom_logged_in": True,
             "account_selected": True,
             "account_no": "12345678",
@@ -197,7 +196,6 @@ class ExecutionFinalSendGateReadinessPolicyContractTest(unittest.TestCase):
     def test_guard_missing_or_false_blocks(self) -> None:
         cases = [
             ({}, "CURRENT_GUARD_REQUIRED"),
-            (self._guard(real_trade_enabled=False), "GUARD_REAL_TRADE_ENABLED_NOT_TRUE"),
             (self._guard(kiwoom_logged_in=False), "GUARD_KIWOOM_LOGGED_IN_NOT_TRUE"),
             (self._guard(account_selected=False), "GUARD_ACCOUNT_SELECTED_NOT_TRUE"),
             (self._guard(account_no=""), "GUARD_ACCOUNT_NO_REQUIRED"),

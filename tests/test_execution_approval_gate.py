@@ -131,16 +131,22 @@ class ExecutionApprovalGateTest(unittest.TestCase):
         self.assertEqual("DENIED", result["status"])
         self.assertIn("operator_context.operator_confirmed is not true", result["issues"])
 
-    def test_real_trade_enabled_false_is_denied(self) -> None:
-        result = evaluate_execution_approval(
-            self._readiness(),
-            self._operator_context(real_trade_enabled=False),
-            self._approval_policy(),
-            self._runtime_snapshot(),
-        )
-
-        self.assertEqual("DENIED", result["status"])
-        self.assertIn("operator_context.real_trade_enabled is not true", result["issues"])
+    def test_legacy_real_trade_values_do_not_change_approval(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                operator = self._operator_context()
+                if value is None:
+                    operator.pop("real_trade_enabled", None)
+                    operator.pop("real_trade_guard_ok", None)
+                else:
+                    operator["real_trade_enabled"] = value
+                    operator["real_trade_guard_ok"] = value
+                result = evaluate_execution_approval(
+                    self._readiness(), operator, self._approval_policy(), self._runtime_snapshot()
+                )
+                self.assertEqual("APPROVED", result["status"])
+                self.assertNotIn("real_trade_enabled", result["approval"])
+                self.assertNotIn("real_trade_guard_ok", result["approval"])
 
     def test_approval_policy_reject_is_denied(self) -> None:
         result = evaluate_execution_approval(

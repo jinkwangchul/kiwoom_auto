@@ -482,7 +482,6 @@ class ExecutionTimeSliceDueTest(unittest.TestCase):
             entries=(
                 SimpleNamespace(
                     execution_ready=True,
-                    real_trade_enabled=True,
                     signal_probe_only=False,
                     stock_code="005930",
                     stock_name="삼성전자",
@@ -490,7 +489,6 @@ class ExecutionTimeSliceDueTest(unittest.TestCase):
                 ),
                 SimpleNamespace(
                     execution_ready=True,
-                    real_trade_enabled=True,
                     signal_probe_only=False,
                     stock_code="000660",
                     stock_name="SK하이닉스",

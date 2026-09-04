@@ -215,7 +215,6 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
                         stock_dir=None,
                         execution_ready=True,
                         signal_probe_only=True,
-                        real_trade_enabled=False,
                     ),
                 )
             ),

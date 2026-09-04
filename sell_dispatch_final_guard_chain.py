@@ -127,7 +127,7 @@ def build_sell_dispatch_final_execution_guard(approval_gate: Any, guard_context:
 
         guard = evaluate_final_execution_guard(
             {"status": "REAL_READY", "execution_enabled": True},
-            {"operator_confirmed": True, "real_trade_enabled": True},
+            {"operator_confirmed": True},
             {"unresolved": False, "hoga_preview": {"unresolved": False}, "order_type_preview": {"unresolved": False}},
         )
         sell_reason = _sell_guard_reason(preview, context)

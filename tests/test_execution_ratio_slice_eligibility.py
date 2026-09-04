@@ -344,7 +344,6 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
                     candidate,
                     {
                         "operator_confirmed": True,
-                        "real_trade_enabled": True,
                         "account_no": "12345678",
                     },
                 )["candidate_result"]
@@ -429,8 +428,8 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
             auto_process_executable_orders_for_real_trade=mock.Mock(return_value={"processed": 1, "blocked": 0}),
         )
         snapshot = SimpleNamespace(entries=(
-            SimpleNamespace(execution_ready=True, real_trade_enabled=True, signal_probe_only=False, stock_code="005930", stock_name="삼성전자", stock_dir=self.root / "005930"),
-            SimpleNamespace(execution_ready=True, real_trade_enabled=True, signal_probe_only=False, stock_code="000660", stock_name="SK하이닉스", stock_dir=self.root / "000660"),
+            SimpleNamespace(execution_ready=True, signal_probe_only=False, stock_code="005930", stock_name="삼성전자", stock_dir=self.root / "005930"),
+            SimpleNamespace(execution_ready=True, signal_probe_only=False, stock_code="000660", stock_name="SK하이닉스", stock_dir=self.root / "000660"),
         ))
         inspected = {
             "ok": True,

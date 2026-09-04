@@ -61,8 +61,6 @@ class RuleApplyPreviewExecutionPreviewControllerTest(unittest.TestCase):
     def _guard(self, **overrides: object) -> dict[str, object]:
         result: dict[str, object] = {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
-            "real_trade_guard_ok": True,
             "account_no": "12345678",
         }
         result.update(overrides)
@@ -149,7 +147,7 @@ class RuleApplyPreviewExecutionPreviewControllerTest(unittest.TestCase):
         apply_preview = self._apply_preview()
         signal_context = self._signal_context()
         guard = self._guard()
-        guard_defaults = {"real_trade_guard_ok": True}
+        guard_defaults = {}
         order_defaults = {"memo": "default"}
         originals = (
             deepcopy(apply_preview),

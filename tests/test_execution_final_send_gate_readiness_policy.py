@@ -193,11 +193,17 @@ class ExecutionFinalSendGateReadinessPolicyTest(unittest.TestCase):
                 self.assertIn(f"IDENTITY_MISMATCH_{field.upper()}", result["issues"])
                 self.assertEqual("FAIL", result["identity_checks"][field]["result"])
 
-    def test_guard_real_trade_enabled_false_blocks(self) -> None:
-        result = self._evaluate(guard=self._guard(real_trade_enabled=False))
-
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertIn("GUARD_REAL_TRADE_ENABLED_NOT_TRUE", result["issues"])
+    def test_legacy_real_trade_values_do_not_change_readiness(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = self._evaluate(guard=guard)
+                self.assertEqual("READY_FOR_FINAL_SEND_GATE", result["status"])
+                self.assertNotIn("real_trade_enabled", result["guard_checks"])
 
     def test_guard_kiwoom_logged_in_false_blocks(self) -> None:
         result = self._evaluate(guard=self._guard(kiwoom_logged_in=False))

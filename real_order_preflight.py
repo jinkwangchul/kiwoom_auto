@@ -20,7 +20,6 @@ STEP 13-A: 실제 주문 사전검사기.
 
 기본 차단 원칙:
 - real_trade_guard.json이 없으면 차단.
-- real_trade_enabled가 True가 아니면 차단.
 - kiwoom_logged_in이 True가 아니면 차단.
 - account_selected가 True가 아니면 차단.
 - operator_confirmed가 True가 아니면 차단.
@@ -133,7 +132,6 @@ def ensure_default_real_trade_guard() -> dict[str, Any]:
     guard = {
         "version": 1,
         "updated_at": now_text(),
-        "real_trade_enabled": False,
         "kiwoom_logged_in": False,
         "account_selected": False,
         "operator_confirmed": False,
@@ -153,12 +151,6 @@ def evaluate_real_order_preflight(order: dict[str, Any], guard: dict[str, Any]) 
         return {
             "real_preflight_status": "IGNORED",
             "real_preflight_reason": f"실주문 사전검사 대상 아님: {status}",
-        }
-
-    if not _truthy(guard.get("real_trade_enabled")):
-        return {
-            "real_preflight_status": "BLOCKED_REAL",
-            "real_preflight_reason": "실거래 허용 OFF",
         }
 
     if not _truthy(guard.get("kiwoom_logged_in")):

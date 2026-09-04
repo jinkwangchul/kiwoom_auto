@@ -297,7 +297,7 @@ class BuyRepeatExitPolicyUnitTest(unittest.TestCase):
                  "replan_proposals": [], "reviews": [], "waiting": [], "errors": [],
                  "blocked_execution_process_ids": []}
         entry = SimpleNamespace(stock_code=CODE, stock_name="테스트", stock_dir=Path("unused"),
-                                execution_ready=True, real_trade_enabled=True, signal_probe_only=False)
+                                execution_ready=True, signal_probe_only=False)
         snapshot = SimpleNamespace(entries=(entry,))
         window = SimpleNamespace(
             current_selected_account_no=lambda: ACCOUNT,

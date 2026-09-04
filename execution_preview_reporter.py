@@ -149,7 +149,6 @@ def _build_text(report: dict[str, Any]) -> str:
         "",
         "[Guard]",
         f"operator_confirmed: {_display(guard_snapshot.get('operator_confirmed'))}",
-        f"real_trade_enabled: {_display(guard_snapshot.get('real_trade_enabled'))}",
         f"account_no: {_display(guard_snapshot.get('account_no'))}",
         "",
         "[Pipeline]",

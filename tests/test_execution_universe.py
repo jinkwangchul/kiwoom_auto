@@ -50,7 +50,6 @@ class ExecutionUniverseTest(unittest.TestCase):
                     "status": "STOPPED",
                     "trade_started": False,
                     "trade_enabled": False,
-                    "real_trade_enabled": True,
                 },
                 config={"assigned_routine_instance_id": "indicator-follow-a"},
             )
@@ -82,7 +81,6 @@ class ExecutionUniverseTest(unittest.TestCase):
                 state={
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                 },
             )
             window = SimpleNamespace(
@@ -108,7 +106,6 @@ class ExecutionUniverseTest(unittest.TestCase):
                 state={
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                 },
             )
             window = SimpleNamespace(
@@ -134,7 +131,6 @@ class ExecutionUniverseTest(unittest.TestCase):
                 state={
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                     "signal_probe_only": True,
                 },
             )
@@ -167,7 +163,6 @@ class ExecutionUniverseTest(unittest.TestCase):
                 state={
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                 },
             )
             unassigned = _write_stock(
@@ -176,7 +171,6 @@ class ExecutionUniverseTest(unittest.TestCase):
                 state={
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                 },
             )
             window = SimpleNamespace(

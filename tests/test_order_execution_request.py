@@ -19,7 +19,6 @@ class OrderExecutionRequestPreviewTest(unittest.TestCase):
     def _guard(self) -> dict:
         return {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
             "account_no": "12345678",
         }
 

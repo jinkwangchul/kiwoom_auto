@@ -33,13 +33,16 @@ class RealOrderPreflightEvaluateTests(unittest.TestCase):
 
         self.assertEqual("REAL_READY", result.get("real_preflight_status"))
 
-    def test_executable_with_real_trade_disabled_blocks(self) -> None:
-        result = evaluate_real_order_preflight(
-            self._order(),
-            self._guard(real_trade_enabled=False),
-        )
-
-        self.assertEqual("BLOCKED_REAL", result.get("real_preflight_status"))
+    def test_legacy_real_trade_values_do_not_change_preflight(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = evaluate_real_order_preflight(self._order(), guard)
+                self.assertEqual("REAL_READY", result.get("real_preflight_status"))
 
     def test_executable_without_operator_confirmation_blocks(self) -> None:
         result = evaluate_real_order_preflight(

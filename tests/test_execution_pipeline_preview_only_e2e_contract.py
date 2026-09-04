@@ -122,7 +122,6 @@ class PreviewOnlyExecutionPipelineE2EContractTest(unittest.TestCase):
 
     def _guard(self, **overrides: object) -> dict[str, object]:
         guard: dict[str, object] = {
-            "real_trade_enabled": True,
             "kiwoom_logged_in": True,
             "account_selected": True,
             "account_no": "12345678",
@@ -172,7 +171,6 @@ class PreviewOnlyExecutionPipelineE2EContractTest(unittest.TestCase):
                 "real_broker_dispatch_enabled": True,
                 "kiwoom_connected": True,
                 "account_selected": True,
-                "real_trade_enabled": True,
             },
         )
         broker = broker_adapter or MockBrokerAdapter()
@@ -259,7 +257,6 @@ class PreviewOnlyExecutionPipelineE2EContractTest(unittest.TestCase):
                 "real_broker_dispatch_enabled": True,
                 "kiwoom_connected": True,
                 "account_selected": True,
-                "real_trade_enabled": True,
             },
         )
         broker_dispatch = orchestrate_broker_dispatch(broker_open, entrypoint, broker)

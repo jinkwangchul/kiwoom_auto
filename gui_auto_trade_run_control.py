@@ -72,8 +72,6 @@ from operation_policy_gate import (
 )
 from state_policy import (
     operation_mode_display,
-    real_trade_enabled,
-    trade_permission_display,
     auto_trade_status_display,
     normalize_operation_mode,
     status_after_operation_mode_change,
@@ -2017,7 +2015,6 @@ def start_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
             {
                 "status": "MONITORING",
                 "trade_enabled": True,
-                "real_trade_enabled": False,
                 "review_required": False,
                 "review_status": "",
                 "review_reason": "",
@@ -2071,7 +2068,6 @@ def stop_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
             {
                 "status": "STOPPED",
                 "trade_enabled": False,
-                "real_trade_enabled": False,
                 "signal_probe_only": False,
                 "signal_probe_stopped_at": stopped_at,
                 "updated_at": stopped_at,
@@ -2751,13 +2747,8 @@ def auto_trade_start_selected_auto_trades(
             continue
 
         operation_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-        start_status = (
-            "RUNNING"
-            if real_trade_enabled(config)
-            else status_after_operation_mode_change(operation_mode, config)
-        )
+        start_status = status_after_operation_mode_change(operation_mode, config)
         mode_display = operation_mode_display(operation_mode)
-        trade_permission_text, _, _ = trade_permission_display(config)
         started_at = now_text()
 
         metadata = {
@@ -2768,7 +2759,6 @@ def auto_trade_start_selected_auto_trades(
             "ignore_signals_before": started_at,
             # operation_mode는 config.json만 원본으로 사용한다.
             # state.json에는 저장하지 않는다.
-            "real_trade_enabled": real_trade_enabled(config),
             "trade_enabled": True,
             "trade_started_at": started_at,
             "startup_reset_reason": "",
@@ -2809,7 +2799,7 @@ def auto_trade_start_selected_auto_trades(
             failure_reasons.append("INTERNAL_EXCEPTION")
             continue
         if result in ("changed", "unchanged"):
-            completed.append(f"{code} {name}({mode_display}/{trade_permission_text}/{auto_trade_status_display(applied_status)})")
+            completed.append(f"{code} {name}({mode_display}/{auto_trade_status_display(applied_status)})")
             completed_codes.append(str(code))
             if result == "changed":
                 append_production_event(

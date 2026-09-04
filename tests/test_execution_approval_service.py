@@ -95,15 +95,17 @@ class ExecutionApprovalServiceTest(unittest.TestCase):
         self.assertEqual("operator_confirmed", result["approval_stage"])
         self.assertIn("context.operator_confirmed is not true", result["blocked_reasons"])
 
-    def test_real_trade_guard_ok_false_is_blocked(self) -> None:
-        context = self._context()
-        context["real_trade_guard_ok"] = False
-
-        result = evaluate_execution_approval(self._preview_result(), context)
-
-        self.assertFalse(result["approved"])
-        self.assertEqual("real_trade_guard", result["approval_stage"])
-        self.assertIn("context.real_trade_guard_ok is not true", result["blocked_reasons"])
+    def test_legacy_real_trade_guard_does_not_change_approval(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                context = self._context()
+                if value is None:
+                    context.pop("real_trade_guard_ok", None)
+                else:
+                    context["real_trade_guard_ok"] = value
+                result = evaluate_execution_approval(self._preview_result(), context)
+                self.assertTrue(result["approved"])
+                self.assertEqual("approved", result["approval_stage"])
 
     def test_all_conditions_met_is_execution_candidate(self) -> None:
         result = evaluate_execution_approval(self._preview_result(), self._context())

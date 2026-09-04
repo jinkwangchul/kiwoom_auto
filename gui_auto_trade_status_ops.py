@@ -756,7 +756,6 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
     if bool(state.get("signal_probe_only", False)):
         probe_metadata = {
             "trade_enabled": True,
-            "real_trade_enabled": False,
             "signal_probe_only": True,
             "operation_policy_recalculated_at": now_text(),
             "operation_policy_reason": reason,
@@ -764,7 +763,7 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         }
         needs_restore = before_status != "MONITORING" or any(
             state.get(key) != value for key, value in probe_metadata.items()
-            if key in {"trade_enabled", "real_trade_enabled", "signal_probe_only"}
+            if key in {"trade_enabled", "signal_probe_only"}
         )
         if needs_restore:
             if window.update_stock_status(

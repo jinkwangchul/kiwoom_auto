@@ -99,7 +99,6 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                     "status": "RUNNING",
                     "holding_qty": 3,
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                     "trade_started_at": "2026-07-27 09:00:00",
                 }
             ),
@@ -1002,7 +1001,6 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         base_state = {
             "status": "EARLY_CLOSE",
             "trade_enabled": True,
-            "real_trade_enabled": True,
             "signal_probe_only": False,
             "review_required": False,
             "early_close_requested_at": "2026-08-10 10:00:00",
@@ -1055,7 +1053,6 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             "state": {
                 "status": "AUTO_CLOSE",
                 "trade_enabled": True,
-                "real_trade_enabled": True,
                 "signal_probe_only": False,
                 "review_required": False,
                 "auto_close_requested_at": "2026-08-10 15:20:00",

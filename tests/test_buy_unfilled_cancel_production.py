@@ -173,7 +173,6 @@ class BuyUnfilledCancelTimerRoutingTest(unittest.TestCase):
             stock_name="테스트",
             stock_dir=Path("unused"),
             execution_ready=True,
-            real_trade_enabled=True,
             signal_probe_only=False,
         )
         snapshot = SimpleNamespace(entries=(entry,))

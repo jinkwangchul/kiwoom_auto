@@ -57,7 +57,6 @@ class ExecutionPreviewReporterTest(unittest.TestCase):
                             "execution_request": {
                                 "guard_snapshot": {
                                     "operator_confirmed": True,
-                                    "real_trade_enabled": True,
                                     "account_no": "12345678",
                                 }
                             },

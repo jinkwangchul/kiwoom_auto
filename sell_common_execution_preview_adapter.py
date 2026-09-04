@@ -164,8 +164,6 @@ def _guard_block_reason(guard_context: Any) -> str | None:
         return "guard_context must be a dict"
     if guard_context.get("operator_confirmed") is not True:
         return "guard_context.operator_confirmed must be True"
-    if guard_context.get("real_trade_enabled") is not True:
-        return "guard_context.real_trade_enabled must be True"
     return None
 
 

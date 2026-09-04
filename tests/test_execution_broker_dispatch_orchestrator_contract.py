@@ -99,7 +99,6 @@ def _policy(**overrides: object) -> dict[str, object]:
             "real_broker_dispatch_enabled": True,
             "kiwoom_connected": True,
             "account_selected": True,
-            "real_trade_enabled": True,
         },
         "issues": [],
         "warnings": [],

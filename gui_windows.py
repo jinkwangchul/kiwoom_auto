@@ -1646,10 +1646,17 @@ from production_recovery_contract import (
     ACCOUNT_REVIEW_REQUIRED,
     BrokerAccountSnapshot,
     BrokerSnapshotPart,
+    RecoveryGateDecision,
     RecoverySessionIdentity,
     combine_account_snapshot,
     create_recovery_session_identity,
     recovery_request_id,
+)
+from real_trade_retirement_migration import (
+    CURRENT_SCHEMA as RETIRED_SCHEMA_CURRENT,
+    DATA_INVALID as RETIRED_SCHEMA_DATA_INVALID,
+    MIGRATION_REQUIRED as RETIRED_SCHEMA_MIGRATION_REQUIRED,
+    inspect_stock_code_real_trade_schema,
 )
 from production_recovery_state_registry import (
     RECOVERY_ACCOUNT_FAILED,
@@ -7140,6 +7147,29 @@ class MainWindow(QMainWindow):
     ):
         api = getattr(self, "kiwoom_api", None)
         context = production_recovery_registry.snapshot()
+        normalized_stock_code = str(stock_code or "").strip().upper()
+        if normalized_stock_code != "__GLOBAL_OPERATION_START__":
+            compatibility = inspect_stock_code_real_trade_schema(
+                PROJECT_ROOT,
+                normalized_stock_code,
+            )
+            if compatibility.status != RETIRED_SCHEMA_CURRENT:
+                return RecoveryGateDecision(
+                    False,
+                    compatibility.reason_code,
+                    str(getattr(context, "account_status", "") or ""),
+                    "SCHEMA_BLOCKED",
+                    str(
+                        getattr(
+                            getattr(context, "identity", None),
+                            "recovery_session_id",
+                            "",
+                        )
+                        or ""
+                    ),
+                    tuple(compatibility.evidence)
+                    + (f"caller={str(caller_name or '').strip()}",),
+                )
         return check_production_recovery_gate(
             login_session_id=str(
                 getattr(api, "login_session_id", lambda: "")() or ""
@@ -7218,6 +7248,16 @@ class MainWindow(QMainWindow):
 
     def production_recovery_block_user_message(self, decision) -> str:
         reason_code = str(getattr(decision, "reason_code", "") or "").strip()
+        if reason_code == RETIRED_SCHEMA_MIGRATION_REQUIRED:
+            return (
+                "구형 감시/운영 설정 데이터가 감지되었습니다. "
+                "현재 운영 전에 데이터 마이그레이션이 필요합니다."
+            )
+        if reason_code == RETIRED_SCHEMA_DATA_INVALID:
+            return (
+                "종목 설정 데이터를 확인할 수 없어 운영을 시작하지 않았습니다. "
+                "데이터 상태를 확인한 뒤 다시 시도하십시오."
+            )
         api = getattr(self, "kiwoom_api", None)
         connected = False
         checker = getattr(api, "is_connected", None)

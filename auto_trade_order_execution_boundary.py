@@ -28,7 +28,6 @@ from gui_auto_trade_policy import (
 from gui_auto_trade_runtime import parse_stock_folder_name
 from gui_operation_environment import read_system_total_budget_for_recalculation
 from runtime_io import read_json_dict
-from state_policy import real_trade_enabled
 from operation_policy_gate import read_operation_state
 from production_recovery_contract import (
     ACCOUNT_COMPLETED,
@@ -488,21 +487,15 @@ class AutoTradeOrderExecutionBoundary:
             if str(value or "").strip()
         ] if isinstance(raw_accounts, list) else []
 
-        stock_config, stock_config_source = self.real_preflight_stock_config_for_order(order)
-        stock_config_found = stock_config_source not in {"missing_order_code", "stock_config_not_found"}
-        real_enabled = bool(stock_config_found and real_trade_enabled(stock_config))
         account_selected = bool(account_no and account_no in accounts)
 
         return {
-            "real_trade_enabled": real_enabled,
             "kiwoom_logged_in": connected,
             "account_selected": account_selected,
             "account_no": account_no if account_selected else "",
             "operator_confirmed": bool(operator_confirmed),
             "account_numbers": accounts,
             "selected_account_valid": account_selected,
-            "real_trade_source": stock_config_source,
-            "real_trade_config_found": stock_config_found,
             "real_trade_guard_source": "gui_session",
         }
 
@@ -520,10 +513,6 @@ class AutoTradeOrderExecutionBoundary:
             reasons.append("kiwoom account list is empty")
         if guard.get("account_selected") is not True:
             reasons.append("selected account is missing or stale")
-        if guard.get("real_trade_config_found") is not True:
-            reasons.append("real trade config for order is not found")
-        elif guard.get("real_trade_enabled") is not True:
-            reasons.append("real trade is disabled for order stock")
         if include_operator and guard.get("operator_confirmed") is not True:
             reasons.append("operator confirmation is required")
         return reasons
@@ -552,8 +541,6 @@ class AutoTradeOrderExecutionBoundary:
             issues.append("kiwoom api is not connected")
         if guard_dict.get("account_selected") is not True or not str(guard_dict.get("account_no") or "").strip():
             issues.append("selected account is missing or stale")
-        if guard_dict.get("real_trade_enabled") is not True:
-            issues.append("real trade is disabled for order stock")
         if not canonical_executions or not canonical_locks:
             issues.append("runtime target is not the canonical project runtime path")
         if not str(order_dict.get("id") or "").strip():
@@ -967,8 +954,6 @@ class AutoTradeOrderExecutionBoundary:
         order_account = str(order.get("account_no") or "").strip()
         request_account = str(request_preview_dict.get("account_no") or "").strip()
 
-        config, _source = self.real_preflight_stock_config_for_order(order)
-        real_trade_enabled = bool(isinstance(config, dict) and config.get("real_trade_enabled") is True)
         try:
             canonical_queue = queue_path.resolve() == self._context.order_queue_path().resolve()
         except Exception:
@@ -993,8 +978,6 @@ class AutoTradeOrderExecutionBoundary:
             issues.append("selected account does not match execution request account")
         if order_account and selected_account and order_account != selected_account:
             issues.append("selected account does not match ORDER_QUEUED account")
-        if not real_trade_enabled:
-            issues.append("real trade is disabled for order stock")
         if not canonical_queue:
             issues.append("queue path is not canonical runtime/order_queue.json")
 
@@ -1005,7 +988,6 @@ class AutoTradeOrderExecutionBoundary:
             "selected_account_no": selected_account,
             "order_account_no": order_account,
             "request_account_no": request_account,
-            "real_trade_enabled": real_trade_enabled,
             "canonical_queue_path": canonical_queue,
             "send_order_callable": send_order_callable,
         }
@@ -1816,7 +1798,6 @@ class AutoTradeOrderExecutionBoundary:
             }
 
         guard = {
-            "real_trade_enabled": environment.get("real_trade_enabled") is True,
             "kiwoom_logged_in": environment.get("kiwoom_connected") is True,
             "account_selected": bool(str(environment.get("selected_account_no") or "").strip()),
             "account_no": str(environment.get("selected_account_no") or "").strip(),
@@ -2584,8 +2565,6 @@ class AutoTradeOrderExecutionBoundary:
             reasons.append(routine_order_reason)
         if state_dict.get("trade_enabled") is not True:
             reasons.append("trade_enabled is not true")
-        if state_dict.get("real_trade_enabled") is not True:
-            reasons.append("real_trade_enabled is not true")
         if state_dict.get("signal_probe_only") is True:
             reasons.append("signal_probe_only is true")
         if state_dict.get("review_required") is True:

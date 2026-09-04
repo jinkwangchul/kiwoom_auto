@@ -224,7 +224,7 @@ def _bridge(
 
 class SellExecutionQueuePreviewTests(unittest.TestCase):
     def _guard(self) -> dict:
-        return {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"}
+        return {"operator_confirmed": True, "account_no": "12345678"}
 
     def _build_with_record(self, record: dict) -> dict:
         queue_preview = _queue_write_preview(record=record)

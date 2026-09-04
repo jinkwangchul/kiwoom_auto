@@ -135,9 +135,6 @@ def evaluate_final_send_gate(
     if not guard:
         return _blocked("guard", "current_guard is required")
 
-    if not _truthy(guard.get("real_trade_enabled")):
-        return _blocked("guard", "current_guard.real_trade_enabled is not true")
-
     if not _truthy(guard.get("kiwoom_logged_in")):
         return _blocked("guard", "current_guard.kiwoom_logged_in is not true")
 

@@ -154,18 +154,16 @@ class ExecutionPipelineControllerTest(unittest.TestCase):
         self.assertEqual("hoga_mapper", result["stage_diagnostics"][-1]["stage"])
         self.assertFalse(result["stage_diagnostics"][-1]["ok"])
 
-    def test_real_trade_guard_failure_keeps_guard_blocked_stage_and_reason(self) -> None:
-        guard = self._guard()
-        guard["real_trade_enabled"] = False
-
-        result = run_execution_preview_pipeline(self._order(), guard)
-
-        self.assertFalse(result["ok"])
-        self.assertEqual("final_guard", result["blocked_stage"])
-        self.assertEqual("guard.real_trade_enabled is not true", result["blocked_reason"])
-        self.assertEqual("guard", result["stage_diagnostics"][-1]["stage"])
-        self.assertFalse(result["stage_diagnostics"][-1]["ok"])
-        self.assertEqual("guard.real_trade_enabled is not true", result["stage_diagnostics"][-1]["reason"])
+    def test_legacy_real_trade_values_do_not_change_pipeline(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = run_execution_preview_pipeline(self._order(), guard)
+                self.assertTrue(result["ok"])
 
     def test_final_guard_blocked(self) -> None:
         order = self._order()

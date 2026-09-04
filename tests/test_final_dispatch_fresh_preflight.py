@@ -41,7 +41,7 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
         self.stock_dir = self.root / f"{CODE}_LG"
         self.stock_dir.mkdir()
         (self.stock_dir / "config.json").write_text(
-            json.dumps({"real_trade_enabled": True}, ensure_ascii=False),
+            json.dumps({}, ensure_ascii=False),
             encoding="utf-8",
         )
         (self.stock_dir / "state.json").write_text(
@@ -49,7 +49,6 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
                 {
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                     "signal_probe_only": False,
                     "review_required": False,
                 },

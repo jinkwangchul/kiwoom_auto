@@ -187,11 +187,16 @@ class FinalSendGateServiceTest(unittest.TestCase):
         self.assertFalse(result["final_send_gate_ok"])
         self.assertIn("current_guard is required", result["blocked_reasons"])
 
-    def test_guard_real_trade_enabled_false_is_blocked(self) -> None:
-        result = self._evaluate(current_guard=self._guard(real_trade_enabled=False))
-
-        self.assertFalse(result["final_send_gate_ok"])
-        self.assertIn("current_guard.real_trade_enabled is not true", result["blocked_reasons"])
+    def test_legacy_real_trade_values_do_not_change_final_send_gate(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = self._evaluate(current_guard=guard)
+                self.assertTrue(result["final_send_gate_ok"])
 
     def test_guard_kiwoom_logged_in_false_is_blocked(self) -> None:
         result = self._evaluate(current_guard=self._guard(kiwoom_logged_in=False))

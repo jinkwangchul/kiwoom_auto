@@ -116,7 +116,7 @@ class ExecutionReadinessInputBuilderTest(unittest.TestCase):
     def _legacy_context(self, **overrides) -> dict:
         context = {
             "source": "gui_execution_preview_button",
-            "guard": {"operator_confirmed": True, "real_trade_enabled": True},
+            "guard": {"operator_confirmed": True},
             "legacy_execution_preview_result": self._legacy_preview(),
         }
         context.update(overrides)

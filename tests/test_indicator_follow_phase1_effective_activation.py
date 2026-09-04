@@ -337,7 +337,7 @@ class IndicatorFollowEffectiveActivationTest(unittest.TestCase):
 
 
 class IndicatorFollowExecutionKillSwitchTest(unittest.TestCase):
-    def test_disabled_instance_is_blocked_at_committed_bar_probe(self) -> None:
+    def test_disabled_instance_is_blocked_in_current_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "005930_Test"
             stock_dir.mkdir()

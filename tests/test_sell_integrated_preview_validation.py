@@ -14,7 +14,6 @@ from sell_real_ready_adapter_preview import build_sell_real_ready_adapter_previe
 def _guard() -> dict:
     return {
         "operator_confirmed": True,
-        "real_trade_enabled": True,
         "account_no": "12345678",
     }
 

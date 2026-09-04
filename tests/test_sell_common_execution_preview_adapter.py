@@ -151,15 +151,18 @@ class SellCommonExecutionPreviewAdapterTests(unittest.TestCase):
         self.assertEqual(result["status"], "BLOCKED")
         pipeline.assert_not_called()
 
-    def test_real_trade_enabled_false_blocks_without_pipeline_call(self):
-        with mock.patch.object(subject, "run_execution_preview_pipeline") as pipeline:
-            result = build_sell_common_execution_preview(
-                _adapter_preview([_candidate("METHOD")]),
-                _guard(real_trade_enabled=False),
-            )
-
-        self.assertEqual(result["status"], "BLOCKED")
-        pipeline.assert_not_called()
+    def test_legacy_real_trade_values_do_not_change_preview(self):
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = _guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = build_sell_common_execution_preview(
+                    _adapter_preview([_candidate("METHOD")]), guard
+                )
+                self.assertEqual(result["status"], "READY")
 
     def test_market_blocked_without_price_substitution(self):
         result = build_sell_common_execution_preview(

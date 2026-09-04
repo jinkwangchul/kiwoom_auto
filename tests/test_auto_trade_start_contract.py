@@ -220,7 +220,6 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 json.dumps(
                     {
                         "operation_mode": "CONTINUOUS",
-                        "real_trade_enabled": False,
                     },
                     ensure_ascii=False,
                 ),
@@ -273,7 +272,6 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 json.dumps(
                     {
                         "operation_mode": "CONTINUOUS",
-                        "real_trade_enabled": False,
                     },
                     ensure_ascii=False,
                 ),
@@ -381,7 +379,6 @@ class AutoTradeStartContractTest(unittest.TestCase):
                     "assigned_routine_instance_id": instance_id,
                     "routine_definition_id": f"definition-{instance_id}",
                     "routine_instance_name": instance_name,
-                    "real_trade_enabled": True,
                 },
                 ensure_ascii=False,
             ),
@@ -1120,6 +1117,47 @@ class AutoTradeStartContractTest(unittest.TestCase):
             result["user_message"],
         )
         self.assertNotIn("RECOVERY_", window.statusBarMessage.call_args.args[0])
+
+    def test_legacy_schema_blocks_before_operation_start_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "005930", "삼성전자", "inst-a", "지표추종매매A")
+            state_before = (stock[0] / "state.json").read_bytes()
+            window = _StartWindow([stock])
+            window.send_order = Mock()
+            window.filter_start_targets_by_recovery = Mock(
+                return_value={
+                    "allowed": False,
+                    "reason": "MIGRATION_REQUIRED",
+                    "user_message": (
+                        "구형 감시/운영 설정 데이터가 감지되었습니다. "
+                        "현재 운영 전에 데이터 마이그레이션이 필요합니다."
+                    ),
+                    "eligible": (),
+                    "excluded_review": (),
+                    "blocked_target_details": (
+                        {
+                            "stock_code": "005930",
+                            "stock_name": "삼성전자",
+                            "reason": "MIGRATION_REQUIRED",
+                            "display_label": "005930 삼성전자",
+                        },
+                    ),
+                }
+            )
+
+            result = auto_trade_start_selected_auto_trades(
+                window,
+                request_scope=START_REQUEST_SINGLE,
+            )
+            state_after = (stock[0] / "state.json").read_bytes()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("MIGRATION_REQUIRED", result["reason"])
+        self.assertEqual(state_before, state_after)
+        self.assertEqual([], window.recalculate_calls)
+        self.assertEqual((), participant_codes(window))
+        window.send_order.assert_not_called()
 
     def test_assigned_post_login_stock_is_blocked_before_operation_or_order_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

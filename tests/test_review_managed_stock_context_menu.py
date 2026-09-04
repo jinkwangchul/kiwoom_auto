@@ -172,12 +172,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             ats_liquidation=Mock(),
             set_operation_exclusion=Mock(),
             clear_operation_exclusion=Mock(),
-            trade_permission_label=Mock(
-                return_value=(
-                    "실주문 전환" if operation_excluded else "감시전용 전환"
-                )
-            ),
-            toggle_trade_permission=Mock(),
         )
         runtime_state = {"marker": "unchanged"}
         parent = SimpleNamespace(
@@ -239,7 +233,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "운영시작",
             "검토정지",
             "운영제외",
-            "감시전용 전환",
             "조기마감",
             "개별청산",
             "종목등록",
@@ -262,7 +255,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "운영시작",
             "검토정지",
             "운영제외",
-            "감시전용 전환",
             "조기마감",
             "개별청산",
             "종목등록",
@@ -281,7 +273,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "운영시작",
             "검토정지",
             "운영제외",
-            "감시전용 전환",
             "시간변경",
             "변경리셋",
             "종목등록",
@@ -308,7 +299,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
                 "전체선택",
                 "선택해제",
                 "제외해제",
-                "실주문 전환",
                 "조기마감",
                 "개별청산",
                 "시간변경",
@@ -324,7 +314,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "전체선택",
             "선택해제",
             "제외해제",
-            "실주문 전환",
             "시간변경",
             "변경리셋",
             "등록해제",
@@ -340,7 +329,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "전체선택": "select_all",
             "선택해제": "clear_selection",
             "제외해제": "clear_operation_exclusion",
-            "실주문 전환": "toggle_trade_permission",
             "시간변경": "time_change",
             "변경리셋": "time_reset",
             "등록해제": "unregister",
@@ -409,17 +397,13 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         self.assertTrue(availability.review_managed)
         self.assertEqual(availability.reason_for("start"), "REVIEW_REQUIRED")
         self.assertEqual(availability.reason_for("exclusion"), "REVIEW_REQUIRED")
-        self.assertEqual(
-            availability.reason_for("trade_permission"),
-            "REVIEW_REQUIRED",
-        )
         self.assertEqual(availability.reason_for("unregister"), "REVIEW_REQUIRED")
 
     def test_review_disabled_actions_explain_user_reason_without_changing_policy(self) -> None:
         menu, _callbacks = self._render("SCHEDULED", review=True)
         entries = menu.top_entries()
 
-        for label in ("운영시작", "운영제외", "감시전용 전환", "등록해제", "간이차트"):
+        for label in ("운영시작", "운영제외", "등록해제", "간이차트"):
             with self.subTest(label=label):
                 action = entries[label]
                 self.assertFalse(action.enabled)

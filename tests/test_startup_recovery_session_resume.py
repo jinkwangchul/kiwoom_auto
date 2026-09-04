@@ -622,7 +622,6 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                     {
                         "status": "RUNNING",
                         "trade_enabled": True,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
                         "ignore_signals_before": "2026-08-26 09:30:00",
@@ -681,7 +680,6 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                     {
                         "status": "STOPPED",
                         "trade_enabled": False,
-                        "real_trade_enabled": True,
                         "signal_probe_only": False,
                     }
                 ),

@@ -210,7 +210,7 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
         first = self.inspect()["proposals"][0]
         order = order_queue.signal_to_order_candidates(first["signal"], 1)[0]
         order.update(status="REAL_READY", execution_enabled=True)
-        preview = preview_execution_for_order(order, {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"})
+        preview = preview_execution_for_order(order, {"operator_confirmed": True, "account_no": "12345678"})
         self.assertTrue(preview["ok"], preview)
         process = preview["candidate_result"]["process_record"]
         self.assertEqual(1000, process["process_plan"]["approved_budget"])
@@ -220,7 +220,7 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
         self.assertFalse(child["execution_process_owner_required"])
         order = order_queue.signal_to_order_candidates(second["signal"], 1)[0]
         order.update(status="REAL_READY", execution_enabled=True)
-        preview = preview_execution_for_order(order, {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"})
+        preview = preview_execution_for_order(order, {"operator_confirmed": True, "account_no": "12345678"})
         self.assertTrue(preview["ok"], preview)
         self.assertIsNone(preview["candidate_result"]["process_record"])
 
@@ -333,7 +333,7 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
             index = len(json.loads(executions.read_text(encoding="utf-8"))["executions"]) + 1
             order = order_queue.signal_to_order_candidates(proposal["signal"], index)[0]
             order.update(status="REAL_READY", execution_enabled=True)
-            preview = preview_execution_for_order(order, {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"})
+            preview = preview_execution_for_order(order, {"operator_confirmed": True, "account_no": "12345678"})
             candidate = preview["candidate_result"]
             pipeline = preview["pipeline_result"]["pipeline"]
             catalog = build_execution_runtime_catalog_preview(

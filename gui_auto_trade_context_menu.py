@@ -187,9 +187,6 @@ class StockContextMenuCallbacks:
     ] | None = None
     set_operation_exclusion: Callable[[], None] | None = None
     clear_operation_exclusion: Callable[[], None] | None = None
-    trade_permission_label: Callable[[], str] | None = None
-    trade_permission_available: Callable[[], bool] | None = None
-    toggle_trade_permission: Callable[[], None] | None = None
     mock_create: Callable[[], None] | None = None
     mock_actions: Callable[[], dict[str, Any]] | None = None
 
@@ -203,7 +200,6 @@ class StockContextMenuAvailability:
     start_allowed: bool
     emergency_stop_allowed: bool
     exclusion_allowed: bool
-    trade_permission_allowed: bool
     early_close_allowed: bool
     early_close_cancel_allowed: bool
     individual_liquidation_allowed: bool
@@ -255,7 +251,6 @@ def inspect_stock_context_menu_availability(
             "start",
             "emergency_stop",
             "exclusion",
-            "trade_permission",
             "early_close",
             "early_close_cancel",
             "individual_liquidation",
@@ -294,15 +289,6 @@ def inspect_stock_context_menu_availability(
                 ),
                 "EXCLUSION_UNAVAILABLE",
             )
-
-    permission_available = True
-    availability_getter = callbacks.trade_permission_available
-    try:
-        if callable(availability_getter):
-            permission_available = bool(availability_getter())
-    except Exception:
-        permission_available = False
-    trade_permission_allowed = bool(has_selection and permission_available)
 
     start_allowed = bool(has_selection)
     emergency_stop_allowed = bool(has_selection)
@@ -418,7 +404,6 @@ def inspect_stock_context_menu_availability(
             "start",
             "emergency_stop",
             "exclusion",
-            "trade_permission",
             "early_close",
             "early_close_cancel",
             "individual_liquidation",
@@ -430,7 +415,6 @@ def inspect_stock_context_menu_availability(
         start_allowed = False
         emergency_stop_allowed = False
         exclusion_allowed = False
-        trade_permission_allowed = False
         early_close_allowed = False
         early_close_cancel_allowed = False
         individual_liquidation_allowed = False
@@ -449,15 +433,12 @@ def inspect_stock_context_menu_availability(
         individual_liquidation_allowed = False
         stock_register_allowed = False
 
-    if not trade_permission_allowed and "trade_permission" not in reasons:
-        reasons["trade_permission"] = "TRADE_PERMISSION_UNAVAILABLE"
     return StockContextMenuAvailability(
         review_managed=review_managed,
         excluded_management=excluded_management,
         start_allowed=start_allowed,
         emergency_stop_allowed=emergency_stop_allowed,
         exclusion_allowed=exclusion_allowed,
-        trade_permission_allowed=trade_permission_allowed,
         early_close_allowed=early_close_allowed,
         early_close_cancel_allowed=early_close_cancel_allowed,
         individual_liquidation_allowed=individual_liquidation_allowed,
@@ -1111,17 +1092,6 @@ def show_monitor_stock_context_menu(
         action_set_exclusion = menu.addAction("운영제외")
         action_set_exclusion.setEnabled(availability.exclusion_allowed)
 
-    action_trade_permission = None
-    if callbacks.toggle_trade_permission is not None:
-        label_getter = callbacks.trade_permission_label
-        try:
-            permission_label = label_getter() if callable(label_getter) else ""
-        except Exception:
-            permission_label = ""
-        permission_label = str(permission_label or "").strip() or "거래권한 전환"
-        action_trade_permission = menu.addAction(permission_label)
-        action_trade_permission.setEnabled(availability.trade_permission_allowed)
-
     menu.addSeparator()
     early_close = _add_early_close_menu(
         menu,
@@ -1213,12 +1183,6 @@ def show_monitor_stock_context_menu(
         fallback="현재 선택한 종목의 운영 제외 상태를 변경할 수 없습니다.",
     )
     _set_disabled_reason(
-        action_trade_permission,
-        enabled=availability.trade_permission_allowed,
-        reason_code=availability.reason_for("trade_permission"),
-        fallback="현재 선택한 종목의 주문 권한을 변경할 수 없습니다.",
-    )
-    _set_disabled_reason(
         early_close["menu"],
         enabled=(availability.early_close_allowed or availability.early_close_cancel_allowed),
         reason_code=(
@@ -1297,7 +1261,6 @@ def show_monitor_stock_context_menu(
     allow(action_emergency_stop, availability.emergency_stop_allowed)
     allow(action_set_exclusion, availability.exclusion_allowed)
     allow(action_clear_exclusion, availability.exclusion_allowed)
-    allow(action_trade_permission, availability.trade_permission_allowed)
     allow(action_stock_register, availability.stock_register_allowed)
     allow(action_unregister, availability.unregister_allowed)
     allow(action_open_charts, availability.chart_allowed)
@@ -1344,9 +1307,6 @@ def show_monitor_stock_context_menu(
     elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
         selected_option = "OPERATION_EXCLUSION_RELEASE"
         decision_event_type = "OPERATOR_SETTING_DECISION"
-    elif action_trade_permission is not None and chosen == action_trade_permission:
-        selected_option = "TRADE_PERMISSION_TOGGLE"
-        decision_event_type = "OPERATOR_SETTING_DECISION"
     elif chosen == early_close["routine"]:
         selected_option = "EARLY_CLOSE_ROUTINE"
     elif chosen == early_close["market"]:
@@ -1392,7 +1352,6 @@ def show_monitor_stock_context_menu(
                     "EMERGENCY_RELEASE",
                     "OPERATION_EXCLUDE",
                     "OPERATION_EXCLUSION_RELEASE",
-                    "TRADE_PERMISSION_TOGGLE",
                     "EARLY_CLOSE_ROUTINE",
                     "EARLY_CLOSE_MARKET",
                     "EARLY_CLOSE_CURRENT",
@@ -1424,8 +1383,6 @@ def show_monitor_stock_context_menu(
         callbacks.set_operation_exclusion()
     elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
         callbacks.clear_operation_exclusion()
-    elif action_trade_permission is not None and chosen == action_trade_permission:
-        callbacks.toggle_trade_permission()
     elif action_unregister is not None and chosen == action_unregister:
         callbacks.unregister()
     elif action_open_charts is not None and chosen == action_open_charts:
@@ -1548,15 +1505,6 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ats_execution_method_set=lambda method, label: window_callback(
             "set_selected_manual_ats_execution_method"
         )(method, label, selected),
-        trade_permission_label=window_callback("selected_trade_permission_context_label"),
-        trade_permission_available=(
-            getattr(window, "selected_trade_permission_available", None)
-            if callable(
-                getattr(window, "selected_trade_permission_available", None)
-            )
-            else None
-        ),
-        toggle_trade_permission=window_callback("toggle_selected_trade_permission"),
         ats_liquidation_available=lambda: (
             window_callback("selected_manual_ats_liquidation_available")(selected)
         ),

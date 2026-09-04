@@ -25,7 +25,6 @@ class RealOrderPreflightSingleOrderTests(unittest.TestCase):
 
     def _write_guard(self, **overrides: object) -> None:
         guard = {
-            "real_trade_enabled": True,
             "kiwoom_logged_in": True,
             "account_selected": True,
             "operator_confirmed": True,
@@ -65,8 +64,8 @@ class RealOrderPreflightSingleOrderTests(unittest.TestCase):
         self.assertEqual(1, len(orders))
         return orders[0]
 
-    def test_executable_with_blocking_guard_moves_to_blocked_real(self) -> None:
-        self._write_guard(real_trade_enabled=False)
+    def test_executable_without_operator_confirmation_moves_to_blocked_real(self) -> None:
+        self._write_guard(operator_confirmed=False)
         self._write_queue(status="EXECUTABLE", execution_enabled=False)
 
         result = real_order_preflight.apply_real_order_preflight_for_order(

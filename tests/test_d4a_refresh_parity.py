@@ -180,7 +180,6 @@ class D4aRefreshParityTests(unittest.TestCase):
     def test_settings_mutation_routes_use_shared_refresh(self) -> None:
         functions = (
             setting_window.delete_routine_instance_with_existing_policy,
-            setting_window.AutoTradeSettingWindow.toggle_selected_trade_permission,
             setting_window.AutoTradeSettingWindow.toggle_selected_manual_override_flag,
             setting_window.AutoTradeSettingWindow.reset_selected_manual_override,
             setting_window.AutoTradeSettingWindow.unregister_routine_tree_stock,

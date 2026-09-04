@@ -275,7 +275,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                     "buy_qty": 1,
                     "assigned_routine_instance_id": "instance-test",
                     "routine_instance_name": "테스트 루틴",
-                    "real_trade_enabled": True,
                 },
                 ensure_ascii=False,
             ),

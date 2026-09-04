@@ -49,7 +49,6 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                 {
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                     "signal_probe_only": False,
                     "review_required": False,
                     "holding_qty": holding_qty,

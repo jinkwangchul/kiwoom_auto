@@ -142,9 +142,6 @@ def preview_real_order_preflight(order: Any, guard: Any, context: Any = None) ->
     if not source_signal_id:
         return _blocked("source_signal_id", "order.source_signal_id is required")
 
-    if not _truthy(guard_dict.get("real_trade_enabled")):
-        return _blocked("guard", "guard.real_trade_enabled is not true")
-
     if not _truthy(guard_dict.get("kiwoom_logged_in")):
         return _blocked("guard", "guard.kiwoom_logged_in is not true")
 
@@ -250,7 +247,6 @@ def commit_real_order_preflight(
         validation = preview_real_order_preflight(
             target_order,
             {
-                "real_trade_enabled": True,
                 "kiwoom_logged_in": True,
                 "account_selected": True,
                 "account_no": "COMMIT_REVALIDATION",

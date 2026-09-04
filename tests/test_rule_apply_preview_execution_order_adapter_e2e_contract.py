@@ -64,8 +64,6 @@ class RuleApplyPreviewExecutionOrderAdapterE2EContractTest(unittest.TestCase):
     def _guard_defaults(self) -> dict[str, object]:
         return {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
-            "real_trade_guard_ok": True,
             "account_no": "12345678",
         }
 

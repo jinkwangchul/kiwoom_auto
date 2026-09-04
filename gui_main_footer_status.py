@@ -57,7 +57,6 @@ _CANONICAL_CATEGORIES = {
     "✓ 운영 정지": "success",
     "✕ 운영 시작 실패": "failure",
     "✕ 운영 정지 실패": "failure",
-    "● 감시전용 운영": "state",
     "✕ 긴급정지": "failure",
     "✓ 긴급정지 해제": "success",
     "✓ 설정 저장 완료": "success",
@@ -277,8 +276,6 @@ def project_operator_footer_message(
         if _contains_any(message, ("정상", "완료", "수신 중")):
             return _projection("✓ 시장데이터 수신 정상", "success")
 
-    if "감시전용" in message or "신호평가 전용" in message:
-        return _projection("● 감시전용 운영", "state")
     if _contains_any(
         message,
         (

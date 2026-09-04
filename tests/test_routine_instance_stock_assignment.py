@@ -29,7 +29,6 @@ def instance(instance_id: str, name: str) -> RoutineInstanceRecord:
         persisted=True,
         source="PERSISTED",
         enabled=False,
-        real_trade_allowed=False,
     )
 
 

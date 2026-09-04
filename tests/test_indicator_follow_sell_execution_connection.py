@@ -739,7 +739,6 @@ class IndicatorFollowSellExecutionConnectionTest(unittest.TestCase):
                     order,
                     {
                         "operator_confirmed": True,
-                        "real_trade_enabled": True,
                         "account_no": "12345678",
                     },
                 )

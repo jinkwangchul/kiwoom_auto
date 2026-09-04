@@ -82,12 +82,6 @@ from state_policy import (
     effective_schedule_times,
     normalize_operation_mode,
 )
-from gui_routine_service import (
-    execute_selected_stock_real_trade_command,
-    selected_stock_real_trade_target_enabled,
-    selected_stock_trade_permission_available,
-    selected_stock_trade_permission_label,
-)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -517,29 +511,6 @@ def execute_main_monitoring_selective_start(
     ).as_legacy_dict()
 
 
-def toggle_main_monitoring_trade_permission(
-    adapter: MainMonitoringStockOperationAdapter,
-) -> dict[str, object]:
-    """Apply the shared RealTrade command and keep Main-only UI feedback here."""
-
-    selected = adapter.selected_stock_infos()
-    if not selected:
-        adapter.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
-        return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
-    result = execute_selected_stock_real_trade_command(
-        adapter,
-        selected,
-        selected_stock_real_trade_target_enabled(selected),
-    )
-    if result.get("changed"):
-        adapter.refresh_all()
-    message = f"거래권한 변경: {result.get('changed', 0)}개"
-    if result.get("blocked"):
-        message += f" / 차단 {result.get('blocked', 0)}개"
-    adapter.statusBarMessage(message)
-    return result
-
-
 def set_main_monitoring_individual_schedule_time(
     adapter: MainMonitoringStockOperationAdapter,
 ) -> None:
@@ -793,14 +764,6 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
                 adapter.selected_stock_infos(),
             )
         ),
-        trade_permission_label=lambda: selected_stock_trade_permission_label(
-            adapter.selected_stock_infos()
-        ),
-        trade_permission_available=lambda: selected_stock_trade_permission_available(
-            adapter,
-            adapter.selected_stock_infos(),
-        ),
-        toggle_trade_permission=lambda: toggle_main_monitoring_trade_permission(adapter),
         ats_liquidation_available=(
             lambda: auto_trade_selected_manual_ats_liquidation_available(
                 adapter,

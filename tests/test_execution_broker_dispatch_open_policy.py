@@ -199,7 +199,6 @@ class ExecutionBrokerDispatchOpenPolicyTest(unittest.TestCase):
             ("real_broker_dispatch_enabled", "REAL_BROKER_DISPATCH_ENVIRONMENT_DISABLED"),
             ("kiwoom_connected", "KIWOOM_CONNECTED_NOT_TRUE"),
             ("account_selected", "ACCOUNT_SELECTED_NOT_TRUE"),
-            ("real_trade_enabled", "REAL_TRADE_ENABLED_NOT_TRUE"),
         ]
         for flag, expected_issue in cases:
             with self.subTest(flag=flag):
@@ -213,6 +212,22 @@ class ExecutionBrokerDispatchOpenPolicyTest(unittest.TestCase):
                 self.assertEqual("BLOCKED", result["status"])
                 self.assertIn(expected_issue, result["issues"])
                 self.assertFalse(result["broker_dispatch_allowed"])
+
+    def test_legacy_real_trade_flag_does_not_change_dispatch_readiness(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                environment = self._environment()
+                if value is None:
+                    environment.pop("real_trade_enabled", None)
+                else:
+                    environment["real_trade_enabled"] = value
+                result = evaluate_execution_broker_dispatch_open_policy(
+                    self._orchestrator(),
+                    confirmations=self._confirmations(),
+                    environment_flags=environment,
+                )
+                self.assertEqual("READY_TO_OPEN_BROKER_DISPATCH", result["status"])
+                self.assertNotIn("real_trade_enabled", result["environment_checks"])
 
     def test_broker_kiwoom_queue_and_runtime_are_not_called(self) -> None:
         with (

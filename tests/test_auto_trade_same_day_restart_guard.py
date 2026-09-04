@@ -106,7 +106,6 @@ class SameDayRestartGuardTest(unittest.TestCase):
             "end_buy_time": "13:30:00",
             "assigned_routine_instance_id": "instance-a",
             "routine_instance_name": "루틴 A",
-            "real_trade_enabled": True,
             "trade_amount_type": "QUANTITY",
             "buy_qty": 1,
         }

@@ -262,7 +262,6 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     {
                         "operation_mode": "CONTINUOUS",
                         "assigned_routine_instance_id": "instance-a",
-                        "real_trade_enabled": False,
                     },
                     ensure_ascii=False,
                 ),

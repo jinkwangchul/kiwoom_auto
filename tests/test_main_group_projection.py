@@ -44,7 +44,6 @@ def _instance(
         persisted=True,
         source="PERSISTED",
         enabled=True,
-        real_trade_allowed=True,
         group_id=group_id,
     )
 

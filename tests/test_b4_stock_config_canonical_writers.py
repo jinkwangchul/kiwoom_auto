@@ -32,7 +32,6 @@ class B4StockConfigCanonicalWritersTest(unittest.TestCase):
             "end_buy_time": "13:30:00",
             "buy_end_time": "13:30:00",
             "operation_excluded": False,
-            "real_trade_enabled": True,
             "routine": "RoutineA",
             "routine_instance_name": "RoutineA",
             "assigned_routine_instance_id": "instance-a",
@@ -210,7 +209,7 @@ class B4StockConfigCanonicalWritersTest(unittest.TestCase):
         saved = read_json_dict(self.config_path)
         self.assertTrue(saved["operation_excluded"])
         self.assertEqual(1_000_000, saved["buy_limit_amount"])
-        self.assertTrue(saved["real_trade_enabled"])
+        self.assertNotIn("real_trade_enabled", saved)
 
     def test_exclusion_same_field_conflict_does_not_overwrite(self) -> None:
         original_patch = StockRepository.patch_stock_config
@@ -269,144 +268,13 @@ class B4StockConfigCanonicalWritersTest(unittest.TestCase):
         writer.assert_not_called()
         self.assertEqual(before, self.config_path.read_bytes())
 
-    def test_real_trade_uses_canonical_patch_and_no_change_skips_writer(self) -> None:
-        original_patch = StockRepository.patch_stock_config
-        with patch.object(
-            routine_service.StockRepository,
-            "patch_stock_config",
-            autospec=True,
-            side_effect=original_patch,
-        ) as canonical_patch:
-            changed = routine_service.set_stock_real_trade_enabled(
-                self.window,
-                self.stock_dir,
-                "005930",
-                "삼성전자",
-                False,
-            )
-
-        self.assertTrue(changed["ok"], changed)
-        self.assertTrue(changed["changed"])
-        self.assertEqual(
-            {
-                "real_trade_enabled",
-                "real_trade_policy_updated_at",
-                "updated_at",
-            },
-            set(canonical_patch.call_args.args[2]),
-        )
-        saved = read_json_dict(self.config_path)
-        self.assertFalse(saved["real_trade_enabled"])
-        self.assertEqual(100_000, saved["buy_amount"])
-
-        before = self.config_path.read_bytes()
-        with patch.object(
-            routine_service.StockRepository,
-            "patch_stock_config",
-        ) as canonical_patch:
-            unchanged = routine_service.set_stock_real_trade_enabled(
-                self.window,
-                self.stock_dir,
-                "005930",
-                "삼성전자",
-                False,
-            )
-        self.assertTrue(unchanged["ok"], unchanged)
-        self.assertFalse(unchanged["changed"])
-        canonical_patch.assert_not_called()
-        self.assertEqual(before, self.config_path.read_bytes())
-
-    def test_real_trade_same_field_conflict_fails_closed(self) -> None:
-        original_patch = StockRepository.patch_stock_config
-
-        def conflict(repository, code, patch_values, **kwargs):
-            concurrent = read_json_dict(self.config_path)
-            concurrent["real_trade_enabled"] = None
-            concurrent["conflict_owner"] = "other-writer"
-            self._write_config(concurrent)
-            return original_patch(repository, code, patch_values, **kwargs)
-
-        with patch.object(
-            routine_service.StockRepository,
-            "patch_stock_config",
-            autospec=True,
-            side_effect=conflict,
-        ):
-            result = routine_service.set_stock_real_trade_enabled(
-                self.window,
-                self.stock_dir,
-                "005930",
-                "삼성전자",
-                False,
-            )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(STOCK_CONFIG_WRITE_FIELD_CONFLICT, result["reason"])
-        saved = read_json_dict(self.config_path)
-        self.assertIsNone(saved["real_trade_enabled"])
-        self.assertEqual("other-writer", saved["conflict_owner"])
-
-    def test_real_trade_merges_unrelated_concurrent_budget_change(self) -> None:
-        original_patch = StockRepository.patch_stock_config
-
-        def concurrent_budget(repository, code, patch_values, **kwargs):
-            concurrent = read_json_dict(self.config_path)
-            concurrent["buy_amount"] = 300_000
-            self._write_config(concurrent)
-            return original_patch(repository, code, patch_values, **kwargs)
-
-        with patch.object(
-            routine_service.StockRepository,
-            "patch_stock_config",
-            autospec=True,
-            side_effect=concurrent_budget,
-        ):
-            result = routine_service.set_stock_real_trade_enabled(
-                self.window,
-                self.stock_dir,
-                "005930",
-                "삼성전자",
-                False,
-            )
-
-        self.assertTrue(result["ok"], result)
-        saved = read_json_dict(self.config_path)
-        self.assertFalse(saved["real_trade_enabled"])
-        self.assertEqual(300_000, saved["buy_amount"])
-
-    def test_real_trade_running_guard_calls_no_writer(self) -> None:
-        self._write_state({"status": "RUNNING", "trade_enabled": True})
-        attach_participant_owner(self.window, {"005930"})
-        before = self.config_path.read_bytes()
-        with patch.object(routine_service, "_patch_real_trade_enabled") as writer:
-            result = routine_service.set_stock_real_trade_enabled(
-                self.window,
-                self.stock_dir,
-                "005930",
-                "삼성전자",
-                False,
-            )
-
-        self.assertFalse(result["ok"])
-        writer.assert_not_called()
-        self.assertEqual(before, self.config_path.read_bytes())
-
-    def test_cross_field_sequence_preserves_budget_limit_real_trade_and_override(self) -> None:
+    def test_cross_field_sequence_preserves_budget_limit_and_override(self) -> None:
         self.assertTrue(self._change_operation_mode("CONTINUOUS"))
         self.assertTrue(self._set_excluded(True))
-        result = routine_service.set_stock_real_trade_enabled(
-            self.window,
-            self.stock_dir,
-            "005930",
-            "삼성전자",
-            False,
-        )
-        self.assertTrue(result["ok"], result)
 
         saved = read_json_dict(self.config_path)
         self.assertEqual("CONTINUOUS", saved["operation_mode"])
         self.assertTrue(saved["operation_excluded"])
-        self.assertFalse(saved["real_trade_enabled"])
         self.assertEqual(100_000, saved["buy_amount"])
         self.assertEqual(1_000_000, saved["buy_limit_amount"])
         self.assertEqual({"owner": "fixture"}, saved["policy_override"])

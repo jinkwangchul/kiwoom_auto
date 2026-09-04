@@ -75,7 +75,6 @@ def create_stock_fixture(
             "code": code,
             "name": name,
             "operation_excluded": False,
-            "real_trade_enabled": False,
             "assigned_routine_instance_id": "",
             **dict(config or {}),
         },

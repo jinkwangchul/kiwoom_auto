@@ -156,12 +156,10 @@ class ManualExecutionChainIntegrationTest(unittest.TestCase):
 
     def _guard(self) -> dict:
         return {
-            "real_trade_enabled": True,
             "kiwoom_logged_in": True,
             "account_selected": True,
             "account_no": "12345678",
             "operator_confirmed": True,
-            "real_trade_guard_ok": True,
         }
 
     def test_manual_execution_pre_sendorder_chain_uses_temp_files_only(self) -> None:

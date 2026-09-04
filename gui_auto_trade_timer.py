@@ -130,7 +130,6 @@ def auto_trade_real_execution_active(
     for entry in snapshot.entries:
         if (
             entry.execution_ready
-            and entry.real_trade_enabled
             and not entry.signal_probe_only
         ):
             return True
@@ -204,7 +203,6 @@ def _process_pending_signal_pipeline(
         entry.stock_code
         for entry in snapshot.entries
         if getattr(entry, "execution_ready", False)
-        and getattr(entry, "real_trade_enabled", False)
         and not getattr(entry, "signal_probe_only", False)
     )
     entries_by_code = {

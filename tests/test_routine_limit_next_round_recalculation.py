@@ -431,7 +431,6 @@ class RoutineLimitNextRoundRecalculationTest(unittest.TestCase):
                         "assigned_routine_instance_id": "instance-a",
                         "routine_instance_name": "루틴 A",
                         "operation_mode": "SCHEDULED",
-                        "real_trade_enabled": True,
                     },
                     ensure_ascii=False,
                 ),

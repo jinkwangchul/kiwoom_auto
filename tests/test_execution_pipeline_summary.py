@@ -80,21 +80,14 @@ class ExecutionPipelineSummaryTest(unittest.TestCase):
 
         self.assertIn("order.execution_enabled is not true", summary["blocked_reasons"])
 
-    def test_guard_failure_summary_keeps_diagnostic_reason(self) -> None:
+    def test_legacy_real_trade_false_does_not_block_summary(self) -> None:
         guard = self._guard()
         guard["real_trade_enabled"] = False
-        pipeline_result = run_execution_preview_pipeline(self._order(), guard)
-
-        summary = summarize_execution_preview_pipeline(pipeline_result)
-
-        self.assertEqual("final_guard", summary["blocked_stage"])
-        self.assertEqual("guard.real_trade_enabled is not true", summary["blocked_reason"])
-        self.assertEqual("guard", summary["stage_diagnostics"][-1]["stage"])
-        self.assertFalse(summary["stage_diagnostics"][-1]["ok"])
-        self.assertEqual(
-            "guard.real_trade_enabled is not true",
-            summary["stage_diagnostics"][-1]["reason"],
+        pipeline_result = run_execution_preview_pipeline(
+            self._order(), guard
         )
+        summary = summarize_execution_preview_pipeline(pipeline_result)
+        self.assertTrue(summary["ok"])
 
     def test_mapper_unresolved_summary_keeps_diagnostics_without_order_available_wording(self) -> None:
         order = self._order()

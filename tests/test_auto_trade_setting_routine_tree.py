@@ -427,7 +427,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             persisted=True,
             source="PERSISTED",
             enabled=False,
-            real_trade_allowed=False,
             rules_path=Path("routine_instances") / instance_id / "rules.json",
             schema_version="1.0",
             group_id=group_id,
@@ -2134,7 +2133,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "inspect_stock_review_state",
                 return_value=SimpleNamespace(review_required=False),
             ),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "show_toast"),
         ):
@@ -2294,14 +2292,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
             ),
             patch.object(setting_window, "execute_assignment_unassign", side_effect=execute_unassign) as execute,
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.unregister_selected_result_rows())
 
         execute.assert_called_once()
         question.assert_not_called()
-        ensure_routine.assert_called_once_with("005930", "삼성전자")
         parent.refresh_all.assert_called_once_with()
         self.assertEqual("등록대기", dialog.result_table.item(0, 3).text())
         toast.assert_called_with(dialog, "등록해제 1건 | 삼성전자")
@@ -2350,7 +2346,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
             ),
             patch.object(setting_window, "execute_assignment_unassign", side_effect=execute_unassign) as execute,
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.unregister_selected_result_rows())
@@ -2417,7 +2412,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
             ),
             patch.object(setting_window, "execute_assignment_unassign", side_effect=execute_unassign),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.unregister_selected_result_rows())
@@ -2677,7 +2671,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(success=True, changed=True),
             ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "show_toast") as toast,
         ):
@@ -2725,7 +2718,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(success=True, changed=True),
             ) as assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
             patch.object(dialog, "_refresh_classification_for_stock", return_value=True),
             patch.object(setting_window, "show_toast") as toast,
@@ -2779,7 +2771,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(success=True, changed=True),
             ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "show_toast") as toast,
         ):
@@ -2850,7 +2841,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(success=True, changed=True),
             ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "sync_auto_trade_monitoring_universe") as sync_monitoring,
             patch.object(setting_window, "show_toast") as toast,
@@ -2902,7 +2892,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(success=True, changed=True),
             ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "sync_auto_trade_monitoring_universe") as sync_monitoring,
             patch.object(setting_window, "show_toast") as toast,
@@ -6650,7 +6639,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     stock_register_window.stock_register_operation_status_color("미지정")
                 )
                 self.assertEqual(
-                    stock_register_window.auto_trade_status_color("감시전용"),
+                    stock_register_window.auto_trade_status_color("운영정지"),
                     stock_register_window.stock_register_operation_status_color("운영정지"),
                 )
                 self.assertEqual(
@@ -7381,7 +7370,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "execute_assignment_change",
                 return_value=SimpleNamespace(ok=True, changed=True),
             ) as execute_assignment,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -7439,7 +7427,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "execute_assignment_change",
                 return_value=SimpleNamespace(ok=True, changed=True),
             ) as execute_assignment,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -7469,7 +7456,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(allowed=False, reason_code="REVIEW_REQUIRED"),
             ),
             patch.object(stock_register_window, "execute_assignment_change") as execute_assignment,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -7549,7 +7535,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(allowed=False, reason_code="EMERGENCY_REQUIRED"),
             ),
             patch.object(stock_register_window, "execute_assignment_change") as execute_assignment,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -7579,7 +7564,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(allowed=False, reason_code="REVIEW_REQUIRED"),
             ),
             patch.object(stock_register_window, "execute_assignment_change") as execute_assignment,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -7621,7 +7605,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "execute_assignment_change",
                 return_value=SimpleNamespace(ok=True, changed=True),
             ) as execute_assignment,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -7793,7 +7776,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 },
             ),
             patch.object(stock_register_window, "execute_assignment_unassign") as execute_unassign,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QDialog, "exec_", side_effect=AssertionError("confirm dialog must not open")),
@@ -7835,7 +7817,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 },
             ),
             patch.object(stock_register_window, "execute_assignment_unassign") as execute_unassign,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QDialog, "exec_", side_effect=AssertionError("confirm dialog must not open")),
@@ -8321,7 +8302,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "execute_assignment_unassign",
                 return_value=SimpleNamespace(ok=True, changed=True),
             ) as execute_unassign,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
@@ -8398,7 +8378,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "execute_assignment_unassign",
                 return_value=SimpleNamespace(ok=True, changed=True),
             ) as execute_unassign,
-            patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
@@ -9970,7 +9949,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         def fake_read_json(path: Path):
             if str(path).endswith("config.json"):
                 if "005930_B" in str(path):
-                    return {"assigned_routine_instance_id": "inst-a", "real_trade_enabled": True}
+                    return {"assigned_routine_instance_id": "inst-a"}
                 return {"assigned_routine_instance_id": "other"}
             return {"status": "RUNNING", "trade_enabled": True}
 
@@ -13845,7 +13824,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "execute_assignment_unassign",
                 return_value=SimpleNamespace(ok=True, changed=True),
             ) as execute_unassign,
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(setting_window.QMessageBox, "question") as question,
             patch.object(setting_window, "show_toast") as toast,
         ):
@@ -14000,7 +13978,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=SimpleNamespace(success=True, changed=True),
             ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "show_toast") as toast,
         ):

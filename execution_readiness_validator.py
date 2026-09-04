@@ -194,10 +194,6 @@ def validate_execution_readiness(
         blocked_issues.append("preview_controller_result.preview_only is not true")
     if guard_dict.get("operator_confirmed") is not True:
         blocked_issues.append("guard.operator_confirmed is not true")
-    if guard_dict.get("real_trade_enabled") is not True:
-        blocked_issues.append("guard.real_trade_enabled is not true")
-    if guard_dict.get("real_trade_guard_ok") is not True:
-        blocked_issues.append("guard.real_trade_guard_ok is not true")
     if not _clean_text(guard_dict.get("account_no")):
         blocked_issues.append("guard.account_no is required")
     readiness["guard_ready"] = not blocked_issues

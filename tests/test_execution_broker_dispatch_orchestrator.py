@@ -97,7 +97,6 @@ class ExecutionBrokerDispatchOrchestratorTest(unittest.TestCase):
                 "real_broker_dispatch_enabled": True,
                 "kiwoom_connected": True,
                 "account_selected": True,
-                "real_trade_enabled": True,
             },
             "issues": [],
             "warnings": [],

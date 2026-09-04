@@ -68,7 +68,6 @@ class ExecutionFinalSendGateCallOrchestratorTest(unittest.TestCase):
 
     def _guard(self, **overrides: object) -> dict[str, object]:
         guard = {
-            "real_trade_enabled": True,
             "kiwoom_logged_in": True,
             "account_selected": True,
             "account_no": "12345678",

@@ -39,7 +39,6 @@ def _approval_context(order: Any, guard: Any) -> dict[str, Any]:
     return {
         "execution_enabled": order_dict.get("execution_enabled"),
         "operator_confirmed": guard_dict.get("operator_confirmed"),
-        "real_trade_guard_ok": guard_dict.get("real_trade_guard_ok", guard_dict.get("real_trade_enabled")),
     }
 
 

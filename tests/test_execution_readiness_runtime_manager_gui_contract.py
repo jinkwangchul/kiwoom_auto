@@ -80,7 +80,7 @@ class ExecutionReadinessRuntimeManagerGuiContractTest(unittest.TestCase):
     def _preview_context(self) -> dict:
         return {
             "source": "gui_execution_preview_button",
-            "guard": {"operator_confirmed": True, "real_trade_enabled": True},
+            "guard": {"operator_confirmed": True},
         }
 
     def _build(self, **kwargs) -> dict:

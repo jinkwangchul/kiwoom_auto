@@ -110,7 +110,7 @@ class RoutineInstanceRegistryTest(unittest.TestCase):
         self.assertFalse(instance.persisted)
         self.assertEqual(LEGACY_INSTANCE_SOURCE, instance.source)
         self.assertTrue(instance.enabled)
-        self.assertFalse(instance.real_trade_allowed)
+        self.assertFalse(hasattr(instance, "real_trade_allowed"))
 
     def test_explicit_definition_id_has_priority(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -219,7 +219,7 @@ class RoutineInstanceRegistryTest(unittest.TestCase):
         self.assertTrue(instance.buy_limit_enabled)
         self.assertEqual(12_000_000, instance.buy_limit_amount)
         self.assertEqual(instance_dir / "rules.json", instance.rules_path)
-        self.assertFalse(instance.real_trade_allowed)
+        self.assertFalse(hasattr(instance, "real_trade_allowed"))
 
     def test_invalid_uuid_or_directory_mismatch_is_diagnostic_only(self) -> None:
         instance_id = "a52f539d-4f18-4ef6-b0cf-f471567982a1"

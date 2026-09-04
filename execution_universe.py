@@ -23,6 +23,10 @@ from gui_auto_trade_policy import (
     auto_trade_setting_trade_started,
 )
 from gui_auto_trade_runtime import all_registered_stock_dirs, parse_stock_folder_name
+from real_trade_retirement_migration import (
+    CURRENT_SCHEMA as RETIRED_SCHEMA_CURRENT,
+    inspect_real_trade_schema_compatibility,
+)
 
 
 RECOVERY_READINESS_UNAVAILABLE = "RECOVERY_READINESS_UNAVAILABLE"
@@ -34,6 +38,8 @@ OPERATION_EXCLUDED = "OPERATION_EXCLUDED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
 EMERGENCY_BLOCKED = "EMERGENCY_BLOCKED"
 STATUS_BLOCKED = "STATUS_BLOCKED"
+MIGRATION_REQUIRED = "MIGRATION_REQUIRED"
+DATA_INVALID = "DATA_INVALID"
 
 _LOCAL_BLOCKED_STATUSES = {
     "REVIEW_REQUIRED",
@@ -58,7 +64,6 @@ class ExecutionUniverseEntry:
     operation_excluded: bool
     review_required: bool
     emergency_blocked: bool
-    real_trade_enabled: bool
     signal_probe_only: bool
     execution_member: bool
     execution_ready: bool
@@ -148,8 +153,11 @@ def project_execution_universe(
         operation_excluded = is_operation_excluded(config)
         review_required = is_review_required_state(state)
         emergency_blocked = is_emergency_stopped_state(state)
-        real_trade_enabled = state.get("real_trade_enabled") is True
         signal_probe_only = state.get("signal_probe_only") is True
+        schema_compatibility = inspect_real_trade_schema_compatibility(
+            stock_dir,
+            expected_stock_code=stock_code,
+        )
 
         blockers: list[str] = []
         if not stock_code:
@@ -166,6 +174,8 @@ def project_execution_universe(
             blockers.append(EMERGENCY_BLOCKED)
         if _status_blocked(state):
             blockers.append(STATUS_BLOCKED)
+        if schema_compatibility.status != RETIRED_SCHEMA_CURRENT:
+            blockers.append(schema_compatibility.reason_code)
 
         execution_member = not blockers
         execution_ready = execution_member and global_ready
@@ -182,7 +192,6 @@ def project_execution_universe(
                 operation_excluded=operation_excluded,
                 review_required=review_required,
                 emergency_blocked=emergency_blocked,
-                real_trade_enabled=real_trade_enabled,
                 signal_probe_only=signal_probe_only,
                 execution_member=execution_member,
                 execution_ready=execution_ready,

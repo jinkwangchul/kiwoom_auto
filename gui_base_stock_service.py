@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from gui_routine_service import ensure_single_real_trade_routine_for_stock
 from gui_stock_data import load_stock_library as load_verified_runtime_stock_library
 from stock_code_contract import (
     is_valid_stock_code as canonical_is_valid_stock_code,
@@ -216,18 +215,6 @@ def read_base_stocks() -> list[dict[str, object]]:
         return central_stocks
     return []
 
-
-
-def ensure_single_real_trade_routine_for_all_stocks() -> None:
-    """
-    기존 데이터 마이그레이션용 보정.
-    기초종목.txt에 연결된 각 종목마다 실주문 루틴이 최대 1개가 되도록 정리한다.
-    """
-    for stock in read_base_stocks():
-        code = str(stock.get("code", "")).strip()
-        name = str(stock.get("name", "")).strip()
-        if code and name:
-            ensure_single_real_trade_routine_for_stock(code, name)
 
 
 def update_base_stock_routines(

@@ -235,7 +235,6 @@ class SendOrderEntrypointTest(unittest.TestCase):
 
     def test_guard_conditions_failure_is_blocked(self) -> None:
         cases = [
-            ("real_trade_enabled", False, "current_guard.real_trade_enabled is not true"),
             ("kiwoom_logged_in", False, "current_guard.kiwoom_logged_in is not true"),
             ("account_selected", False, "current_guard.account_selected is not true"),
             ("account_no", "", "current_guard.account_no is required"),
@@ -247,6 +246,17 @@ class SendOrderEntrypointTest(unittest.TestCase):
 
                 self.assertFalse(result["send_order_executed"])
                 self.assertIn(reason, result["blocked_reasons"])
+
+    def test_legacy_real_trade_values_do_not_change_send_entrypoint(self) -> None:
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                guard = self._guard()
+                if value is None:
+                    guard.pop("real_trade_enabled", None)
+                else:
+                    guard["real_trade_enabled"] = value
+                result = self._execute(current_guard=guard)
+                self.assertTrue(result["send_order_executed"])
 
     def test_account_no_mismatch_is_blocked(self) -> None:
         result = self._execute(current_guard=self._guard(account_no="87654321"))

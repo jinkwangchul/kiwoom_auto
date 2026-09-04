@@ -47,7 +47,6 @@ def main() -> None:
 
     if isinstance(guard, dict) and guard:
         print("\n[real_trade_guard]")
-        print(f"- real_trade_enabled: {guard.get('real_trade_enabled')}")
         print(f"- kiwoom_logged_in: {guard.get('kiwoom_logged_in')}")
         print(f"- account_selected: {guard.get('account_selected')}")
         print(f"- operator_confirmed: {guard.get('operator_confirmed')}")

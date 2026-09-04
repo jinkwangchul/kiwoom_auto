@@ -73,9 +73,6 @@ def evaluate_execution_approval(
     if not _truthy(ctx.get("operator_confirmed")):
         return _blocked("operator_confirmed", "context.operator_confirmed is not true")
 
-    if not _truthy(ctx.get("real_trade_guard_ok")):
-        return _blocked("real_trade_guard", "context.real_trade_guard_ok is not true")
-
     return {
         "approved": True,
         "approval_stage": "approved",

@@ -85,7 +85,6 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         state = {
             "status": "MONITORING",
             "trade_enabled": True,
-            "real_trade_enabled": False,
             "holding_qty": holding_qty,
         }
         candles = [{"time": "2026-07-03 09:00:00", "close": 100.0}]
@@ -233,7 +232,6 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
             {
                 "status": "RUNNING",
                 "trade_enabled": True,
-                "real_trade_enabled": True,
                 "signal_probe_only": False,
                 "holding_qty": 10,
             },
@@ -352,7 +350,6 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
             {
                 "status": "RUNNING",
                 "trade_enabled": True,
-                "real_trade_enabled": True,
                 "holding_qty": 0,
             },
         )

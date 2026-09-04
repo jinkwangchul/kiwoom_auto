@@ -1779,7 +1779,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 intent=ASSIGNMENT_INTENT_UNASSIGN,
             )
             if result.ok and result.changed:
-                ensure_single_real_trade_routine_for_stock(code, name)
                 succeeded.append(code)
                 succeeded_names.append(name)
             else:
@@ -1880,8 +1879,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
         try:
             repo = StockRepository(PROJECT_ROOT)
-            stock_dir = repo.ensure_stock_folder(code, name, routine=routine_type)
-            ensure_single_real_trade_routine_for_stock(code, name, routine_type)
+            repo.ensure_stock_folder(code, name, routine=routine_type)
         except Exception:
             LOGGER.exception("Failed to prepare stock assignment files")
             return False
@@ -2326,7 +2324,6 @@ def auto_trade_register_historical_stock_to_original_instance(
 
 
 from gui_base_stock_service import (
-    ensure_single_real_trade_routine_for_all_stocks,
     find_library_stock_by_code,
     is_valid_stock_code,
     load_stock_library,
@@ -2348,7 +2345,6 @@ from state_policy import (
     normalized_hhmmss_or_empty,
     operation_mode_check_text,
     operation_mode_display,
-    trade_permission_display,
     operation_mode_recalculation_target_status,
     operation_text_and_color,
     schedule_override_enabled,
@@ -2543,13 +2539,6 @@ from gui_auto_trade_table_loader import (
     _selected_instance_stock_dirs,
     auto_trade_load_selected_routine_stocks,
     refresh_auto_trade_chart_open_code_styles,
-)
-from gui_routine_service import (
-    ensure_single_real_trade_routine_for_stock,
-    execute_selected_stock_real_trade_command,
-    selected_stock_real_trade_target_enabled,
-    selected_stock_trade_permission_available,
-    selected_stock_trade_permission_label,
 )
 from gui_operation_environment import (
     OperationEnvironmentSettingsDialog,
@@ -6299,49 +6288,6 @@ class AutoTradeSettingWindow(QDialog):
                 config = default_config()
             modes.add(normalize_operation_mode(config.get("operation_mode", "SCHEDULED")))
         return modes
-
-    def selected_trade_permission_context_label(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> str:
-        selected = selected if selected is not None else self.selected_stock_infos()
-        return selected_stock_trade_permission_label(selected)
-
-    def selected_trade_permission_available(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> bool:
-        selected = selected if selected is not None else self.selected_stock_infos()
-        return selected_stock_trade_permission_available(self, selected)
-
-    def toggle_selected_trade_permission(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> dict[str, object]:
-        selected = selected if selected is not None else self.selected_stock_infos()
-        if not selected:
-            self.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
-            return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
-        target_enabled = selected_stock_real_trade_target_enabled(selected)
-        result = execute_selected_stock_real_trade_command(
-            self,
-            selected,
-            target_enabled,
-        )
-        changed_targets = tuple(result.get("changed_targets", ()) or ())
-        blocked_targets = tuple(result.get("blocked_targets", ()) or ())
-        if changed_targets:
-            append_changelog(
-                "UPDATE",
-                "config.json",
-                f"거래권한 변경: {' / '.join(changed_targets)} -> {'실주문' if target_enabled else '감시전용'}",
-            )
-            refresh_auto_trade_views(self)
-        message = f"거래권한 변경: {result.get('changed', 0)}개"
-        if blocked_targets:
-            message += f" / 차단 {len(blocked_targets)}개"
-        self.statusBarMessage(message)
-        return result
 
     def toggle_selected_manual_override_flag(self, flag_key: str, label: str) -> None:
         """수동운영 종목의 개별 수동시간 사용 여부를 즉시 전환한다.
@@ -10227,7 +10173,6 @@ class AutoTradeSettingWindow(QDialog):
             )
             return False
 
-        ensure_single_real_trade_routine_for_stock(code, name)
         sync_auto_trade_monitoring_universe(self)
         refresh_auto_trade_views(self)
         observe_owner_failure_transition(
@@ -10861,7 +10806,6 @@ class AutoTradeSettingWindow(QDialog):
                 f"approval_status: {order.get('approval_status', '-')}",
                 f"policy_status: {order.get('policy_status', '-')}",
                 "",
-                f"guard.real_trade_enabled: {guard.get('real_trade_enabled', '-')}",
                 f"guard.kiwoom_logged_in: {guard.get('kiwoom_logged_in', '-')}",
                 f"guard.account_selected: {guard.get('account_selected', '-')}",
                 f"guard.account_no: {guard.get('account_no', '-')}",

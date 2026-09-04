@@ -72,7 +72,6 @@ def _stock(root: Path, *, holding: int = 0, review: bool = False) -> tuple[Stock
             "code": "005930",
             "name": "삼성전자",
             "operation_excluded": False,
-            "real_trade_enabled": False,
             "assigned_routine_instance_id": INSTANCE_A,
             "routine_instance_name": "루틴A",
             "routine_definition_id": "definition_a",

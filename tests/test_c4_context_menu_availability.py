@@ -67,7 +67,6 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
             early_close_profit_loss=Mock(),
             early_close_cancel=Mock(),
             individual_liquidation=Mock(),
-            trade_permission_available=Mock(return_value=trade_allowed),
         )
 
     def test_main_and_settings_inputs_share_review_projection(self) -> None:
@@ -116,7 +115,6 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
             self.assertTrue(main_result.review_managed)
             self.assertFalse(main_result.start_allowed)
             self.assertFalse(main_result.exclusion_allowed)
-            self.assertFalse(main_result.trade_permission_allowed)
             self.assertFalse(main_result.unregister_allowed)
             self.assertTrue(main_result.time_management_allowed)
             self.assertTrue(main_result.ats_settings_allowed)
@@ -155,17 +153,11 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
             self.assertFalse(result.review_managed)
             self.assertFalse(result.exclusion_allowed)
             self.assertEqual(result.reason_for("exclusion"), "CURRENTLY_RUNNING")
-            self.assertFalse(result.trade_permission_allowed)
-            self.assertEqual(
-                result.reason_for("trade_permission"),
-                "TRADE_PERMISSION_UNAVAILABLE",
-            )
             exclusion_inspector.assert_called_once_with(
                 ANY,
                 target,
                 True,
             )
-            callbacks.trade_permission_available.assert_called_once_with()
 
     def test_unregister_backend_availability_flows_into_ui_without_mutation(self) -> None:
         with TemporaryDirectory() as temp:

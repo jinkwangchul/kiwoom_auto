@@ -70,7 +70,6 @@ def _order_queued_record(**overrides: object) -> dict[str, object]:
 
 def _guard(**overrides: object) -> dict[str, object]:
     result = {
-        "real_trade_enabled": True,
         "kiwoom_logged_in": True,
         "account_selected": True,
         "account_no": "12345678",

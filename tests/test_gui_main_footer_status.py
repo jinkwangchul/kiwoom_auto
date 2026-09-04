@@ -67,14 +67,12 @@ class MainFooterStatusProjectionTest(unittest.TestCase):
             ("운영 정지 완료", "✓ 운영 정지", OPERATOR_FOOTER_SUCCESS_COLOR),
             ("운영 시작 실패: 상태 오류", "✕ 운영 시작 실패", OPERATOR_FOOTER_FAILURE_COLOR),
             ("운영 정지 실패", "✕ 운영 정지 실패", OPERATOR_FOOTER_FAILURE_COLOR),
-            ("감시전용 전환 완료", "● 감시전용 운영", OPERATOR_FOOTER_STATE_COLOR),
             ("긴급정지 실행 완료: 4개 종목", "✕ 긴급정지", OPERATOR_FOOTER_FAILURE_COLOR),
             ("전역 긴급정지 상태입니다. 정지해제 후 다시 시도하십시오.", "✕ 긴급정지", OPERATOR_FOOTER_FAILURE_COLOR),
             ("정지해제 완료: 정상 4개", "✓ 긴급정지 해제", OPERATOR_FOOTER_SUCCESS_COLOR),
             ("환경설정 저장 완료", "✓ 설정 저장 완료", OPERATOR_FOOTER_SUCCESS_COLOR),
             ("운영시작 대상이 없습니다.", "※ 운영 대상 없음", OPERATOR_FOOTER_WARNING_COLOR),
             ("선택한 종목은 복구 검토 대상입니다.", "✕ 서버 인증 실패", OPERATOR_FOOTER_FAILURE_COLOR),
-            ("거래권한을 변경할 종목을 1개 이상 선택하세요.", "✕ 작업 처리 실패", OPERATOR_FOOTER_FAILURE_COLOR),
             ("모든 등록 종목의 필수 설정이 완료되지 않았습니다.", "✕ 운영 시작 실패", OPERATOR_FOOTER_FAILURE_COLOR),
         )
         for raw, expected, color in cases:

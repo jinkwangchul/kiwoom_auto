@@ -116,9 +116,6 @@ def _validate_guard(current_guard: Any, account_no: str) -> dict[str, Any] | Non
     if not guard:
         return _blocked("guard", "current_guard is required")
 
-    if not _truthy(guard.get("real_trade_enabled")):
-        return _blocked("guard", "current_guard.real_trade_enabled is not true")
-
     if not _truthy(guard.get("kiwoom_logged_in")):
         return _blocked("guard", "current_guard.kiwoom_logged_in is not true")
 

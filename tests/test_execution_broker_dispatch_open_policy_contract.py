@@ -73,7 +73,6 @@ def _environment(**overrides: object) -> dict[str, object]:
         "real_broker_dispatch_enabled": True,
         "kiwoom_connected": True,
         "account_selected": True,
-        "real_trade_enabled": True,
     }
     result.update(overrides)
     return result
@@ -176,7 +175,6 @@ class ExecutionBrokerDispatchOpenPolicyContractTest(unittest.TestCase):
             ("real_broker_dispatch_enabled", "REAL_BROKER_DISPATCH_ENVIRONMENT_DISABLED"),
             ("kiwoom_connected", "KIWOOM_CONNECTED_NOT_TRUE"),
             ("account_selected", "ACCOUNT_SELECTED_NOT_TRUE"),
-            ("real_trade_enabled", "REAL_TRADE_ENABLED_NOT_TRUE"),
         ]
 
         for flag, expected_issue in cases:

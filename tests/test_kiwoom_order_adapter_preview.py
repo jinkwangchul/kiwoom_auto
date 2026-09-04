@@ -28,7 +28,6 @@ class KiwoomOrderAdapterPreviewTests(unittest.TestCase):
         self._write_json(
             self.guard_path,
             {
-                "real_trade_enabled": True,
                 "kiwoom_logged_in": True,
                 "account_selected": True,
                 "operator_confirmed": True,

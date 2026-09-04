@@ -105,8 +105,6 @@ def _callbacks() -> context_menu.StockContextMenuCallbacks:
         open_charts=Mock(),
         time_change=Mock(),
         time_reset=Mock(),
-        trade_permission_label=Mock(return_value="감시전용 전환"),
-        toggle_trade_permission=Mock(),
     )
 
 
@@ -810,7 +808,6 @@ class MainStockOperationHostTest(unittest.TestCase):
                 "운영시작",
                 "전체선택",
                 "선택해제",
-                "감시전용 전환",
                 "시간변경",
                 "변경리셋",
                 "등록해제",
@@ -891,9 +888,6 @@ class MainStockOperationHostTest(unittest.TestCase):
                     (Path("stocks") / "005930_test", "005930", "test")
                 ]
                 settings_window.selected_operation_mode_set.return_value = modes
-                settings_window.selected_trade_permission_context_label.return_value = (
-                    "감시전용 전환"
-                )
                 context_menu.show_auto_trade_stock_context_menu(
                     settings_window,
                     QPoint(),
@@ -958,8 +952,6 @@ class MainStockOperationHostTest(unittest.TestCase):
             open_charts=Mock(),
             time_change=Mock(),
             time_reset=Mock(),
-            trade_permission_label=Mock(return_value="감시전용 전환"),
-            toggle_trade_permission=Mock(),
             stock_register=Mock(),
             unregister=Mock(),
         )
@@ -970,7 +962,6 @@ class MainStockOperationHostTest(unittest.TestCase):
             "전체선택",
             "선택해제",
             "운영제외",
-            "감시전용 전환",
             "<separator>",
             "조기마감",
             "개별청산",
@@ -1004,9 +995,6 @@ class MainStockOperationHostTest(unittest.TestCase):
                 (Path("stocks") / "005930_test", "005930", "test")
             ]
             settings_window.selected_operation_mode_set.return_value = {"SCHEDULED"}
-            settings_window.selected_trade_permission_context_label.return_value = (
-                "감시전용 전환"
-            )
             settings_window._stock_status_filter = "running"
             settings_window._all_stocks_scope_active = False
             settings_window.current_selected_routine_row_metadata.return_value = {

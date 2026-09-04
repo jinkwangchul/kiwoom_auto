@@ -676,7 +676,6 @@ class StaleSignalReentryAuditTests(unittest.TestCase):
                 stock_dir=stock_dir,
                 execution_ready=True,
                 signal_probe_only=True,
-                real_trade_enabled=False,
             )
             snapshot = SimpleNamespace(entries=(entry,))
             window = SimpleNamespace(statusBarMessage=Mock())

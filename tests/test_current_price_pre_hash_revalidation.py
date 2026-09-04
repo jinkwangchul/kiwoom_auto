@@ -34,7 +34,7 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
         self.stock_dir = self.root / f"{CODE}_LG"
         self.stock_dir.mkdir()
         (self.stock_dir / "config.json").write_text(
-            json.dumps({"real_trade_enabled": True}),
+            json.dumps({}),
             encoding="utf-8",
         )
         (self.stock_dir / "state.json").write_text(
@@ -42,7 +42,6 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
                 {
                     "status": "RUNNING",
                     "trade_enabled": True,
-                    "real_trade_enabled": True,
                     "signal_probe_only": False,
                     "review_required": False,
                 }
@@ -423,7 +422,7 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
         ), mock.patch.object(
             self.boundary,
             "build_real_preflight_guard_from_gui",
-            return_value={"operator_confirmed": True, "real_trade_enabled": True},
+            return_value={"operator_confirmed": True},
         ), mock.patch.object(
             self.boundary, "real_preflight_guard_block_reasons", return_value=[]
         ), mock.patch(
@@ -459,7 +458,6 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
         finalized["execution_enabled"] = True
         guard = {
             "operator_confirmed": True,
-            "real_trade_enabled": True,
             "account_no": ACCOUNT,
         }
 

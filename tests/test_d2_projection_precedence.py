@@ -147,10 +147,7 @@ class D2ProjectionPrecedenceTest(unittest.TestCase):
                 setting_window,
                 "normalize_base_stock_single_routine_file",
                 return_value=False,
-            ), patch.object(
-                setting_window,
-                "ensure_single_real_trade_routine_for_all_stocks",
-            ) as realtrade_writer:
+            ):
                 AutoTradeSettingWindow.refresh_all(owner)
 
             self.assertEqual(
@@ -161,7 +158,9 @@ class D2ProjectionPrecedenceTest(unittest.TestCase):
                 before_mtime,
                 (config_path.stat().st_mtime_ns, state_path.stat().st_mtime_ns),
             )
-            realtrade_writer.assert_not_called()
+            self.assertFalse(
+                hasattr(setting_window, "ensure_single_real_trade_routine_for_all_stocks")
+            )
 
     def test_operation_projection_keeps_review_exclusion_current_session_precedence(self) -> None:
         participant_window = SimpleNamespace(

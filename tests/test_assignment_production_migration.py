@@ -114,7 +114,6 @@ class AssignmentProductionMigrationTests(unittest.TestCase):
                 "buy_limit_amount": 777_000,
                 "operation_mode": "SCHEDULED",
                 "operation_excluded": True,
-                "real_trade_enabled": False,
                 "policy_overrides": {"entry": False, "exit": True},
             },
         )
@@ -172,7 +171,6 @@ class AssignmentProductionMigrationTests(unittest.TestCase):
             "buy_limit_amount": 777_000,
             "operation_mode": "SCHEDULED",
             "operation_excluded": True,
-            "real_trade_enabled": False,
             "policy_overrides": {"entry": False, "exit": True},
         }.items():
             self.assertEqual(expected, config[key])

@@ -10,7 +10,7 @@ from sell_execution_full_preview_orchestrator import build_sell_execution_full_p
 
 
 def _guard() -> dict:
-    return {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"}
+    return {"operator_confirmed": True, "account_no": "12345678"}
 
 
 def _candidate(

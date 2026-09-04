@@ -18,7 +18,6 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
             "operation_mode": "SCHEDULED",
             "start_time": "09:00:00",
             "end_buy_time": "13:30:00",
-            "real_trade_enabled": True,
         }
         self.operation_state = {
             "operation_date": "2026-08-10",
@@ -28,7 +27,6 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
         self.running_state = {
             "status": "RUNNING",
             "trade_enabled": True,
-            "real_trade_enabled": True,
             "signal_probe_only": False,
             "review_required": False,
             "buy_enabled": False,

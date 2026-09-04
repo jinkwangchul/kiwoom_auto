@@ -39,8 +39,6 @@ from state_policy import (
     status_after_operation_mode_change,  # compatibility patch point; projection delegates below
     operation_text_and_color,
     operation_mode_display,
-    real_trade_enabled,
-    trade_permission_display,
 )
 from gui_auto_trade_display import (
     apply_auto_trade_setting_activity_style,

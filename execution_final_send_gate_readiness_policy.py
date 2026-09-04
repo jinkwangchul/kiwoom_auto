@@ -113,7 +113,6 @@ def _identity_checks(identity: dict[str, Any], request_preview: dict[str, Any], 
 def _guard_checks(current_guard: Any) -> tuple[dict[str, Any], list[str]]:
     guard = _as_dict(current_guard)
     checks = {
-        "real_trade_enabled": _truthy(guard.get("real_trade_enabled")),
         "kiwoom_logged_in": _truthy(guard.get("kiwoom_logged_in")),
         "account_selected": _truthy(guard.get("account_selected")),
         "account_no": bool(_text(guard.get("account_no"))),
@@ -122,8 +121,6 @@ def _guard_checks(current_guard: Any) -> tuple[dict[str, Any], list[str]]:
     issues: list[str] = []
     if not guard:
         issues.append("CURRENT_GUARD_REQUIRED")
-    if not checks["real_trade_enabled"]:
-        issues.append("GUARD_REAL_TRADE_ENABLED_NOT_TRUE")
     if not checks["kiwoom_logged_in"]:
         issues.append("GUARD_KIWOOM_LOGGED_IN_NOT_TRUE")
     if not checks["account_selected"]:

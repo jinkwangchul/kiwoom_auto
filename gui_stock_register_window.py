@@ -155,9 +155,6 @@ from routine_instance_registry import (
     RoutineInstanceRecord,
 )
 from stock_repository import repository as stock_repository_factory
-from gui_routine_service import (
-    ensure_single_real_trade_routine_for_stock,
-)
 from gui_toast import show_toast
 from gui_user_reason import user_reason_message
 from gui_operation_ui_context import (
@@ -185,8 +182,6 @@ from state_policy import (
     normalized_hhmmss_or_empty,
     operation_mode_check_text,
     operation_mode_display,
-    real_trade_enabled,
-    trade_permission_display,
     operation_mode_recalculation_target_status,
     operation_text_and_color,
     read_global_schedule,
@@ -1010,7 +1005,7 @@ def stock_register_operation_status_color(display_status: str) -> str | None:
     if normalized == "운영중":
         return auto_trade_status_color("매수/매도")
     if normalized == "운영정지":
-        return auto_trade_status_color("감시전용")
+        return auto_trade_status_color("운영정지")
     if normalized == "미지정":
         return None
     return auto_trade_status_color(normalized)
@@ -2238,7 +2233,6 @@ class StockRegisterWindow(QDialog):
                 continue
 
             created_paths.append(str(stock_dir.relative_to(PROJECT_ROOT)))
-            ensure_single_real_trade_routine_for_stock(code, name, selected_routine_type)
             applied_items.append(f"{code},{name}({selected_routine_name})")
 
         if applied_items:
@@ -2351,7 +2345,6 @@ class StockRegisterWindow(QDialog):
                 intent=ASSIGNMENT_INTENT_UNASSIGN,
             )
             if result.ok and result.changed:
-                ensure_single_real_trade_routine_for_stock(code, name)
                 removed_items.append(f"{code},{name}({routine_name})")
             else:
                 failure_details.append(

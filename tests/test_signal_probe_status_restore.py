@@ -76,7 +76,6 @@ class SignalProbeStatusRestoreTest(unittest.TestCase):
             "status": "MONITORING",
             "signal_probe_only": True,
             "trade_enabled": True,
-            "real_trade_enabled": False,
         }
         for buy_enabled, sell_enabled in (
             (False, False),
@@ -103,7 +102,6 @@ class SignalProbeStatusRestoreTest(unittest.TestCase):
     def test_canonical_probe_sources_restore_when_mismatched(self) -> None:
         scenarios = (
             ("trade disabled", {"trade_enabled": False}),
-            ("real trade enabled", {"real_trade_enabled": True}),
             ("stopped status", {"status": "STOPPED"}),
             ("running status", {"status": "RUNNING"}),
         )
@@ -111,7 +109,6 @@ class SignalProbeStatusRestoreTest(unittest.TestCase):
             "status": "MONITORING",
             "signal_probe_only": True,
             "trade_enabled": True,
-            "real_trade_enabled": False,
         }
         for label, updates in scenarios:
             with self.subTest(label=label):
@@ -123,7 +120,7 @@ class SignalProbeStatusRestoreTest(unittest.TestCase):
                 self.assertEqual("MONITORING", saved["status"])
                 self.assertIs(saved["signal_probe_only"], True)
                 self.assertIs(saved["trade_enabled"], True)
-                self.assertIs(saved["real_trade_enabled"], False)
+                self.assertNotIn("real_trade_enabled", saved)
                 self.assertNotIn("buy_enabled", saved)
                 self.assertNotIn("sell_enabled", saved)
 
@@ -155,7 +152,7 @@ class SignalProbeStatusRestoreTest(unittest.TestCase):
         self.assertEqual("MONITORING", started["status"])
         self.assertIs(started["signal_probe_only"], True)
         self.assertIs(started["trade_enabled"], True)
-        self.assertIs(started["real_trade_enabled"], False)
+        self.assertNotIn("real_trade_enabled", started)
         self.assertNotIn("buy_enabled", started)
         self.assertNotIn("sell_enabled", started)
 
@@ -165,14 +162,13 @@ class SignalProbeStatusRestoreTest(unittest.TestCase):
                 "status": "MONITORING",
                 "signal_probe_only": True,
                 "trade_enabled": True,
-                "real_trade_enabled": False,
             },
         )
         self.assertEqual(1, stop_result["count"])
         self.assertEqual("STOPPED", stopped["status"])
         self.assertIs(stopped["signal_probe_only"], False)
         self.assertIs(stopped["trade_enabled"], False)
-        self.assertIs(stopped["real_trade_enabled"], False)
+        self.assertNotIn("real_trade_enabled", stopped)
         self.assertNotIn("buy_enabled", stopped)
         self.assertNotIn("sell_enabled", stopped)
 
