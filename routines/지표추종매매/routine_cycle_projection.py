@@ -61,6 +61,11 @@ def _unresolved(reason: str, *, holding_qty: int = 0, avg_price: float = 0.0) ->
         "filled_buy_amount_by_round": {},
         "base_filled_buy_amount": 0.0,
         "last_filled_buy_amount": 0.0,
+        "approved_buy_budget_by_round": {},
+        "last_normal_round_approved_budget": None,
+        "last_confirmed_buy_order_price": None,
+        "last_plus_one_pending": False,
+        "last_plus_one_completed": False,
         "pending_buy_rounds": [],
         "pending_buy_order_identities": [],
         "partial_sell": False,
@@ -79,6 +84,10 @@ def _resolved(
     last_buy_order_identity: str | None,
     cycle_identity: str | None,
     filled_buy_amount_by_round: dict[int, float],
+    approved_buy_budget_by_round: dict[int, float],
+    confirmed_order_price_by_round: dict[int, float],
+    last_plus_one_pending: bool,
+    last_plus_one_completed: bool,
     pending_buy_rounds: list[int],
     pending_buy_order_identities: list[str],
     partial_sell: bool,
@@ -96,6 +105,11 @@ def _resolved(
         "filled_buy_amount_by_round": dict(filled_buy_amount_by_round),
         "base_filled_buy_amount": filled_buy_amount_by_round.get(1, 0.0),
         "last_filled_buy_amount": filled_buy_amount_by_round.get(confirmed_round, 0.0),
+        "approved_buy_budget_by_round": dict(approved_buy_budget_by_round),
+        "last_normal_round_approved_budget": approved_buy_budget_by_round.get(confirmed_round),
+        "last_confirmed_buy_order_price": confirmed_order_price_by_round.get(confirmed_round),
+        "last_plus_one_pending": last_plus_one_pending,
+        "last_plus_one_completed": last_plus_one_completed,
         "pending_buy_rounds": list(pending_buy_rounds),
         "pending_buy_order_identities": list(pending_buy_order_identities),
         "partial_sell": partial_sell,
@@ -197,6 +211,35 @@ def _fill_sort_key(fill: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _approved_round_budget(intent: dict[str, Any]) -> float | None:
+    """Return the immutable approved budget for one normal BUY process."""
+    for plan_key in ("multi_hoga_plan", "multi_time_plan", "multi_ratio_plan"):
+        plan = _as_dict(intent.get(plan_key))
+        value = _number(plan.get("approved_round_budget"))
+        if value is not None and value > 0:
+            return value
+    value = _number(intent.get("approved_round_budget"))
+    if value is None:
+        value = _number(intent.get("budget"))
+    return value if value is not None and value > 0 else None
+
+
+def _canonical_order_basis_price(intent: dict[str, Any]) -> float | None:
+    """Return the approved/order basis, not a later tick or Position average."""
+    for plan_key, field in (
+        ("multi_hoga_plan", "base_price"),
+        ("multi_time_plan", "order_price"),
+        ("multi_ratio_plan", "order_price"),
+    ):
+        value = _number(_as_dict(intent.get(plan_key)).get(field))
+        if value is not None and value > 0:
+            return value
+    value = _number(intent.get("actionable_order_price"))
+    if value is None:
+        value = _number(intent.get("price"))
+    return value if value is not None and value > 0 else None
+
+
 def project_indicator_follow_cycle(
     *,
     code: str,
@@ -282,6 +325,7 @@ def project_indicator_follow_cycle(
     )
     pending_buy_rounds: list[int] = []
     pending_buy_order_identities: list[str] = []
+    last_plus_one_pending = False
     for order in target_orders:
         if _upper(order.get("status")) in TERMINAL_ORDER_STATUSES:
             continue
@@ -289,6 +333,8 @@ def project_indicator_follow_cycle(
         side = _upper(intent.get("side") or order.get("side"))
         if side != "BUY":
             continue
+        if _upper(intent.get("generation_kind")) == "LAST_PLUS_ONE":
+            last_plus_one_pending = True
         pending_round = _integer(intent.get("buy_round"))
         if pending_round is None or pending_round <= 0:
             return _unresolved(
@@ -308,11 +354,14 @@ def project_indicator_follow_cycle(
     confirmed_round = 0
     cumulative_buy_amount = 0.0
     filled_buy_amount_by_round: dict[int, float] = {}
+    approved_buy_budget_by_round: dict[int, float] = {}
+    confirmed_order_price_by_round: dict[int, float] = {}
     last_buy_identity: str | None = None
     cycle_identity: str | None = None
     partial_sell = False
     cycle_ended = False
     foreign_fill_during_active_cycle = False
+    filled_order_identities: set[str] = set()
 
     code_fills = [
         item for item in fill_records
@@ -356,6 +405,18 @@ def project_indicator_follow_cycle(
                 planned_round = _integer(intent.get("buy_round"))
                 if phase not in {"BASE", "REPEAT"} or planned_round is None or planned_round <= 0:
                     return _unresolved("BUY_PROVENANCE_INCOMPLETE", holding_qty=holding_qty, avg_price=avg_price)
+                generation_kind = _upper(intent.get("generation_kind"))
+                if generation_kind == "LAST_PLUS_ONE":
+                    if not active or confirmed_round <= 0:
+                        return _unresolved(
+                            "LAST_PLUS_ONE_CYCLE_BOUNDARY_UNRESOLVED",
+                            holding_qty=holding_qty,
+                            avg_price=avg_price,
+                        )
+                    cumulative_buy_amount += delta * price
+                    filled_order_identities.add(_order_identity(order))
+                    ledger_qty += delta
+                    continue
                 first_fill_for_order = previous == 0
                 if first_fill_for_order:
                     if not active:
@@ -366,6 +427,8 @@ def project_indicator_follow_cycle(
                         round_processes = {}
                         cumulative_buy_amount = 0.0
                         filled_buy_amount_by_round = {}
+                        approved_buy_budget_by_round = {}
+                        confirmed_order_price_by_round = {}
                         last_buy_identity = None
                         cycle_identity = _clean(intent.get("cycle_identity")) or order_key
                         partial_sell = False
@@ -389,6 +452,12 @@ def project_indicator_follow_cycle(
                     confirmed_round = planned_round
                     round_processes[planned_round] = process_identity
                     last_buy_identity = order_key
+                    approved_budget = _approved_round_budget(intent)
+                    confirmed_price = _canonical_order_basis_price(intent)
+                    if approved_budget is not None:
+                        approved_buy_budget_by_round[planned_round] = approved_budget
+                    if confirmed_price is not None:
+                        confirmed_order_price_by_round[planned_round] = confirmed_price
                     if cycle_identity is None:
                         cycle_identity = _clean(intent.get("cycle_identity")) or order_key
                 filled_amount = delta * price
@@ -410,6 +479,8 @@ def project_indicator_follow_cycle(
                     confirmed_round = 0
                     cumulative_buy_amount = 0.0
                     filled_buy_amount_by_round = {}
+                    approved_buy_budget_by_round = {}
+                    confirmed_order_price_by_round = {}
                     last_buy_identity = None
                     cycle_identity = None
                     partial_sell = False
@@ -428,6 +499,26 @@ def project_indicator_follow_cycle(
     if holding_qty == 0 and pending_target:
         return _unresolved("ZERO_HOLDING_WITH_PENDING_ROUTINE_ORDER", holding_qty=holding_qty, avg_price=avg_price)
 
+    last_plus_one_groups: dict[str, list[dict[str, Any]]] = {}
+    for order in target_orders:
+        intent = _order_intent(order)
+        if _upper(intent.get("generation_kind")) != "LAST_PLUS_ONE":
+            continue
+        if cycle_identity and _clean(intent.get("cycle_identity")) != cycle_identity:
+            continue
+        group_key = (
+            _clean(intent.get("execution_process_id"))
+            or _clean(intent.get("source_signal_id"))
+            or _order_identity(order)
+        )
+        last_plus_one_groups.setdefault(group_key, []).append(order)
+    last_plus_one_completed = any(
+        bool(group)
+        and all(_upper(order.get("status")) == "FILLED" for order in group)
+        and any(_order_identity(order) in filled_order_identities for order in group)
+        for group in last_plus_one_groups.values()
+    )
+
     return _resolved(
         active=active,
         confirmed_round=confirmed_round,
@@ -437,6 +528,10 @@ def project_indicator_follow_cycle(
         last_buy_order_identity=last_buy_identity,
         cycle_identity=cycle_identity,
         filled_buy_amount_by_round=filled_buy_amount_by_round,
+        approved_buy_budget_by_round=approved_buy_budget_by_round,
+        confirmed_order_price_by_round=confirmed_order_price_by_round,
+        last_plus_one_pending=last_plus_one_pending,
+        last_plus_one_completed=last_plus_one_completed,
         pending_buy_rounds=sorted(pending_buy_rounds),
         pending_buy_order_identities=pending_buy_order_identities,
         partial_sell=partial_sell,

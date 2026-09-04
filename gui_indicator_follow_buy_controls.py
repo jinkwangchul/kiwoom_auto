@@ -15,7 +15,10 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from gui_indicator_follow_buy_method_controls import IndicatorFollowBuyMethodControlsMixin
+from gui_indicator_follow_buy_method_controls import (
+    IndicatorFollowBuyMethodControlsMixin,
+    sync_buy_direction_comparator,
+)
 
 
 class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
@@ -372,16 +375,6 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             layout.addLayout(row)
             return row
 
-        def set_compare_items_by_direction(direction_combo, compare_combo):
-            direction = direction_combo.currentText().strip()
-            visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
-            for item_text in ["이상", "이하", "이내", "이탈"]:
-                index = compare_combo.findText(item_text)
-                if index >= 0:
-                    compare_combo.view().setRowHidden(index, item_text not in visible_items)
-            if compare_combo.currentText() not in visible_items:
-                compare_combo.setCurrentText("이내" if direction == "상하" else "이상")
-
         def set_widgets_enabled(widgets, enabled):
             for widget in widgets:
                 widget.setEnabled(enabled)
@@ -504,7 +497,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             cycle_time_stack.setCurrentIndex(max(cycle_time_combo.currentIndex(), 0))
 
         def update_cycle_ratio_compare(*_args):
-            set_compare_items_by_direction(cycle_ratio_direction_combo, cycle_ratio_compare_combo)
+            sync_buy_direction_comparator(cycle_ratio_direction_combo, cycle_ratio_compare_combo)
 
         cycle_time_combo.currentIndexChanged.connect(update_cycle_time_mode)
         cycle_ratio_direction_combo.currentTextChanged.connect(update_cycle_ratio_compare)
@@ -544,6 +537,18 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         cycle_price_value_line = make_line("0.15", 46)
         cycle_price_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
         cycle_price_action_combo = make_combo(["매수리셋", "일괄취소"], "일괄취소", 100)
+        cancel_batch_index = cycle_price_action_combo.findText("일괄취소")
+        cancel_batch_item = (
+            cycle_price_action_combo.model().item(cancel_batch_index)
+            if cancel_batch_index >= 0 and hasattr(cycle_price_action_combo.model(), "item")
+            else None
+        )
+        if cancel_batch_item is not None:
+            cancel_batch_item.setEnabled(False)
+            cancel_batch_item.setToolTip("CYCLE_OPTION_EXECUTION_NOT_CONNECTED")
+        cycle_price_action_combo.setToolTip(
+            "일괄취소는 CYCLE_OPTION_EXECUTION_NOT_CONNECTED 상태로 예약되어 있습니다."
+        )
         cycle_price_layout.addWidget(cycle_price_left_combo)
         cycle_price_layout.addWidget(make_label("대비", 36))
         cycle_price_layout.addWidget(cycle_price_right_combo)
@@ -560,7 +565,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             cycle_situation_stack.setCurrentIndex(0 if cycle_situation_combo.currentText().strip() == "미체결" else 1)
 
         def update_cycle_price_compare(*_args):
-            set_compare_items_by_direction(cycle_price_direction_combo, cycle_price_compare_combo)
+            sync_buy_direction_comparator(cycle_price_direction_combo, cycle_price_compare_combo)
 
         cycle_situation_combo.currentTextChanged.connect(update_cycle_situation_mode)
         cycle_price_direction_combo.currentTextChanged.connect(update_cycle_price_compare)
@@ -603,10 +608,6 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             self._buy_cycle_time_combo = cycle_time_combo
             self._buy_cycle_situation_combo = cycle_situation_combo
             self.buy_cycle_column_widget = cycle_column
-            cycle_column.setEnabled(False)
-            cycle_column.setToolTip("현재 지원되지 않는 설정입니다.")
-            for widget in cycle_column.findChildren(QWidget):
-                widget.setToolTip("현재 지원되지 않는 설정입니다.")
 
             # 이탈조건 박스가 별도 호출에서 이미 만들어졌거나 이후 만들어지는 경우를 모두 처리한다.
             # 로컬 클로저 참조가 아니라 등록된 updater를 호출해 제한시간 활성조건을 동기화한다.
@@ -694,7 +695,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         exit_checks.extend([exit_price_check, exit_count_check, exit_time_check])
 
         def update_exit_price_compare(*_args):
-            set_compare_items_by_direction(exit_price_direction_combo, exit_price_compare_combo)
+            sync_buy_direction_comparator(exit_price_direction_combo, exit_price_compare_combo)
 
         cycle_time_source = getattr(self, "_buy_cycle_time_combo", None)
         cycle_situation_source = getattr(self, "_buy_cycle_situation_combo", None)

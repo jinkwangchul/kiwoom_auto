@@ -86,6 +86,68 @@ from event_journal_production import append_production_event
 
 
 DEFAULT_BUY_SIGNAL_EXPR = "A and B and C and D"
+LEGACY_ADDITIONAL_STATE_PARTIAL_LOSS = "LEGACY_ADDITIONAL_STATE_PARTIAL_LOSS"
+
+
+def _default_buy_additional_ui_state():
+    return {
+        "price_compare_skip": {
+            "check": False,
+            "direction_combo": "상향",
+            "ratio_line": "0.5",
+            "compare_combo": "이하",
+            "action": "SKIP_CURRENT_GENERATION",
+        },
+        "last_plus_one": {
+            "check": False,
+            "method_combo": "시장가",
+            "direction_combo": "상향",
+            "ratio_line": "0.45",
+            "compare_combo": "이상",
+        },
+    }
+
+
+def normalize_buy_additional_ui_state(value):
+    """Normalize old flat additional UI state without guessing lost fields.
+
+    The old collector wrote both widget groups into one dict. Its collection
+    order means the shared keys can only be attributed to price_compare_skip;
+    only method_combo can be recovered for last_plus_one.
+    """
+    defaults = _default_buy_additional_ui_state()
+    if not isinstance(value, dict):
+        return {"state": defaults, "warnings": [], "legacy_flat": False}
+
+    has_nested = "price_compare_skip" in value or "last_plus_one" in value
+    if has_nested:
+        normalized = deepcopy(defaults)
+        for namespace in ("price_compare_skip", "last_plus_one"):
+            source = value.get(namespace)
+            if isinstance(source, dict):
+                normalized[namespace].update(deepcopy(source))
+        normalized["price_compare_skip"]["action"] = "SKIP_CURRENT_GENERATION"
+        return {"state": normalized, "warnings": [], "legacy_flat": False}
+
+    legacy_keys = {
+        "check", "direction_combo", "ratio_line", "compare_combo", "method_combo",
+    }
+    if not any(key in value for key in legacy_keys):
+        return {"state": defaults, "warnings": [], "legacy_flat": False}
+
+    normalized = deepcopy(defaults)
+    for key in ("check", "direction_combo", "ratio_line", "compare_combo"):
+        if key in value:
+            normalized["price_compare_skip"][key] = deepcopy(value[key])
+    if "method_combo" in value:
+        normalized["last_plus_one"]["method_combo"] = deepcopy(value["method_combo"])
+    # The old flat payload cannot prove the last+1 checkbox or active details.
+    normalized["last_plus_one"]["check"] = False
+    return {
+        "state": normalized,
+        "warnings": [LEGACY_ADDITIONAL_STATE_PARTIAL_LOSS],
+        "legacy_flat": True,
+    }
 
 
 def _routine_setting_changes(
@@ -472,15 +534,14 @@ class IndicatorFollowRoutineSettingsDialog(
         text.setReadOnly(True)
         text.setPlainText(
             "고급/확장 설정\n\n"
-            "현재 잠금:\n"
-            "- 다중매수\n"
-            "- 다중호가\n"
-            "- 다중지점\n"
-            "- 지속매수\n"
-            "- 평단 중심 매수강도\n"
-            "- 능동매수\n"
-            "- 루틴 주문취소\n\n"
-            "위 항목은 개념 확정 후 별도 설정 화면으로 연결합니다."
+            "연결 완료:\n"
+            "- 직전회차주문가 대비 현재주문가\n"
+            "- 마지막+1 회차\n"
+            "- 다중지점 마지막회차 능동매수\n"
+            "- 지원되는 순환설정\n\n"
+            "예약 유지:\n"
+            "- 평단관리 능동매수 (ACTIVE_BUY_NOT_IMPLEMENTED)\n"
+            "- 순환 가격비교 일괄취소 (CYCLE_OPTION_EXECUTION_NOT_CONNECTED)"
         )
         layout.addWidget(text, 1)
 
@@ -558,7 +619,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self._set_card_status(self.card_buy, "확인 불가", "error")
         self._set_card_status(self.card_sell, "확인 불가", "error")
         self._set_card_status(self.card_profit, "확인 불가", "error")
-        self._set_card_status(self.card_advanced, "잠금", "locked")
+        self._set_card_status(self.card_advanced, "부분 연결", "active")
         self._set_card_status(self.card_validation, "오류", "error")
 
         self.preview_text.clear()
@@ -678,7 +739,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self.validation_signal_line.setText("BUY / SELL / signal=None")
         self.validation_execution_line.setText("비활성" if not execution_enabled else "활성")
         self.validation_sell_line.setText(f"{sell_logic} 결합")
-        self.validation_buy_line.setText("확장 잠금")
+        self.validation_buy_line.setText("연결 기능 사용 가능 / 예약 기능 잠금")
 
         if not signal_only:
             self._set_card_status(self.card_validation, "확인 필요", "locked")
@@ -2558,7 +2619,12 @@ class IndicatorFollowRoutineSettingsDialog(
 
     def apply_indicator_follow_ui_state(self, state):
         """Apply a collected UI state in memory only; this never writes rules.json."""
-        result = {"applied": [], "skipped": [], "sync_errors": []}
+        result = {
+            "applied": [],
+            "skipped": [],
+            "sync_errors": [],
+            "compatibility_warnings": [],
+        }
         if not isinstance(state, dict):
             result["skipped"].append({
                 "name": "state",
@@ -2582,7 +2648,49 @@ class IndicatorFollowRoutineSettingsDialog(
                 signal_filter.get("buy_composite") if isinstance(signal_filter, dict) else None,
                 result=result,
             )
-            self._apply_prefixed_ui_values(buy_ui.get("base", {}), "buy_base_", result=result)
+            base_state = buy_ui.get("base", {})
+            if not isinstance(base_state, dict):
+                base_state = {}
+            self._apply_prefixed_ui_values(
+                {
+                    key: value
+                    for key, value in base_state.items()
+                    if key != "last_round_active_buy"
+                },
+                "buy_base_",
+                result=result,
+            )
+            last_round_active = base_state.get("last_round_active_buy")
+            if last_round_active is None and "base" in buy_ui:
+                last_round_active = {
+                    "enabled": False,
+                    "checked": False,
+                    "direction_combo": "상향",
+                    "ratio_line": "0.45",
+                    "compare_combo": "이상",
+                }
+            if isinstance(last_round_active, dict):
+                checked = last_round_active.get(
+                    "checked",
+                    last_round_active.get("enabled", False),
+                )
+                skipped = self._apply_ui_widget_value(
+                    "buy_last_round_active_check",
+                    bool(checked),
+                )
+                if skipped is None:
+                    result["applied"].append("buy_last_round_active_check")
+                else:
+                    result["skipped"].append(skipped)
+                self._apply_prefixed_ui_values(
+                    {
+                        key: value
+                        for key, value in last_round_active.items()
+                        if key in {"direction_combo", "ratio_line", "compare_combo"}
+                    },
+                    "buy_last_round_active_",
+                    result=result,
+                )
             self._apply_prefixed_ui_values(buy_ui.get("repeat", {}), "buy_base_", result=result)
             self._apply_prefixed_ui_values(
                 buy_ui.get("price_compare", {}),
@@ -2594,9 +2702,21 @@ class IndicatorFollowRoutineSettingsDialog(
                 "buy_situation_response_",
                 result=result,
             )
-            self._apply_existing_prefixed_ui_values(
-                buy_ui.get("additional", {}),
-                ("buy_additional_active_", "buy_price_compare_skip_"),
+            additional = normalize_buy_additional_ui_state(buy_ui.get("additional", {}))
+            result["compatibility_warnings"].extend(additional["warnings"])
+            additional_state = additional["state"]
+            self._apply_prefixed_ui_values(
+                {
+                    key: value
+                    for key, value in additional_state["price_compare_skip"].items()
+                    if key != "action"
+                },
+                "buy_price_compare_skip_",
+                result=result,
+            )
+            self._apply_prefixed_ui_values(
+                additional_state["last_plus_one"],
+                "buy_additional_active_",
                 result=result,
             )
             self._apply_existing_prefixed_ui_values(
@@ -2720,6 +2840,39 @@ class IndicatorFollowRoutineSettingsDialog(
             if name.startswith("buy_additional_active_")
             or name.startswith("buy_price_compare_skip_")
         )
+        last_round_active_check = getattr(self, "buy_last_round_active_check", None)
+        last_round_active_prerequisite = getattr(
+            self,
+            "_buy_last_round_active_prerequisite",
+            None,
+        )
+        last_round_active_checked = bool(
+            last_round_active_check is not None
+            and last_round_active_check.isChecked()
+        )
+        last_round_active_state = {
+            "enabled": bool(
+                last_round_active_checked
+                and callable(last_round_active_prerequisite)
+                and last_round_active_prerequisite()
+            ),
+            "checked": last_round_active_checked,
+            "direction_combo": (
+                self.buy_last_round_active_direction_combo.currentText()
+                if hasattr(self, "buy_last_round_active_direction_combo")
+                else "상향"
+            ),
+            "ratio_line": (
+                self.buy_last_round_active_ratio_line.text()
+                if hasattr(self, "buy_last_round_active_ratio_line")
+                else "0.45"
+            ),
+            "compare_combo": (
+                self.buy_last_round_active_compare_combo.currentText()
+                if hasattr(self, "buy_last_round_active_compare_combo")
+                else "이상"
+            ),
+        }
         buy_ui = {
             "signal_filter": {
                 **self._collect_prefixed_ui_values(("buy_ocr_",)),
@@ -2728,10 +2881,13 @@ class IndicatorFollowRoutineSettingsDialog(
                 **self._collect_prefixed_ui_values(("buy_rsi_",)),
                 "buy_composite": self._collect_buy_composite_ui_state(),
             },
-            "base": self._collect_named_ui_values_without_prefix(
-                buy_base_section_names,
-                "buy_base_",
-            ),
+            "base": {
+                **self._collect_named_ui_values_without_prefix(
+                    buy_base_section_names,
+                    "buy_base_",
+                ),
+                "last_round_active_buy": last_round_active_state,
+            },
             "repeat": self._collect_named_ui_values_without_prefix(
                 buy_repeat_section_names,
                 "buy_base_",
@@ -2744,20 +2900,23 @@ class IndicatorFollowRoutineSettingsDialog(
                 "buy_situation_response_",
             ),
             "additional": {
-                **self._collect_named_ui_values_without_prefix(
+                "last_plus_one": self._collect_named_ui_values_without_prefix(
                     [
                         name for name in buy_additional_names
                         if name.startswith("buy_additional_active_")
                     ],
                     "buy_additional_active_",
                 ),
-                **self._collect_named_ui_values_without_prefix(
-                    [
-                        name for name in buy_additional_names
-                        if name.startswith("buy_price_compare_skip_")
-                    ],
-                    "buy_price_compare_skip_",
-                ),
+                "price_compare_skip": {
+                    **self._collect_named_ui_values_without_prefix(
+                        [
+                            name for name in buy_additional_names
+                            if name.startswith("buy_price_compare_skip_")
+                        ],
+                        "buy_price_compare_skip_",
+                    ),
+                    "action": "SKIP_CURRENT_GENERATION",
+                },
             },
             "cycle": {
                 **self._collect_named_ui_values_without_prefix(

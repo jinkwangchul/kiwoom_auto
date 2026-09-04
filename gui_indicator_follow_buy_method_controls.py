@@ -12,6 +12,28 @@ from PyQt5.QtWidgets import (
 )
 
 
+def sync_buy_direction_comparator(direction_combo, compare_combo):
+    """Keep BUY direction/comparator UI aligned with the canonical ratio grammar."""
+    direction = direction_combo.currentText().strip()
+    visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
+    for item_text in ["이상", "이하", "이내", "이탈"]:
+        index = compare_combo.findText(item_text)
+        if index >= 0:
+            compare_combo.view().setRowHidden(index, item_text not in visible_items)
+    if compare_combo.currentText() not in visible_items:
+        compare_combo.setCurrentText("이내" if direction == "상하" else "이상")
+
+
+def set_buy_combo_item_enabled(combo, item_text, enabled, tooltip=""):
+    index = combo.findText(item_text)
+    model = combo.model()
+    item = model.item(index) if index >= 0 and hasattr(model, "item") else None
+    if item is not None:
+        item.setEnabled(enabled)
+        if tooltip:
+            item.setToolTip(tooltip)
+
+
 class HogaTotalDisplay(QLabel):
     def __init__(self, up_line, down_line, width):
         super().__init__()
@@ -196,6 +218,8 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addLayout(time_row)
 
         self.buy_base_time_mode_combo = make_combo(["선택없음", "다중시간", "다중비율"], "다중시간", 116)
+        for index, token in enumerate(("NONE", "MULTI_TIME", "MULTI_RATIO")):
+            self.buy_base_time_mode_combo.setItemData(index, token, Qt.UserRole)
         time_row.addWidget(self.buy_base_time_mode_combo)
         time_row.addWidget(make_label("|", 8, Qt.AlignCenter))
 
@@ -252,9 +276,68 @@ class IndicatorFollowBuyMethodControlsMixin:
         ratio_layout.addStretch(1)
         self.buy_base_time_stack.addWidget(self.buy_base_ratio_widget)
         time_row.addStretch(1)
-
         time_mode_combo = self.buy_base_time_mode_combo
         time_stack = self.buy_base_time_stack
+
+        self.buy_last_round_active_row_widget = QWidget()
+        last_round_active_row = QHBoxLayout(self.buy_last_round_active_row_widget)
+        last_round_active_row.setContentsMargins(32, 0, 0, 0)
+        last_round_active_row.setSpacing(4)
+        layout.addWidget(self.buy_last_round_active_row_widget)
+
+        self.buy_last_round_active_check = QCheckBox("마지막회차 능동매수")
+        self.buy_last_round_active_check.setFixedWidth(138)
+        self.buy_last_round_active_check.setFixedHeight(30)
+        self.buy_last_round_active_check.setStyleSheet("font-size: 8pt;")
+        self.buy_last_round_active_set_price_label = make_label("설정가에 평단이", 102)
+        self.buy_last_round_active_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
+        self.buy_last_round_active_ratio_line = make_line("0.45", 46)
+        self.buy_last_round_active_percent_label = make_label("%", 14)
+        self.buy_last_round_active_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
+        last_round_active_row.addWidget(self.buy_last_round_active_check)
+        last_round_active_row.addWidget(self.buy_last_round_active_set_price_label)
+        last_round_active_row.addWidget(self.buy_last_round_active_direction_combo)
+        last_round_active_row.addWidget(self.buy_last_round_active_ratio_line)
+        last_round_active_row.addWidget(self.buy_last_round_active_percent_label)
+        last_round_active_row.addWidget(self.buy_last_round_active_compare_combo)
+        last_round_active_row.addStretch(1)
+
+        last_round_active_check = self.buy_last_round_active_check
+        last_round_active_direction_combo = self.buy_last_round_active_direction_combo
+        last_round_active_compare_combo = self.buy_last_round_active_compare_combo
+        last_round_active_details = (
+            self.buy_last_round_active_set_price_label,
+            last_round_active_direction_combo,
+            self.buy_last_round_active_ratio_line,
+            self.buy_last_round_active_percent_label,
+            last_round_active_compare_combo,
+        )
+
+        def last_round_active_prerequisite():
+            return time_mode_combo.currentData(Qt.UserRole) in {"MULTI_TIME", "MULTI_RATIO"}
+
+        def update_last_round_active_state_local(*_args):
+            prerequisite = last_round_active_prerequisite()
+            last_round_active_check.setEnabled(prerequisite)
+            details_enabled = prerequisite and last_round_active_check.isChecked()
+            for widget in last_round_active_details:
+                widget.setEnabled(details_enabled)
+            sync_buy_direction_comparator(
+                last_round_active_direction_combo,
+                last_round_active_compare_combo,
+            )
+
+        self._buy_last_round_active_prerequisite = last_round_active_prerequisite
+        time_mode_combo.currentIndexChanged.connect(update_last_round_active_state_local)
+        last_round_active_check.toggled.connect(update_last_round_active_state_local)
+        last_round_active_direction_combo.currentTextChanged.connect(
+            update_last_round_active_state_local
+        )
+        if not hasattr(self, "_buy_last_round_active_state_updaters"):
+            self._buy_last_round_active_state_updaters = []
+        self._buy_last_round_active_state_updaters.append(
+            update_last_round_active_state_local
+        )
 
         def update_time_mode_local(*_args):
             index = time_mode_combo.currentIndex()
@@ -267,6 +350,7 @@ class IndicatorFollowBuyMethodControlsMixin:
             self._buy_time_mode_state_updaters = []
         self._buy_time_mode_state_updaters.append(update_time_mode_local)
         update_time_mode_local()
+        update_last_round_active_state_local()
 
     def _build_repeat_buy_section(self, layout, make_combo, make_line, make_label):
         self.buy_repeat_setting_label = QLabel("▶반복매수설정")
@@ -293,6 +377,12 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         self.buy_base_detail_mode_combo = make_combo(
             ["회차기준", "예산기준", "능동매수"], "회차기준", 116, ModeSwitchComboBox
+        )
+        set_buy_combo_item_enabled(
+            self.buy_base_detail_mode_combo,
+            "능동매수",
+            False,
+            "ACTIVE_BUY_NOT_IMPLEMENTED",
         )
         base_detail_row.addWidget(self.buy_base_detail_mode_combo)
         base_detail_row.addWidget(make_label("|", 8, Qt.AlignCenter))
@@ -413,6 +503,12 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_price_compare_above_right_label = make_label("주문가", 48)
         self.buy_price_compare_above_mode_combo = make_combo(
             ["회차기준", "예산기준", "능동매수"], "회차기준", 116, ModeSwitchComboBox
+        )
+        set_buy_combo_item_enabled(
+            self.buy_price_compare_above_mode_combo,
+            "능동매수",
+            False,
+            "ACTIVE_BUY_NOT_IMPLEMENTED",
         )
         price_compare_above_row.addWidget(self.buy_price_compare_above_left_label)
         price_compare_above_row.addWidget(self.buy_price_compare_above_condition_combo)
@@ -674,19 +770,34 @@ class IndicatorFollowBuyMethodControlsMixin:
         additional_active_method_combo = self.buy_additional_active_method_combo
         additional_active_detail_row_widget = self.buy_additional_active_detail_row_widget
         additional_active_detail_widgets = self._buy_additional_active_detail_widgets
+        price_compare_skip_check = self.buy_price_compare_skip_check
+        price_compare_skip_direction_combo = self.buy_price_compare_skip_direction_combo
+        price_compare_skip_compare_combo = self.buy_price_compare_skip_compare_combo
+        price_compare_skip_details = (
+            price_compare_skip_direction_combo,
+            self.buy_price_compare_skip_ratio_line,
+            price_compare_skip_compare_combo,
+        )
 
         def update_additional_active_state_local(*_args):
-            enabled = (
+            price_enabled = price_compare_skip_check.isChecked()
+            for widget in price_compare_skip_details:
+                widget.setEnabled(price_enabled)
+
+            method_enabled = additional_active_check.isChecked()
+            additional_active_method_combo.setEnabled(method_enabled)
+            detail_enabled = (
                 additional_active_check.isChecked()
                 and additional_active_method_combo.currentText().strip() == "능동"
             )
 
             for widget in additional_active_detail_widgets:
-                widget.setEnabled(enabled)
+                widget.setEnabled(detail_enabled)
 
             additional_active_detail_row_widget.updateGeometry()
             additional_active_detail_row_widget.update()
 
+        price_compare_skip_check.toggled.connect(update_additional_active_state_local)
         additional_active_check.toggled.connect(update_additional_active_state_local)
         additional_active_method_combo.currentIndexChanged.connect(update_additional_active_state_local)
 
@@ -694,22 +805,6 @@ class IndicatorFollowBuyMethodControlsMixin:
             self._buy_additional_active_state_updaters = []
         self._buy_additional_active_state_updaters.append(update_additional_active_state_local)
         update_additional_active_state_local()
-
-        unsupported_message = "현재 지원되지 않는 설정입니다."
-        self.buy_additional_setting_label.setToolTip(unsupported_message)
-        self.buy_price_compare_skip_row_widget.setEnabled(False)
-        self.buy_price_compare_skip_row_widget.setToolTip(unsupported_message)
-        self.buy_additional_active_row_widget.setEnabled(False)
-        self.buy_additional_active_row_widget.setToolTip(unsupported_message)
-        self.buy_additional_active_detail_row_widget.setEnabled(False)
-        self.buy_additional_active_detail_row_widget.setToolTip(unsupported_message)
-        for row in (
-            self.buy_price_compare_skip_row_widget,
-            self.buy_additional_active_row_widget,
-            self.buy_additional_active_detail_row_widget,
-        ):
-            for widget in row.findChildren(QWidget):
-                widget.setToolTip(unsupported_message)
 
     def _build_situation_response_section(self, layout, make_combo, make_line, make_label):
         self.buy_situation_response_label = QLabel("▶상황변화대응")
@@ -836,6 +931,10 @@ class IndicatorFollowBuyMethodControlsMixin:
         for updater in getattr(self, "_buy_additional_active_state_updaters", []):
             updater()
 
+    def _update_last_round_active_state(self, *_args):
+        for updater in getattr(self, "_buy_last_round_active_state_updaters", []):
+            updater()
+
     def _update_situation_response_state(self, *_args):
         for updater in getattr(self, "_buy_situation_response_updaters", []):
             updater()
@@ -843,6 +942,7 @@ class IndicatorFollowBuyMethodControlsMixin:
     def _update_all_buy_method_states(self):
         self._update_hoga_mode()
         self._update_time_mode()
+        self._update_last_round_active_state()
         self._update_apply_all_enabled()
         self._update_additional_active_state()
         self._update_situation_response_state()

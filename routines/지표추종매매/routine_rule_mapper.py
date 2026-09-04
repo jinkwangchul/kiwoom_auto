@@ -11,6 +11,7 @@ import hashlib
 import json
 from copy import deepcopy
 from datetime import datetime
+from math import isfinite
 from typing import Any
 
 
@@ -68,6 +69,22 @@ BUY_RSI_FILTER_PATH = "buy.filters.rsi"
 BUY_COMPOSITE_FILTER_PATH = "buy.filters.composite"
 BUY_EXECUTION_BASE_PATH = "buy.execution.base"
 BUY_EXECUTION_REPEAT_PATH = "buy.execution.repeat"
+BUY_EXECUTION_ADDITIONAL_PATH = "buy.execution.additional"
+BUY_EXECUTION_CYCLE_PATH = "buy.execution.cycle"
+_BUY_EXECUTION_PATHS = {
+    BUY_EXECUTION_BASE_PATH,
+    BUY_EXECUTION_REPEAT_PATH,
+    BUY_EXECUTION_ADDITIONAL_PATH,
+    BUY_EXECUTION_CYCLE_PATH,
+}
+_BUY_EXECUTION_CANDIDATE_KEYS = {
+    BUY_EXECUTION_BASE_PATH: "base",
+    BUY_EXECUTION_REPEAT_PATH: "repeat",
+    BUY_EXECUTION_ADDITIONAL_PATH: "additional",
+    BUY_EXECUTION_CYCLE_PATH: "cycle",
+}
+P1_EXECUTION_LOCK_REASON = "MAPPED_BUT_EXECUTION_NOT_CONNECTED"
+CYCLE_OPTION_EXECUTION_LOCK_REASON = "CYCLE_OPTION_EXECUTION_NOT_CONNECTED"
 RSI_INDICATOR_PATH = "indicators.rsi"
 SELL_METHOD_SELECTED_SETS_PATH = "sell.method.selected_sets"
 SELL_METHOD_SETTING_A_PATH = "sell.method.setting_a"
@@ -174,7 +191,7 @@ def _preview_diff_risk(path: str) -> str:
         return "low"
     if path == BUY_COMPOSITE_FILTER_PATH:
         return "low"
-    if path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
+    if path in _BUY_EXECUTION_PATHS:
         return "medium"
     if path in _SELL_METHOD_PATHS:
         return "medium"
@@ -215,6 +232,12 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_EXECUTION_REPEAT_PATH: (
             "UI preview-only BUY execution repeat policy candidate."
+        ),
+        BUY_EXECUTION_ADDITIONAL_PATH: (
+            "BUY additional policy connected to the Routine-owned P2 execution consumer."
+        ),
+        BUY_EXECUTION_CYCLE_PATH: (
+            "Signal-scoped BUY cycle policy; unsupported CANCEL_BATCH remains execution-locked."
         ),
         SELL_METHOD_SELECTED_SETS_PATH: (
             "UI preview-only SELL method selected sets policy candidate."
@@ -607,6 +630,10 @@ def _execution_policy_value(candidate: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+def _execution_candidate_is_locked(candidate: dict[str, Any]) -> bool:
+    return bool(candidate) and candidate.get("execution_connected") is False
+
+
 def _method_policy_value(candidate: dict[str, Any]) -> Any:
     if "value" not in candidate:
         return _MISSING
@@ -634,7 +661,7 @@ def _set_buy_execution_policy_value(
     path: str,
     value: dict[str, Any],
 ) -> bool:
-    if path not in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
+    if path not in _BUY_EXECUTION_PATHS:
         return False
     buy = root.get("buy")
     if not isinstance(buy, dict):
@@ -746,6 +773,322 @@ def _round_operator_token(value: Any) -> str | None:
     })
 
 
+def _strict_ui_bool(value: Any, *, default: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None and default is not None:
+        return default
+    return None
+
+
+def _nonnegative_float(value: Any) -> float | None:
+    number = _safe_float(value)
+    if number is None or not isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _last_plus_one_method_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "시장가": "MARKET",
+        "현재가": "CURRENT_PRICE",
+        "능동": "ACTIVE",
+    })
+
+
+def _normalize_additional_mapper_state(
+    additional: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, dict[str, Any]]:
+    price_defaults = {
+        "check": False,
+        "direction_combo": "상향",
+        "ratio_line": "0.5",
+        "compare_combo": "이하",
+        "action": "SKIP_CURRENT_GENERATION",
+    }
+    last_defaults = {
+        "check": False,
+        "method_combo": "시장가",
+        "direction_combo": "상향",
+        "ratio_line": "0.45",
+        "compare_combo": "이상",
+    }
+    if "price_compare_skip" in additional or "last_plus_one" in additional:
+        price = deepcopy(price_defaults)
+        last = deepcopy(last_defaults)
+        if isinstance(additional.get("price_compare_skip"), dict):
+            price.update(deepcopy(additional["price_compare_skip"]))
+        if isinstance(additional.get("last_plus_one"), dict):
+            last.update(deepcopy(additional["last_plus_one"]))
+        price["action"] = "SKIP_CURRENT_GENERATION"
+        return {"price_compare_skip": price, "last_plus_one": last}
+
+    legacy_keys = {"check", "direction_combo", "ratio_line", "compare_combo", "method_combo"}
+    price = deepcopy(price_defaults)
+    last = deepcopy(last_defaults)
+    if any(key in additional for key in legacy_keys):
+        warnings.append("LEGACY_ADDITIONAL_STATE_PARTIAL_LOSS")
+        for key in ("check", "direction_combo", "ratio_line", "compare_combo"):
+            if key in additional:
+                price[key] = deepcopy(additional[key])
+        if "method_combo" in additional:
+            last["method_combo"] = deepcopy(additional["method_combo"])
+        last["check"] = False
+    return {"price_compare_skip": price, "last_plus_one": last}
+
+
+def _build_last_round_active_buy_policy(
+    base: dict[str, Any],
+    point_mode: str | None,
+    warnings: list[str],
+) -> tuple[dict[str, Any] | None, bool]:
+    source = base.get("last_round_active_buy")
+    if source is None:
+        source = {}
+    if not isinstance(source, dict):
+        warnings.append("buy last-round active policy is not a dict")
+        return None, False
+    enabled = _strict_ui_bool(source.get("enabled"), default=False)
+    if enabled is None:
+        warnings.append("buy last-round active enabled must be boolean")
+        return None, False
+    policy = {
+        "enabled": enabled,
+        "applies_to": "LAST_MULTI_POINT_CHILD",
+        "budget_policy_override": "NONE",
+        "purpose": "BUY_METHOD_SPECIAL_ACTION",
+        "subject": "AVERAGE_PRICE",
+        "reference": "MULTI_POINT_SET_PRICE",
+        "direction": _direction_token(source.get("direction", source.get("direction_combo", "상향"))),
+        "ratio_percent": _nonnegative_float(source.get("ratio_percent", source.get("ratio_line", "0.45"))),
+        "comparator": _ratio_compare_token(source.get("comparator", source.get("compare_combo", "이상"))),
+    }
+    if policy["direction"] not in {"UP", "DOWN", "BOTH"}:
+        warnings.append("buy last-round active direction is invalid")
+        return None, False
+    if policy["ratio_percent"] is None:
+        warnings.append("buy last-round active ratio is invalid")
+        return None, False
+    if policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}:
+        warnings.append("buy last-round active comparator is invalid")
+        return None, False
+    if enabled and point_mode not in {"MULTI_TIME", "MULTI_RATIO"}:
+        warnings.append("buy last-round active requires MULTI_TIME or MULTI_RATIO")
+        return None, False
+    return policy, False
+
+
+def _build_buy_execution_additional_candidate(
+    additional: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any] | None:
+    if not additional:
+        return None
+    normalized = _normalize_additional_mapper_state(additional, warnings)
+    price = normalized["price_compare_skip"]
+    last = normalized["last_plus_one"]
+    price_enabled = _strict_ui_bool(price.get("check"), default=False)
+    last_enabled = _strict_ui_bool(last.get("check"), default=False)
+    if price_enabled is None or last_enabled is None:
+        warnings.append("buy additional enabled values must be boolean")
+        return None
+
+    price_policy = {
+        "enabled": price_enabled,
+        "reference_source": "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
+        "current_source": "ACTIONABLE_ORDER_PRICE",
+        "direction": _direction_token(price.get("direction_combo")),
+        "ratio_percent": _nonnegative_float(price.get("ratio_line")),
+        "comparator": _ratio_compare_token(price.get("compare_combo")),
+        "action": "SKIP_CURRENT_GENERATION",
+        "skipped_round_increment": False,
+    }
+    if (
+        price_policy["direction"] not in {"UP", "DOWN", "BOTH"}
+        or price_policy["ratio_percent"] is None
+        or price_policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+    ):
+        warnings.append("buy previous-round price skip policy is invalid")
+        return None
+
+    method = _last_plus_one_method_token(last.get("method_combo"))
+    active_condition = {
+        "lhs_source": "ACTIONABLE_ORDER_PRICE",
+        "rhs_source": "AVERAGE_PRICE",
+        "direction": _direction_token(last.get("direction_combo")),
+        "ratio_percent": _nonnegative_float(last.get("ratio_line")),
+        "comparator": _ratio_compare_token(last.get("compare_combo")),
+    }
+    if method not in {"MARKET", "CURRENT_PRICE", "ACTIVE"}:
+        warnings.append("buy last+1 method is invalid")
+        return None
+    if (
+        active_condition["direction"] not in {"UP", "DOWN", "BOTH"}
+        or active_condition["ratio_percent"] is None
+        or active_condition["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+    ):
+        warnings.append("buy last+1 active condition is invalid")
+        return None
+    last_policy = {
+        "enabled": last_enabled,
+        "generation_kind": "LAST_PLUS_ONE",
+        "trigger": "AFTER_NORMAL_MAX_ROUND_COMPLETED",
+        "max_occurrences": 1,
+        "method": method,
+        "active_condition": active_condition,
+        "budget_basis": "LAST_NORMAL_ROUND_APPROVED_BUDGET",
+        "terminal_after_completed_fill": True,
+    }
+    locked = False
+    value = {
+        "previous_round_price_skip": price_policy,
+        "last_plus_one": last_policy,
+        "execution_connected": not locked,
+        "execution_lock_reason": P1_EXECUTION_LOCK_REASON if locked else "",
+    }
+    return {
+        "path": BUY_EXECUTION_ADDITIONAL_PATH,
+        "operation": "set_execution_policy",
+        "value": value,
+        "execution_connected": not locked,
+        "execution_lock_reason": P1_EXECUTION_LOCK_REASON if locked else "",
+    }
+
+
+def _build_buy_execution_cycle_candidate(
+    cycle: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any] | None:
+    if not cycle or not any(str(key).startswith("buy_cycle_") for key in cycle):
+        return None
+    hoga_mode = _hoga_mode_token(cycle.get("buy_cycle_hoga_mode_combo"))
+    point_mode = _point_mode_token(cycle.get("buy_cycle_time_mode_combo"))
+    order_price_basis = _price_basis_token(cycle.get("buy_cycle_order_combo"))
+    hoga_up = _safe_int(cycle.get("buy_cycle_hoga_up_line"))
+    hoga_down = _safe_int(cycle.get("buy_cycle_hoga_down_line"))
+    if hoga_mode not in {"SINGLE", "MULTI"} or point_mode not in {"NONE", "MULTI_TIME", "MULTI_RATIO"}:
+        warnings.append("buy cycle mode is invalid")
+        return None
+    if hoga_mode == "SINGLE" and order_price_basis not in {"ORDER_PRICE", "CURRENT_PRICE", "MARKET"}:
+        warnings.append("buy cycle order price basis is invalid")
+        return None
+    if hoga_mode == "MULTI" and (
+        hoga_up is None or hoga_up < 0 or hoga_down is None or hoga_down < 0
+    ):
+        warnings.append("buy cycle multi-hoga range is invalid")
+        return None
+
+    point_policy: dict[str, Any] = {"mode": point_mode}
+    if point_mode == "MULTI_TIME":
+        point_policy.update({
+            "value": _nonnegative_float(cycle.get("buy_cycle_time_value_line")),
+            "unit": _point_unit_token(cycle.get("buy_cycle_time_unit_combo")),
+            "range": _range_token(cycle.get("buy_cycle_time_range_combo")),
+            "count": _safe_int(cycle.get("buy_cycle_time_count_line")),
+            "order_price_basis": _price_basis_token(cycle.get("buy_cycle_time_order_combo")),
+        })
+        if (
+            point_policy["value"] is None
+            or point_policy["unit"] not in {"SECOND", "MINUTE", "BAR"}
+            or point_policy["range"] not in {"WITHIN", "INTERVAL"}
+            or not isinstance(point_policy["count"], int) or point_policy["count"] <= 0
+            or point_policy["order_price_basis"] not in {"ORDER_PRICE", "CURRENT_PRICE"}
+        ):
+            warnings.append("buy cycle MULTI_TIME policy is invalid")
+            return None
+    elif point_mode == "MULTI_RATIO":
+        point_policy.update({
+            "left_source": _price_basis_token(cycle.get("buy_cycle_ratio_left_combo")),
+            "right_source": _price_basis_token(cycle.get("buy_cycle_ratio_right_combo")),
+            "direction": _direction_token(cycle.get("buy_cycle_ratio_direction_combo")),
+            "ratio_percent": _nonnegative_float(cycle.get("buy_cycle_ratio_value_line")),
+            "comparator": _ratio_compare_token(cycle.get("buy_cycle_ratio_compare_combo")),
+            "count": _safe_int(cycle.get("buy_cycle_ratio_count_line")),
+        })
+        if (
+            point_policy["left_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or point_policy["right_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or point_policy["direction"] not in {"UP", "DOWN", "BOTH"}
+            or point_policy["ratio_percent"] is None
+            or point_policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+            or not isinstance(point_policy["count"], int) or point_policy["count"] <= 0
+        ):
+            warnings.append("buy cycle MULTI_RATIO policy is invalid")
+            return None
+
+    situation_mode = _choice_token(cycle.get("buy_cycle_situation_mode_combo"), {
+        "미체결": "UNFILLED",
+        "가격비교": "PRICE_COMPARE",
+    })
+    situation: dict[str, Any]
+    if situation_mode == "UNFILLED":
+        situation = {
+            "mode": "UNFILLED",
+            "action": "CANCEL",
+            "scope": {"매회": "EACH", "일괄": "BATCH"}.get(cycle.get("buy_cycle_pending_scope_combo")),
+            "configured_value": _nonnegative_float(cycle.get("buy_cycle_pending_value_line")),
+            "configured_unit": _point_unit_token(cycle.get("buy_cycle_pending_unit_combo")),
+            "anchor": "BROKER_ACCEPTED_AT",
+        }
+        if situation["scope"] not in {"EACH", "BATCH"} or situation["configured_value"] is None \
+                or situation["configured_unit"] not in {"SECOND", "MINUTE", "BAR"}:
+            warnings.append("buy cycle unfilled policy is invalid")
+            return None
+    elif situation_mode == "PRICE_COMPARE":
+        situation = {
+            "mode": "PRICE_COMPARE",
+            "left_source": _price_basis_token(cycle.get("buy_cycle_price_left_combo")),
+            "right_source": _price_basis_token(cycle.get("buy_cycle_price_right_combo")),
+            "direction": _direction_token(cycle.get("buy_cycle_price_direction_combo")),
+            "ratio_percent": _nonnegative_float(cycle.get("buy_cycle_price_value_line")),
+            "comparator": _ratio_compare_token(cycle.get("buy_cycle_price_compare_combo")),
+            "action": {"매수리셋": "RESET", "일괄취소": "CANCEL_BATCH"}.get(cycle.get("buy_cycle_price_action_combo")),
+        }
+        if (
+            situation["left_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or situation["right_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or situation["direction"] not in {"UP", "DOWN", "BOTH"}
+            or situation["ratio_percent"] is None
+            or situation["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+            or situation["action"] not in {"RESET", "CANCEL_BATCH"}
+        ):
+            warnings.append("buy cycle price response is invalid")
+            return None
+    else:
+        warnings.append("buy cycle situation mode is invalid")
+        return None
+
+    connected = not (
+        situation.get("mode") == "PRICE_COMPARE"
+        and situation.get("action") == "CANCEL_BATCH"
+    )
+    lock_reason = "" if connected else CYCLE_OPTION_EXECUTION_LOCK_REASON
+    value = {
+        "scope": "SIGNAL_SCOPED_BUY_CYCLE",
+        "requires_source_signal": True,
+        "autonomous_scheduler": False,
+        "after_cycle_completion": "REQUIRE_NEW_BUY_SIGNAL",
+        "order_policy": {
+            "hoga_mode": hoga_mode,
+            "order_price_basis": order_price_basis,
+            "hoga_up": hoga_up,
+            "hoga_down": hoga_down,
+        },
+        "point_policy": point_policy,
+        "situation_response": situation,
+        "execution_connected": connected,
+        "execution_lock_reason": lock_reason,
+    }
+    return {
+        "path": BUY_EXECUTION_CYCLE_PATH,
+        "operation": "set_execution_policy",
+        "value": value,
+        "execution_connected": connected,
+        "execution_lock_reason": lock_reason,
+    }
+
+
 def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     keys = (
         "hoga_combo",
@@ -789,10 +1132,26 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
         "ratio_compare": _ratio_compare_token(base.get("ratio_compare_combo")),
         "ratio_count": _safe_int(base.get("ratio_count_line")),
     }
+    last_round_active_buy, active_execution_lock = _build_last_round_active_buy_policy(
+        base,
+        value["point_mode"],
+        warnings,
+    )
+    if last_round_active_buy is None:
+        return None
+    value["last_round_active_buy"] = last_round_active_buy
+    value["execution_connected"] = not active_execution_lock
+    value["execution_lock_reason"] = (
+        P1_EXECUTION_LOCK_REASON if active_execution_lock else ""
+    )
     return {
         "path": BUY_EXECUTION_BASE_PATH,
         "operation": "set_execution_policy",
         "value": value,
+        "execution_connected": not active_execution_lock,
+        "execution_lock_reason": (
+            P1_EXECUTION_LOCK_REASON if active_execution_lock else ""
+        ),
     }
 
 
@@ -1598,6 +1957,7 @@ def build_engine_rules_preview_from_ui_state(
     validation_warnings: list[str] = []
     postponed: list[str] = []
     legacy_notices: list[str] = []
+    execution_locks: list[str] = []
     preview_rules = deepcopy(current_rules) if isinstance(current_rules, dict) else {}
     source_rules = current_rules if isinstance(current_rules, dict) else {}
     preview_rules["bar"] = {}
@@ -1620,6 +1980,8 @@ def build_engine_rules_preview_from_ui_state(
     price_compare = _as_dict(buy_ui.get("price_compare"))
     execution_base = _as_dict(buy_ui.get("base"))
     execution_repeat = _as_dict(buy_ui.get("repeat"))
+    execution_additional = _as_dict(buy_ui.get("additional"))
+    execution_cycle = _as_dict(buy_ui.get("cycle"))
 
     buy_ocr_filter_candidate = _build_buy_ocr_filter_candidate(signal_filter, validation_warnings)
     if buy_ocr_filter_candidate:
@@ -1670,7 +2032,9 @@ def build_engine_rules_preview_from_ui_state(
     old_base = _as_dict(_as_dict(_as_dict(source_rules.get("buy")).get("execution")).get("base"))
     if not buy_execution_base_candidate and old_base and ("type_combo" in situation or buy_exit_policy is not None):
         buy_execution_base_candidate = {"path": BUY_EXECUTION_BASE_PATH,
-            "operation": "set_execution_policy", "value": deepcopy(old_base)}
+            "operation": "set_execution_policy", "value": deepcopy(old_base),
+            "execution_connected": True,
+            "execution_lock_reason": ""}
     if buy_execution_base_candidate:
         value = buy_execution_base_candidate["value"]
         if "type_combo" not in situation and "unfilled_timeout_policy" in old_base:
@@ -1717,6 +2081,11 @@ def build_engine_rules_preview_from_ui_state(
             buy_execution_base_candidate["value"],
         )
         preview_candidates.setdefault("execution", {})["base"] = buy_execution_base_candidate
+        if buy_execution_base_candidate.get("execution_connected") is False:
+            execution_locks.append(
+                f"{BUY_EXECUTION_BASE_PATH}: "
+                f"{buy_execution_base_candidate.get('execution_lock_reason') or P1_EXECUTION_LOCK_REASON}"
+            )
 
     buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(
         execution_repeat,
@@ -1730,6 +2099,40 @@ def build_engine_rules_preview_from_ui_state(
             buy_execution_repeat_candidate["value"],
         )
         preview_candidates.setdefault("execution", {})["repeat"] = buy_execution_repeat_candidate
+
+    buy_execution_additional_candidate = _build_buy_execution_additional_candidate(
+        execution_additional,
+        validation_warnings,
+    )
+    if buy_execution_additional_candidate:
+        _set_buy_execution_policy_value(
+            preview_rules,
+            BUY_EXECUTION_ADDITIONAL_PATH,
+            buy_execution_additional_candidate["value"],
+        )
+        preview_candidates.setdefault("execution", {})["additional"] = buy_execution_additional_candidate
+        if buy_execution_additional_candidate.get("execution_connected") is False:
+            execution_locks.append(
+                f"{BUY_EXECUTION_ADDITIONAL_PATH}: "
+                f"{buy_execution_additional_candidate.get('execution_lock_reason') or P1_EXECUTION_LOCK_REASON}"
+            )
+
+    buy_execution_cycle_candidate = _build_buy_execution_cycle_candidate(
+        execution_cycle,
+        validation_warnings,
+    )
+    if buy_execution_cycle_candidate:
+        _set_buy_execution_policy_value(
+            preview_rules,
+            BUY_EXECUTION_CYCLE_PATH,
+            buy_execution_cycle_candidate["value"],
+        )
+        preview_candidates.setdefault("execution", {})["cycle"] = buy_execution_cycle_candidate
+        if buy_execution_cycle_candidate.get("execution_connected") is False:
+            execution_locks.append(
+                f"{BUY_EXECUTION_CYCLE_PATH}: "
+                f"{buy_execution_cycle_candidate.get('execution_lock_reason') or CYCLE_OPTION_EXECUTION_LOCK_REASON}"
+            )
 
     rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, validation_warnings)
     if rsi_candidate:
@@ -1804,13 +2207,7 @@ def build_engine_rules_preview_from_ui_state(
         postponed.append("buy method mapping is postponed")
     if not buy_execution_repeat_candidate:
         postponed.append("repeat buy mapping is postponed")
-    postponed.extend([
-        "situation price response mapping is postponed",
-        "additional feature mapping is postponed",
-        "cycle setting mapping is postponed",
-        "exit condition mapping is postponed",
-        "completion policy mapping is postponed",
-    ])
+    postponed.append("completion policy mapping is postponed")
 
     mapped_paths = [
         BAR_MINUTES_PATH,
@@ -1833,6 +2230,10 @@ def build_engine_rules_preview_from_ui_state(
         mapped_paths.append(BUY_EXECUTION_BASE_PATH)
     if buy_execution_repeat_candidate:
         mapped_paths.append(BUY_EXECUTION_REPEAT_PATH)
+    if buy_execution_additional_candidate:
+        mapped_paths.append(BUY_EXECUTION_ADDITIONAL_PATH)
+    if buy_execution_cycle_candidate:
+        mapped_paths.append(BUY_EXECUTION_CYCLE_PATH)
     if sell_profit_rate_candidate:
         mapped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
     mapped_paths.extend(sell_method_candidates.keys())
@@ -1841,13 +2242,14 @@ def build_engine_rules_preview_from_ui_state(
     ])
     mapped_paths.extend(sell_add_signal_candidates.keys())
 
-    warnings = list(validation_warnings) + list(postponed)
+    warnings = list(validation_warnings) + list(postponed) + list(execution_locks)
     return {
         "preview_rules": preview_rules,
         "mapped_paths": mapped_paths,
         "validation_warnings": validation_warnings,
         "postponed": postponed,
         "legacy_notices": legacy_notices,
+        "execution_locks": execution_locks,
         "warnings": warnings,
     }
 
@@ -1868,6 +2270,7 @@ def build_engine_rules_pending_from_ui_state(
         "mode": preview_namespace.get("mode", "merge_add_candidate"),
         "mapped_paths": list(preview_result.get("mapped_paths", [])),
         "candidates": deepcopy(_as_dict(preview_namespace.get("candidates"))),
+        "execution_locks": list(preview_result.get("execution_locks", [])),
         "warnings": list(preview_result.get("warnings", [])),
     }
     return {
@@ -1876,6 +2279,7 @@ def build_engine_rules_pending_from_ui_state(
         "validation_warnings": list(preview_result.get("validation_warnings", [])),
         "postponed": list(preview_result.get("postponed", [])),
         "legacy_notices": list(preview_result.get("legacy_notices", [])),
+        "execution_locks": list(preview_result.get("execution_locks", [])),
         "warnings": list(preview_result.get("warnings", [])),
     }
 
@@ -1944,6 +2348,16 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
     buy_execution_repeat = _as_dict(_as_dict(candidates.get("execution")).get("repeat"))
     if buy_execution_repeat:
         execution_path = str(buy_execution_repeat.get("path") or BUY_EXECUTION_REPEAT_PATH)
+        candidate_paths[execution_path] = "set_execution_policy"
+
+    buy_execution_additional = _as_dict(_as_dict(candidates.get("execution")).get("additional"))
+    if buy_execution_additional:
+        execution_path = str(buy_execution_additional.get("path") or BUY_EXECUTION_ADDITIONAL_PATH)
+        candidate_paths[execution_path] = "set_execution_policy"
+
+    buy_execution_cycle = _as_dict(_as_dict(candidates.get("execution")).get("cycle"))
+    if buy_execution_cycle:
+        execution_path = str(buy_execution_cycle.get("path") or BUY_EXECUTION_CYCLE_PATH)
         candidate_paths[execution_path] = "set_execution_policy"
 
     rsi_candidate = _as_dict(_as_dict(candidates.get("indicators")).get("rsi"))
@@ -2023,6 +2437,8 @@ def build_rule_approval_session_fingerprint(
         BUY_PRICE_COMPARE_FILTER_PATH: _get_path_value(rules, BUY_PRICE_COMPARE_FILTER_PATH),
         BUY_EXECUTION_BASE_PATH: _get_path_value(rules, BUY_EXECUTION_BASE_PATH),
         BUY_EXECUTION_REPEAT_PATH: _get_path_value(rules, BUY_EXECUTION_REPEAT_PATH),
+        BUY_EXECUTION_ADDITIONAL_PATH: _get_path_value(rules, BUY_EXECUTION_ADDITIONAL_PATH),
+        BUY_EXECUTION_CYCLE_PATH: _get_path_value(rules, BUY_EXECUTION_CYCLE_PATH),
         SELL_METHOD_SELECTED_SETS_PATH: _get_path_value(rules, SELL_METHOD_SELECTED_SETS_PATH),
         SELL_METHOD_SETTING_A_PATH: _get_path_value(rules, SELL_METHOD_SETTING_A_PATH),
         SELL_METHOD_SETTING_B_PATH: _get_path_value(rules, SELL_METHOD_SETTING_B_PATH),
@@ -2539,6 +2955,12 @@ def build_approved_rule_patch_preview(
 
         if path == BUY_EXECUTION_BASE_PATH:
             execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
+            if _execution_candidate_is_locked(execution_candidate):
+                skipped_paths.append(_patch_skipped(
+                    path,
+                    execution_candidate.get("execution_lock_reason") or P1_EXECUTION_LOCK_REASON,
+                ))
+                continue
             candidate_value = _execution_policy_value(execution_candidate)
             if not candidate_value:
                 skipped_paths.append(_patch_skipped(path, "BUY execution base value is not available"))
@@ -2573,6 +2995,34 @@ def build_approved_rule_patch_preview(
             patches.append({
                 "source_path": BUY_EXECUTION_REPEAT_PATH,
                 "target_path": BUY_EXECUTION_REPEAT_PATH,
+                "operation": "set_execution_policy",
+                "value": candidate_value,
+                "risk": "medium",
+            })
+            continue
+
+        if path in {BUY_EXECUTION_ADDITIONAL_PATH, BUY_EXECUTION_CYCLE_PATH}:
+            candidate_key = _BUY_EXECUTION_CANDIDATE_KEYS[path]
+            execution_candidate = _as_dict(
+                _as_dict(preview_candidates.get("execution")).get(candidate_key)
+            )
+            if _execution_candidate_is_locked(execution_candidate):
+                skipped_paths.append(_patch_skipped(
+                    path,
+                    execution_candidate.get("execution_lock_reason") or P1_EXECUTION_LOCK_REASON,
+                ))
+                continue
+            candidate_value = _execution_policy_value(execution_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY execution policy value is not available"))
+                continue
+            current_value = _get_path_value(current, path)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY execution policy is unchanged"))
+                continue
+            patches.append({
+                "source_path": path,
+                "target_path": path,
                 "operation": "set_execution_policy",
                 "value": candidate_value,
                 "risk": "medium",
@@ -2811,7 +3261,7 @@ def apply_approved_rule_patch_preview(
             continue
 
         if operation == "set_execution_policy":
-            if target_path not in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
+            if target_path not in _BUY_EXECUTION_PATHS:
                 skipped_patches.append(_apply_skipped(patch, "unsupported execution policy target path"))
                 warnings.append(f"unsupported execution policy target path: {target_path}")
                 continue
@@ -3070,6 +3520,19 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "path": BUY_EXECUTION_REPEAT_PATH,
             "operation": "set_execution_policy",
             "change_type": "set_buy_execution_repeat",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_execution_policy" and target_path in {
+        BUY_EXECUTION_ADDITIONAL_PATH,
+        BUY_EXECUTION_CYCLE_PATH,
+    }:
+        diffs.append({
+            "path": target_path,
+            "operation": "set_execution_policy",
+            "change_type": f"set_buy_execution_{target_path.rsplit('.', 1)[-1]}",
             "value": deepcopy(patch.get("value")),
             "replace": False,
         })
@@ -3445,6 +3908,8 @@ def approve_engine_rule_candidates(
         BUY_COMPOSITE_FILTER_PATH,
         BUY_EXECUTION_BASE_PATH,
         BUY_EXECUTION_REPEAT_PATH,
+        BUY_EXECUTION_ADDITIONAL_PATH,
+        BUY_EXECUTION_CYCLE_PATH,
         SELL_METHOD_SELECTED_SETS_PATH,
         SELL_METHOD_SETTING_A_PATH,
         SELL_METHOD_SETTING_B_PATH,
@@ -3597,7 +4062,13 @@ def approve_engine_rule_candidates(
     if BUY_EXECUTION_BASE_PATH in approved_paths:
         execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
         candidate_value = _execution_policy_value(execution_candidate)
-        if not candidate_value:
+        if _execution_candidate_is_locked(execution_candidate):
+            skipped_paths.append(BUY_EXECUTION_BASE_PATH)
+            warnings.append(
+                "BUY execution base approval blocked: "
+                f"{execution_candidate.get('execution_lock_reason') or P1_EXECUTION_LOCK_REASON}"
+            )
+        elif not candidate_value:
             skipped_paths.append(BUY_EXECUTION_BASE_PATH)
             warnings.append("BUY execution base approval skipped: value is not available")
         elif _set_buy_execution_policy_value(
@@ -3625,6 +4096,29 @@ def approve_engine_rule_candidates(
         else:
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
             warnings.append("BUY execution repeat approval skipped: target path is not writable")
+
+    for execution_path in (BUY_EXECUTION_ADDITIONAL_PATH, BUY_EXECUTION_CYCLE_PATH):
+        if execution_path not in approved_paths:
+            continue
+        candidate_key = _BUY_EXECUTION_CANDIDATE_KEYS[execution_path]
+        execution_candidate = _as_dict(
+            _as_dict(preview_candidates.get("execution")).get(candidate_key)
+        )
+        candidate_value = _execution_policy_value(execution_candidate)
+        if _execution_candidate_is_locked(execution_candidate):
+            skipped_paths.append(execution_path)
+            warnings.append(
+                f"BUY execution {candidate_key} approval blocked: "
+                f"{execution_candidate.get('execution_lock_reason') or P1_EXECUTION_LOCK_REASON}"
+            )
+        elif not candidate_value:
+            skipped_paths.append(execution_path)
+            warnings.append(f"BUY execution {candidate_key} approval skipped: value is not available")
+        elif _set_buy_execution_policy_value(approved_rules, execution_path, candidate_value):
+            applied_paths.append(execution_path)
+        else:
+            skipped_paths.append(execution_path)
+            warnings.append(f"BUY execution {candidate_key} approval skipped: target path is not writable")
 
     method_policy_candidates = _as_dict(_as_dict(preview_candidates.get("sell")).get("method_policy_candidates"))
     for method_path in (
@@ -3728,13 +4222,16 @@ def compare_engine_rules_preview(
     validation_warnings = preview.get("validation_warnings")
     postponed = preview.get("postponed")
     legacy_notices = preview.get("legacy_notices")
+    execution_locks = preview.get("execution_locks")
     fallback_warnings = preview.get("warnings")
     validation_warning_list = validation_warnings if isinstance(validation_warnings, list) else []
     postponed_list = postponed if isinstance(postponed, list) else []
     legacy_notice_list = legacy_notices if isinstance(legacy_notices, list) else []
-    if not validation_warning_list and not postponed_list and isinstance(fallback_warnings, list):
+    execution_lock_list = execution_locks if isinstance(execution_locks, list) else []
+    if not validation_warning_list and not postponed_list and not execution_lock_list \
+            and isinstance(fallback_warnings, list):
         validation_warning_list = fallback_warnings
-    warning_list = list(validation_warning_list) + list(postponed_list)
+    warning_list = list(validation_warning_list) + list(postponed_list) + list(execution_lock_list)
     preview_candidates = _as_dict(
         _as_dict(preview_rules.get("indicator_follow_rule_preview")).get("candidates")
     )
@@ -3749,6 +4246,7 @@ def compare_engine_rules_preview(
         "validation": len(validation_warning_list),
         "postponed": len(postponed_list),
         "legacy": len(legacy_notice_list),
+        "execution_locks": len(execution_lock_list),
         "warnings_total": len(warning_list),
     }
     changes: list[dict[str, Any]] = []
@@ -3792,6 +4290,14 @@ def compare_engine_rules_preview(
             preview_value = _execution_policy_value(
                 _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
             )
+        elif path in {BUY_EXECUTION_ADDITIONAL_PATH, BUY_EXECUTION_CYCLE_PATH}:
+            preview_value = _execution_policy_value(
+                _as_dict(
+                    _as_dict(preview_candidates.get("execution")).get(
+                        _BUY_EXECUTION_CANDIDATE_KEYS[path]
+                    )
+                )
+            )
         elif path in _SELL_METHOD_PATHS:
             preview_value = _method_policy_value(
                 _as_dict(_as_dict(_as_dict(preview_candidates.get("sell")).get("method_policy_candidates")).get(path))
@@ -3821,7 +4327,7 @@ def compare_engine_rules_preview(
             status = "changed" if current_exists else "added"
         elif path == BUY_COMPOSITE_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
-        elif path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH} and preview_exists:
+        elif path in _BUY_EXECUTION_PATHS and preview_exists:
             status = "changed" if current_exists else "added"
         elif path in _SELL_METHOD_PATHS and preview_exists:
             status = "changed" if current_exists else "added"
@@ -3852,5 +4358,6 @@ def compare_engine_rules_preview(
         "validation_warnings": list(validation_warning_list),
         "postponed": list(postponed_list),
         "legacy_notices": list(legacy_notice_list),
+        "execution_locks": list(execution_lock_list),
         "warnings": list(warning_list),
     }

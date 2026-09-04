@@ -198,7 +198,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self._build_preview()
 
         self.assertEqual(result["validation_warnings"], [])
-        self.assertEqual(len(result["postponed"]), 7)
+        self.assertEqual(
+            result["postponed"],
+            [
+                "buy method mapping is postponed",
+                "repeat buy mapping is postponed",
+                "completion policy mapping is postponed",
+            ],
+        )
         self.assertEqual(len(result["legacy_notices"]), 2)
         self.assertEqual(result["warnings"], result["validation_warnings"] + result["postponed"])
         self.assertTrue(all("legacy" not in warning.lower() for warning in result["warnings"]))
@@ -3580,6 +3587,19 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "ratio_value": 1.5,
             "ratio_compare": ">=",
             "ratio_count": 2,
+            "last_round_active_buy": {
+                "enabled": False,
+                "applies_to": "LAST_MULTI_POINT_CHILD",
+                "budget_policy_override": "NONE",
+                "purpose": "BUY_METHOD_SPECIAL_ACTION",
+                "subject": "AVERAGE_PRICE",
+                "reference": "MULTI_POINT_SET_PRICE",
+                "direction": "UP",
+                "ratio_percent": 0.45,
+                "comparator": ">=",
+            },
+            "execution_connected": True,
+            "execution_lock_reason": "",
         })
         self.assertEqual(execution["repeat"]["value"], {
             "buy_phase": "REPEAT",

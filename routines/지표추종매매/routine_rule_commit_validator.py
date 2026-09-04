@@ -167,6 +167,102 @@ def validate_committed_rules(
         add_check("buy_exit_policy_valid", valid)
         if not valid:
             add_unexpected(exit_path, "invalid BUY repeat-exit policy")
+    last_round_active_path = "buy.execution.base.last_round_active_buy"
+    if _path_exists(post_rules, last_round_active_path):
+        policy = _get_path(post_rules, last_round_active_path)
+        enabled = policy.get("enabled") if isinstance(policy, dict) else None
+        ratio = policy.get("ratio_percent") if isinstance(policy, dict) else None
+        valid = (
+            isinstance(policy, dict)
+            and isinstance(enabled, bool)
+            and policy.get("applies_to") == "LAST_MULTI_POINT_CHILD"
+            and policy.get("budget_policy_override") == "NONE"
+            and policy.get("purpose") == "BUY_METHOD_SPECIAL_ACTION"
+            and policy.get("subject") == "AVERAGE_PRICE"
+            and policy.get("reference") == "MULTI_POINT_SET_PRICE"
+            and policy.get("direction") in {"UP", "DOWN", "BOTH"}
+            and isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
+            and isfinite(ratio) and ratio >= 0
+            and policy.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+        )
+        add_check("buy_last_round_active_policy_valid", valid)
+        add_check("buy_last_round_active_execution_connected", valid)
+        if not valid:
+            add_unexpected(last_round_active_path, "invalid BUY last-round active policy")
+
+    additional_path = "buy.execution.additional"
+    if _path_exists(post_rules, additional_path):
+        policy = _get_path(post_rules, additional_path)
+        price = policy.get("previous_round_price_skip") if isinstance(policy, dict) else None
+        last = policy.get("last_plus_one") if isinstance(policy, dict) else None
+        price_enabled = price.get("enabled") if isinstance(price, dict) else None
+        last_enabled = last.get("enabled") if isinstance(last, dict) else None
+        price_ratio = price.get("ratio_percent") if isinstance(price, dict) else None
+        active = last.get("active_condition") if isinstance(last, dict) else None
+        active_ratio = active.get("ratio_percent") if isinstance(active, dict) else None
+        valid = (
+            isinstance(policy, dict)
+            and isinstance(price, dict)
+            and isinstance(last, dict)
+            and isinstance(price_enabled, bool)
+            and isinstance(last_enabled, bool)
+            and price.get("reference_source") == "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
+            and price.get("current_source") == "ACTIONABLE_ORDER_PRICE"
+            and price.get("action") == "SKIP_CURRENT_GENERATION"
+            and price.get("skipped_round_increment") is False
+            and last.get("generation_kind") == "LAST_PLUS_ONE"
+            and last.get("trigger") == "AFTER_NORMAL_MAX_ROUND_COMPLETED"
+            and last.get("max_occurrences") == 1
+            and last.get("method") in {"MARKET", "CURRENT_PRICE", "ACTIVE"}
+            and last.get("budget_basis") == "LAST_NORMAL_ROUND_APPROVED_BUDGET"
+            and last.get("terminal_after_completed_fill") is True
+            and price.get("direction") in {"UP", "DOWN", "BOTH"}
+            and isinstance(price_ratio, (int, float)) and not isinstance(price_ratio, bool)
+            and isfinite(price_ratio) and price_ratio >= 0
+            and price.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+            and isinstance(active, dict)
+            and active.get("direction") in {"UP", "DOWN", "BOTH"}
+            and isinstance(active_ratio, (int, float)) and not isinstance(active_ratio, bool)
+            and isfinite(active_ratio) and active_ratio >= 0
+            and active.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+        )
+        execution_connected = policy.get("execution_connected") is True
+        add_check("buy_additional_policy_valid", valid)
+        add_check("buy_additional_execution_connected", execution_connected)
+        if not valid:
+            add_unexpected(additional_path, "invalid BUY additional policy")
+        if not execution_connected:
+            add_unexpected(additional_path, "BUY additional execution consumer is not connected")
+
+    cycle_path = "buy.execution.cycle"
+    if _path_exists(post_rules, cycle_path):
+        policy = _get_path(post_rules, cycle_path)
+        situation = policy.get("situation_response") if isinstance(policy, dict) else None
+        unsupported_cancel_batch = (
+            isinstance(situation, dict)
+            and situation.get("mode") == "PRICE_COMPARE"
+            and situation.get("action") == "CANCEL_BATCH"
+        )
+        connected = policy.get("execution_connected") is True if isinstance(policy, dict) else False
+        valid = (
+            isinstance(policy, dict)
+            and policy.get("scope") == "SIGNAL_SCOPED_BUY_CYCLE"
+            and policy.get("requires_source_signal") is True
+            and policy.get("autonomous_scheduler") is False
+            and policy.get("after_cycle_completion") == "REQUIRE_NEW_BUY_SIGNAL"
+            and isinstance(policy.get("order_policy"), dict)
+            and isinstance(policy.get("point_policy"), dict)
+            and isinstance(situation, dict)
+            and connected
+            and not unsupported_cancel_batch
+            and policy.get("execution_lock_reason") in {"", None}
+        )
+        add_check("buy_cycle_policy_valid", valid)
+        add_check("buy_cycle_execution_connected", connected and not unsupported_cancel_batch)
+        if not valid:
+            add_unexpected(cycle_path, "invalid BUY cycle policy")
+        if unsupported_cancel_batch or not connected:
+            add_unexpected(cycle_path, "CYCLE_OPTION_EXECUTION_NOT_CONNECTED")
     if _path_exists(post_rules, "sell.method.selected_sets"):
         selected_sets = _get_path(post_rules, "sell.method.selected_sets")
         selected_sets_valid = (
@@ -324,6 +420,22 @@ def validate_committed_rules(
         and diff.get("path") == "buy.execution.repeat"
         and isinstance(diff.get("value"), dict)
     ]
+    allowed_buy_execution_additional_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_execution_policy"
+        and diff.get("path") == "buy.execution.additional"
+        and isinstance(diff.get("value"), dict)
+    ]
+    allowed_buy_execution_cycle_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_execution_policy"
+        and diff.get("path") == "buy.execution.cycle"
+        and isinstance(diff.get("value"), dict)
+    ]
     allowed_sell_method_paths = {
         "sell.method.selected_sets",
         "sell.method.setting_a",
@@ -436,6 +548,16 @@ def validate_committed_rules(
             elif path == "buy.execution.repeat":
                 add_check(
                     "final_diff_buy_execution_repeat_matches",
+                    _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
+                )
+            elif path == "buy.execution.additional":
+                add_check(
+                    "final_diff_buy_execution_additional_matches",
+                    _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
+                )
+            elif path == "buy.execution.cycle":
+                add_check(
+                    "final_diff_buy_execution_cycle_matches",
                     _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
                 )
             else:
@@ -651,8 +773,27 @@ def validate_committed_rules(
             _get_path(post_normalized, "buy.execution").pop("repeat", None)
             if _get_path(post_normalized, "buy.execution") == {} and not _path_exists(pre_normalized, "buy.execution"):
                 _get_path(post_normalized, "buy").pop("execution", None)
+    for allowed_diffs, execution_key in (
+        (allowed_buy_execution_additional_diffs, "additional"),
+        (allowed_buy_execution_cycle_diffs, "cycle"),
+    ):
+        path = f"buy.execution.{execution_key}"
+        if allowed_diffs and _path_exists(post_normalized, path):
+            if _path_exists(pre_normalized, path):
+                _get_path(post_normalized, "buy.execution")[execution_key] = deepcopy(
+                    _get_path(pre_normalized, path)
+                )
+            elif _path_exists(post_normalized, "buy.execution"):
+                _get_path(post_normalized, "buy.execution").pop(execution_key, None)
+                if _get_path(post_normalized, "buy.execution") == {} and not _path_exists(pre_normalized, "buy.execution"):
+                    _get_path(post_normalized, "buy").pop("execution", None)
     if (
-        (allowed_buy_execution_base_diffs or allowed_buy_execution_repeat_diffs)
+        (
+            allowed_buy_execution_base_diffs
+            or allowed_buy_execution_repeat_diffs
+            or allowed_buy_execution_additional_diffs
+            or allowed_buy_execution_cycle_diffs
+        )
         and _path_exists(pre_normalized, "buy.execution")
         and not isinstance(_get_path(pre_normalized, "buy.execution"), dict)
     ):
