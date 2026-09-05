@@ -495,6 +495,8 @@ def enqueue_routine_signal(
             value = result.get(field)
             if value not in (None, ""):
                 record[field] = value
+        if isinstance(result.get("signal_runtime_policy"), dict):
+            record["signal_runtime_policy"] = deepcopy(result["signal_runtime_policy"])
         for field in (
             "signal_bar_time",
             "signal_bar_close",

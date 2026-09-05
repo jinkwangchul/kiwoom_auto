@@ -451,7 +451,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addWidget(self.buy_price_compare_detail_row_widget)
 
         self.buy_price_compare_left_label = make_label("평단가", 48)
-        self.buy_price_compare_condition_combo = make_combo(["=<", "<"], "=<", 54)
+        self.buy_price_compare_condition_combo = make_combo(["<="], "<=", 54)
         self.buy_price_compare_right_label = make_label("주문가", 48)
         self.buy_price_compare_mode_combo = make_combo(
             ["회차기준", "예산기준"], "회차기준", 116, ModeSwitchComboBox
@@ -499,7 +499,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addWidget(self.buy_price_compare_above_row_widget)
 
         self.buy_price_compare_above_left_label = make_label("평단가", 48)
-        self.buy_price_compare_above_condition_combo = make_combo([">", ">="], ">", 54)
+        self.buy_price_compare_above_condition_combo = make_combo([">"], ">", 54)
         self.buy_price_compare_above_right_label = make_label("주문가", 48)
         self.buy_price_compare_above_mode_combo = make_combo(
             ["회차기준", "예산기준", "능동매수"], "회차기준", 116, ModeSwitchComboBox
@@ -630,27 +630,8 @@ class IndicatorFollowBuyMethodControlsMixin:
                 return
             boundary_syncing["active"] = True
             try:
-                top_value = price_condition_combo.currentText().strip()
-                bottom_value = price_above_condition_combo.currentText().strip()
-
-                if source == "top":
-                    if top_value == "=<":
-                        set_combo_items_preserving(price_above_condition_combo, [">"], ">")
-                    else:
-                        set_combo_items_preserving(price_above_condition_combo, [">", ">="], bottom_value if bottom_value in [">", ">="] else ">")
-                elif source == "bottom":
-                    if bottom_value == ">=":
-                        set_combo_items_preserving(price_condition_combo, ["<"], "<")
-                    else:
-                        set_combo_items_preserving(price_condition_combo, ["=<", "<"], top_value if top_value in ["=<", "<"] else "=<")
-                else:
-                    if top_value == "=<":
-                        set_combo_items_preserving(price_above_condition_combo, [">"], ">")
-                    elif bottom_value == ">=":
-                        set_combo_items_preserving(price_condition_combo, ["<"], "<")
-                    else:
-                        set_combo_items_preserving(price_condition_combo, ["=<", "<"], top_value if top_value in ["=<", "<"] else "=<")
-                        set_combo_items_preserving(price_above_condition_combo, [">", ">="], bottom_value if bottom_value in [">", ">="] else ">")
+                set_combo_items_preserving(price_condition_combo, ["<="], "<=")
+                set_combo_items_preserving(price_above_condition_combo, [">"], ">")
             finally:
                 boundary_syncing["active"] = False
 

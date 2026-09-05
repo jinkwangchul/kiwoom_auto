@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from engines.condition_engine import evaluate_condition, evaluate_groups_or
+from engines.condition_engine import (
+    evaluate_condition,
+    evaluate_condition_expression,
+    evaluate_groups_or,
+)
 from engines.indicator_engine import build_indicator_series, close_prices, rsi
 from engines.signal_result import RoutineSignal, signal_to_dict
 
@@ -1061,6 +1065,60 @@ def _evaluate_buy_composite_filter(
             group_results=[],
         )
 
+    expression = composite_cfg.get("expression")
+    if isinstance(expression, dict):
+        identifier_map = expression.get("identifier_map")
+        expression_ast = expression.get("ast")
+        identifiers = expression.get("identifiers")
+        if not isinstance(identifier_map, dict) or not isinstance(identifiers, list):
+            return False, _composite_detail(
+                enabled=True,
+                logic="EXPRESSION",
+                passed=False,
+                reason="invalid_expression_contract",
+                referenced_filters=[],
+                unreferenced_required_filters=[],
+                group_results=[],
+            )
+        values: dict[str, bool] = {}
+        referenced_filters: list[str] = []
+        for raw_identifier in identifiers:
+            identifier = str(raw_identifier or "").strip().upper()
+            filter_name = str(identifier_map.get(identifier) or "").strip().lower()
+            result = filter_results.get(filter_name)
+            if (
+                not filter_name
+                or not isinstance(result, dict)
+                or not result.get("configured", False)
+                or not result.get("enabled", False)
+            ):
+                return False, _composite_detail(
+                    enabled=True,
+                    logic="EXPRESSION",
+                    passed=False,
+                    reason=f"expression_filter_unavailable:{identifier}",
+                    referenced_filters=referenced_filters,
+                    unreferenced_required_filters=[],
+                    group_results=[],
+                )
+            values[identifier] = bool(result.get("passed", False))
+            if filter_name not in referenced_filters:
+                referenced_filters.append(filter_name)
+        evaluated = evaluate_condition_expression(
+            expression_ast,
+            values,
+        )
+        passed = bool(evaluated.get("passed")) if evaluated.get("ok") else False
+        return passed, _composite_detail(
+            enabled=True,
+            logic="EXPRESSION",
+            passed=passed,
+            reason="expression_evaluated" if evaluated.get("ok") else str(evaluated.get("reason")),
+            referenced_filters=referenced_filters,
+            unreferenced_required_filters=[],
+            group_results=[f"{key}:{'PASS' if value else 'FAIL'}" for key, value in values.items()],
+        )
+
     top_logic = _composite_logic(composite_cfg.get("logic", "AND"))
     if top_logic is None:
         return False, _composite_detail(
@@ -1436,15 +1494,63 @@ def evaluate_indicator_follow_routine(
     if isinstance(profit_rate_sell_cfg, dict) and profit_rate_sell_cfg.get("enabled", False):
         active_sell_names.append("profit_rate_sell")
 
+    ui_signal_names = {"ui_condition_a", "ui_condition_b", "ui_condition_c"}
+    active_ui_signal_names = [name for name in active_sell_names if name in ui_signal_names]
+    aggregation_sell_names = list(active_sell_names)
+    ui_expression_passed: bool | None = None
+    if active_ui_signal_names:
+        expression_contracts = [
+            condition_sell_signals[name].get("signal_expression")
+            for name in active_ui_signal_names
+            if isinstance(condition_sell_signals.get(name), dict)
+        ]
+        expression_contracts = [value for value in expression_contracts if isinstance(value, dict)]
+        if expression_contracts:
+            canonical_expression = expression_contracts[0]
+            if any(value != canonical_expression for value in expression_contracts[1:]):
+                ui_expression_passed = False
+            else:
+                identifier_map = canonical_expression.get("identifier_map")
+                identifiers = canonical_expression.get("identifiers")
+                if isinstance(identifier_map, dict) and isinstance(identifiers, list):
+                    expression_values: dict[str, bool] = {}
+                    for raw_identifier in identifiers:
+                        identifier = str(raw_identifier or "").strip().upper()
+                        signal_name = str(identifier_map.get(identifier) or "").strip()
+                        if signal_name not in condition_sell_passed:
+                            expression_values = {}
+                            break
+                        expression_values[identifier] = bool(condition_sell_passed[signal_name])
+                    if expression_values:
+                        evaluated = evaluate_condition_expression(
+                            canonical_expression.get("ast"),
+                            expression_values,
+                            current_identity=sell_index,
+                        )
+                        ui_expression_passed = bool(evaluated.get("passed")) if evaluated.get("ok") else False
+                    else:
+                        ui_expression_passed = False
+                else:
+                    ui_expression_passed = False
+            aggregation_sell_names = [
+                name for name in aggregation_sell_names if name not in ui_signal_names
+            ]
+            aggregation_sell_names.append("ui_signal_expression")
+
     sell_logic = _logic(sell_cfg.get("signal_logic", "OR"), "OR")
-    if not active_sell_names:
+    if not aggregation_sell_names:
         sell_passed = False
     elif sell_logic == "AND":
         signal_pass_map = dict(condition_sell_passed)
         signal_pass_map["profit_rate_sell"] = profit_passed
-        sell_passed = all(signal_pass_map.get(name, False) for name in active_sell_names)
+        if ui_expression_passed is not None:
+            signal_pass_map["ui_signal_expression"] = ui_expression_passed
+        sell_passed = all(signal_pass_map.get(name, False) for name in aggregation_sell_names)
     else:
-        sell_passed = any(condition_sell_passed.get(name, False) for name in active_sell_names) or profit_passed
+        signal_pass_map = dict(condition_sell_passed)
+        if ui_expression_passed is not None:
+            signal_pass_map["ui_signal_expression"] = ui_expression_passed
+        sell_passed = any(signal_pass_map.get(name, False) for name in aggregation_sell_names) or profit_passed
 
     active_sell_group_paths = [
         f"sell.signals.{signal_name}.groups[{group_index}]"

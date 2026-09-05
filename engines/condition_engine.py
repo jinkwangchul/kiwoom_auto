@@ -36,6 +36,154 @@ class GroupResult:
     details: list[str]
 
 
+_EXPRESSION_OPERATORS = {"AND", "OR", "NOT"}
+
+
+def parse_condition_expression(
+    expression: Any,
+    *,
+    allowed_identifiers: set[str] | tuple[str, ...] | list[str],
+    allow_duplicate_identifiers: bool = True,
+    max_identifiers: int = 10,
+) -> dict[str, Any]:
+    """Parse the UI's bounded condition expression without using ``eval``.
+
+    ``NOT`` is the project's binary exclusion operator: ``A NOT B`` means
+    ``A AND (NOT B)``.  Unary NOT and the composite tokens ``AND NOT`` /
+    ``OR NOT`` are therefore rejected.  The returned AST contains only JSON
+    values so it can travel through the existing Rule approval/commit path.
+    """
+    text = str(expression or "").strip()
+    if not text:
+        return {"ok": False, "reason": "CONDITION_EXPRESSION_EMPTY"}
+
+    allowed = {str(value).strip().upper() for value in allowed_identifiers}
+    raw_tokens = text.replace("(", " ( ").replace(")", " ) ").split()
+    tokens = [token.upper() for token in raw_tokens]
+    if not tokens:
+        return {"ok": False, "reason": "CONDITION_EXPRESSION_EMPTY"}
+    for token in tokens:
+        if token not in allowed and token not in _EXPRESSION_OPERATORS and token not in {"(", ")"}:
+            return {"ok": False, "reason": f"CONDITION_EXPRESSION_TOKEN_UNSUPPORTED:{token}"}
+
+    identifier_tokens = [token for token in tokens if token in allowed]
+    if not identifier_tokens:
+        return {"ok": False, "reason": "CONDITION_EXPRESSION_IDENTIFIER_MISSING"}
+    if len(identifier_tokens) > max_identifiers:
+        return {"ok": False, "reason": "CONDITION_EXPRESSION_IDENTIFIER_LIMIT_EXCEEDED"}
+    if not allow_duplicate_identifiers and len(identifier_tokens) != len(set(identifier_tokens)):
+        return {"ok": False, "reason": "CONDITION_EXPRESSION_DUPLICATE_IDENTIFIER"}
+
+    position = 0
+
+    def parse_primary() -> dict[str, Any]:
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError("CONDITION_EXPRESSION_OPERAND_MISSING")
+        token = tokens[position]
+        if token == "(":
+            position += 1
+            node = parse_sequence()
+            if position >= len(tokens) or tokens[position] != ")":
+                raise ValueError("CONDITION_EXPRESSION_PARENTHESIS_UNBALANCED")
+            position += 1
+            return node
+        if token in allowed:
+            position += 1
+            return {"type": "identifier", "name": token}
+        raise ValueError(f"CONDITION_EXPRESSION_OPERAND_INVALID:{token}")
+
+    def parse_sequence() -> dict[str, Any]:
+        """Parse every binary operator with the UI's left-to-right contract."""
+        nonlocal position
+        node = parse_primary()
+        while position < len(tokens) and tokens[position] in _EXPRESSION_OPERATORS:
+            operator = tokens[position]
+            position += 1
+            right = parse_primary()
+            node = {"type": "binary", "operator": operator, "left": node, "right": right}
+        return node
+
+    try:
+        ast = parse_sequence()
+        if position != len(tokens):
+            raise ValueError(f"CONDITION_EXPRESSION_TRAILING_TOKEN:{tokens[position]}")
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
+
+    normalized = " ".join(tokens).replace("( ", "(").replace(" )", ")")
+    return {
+        "ok": True,
+        "reason": None,
+        "normalized": normalized,
+        "identifiers": identifier_tokens,
+        "ast": ast,
+    }
+
+
+def evaluate_condition_expression(
+    expression_ast: Any,
+    values: dict[str, Any],
+    *,
+    current_identity: Any = None,
+) -> dict[str, Any]:
+    """Evaluate a canonical expression as matched-result identity sets.
+
+    ``NOT`` is binary set subtraction.  Boolean callers remain compatible:
+    ``True`` represents the supplied current identity (or a local sentinel).
+    """
+    normalized_values = {str(key).strip().upper(): value for key, value in values.items()}
+    fallback_identity = "__CURRENT__"
+
+    def normalize_result(value: Any, name: str) -> set[Any]:
+        if isinstance(value, bool):
+            return {(current_identity if current_identity is not None else fallback_identity)} if value else set()
+        if isinstance(value, (set, frozenset, list, tuple)) and not isinstance(value, (str, bytes)):
+            try:
+                return set(value)
+            except TypeError as exc:
+                raise ValueError(f"CONDITION_EXPRESSION_VALUE_INVALID:{name}") from exc
+        raise ValueError(f"CONDITION_EXPRESSION_VALUE_INVALID:{name}")
+
+    def evaluate_node(node: Any) -> set[Any]:
+        if not isinstance(node, dict):
+            raise ValueError("CONDITION_EXPRESSION_AST_INVALID")
+        node_type = str(node.get("type") or "").strip().lower()
+        if node_type == "identifier":
+            name = str(node.get("name") or "").strip().upper()
+            if name not in normalized_values:
+                raise ValueError(f"CONDITION_EXPRESSION_VALUE_MISSING:{name}")
+            return normalize_result(normalized_values[name], name)
+        if node_type != "binary":
+            raise ValueError("CONDITION_EXPRESSION_AST_NODE_UNSUPPORTED")
+        operator = str(node.get("operator") or "").strip().upper()
+        if operator not in _EXPRESSION_OPERATORS:
+            raise ValueError(f"CONDITION_EXPRESSION_OPERATOR_UNSUPPORTED:{operator}")
+        left = evaluate_node(node.get("left"))
+        right = evaluate_node(node.get("right"))
+        if operator == "AND":
+            return left & right
+        if operator == "OR":
+            return left | right
+        return left - right
+
+    try:
+        matched = evaluate_node(expression_ast)
+        passed = (
+            current_identity in matched
+            if current_identity is not None
+            else bool(matched)
+        )
+        return {
+            "ok": True,
+            "passed": passed,
+            "matched_identities": sorted(matched, key=lambda value: (type(value).__name__, repr(value))),
+            "reason": None,
+        }
+    except ValueError as exc:
+        return {"ok": False, "passed": False, "matched_identities": [], "reason": str(exc)}
+
+
 def normalize_market_snapshot(market_snapshot: dict[str, Any]) -> dict[str, Any]:
     """Return the read-only standard market snapshot shape used by probes."""
     candles_source = None
@@ -124,8 +272,6 @@ def _series_key(condition: dict[str, Any], target_key: str = "target") -> str:
 def _value_at(series: list[float | None] | None, index: int) -> float | None:
     if not series:
         return None
-    if index < 0:
-        index = len(series) + index
     if index < 0 or index >= len(series):
         return None
     return series[index]
@@ -246,19 +392,27 @@ def evaluate_condition(
         )
         return ConditionResult(True, "비활성 조건 통과 처리")
 
+    try:
+        bar_offset = int(condition.get("bar_offset", 0))
+    except (TypeError, ValueError):
+        bar_offset = -1
+    if bar_offset < 0:
+        return ConditionResult(False, "bar_offset must be a non-negative integer")
     target_key = _series_key(condition)
     operator = _norm(condition.get("operator"))
     use_not = bool(condition.get("not", False))
     series = series_map.get(target_key)
+    base_index = (len(series) + index) if series and index < 0 else index
+    effective_index = base_index - bar_offset
 
-    current = _value_at(series, index)
-    prev = _value_at(series, index - 1)
-    prev2 = _value_at(series, index - 2)
+    current = _value_at(series, effective_index)
+    prev = _value_at(series, effective_index - 1)
+    prev2 = _value_at(series, effective_index - 2)
 
     passed = False
     detail = f"{target_key} {operator}"
     right_operand = _operand("none", "none", None, None, "operator has no right operand")
-    snapshots = [_indicator_snapshot(target_key, index, series, _series_period(condition, target_key))]
+    snapshots = [_indicator_snapshot(target_key, effective_index, series, _series_period(condition, target_key))]
 
     if operator == "TURN_UP":
         passed = (
@@ -283,13 +437,13 @@ def evaluate_condition(
     elif operator in {"CROSS_UP", "CROSS_DOWN"}:
         compare_target = _series_key(condition, "compare_target")
         compare_series = series_map.get(compare_target)
-        compare_current = _value_at(compare_series, index)
-        compare_prev = _value_at(compare_series, index - 1)
-        right_operand = _operand("indicator", compare_target, index, compare_current)
+        compare_current = _value_at(compare_series, effective_index)
+        compare_prev = _value_at(compare_series, effective_index - 1)
+        right_operand = _operand("indicator", compare_target, effective_index, compare_current)
         snapshots.append(
             _indicator_snapshot(
                 compare_target,
-                index,
+                effective_index,
                 compare_series,
                 _series_period(condition, compare_target, compare=True),
             )
@@ -306,12 +460,37 @@ def evaluate_condition(
                 passed = prev <= 0 and current > 0
             else:
                 passed = prev >= 0 and current < 0
+    elif operator == "PERCENT_GAP":
+        compare_key = _series_key(condition, "compare_target")
+        compare_value = _value_at(series_map.get(compare_key), effective_index)
+        percent = _safe_float(condition.get("value"))
+        direction = _norm(condition.get("direction"))
+        compare_mode = _norm(condition.get("compare_mode"))
+        right_operand = _operand("indicator", compare_key, effective_index, compare_value)
+        snapshots.append(
+            _indicator_snapshot(
+                compare_key,
+                effective_index,
+                series_map.get(compare_key),
+                _series_period(condition, compare_key, compare=True),
+            )
+        )
+        if current is not None and compare_value is not None and compare_value > 0 and percent is not None and percent >= 0:
+            lower = compare_value * (1 - percent / 100.0)
+            upper = compare_value * (1 + percent / 100.0)
+            if direction == "UP":
+                passed = current >= upper if compare_mode == "GTE" else current <= upper if compare_mode == "LTE" else False
+            elif direction == "DOWN":
+                passed = current >= lower if compare_mode == "GTE" else current <= lower if compare_mode == "LTE" else False
+            elif direction == "BOTH":
+                passed = lower <= current <= upper if compare_mode == "WITHIN" else (current < lower or current > upper) if compare_mode == "OUTSIDE" else False
+        detail = f"{target_key} PERCENT_GAP {compare_key} {direction} {compare_mode} {percent}%"
     elif operator in {">", ">=", "<", "<=", "=", "==", "GT", "GTE", "LT", "LTE", "EQ", "ABOVE", "BELOW"}:
         right_value = _safe_float(condition.get("value"))
         compare_target = condition.get("compare_target")
         if compare_target:
             compare_key = _series_key(condition, "compare_target")
-            right_value = _value_at(series_map.get(compare_key), index)
+            right_value = _value_at(series_map.get(compare_key), effective_index)
             offset_percent = _safe_float(condition.get("value"))
             right_value = _apply_percent_offset(right_value, operator, offset_percent)
             detail = (
@@ -319,11 +498,11 @@ def evaluate_condition(
                 if offset_percent is None
                 else f"{target_key} {operator} {compare_key} offset {offset_percent}%"
             )
-            right_operand = _operand("indicator", compare_key, index, right_value)
+            right_operand = _operand("indicator", compare_key, effective_index, right_value)
             snapshots.append(
                 _indicator_snapshot(
                     compare_key,
-                    index,
+                    effective_index,
                     series_map.get(compare_key),
                     _series_period(condition, compare_key, compare=True),
                 )
@@ -343,7 +522,7 @@ def evaluate_condition(
                 "condition_type": str(condition.get("type") or target_key),
                 "operator": operator or "UNSUPPORTED",
                 "negated": use_not,
-                "left_operand": _operand("indicator", target_key, index, current),
+                "left_operand": _operand("indicator", target_key, effective_index, current),
                 "right_operand": right_operand,
                 "raw_result": False,
                 "final_result": False,
@@ -365,7 +544,7 @@ def evaluate_condition(
             "condition_type": str(condition.get("type") or target_key),
             "operator": operator,
             "negated": use_not,
-            "left_operand": _operand("indicator", target_key, index, current),
+            "left_operand": _operand("indicator", target_key, effective_index, current),
             "right_operand": right_operand,
             "raw_result": raw_passed,
             "final_result": passed,
@@ -412,6 +591,7 @@ def evaluate_group(
     logic = _logic(group.get("conditions_logic", group.get("logic", "AND")), "AND")
     all_passed = True
     any_passed = False
+    expression_values: dict[str, bool] = {}
     condition_paths: list[str] = []
     for condition_index, condition in enumerate(conditions):
         if not isinstance(condition, dict):
@@ -427,7 +607,28 @@ def evaluate_group(
         else:
             any_passed = True
 
-    passed = any_passed if logic == "OR" else all_passed
+        expression_id = str(condition.get("expression_id") or f"C{condition_index}").strip().upper()
+        if expression_id in expression_values:
+            all_passed = False
+            details.append(f"FAIL duplicate expression_id: {expression_id}")
+        else:
+            expression_values[expression_id] = result.passed
+
+    expression_ast = group.get("condition_expression")
+    if expression_ast is not None:
+        representative_length = max((len(series) for series in series_map.values() if isinstance(series, list)), default=0)
+        current_identity = representative_length + index if index < 0 else index
+        expression_result = evaluate_condition_expression(
+            expression_ast,
+            expression_values,
+            current_identity=current_identity,
+        )
+        passed = bool(expression_result.get("passed")) if expression_result.get("ok") else False
+        if not expression_result.get("ok"):
+            details.append(f"FAIL {expression_result.get('reason')}")
+        logic = "EXPRESSION"
+    else:
+        passed = any_passed if logic == "OR" else all_passed
     _notify_observer(observer, "observe_group", {
         "path": group_path,
         "group_name": group_name,

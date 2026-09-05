@@ -1161,7 +1161,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])
 
-    def test_sell_signal_added_disabled_and_macd_sell_unchanged(self):
+    def test_approved_sell_signal_added_executable_and_macd_sell_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             session_path = Path(temp_dir) / "approval_session.json"
@@ -1183,10 +1183,39 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertIn("ui_condition_c", signals)
-            self.assertFalse(signals["ui_condition_c"]["enabled"])
+            self.assertTrue(signals["ui_condition_c"]["enabled"])
             self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
 
-    def test_sell_condition_b_signal_added_disabled_and_macd_sell_unchanged(self):
+    def test_signal_runtime_policy_commits_through_canonical_apply_boundary(self):
+        self.ui_state["basic"]["basic_duplicate_signal_combo"] = "선행신호 우선"
+        self.ui_state["basic"]["basic_error_policy_combo"] = "매매지속"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            session_path = Path(temp_dir) / "approval_session.json"
+            self._write_rules(rules_path, self.current_rules)
+            apply_preview, gate, context = self._build_apply_and_gate(
+                rules_path,
+                session_path,
+                {"signal_runtime_policy": "APPROVED"},
+            )
+
+            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                gate,
+                context,
+            )
+            saved = json.loads(rules_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(saved["signal_runtime_policy"], {
+                "duplicate_priority": "LEADING",
+                "error_policy": "CONTINUE_NEXT_CYCLE",
+                "normal_duplicate_cancel_is_error": False,
+            })
+            self.assertTrue(result["post_validation"]["ok"], result["post_validation"])
+
+    def test_approved_sell_condition_b_signal_added_executable_and_macd_sell_unchanged(self):
         self.ui_state["sell_ui"]["signal_conditions"]["condition_b"] = {
             "bollinger_check": True,
             "bollinger_direction_combo": "상향",
@@ -1215,7 +1244,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertIn("ui_condition_b", signals)
-            self.assertFalse(signals["ui_condition_b"]["enabled"])
+            self.assertTrue(signals["ui_condition_b"]["enabled"])
             self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
 
     def test_buy_and_sell_allowed_changes_pass_deep_compare(self):

@@ -195,6 +195,7 @@ def _repeat_budget(
     repeat_rule: dict[str, Any],
     budget_context: dict[str, Any],
     current_price: float | None,
+    confirmed_round: int | None = None,
 ) -> tuple[float | None, int | None, str | None, dict[str, Any], list[str]]:
     detail_mode = str(repeat_rule.get("detail_mode") or "").strip().upper()
     operator = str(repeat_rule.get("round_operator") or "").strip().upper()
@@ -205,6 +206,7 @@ def _repeat_budget(
         "round_operator": operator,
         "base_buy_budget": base_budget,
         "previous_buy_budget": previous_budget,
+        "confirmed_previous_buy_round": confirmed_round,
         "current_price": current_price,
     }
     if detail_mode not in SUPPORTED_DETAIL_MODES:
@@ -226,9 +228,6 @@ def _repeat_budget(
         return None, None, None, evidence, ["ACTIVE_BUY_NOT_IMPLEMENTED"]
     if current_price is None:
         return None, None, None, evidence, ["CURRENT_PRICE_VALUE_MISSING"]
-    if previous_budget is None:
-        return None, None, None, evidence, ["PREVIOUS_BUY_BUDGET_NOT_POSITIVE"]
-
     budget: float | None = None
     reference: str | None = None
     if detail_mode == "ROUND":
@@ -238,17 +237,21 @@ def _repeat_budget(
             return None, None, None, evidence, ["BASE_BUY_BUDGET_NOT_POSITIVE"]
         if factor is None:
             return None, None, None, evidence, ["ROUND_BUDGET_FACTOR_NOT_POSITIVE"]
+        if not isinstance(confirmed_round, int) or isinstance(confirmed_round, bool) or confirmed_round <= 0:
+            return None, None, None, evidence, ["CONFIRMED_PREVIOUS_BUY_ROUND_INVALID"]
         if operator == "ADD":
-            budget = previous_budget + (base_budget * factor)
-            reference = "PREVIOUS_PLUS_BASE"
+            budget = (confirmed_round + factor) * base_budget
+            reference = "CONFIRMED_ROUND_PLUS_VALUE_X_STARTING_BUDGET"
         elif operator == "MULTIPLY":
-            budget = base_budget * factor
-            reference = "BASE_BUDGET"
+            budget = (confirmed_round * factor) * base_budget
+            reference = "CONFIRMED_ROUND_X_VALUE_X_STARTING_BUDGET"
         else:
             return None, None, None, evidence, ["INVALID_ROUND_OPERATOR"]
     elif detail_mode == "BUDGET":
         factor = _positive_float(repeat_rule.get("budget_ratio"))
         evidence["previous_budget_factor"] = factor
+        if previous_budget is None:
+            return None, None, None, evidence, ["PREVIOUS_BUY_BUDGET_NOT_POSITIVE"]
         if factor is None:
             return None, None, None, evidence, ["BUDGET_FACTOR_NOT_POSITIVE"]
         budget = previous_budget * factor
@@ -456,7 +459,7 @@ def evaluate_buy_execution_policy(
         )
     else:
         round_budget, quantity, budget_reference, budget_evidence, budget_issues = _repeat_budget(
-            repeat_rule, budget, current_price
+            repeat_rule, budget, current_price, confirmed_round
         )
     issues.extend(budget_issues)
 

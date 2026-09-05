@@ -37,6 +37,7 @@ from execution_universe import (
     project_execution_universe,
 )
 from event_journal_production import (
+    append_production_event,
     observe_owner_failure_transition,
     observe_production_exception,
 )
@@ -326,6 +327,78 @@ def _signal_marker_snapshot(
     return marker
 
 
+def apply_signal_runtime_error_policy(
+    result: dict[str, Any],
+    runtime_policy: dict[str, Any] | None,
+    *,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    routine_name: str,
+    tick_key: str,
+    event_appender: Callable[..., Any] = append_production_event,
+    review_marker: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Apply an explicitly committed signal error policy at the probe boundary.
+
+    Absence of the new policy preserves the legacy probe behavior.  This keeps
+    the policy additive and prevents an Indicator Follow default from changing
+    unrelated routine types.
+    """
+    if not isinstance(runtime_policy, dict):
+        return result
+    if "signal" not in result:
+        result["signal"] = "ERROR"
+        result.setdefault("reason", "routine result omitted BUY/SELL signal field")
+    if str(result.get("signal") or "").strip().upper() != "ERROR":
+        return result
+
+    policy = str(runtime_policy.get("error_policy") or "STOP_AND_REVIEW").strip().upper()
+    if policy not in {"STOP_AND_REVIEW", "CONTINUE_NEXT_CYCLE"}:
+        policy = "STOP_AND_REVIEW"
+    reason_code = "INDICATOR_FOLLOW_ABNORMAL_SIGNAL_FLOW"
+    event_result = event_appender(
+        "PROCESSING_ERROR",
+        severity="ERROR",
+        result="FAILED",
+        source="routine_signal_probe.probe_routine_for_stock",
+        template_args={"target": name or code},
+        target_type="STOCK",
+        target_id=code,
+        target_name=name or code,
+        stock_code=code,
+        stock_name=name,
+        routine=routine_name,
+        reason_code=reason_code,
+        component="routine_signal_probe",
+        operation="evaluate_indicator_follow",
+        details={"error_policy": policy, "reason": result.get("reason")},
+    )
+    result["error_policy_event"] = event_result
+    result["error_policy_action"] = policy
+    if policy == "STOP_AND_REVIEW":
+        review_payload = {
+            "review_reasons": [reason_code],
+            "review_location": "INDICATOR_FOLLOW_ERROR_POLICY",
+            "routine": routine_name,
+            "detail": result.get("reason"),
+        }
+        if callable(review_marker):
+            try:
+                result["error_policy_review_created"] = bool(
+                    review_marker(stock_dir, code, name, review_payload, source="INDICATOR_FOLLOW_ERROR_POLICY")
+                )
+            except Exception:
+                result["error_policy_review_created"] = False
+    else:
+        result["cycle_failure_evidence"] = {
+            "reason_code": reason_code,
+            "action": "SKIP_ABNORMAL_FLOW_CONTINUE_NEXT_CYCLE",
+            "tick_key": tick_key,
+        }
+    return result
+
+
 def probe_routine_for_stock(
     routine_module: Any,
     routine_name: str,
@@ -336,12 +409,14 @@ def probe_routine_for_stock(
     trigger_provenance: dict[str, Any] | None = None,
     account_budget_context: dict[str, Any] | None = None,
     actionable_price_reader: Callable[[str, str], Any] | None = None,
+    review_marker: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
     state = _read_json_dict(stock_dir / "state.json")
     stock_config = _read_json_dict(stock_dir / "config.json")
     routine_instance_id = str(stock_config.get("assigned_routine_instance_id") or "").strip()
     routine_type = str(getattr(routine_module, "ROUTINE_TYPE", "") or "").strip()
+    instance_rules: dict[str, Any] | None = None
 
     queue_result = None
     trace_observer = (
@@ -634,6 +709,20 @@ def probe_routine_for_stock(
                     except Exception:
                         pass
 
+    runtime_policy = instance_rules.get("signal_runtime_policy") if isinstance(instance_rules, dict) else None
+    if isinstance(runtime_policy, dict):
+        result["signal_runtime_policy"] = dict(runtime_policy)
+    result = apply_signal_runtime_error_policy(
+        result,
+        runtime_policy,
+        stock_dir=stock_dir,
+        code=code,
+        name=name,
+        routine_name=routine_name,
+        tick_key=tick_key,
+        review_marker=review_marker,
+    )
+
     queue_text = ""
     if isinstance(queue_result, dict):
         queue_text = f" queue={queue_result.get('status')}"
@@ -724,6 +813,7 @@ def probe_selected_routine_once(
                 stock_code,
             )
         )
+        probe_kwargs["review_marker"] = getattr(window, "mark_review_required", None)
         result = probe_routine_for_stock(
             routine_module,
             routine_name,
@@ -956,6 +1046,7 @@ def probe_execution_stock_for_committed_bar(
             stock_code,
         )
     )
+    probe_kwargs["review_marker"] = getattr(window, "mark_review_required", None)
     return probe_routine_for_stock(
         routine_module,
         routine_name,

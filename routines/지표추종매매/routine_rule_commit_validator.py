@@ -348,6 +348,14 @@ def validate_committed_rules(
         and diff.get("operation") == "set_value"
         and diff.get("path") == "bar.bar_minutes"
     ]
+    allowed_signal_runtime_policy_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_signal_runtime_policy"
+        and diff.get("path") == "signal_runtime_policy"
+        and isinstance(diff.get("value"), dict)
+    ]
     allowed_rsi_indicator_diffs = [
         diff
         for diff in final_diff
@@ -497,6 +505,14 @@ def validate_committed_rules(
                     "final_diff_rsi_indicator_matches",
                     _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
                 )
+        if operation == "set_signal_runtime_policy":
+            path = str(diff.get("path") or "")
+            add_check(
+                "final_diff_signal_runtime_policy_matches",
+                path == "signal_runtime_policy"
+                and _path_exists(post_rules, path)
+                and _get_path(post_rules, path) == diff.get("value"),
+            )
         if operation == "set_filter":
             path = str(diff.get("path") or "")
             if path == "buy.filters.moving_average":
@@ -569,8 +585,8 @@ def validate_committed_rules(
             signal = _get_path(post_rules, path) if signal_exists else None
             add_check("final_diff_sell_signal_exists", signal_exists)
             add_check(
-                "final_diff_sell_signal_disabled",
-                isinstance(signal, dict) and signal.get("enabled") is False,
+                "final_diff_sell_signal_executable",
+                isinstance(signal, dict) and signal.get("enabled") is True,
             )
             add_check("final_diff_sell_macd_preserved", _path_exists(post_rules, "sell.signals.macd_sell"))
         if operation == "set_signal":
@@ -683,12 +699,12 @@ def validate_committed_rules(
             if not isinstance(signal, dict):
                 add_unexpected(allowed_sell_signal_path, "final_diff sell signal missing from post rules")
             else:
-                enabled_false = signal.get("enabled") is False
+                enabled_true = signal.get("enabled") is True
                 no_preview_candidate = "preview_candidate" not in signal
-                add_check(f"allowed_sell_signal_disabled:{allowed_sell_signal_key}", enabled_false)
+                add_check(f"allowed_sell_signal_executable:{allowed_sell_signal_key}", enabled_true)
                 add_check(f"allowed_sell_signal_not_preview_candidate:{allowed_sell_signal_key}", no_preview_candidate)
-                if not enabled_false:
-                    add_unexpected(allowed_sell_signal_path, "allowed sell signal is not disabled")
+                if not enabled_true:
+                    add_unexpected(allowed_sell_signal_path, "allowed sell signal is not executable")
                 if not no_preview_candidate:
                     add_unexpected(allowed_sell_signal_path, "allowed sell signal contains preview_candidate")
     else:
@@ -699,6 +715,11 @@ def validate_committed_rules(
     post_normalized = deepcopy(post_rules)
     if allowed_bar_minutes_diffs and _path_exists(pre_normalized, "bar.bar_minutes") and _path_exists(post_normalized, "bar.bar_minutes"):
         _get_path(post_normalized, "bar")["bar_minutes"] = deepcopy(_get_path(pre_normalized, "bar.bar_minutes"))
+    if allowed_signal_runtime_policy_diffs and _path_exists(post_normalized, "signal_runtime_policy"):
+        if _path_exists(pre_normalized, "signal_runtime_policy"):
+            post_normalized["signal_runtime_policy"] = deepcopy(pre_normalized["signal_runtime_policy"])
+        else:
+            post_normalized.pop("signal_runtime_policy", None)
     if allowed_rsi_indicator_diffs and _path_exists(pre_normalized, "indicators.rsi") and _path_exists(post_normalized, "indicators.rsi"):
         _get_path(post_normalized, "indicators")["rsi"] = deepcopy(_get_path(pre_normalized, "indicators.rsi"))
     if allowed_buy_ma_filter_diffs and _path_exists(post_normalized, "buy.filters.moving_average"):

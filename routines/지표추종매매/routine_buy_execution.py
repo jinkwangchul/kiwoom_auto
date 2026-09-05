@@ -831,6 +831,70 @@ def _configured_order_price_basis(rules: dict[str, Any]) -> str:
     return str(base.get("order_price_basis") or "").strip().upper()
 
 
+def _buy_price_compare_branch_planning_rules(
+    *,
+    rules: dict[str, Any],
+    confirmed_round: int,
+    average_price: Any,
+    actionable_order_price: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
+    """Apply an approved price-compare branch to the existing repeat budget policy."""
+    if confirmed_round <= 0:
+        return rules, None, ""
+    price_compare = _as_dict(_as_dict(_as_dict(rules.get("buy")).get("filters")).get("price_compare"))
+    conditions = price_compare.get("conditions")
+    branch_conditions = [
+        condition for condition in conditions or []
+        if isinstance(condition, dict) and isinstance(condition.get("branch_policy"), dict)
+    ] if isinstance(conditions, list) else []
+    if not branch_conditions:
+        return rules, None, ""
+    boundary = {
+        str(condition.get("branch_id") or ""): str(condition.get("operator") or "")
+        for condition in branch_conditions
+    }
+    if boundary != {"BELOW_OR_EQUAL": "<=", "ABOVE": ">"}:
+        return rules, None, "BUY_PRICE_COMPARE_BRANCH_BOUNDARY_INVALID"
+
+    average = _positive_float(average_price)
+    order_price = _positive_float(actionable_order_price)
+    if average is None or order_price is None:
+        return rules, None, "BUY_PRICE_COMPARE_BRANCH_EVIDENCE_UNAVAILABLE"
+
+    def matches(operator: str) -> bool:
+        return {"<=": average <= order_price, ">": average > order_price}.get(operator, False)
+
+    matched = [condition for condition in branch_conditions if matches(str(condition.get("operator") or ""))]
+    if len(matched) != 1:
+        return rules, None, "BUY_PRICE_COMPARE_BRANCH_NOT_DETERMINISTIC"
+    selected = matched[0]
+    policy = _as_dict(selected.get("branch_policy"))
+    detail_mode = str(policy.get("detail_mode") or "").strip().upper()
+    if detail_mode == "ROUND":
+        if (
+            policy.get("round_operator") not in {"ADD", "MULTIPLY"}
+            or _positive_float(policy.get("round_budget_value")) is None
+        ):
+            return rules, None, "BUY_PRICE_COMPARE_BRANCH_POLICY_INVALID"
+    elif detail_mode == "BUDGET":
+        if _positive_float(policy.get("budget_ratio")) is None:
+            return rules, None, "BUY_PRICE_COMPARE_BRANCH_POLICY_INVALID"
+    else:
+        return rules, None, "BUY_PRICE_COMPARE_BRANCH_POLICY_UNSUPPORTED"
+
+    planned = deepcopy(rules)
+    repeat = planned.setdefault("buy", {}).setdefault("execution", {}).setdefault("repeat", {})
+    repeat.update(deepcopy(policy))
+    evidence = {
+        "branch_id": selected.get("branch_id"),
+        "average_price": average,
+        "actionable_order_price": order_price,
+        "operator": selected.get("operator"),
+        "policy": deepcopy(policy),
+    }
+    return planned, evidence, ""
+
+
 def build_indicator_follow_buy_intent(
     *,
     buy_signal_result: Any,
@@ -894,11 +958,6 @@ def build_indicator_follow_buy_intent(
         planning_rules, cycle_policy, cycle_reason = _cycle_planning_rules(rules)
     if cycle_reason:
         return _blocked(cycle_reason)
-    support_reason = inspect_buy_execution_support(
-        subject={"side": "BUY", "buy_round": next_round}, rules=planning_rules, _planning=True,
-    )
-    if support_reason:
-        return _blocked(support_reason)
     price_basis = _configured_order_price_basis(planning_rules)
     reference_price = _positive_float(
         runtime_context.get("reference_price", runtime_context.get("current_price"))
@@ -918,6 +977,21 @@ def build_indicator_follow_buy_intent(
     actionable_order_price = (
         actionable_price if price_basis in {"CURRENT_PRICE", "MARKET"} else reference_price
     )
+    branch_evidence = None
+    if not last_plus_one:
+        planning_rules, branch_evidence, branch_reason = _buy_price_compare_branch_planning_rules(
+            rules=planning_rules,
+            confirmed_round=confirmed_round,
+            average_price=cycle.get("avg_price"),
+            actionable_order_price=actionable_order_price,
+        )
+        if branch_reason:
+            return _blocked(branch_reason)
+    support_reason = inspect_buy_execution_support(
+        subject={"side": "BUY", "buy_round": next_round}, rules=planning_rules, _planning=True,
+    )
+    if support_reason:
+        return _blocked(support_reason)
     price_skip = _previous_price_skip_result(
         policy=previous_price_policy,
         cycle=cycle,
@@ -987,6 +1061,8 @@ def build_indicator_follow_buy_intent(
     intent = deepcopy(_as_dict(preview.get("execution_intent")))
     intent["confirmed_previous_round"] = confirmed_round
     intent["actionable_order_price"] = actionable_order_price
+    if branch_evidence is not None:
+        intent["buy_price_compare_branch"] = branch_evidence
     if last_plus_one:
         intent.update({
             "generation_kind": "LAST_PLUS_ONE",

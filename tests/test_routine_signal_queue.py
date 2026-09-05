@@ -117,6 +117,22 @@ class RoutineSignalQueueTest(unittest.TestCase):
         self.assertTrue(result["post_write_verified"])
         self.assertEqual(1, len(self._data()["signals"]))
 
+    def test_enqueue_preserves_committed_signal_runtime_policy_metadata(self) -> None:
+        policy = {
+            "duplicate_priority": "TRAILING",
+            "error_policy": "CONTINUE_NEXT_CYCLE",
+            "normal_duplicate_cancel_is_error": False,
+        }
+        result = routine_signal_queue.enqueue_routine_signal(
+            {"signal": "SELL", "reason": "policy", "signal_index": 2, "signal_runtime_policy": policy},
+            routine="지표추종매매",
+            code="005930",
+            name="삼성전자",
+            tick_key="POLICY",
+        )
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(self._data()["signals"][0]["signal_runtime_policy"], policy)
+
     def test_dedupe_key_contract_is_preserved(self) -> None:
         first = self._enqueue("T1", signal_index=1)
         duplicate = self._enqueue("T1", signal_index=1)

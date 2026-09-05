@@ -118,6 +118,52 @@ def bollinger_band(
     return lower, ma, upper
 
 
+def price_box(
+    values: list[float | None],
+    period: int = 24,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Calculate Kiwoom's Price Box over the supplied chart dataset.
+
+    ``A`` is the rolling simple MA series.  AvgIf/StdevIf select matching
+    ``price - A`` deviations from the full dataset supplied by the caller;
+    historical cutoffs therefore belong at the caller/input boundary.
+
+    KIWOOM_STDEVIF_DIVISOR_EXACT_PARITY_NOT_OFFICIALLY_EXPOSED: the
+    project-standard population variance divisor is intentionally reused.
+    """
+    middle = simple_ma(values, period)
+
+    def filtered_stats(items: list[float]) -> tuple[float, float] | None:
+        if not items:
+            return None
+        mean = sum(items) / len(items)
+        variance = sum((item - mean) ** 2 for item in items) / len(items)
+        return mean, math.sqrt(variance)
+
+    deviations = [
+        price - average
+        for price, average in zip(values, middle)
+        if price is not None and average is not None
+    ]
+    positive_stats = filtered_stats([value for value in deviations if value > 0])
+    negative_stats = filtered_stats([value for value in deviations if value < 0])
+
+    lower: list[float | None] = []
+    upper: list[float | None] = []
+    for average in middle:
+        upper.append(
+            None
+            if average is None or positive_stats is None
+            else average + positive_stats[0] + (2.0 * positive_stats[1])
+        )
+        lower.append(
+            None
+            if average is None or negative_stats is None
+            else average + negative_stats[0] - (2.0 * negative_stats[1])
+        )
+    return lower, middle, upper
+
+
 def rsi(values: list[float | None], period: int = 14) -> list[float | None]:
     if period <= 0:
         return [None for _ in values]
@@ -196,8 +242,9 @@ def build_indicator_series(
     config: dict[str, Any] | None = None,
 ) -> dict[str, list[float | None]]:
     cfg = config if isinstance(config, dict) else {}
+    indicator_cfg = cfg.get("indicators") if isinstance(cfg.get("indicators"), dict) else cfg
 
-    macd_cfg = cfg.get("macd", {}) if isinstance(cfg.get("macd"), dict) else {}
+    macd_cfg = indicator_cfg.get("macd", {}) if isinstance(indicator_cfg.get("macd"), dict) else {}
     fast = int(macd_cfg.get("fast", 12) or 12)
     slow = int(macd_cfg.get("slow", 26) or 26)
     signal_period = int(macd_cfg.get("signal", 9) or 9)
@@ -206,16 +253,20 @@ def build_indicator_series(
     vols = volumes(candles)
     macd_line, signal_line, osc = macd_series(closes, fast, slow, signal_period)
 
-    rsi_cfg = cfg.get("rsi", {}) if isinstance(cfg.get("rsi"), dict) else {}
+    rsi_cfg = indicator_cfg.get("rsi", {}) if isinstance(indicator_cfg.get("rsi"), dict) else {}
     rsi_period = int(rsi_cfg.get("period", 14) or 14)
 
-    bollinger_cfg = cfg.get("bollinger", {}) if isinstance(cfg.get("bollinger"), dict) else {}
+    bollinger_cfg = indicator_cfg.get("bollinger", {}) if isinstance(indicator_cfg.get("bollinger"), dict) else {}
     bollinger_period = int(bollinger_cfg.get("period", 20) or 20)
     bollinger_std = safe_float(bollinger_cfg.get("std", 2.0)) or 2.0
 
     bollinger_lower, bollinger_middle, bollinger_upper = bollinger_band(
         closes, bollinger_period, bollinger_std
     )
+
+    price_box_cfg = indicator_cfg.get("price_box", {}) if isinstance(indicator_cfg.get("price_box"), dict) else {}
+    price_box_period = int(price_box_cfg.get("period", 24) or 24)
+    price_box_lower, price_box_middle, price_box_upper = price_box(closes, price_box_period)
 
     series_map: dict[str, list[float | None]] = {
         "CLOSE": closes,
@@ -228,9 +279,12 @@ def build_indicator_series(
         "BOLLINGER_LOWER": bollinger_lower,
         "BOLLINGER_MIDDLE": bollinger_middle,
         "BOLLINGER_UPPER": bollinger_upper,
+        "PRICE_BOX_LOWER": price_box_lower,
+        "PRICE_BOX_MIDDLE": price_box_middle,
+        "PRICE_BOX_UPPER": price_box_upper,
     }
 
-    ma_periods = cfg.get("moving_averages", [5, 20, 60])
+    ma_periods = indicator_cfg.get("moving_averages", [5, 20, 60])
     if not isinstance(ma_periods, list):
         ma_periods = [5, 20, 60]
 

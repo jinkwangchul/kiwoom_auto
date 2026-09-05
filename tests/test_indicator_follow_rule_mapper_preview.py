@@ -721,7 +721,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(candidate["path"], "sell.signals.ui_preview_condition_c")
         signal = candidate["value"]
         self.assertEqual(signal["groups"][0]["name"], "UI_PREVIEW_SELL_CONDITION_C")
-        self.assertFalse(signal["enabled"])
+        self.assertTrue(signal["enabled"])
         self.assertTrue(signal["preview_candidate"])
         self.assertEqual(signal["groups"][0]["conditions"][0]["target"], "MACD")
         self.assertEqual(signal["groups"][0]["conditions"][0]["operator"], "<=")
@@ -985,7 +985,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertIn("sell.signals.ui_preview_condition_c", result["applied_paths"])
         self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
         self.assertIn("ui_condition_c", signals)
-        self.assertFalse(signals["ui_condition_c"]["enabled"])
+        self.assertTrue(signals["ui_condition_c"]["enabled"])
         self.assertNotIn("path", signals["ui_condition_c"])
         self.assertNotIn("preview_candidate", signals["ui_condition_c"])
         self.assertEqual(
@@ -1026,7 +1026,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(candidate["path"], "sell.signals.ui_preview_condition_a")
         self.assertEqual(candidate["value"]["groups"][0]["name"], "condition_a")
-        self.assertFalse(candidate["value"]["enabled"])
+        self.assertTrue(candidate["value"]["enabled"])
         self.assertEqual([condition["target"] for condition in conditions], ["OSC", "OSC"])
         self.assertEqual([condition["operator"] for condition in conditions], ["TURN_UP", "<="])
         self.assertEqual(conditions[1]["value"], -91.0)
@@ -1079,7 +1079,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertIn("sell.signals.ui_preview_condition_a", result["mapped_paths"])
         self.assertIn("sell.signals.ui_preview_condition_c", result["mapped_paths"])
 
-    def test_sell_condition_a_gap_only_is_deferred_without_candidate(self):
+    def test_sell_condition_a_gap_only_creates_candidate(self):
         state = deepcopy(self.ui_state)
         state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
         state["sell_ui"]["signal_conditions"]["condition_a"] = {
@@ -1094,11 +1094,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
         candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
 
-        self.assertNotIn("sell", candidates)
-        self.assertIn(
-            "sell condition A GAP mapping is postponed until gap semantics are finalized",
-            result["warnings"],
-        )
+        condition = candidates["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
+        self.assertEqual(condition["operator"], "PERCENT_GAP")
+        self.assertIn("sell.signals.ui_preview_condition_a", result["mapped_paths"])
 
     def test_sell_condition_a_empty_config_does_not_create_candidate(self):
         state = deepcopy(self.ui_state)
@@ -1141,7 +1139,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(patch_preview["patches"][0]["source_path"], "sell.signals.ui_preview_condition_a")
         self.assertEqual(patch_preview["patches"][0]["target_path"], "sell.signals.ui_condition_a")
         self.assertIn("ui_condition_a", signals)
-        self.assertFalse(signals["ui_condition_a"]["enabled"])
+        self.assertTrue(signals["ui_condition_a"]["enabled"])
         self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
         self.assertTrue(commit_preview["commit_allowed"])
         self.assertEqual(commit_preview["final_diff"][0]["path"], "sell.signals.ui_condition_a")
@@ -1204,7 +1202,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(candidate["path"], "sell.signals.ui_preview_condition_b")
         self.assertEqual(candidate["value"]["groups"][0]["name"], "condition_b")
-        self.assertFalse(candidate["value"]["enabled"])
+        self.assertTrue(candidate["value"]["enabled"])
         self.assertEqual(condition["target"], "CLOSE")
         self.assertEqual(condition["operator"], ">=")
         self.assertEqual(condition["compare_target"], "BOLLINGER_UPPER")
@@ -1285,7 +1283,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
         self.assertNotIn("sell.signals.ui_preview_condition_b", result["mapped_paths"])
 
-    def test_sell_condition_b_price_box_only_is_postponed_without_candidate(self):
+    def test_sell_condition_b_price_box_only_creates_candidate(self):
         state = deepcopy(self.ui_state)
         state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
         state["sell_ui"]["signal_conditions"]["condition_b"] = {
@@ -1297,13 +1295,11 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
 
-        self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
-        self.assertIn(
-            "sell condition B Price Box mapping is postponed until price box series semantics are finalized",
-            result["warnings"],
-        )
+        condition = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
+        self.assertEqual(condition["compare_target"], "PRICE_BOX_UPPER")
+        self.assertEqual(condition["operator"], ">=")
 
-    def test_sell_condition_b_gap_only_is_postponed_without_candidate(self):
+    def test_sell_condition_b_gap_only_creates_candidate(self):
         state = deepcopy(self.ui_state)
         state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
         state["sell_ui"]["signal_conditions"]["condition_b"] = {
@@ -1317,10 +1313,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
 
-        self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
-        self.assertIn("sell condition B GAP mapping is postponed until gap semantics are finalized", result["warnings"])
+        condition = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
+        self.assertEqual(condition["operator"], "PERCENT_GAP")
 
-    def test_sell_condition_b_or_not_logic_blocks_candidate(self):
+    def test_sell_condition_b_or_not_logic_is_preserved_when_next_row_is_active(self):
         for logic in ("OR", "NOT"):
             with self.subTest(logic=logic):
                 state = deepcopy(self.ui_state)
@@ -1331,12 +1327,18 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                     "bollinger_compare_combo": "이상",
                     "bollinger_value_line": "0.1",
                     "bollinger_logic_combo": logic,
+                    "gap_check": True,
+                    "gap_left_combo": "현재가",
+                    "gap_right_combo": "평단가",
+                    "gap_direction_combo": "상향",
+                    "gap_value_line": "0.25",
+                    "gap_compare_combo": "이상",
                 }
 
                 result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
 
-                self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
-                self.assertIn(f"sell condition B Bollinger logic is not supported: '{logic}'", result["warnings"])
+                group = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]["groups"][0]
+                self.assertEqual(group["condition_expression"]["operator"], logic)
 
     def test_sell_condition_b_approval_apply_and_commit_preview(self):
         state = deepcopy(self.ui_state)
@@ -1368,7 +1370,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(patch_preview["patches"][0]["source_path"], "sell.signals.ui_preview_condition_b")
         self.assertEqual(patch_preview["patches"][0]["target_path"], "sell.signals.ui_condition_b")
         self.assertIn("ui_condition_b", signals)
-        self.assertFalse(signals["ui_condition_b"]["enabled"])
+        self.assertTrue(signals["ui_condition_b"]["enabled"])
         self.assertNotIn("ui_condition_a", signals)
         self.assertNotIn("ui_condition_c", signals)
         self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
@@ -1642,7 +1644,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual([condition.get("compare_period") for condition in conditions], [None, 20, 60])
         self.assertNotIn("sell.signals.ui_preview_condition_c_macd_sell", result["mapped_paths"])
 
-    def test_sell_condition_c_gap_only_is_deferred_without_candidate(self):
+    def test_sell_condition_c_gap_only_creates_candidate(self):
         state = deepcopy(self.ui_state)
         condition_c = state["sell_ui"]["signal_conditions"]["condition_c"]
         condition_c.clear()
@@ -1658,11 +1660,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
         candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
 
-        self.assertNotIn("sell", candidates)
-        self.assertIn(
-            "sell condition C GAP mapping is postponed until gap direction semantics are finalized",
-            result["warnings"],
-        )
+        condition = candidates["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
+        self.assertEqual(condition["operator"], "PERCENT_GAP")
 
     def test_sell_condition_c_unsupported_array_blocks_candidate(self):
         state = deepcopy(self.ui_state)
@@ -1701,7 +1700,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertIn("ui_condition_c_macd_sell", signals)
         self.assertIn("ui_condition_c", signals)
-        self.assertFalse(signals["ui_condition_c"]["enabled"])
+        self.assertTrue(signals["ui_condition_c"]["enabled"])
 
     def test_approval_does_not_mutate_current_rules_or_preview(self):
         preview = self._build_preview()
@@ -2054,7 +2053,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(patch["target_path"], "sell.signals.ui_condition_c")
         self.assertNotEqual(patch["target_path"], "sell.signals.macd_sell")
         self.assertEqual(patch["risk"], "high")
-        self.assertFalse(patch["signal"]["enabled"])
+        self.assertTrue(patch["signal"]["enabled"])
         self.assertNotIn("preview_candidate", patch["signal"])
         self.assertNotIn("path", patch["signal"])
         self.assertEqual(
@@ -2392,7 +2391,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(result["summary"]["applied"], 1)
         self.assertIn("ui_condition_c", signals)
-        self.assertFalse(signals["ui_condition_c"]["enabled"])
+        self.assertTrue(signals["ui_condition_c"]["enabled"])
         self.assertNotIn("preview_candidate", signals["ui_condition_c"])
         self.assertEqual(
             signals["ui_condition_c"]["groups"][0]["conditions"][0]["target"],

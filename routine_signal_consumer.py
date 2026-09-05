@@ -3,14 +3,18 @@
 
 This module consumes PENDING BUY/SELL routine signals. By default it only asks
 the bridge for an OrderManager dry-run and an order payload preview. Optional
-flags can update routine signal status and write order_queue.json candidates,
-but it never mutates orders.json, calls an executor, or sends an order.
+flags can update routine signal status and write order_queue.json candidates.
+It never directly calls a new-order executor or SendOrder.  When the committed
+duplicate policy selects the trailing signal, an injected existing cancel
+boundary may neutralize the predecessor through the normal final-send gates.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+import json
+from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -36,6 +40,7 @@ try:
         append_order_candidates,
         order_candidate_dedupe_key,
         read_order_queue,
+        read_signal_queue,
         signal_to_order_candidate,
         signal_to_order_candidates,
     )
@@ -45,6 +50,194 @@ except Exception:  # pragma: no cover
     read_order_queue = None
     signal_to_order_candidate = None
     signal_to_order_candidates = None
+    read_signal_queue = None
+
+try:
+    from execution_unfilled_cancel_eligibility import cancel_effect_state
+except Exception:  # pragma: no cover
+    cancel_effect_state = None
+
+
+_SIGNAL_TERMINAL_STATUSES = {"DONE", "CANCELLED", "EXPIRED", "ERROR", "BLOCKED"}
+_ORDER_TERMINAL_STATUSES = {
+    "DONE", "FILLED", "CANCELED", "CANCELLED", "REJECTED", "BROKER_REJECTED",
+    "SEND_CALL_REJECTED", "BLOCKED", "BLOCKED_POLICY", "FAILED",
+}
+
+
+def read_latest_holding_consistency(
+    stock_code: Any,
+    *,
+    positions_path: str | Path | None = None,
+    holdings_path: str | Path | None = None,
+) -> bool:
+    """Read the existing Position/Broker reconciliation evidence fail-closed."""
+    code = str(stock_code or "").strip().lstrip("A")
+    if not code:
+        return False
+    root = Path(__file__).resolve().parent / "runtime"
+    resolved_positions_path = Path(positions_path) if positions_path is not None else root / "positions.json"
+    resolved_holdings_path = Path(holdings_path) if holdings_path is not None else root / "broker_holdings.json"
+    if not resolved_positions_path.exists() or not resolved_holdings_path.exists():
+        return False
+    try:
+        positions_root = json.loads(resolved_positions_path.read_text(encoding="utf-8"))
+        holdings_root = json.loads(resolved_holdings_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if (
+        not isinstance(positions_root, dict)
+        or not isinstance(positions_root.get("positions"), list)
+        or not isinstance(holdings_root, dict)
+        or not isinstance(holdings_root.get("holdings"), list)
+    ):
+        return False
+    positions = [row for row in positions_root["positions"] if isinstance(row, dict) and str(row.get("code") or "").strip().lstrip("A") == code]
+    holdings = [row for row in holdings_root["holdings"] if isinstance(row, dict) and str(row.get("code") or "").strip().lstrip("A") == code]
+    if len(positions) > 1 or len(holdings) > 1:
+        return False
+    if holdings:
+        holding = holdings[0]
+        if holding.get("manual_reconciliation_required") is True:
+            return False
+        if str(holding.get("reconciliation_status") or "CONSISTENT").strip().upper() != "CONSISTENT":
+            return False
+    if not positions and not holdings:
+        return True
+    position_qty = int(positions[0].get("quantity") or 0) if positions else 0
+    holding_qty = int(holdings[0].get("holding_quantity") or 0) if holdings else 0
+    return position_qty == holding_qty
+
+
+def _signal_scope(signal: dict[str, Any]) -> tuple[str, str]:
+    instance = str(signal.get("routine_instance_id") or "").strip()
+    routine = instance or str(signal.get("routine") or "").strip()
+    return str(signal.get("code") or "").strip(), routine
+
+
+def _order_request(order: dict[str, Any]) -> dict[str, Any]:
+    execution_request = order.get("execution_request")
+    if not isinstance(execution_request, dict):
+        return {}
+    preview = execution_request.get("request_preview")
+    return preview if isinstance(preview, dict) else {}
+
+
+def apply_duplicate_signal_priority(
+    pending_signals: list[dict[str, Any]],
+    *,
+    all_signals: list[dict[str, Any]] | None = None,
+    orders: list[dict[str, Any]] | None = None,
+    cancel_requester: Any = None,
+    holding_consistency_reader: Any = None,
+    status_updater: Any = update_signal_status,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Arbitrate overlapping signals before Candidate/Approval mutation.
+
+    The trailing policy reuses the existing cancel writer and waits for its
+    durable effect.  It never treats normal duplicate neutralization as an
+    execution error.
+    """
+    all_rows = [row for row in (all_signals or pending_signals) if isinstance(row, dict)]
+    order_rows = [row for row in (orders or []) if isinstance(row, dict)]
+    selected: list[dict[str, Any]] = []
+    summary = {
+        "leading_ignored": 0,
+        "trailing_deferred": 0,
+        "cancel_requested": 0,
+        "holding_mismatch": 0,
+        "status_update_failed": 0,
+        "neutralized": 0,
+    }
+    by_scope: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for signal in pending_signals:
+        if isinstance(signal, dict):
+            by_scope.setdefault(_signal_scope(signal), []).append(signal)
+
+    for scope, candidates in by_scope.items():
+        candidates.sort(key=lambda row: (str(row.get("created_at") or ""), str(row.get("id") or "")))
+        current = candidates[-1]
+        policy = current.get("signal_runtime_policy")
+        priority = str(policy.get("duplicate_priority") or "").strip().upper() if isinstance(policy, dict) else ""
+        active = [
+            row for row in all_rows
+            if _signal_scope(row) == scope
+            and str(row.get("status") or "").strip().upper() not in _SIGNAL_TERMINAL_STATUSES
+        ]
+        active.sort(key=lambda row: (str(row.get("created_at") or ""), str(row.get("id") or "")))
+        current_id = str(current.get("id") or "")
+        predecessors = [row for row in active if str(row.get("id") or "") != current_id]
+        if not predecessors or priority not in {"LEADING", "TRAILING"}:
+            selected.extend(candidates)
+            continue
+
+        if priority == "LEADING":
+            leader_id = str(active[0].get("id") or "") if active else ""
+            for candidate in candidates:
+                candidate_id = str(candidate.get("id") or "")
+                if candidate_id == leader_id:
+                    selected.append(candidate)
+                    continue
+                if callable(status_updater) and candidate_id:
+                    status_result = status_updater(candidate_id, "CANCELLED", metadata={"duplicate_priority": "LEADING", "reason_code": "DUPLICATE_SIGNAL_LEADING_PRIORITY"})
+                    if isinstance(status_result, dict) and status_result.get("ok") is not True:
+                        summary["status_update_failed"] += 1
+                summary["leading_ignored"] += 1
+            continue
+
+        waiting = False
+        for predecessor in predecessors:
+            predecessor_id = str(predecessor.get("id") or "")
+            source_orders = [row for row in order_rows if str(row.get("source_signal_id") or "") == predecessor_id]
+            original_orders = [
+                row for row in source_orders
+                if str(row.get("order_action") or _order_request(row).get("order_action") or "NEW").strip().upper() == "NEW"
+            ]
+            active_originals = [row for row in original_orders if str(row.get("status") or "").strip().upper() not in _ORDER_TERMINAL_STATUSES]
+            for original in active_originals:
+                broker_no = str(original.get("broker_order_no") or "").strip()
+                related_cancels = [
+                    row for row in order_rows
+                    if str(row.get("order_action") or _order_request(row).get("order_action") or "").strip().upper() == "CANCEL"
+                    and str(_order_request(row).get("original_order_no") or row.get("original_order_no") or "").strip() == broker_no
+                ]
+                effects = [cancel_effect_state(row) for row in related_cancels] if callable(cancel_effect_state) else []
+                if "CONFIRMED" in effects:
+                    continue
+                if related_cancels:
+                    waiting = True
+                    continue
+                if not callable(cancel_requester) or not broker_no:
+                    waiting = True
+                    continue
+                result = cancel_requester(
+                    str(original.get("id") or ""),
+                    expected_account_no=str(original.get("account_no") or _order_request(original).get("account_no") or ""),
+                    expected_code=str(original.get("code") or ""),
+                    expected_side=str(original.get("side") or ""),
+                    expected_broker_order_no=broker_no,
+                    cancel_evidence={"trigger": "DUPLICATE_SIGNAL_TRAILING_PRIORITY", "successor_signal_id": current_id, "predecessor_signal_id": predecessor_id},
+                )
+                summary["cancel_requested"] += int(isinstance(result, dict) and result.get("cancel_requested", 0) or 0)
+                waiting = True
+            if active_originals and waiting:
+                continue
+            if callable(holding_consistency_reader) and holding_consistency_reader(scope[0]) is not True:
+                summary["holding_mismatch"] += 1
+                waiting = True
+                continue
+            if callable(status_updater) and predecessor_id:
+                status_result = status_updater(predecessor_id, "CANCELLED", metadata={"duplicate_priority": "TRAILING", "reason_code": "DUPLICATE_SIGNAL_REPLACED_AFTER_CANCEL_EFFECT", "successor_signal_id": current_id})
+                if isinstance(status_result, dict) and status_result.get("ok") is not True:
+                    summary["status_update_failed"] += 1
+                    waiting = True
+                    continue
+            summary["neutralized"] += 1
+        if waiting:
+            summary["trailing_deferred"] += 1
+            continue
+        selected.append(current)
+    return selected, summary
 
 try:
     from order_approval_engine import evaluate_order_approval
@@ -985,6 +1178,8 @@ def consume_pending_routine_signals_dry_run(
     apply_approval: bool = False,
     allowed_stock_codes: Iterable[Any] | None = None,
     signal_cutoff_by_stock_code: dict[Any, Any] | None = None,
+    duplicate_cancel_requester: Any = None,
+    holding_consistency_reader: Any = None,
 ) -> dict[str, Any]:
     """Consume pending routine signals in memory with OrderManager + payload preview."""
     signals = load_pending_routine_signals(
@@ -992,6 +1187,23 @@ def consume_pending_routine_signals_dry_run(
         signal_cutoff_by_stock_code=signal_cutoff_by_stock_code,
     )
     signals = [signal for signal in signals if not _is_deferred_child_signal(signal)]
+    all_signal_rows: list[dict[str, Any]] = []
+    if callable(read_signal_queue):
+        signal_root = read_signal_queue()
+        if isinstance(signal_root, dict) and isinstance(signal_root.get("signals"), list):
+            all_signal_rows = signal_root["signals"]
+    order_rows: list[dict[str, Any]] = []
+    if callable(read_order_queue):
+        order_root = read_order_queue()
+        if isinstance(order_root, dict) and isinstance(order_root.get("orders"), list):
+            order_rows = order_root["orders"]
+    signals, duplicate_priority_summary = apply_duplicate_signal_priority(
+        signals,
+        all_signals=all_signal_rows,
+        orders=order_rows,
+        cancel_requester=duplicate_cancel_requester,
+        holding_consistency_reader=holding_consistency_reader,
+    )
     clean_limit = _clean_limit(limit)
     if clean_limit is not None:
         signals = signals[:clean_limit]
@@ -1094,6 +1306,7 @@ def consume_pending_routine_signals_dry_run(
             "marked_blocked": marked_blocked,
             "marked_error": marked_error,
             "orders_created": int(order_queue_result.get("orders_created", 0) or 0),
+            "duplicate_priority": duplicate_priority_summary,
             "order_queue_written": bool(order_queue_result.get("order_queue_written")),
             "approval_checked": int(order_queue_result.get("approval_checked", 0) or 0),
             "approved": int(order_queue_result.get("approved", 0) or 0),

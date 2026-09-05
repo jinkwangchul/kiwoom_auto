@@ -43,6 +43,7 @@ try:
         record_final_residual_sell_exit_completion,
         record_repeat_sell_exit,
         record_buy_repeat_exit_completion,
+        read_latest_holding_consistency,
     )
 except Exception:
     consume_pending_routine_signals_dry_run = None
@@ -55,6 +56,7 @@ except Exception:
     record_final_residual_sell_exit_completion = None
     record_repeat_sell_exit = None
     record_buy_repeat_exit_completion = None
+    read_latest_holding_consistency = None
 
 try:
     from execution_process_supplement import inspect_execution_process_supplements
@@ -1083,6 +1085,11 @@ def _process_pending_signal_pipeline(
                 final_residual_exit_summary["errors"]
             ) + 1
 
+    duplicate_cancel_requester = getattr(window, "queue_open_order_cancel_automatically", None)
+    if not callable(duplicate_cancel_requester):
+        host_reader = getattr(window, "main_monitoring_auto_trade_operation_host", None)
+        host = host_reader() if callable(host_reader) else None
+        duplicate_cancel_requester = getattr(host, "queue_open_order_cancel_automatically", None)
     consumer_result = consume_pending_routine_signals_dry_run(
         limit=5,
         mark_previewed=True,
@@ -1090,6 +1097,8 @@ def _process_pending_signal_pipeline(
         apply_approval=True,
         allowed_stock_codes=allowed_stock_codes,
         signal_cutoff_by_stock_code=signal_cutoff_by_stock_code,
+        duplicate_cancel_requester=duplicate_cancel_requester,
+        holding_consistency_reader=read_latest_holding_consistency,
     )
     summary = consumer_result.get("summary", {}) if isinstance(consumer_result, dict) else {}
     checked = int(summary.get("signals_checked", 0) or 0)

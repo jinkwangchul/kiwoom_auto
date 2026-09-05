@@ -387,6 +387,9 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
 
     signal = evaluate_indicator_follow_routine(candles, config, context)
     result = signal_to_dict(signal)
+    signal_runtime_policy = config.get("signal_runtime_policy") if isinstance(config, dict) else None
+    if isinstance(signal_runtime_policy, dict):
+        result["signal_runtime_policy"] = dict(signal_runtime_policy)
     cycle = context.get("cycle")
     signal_side = str(result.get("signal") or "").strip().upper()
     if isinstance(cycle, dict):

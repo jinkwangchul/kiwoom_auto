@@ -14,6 +14,8 @@ from datetime import datetime
 from math import isfinite
 from typing import Any
 
+from engines.condition_engine import parse_condition_expression
+
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -60,6 +62,7 @@ def build_apply_preview_hash(apply_preview: dict[str, Any]) -> str:
 
 _MISSING = object()
 BAR_MINUTES_PATH = "bar.bar_minutes"
+SIGNAL_RUNTIME_POLICY_PATH = "signal_runtime_policy"
 BUY_CONDITIONS_PATH = "buy.groups[0].conditions"
 BUY_MOVING_AVERAGE_FILTER_PATH = "buy.filters.moving_average"
 BUY_PRICE_COMPARE_FILTER_PATH = "buy.filters.price_compare"
@@ -166,6 +169,34 @@ def _get_path_value(data: dict[str, Any], path: str) -> Any:
                 return _MISSING
             current = current[part]
     return current
+
+
+def _build_signal_runtime_policy_candidate(basic: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    if "basic_duplicate_signal_combo" not in basic and "basic_error_policy_combo" not in basic:
+        return None
+    duplicate = {
+        "선행신호 우선": "LEADING",
+        "후행신호 우선": "TRAILING",
+        "LEADING": "LEADING",
+        "TRAILING": "TRAILING",
+    }.get(str(basic.get("basic_duplicate_signal_combo") or "후행신호 우선").strip())
+    error = {
+        "매매중지": "STOP_AND_REVIEW",
+        "매매지속": "CONTINUE_NEXT_CYCLE",
+        "STOP_AND_REVIEW": "STOP_AND_REVIEW",
+        "CONTINUE_NEXT_CYCLE": "CONTINUE_NEXT_CYCLE",
+    }.get(str(basic.get("basic_error_policy_combo") or "매매중지").strip())
+    if duplicate is None or error is None:
+        warnings.append("signal runtime policy is invalid")
+        return None
+    return {
+        "path": SIGNAL_RUNTIME_POLICY_PATH,
+        "value": {
+            "duplicate_priority": duplicate,
+            "error_policy": error,
+            "normal_duplicate_cancel_is_error": False,
+        },
+    }
 
 
 def _preview_diff_risk(path: str) -> str:
@@ -460,6 +491,37 @@ def _build_buy_rsi_filter_candidate(signal_filter: dict[str, Any], warnings: lis
 
 
 def _build_buy_composite_filter_candidate(signal_filter: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    signal_expression = str(signal_filter.get("signal_expression") or "").strip()
+    if signal_expression:
+        parsed = parse_condition_expression(
+            signal_expression,
+            allowed_identifiers={"A", "B", "C", "D"},
+            allow_duplicate_identifiers=True,
+        )
+        if not parsed.get("ok"):
+            warnings.append(f"buy signal expression is invalid: {parsed.get('reason')}")
+            return None
+        return {
+            "path": BUY_COMPOSITE_FILTER_PATH,
+            "value": {
+                "enabled": True,
+                "expression": {
+                    "source": signal_expression,
+                    "normalized": parsed["normalized"],
+                    "ast": parsed["ast"],
+                    "identifiers": parsed["identifiers"],
+                    "identifier_map": {
+                        "A": "ocr",
+                        "B": "bollinger",
+                        "C": "moving_average",
+                        "D": "rsi",
+                    },
+                },
+                "include_unreferenced_active_filters": "AND_REQUIRED",
+                "groups": [],
+            },
+        }
+
     if "buy_composite" not in signal_filter:
         return None
 
@@ -1414,24 +1476,48 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
         below_operator = _price_compare_operator(price_compare.get("condition_combo"))
         above_operator = _price_compare_operator(price_compare.get("above_condition_combo"))
         conditions: list[dict[str, Any]] = []
-        if below_operator is None:
+        if below_operator not in {"<", "<="}:
             warnings.append(f"buy price compare condition is not mapped: {price_compare.get('condition_combo')!r}")
             return None
-        if above_operator is None:
+        if above_operator not in {">", ">="}:
             warnings.append(f"buy price compare above condition is not mapped: {price_compare.get('above_condition_combo')!r}")
             return None
-        conditions.append(_price_compare_condition(
+        # The two simultaneous Production branches have one exact, gap-free boundary.
+        below_operator = "<="
+        above_operator = ">"
+        has_branch_policy_fields = any(
+            key in price_compare
+            for key in (
+                "round_operator_combo",
+                "round_budget_line",
+                "budget_ratio_line",
+                "above_round_operator_combo",
+                "above_round_budget_line",
+                "above_budget_ratio_line",
+            )
+        )
+        below_policy = _buy_price_compare_branch_policy(price_compare, "", warnings) if has_branch_policy_fields else None
+        above_policy = _buy_price_compare_branch_policy(price_compare, "above_", warnings) if has_branch_policy_fields else None
+        if has_branch_policy_fields and (below_policy is None or above_policy is None):
+            return None
+        below_condition = _price_compare_condition(
             target="AVG_PRICE",
             operator=below_operator,
             compare_target="ORDER_PRICE",
             description="UI preview: BUY price compare below-branch filter condition",
-        ))
-        conditions.append(_price_compare_condition(
+        )
+        if below_policy is not None:
+            below_condition.update({"branch_id": "BELOW_OR_EQUAL", "branch_policy": below_policy})
+        conditions.append(below_condition)
+        above_condition = _price_compare_condition(
             target="AVG_PRICE",
             operator=above_operator,
             compare_target="ORDER_PRICE",
             description="UI preview: BUY price compare above-branch filter condition",
-        ))
+        )
+        if above_policy is not None:
+            above_condition.update({"branch_id": "ABOVE", "branch_policy": above_policy})
+        conditions.append(above_condition)
 
     return {
         "path": BUY_PRICE_COMPARE_FILTER_PATH,
@@ -1441,6 +1527,38 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
             "conditions": conditions,
         },
     }
+
+
+def _buy_price_compare_branch_policy(
+    price_compare: dict[str, Any],
+    prefix: str,
+    warnings: list[str],
+) -> dict[str, Any] | None:
+    label = "above" if prefix else "below"
+    mode = str(price_compare.get(f"{prefix}mode_combo") or "").strip()
+    if mode == "회차기준":
+        operator = str(price_compare.get(f"{prefix}round_operator_combo") or "").strip()
+        operator_token = {"+": "ADD", "x": "MULTIPLY", "X": "MULTIPLY"}.get(operator)
+        value = _safe_float(price_compare.get(f"{prefix}round_budget_line"))
+        if operator_token is None or value is None or value <= 0:
+            warnings.append(f"buy price compare {label} round policy is invalid")
+            return None
+        return {
+            "detail_mode": "ROUND",
+            "round_operator": operator_token,
+            "round_budget_value": value,
+        }
+    if mode == "예산기준":
+        ratio = _safe_float(price_compare.get(f"{prefix}budget_ratio_line"))
+        if ratio is None or ratio <= 0:
+            warnings.append(f"buy price compare {label} budget policy is invalid")
+            return None
+        return {"detail_mode": "BUDGET", "budget_ratio": ratio}
+    if mode == "능동매수":
+        warnings.append("buy price compare ACTIVE_BUY remains reserved")
+        return None
+    warnings.append(f"buy price compare {label} mode is not mapped: {mode!r}")
+    return None
 
 
 def _build_sell_condition_c_indicator_condition(condition_c: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
@@ -1536,37 +1654,102 @@ def _build_sell_condition_c_array_conditions(condition_c: dict[str, Any], warnin
     ]
 
 
-def _build_sell_condition_c_signal_candidate(condition_c: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+def _build_sell_gap_condition(source: dict[str, Any], warnings: list[str], label: str) -> dict[str, Any] | None:
+    if source.get("gap_check") is False:
+        return None
+    if not any(key in source for key in ("gap_left_combo", "gap_right_combo", "gap_direction_combo", "gap_value_line", "gap_compare_combo")):
+        return None
+    left = _series_target(source.get("gap_left_combo"))
+    right = _series_target(source.get("gap_right_combo"))
+    direction = {"상향": "UP", "하향": "DOWN", "상하": "BOTH", "UP": "UP", "DOWN": "DOWN", "BOTH": "BOTH"}.get(str(source.get("gap_direction_combo") or "").strip())
+    compare_mode = {"이상": "GTE", "이하": "LTE", "이내": "WITHIN", "이탈": "OUTSIDE", "GTE": "GTE", "LTE": "LTE", "WITHIN": "WITHIN", "OUTSIDE": "OUTSIDE"}.get(str(source.get("gap_compare_combo") or "").strip())
+    value = _safe_float(source.get("gap_value_line"))
+    if left is None or right is None or direction is None or compare_mode is None or value is None or value < 0:
+        warnings.append(f"{label} GAP policy is invalid")
+        return None
+    if direction == "BOTH" and compare_mode not in {"WITHIN", "OUTSIDE"}:
+        warnings.append(f"{label} GAP BOTH requires WITHIN/OUTSIDE")
+        return None
+    if direction != "BOTH" and compare_mode not in {"GTE", "LTE"}:
+        warnings.append(f"{label} GAP directional policy requires GTE/LTE")
+        return None
+    return {
+        "enabled": True,
+        "not": False,
+        "target": left,
+        "operator": "PERCENT_GAP",
+        "compare_target": right,
+        "direction": direction,
+        "compare_mode": compare_mode,
+        "value": value,
+        "description": f"UI preview: {label} GAP condition",
+    }
+
+
+def _sell_group_from_rows(
+    *,
+    name: str,
+    rows: list[tuple[str, list[dict[str, Any]], Any]],
+    warnings: list[str],
+) -> dict[str, Any] | None:
+    active: list[tuple[list[str], Any]] = []
     conditions: list[dict[str, Any]] = []
+    for row_name, row_conditions, operator_after in rows:
+        if not row_conditions:
+            continue
+        ids: list[str] = []
+        for index, condition in enumerate(row_conditions):
+            expression_id = f"{row_name}_{index}"
+            condition["expression_id"] = expression_id
+            ids.append(expression_id)
+            conditions.append(condition)
+        active.append((ids, operator_after))
+    if not active:
+        return None
+    if len(active) == 1:
+        for condition in conditions:
+            condition.pop("expression_id", None)
+        return {"enabled": True, "name": name, "conditions_logic": "AND", "conditions": conditions}
+    expression = _fold_expression_ids(active[0][0])
+    for index in range(1, len(active)):
+        right = _fold_expression_ids(active[index][0])
+        operator = str(active[index - 1][1] or "AND").strip().upper()
+        if operator not in {"AND", "OR", "NOT"} or expression is None or right is None:
+            warnings.append(f"{name} row logic is not supported: {active[index - 1][1]!r}")
+            return None
+        expression = {"type": "binary", "operator": operator, "left": expression, "right": right}
+    group = {"enabled": True, "name": name, "conditions_logic": "AND", "conditions": conditions}
+    if expression is not None:
+        group["condition_expression"] = expression
+    return group
 
+
+def _build_sell_condition_c_signal_candidate(condition_c: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     macd_condition = _build_sell_condition_c_indicator_condition(condition_c, warnings)
-    if macd_condition:
-        conditions.append(macd_condition)
-
-    if condition_c.get("gap_check") is True:
-        warnings.append("sell condition C GAP mapping is postponed until gap direction semantics are finalized")
-
+    gap_condition = _build_sell_gap_condition(condition_c, warnings, "sell condition C")
     array_conditions = _build_sell_condition_c_array_conditions(condition_c, warnings)
     if array_conditions is None:
         return None
-    conditions.extend(array_conditions)
-
-    if not conditions:
+    group = _sell_group_from_rows(
+        name="UI_PREVIEW_SELL_CONDITION_C",
+        rows=[
+            ("GAP", [gap_condition] if gap_condition else [], condition_c.get("gap_logic_combo")),
+            ("MACD", [macd_condition] if macd_condition else [], condition_c.get("macd_logic_combo")),
+            ("ARRAY", array_conditions, None),
+        ],
+        warnings=warnings,
+    )
+    if group is None:
         return None
 
     return {
         "path": SELL_CONDITION_C_SIGNAL_PREVIEW_PATH,
         "candidate_type": "add_signal",
         "value": {
-            "enabled": False,
+            "enabled": True,
             "preview_candidate": True,
             "groups_logic": "OR",
-            "groups": [{
-                "enabled": True,
-                "name": "UI_PREVIEW_SELL_CONDITION_C",
-                "conditions_logic": "AND",
-                "conditions": conditions,
-            }],
+            "groups": [group],
         },
     }
 
@@ -1576,7 +1759,9 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
         return []
 
     if not any(key in condition_a for key in (
+        "ocr_direction_combo",
         "ocr_turn_combo",
+        "ocr_convert_line",
         "ocr_compare_combo",
         "ocr_sign_combo",
         "ocr_value_line",
@@ -1584,7 +1769,12 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
         return []
 
     conditions: list[dict[str, Any]] = []
-    turn_text = str(condition_a.get("ocr_turn_combo", "")).strip()
+    turn_text = str(condition_a.get("ocr_direction_combo", condition_a.get("ocr_turn_combo", ""))).strip()
+    raw_bar_offset = condition_a.get("ocr_convert_line", 0)
+    bar_offset = _safe_int(raw_bar_offset)
+    if bar_offset is None or bar_offset < 0:
+        warnings.append("sell condition A OCR convert bar is not a non-negative integer")
+        return None
     if turn_text:
         turn_operator = {
             "\uc0c1\uc2b9": "TURN_UP",
@@ -1602,6 +1792,8 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
             "operator": turn_operator,
             "description": "UI preview: sell condition A OCR/OSC turn condition",
         })
+        if "ocr_convert_line" in condition_a:
+            conditions[-1]["bar_offset"] = bar_offset
 
     raw_threshold = condition_a.get("ocr_value_line")
     if raw_threshold not in (None, ""):
@@ -1621,6 +1813,8 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
             "value": threshold,
             "description": "UI preview: sell condition A OCR/OSC threshold condition",
         })
+        if "ocr_convert_line" in condition_a:
+            conditions[-1]["bar_offset"] = bar_offset
 
     return conditions
 
@@ -1667,37 +1861,130 @@ def _build_sell_condition_a_rsi_condition(condition_a: dict[str, Any], warnings:
 
 
 def _build_sell_condition_a_signal_candidate(condition_a: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
-    conditions: list[dict[str, Any]] = []
-
     ocr_conditions = _build_sell_condition_a_ocr_conditions(condition_a, warnings)
     if ocr_conditions is None:
         return None
-    conditions.extend(ocr_conditions)
-
-    if condition_a.get("gap_check") is True:
-        warnings.append("sell condition A GAP mapping is postponed until gap semantics are finalized")
-
+    gap_condition = _build_sell_gap_condition(condition_a, warnings, "sell condition A")
     rsi_condition = _build_sell_condition_a_rsi_condition(condition_a, warnings)
-    if rsi_condition:
-        conditions.append(rsi_condition)
-
-    if not conditions:
+    group = _sell_group_from_rows(
+        name="condition_a",
+        rows=[
+            ("OCR", ocr_conditions, condition_a.get("ocr_logic_combo")),
+            ("GAP", [gap_condition] if gap_condition else [], condition_a.get("gap_logic_combo")),
+            ("RSI", [rsi_condition] if rsi_condition else [], None),
+        ],
+        warnings=warnings,
+    )
+    if group is None:
         return None
 
     return {
         "path": SELL_CONDITION_A_SIGNAL_PREVIEW_PATH,
         "candidate_type": "add_signal",
         "value": {
-            "enabled": False,
+            "enabled": True,
             "preview_candidate": True,
             "groups_logic": "OR",
-            "groups": [{
-                "enabled": True,
-                "name": "condition_a",
-                "conditions_logic": "AND",
-                "conditions": conditions,
-            }],
+            "groups": [group],
         },
+    }
+
+
+def _expression_identifier(name: str) -> dict[str, Any]:
+    return {"type": "identifier", "name": name}
+
+
+def _fold_expression_ids(identifiers: list[str]) -> dict[str, Any] | None:
+    if not identifiers:
+        return None
+    node = _expression_identifier(identifiers[0])
+    for identifier in identifiers[1:]:
+        node = {
+            "type": "binary",
+            "operator": "AND",
+            "left": node,
+            "right": _expression_identifier(identifier),
+        }
+    return node
+
+
+def _row_logic_expression(
+    left_ids: list[str],
+    right_ids: list[str],
+    operator_value: Any,
+    warnings: list[str],
+    label: str,
+) -> dict[str, Any] | None:
+    left = _fold_expression_ids(left_ids)
+    right = _fold_expression_ids(right_ids)
+    if left is None:
+        return right
+    if right is None:
+        return left
+    operator = str(operator_value or "AND").strip().upper()
+    if operator not in {"AND", "OR", "NOT"}:
+        warnings.append(f"{label} logic is not supported: {operator_value!r}")
+        return None
+    return {"type": "binary", "operator": operator, "left": left, "right": right}
+
+
+def _attach_sell_signal_expression(
+    candidates: dict[str, dict[str, Any]],
+    expression: Any,
+    warnings: list[str],
+) -> None:
+    expression_text = str(expression or "").strip()
+    if not expression_text or not candidates:
+        return
+    parsed = parse_condition_expression(
+        expression_text,
+        allowed_identifiers={"A", "B", "C"},
+        allow_duplicate_identifiers=False,
+    )
+    if not parsed.get("ok"):
+        warnings.append(f"sell signal expression is invalid: {parsed.get('reason')}")
+        candidates.clear()
+        return
+    expression_value = {
+        "source": expression_text,
+        "normalized": parsed["normalized"],
+        "ast": parsed["ast"],
+        "identifiers": parsed["identifiers"],
+        "identifier_map": {
+            "A": APPROVED_SELL_CONDITION_A_SIGNAL_KEY,
+            "B": APPROVED_SELL_CONDITION_B_SIGNAL_KEY,
+            "C": APPROVED_SELL_CONDITION_C_SIGNAL_KEY,
+        },
+    }
+    for candidate in candidates.values():
+        value = _as_dict(candidate.get("value"))
+        value["signal_expression"] = deepcopy(expression_value)
+
+
+def _build_sell_condition_b_price_box_condition(condition_b: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    if condition_b.get("price_box_check") is False:
+        return None
+    if not any(key in condition_b for key in ("price_box_direction_combo", "price_box_value_line", "price_box_compare_combo")):
+        return None
+    compare_target = {
+        "상향": "PRICE_BOX_UPPER",
+        "하향": "PRICE_BOX_LOWER",
+        "UPPER": "PRICE_BOX_UPPER",
+        "LOWER": "PRICE_BOX_LOWER",
+    }.get(str(condition_b.get("price_box_direction_combo") or "").strip())
+    operator = _compare_operator(condition_b.get("price_box_compare_combo"))
+    value = _safe_float(condition_b.get("price_box_value_line"))
+    if compare_target is None or operator not in {">=", "<="} or value is None or value < 0:
+        warnings.append("sell condition B Price Box policy is invalid")
+        return None
+    return {
+        "enabled": True,
+        "not": False,
+        "target": "CLOSE",
+        "operator": operator,
+        "compare_target": compare_target,
+        "value": value,
+        "description": "UI preview: sell condition B Price Box condition",
     }
 
 
@@ -1710,11 +1997,6 @@ def _build_sell_condition_b_bollinger_condition(condition_b: dict[str, Any], war
         "bollinger_value_line",
         "bollinger_compare_combo",
     )):
-        return None
-
-    logic = str(condition_b.get("bollinger_logic_combo", "AND") or "AND").strip().upper()
-    if logic != "AND":
-        warnings.append(f"sell condition B Bollinger logic is not supported: {condition_b.get('bollinger_logic_combo')!r}")
         return None
 
     direction = str(condition_b.get("bollinger_direction_combo") or "").strip()
@@ -1737,47 +2019,41 @@ def _build_sell_condition_b_bollinger_condition(condition_b: dict[str, Any], war
     if offset is None:
         warnings.append("sell condition B Bollinger offset is not numeric")
         return None
-    signed_offset = abs(offset) if compare_target == "BOLLINGER_UPPER" else -abs(offset)
-
     return {
         "enabled": True,
         "not": False,
         "target": "CLOSE",
         "operator": operator,
         "compare_target": compare_target,
-        "value": signed_offset,
+        "value": abs(offset) if compare_target == "BOLLINGER_UPPER" else -abs(offset),
         "description": "UI preview: sell condition B Bollinger band condition",
     }
 
 
 def _build_sell_condition_b_signal_candidate(condition_b: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
-    unsupported_active = False
-    if condition_b.get("price_box_check") is True:
-        warnings.append("sell condition B Price Box mapping is postponed until price box series semantics are finalized")
-        unsupported_active = True
-    if condition_b.get("gap_check") is True:
-        warnings.append("sell condition B GAP mapping is postponed until gap semantics are finalized")
-        unsupported_active = True
-
+    price_box_condition = _build_sell_condition_b_price_box_condition(condition_b, warnings)
     bollinger_condition = _build_sell_condition_b_bollinger_condition(condition_b, warnings)
-    if unsupported_active:
-        return None
-    if not bollinger_condition:
+    gap_condition = _build_sell_gap_condition(condition_b, warnings, "sell condition B")
+    group = _sell_group_from_rows(
+        name="condition_b",
+        rows=[
+            ("PRICE_BOX", [price_box_condition] if price_box_condition else [], condition_b.get("price_box_logic_combo")),
+            ("BOLLINGER", [bollinger_condition] if bollinger_condition else [], condition_b.get("bollinger_logic_combo")),
+            ("GAP", [gap_condition] if gap_condition else [], None),
+        ],
+        warnings=warnings,
+    )
+    if group is None:
         return None
 
     return {
         "path": SELL_CONDITION_B_SIGNAL_PREVIEW_PATH,
         "candidate_type": "add_signal",
         "value": {
-            "enabled": False,
+            "enabled": True,
             "preview_candidate": True,
             "groups_logic": "OR",
-            "groups": [{
-                "enabled": True,
-                "name": "condition_b",
-                "conditions_logic": "AND",
-                "conditions": [bollinger_condition],
-            }],
+            "groups": [group],
         },
     }
 
@@ -1975,8 +2251,14 @@ def build_engine_rules_preview_from_ui_state(
             "value": bar_minutes,
         }
 
+    signal_runtime_policy_candidate = _build_signal_runtime_policy_candidate(basic, validation_warnings)
+    if signal_runtime_policy_candidate:
+        _set_path_value(preview_rules, SIGNAL_RUNTIME_POLICY_PATH, signal_runtime_policy_candidate["value"])
+        preview_candidates["signal_runtime_policy"] = signal_runtime_policy_candidate
+
     buy_ui = _as_dict(state.get("buy_ui"))
-    signal_filter = _as_dict(buy_ui.get("signal_filter"))
+    signal_filter = deepcopy(_as_dict(buy_ui.get("signal_filter")))
+    signal_filter["signal_expression"] = basic.get("buy_signal_expr_line")
     price_compare = _as_dict(buy_ui.get("price_compare"))
     execution_base = _as_dict(buy_ui.get("base"))
     execution_repeat = _as_dict(buy_ui.get("repeat"))
@@ -2183,6 +2465,12 @@ def build_engine_rules_preview_from_ui_state(
     else:
         validation_warnings.append("sell condition C candidate group was not generated")
 
+    _attach_sell_signal_expression(
+        sell_add_signal_candidates,
+        basic.get("sell_signal_expr_line"),
+        validation_warnings,
+    )
+
     if sell_add_signal_candidates or sell_profit_rate_candidate or sell_method_candidates:
         sell_candidates: dict[str, Any] = {}
         if sell_method_candidates:
@@ -2201,6 +2489,7 @@ def build_engine_rules_preview_from_ui_state(
     preview_rules["indicator_follow_rule_preview"] = {
         "mode": "merge_add_candidate",
         "candidates": preview_candidates,
+        "reserved_controls": [],
     }
 
     if not buy_execution_base_candidate:
@@ -2212,6 +2501,8 @@ def build_engine_rules_preview_from_ui_state(
     mapped_paths = [
         BAR_MINUTES_PATH,
     ]
+    if signal_runtime_policy_candidate:
+        mapped_paths.append(SIGNAL_RUNTIME_POLICY_PATH)
     if buy_candidate:
         mapped_paths.append(BUY_CONDITIONS_PATH)
     if buy_ma_filter_candidate:
@@ -2304,6 +2595,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
     if bar_candidate:
         bar_path = str(bar_candidate.get("path") or BAR_MINUTES_PATH)
         candidate_paths[bar_path] = "set_value"
+
+    signal_policy_candidate = _as_dict(candidates.get("signal_runtime_policy"))
+    if signal_policy_candidate:
+        policy_path = str(signal_policy_candidate.get("path") or SIGNAL_RUNTIME_POLICY_PATH)
+        candidate_paths[policy_path] = "set_signal_runtime_policy"
 
     buy_candidate = _as_dict(candidates.get("buy"))
     if buy_candidate:
@@ -2428,6 +2724,7 @@ def build_rule_approval_session_fingerprint(
     mapped_paths = list(_as_list(preview.get("mapped_paths")))
     current_rule_targets = {
         BAR_MINUTES_PATH: _get_path_value(rules, BAR_MINUTES_PATH),
+        SIGNAL_RUNTIME_POLICY_PATH: _get_path_value(rules, SIGNAL_RUNTIME_POLICY_PATH),
         BUY_CONDITIONS_PATH: _get_path_value(rules, BUY_CONDITIONS_PATH),
         BUY_MOVING_AVERAGE_FILTER_PATH: _get_path_value(rules, BUY_MOVING_AVERAGE_FILTER_PATH),
         BUY_BOLLINGER_FILTER_PATH: _get_path_value(rules, BUY_BOLLINGER_FILTER_PATH),
@@ -2771,6 +3068,24 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == SIGNAL_RUNTIME_POLICY_PATH:
+            candidate = _as_dict(preview_candidates.get("signal_runtime_policy"))
+            value = candidate.get("value")
+            if not isinstance(value, dict):
+                skipped_paths.append(_patch_skipped(path, "signal runtime policy value is not available"))
+                continue
+            if _get_path_value(current, path) == value:
+                skipped_paths.append(_patch_skipped(path, "signal runtime policy is unchanged"))
+                continue
+            patches.append({
+                "source_path": path,
+                "target_path": path,
+                "operation": "set_signal_runtime_policy",
+                "value": deepcopy(value),
+                "risk": "medium",
+            })
+            continue
+
         if path == RSI_INDICATOR_PATH:
             rsi_candidate = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi"))
             candidate_value = rsi_candidate.get("value")
@@ -3090,7 +3405,7 @@ def build_approved_rule_patch_preview(
             signal.pop("path", None)
             signal.pop("candidate_type", None)
             signal.pop("preview_candidate", None)
-            signal["enabled"] = False
+            signal["enabled"] = signal.get("enabled") is True
             existing_signal = _get_path_value(current, target_path)
             if existing_signal is not _MISSING:
                 if existing_signal == signal:
@@ -3188,6 +3503,21 @@ def apply_approved_rule_patch_preview(
                 continue
 
             indicators_section["rsi"] = deepcopy(value)
+            applied_patches.append({
+                "source_path": patch.get("source_path"),
+                "target_path": target_path,
+                "operation": operation,
+            })
+            continue
+
+        if operation == "set_signal_runtime_policy":
+            value = patch.get("value")
+            if target_path != SIGNAL_RUNTIME_POLICY_PATH or not isinstance(value, dict):
+                skipped_patches.append(_apply_skipped(patch, "unsupported signal runtime policy"))
+                continue
+            if not _set_path_value(applied_rules_preview, target_path, value):
+                skipped_patches.append(_apply_skipped(patch, "signal runtime policy path is not writable"))
+                continue
             applied_patches.append({
                 "source_path": patch.get("source_path"),
                 "target_path": target_path,
@@ -3375,7 +3705,7 @@ def apply_approved_rule_patch_preview(
                 continue
             signal.pop("preview_candidate", None)
             signal.pop("candidate_type", None)
-            signal["enabled"] = False
+            signal["enabled"] = signal.get("enabled") is True
             signals[sell_target_key] = signal
             applied_patches.append({
                 "source_path": patch.get("source_path"),
@@ -3413,6 +3743,16 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "path": BAR_MINUTES_PATH,
             "operation": "set_value",
             "change_type": "set_bar_minutes",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_signal_runtime_policy" and target_path == SIGNAL_RUNTIME_POLICY_PATH:
+        diffs.append({
+            "path": SIGNAL_RUNTIME_POLICY_PATH,
+            "operation": "set_signal_runtime_policy",
+            "change_type": "set_signal_runtime_policy",
             "value": deepcopy(patch.get("value")),
             "replace": False,
         })
@@ -4197,7 +4537,7 @@ def approve_engine_rule_candidates(
                 approved_signal.pop("path", None)
                 approved_signal.pop("candidate_type", None)
                 approved_signal.pop("preview_candidate", None)
-                approved_signal["enabled"] = False
+                approved_signal["enabled"] = approved_signal.get("enabled") is True
                 signals[target_key] = approved_signal
                 applied_paths.append(sell_preview_path)
 

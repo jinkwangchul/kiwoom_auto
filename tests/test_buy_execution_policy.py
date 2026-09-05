@@ -103,7 +103,7 @@ class BuyExecutionPolicyTest(unittest.TestCase):
         self.assertEqual(80000, result["round_budget"])
         self.assertEqual(40000, result["evidence"]["budget_calculation"]["ignored_remainder"])
 
-    def test_repeat_add_uses_previous_plus_initial_budget_factor(self):
+    def test_repeat_add_uses_confirmed_round_plus_value_times_starting_budget(self):
         result = self._evaluate(
             runtime_state_snapshot=self._runtime(
                 confirmed_current_buy_round=1,
@@ -116,9 +116,9 @@ class BuyExecutionPolicyTest(unittest.TestCase):
         self.assertEqual(2, result["buy_round"])
         self.assertEqual(15, result["quantity"])
         self.assertEqual(150000, result["round_budget"])
-        self.assertEqual("PREVIOUS_PLUS_BASE", result["budget_reference"])
+        self.assertEqual("CONFIRMED_ROUND_PLUS_VALUE_X_STARTING_BUDGET", result["budget_reference"])
 
-    def test_repeat_multiply_uses_initial_budget_reference(self):
+    def test_repeat_multiply_uses_confirmed_round_times_value_times_starting_budget(self):
         repeat = self._rules()["buy"]["execution"]["repeat"]
         repeat.update(round_operator="MULTIPLY", round_budget_value=1.5)
         result = self._evaluate(
@@ -131,7 +131,7 @@ class BuyExecutionPolicyTest(unittest.TestCase):
 
         self.assertEqual(STATUS_READY, result["status"], result)
         self.assertEqual(150000, result["round_budget"])
-        self.assertEqual("BASE_BUDGET", result["budget_reference"])
+        self.assertEqual("CONFIRMED_ROUND_X_VALUE_X_STARTING_BUDGET", result["budget_reference"])
 
     def test_budget_mode_uses_previous_budget_not_total_budget(self):
         repeat = self._rules()["buy"]["execution"]["repeat"]
