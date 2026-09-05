@@ -22,14 +22,17 @@ from __future__ import annotations
 
 import json
 import sys
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from candle_timeframe_aggregation import (
+    aggregate_minute_candles,
     candle_market_datetime,
     completed_timeframe_candles,
     parse_market_datetime,
+    read_canonical_bar_minutes,
 )
 from execution_universe import (
     ExecutionUniverseSnapshot,
@@ -43,6 +46,11 @@ from event_journal_production import (
 )
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
 from routine_package_contract import EVALUATION_ROLE, load_routine_module
+from routine_main_facts import (
+    capture_routine_main_facts,
+    routine_main_facts_identity,
+    validate_routine_main_facts,
+)
 from gui_stock_data import find_library_stock_by_code
 from gui_operation_ui_context import actionable_current_price
 from order_candidate_engine import read_reference_price
@@ -54,9 +62,6 @@ from running_budget_adjustment import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 LOG_PATH = RUNTIME_DIR / "routine_signal_probe.log"
-ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
-FILLS_PATH = RUNTIME_DIR / "fills.json"
-POSITIONS_PATH = RUNTIME_DIR / "positions.json"
 _DEFAULT_OBSERVER_SENTINEL = object()
 TRIGGER_PROVENANCE_FIELDS = (
     "trigger_commit_identity",
@@ -65,6 +70,15 @@ TRIGGER_PROVENANCE_FIELDS = (
     "trigger_canonical_content_hash",
 )
 _DEFAULT_DECISION_TRACE_OBSERVER: Any = None
+
+
+def _requires_base_bar_entry_projection(rules: dict[str, Any] | None) -> bool:
+    """Compatibility query delegated to the routine-owned OCR contract."""
+    try:
+        from routines.지표추종매매.routine import market_bar_projection_request
+        return market_bar_projection_request(rules).get("projection") == "FORMING_BASE_BAR"
+    except Exception:
+        return False
 
 
 def _routine_observer_owner() -> Any:
@@ -173,15 +187,6 @@ def _read_json(path: Path) -> Any:
 def _read_json_dict(path: Path) -> dict[str, Any]:
     data = _read_json(path)
     return data if isinstance(data, dict) else {}
-
-
-def _read_runtime_ledger(path: Path, list_key: str) -> dict[str, Any] | None:
-    if not path.exists():
-        return {"version": 1, list_key: []}
-    data = _read_json(path)
-    if not isinstance(data, dict) or not isinstance(data.get(list_key), list):
-        return None
-    return data
 
 
 def _append_log(line: str) -> None:
@@ -300,7 +305,7 @@ def _signal_marker_snapshot(
     result: dict[str, Any],
     candles: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    index = result.get("signal_index")
+    index = result.get("signal_activation_index", result.get("signal_index"))
     if not isinstance(index, int) or isinstance(index, bool):
         return {}
     if not candles or not -len(candles) <= index < len(candles):
@@ -356,7 +361,7 @@ def apply_signal_runtime_error_policy(
     policy = str(runtime_policy.get("error_policy") or "STOP_AND_REVIEW").strip().upper()
     if policy not in {"STOP_AND_REVIEW", "CONTINUE_NEXT_CYCLE"}:
         policy = "STOP_AND_REVIEW"
-    reason_code = "INDICATOR_FOLLOW_ABNORMAL_SIGNAL_FLOW"
+    reason_code = "ROUTINE_ABNORMAL_SIGNAL_FLOW"
     event_result = event_appender(
         "PROCESSING_ERROR",
         severity="ERROR",
@@ -371,7 +376,7 @@ def apply_signal_runtime_error_policy(
         routine=routine_name,
         reason_code=reason_code,
         component="routine_signal_probe",
-        operation="evaluate_indicator_follow",
+        operation="evaluate_routine",
         details={"error_policy": policy, "reason": result.get("reason")},
     )
     result["error_policy_event"] = event_result
@@ -379,14 +384,14 @@ def apply_signal_runtime_error_policy(
     if policy == "STOP_AND_REVIEW":
         review_payload = {
             "review_reasons": [reason_code],
-            "review_location": "INDICATOR_FOLLOW_ERROR_POLICY",
+            "review_location": "ROUTINE_ERROR_POLICY",
             "routine": routine_name,
             "detail": result.get("reason"),
         }
         if callable(review_marker):
             try:
                 result["error_policy_review_created"] = bool(
-                    review_marker(stock_dir, code, name, review_payload, source="INDICATOR_FOLLOW_ERROR_POLICY")
+                    review_marker(stock_dir, code, name, review_payload, source="ROUTINE_ERROR_POLICY")
                 )
             except Exception:
                 result["error_policy_review_created"] = False
@@ -410,10 +415,34 @@ def probe_routine_for_stock(
     account_budget_context: dict[str, Any] | None = None,
     actionable_price_reader: Callable[[str, str], Any] | None = None,
     review_marker: Callable[..., Any] | None = None,
+    main_facts: dict[str, Any] | None = None,
+    fresh_main_facts_provider: Callable[[], dict[str, Any]] | None = None,
+    _facts_retry: int = 0,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
-    state = _read_json_dict(stock_dir / "state.json")
-    stock_config = _read_json_dict(stock_dir / "config.json")
+    if isinstance(main_facts, dict):
+        facts_valid, facts_reason = validate_routine_main_facts(main_facts)
+        if not facts_valid:
+            return {
+                "signal": "ERROR",
+                "reason": facts_reason,
+                "routine": routine_name,
+                "code": code,
+                "name": name,
+            }
+        state = deepcopy((main_facts.get("stock_states") or {}).get(code) or {})
+        stock_config = deepcopy((main_facts.get("stock_configs") or {}).get(code) or {})
+        if not state or not stock_config:
+            return {
+                "signal": "ERROR",
+                "reason": "MAIN_FACTS_STOCK_PROJECTION_MISSING",
+                "routine": routine_name,
+                "code": code,
+                "name": name,
+            }
+    else:
+        state = _read_json_dict(stock_dir / "state.json")
+        stock_config = _read_json_dict(stock_dir / "config.json")
     routine_instance_id = str(stock_config.get("assigned_routine_instance_id") or "").strip()
     routine_type = str(getattr(routine_module, "ROUTINE_TYPE", "") or "").strip()
     instance_rules: dict[str, Any] | None = None
@@ -434,14 +463,41 @@ def probe_routine_for_stock(
             "name": name,
         }
     else:
-        raw_candles = _load_candles_from_stock_dir(stock_dir)
+        facts_market = main_facts.get("market", {}) if isinstance(main_facts, dict) else {}
+        facts_candles = (
+            facts_market.get("raw_candles_by_code", {}).get(code)
+            if isinstance(facts_market, dict)
+            and isinstance(facts_market.get("raw_candles_by_code"), dict)
+            else None
+        )
+        raw_candles = (
+            [deepcopy(value) for value in facts_candles if isinstance(value, dict)]
+            if isinstance(facts_candles, list)
+            else _load_candles_from_stock_dir(stock_dir)
+        )
         instance_rules = _load_instance_rules(routine_instance_id)
         try:
-            candles = completed_timeframe_candles(
-                raw_candles,
-                instance_rules,
-                now=parse_market_datetime(tick_key),
-            )
+            tick_time = parse_market_datetime(tick_key)
+            projection_reader = getattr(routine_module, "market_bar_projection_request", None)
+            if not callable(projection_reader):
+                raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_UNAVAILABLE")
+            projection_request = projection_reader(instance_rules)
+            if not isinstance(projection_request, dict) or projection_request.get("projection") not in {
+                "FORMING_BASE_BAR", "COMPLETED_TIMEFRAME"
+            }:
+                raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
+            if projection_request["projection"] == "FORMING_BASE_BAR":
+                candles = aggregate_minute_candles(
+                    raw_candles,
+                    read_canonical_bar_minutes(instance_rules),
+                    now=tick_time,
+                )
+            else:
+                candles = completed_timeframe_candles(
+                    raw_candles,
+                    instance_rules,
+                    now=tick_time,
+                )
             candle_projection_error = ""
         except ValueError as exc:
             candles = []
@@ -495,7 +551,10 @@ def probe_routine_for_stock(
                 "tick_key": tick_key,
                 "routine_instance_id": routine_instance_id,
                 "routine_type": routine_type,
+                "forming_base_bar_projection": projection_request["projection"] == "FORMING_BASE_BAR",
             }
+            if isinstance(main_facts, dict):
+                context["main_facts"] = deepcopy(main_facts)
             library_stock = find_library_stock_by_code(code)
             if isinstance(library_stock, dict):
                 classification = str(library_stock.get("classification") or "").strip()
@@ -504,7 +563,9 @@ def probe_routine_for_stock(
                     context["instrument_classification"] = classification
                 if market:
                     context["market"] = market
-            if isinstance(account_budget_context, dict):
+            if isinstance(main_facts, dict) and isinstance(main_facts.get("budget"), dict):
+                context["account_budget"] = deepcopy(main_facts["budget"])
+            elif isinstance(account_budget_context, dict):
                 context["account_budget"] = dict(account_budget_context)
             provenance = {
                 field: trigger_provenance.get(field)
@@ -531,10 +592,18 @@ def probe_routine_for_stock(
                         context["decision_trace_observer"] = trace_collector
                 except Exception:
                     trace_collector = None
-            reference_price = read_reference_price(code, name)
+            reference_price = None
+            if isinstance(facts_market, dict):
+                reference_price = (facts_market.get("reference_prices_by_code") or {}).get(code)
+            if reference_price is None:
+                reference_price = read_reference_price(code, name)
             if isinstance(reference_price, (int, float)) and reference_price > 0:
                 context["reference_price"] = reference_price
-            if callable(actionable_price_reader):
+            if isinstance(main_facts, dict):
+                current_price = (main_facts.get("actionable_prices_by_code") or {}).get(code)
+                if isinstance(current_price, (int, float)) and current_price > 0:
+                    context["actionable_current_price"] = current_price
+            elif callable(actionable_price_reader):
                 try:
                     current_price = actionable_price_reader(code, name)
                 except Exception:
@@ -544,12 +613,15 @@ def probe_routine_for_stock(
             cycle_projector = getattr(routine_module, "project_cycle_context", None)
             if callable(cycle_projector):
                 try:
+                    if not isinstance(main_facts, dict):
+                        raise ValueError("ROUTINE_SIGNAL_MAIN_FACTS_REQUIRED")
                     context["cycle"] = cycle_projector(
                         code=code,
                         routine_instance_id=routine_instance_id,
-                        order_queue=_read_runtime_ledger(ORDER_QUEUE_PATH, "orders"),
-                        fills=_read_runtime_ledger(FILLS_PATH, "fills"),
-                        positions=_read_runtime_ledger(POSITIONS_PATH, "positions"),
+                        order_queue=deepcopy(main_facts.get("orders") or []),
+                        fills=deepcopy(main_facts.get("fills") or []),
+                        positions=deepcopy(main_facts.get("positions") or []),
+                        signals=deepcopy(main_facts.get("signals") or []),
                     )
                 except Exception as exc:
                     context["cycle"] = {
@@ -565,6 +637,8 @@ def probe_routine_for_stock(
                         "unresolved_reason": f"CYCLE_PROJECTION_ERROR:{type(exc).__name__}",
                     }
             try:
+                if isinstance(main_facts, dict) and not callable(cycle_projector):
+                    raise ValueError("ROUTINE_CYCLE_PROJECTION_UNAVAILABLE")
                 raw_result = evaluate(context)
                 if isinstance(raw_result, dict):
                     signal_kind = str(raw_result.get("signal") or "").strip().upper()
@@ -614,12 +688,56 @@ def probe_routine_for_stock(
                 for field, value in provenance.items():
                     result.setdefault(field, value)
 
+                if isinstance(main_facts, dict) and callable(fresh_main_facts_provider):
+                    fresh_facts = fresh_main_facts_provider()
+                    fresh_valid, fresh_reason = validate_routine_main_facts(fresh_facts)
+                    if not fresh_valid:
+                        raise ValueError(fresh_reason)
+                    if fresh_facts.get("snapshot_hash") != main_facts.get("snapshot_hash"):
+                        if _facts_retry >= 2:
+                            return {
+                                "signal": "SKIP",
+                                "reason": "MAIN_FACTS_CHANGED_BEFORE_SIGNAL_MUTATION",
+                                "routine": routine_name,
+                                "code": code,
+                                "name": name,
+                                "facts_stale": True,
+                            }
+                        return probe_routine_for_stock(
+                            routine_module,
+                            routine_name,
+                            stock_dir,
+                            tick_key,
+                            decision_trace_observer=decision_trace_observer,
+                            trigger_provenance=trigger_provenance,
+                            account_budget_context=account_budget_context,
+                            actionable_price_reader=actionable_price_reader,
+                            review_marker=review_marker,
+                            main_facts=fresh_facts,
+                            fresh_main_facts_provider=fresh_main_facts_provider,
+                            _facts_retry=_facts_retry + 1,
+                        )
+                if isinstance(main_facts, dict):
+                    facts_identity = routine_main_facts_identity(
+                        main_facts,
+                        stock_code=code,
+                    )
+                    result["evaluation_facts_identity"] = facts_identity
+                    for intent_key in ("execution_intent", "execution_intents"):
+                        intents = result.get(intent_key)
+                        if isinstance(intents, dict):
+                            intents["evaluation_facts_identity"] = dict(facts_identity)
+                        elif isinstance(intents, list):
+                            for intent in intents:
+                                if isinstance(intent, dict):
+                                    intent["evaluation_facts_identity"] = dict(facts_identity)
+
                 queue_result = _maybe_enqueue_signal(
                     result,
                     routine_name=routine_name,
                     code=code,
                     name=name,
-                    tick_key=tick_key,
+                    tick_key=str(result.get("signal_activation_bar_time") or tick_key),
                     routine_type=routine_type,
                     routine_instance_id=routine_instance_id,
                     candles=candles,
@@ -1033,6 +1151,53 @@ def probe_execution_stock_for_committed_bar(
         f"routine_assignment:{code}",
         active=False,
     )
+
+    def capture_signal_facts() -> dict[str, Any]:
+        account_getter = getattr(window, "current_selected_account_no", None)
+        if not callable(account_getter):
+            account_getter = getattr(window, "selected_account_no", None)
+        if not callable(account_getter):
+            account_getter = getattr(window, "_selected_account_no", None)
+        account_no = str(account_getter() or "").strip() if callable(account_getter) else ""
+        current_price = actionable_current_price(window, code)
+        current_cash = (
+            window.current_orderable_cash_for_budget()
+            if callable(getattr(window, "current_orderable_cash_for_budget", None))
+            else None
+        )
+        budget = _production_account_budget_context(window)
+        return capture_routine_main_facts(
+            stock_dirs={code: target_dir},
+            selected_account_no=account_no,
+            allowed_stock_codes=(code,),
+            actionable_prices_by_code={code: current_price},
+            current_orderable_cash=current_cash,
+            budget=budget,
+            market={
+                "tick_key": tick_key,
+                "raw_candles_by_code": {code: _load_candles_from_stock_dir(target_dir)},
+                "reference_prices_by_code": {code: read_reference_price(code, name)},
+            },
+        ).to_payload()
+
+    try:
+        signal_main_facts = capture_signal_facts()
+    except Exception as exc:
+        _observe_routine_contract_failure(
+            scope=f"routine_signal_facts:{code}",
+            reason_code="ROUTINE_SIGNAL_FACTS_UNAVAILABLE",
+            routine_name=routine_name,
+            stock_code=code,
+            stock_name=name,
+            result_type=type(exc).__name__,
+        )
+        return {
+            "signal": "ERROR",
+            "reason": "ROUTINE_SIGNAL_FACTS_UNAVAILABLE",
+            "routine": routine_name,
+            "code": code,
+            "name": name,
+        }
     probe_kwargs = (
         {"trigger_provenance": trigger_provenance}
         if isinstance(trigger_provenance, dict) and trigger_provenance
@@ -1047,6 +1212,8 @@ def probe_execution_stock_for_committed_bar(
         )
     )
     probe_kwargs["review_marker"] = getattr(window, "mark_review_required", None)
+    probe_kwargs["main_facts"] = signal_main_facts
+    probe_kwargs["fresh_main_facts_provider"] = capture_signal_facts
     return probe_routine_for_stock(
         routine_module,
         routine_name,

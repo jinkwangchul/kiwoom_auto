@@ -35,6 +35,7 @@ from execution_time_slice_due import (
     inspect_buy_slice_funding,
     cancel_effect_state,
 )
+from routine_main_facts import records_from_routine_main_facts
 
 
 def _positive_number(value: Any) -> float | None:
@@ -104,6 +105,7 @@ def inspect_eligible_ratio_slices(
     fills_path: str | Path = FILLS_PATH,
     positions_path: str | Path = POSITIONS_PATH,
     holdings_path: str | Path = HOLDINGS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return at most one safe eligible ratio child per signal without writes."""
     account_no = _text(selected_account_no)
@@ -132,7 +134,11 @@ def inspect_eligible_ratio_slices(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in sources:
-        values, error = _read(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)

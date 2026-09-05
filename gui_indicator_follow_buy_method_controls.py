@@ -278,6 +278,8 @@ class IndicatorFollowBuyMethodControlsMixin:
         time_row.addStretch(1)
         time_mode_combo = self.buy_base_time_mode_combo
         time_stack = self.buy_base_time_stack
+        ratio_direction_combo = self.buy_base_ratio_direction_combo
+        ratio_compare_combo = self.buy_base_ratio_compare_combo
 
         self.buy_last_round_active_row_widget = QWidget()
         last_round_active_row = QHBoxLayout(self.buy_last_round_active_row_widget)
@@ -345,11 +347,24 @@ class IndicatorFollowBuyMethodControlsMixin:
             time_stack.updateGeometry()
             time_stack.update()
 
+        def update_base_ratio_direction_comparator_local(*_args):
+            sync_buy_direction_comparator(
+                ratio_direction_combo,
+                ratio_compare_combo,
+            )
+
         time_mode_combo.currentIndexChanged.connect(update_time_mode_local)
+        ratio_direction_combo.currentTextChanged.connect(
+            update_base_ratio_direction_comparator_local
+        )
         if not hasattr(self, "_buy_time_mode_state_updaters"):
             self._buy_time_mode_state_updaters = []
         self._buy_time_mode_state_updaters.append(update_time_mode_local)
+        self._buy_time_mode_state_updaters.append(
+            update_base_ratio_direction_comparator_local
+        )
         update_time_mode_local()
+        update_base_ratio_direction_comparator_local()
         update_last_round_active_state_local()
 
     def _build_repeat_buy_section(self, layout, make_combo, make_line, make_label):
@@ -377,12 +392,6 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         self.buy_base_detail_mode_combo = make_combo(
             ["회차기준", "예산기준", "능동매수"], "회차기준", 116, ModeSwitchComboBox
-        )
-        set_buy_combo_item_enabled(
-            self.buy_base_detail_mode_combo,
-            "능동매수",
-            False,
-            "ACTIVE_BUY_NOT_IMPLEMENTED",
         )
         base_detail_row.addWidget(self.buy_base_detail_mode_combo)
         base_detail_row.addWidget(make_label("|", 8, Qt.AlignCenter))
@@ -575,6 +584,8 @@ class IndicatorFollowBuyMethodControlsMixin:
         base_detail_row = self.buy_base_detail_row_widget
         base_mode_combo = self.buy_base_detail_mode_combo
         base_detail_stack = self.buy_base_detail_stack
+        base_active_direction_combo = self.buy_base_active_direction_combo
+        base_active_compare_combo = self.buy_base_active_compare_combo
 
         price_check = self.buy_price_compare_check
         price_detail_row = self.buy_price_compare_detail_row_widget
@@ -601,6 +612,12 @@ class IndicatorFollowBuyMethodControlsMixin:
             base_detail_stack.setCurrentIndex(index if index >= 0 else 0)
             base_detail_row.updateGeometry()
             base_detail_row.update()
+
+        def update_base_active_comparator_local(*_args):
+            sync_buy_direction_comparator(
+                base_active_direction_combo,
+                base_active_compare_combo,
+            )
 
         def update_price_mode_local(*_args):
             index = price_mode_combo.currentIndex()
@@ -658,6 +675,9 @@ class IndicatorFollowBuyMethodControlsMixin:
         base_check.toggled.connect(lambda _checked: update_exclusive_local("base"))
         price_check.toggled.connect(lambda _checked: update_exclusive_local("price_compare"))
         base_mode_combo.currentIndexChanged.connect(update_base_mode_local)
+        base_active_direction_combo.currentTextChanged.connect(
+            update_base_active_comparator_local
+        )
         price_mode_combo.currentIndexChanged.connect(update_price_mode_local)
         price_above_mode_combo.currentIndexChanged.connect(update_price_above_mode_local)
         price_condition_combo.currentIndexChanged.connect(lambda *_args: update_price_compare_boundary_local("top"))
@@ -666,7 +686,11 @@ class IndicatorFollowBuyMethodControlsMixin:
         if not hasattr(self, "_buy_base_price_compare_state_updaters"):
             self._buy_base_price_compare_state_updaters = []
         self._buy_base_price_compare_state_updaters.append(update_exclusive_local)
+        self._buy_base_price_compare_state_updaters.append(
+            update_base_active_comparator_local
+        )
         update_price_compare_boundary_local()
+        update_base_active_comparator_local()
         update_exclusive_local()
 
     def _build_additional_section(self, layout, make_combo, make_line, make_label):
@@ -794,86 +818,213 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_situation_response_label.setStyleSheet("font-size: 9pt; font-weight: bold;")
         layout.addWidget(self.buy_situation_response_label, 0, Qt.AlignLeft)
 
-        situation_response_row_widget = QWidget()
-        situation_response_row = QHBoxLayout(situation_response_row_widget)
-        situation_response_row.setContentsMargins(16, 0, 0, 0)
-        situation_response_row.setSpacing(4)
-        layout.addWidget(situation_response_row_widget)
-
-        situation_type_combo = make_combo(["미체결", "가격비교"], "가격비교", 116)
-        situation_detail_stack = QStackedWidget()
-        situation_detail_stack.setFixedHeight(30)
+        situation_response_widget = QWidget()
+        situation_response_layout = QVBoxLayout(situation_response_widget)
+        situation_response_layout.setContentsMargins(16, 0, 0, 0)
+        situation_response_layout.setSpacing(2)
+        layout.addWidget(situation_response_widget)
 
         unfilled_widget = QWidget()
         unfilled_layout = QHBoxLayout(unfilled_widget)
         unfilled_layout.setContentsMargins(0, 0, 0, 0)
         unfilled_layout.setSpacing(4)
+        unfilled_enabled_check = QCheckBox("미체결")
+        unfilled_enabled_check.setChecked(False)
         unfilled_scope_combo = make_combo(["매회", "일괄"], "매회", 66)
         unfilled_time_line = make_line("10", 34)
         unfilled_unit_combo = make_combo(["분", "초", "봉"], "초", 60)
         unfilled_order_cancel_label = make_label("후 주문취소", 86)
+        unfilled_layout.addWidget(unfilled_enabled_check)
         unfilled_layout.addWidget(unfilled_scope_combo)
         unfilled_layout.addWidget(make_label("기준", 36))
         unfilled_layout.addWidget(unfilled_time_line)
         unfilled_layout.addWidget(unfilled_unit_combo)
         unfilled_layout.addWidget(unfilled_order_cancel_label)
         unfilled_layout.addStretch(1)
-        situation_detail_stack.addWidget(unfilled_widget)
+        situation_response_layout.addWidget(unfilled_widget)
 
         price_compare_widget = QWidget()
         price_compare_layout = QHBoxLayout(price_compare_widget)
         price_compare_layout.setContentsMargins(0, 0, 0, 0)
         price_compare_layout.setSpacing(4)
-        price_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-        price_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 92)
-        price_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
-        price_ratio_line = make_line("0.15", 46)
-        price_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
-        price_action_combo = make_combo(["매수리셋", "일괄취소"], "일괄취소", 100)
-        price_compare_layout.addWidget(price_left_combo)
-        price_compare_layout.addWidget(make_label("대비", 36))
-        price_compare_layout.addWidget(price_right_combo)
-        price_compare_layout.addWidget(price_direction_combo)
-        price_compare_layout.addWidget(price_ratio_line)
-        price_compare_layout.addWidget(make_label("%", 14))
-        price_compare_layout.addWidget(price_compare_combo)
-        price_compare_layout.addWidget(price_action_combo)
+        price_enabled_check = QCheckBox("가격비교")
+        price_enabled_check.setChecked(False)
+        price_compare_layout.addWidget(price_enabled_check)
         price_compare_layout.addStretch(1)
-        situation_detail_stack.addWidget(price_compare_widget)
+        situation_response_layout.addWidget(price_compare_widget)
 
-        situation_response_row.addWidget(situation_type_combo)
-        situation_response_row.addWidget(make_label("|", 8, Qt.AlignCenter))
-        situation_response_row.addWidget(situation_detail_stack)
-        situation_response_row.addStretch(1)
+        price_slots_widget = QWidget()
+        price_slots_layout = QVBoxLayout(price_slots_widget)
+        # 가격비교 체크박스의 표시 중간부터 조건행이 시작되도록 들여쓴다.
+        price_slots_layout.setContentsMargins(28, 0, 0, 0)
+        price_slots_layout.setSpacing(2)
+        situation_response_layout.addWidget(price_slots_widget)
+        self.buy_situation_response_price_slots_widget = price_slots_widget
+
+        def build_price_slot(default_direction, optional=False):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            slot_enabled_check = QCheckBox(row_widget)
+            slot_enabled_check.setVisible(False)
+            slot_enabled_check.setChecked(not optional)
+            left_items = ["무설정", "주문가", "현재가", "평단가"] if optional else ["주문가", "현재가", "평단가"]
+            left_combo = make_combo(left_items, "무설정" if optional else "주문가", 82)
+            left_combo_base_style = left_combo.styleSheet()
+            right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 82)
+            direction_combo = make_combo(["상향", "하향", "상하"], default_direction, 66)
+            ratio_line = make_line("0.15", 46)
+            compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 66)
+            action_combo = make_combo(["매수리셋", "일괄취소"], "일괄취소", 92)
+            row.addWidget(left_combo)
+
+            detail_stack = QStackedWidget()
+            detail_stack.setFixedHeight(30)
+            placeholder_widget = QWidget()
+            placeholder_layout = QHBoxLayout(placeholder_widget)
+            placeholder_layout.setContentsMargins(0, 0, 0, 0)
+            placeholder_layout.setSpacing(4)
+            placeholder_layout.addWidget(make_label("대비", 30))
+            placeholder_right_combo = make_combo(["-"], "-", 82)
+            placeholder_direction_combo = make_combo(["-"], "-", 66)
+            placeholder_ratio_line = make_line("-", 46, Qt.AlignCenter)
+            placeholder_compare_combo = make_combo(["-"], "-", 66)
+            placeholder_action_combo = make_combo(["-"], "-", 92)
+            for widget in (
+                placeholder_right_combo,
+                placeholder_direction_combo,
+                placeholder_compare_combo,
+                placeholder_action_combo,
+            ):
+                widget.setEnabled(False)
+            placeholder_ratio_line.setEnabled(False)
+            placeholder_layout.addWidget(placeholder_right_combo)
+            placeholder_layout.addWidget(placeholder_direction_combo)
+            placeholder_layout.addWidget(placeholder_ratio_line)
+            placeholder_layout.addWidget(make_label("%", 14))
+            placeholder_layout.addWidget(placeholder_compare_combo)
+            placeholder_layout.addWidget(placeholder_action_combo)
+            placeholder_layout.addStretch(1)
+            detail_stack.addWidget(placeholder_widget)
+
+            detail_widget = QWidget()
+            detail_layout = QHBoxLayout(detail_widget)
+            detail_layout.setContentsMargins(0, 0, 0, 0)
+            detail_layout.setSpacing(4)
+            detail_layout.addWidget(make_label("대비", 30))
+            detail_layout.addWidget(right_combo)
+            detail_layout.addWidget(direction_combo)
+            detail_layout.addWidget(ratio_line)
+            detail_layout.addWidget(make_label("%", 14))
+            detail_layout.addWidget(compare_combo)
+            detail_layout.addWidget(action_combo)
+            detail_layout.addStretch(1)
+            detail_stack.addWidget(detail_widget)
+            row.addWidget(detail_stack)
+            row.addStretch(1)
+
+            def update_enabled(*_args):
+                configured = not optional or left_combo.currentText() != "무설정"
+                slot_enabled_check.setChecked(configured)
+                price_enabled = price_enabled_check.isChecked()
+                left_combo.setEnabled(price_enabled)
+                left_combo.setStyleSheet(
+                    left_combo_base_style
+                    + (" color: #808080;" if optional and not configured else "")
+                )
+                for widget in (right_combo, direction_combo, ratio_line, compare_combo, action_combo):
+                    widget.setEnabled(price_enabled and configured)
+                detail_stack.setCurrentIndex(1 if configured else 0)
+                if configured:
+                    sync_buy_direction_comparator(direction_combo, compare_combo)
+
+            direction_combo.currentTextChanged.connect(update_enabled)
+            left_combo.currentTextChanged.connect(update_enabled)
+            update_enabled()
+            return (row_widget, slot_enabled_check, left_combo, right_combo, direction_combo, ratio_line,
+                    compare_combo, action_combo, detail_stack, update_enabled)
+
+        (price_one_widget, price_one_enabled, price_one_left, price_one_right, price_one_direction,
+         price_one_ratio, price_one_compare, price_one_action, price_one_detail_stack,
+         update_price_one) = build_price_slot("상향")
+        (price_two_widget, price_two_enabled, price_two_left, price_two_right, price_two_direction,
+         price_two_ratio, price_two_compare, price_two_action, price_two_detail_stack,
+         update_price_two) = build_price_slot("하향", optional=True)
+        price_slots_layout.addWidget(price_one_widget)
+        price_slots_layout.addWidget(price_two_widget)
 
         # 기존 외부 참조 호환용 속성은 유지하되, 상태 전환은 생성 시점의
         # 로컬 위젯 참조로 처리한다. 동일 UI 중복 생성 시 self 참조 덮어쓰기 방지.
-        self.buy_situation_response_type_combo = situation_type_combo
-        self.buy_situation_response_detail_stack = situation_detail_stack
+        self.buy_situation_response_unfilled_enabled_check = unfilled_enabled_check
         self.buy_situation_response_unfilled_scope_combo = unfilled_scope_combo
         self.buy_situation_response_unfilled_time_line = unfilled_time_line
         self.buy_situation_response_unfilled_unit_combo = unfilled_unit_combo
         self.buy_situation_response_unfilled_order_cancel_label = unfilled_order_cancel_label
-        self.buy_situation_response_left_combo = price_left_combo
-        self.buy_situation_response_right_combo = price_right_combo
-        self.buy_situation_response_direction_combo = price_direction_combo
-        self.buy_situation_response_ratio_line = price_ratio_line
-        self.buy_situation_response_compare_combo = price_compare_combo
-        self.buy_situation_response_action_combo = price_action_combo
+        self.buy_situation_response_price_enabled_check = price_enabled_check
+        self.buy_situation_response_setting1_enabled_check = price_one_enabled
+        self.buy_situation_response_setting1_left_combo = price_one_left
+        self.buy_situation_response_setting1_right_combo = price_one_right
+        self.buy_situation_response_setting1_direction_combo = price_one_direction
+        self.buy_situation_response_setting1_ratio_line = price_one_ratio
+        self.buy_situation_response_setting1_compare_combo = price_one_compare
+        self.buy_situation_response_setting1_action_combo = price_one_action
+        self.buy_situation_response_setting1_detail_stack = price_one_detail_stack
+        self.buy_situation_response_setting2_enabled_check = price_two_enabled
+        self.buy_situation_response_setting2_left_combo = price_two_left
+        self.buy_situation_response_setting2_right_combo = price_two_right
+        self.buy_situation_response_setting2_direction_combo = price_two_direction
+        self.buy_situation_response_setting2_ratio_line = price_two_ratio
+        self.buy_situation_response_setting2_compare_combo = price_two_compare
+        self.buy_situation_response_setting2_action_combo = price_two_action
+        self.buy_situation_response_setting2_detail_stack = price_two_detail_stack
 
-        def update_situation_detail_local(*_args):
-            if situation_type_combo.currentText().strip() == "미체결":
-                situation_detail_stack.setCurrentIndex(0)
-            else:
-                situation_detail_stack.setCurrentIndex(1)
-            situation_response_row_widget.updateGeometry()
-            situation_response_row_widget.update()
+        # Compatibility aliases point only to setting 1.  Both setting slots
+        # retain their own editable direction and are not fixed to UP/DOWN.
+        self.buy_situation_response_left_combo = price_one_left
+        self.buy_situation_response_right_combo = price_one_right
+        self.buy_situation_response_direction_combo = price_one_direction
+        self.buy_situation_response_ratio_line = price_one_ratio
+        self.buy_situation_response_compare_combo = price_one_compare
+        self.buy_situation_response_action_combo = price_one_action
 
-        situation_type_combo.currentIndexChanged.connect(update_situation_detail_local)
+        mutual_update = {"active": False}
+
+        def update_unfilled(*_args):
+            if mutual_update["active"]:
+                return
+            if unfilled_enabled_check.isChecked() and price_enabled_check.isChecked():
+                mutual_update["active"] = True
+                price_enabled_check.setChecked(False)
+                mutual_update["active"] = False
+            enabled = unfilled_enabled_check.isChecked()
+            for widget in (unfilled_scope_combo, unfilled_time_line, unfilled_unit_combo):
+                widget.setEnabled(enabled)
+            unfilled_order_cancel_label.setEnabled(enabled)
+            update_price_one()
+            update_price_two()
+
+        def update_price(*_args):
+            if mutual_update["active"]:
+                return
+            if price_enabled_check.isChecked() and unfilled_enabled_check.isChecked():
+                mutual_update["active"] = True
+                unfilled_enabled_check.setChecked(False)
+                mutual_update["active"] = False
+            update_unfilled()
+            update_price_one()
+            update_price_two()
+
+        unfilled_enabled_check.toggled.connect(update_unfilled)
+        price_enabled_check.toggled.connect(update_price)
         if not hasattr(self, "_buy_situation_response_updaters"):
             self._buy_situation_response_updaters = []
-        self._buy_situation_response_updaters.append(update_situation_detail_local)
-        update_situation_detail_local()
+        self._buy_situation_response_updaters.extend((
+            update_unfilled,
+            update_price,
+        ))
+        update_unfilled()
+        update_price()
 
     def _connect_buy_method_signals(self):
         pass

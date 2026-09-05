@@ -33,12 +33,22 @@ class GroupPackPackingTest(unittest.TestCase):
             "module_name": "indicator_follow_routine",
             "rules_file": "rules.json",
             "locators": {
-                "evaluation": {"file": "routine.py", "callable": "evaluate"},
+                "evaluation": {
+                    "file": "routine.py",
+                    "callable": "evaluate",
+                    "market_bar_projection_callable": "market_bar_projection_request",
+                    "cycle_projection_callable": "project_cycle_context",
+                },
                 "settings": {
                     "project_file": "gui_indicator_follow_routine_settings_dialog.py",
                     "callable": "Dialog",
+                    "registration_callable": "register_routine_instance_snapshot",
                 },
                 "rule_mapper": {"file": "routine_rule_mapper.py"},
+                "rule_commit_validator": {
+                    "file": "routine_rule_commit_validator.py",
+                    "callable": "validate_committed_rules",
+                },
                 "execution_admission": {
                     "file": "routine.py",
                     "callable": "evaluate_execution_admission",
@@ -52,6 +62,12 @@ class GroupPackPackingTest(unittest.TestCase):
         routine_code = b"""\
 def evaluate(context):
     return None
+
+def market_bar_projection_request(rules):
+    return {'projection': 'COMPLETED_TIMEFRAME'}
+
+def project_cycle_context(**facts):
+    return {'status': 'resolved'}
 
 def _allow(subject, rules, routine_identity, rules_identity):
     return {
@@ -69,8 +85,14 @@ evaluate_final_real_order_safety = _allow
             ).encode("utf-8"),
             "routines/지표추종매매/routine.py": routine_code,
             "routines/지표추종매매/routine_rule_mapper.py": b"MAPPER = True\n",
+            "routines/지표추종매매/routine_rule_commit_validator.py": (
+                b"def validate_committed_rules(rules):\n    return {'ok': True}\n"
+            ),
             "routines/지표추종매매/rules.json": b"{}\n",
-            "gui_indicator_follow_routine_settings_dialog.py": b"class Dialog:\n    pass\n",
+            "gui_indicator_follow_routine_settings_dialog.py": (
+                b"class Dialog:\n    pass\n\n"
+                b"def register_routine_instance_snapshot(*args, **kwargs):\n    return {}\n"
+            ),
         }
         for relative, data in files.items():
             path = root.joinpath(*Path(relative).parts)
@@ -199,6 +221,37 @@ evaluate_final_real_order_safety = _allow
         self.assertFalse(valid)
         self.assertIn("locator", error)
         self.assertIn("routine_rule_mapper.py", error)
+
+    def test_missing_declared_production_callback_is_rejected_before_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group, _second, _files = self._source_project(root)
+            routine_path = root / "routines" / "지표추종매매" / "routine.py"
+            routine_path.write_text(
+                routine_path.read_text(encoding="utf-8").replace(
+                    "def market_bar_projection_request(rules):\n"
+                    "    return {'projection': 'COMPLETED_TIMEFRAME'}\n\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            valid, error = validate_group_pack_source(group.group_id, project_root=root)
+
+        self.assertFalse(valid)
+        self.assertIn("market_bar_projection_callable", error)
+
+    def test_missing_settings_registration_callback_is_rejected_before_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group, _second, _files = self._source_project(root)
+            settings_path = root / "gui_indicator_follow_routine_settings_dialog.py"
+            settings_path.write_text("class Dialog:\n    pass\n", encoding="utf-8")
+
+            valid, error = validate_group_pack_source(group.group_id, project_root=root)
+
+        self.assertFalse(valid)
+        self.assertIn("registration_callable", error)
 
     def test_validation_failure_leaves_no_partial_zip(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

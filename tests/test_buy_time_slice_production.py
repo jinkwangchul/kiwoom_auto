@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
+from routine_main_facts import capture_routine_main_facts
 
 from tests import test_indicator_follow_buy_execution_connection as buy_tests
 from account_auto_trade_budget_consumption import project_time_slice_buy_budget
@@ -37,6 +38,7 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
             "stock_config": {"trade_amount_type": "QUANTITY", "buy_qty": 10},
             "routine_instance_id": "INSTANCE_A", "reference_price": 100,
             "actionable_current_price": 100,
+            "code": "005930", "tick_key": "2026-09-02T10:00:00",
             "account_budget": {"account_no": "12345678", "system_total_budget": 10000, "account_consumed_amount": 0},
         }
         context.update(overrides)
@@ -293,10 +295,19 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
             if name == "positions.json":
                 data["positions"][0]["average_price"] = 100
             (runtime / name).write_text(json.dumps(data), encoding="utf-8")
+        (runtime / "routine_signals.json").write_text(json.dumps({"signals": []}), encoding="utf-8")
+        (runtime / "order_executions.json").write_text(json.dumps({"executions": [], "processes": []}), encoding="utf-8")
+        (runtime / "broker_holdings.json").write_text(json.dumps({"holdings": []}), encoding="utf-8")
 
         def check():
+            facts = capture_routine_main_facts(
+                project_root=root,
+                stock_dirs={"005930": stock_dir},
+                selected_account_no="12345678",
+                allowed_stock_codes=("005930",),
+            ).to_payload()
             return buy_tests.bridge.inspect_buy_time_slice_continuation(
-                subject=proposal["signal"], rules=self.rules, project_root=root)
+                subject=proposal["signal"], rules=self.rules, main_facts=facts)
 
         self.assertEqual("", check())
         config["buy_limit_amount"] = 699

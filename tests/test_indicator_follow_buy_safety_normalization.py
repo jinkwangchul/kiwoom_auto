@@ -96,12 +96,12 @@ class BuySafetyNormalizationTest(unittest.TestCase):
         result = self.gate({"execution_intent": intent, "execution_intents": [intent, ratio]})
         self.assertFalse(result["allowed"])
 
-    def test_active_buy_repeat_blocked_but_does_not_disable_supported_initial_buy(self):
+    def test_invalid_active_buy_policy_blocks_repeat_but_not_supported_initial_buy(self):
         self.rules["buy"]["execution"]["repeat"]["detail_mode"] = "ACTIVE_BUY"
         base = self.buy._build(rules=self.rules)
         repeat = self.buy._build(rules=self.rules, cycle=self.buy._cycle(1))
         self.assertEqual("READY", base["status"])
-        self.assertEqual("ACTIVE_BUY_NOT_IMPLEMENTED", repeat["reason"])
+        self.assertEqual("ACTIVE_BUY_POLICY_INVALID", repeat["reason"])
         for final in (False, True):
             self.assertFalse(self.gate({"side": "BUY", "buy_round": 2}, final=final)["allowed"])
 
@@ -127,7 +127,7 @@ class BuySafetyNormalizationTest(unittest.TestCase):
                     result = self.routine.evaluate({"rules": rules, "cycle": self.buy._cycle()})
                 self.assertNotIn("execution_intent", result)
 
-    def test_apply_all_remains_bulk_application_not_a_new_repeat_off_contract(self):
+    def test_apply_all_false_removes_the_existing_repeat_policy(self):
         ui_source = (buy_tests.PROJECT_ROOT / "gui_indicator_follow_buy_method_controls.py").read_text(encoding="utf-8")
         self.assertIn('DetailToggleCheckBox("기본매수설정을 전체매수에 적용")', ui_source)
         before = deepcopy(self.rules)
@@ -135,8 +135,9 @@ class BuySafetyNormalizationTest(unittest.TestCase):
             {"buy_ui": {"repeat": {"apply_all_check": False}}}, self.rules,
         )["preview_rules"]
         self.assertEqual(before, self.rules)
-        self.assertEqual(before["buy"]["execution"]["repeat"], preview["buy"]["execution"]["repeat"])
-        self.assertNotIn("repeat", preview["indicator_follow_rule_preview"]["candidates"].get("execution", {}))
+        self.assertNotIn("repeat", preview["buy"]["execution"])
+        candidate = preview["indicator_follow_rule_preview"]["candidates"]["execution"]["repeat"]
+        self.assertEqual("remove_execution_policy", candidate["operation"])
 
     def test_sell_and_cancel_are_not_blocked_by_buy_unsupported_policy(self):
         self.rules["buy"]["execution"]["base"]["point_mode"] = "MULTI_RATIO"

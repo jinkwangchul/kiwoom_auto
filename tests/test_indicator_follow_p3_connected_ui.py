@@ -42,6 +42,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
             rules_path=self.rules_path
         )
         self.mapper = _load("p3_mapper", "routine_rule_mapper.py")
+        self.validator = _load("p3_validator", "routine_rule_commit_validator.py")
         self.base_rules = {
             "bar": {"bar_minutes": 1},
             "buy": {"groups": [{"conditions": []}]},
@@ -144,6 +145,371 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_last_round_active_direction_combo.setCurrentText("하향")
         self.assertEqual("이상", self.dialog.buy_last_round_active_compare_combo.currentText())
 
+    def test_base_multi_ratio_direction_uses_common_comparator_rule(self) -> None:
+        direction = self.dialog.buy_base_ratio_direction_combo
+        comparator = self.dialog.buy_base_ratio_compare_combo
+
+        for direction_text, allowed in (
+            ("상향", {"이상", "이하"}),
+            ("하향", {"이상", "이하"}),
+            ("상하", {"이내", "이탈"}),
+        ):
+            with self.subTest(direction=direction_text):
+                direction.setCurrentText(direction_text)
+                visible = {
+                    text
+                    for text in ("이상", "이하", "이내", "이탈")
+                    if not comparator.view().isRowHidden(comparator.findText(text))
+                }
+                self.assertEqual(allowed, visible)
+                self.assertIn(comparator.currentText(), allowed)
+
+        direction.setCurrentText("상하")
+        comparator.setCurrentText("이탈")
+        direction.setCurrentText("상향")
+        self.assertEqual("이상", comparator.currentText())
+
+        comparator.setCurrentText("이하")
+        direction.setCurrentText("상하")
+        self.assertEqual("이내", comparator.currentText())
+
+    def test_base_multi_ratio_round_trip_and_legacy_apply_normalize_pair(self) -> None:
+        self.dialog.buy_base_time_mode_combo.setCurrentText("다중비율")
+        self.dialog.buy_base_ratio_direction_combo.setCurrentText("상하")
+        self.dialog.buy_base_ratio_compare_combo.setCurrentText("이탈")
+        expected = deepcopy(self._state()["buy_ui"]["base"])
+
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        self.assertTrue(saved["success"], saved)
+        payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
+        self.dialog.buy_base_ratio_direction_combo.setCurrentText("상향")
+        applied = self.dialog.apply_indicator_follow_ui_state(
+            payload["indicator_follow_ui_state"]["state"]
+        )
+        self.assertFalse(applied["sync_errors"])
+        self.assertEqual(expected, self._state()["buy_ui"]["base"])
+
+        legacy = deepcopy(self._state())
+        legacy["buy_ui"]["base"].update({
+            "ratio_direction_combo": "상향",
+            "ratio_compare_combo": "이탈",
+        })
+        before = self.rules_path.read_bytes()
+        applied = self.dialog.apply_indicator_follow_ui_state(legacy)
+        self.assertFalse(applied["sync_errors"])
+        self.assertEqual("상향", self.dialog.buy_base_ratio_direction_combo.currentText())
+        self.assertEqual("이상", self.dialog.buy_base_ratio_compare_combo.currentText())
+        self.assertEqual(before, self.rules_path.read_bytes())
+
+    def test_base_multi_ratio_mapper_and_validator_guard_direction_comparator_pair(self) -> None:
+        base_state = self._state()
+        valid_pairs = (
+            ("상향", "이상", "UP", ">="),
+            ("상향", "이하", "UP", "<="),
+            ("하향", "이상", "DOWN", ">="),
+            ("하향", "이하", "DOWN", "<="),
+            ("상하", "이내", "BOTH", "WITHIN"),
+            ("상하", "이탈", "BOTH", "OUTSIDE"),
+        )
+        valid_rules = None
+        for direction, comparator, expected_direction, expected_comparator in valid_pairs:
+            with self.subTest(valid=(direction, comparator)):
+                state = deepcopy(base_state)
+                state["buy_ui"]["base"].update({
+                    "time_mode_combo": "다중비율",
+                    "ratio_direction_combo": direction,
+                    "ratio_compare_combo": comparator,
+                })
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state, deepcopy(self.base_rules)
+                )
+                candidate = preview["preview_rules"]["indicator_follow_rule_preview"][
+                    "candidates"
+                ]["execution"]["base"]
+                self.assertEqual(expected_direction, candidate["value"]["ratio_direction"])
+                self.assertEqual(expected_comparator, candidate["value"]["ratio_compare"])
+                rules = preview["preview_rules"]
+                validation = self.validator.validate_committed_rules(
+                    deepcopy(rules), rules, [], {}
+                )
+                checks = {item["name"]: item["ok"] for item in validation["checks"]}
+                self.assertTrue(checks["buy_base_multi_ratio_direction_comparator_valid"])
+                valid_rules = rules
+
+        self.assertIsNotNone(valid_rules)
+        for direction, comparator in (
+            ("상향", "이내"),
+            ("상향", "이탈"),
+            ("하향", "이내"),
+            ("하향", "이탈"),
+            ("상하", "이상"),
+            ("상하", "이하"),
+        ):
+            with self.subTest(invalid=(direction, comparator)):
+                state = deepcopy(base_state)
+                state["buy_ui"]["base"].update({
+                    "time_mode_combo": "다중비율",
+                    "ratio_direction_combo": direction,
+                    "ratio_compare_combo": comparator,
+                })
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state, deepcopy(self.base_rules)
+                )
+                candidates = preview["preview_rules"]["indicator_follow_rule_preview"][
+                    "candidates"
+                ].get("execution", {})
+                self.assertNotIn("base", candidates)
+                self.assertIn(
+                    "buy base MULTI_RATIO direction/comparator pair is invalid",
+                    preview["validation_warnings"],
+                )
+
+                rules = deepcopy(valid_rules)
+                policy = rules["buy"]["execution"]["base"]
+                policy.update({
+                    "ratio_direction": self.mapper._direction_token(direction),
+                    "ratio_compare": self.mapper._ratio_compare_token(comparator),
+                })
+                validation = self.validator.validate_committed_rules(
+                    deepcopy(rules), rules, [], {}
+                )
+                checks = {item["name"]: item["ok"] for item in validation["checks"]}
+                self.assertFalse(checks["buy_base_multi_ratio_direction_comparator_valid"])
+
+        legacy_rules = deepcopy(self.base_rules)
+        legacy_rules.setdefault("buy", {}).setdefault("execution", {})["base"] = deepcopy(
+            valid_rules["buy"]["execution"]["base"]
+        )
+        invalid_state = deepcopy(base_state)
+        invalid_state["buy_ui"]["base"].update({
+            "time_mode_combo": "다중비율",
+            "ratio_direction_combo": "상향",
+            "ratio_compare_combo": "이탈",
+        })
+        legacy_preview = self.mapper.build_engine_rules_preview_from_ui_state(
+            invalid_state, legacy_rules
+        )
+        legacy_candidates = legacy_preview["preview_rules"][
+            "indicator_follow_rule_preview"
+        ]["candidates"].get("execution", {})
+        self.assertNotIn("base", legacy_candidates)
+
+    def test_situation_response_direction_uses_common_comparator_rule(self) -> None:
+        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
+        for slot in ("setting1", "setting2"):
+            direction = getattr(self.dialog, f"buy_situation_response_{slot}_direction_combo")
+            comparator = getattr(self.dialog, f"buy_situation_response_{slot}_compare_combo")
+            for direction_text, allowed in (
+                ("상향", {"이상", "이하"}),
+                ("하향", {"이상", "이하"}),
+                ("상하", {"이내", "이탈"}),
+            ):
+                with self.subTest(slot=slot, direction=direction_text):
+                    direction.setCurrentText(direction_text)
+                    visible = {
+                        text
+                        for text in ("이상", "이하", "이내", "이탈")
+                        if not comparator.view().isRowHidden(comparator.findText(text))
+                    }
+                    self.assertEqual(allowed, visible)
+                    self.assertIn(comparator.currentText(), allowed)
+
+    def test_situation_response_round_trip_and_legacy_apply_normalize_pair(self) -> None:
+        self.assertFalse(hasattr(self.dialog, "buy_situation_response_type_combo"))
+        self.dialog.buy_situation_response_unfilled_enabled_check.setChecked(True)
+        self.assertFalse(self.dialog.buy_situation_response_price_enabled_check.isChecked())
+        self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
+        self.assertFalse(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
+        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
+        self.dialog.buy_situation_response_setting1_direction_combo.setCurrentText("상하")
+        self.dialog.buy_situation_response_setting1_compare_combo.setCurrentText("이탈")
+        self.dialog.buy_situation_response_setting1_action_combo.setCurrentText("매수리셋")
+        self.dialog.buy_situation_response_setting2_direction_combo.setCurrentText("하향")
+        self.dialog.buy_situation_response_setting2_compare_combo.setCurrentText("이하")
+        expected = deepcopy(self._state()["buy_ui"]["situation"])
+
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        self.assertTrue(saved["success"], saved)
+        payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
+        self.dialog.buy_situation_response_setting1_direction_combo.setCurrentText("상향")
+        applied = self.dialog.apply_indicator_follow_ui_state(
+            payload["indicator_follow_ui_state"]["state"]
+        )
+        self.assertFalse(applied["sync_errors"])
+        self.assertEqual(expected, self._state()["buy_ui"]["situation"])
+
+        legacy = deepcopy(self._state())
+        legacy["buy_ui"]["situation"] = {
+            "type_combo": "가격비교",
+            "left_combo": "주문가",
+            "right_combo": "현재가",
+            "direction_combo": "상향",
+            "ratio_line": "0.4",
+            "compare_combo": "이상",
+            "action_combo": "매수리셋",
+        }
+        before = self.rules_path.read_bytes()
+        applied = self.dialog.apply_indicator_follow_ui_state(legacy)
+        self.assertFalse(applied["sync_errors"])
+        self.assertEqual("상향", self.dialog.buy_situation_response_setting1_direction_combo.currentText())
+        self.assertEqual("이상", self.dialog.buy_situation_response_setting1_compare_combo.currentText())
+        self.assertFalse(self.dialog.buy_situation_response_setting2_enabled_check.isChecked())
+        self.assertEqual("무설정", self.dialog.buy_situation_response_setting2_left_combo.currentText())
+        self.assertEqual(before, self.rules_path.read_bytes())
+
+    def test_cycle_section_is_above_exit_conditions(self) -> None:
+        layout = self.dialog.buy_overview_finish.layout()
+        cycle_index = layout.indexOf(self.dialog.buy_cycle_column_widget)
+        finish_index = layout.indexOf(self.dialog.buy_finish_column_widget)
+        self.assertGreaterEqual(cycle_index, 0)
+        self.assertGreaterEqual(finish_index, 0)
+        cycle_row, cycle_column, _, _ = layout.getItemPosition(cycle_index)
+        finish_row, finish_column, _, _ = layout.getItemPosition(finish_index)
+        self.assertEqual((0, 0), (cycle_row, cycle_column))
+        self.assertEqual((1, 0), (finish_row, finish_column))
+        self.assertEqual(
+            28,
+            self.dialog.buy_situation_response_price_slots_widget.layout().contentsMargins().left(),
+        )
+
+    def test_situation_response_mapper_accepts_six_pairs_and_blocks_invalid_pairs(self) -> None:
+        base_state = self._state()
+        valid_pairs = (
+            ("상향", "이상", "UP", ">="),
+            ("상향", "이하", "UP", "<="),
+            ("하향", "이상", "DOWN", ">="),
+            ("하향", "이하", "DOWN", "<="),
+            ("상하", "이내", "BOTH", "WITHIN"),
+            ("상하", "이탈", "BOTH", "OUTSIDE"),
+        )
+        for direction, comparator, expected_direction, expected_comparator in valid_pairs:
+            with self.subTest(valid=(direction, comparator)):
+                state = deepcopy(base_state)
+                state["buy_ui"]["situation"].update({
+                    "price_enabled_check": True,
+                    "setting1_enabled_check": True,
+                    "setting2_enabled_check": False,
+                    "setting1_action_combo": "매수리셋",
+                    "setting1_direction_combo": direction,
+                    "setting1_compare_combo": comparator,
+                })
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state, deepcopy(self.base_rules)
+                )
+                candidate = preview["preview_rules"]["indicator_follow_rule_preview"][
+                    "candidates"
+                ]["execution"]["base"]
+                policy = candidate["value"]["buy_price_response_policies"][0]
+                self.assertEqual(expected_direction, policy["direction"])
+                self.assertEqual(expected_comparator, policy["compare"])
+
+        for direction, comparator in (
+            ("상향", "이내"),
+            ("상향", "이탈"),
+            ("하향", "이내"),
+            ("하향", "이탈"),
+            ("상하", "이상"),
+            ("상하", "이하"),
+        ):
+            with self.subTest(invalid=(direction, comparator)):
+                state = deepcopy(base_state)
+                state["buy_ui"]["situation"].update({
+                    "price_enabled_check": True,
+                    "setting1_enabled_check": True,
+                    "setting2_enabled_check": False,
+                    "setting1_action_combo": "매수리셋",
+                    "setting1_direction_combo": direction,
+                    "setting1_compare_combo": comparator,
+                })
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state, deepcopy(self.base_rules)
+                )
+                candidates = preview["preview_rules"]["indicator_follow_rule_preview"][
+                    "candidates"
+                ].get("execution", {})
+                self.assertNotIn("base", candidates)
+                self.assertIn(
+                    "buy situation price slot SETTING1 is invalid",
+                    preview["validation_warnings"],
+                )
+
+    def test_situation_response_commit_validator_guards_pair_and_cycle_authority(self) -> None:
+        state = self._state()
+        state["buy_ui"]["situation"].update({
+            "price_enabled_check": True,
+            "setting1_enabled_check": True,
+            "setting2_enabled_check": False,
+            "setting1_action_combo": "매수리셋",
+            "setting1_direction_combo": "상향",
+            "setting1_compare_combo": "이상",
+        })
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(
+            state, deepcopy(self.base_rules)
+        )
+        valid_rules = preview["preview_rules"]
+
+        for direction, comparator in (
+            ("UP", ">="),
+            ("UP", "<="),
+            ("DOWN", ">="),
+            ("DOWN", "<="),
+            ("BOTH", "WITHIN"),
+            ("BOTH", "OUTSIDE"),
+        ):
+            with self.subTest(valid=(direction, comparator)):
+                rules = deepcopy(valid_rules)
+                policy = rules["buy"]["execution"]["base"]["buy_price_reset_policy"]
+                policy.update({"direction": direction, "compare": comparator})
+                result = self.validator.validate_committed_rules(
+                    deepcopy(rules), rules, [], {}
+                )
+                check = next(
+                    item for item in result["checks"]
+                    if item["name"] == "buy_price_reset_direction_comparator_valid"
+                )
+                self.assertTrue(check["ok"], result)
+
+        for direction, comparator in (
+            ("UP", "WITHIN"),
+            ("UP", "OUTSIDE"),
+            ("DOWN", "WITHIN"),
+            ("DOWN", "OUTSIDE"),
+            ("BOTH", ">="),
+            ("BOTH", "<="),
+        ):
+            with self.subTest(invalid=(direction, comparator)):
+                rules = deepcopy(valid_rules)
+                rules["buy"]["execution"]["base"]["buy_price_reset_policy"].update({
+                    "direction": direction,
+                    "compare": comparator,
+                })
+                result = self.validator.validate_committed_rules(
+                    deepcopy(rules), rules, [], {}
+                )
+                checks = {item["name"]: item["ok"] for item in result["checks"]}
+                self.assertFalse(checks["buy_price_reset_direction_comparator_valid"])
+                self.assertFalse(checks["buy_price_reset_policy_valid"])
+
+        cycle_rules = deepcopy(valid_rules)
+        cycle_rules["buy"]["execution"]["cycle"]["buy_price_response_policies"] = []
+        cycle_result = self.validator.validate_committed_rules(
+            deepcopy(cycle_rules), cycle_rules, [], {}
+        )
+        cycle_checks = {item["name"]: item["ok"] for item in cycle_result["checks"]}
+        self.assertFalse(cycle_checks["buy_cycle_situation_authority_valid"])
+        self.assertFalse(cycle_checks["buy_cycle_policy_valid"])
+
+        exclusive_rules = deepcopy(valid_rules)
+        exclusive_rules["buy"]["execution"]["base"]["unfilled_timeout_policy"]["enabled"] = True
+        exclusive_result = self.validator.validate_committed_rules(
+            deepcopy(exclusive_rules), exclusive_rules, [], {}
+        )
+        exclusive_checks = {
+            item["name"]: item["ok"] for item in exclusive_result["checks"]
+        }
+        self.assertFalse(exclusive_checks["buy_situation_response_modes_exclusive"])
+        self.assertFalse(exclusive_checks["buy_price_response_slots_valid"])
+
     def test_last_round_active_round_trip_and_mapper_connection(self) -> None:
         self.dialog.buy_base_hoga_combo.setCurrentText("단일호가")
         self.dialog.buy_base_order_combo.setCurrentText("현재가")
@@ -212,14 +578,12 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.assertEqual("0.45", state["ratio_line"])
         self.assertEqual(before, self.rules_path.read_bytes())
 
-    def test_cycle_is_enabled_and_cancel_batch_is_unselectable_and_locked(self) -> None:
+    def test_cycle_is_enabled_and_cancel_batch_is_connected(self) -> None:
         self.assertTrue(self.dialog.buy_cycle_column_widget.isEnabled())
         self.assertTrue(self.dialog.buy_cycle_hoga_mode_combo.isEnabled())
-        combo = self.dialog.buy_cycle_price_action_combo
-        cancel_index = combo.findText("일괄취소")
-        self.assertFalse(combo.model().item(cancel_index).isEnabled())
+        self.assertFalse(hasattr(self.dialog, "buy_cycle_situation_mode_combo"))
+        self.assertFalse(hasattr(self.dialog, "buy_cycle_price_action_combo"))
 
-        combo.setCurrentText("매수리셋")
         self.dialog.buy_cycle_time_mode_combo.setCurrentText("다중비율")
         self.dialog.buy_cycle_ratio_value_line.setText("0.37")
         expected_cycle = deepcopy(self._state()["buy_ui"]["cycle"])
@@ -232,46 +596,69 @@ class ConnectedBuyUiTest(unittest.TestCase):
         )
         self.assertEqual(expected_cycle, self._state()["buy_ui"]["cycle"])
         self.assertTrue(self._candidate("cycle")["execution_connected"])
-        combo.setCurrentText("일괄취소")
-        locked = self._candidate("cycle")
-        self.assertFalse(locked["execution_connected"])
-        self.assertEqual("CYCLE_OPTION_EXECUTION_NOT_CONNECTED", locked["execution_lock_reason"])
+        self.dialog.buy_situation_response_unfilled_enabled_check.setChecked(True)
+        self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
+        self.assertFalse(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
+        self.dialog.buy_situation_response_setting1_action_combo.setCurrentText("일괄취소")
+        connected = self._candidate("cycle")
+        self.assertTrue(connected["execution_connected"])
+        self.assertEqual(
+            "CANCEL_BATCH",
+            connected["value"]["buy_price_response_policies"][0]["action"],
+        )
+        self.assertEqual(
+            self._candidate("base")["value"]["buy_price_response_policies"],
+            connected["value"]["buy_price_response_policies"],
+        )
+        self.assertEqual(
+            self._candidate("base")["value"]["unfilled_timeout_policy"],
+            connected["value"]["unfilled_timeout_policy"],
+        )
+        self.assertFalse(connected["value"]["unfilled_timeout_policy"]["enabled"])
 
-    def test_exit_time_remains_mutually_exclusive_with_cycle_time_and_unfilled(self) -> None:
+    def test_exit_conditions_are_independent_and_use_or(self) -> None:
         self.dialog.buy_cycle_time_mode_combo.setCurrentText("선택없음")
-        self.dialog.buy_cycle_situation_mode_combo.setCurrentText("가격비교")
         self.assertTrue(self.dialog.buy_exit_time_check.isEnabled())
         self.dialog.buy_exit_time_check.setChecked(True)
         self.assertTrue(self.dialog.buy_exit_time_line.isEnabled())
 
         self.dialog.buy_cycle_time_mode_combo.setCurrentText("다중시간")
-        self.assertFalse(self.dialog.buy_exit_time_check.isChecked())
-        self.assertFalse(self.dialog.buy_exit_time_check.isEnabled())
-        self.assertFalse(self.dialog.buy_exit_time_line.isEnabled())
-        blocked_state = deepcopy(self._state())
-        reapplied = self.dialog.apply_indicator_follow_ui_state(blocked_state)
-        self.assertFalse(reapplied["sync_errors"])
-        self.assertFalse(self.dialog.buy_exit_time_check.isEnabled())
-
-        self.dialog.buy_cycle_time_mode_combo.setCurrentText("선택없음")
-        self.dialog.buy_cycle_situation_mode_combo.setCurrentText("미체결")
-        self.assertFalse(self.dialog.buy_exit_time_check.isEnabled())
-        self.dialog.buy_cycle_situation_mode_combo.setCurrentText("가격비교")
+        self.assertTrue(self.dialog.buy_exit_time_check.isChecked())
         self.assertTrue(self.dialog.buy_exit_time_check.isEnabled())
+        self.assertTrue(self.dialog.buy_exit_time_line.isEnabled())
+        self.dialog.buy_exit_price_check.setChecked(True)
+        self.dialog.buy_exit_count_check.setChecked(True)
+        state = deepcopy(self._state())
+        reapplied = self.dialog.apply_indicator_follow_ui_state(state)
+        self.assertFalse(reapplied["sync_errors"])
+        self.assertTrue(self.dialog.buy_exit_time_check.isEnabled())
+        exit_policy = self._candidate("base")["value"]["buy_exit_policy"]
+        self.assertEqual("OR", exit_policy["logic"])
+        self.assertEqual({"PRICE", "COUNT", "TIME"}, {
+            item["condition_type"] for item in exit_policy["conditions"]
+        })
 
-    def test_repeat_active_items_remain_reserved(self) -> None:
-        for combo in (
-            self.dialog.buy_base_detail_mode_combo,
-            self.dialog.buy_price_compare_above_mode_combo,
-        ):
-            index = combo.findText("능동매수")
-            self.assertGreaterEqual(index, 0)
-            self.assertFalse(combo.model().item(index).isEnabled())
+    def test_repeat_active_connected_while_price_compare_active_remains_reserved(self) -> None:
+        repeat_index = self.dialog.buy_base_detail_mode_combo.findText("능동매수")
+        price_compare_index = self.dialog.buy_price_compare_above_mode_combo.findText("능동매수")
+        self.assertTrue(self.dialog.buy_base_detail_mode_combo.model().item(repeat_index).isEnabled())
+        self.assertFalse(self.dialog.buy_price_compare_above_mode_combo.model().item(price_compare_index).isEnabled())
+
+        self.dialog.buy_base_apply_all_check.setChecked(True)
+        self.dialog.buy_base_detail_mode_combo.setCurrentText("능동매수")
+        self.dialog.buy_base_active_direction_combo.setCurrentText("상하")
+        self.dialog.buy_base_active_ratio_line.setText("1.25")
+        self.dialog.buy_base_active_compare_combo.setCurrentText("이탈")
+        repeat = self._candidate("repeat")["value"]
+        self.assertEqual("ACTIVE_BUY", repeat["detail_mode"])
+        self.assertEqual(("BOTH", 1.25, "OUTSIDE"), (
+            repeat["active_direction"], repeat["active_ratio"], repeat["active_compare"]
+        ))
 
         helper = buy_helper_module.IndicatorFollowBuyExecutionConnectionTest()
         rules = helper._rules(repeat_mode="ACTIVE_BUY")
-        blocked = helper._build(rules=rules, cycle=helper._cycle(1), price=100)
-        self.assertEqual("ACTIVE_BUY_NOT_IMPLEMENTED", blocked["reason"])
+        ready = helper._build(rules=rules, cycle=helper._cycle(1), price=100)
+        self.assertEqual("READY", ready["status"], ready)
 
     def test_ui_policies_reach_p2_consumers_without_generic_downgrade(self) -> None:
         helper = buy_helper_module.IndicatorFollowBuyExecutionConnectionTest()
@@ -290,7 +677,10 @@ class ConnectedBuyUiTest(unittest.TestCase):
         )
         self.assertEqual("BUY_GENERATION_SKIPPED_BY_PREVIOUS_ROUND_PRICE", skipped["reason"])
 
-        self.dialog.buy_cycle_price_action_combo.setCurrentText("매수리셋")
+        self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
+        self.dialog.buy_situation_response_setting1_enabled_check.setChecked(True)
+        self.dialog.buy_situation_response_setting2_enabled_check.setChecked(False)
+        self.dialog.buy_situation_response_setting1_action_combo.setCurrentText("매수리셋")
         cycle = self._candidate("cycle")["value"]
         rules = helper._rules()
         rules["buy"]["execution"]["cycle"] = cycle
@@ -343,7 +733,8 @@ class ConnectedBuyUiTest(unittest.TestCase):
         ).toPlainText()
         self.assertIn("직전회차주문가 대비 현재주문가", advanced_text)
         self.assertIn("ACTIVE_BUY_NOT_IMPLEMENTED", advanced_text)
-        self.assertIn("CYCLE_OPTION_EXECUTION_NOT_CONNECTED", advanced_text)
+        self.assertIn("순환 가격비교 일괄취소", advanced_text)
+        self.assertNotIn("CYCLE_OPTION_EXECUTION_NOT_CONNECTED", advanced_text)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,8 @@ from chejan_event_recorder import (
     mark_chejan_reconciliation_state,
 )
 from execution_fill_recorder import find_existing_execution_fill_record, record_execution_fill
-from execution_provenance_contract import validate_child_set, validate_process_record
+from execution_provenance_contract import validate_process_record
+from routine_main_facts import build_routine_main_facts_from_projection
 from operation_close_completion_check_service import (
     SOURCE_STARTUP_RECOVERY,
     check_global_close_completion_after_durable_update,
@@ -97,59 +98,6 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except Exception:
         return 0
-
-
-def _is_durable_pending_deferred_child_plan(signal: Any) -> bool:
-    """Recognize a structurally complete deferred-child plan during startup audit."""
-    if not isinstance(signal, dict):
-        return False
-    signal_id = _clean_text(signal.get("id"))
-    intents = signal.get("execution_intents")
-    if not signal_id or not isinstance(intents, list) or not intents:
-        return False
-    modes = {
-        (
-            _clean_text(intent.get("execution_mode")).upper(),
-            _clean_text(intent.get("child_kind")).upper(),
-        )
-        for intent in intents
-        if isinstance(intent, dict)
-    }
-    if (
-        any(not isinstance(intent, dict) for intent in intents)
-        or modes not in ({("MULTI_TIME", "TIME_SLICE")}, {("MULTI_RATIO", "RATIO_SLICE")})
-        or any(
-            _clean_text(intent.get("source_signal_id")) != signal_id
-            for intent in intents
-        )
-    ):
-        return False
-    process_ids = {
-        _clean_text(intent.get("execution_process_id")) for intent in intents
-    }
-    if len(process_ids) != 1 or "" in process_ids or validate_child_set(intents):
-        return False
-    if modes == {("MULTI_TIME", "TIME_SLICE")}:
-        for intent in intents:
-            child_plan = _as_dict(intent.get("child_plan"))
-            scheduled_at = _clean_text(child_plan.get("scheduled_at"))
-            try:
-                datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
-            except ValueError:
-                return False
-    else:
-        plan_hashes = {
-            json.dumps(
-                _as_dict(intent.get("multi_ratio_plan")),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for intent in intents
-        }
-        if len(plan_hashes) != 1 or plan_hashes == {"{}"}:
-            return False
-    return True
 
 
 def _read_json(path: str | Path) -> tuple[dict[str, Any] | None, str]:
@@ -619,6 +567,7 @@ def assess_startup_recovery(
     routine_signals_path: str | Path = DEFAULT_ROUTINE_SIGNALS_PATH,
     stock_state_paths: list[str | Path] | None = None,
     assignment_reconciliation_summary: dict[str, Any] | None = None,
+    routine_recovery_classifier: Any = None,
 ) -> dict[str, Any]:
     """Assess whether the current process may resume automatic trading.
 
@@ -761,6 +710,19 @@ def assess_startup_recovery(
             processes = [dict(item) for item in processes_value]
     locks = reads["order_locks"].get("items") or []
     signals = reads["routine_signals"].get("items") or []
+    startup_facts = build_routine_main_facts_from_projection(
+        {
+            "signals": signals,
+            "orders": queue_orders,
+            "fills": fills,
+            "positions": positions,
+            "holdings": holdings,
+            "executions": executions,
+            "processes": processes,
+            "locks": locks,
+        }
+    ).to_payload()
+    routine_recovery_reviews: list[dict[str, Any]] = []
 
     if reads["fills"]["status"] == "MISSING" and any(
         _clean_text(order.get("status")).upper() in {"PARTIALLY_FILLED", "FILLED", "PARTIAL_CANCELLED"}
@@ -874,7 +836,62 @@ def assess_startup_recovery(
         signal_id = _clean_text(signal.get("id")) or "unknown signal"
         signal_status = _clean_text(signal.get("status")).upper()
         if signal_status in {"PENDING", "PREVIEWED", "READY", "ORDER_QUEUED", "ERROR"}:
-            if signal_status == "PENDING" and _is_durable_pending_deferred_child_plan(signal):
+            if signal_status == "PENDING":
+                stock_code = _clean_text(signal.get("code")).lstrip("A")
+                instance_id = _clean_text(signal.get("routine_instance_id"))
+                classification: dict[str, Any]
+                if not instance_id or not callable(routine_recovery_classifier):
+                    classification = {
+                        "classification": "REVIEW_REQUIRED",
+                        "reason": (
+                            "STARTUP_ROUTINE_IDENTITY_MISSING"
+                            if not instance_id else "ROUTINE_STARTUP_RECOVERY_UNAVAILABLE"
+                        ),
+                    }
+                else:
+                    try:
+                        raw = routine_recovery_classifier(
+                            instance_id=instance_id,
+                            signal_id=signal_id,
+                            main_facts=startup_facts,
+                        )
+                        classification = dict(raw) if isinstance(raw, dict) else {}
+                    except Exception as exc:
+                        classification = {
+                            "classification": "REVIEW_REQUIRED",
+                            "reason": f"ROUTINE_STARTUP_RECOVERY_UNAVAILABLE:{type(exc).__name__}",
+                        }
+                valid_classification = (
+                    classification.get("classification")
+                    in {"RECOVERABLE", "PENDING_VALID", "REVIEW_REQUIRED"}
+                    and _clean_text(classification.get("signal_id")) == signal_id
+                    and _clean_text(classification.get("stock_code")).lstrip("A") == stock_code
+                    and _clean_text(
+                        _as_dict(classification.get("routine_identity")).get(
+                            "routine_instance_id"
+                        )
+                        or classification.get("routine_instance_id")
+                    ) == instance_id
+                    and classification.get("facts_revision") == startup_facts.get("revision")
+                    and classification.get("facts_snapshot_hash") == startup_facts.get("snapshot_hash")
+                )
+                if valid_classification and classification.get("classification") in {
+                    "RECOVERABLE", "PENDING_VALID"
+                }:
+                    continue
+                reason = _clean_text(classification.get("reason"))
+                if not valid_classification:
+                    reason = "ROUTINE_STARTUP_RECOVERY_CLASSIFICATION_INVALID"
+                routine_recovery_reviews.append(
+                    {
+                        "stock_code": stock_code,
+                        "signal_id": signal_id,
+                        "routine_instance_id": instance_id,
+                        "reason": reason,
+                        "classification": "REVIEW_REQUIRED",
+                    }
+                )
+                review_reasons.append(f"{signal_id}: {reason}")
                 continue
             review_reasons.append(
                 f"{signal_id}: unfinished routine signal status {signal_status or 'UNKNOWN'}"
@@ -939,6 +956,7 @@ def assess_startup_recovery(
         "operator_reconciliation": operator_items,
         "assignment_reconciliation": assignment_summary,
         "reconciliation_details": reconciliation_details,
+        "routine_recovery_reviews": routine_recovery_reviews,
         "read_results": reads,
         "checked_at": _now_text(),
         "runtime_write": False,

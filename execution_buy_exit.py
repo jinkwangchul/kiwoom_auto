@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 from typing import Any
+from routine_main_facts import records_from_routine_main_facts
 
 from execution_price_comparison import evaluate_percent_comparison, resolve_price_source
 from execution_provenance_contract import stable_hash, plan_generation, validate_child_set
@@ -149,7 +150,7 @@ def _signal_intents(signal: dict[str, Any], process_id: str) -> list[dict[str, A
 
 def _buy_exit_policy(intent: dict[str, Any]) -> dict[str, Any]:
     policy = _dict(intent.get("buy_exit_policy"))
-    if policy.get("policy") == "BUY_REPEAT_EXIT" and policy.get("enabled") is True \
+    if policy.get("policy") in {"BUY_RECOVERY_EXIT", "BUY_REPEAT_EXIT"} and policy.get("enabled") is True \
             and str(policy.get("logic") or "").upper() == "OR" \
             and isinstance(policy.get("conditions"), list) and policy.get("conditions"):
         return policy
@@ -157,22 +158,20 @@ def _buy_exit_policy(intent: dict[str, Any]) -> dict[str, Any]:
 
 
 def _anchor(orders: list[dict[str, Any]], signal: dict[str, Any], process_id: str) -> datetime | None:
-    """Recover the first repeat-round anchor; reset generation is irrelevant."""
+    """Recover the first Recovery entry anchor; normal repeat rounds do not count."""
     repeat_records: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for item in orders:
         intent = _intent(item)
-        round_value = _int(intent.get("buy_round"))
-        if round_value is not None and round_value >= 2:
+        if intent.get("recovery_cycle") is True or _int(intent.get("recovery_generation")):
             repeat_records.append((item, intent))
     for intent in _signal_intents(signal, process_id):
-        round_value = _int(intent.get("buy_round"))
-        if round_value is not None and round_value >= 2:
+        if intent.get("recovery_cycle") is True or _int(intent.get("recovery_generation")):
             repeat_records.append((intent, intent))
 
     explicit = [
         parsed
         for item, intent in repeat_records
-        for parsed in [_time(intent.get("buy_repeat_started_at") or intent.get("repeat_started_at"))]
+        for parsed in [_time(intent.get("recovery_started_at"))]
         if parsed is not None
     ]
     if explicit:
@@ -195,7 +194,7 @@ def _completed_repeat_rounds(
     fills: list[dict[str, Any]],
     process_id: str,
 ) -> set[int]:
-    """Count filled repeat rounds, never child count, reset generation, or rejects."""
+    """Count completed Recovery generations, never BUY rounds or child count."""
     latest_by_execution: dict[str, dict[str, Any]] = {}
     for item in orders:
         execution_id = _field_value(item, "execution_id")
@@ -214,9 +213,10 @@ def _completed_repeat_rounds(
 
     grouped: dict[int, list[tuple[str, dict[str, Any]]]] = {}
     for execution_id, order in latest_by_execution.items():
-        round_value = _int(_intent(order).get("buy_round"))
-        if round_value is not None and round_value >= 2:
-            grouped.setdefault(round_value, []).append((execution_id, order))
+        intent = _intent(order)
+        recovery_generation = _int(intent.get("recovery_generation"))
+        if intent.get("recovery_cycle") is True and recovery_generation is not None and recovery_generation > 0:
+            grouped.setdefault(recovery_generation, []).append((execution_id, order))
 
     completed: set[int] = set()
     for round_value, children in grouped.items():
@@ -226,12 +226,7 @@ def _completed_repeat_rounds(
             for _, order in children
         ):
             continue
-        has_fill = any(
-            any((_int(fill.get("filled_quantity")) or 0) > 0 for fill in fills_by_execution.get(execution_id, []))
-            for execution_id, _ in children
-        )
-        if has_fill:
-            completed.add(round_value)
+        completed.add(round_value)
     return completed
 
 
@@ -250,12 +245,12 @@ def evaluate_buy_exit_policy(
         kind = _text(condition.get("condition_type")).upper()
         result: dict[str, Any] = {"condition_type": kind, "matched": False, "status": "READY"}
         if kind == "COUNT":
-            target = _int(condition.get("target_repeat_generations"))
+            target = _int(condition.get("target_recovery_generations", condition.get("target_repeat_generations")))
             if target is None or target <= 0:
                 result.update(status="INVALID", reason="BUY_REPEAT_EXIT_COUNT_INVALID")
                 waiting.append("BUY_REPEAT_EXIT_COUNT_INVALID")
             else:
-                result.update(target_repeat_generations=target, completed_repeat_generations=completed_repeat_count,
+                result.update(target_recovery_generations=target, completed_recovery_generations=completed_repeat_count,
                               matched=completed_repeat_count >= target,
                               reason="MATCHED" if completed_repeat_count >= target else "NOT_MATCHED")
         elif kind == "TIME":
@@ -274,8 +269,8 @@ def evaluate_buy_exit_policy(
                 result.update(status="INVALID", reason="BUY_REPEAT_EXIT_TIME_INVALID")
                 waiting.append("BUY_REPEAT_EXIT_TIME_INVALID")
             elif repeat_started_at is None:
-                result.update(status="NOT_STARTED", duration_ms=duration_ms, reason="FIRST_REPEAT_GENERATION_NOT_STARTED")
-                waiting.append("FIRST_REPEAT_GENERATION_NOT_STARTED")
+                result.update(status="NOT_STARTED", duration_ms=duration_ms, reason="FIRST_RECOVERY_NOT_STARTED")
+                waiting.append("FIRST_RECOVERY_NOT_STARTED")
             else:
                 due = repeat_started_at + timedelta(milliseconds=duration_ms)
                 hit = now >= due
@@ -306,8 +301,8 @@ def evaluate_buy_exit_policy(
         if result.get("matched") is True:
             matched.append(kind)
         evaluated.append(result)
-    payload = {"logic": "OR", "completed_repeat_generations": completed_repeat_count,
-               "repeat_started_at": repeat_started_at.isoformat(timespec="milliseconds") if repeat_started_at else None,
+    payload = {"logic": "OR", "completed_recovery_generations": completed_repeat_count,
+               "recovery_started_at": repeat_started_at.isoformat(timespec="milliseconds") if repeat_started_at else None,
                "order_price": order_price, "current_price": current_price, "average_price": average_price,
                "conditions": evaluated, "matched_condition_types": matched}
     return {**payload, "active": bool(evaluated), "triggered": bool(matched),
@@ -321,14 +316,19 @@ def inspect_buy_repeat_exits(*, selected_account_no: str, actionable_prices_by_c
                              order_queue_path: str | Path = ORDER_QUEUE_PATH,
                              order_executions_path: str | Path = ORDER_EXECUTIONS_PATH,
                              fills_path: str | Path = FILLS_PATH, positions_path: str | Path = POSITIONS_PATH,
-                             holdings_path: str | Path = HOLDINGS_PATH, signals_path: str | Path = SIGNALS_PATH) -> dict[str, Any]:
+                             holdings_path: str | Path = HOLDINGS_PATH, signals_path: str | Path = SIGNALS_PATH,
+                             main_facts: dict[str, Any] | None = None) -> dict[str, Any]:
     fields = [(order_queue_path, "orders", False), (order_executions_path, "executions", False),
               (order_executions_path, "processes", False), (fills_path, "fills", False),
               (positions_path, "positions", False), (holdings_path, "holdings", False),
               (signals_path, "signals", False)]
     loaded: dict[str, list[dict[str, Any]]] = {}; errors: list[str] = []
     for path, field, optional in fields:
-        loaded[field], error = _read(path, field, optional)
+        loaded[field], error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional)
+        )
         if error: errors.append(error)
     result = {"ok": not errors, "cancel_proposals": [], "completion_proposals": [], "reviews": [], "waiting": [], "errors": errors, "blocked_execution_process_ids": []}
     if errors:
@@ -607,9 +607,21 @@ def inspect_buy_repeat_exits(*, selected_account_no: str, actionable_prices_by_c
         completed_repeat_rounds = _completed_repeat_rounds(orders, loaded["fills"], process_id)
         repeat_count = len(completed_repeat_rounds)
         anchor = _anchor(orders, signal, process_id)
+        # Exit conditions own Recovery only.  A normal base BUY must never be
+        # counted or price-exited before the first residual Recovery enters.
+        if anchor is None:
+            continue
         order_price = next((_price(_intent(o).get("price") or o.get("price")) for o in reversed(orders) if _price(_intent(o).get("price") or o.get("price"))), None)
-        evaluation = evaluate_buy_exit_policy(policy=policy, completed_repeat_count=repeat_count, repeat_started_at=anchor,
-            order_price=order_price, current_price=prices.get(code), average_price=_price(position.get("average_price")), now=current_at)
+        evaluation = evaluate_buy_exit_policy(
+            policy=policy,
+            completed_repeat_count=repeat_count,
+            repeat_started_at=anchor,
+            order_price=order_price,
+            current_price=prices.get(code),
+            average_price=_price(position.get("average_price")),
+            now=current_at,
+            timeframe_minutes=_int(signal.get("signal_timeframe_minutes")),
+        )
         if not evaluation.get("triggered"):
             if evaluation.get("waiting_reasons"): result["waiting"].append({"execution_process_id": process_id, "code": code, "reason": "BUY_REPEAT_EXIT_EVIDENCE_PENDING", "waiting_reasons": evaluation["waiting_reasons"]})
             continue
@@ -636,7 +648,7 @@ def inspect_buy_repeat_exits(*, selected_account_no: str, actionable_prices_by_c
                                                      name=name, reasons=["BUY_EXIT_BROKER_ORDER_NO_MISSING"]))
                     cancel_generation_failed = True
                     continue
-                result["cancel_proposals"].append({"execution_process_id": process_id, "source_signal_id": signal_id, "account_no": account, "code": code, "side": "BUY", "order_queued_id": order.get("id") or order.get("order_queued_id"), "broker_order_no": broker_no, "remaining_quantity": _remaining(order), "trigger_snapshot": evaluation, "reason": "BUY_REPEAT_EXIT_CONDITION_MATCHED"})
+                result["cancel_proposals"].append({"execution_process_id": process_id, "source_signal_id": signal_id, "account_no": account, "code": code, "side": "BUY", "order_queued_id": order.get("id") or order.get("order_queued_id"), "broker_order_no": broker_no, "remaining_quantity": _remaining(order), "trigger_snapshot": evaluation, "reason": "BUY_RECOVERY_EXIT_CONDITION_MATCHED"})
         if cancel_generation_failed:
             continue
         if result["cancel_proposals"] and any(p.get("execution_process_id") == process_id for p in result["cancel_proposals"]):
@@ -660,7 +672,16 @@ def inspect_buy_repeat_exits(*, selected_account_no: str, actionable_prices_by_c
             result["waiting"].append({"execution_process_id": process_id, "code": code, "reason": "BUY_EXIT_CANCEL_EFFECT_PENDING"})
             continue
         terminal = all(
-            _text(item.get("status")).upper() in _SUCCESS_TERMINAL and _remaining(item) == 0
+            _text(item.get("status")).upper() in _SUCCESS_TERMINAL
+            and (
+                _remaining(item) == 0
+                or any(
+                    c.get("original_order_effect_confirmed") is True
+                    and _text(c.get("status")).upper() in _SUCCESS_TERMINAL
+                    for c in cancel_orders
+                    if _original_no(c) == _text(item.get("broker_order_no"))
+                )
+            )
             for item in latest_status_by_execution.values()
         )
         if terminal:
@@ -670,11 +691,19 @@ def inspect_buy_repeat_exits(*, selected_account_no: str, actionable_prices_by_c
                 "exit_condition_type": evaluation.get("matched_condition_types", ["OR"])[0],
                 "exit_condition_types": evaluation.get("matched_condition_types", []),
                 "exit_triggered_at": current_at.isoformat(timespec="milliseconds"),
-                "evaluated_generation": latest_round, "repeat_completed_count": repeat_count,
+                "evaluated_plan_generation": latest_generation,
+                "evaluated_buy_round": latest_round,
+                "evaluated_generation": latest_generation,
+                "completed_recovery_generation_count": repeat_count,
+                "recovery_started_at": anchor.isoformat(timespec="milliseconds") if anchor else None,
+                "completed_recovery_generations": sorted(completed_repeat_rounds),
+                # Compatibility aliases for durable evidence written before the
+                # Recovery-cycle terminology was normalized.
+                "repeat_completed_count": repeat_count,
                 "repeat_started_at": anchor.isoformat(timespec="milliseconds") if anchor else None,
                 "completed_repeat_rounds": sorted(completed_repeat_rounds),
                 "exit_source_snapshot_hash": evaluation.get("snapshot_hash"),
-                "exit_source_snapshot": evaluation, "reason": "BUY_REPEAT_EXIT_CONDITION_MATCHED",
+                "exit_source_snapshot": evaluation, "reason": "BUY_RECOVERY_EXIT_CONDITION_MATCHED",
                 "cancel_required": bool(cancel_orders), "cancel_effect_confirmed": True,
                 "buy_phase_completed": True})
     result["blocked_execution_process_ids"] = sorted(blocked)

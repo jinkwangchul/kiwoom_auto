@@ -102,7 +102,7 @@ class BuyPriceResetProductionTest(unittest.TestCase):
 
     def test_threshold_not_met_and_exact_threshold(self) -> None:
         self.assertFalse(self.inspect(current_price=104)["replan_proposals"])
-        self.assertEqual("BUY_PRICE_RESET_THRESHOLD_NOT_MET", self.inspect(current_price=104)["waiting"][0]["reason"])
+        self.assertEqual("BUY_PRICE_RESPONSE_THRESHOLD_NOT_MET", self.inspect(current_price=104)["waiting"][0]["reason"])
         self.assertEqual(1, len(self.inspect(current_price=105)["replan_proposals"]))
 
     def test_open_buy_requires_cancel_first(self) -> None:
@@ -148,6 +148,104 @@ class BuyPriceResetProductionTest(unittest.TestCase):
             "BUY_PRICE_RESET_BLOCKED_BY_HIGHER_PRIORITY_POLICY",
             result["waiting"][0]["reason"],
         )
+
+    def test_recovery_origin_reset_restarts_base_plan_without_recovery_metadata(self) -> None:
+        base_intent = deepcopy(self.intents()[0])
+        base_intent["base_plan_marker"] = "ORIGINAL_BUY_SETTINGS"
+        recovery_intent = deepcopy(base_intent)
+        recovery_intent.update({
+            "execution_id": "RECOVERY-EXECUTION-1",
+            "plan_generation": 1,
+            "quantity": 3,
+            "budget": 300,
+            "recovery_cycle": True,
+            "recovery_generation": 1,
+            "recovery_started_at": "2026-09-03T10:01:00",
+            "confirmed_residual_quantity": 3,
+            "recovery_source_snapshot_hash": "RECOVERY-SNAPSHOT",
+            "recovery_source_original_order_nos": ["BROKER-BASE"],
+            "recovery_source_cancel_ids": ["CANCEL-BASE"],
+        })
+        base_order = {
+            "id": "ORDER-BASE", "status": "CANCELLED", "order_action": "NEW",
+            "side": "BUY", "broker_order_no": "BROKER-BASE", "remaining_quantity": 0,
+            "quantity": 10, "budget": 1000, "account_no": ACCOUNT, "code": CODE,
+            "source_signal_id": SIGNAL, "execution_process_id": PROCESS,
+            "execution_id": base_intent["execution_id"], "plan_generation": 0,
+            "option_snapshot_hash": "OPTION", "execution_intent": base_intent,
+            "updated_at": "2026-09-03T10:00:30",
+        }
+        recovery_order = {
+            "id": "ORDER-RECOVERY", "status": "CANCELLED", "order_action": "NEW",
+            "side": "BUY", "broker_order_no": "BROKER-RECOVERY", "remaining_quantity": 0,
+            "quantity": 3, "budget": 300, "account_no": ACCOUNT, "code": CODE,
+            "source_signal_id": SIGNAL, "execution_process_id": PROCESS,
+            "execution_id": recovery_intent["execution_id"], "plan_generation": 1,
+            "option_snapshot_hash": "OPTION", "execution_intent": recovery_intent,
+            "updated_at": "2026-09-03T10:01:30",
+        }
+        reset_cancel = {
+            "id": "CANCEL-RECOVERY", "status": "CANCELLED", "order_action": "CANCEL",
+            "execution_process_id": PROCESS, "original_order_no": "BROKER-RECOVERY",
+            "original_order_effect_confirmed": True,
+            "cancel_evidence": {
+                "trigger": "BUY_PRICE_CHANGE_RESET", "source_plan_generation": 1,
+            },
+            "updated_at": "2026-09-03T10:02:00",
+        }
+        self.write(self.queue, "orders", [base_order, recovery_order, reset_cancel])
+        self.executions.write_text(json.dumps({
+            "version": 1,
+            "executions": [
+                {"execution_id": base_intent["execution_id"], "execution_process_id": PROCESS, "plan_generation": 0},
+                {"execution_id": recovery_intent["execution_id"], "execution_process_id": PROCESS, "plan_generation": 1},
+            ],
+            "processes": [{"execution_process_id": PROCESS, "option_snapshot_hash": "OPTION"}],
+        }), encoding="utf-8")
+        self.write(self.fills, "fills", [
+            {"execution_id": base_intent["execution_id"], "execution_process_id": PROCESS,
+             "filled_quantity": 4, "filled_price": 100},
+            {"execution_id": recovery_intent["execution_id"], "execution_process_id": PROCESS,
+             "filled_quantity": 1, "filled_price": 100},
+        ])
+        self.write(self.positions, "positions", [{
+            "account_no": ACCOUNT, "code": CODE, "quantity": 5,
+            "average_price": 100, "updated_at": "2026-09-03T10:02:30",
+        }])
+        self.write(self.holdings, "holdings", [{
+            "account_no": ACCOUNT, "code": CODE, "holding_quantity": 5,
+            "available_quantity": 5, "received_at": "2026-09-03T10:02:30",
+            "reconciliation_status": "CONSISTENT",
+        }])
+        self.write(self.signals, "signals", [{
+            "id": SIGNAL, "code": CODE, "name": "테스트", "signal": "BUY",
+            "execution_intent": recovery_intent, "execution_intents": [recovery_intent],
+        }])
+
+        result = inspect_buy_price_resets(
+            selected_account_no=ACCOUNT, allowed_stock_codes=[CODE],
+            actionable_prices_by_code={CODE: 105},
+            now=datetime.fromisoformat("2026-09-03T10:03:00"),
+            order_queue_path=self.queue, order_executions_path=self.executions,
+            fills_path=self.fills, positions_path=self.positions,
+            holdings_path=self.holdings, signals_path=self.signals,
+        )
+
+        self.assertEqual([], result["reviews"], result)
+        proposal = result["replan_proposals"][0]
+        restarted = proposal["execution_intents"][0]
+        self.assertEqual(2, proposal["plan_generation"])
+        self.assertEqual(1, proposal["buy_round"])
+        self.assertEqual(SIGNAL, restarted["source_signal_id"])
+        self.assertEqual(PROCESS, restarted["execution_process_id"])
+        self.assertEqual("ORIGINAL_BUY_SETTINGS", restarted["base_plan_marker"])
+        self.assertEqual(5, restarted["quantity"])
+        for field in (
+            "recovery_cycle", "recovery_generation", "recovery_started_at",
+            "confirmed_residual_quantity", "recovery_source_snapshot_hash",
+            "recovery_source_original_order_nos", "recovery_source_cancel_ids",
+        ):
+            self.assertNotIn(field, restarted)
 
 
 if __name__ == "__main__":

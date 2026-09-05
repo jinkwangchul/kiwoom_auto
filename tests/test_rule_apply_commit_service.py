@@ -964,6 +964,13 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                     },
                     "execution_connected": True,
                     "execution_lock_reason": "",
+                    "buy_completion_policy": {
+                        "policy": "BUY_RECOVERY_TERMINAL_COMPLETION",
+                        "residual_zero": "COMPLETE_CURRENT_BUY_ROUND",
+                        "exit_triggered": "CANCEL_CONFIRM_FILL_THEN_COMPLETE_CURRENT_STATE",
+                        "preserve_position": True,
+                        "next_buy_requires_new_signal": True,
+                    },
                 },
             )
             self.assertEqual(

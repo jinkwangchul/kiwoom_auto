@@ -270,12 +270,35 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
         )
 
         with mock.patch(
+            "auto_trade_order_execution_boundary.signal_dispatch_block_reasons",
+            return_value=[],
+        ), mock.patch(
             "auto_trade_order_execution_boundary.commit_execution_enable"
         ) as commit_enable:
             result = self.boundary.process_executable_order_for_auto_trade(record["id"])
 
         self.assertEqual("auto_trade_runtime_state", result["stage"])
         self.assertEqual(["RECOVERY_STOCK_PENDING"], result["blocked_reasons"])
+        commit_enable.assert_not_called()
+        self.assertEqual([], self.send_order.calls)
+        self.assertEqual(before, self.queue_path.read_bytes())
+
+    def test_superseded_signal_blocks_before_execution_enable_mutation(self) -> None:
+        record = self._record(side="BUY", quantity=1)
+        record["status"] = "EXECUTABLE"
+        self._write_queue(record)
+        before = self.queue_path.read_bytes()
+
+        with mock.patch(
+            "auto_trade_order_execution_boundary.signal_dispatch_block_reasons",
+            return_value=["SIGNAL_PROCESS_SUPERSEDE_PENDING"],
+        ), mock.patch(
+            "auto_trade_order_execution_boundary.commit_execution_enable"
+        ) as commit_enable:
+            result = self.boundary.process_executable_order_for_auto_trade(record["id"])
+
+        self.assertEqual("signal_ownership_guard", result["stage"])
+        self.assertEqual(["SIGNAL_PROCESS_SUPERSEDE_PENDING"], result["blocked_reasons"])
         commit_enable.assert_not_called()
         self.assertEqual([], self.send_order.calls)
         self.assertEqual(before, self.queue_path.read_bytes())

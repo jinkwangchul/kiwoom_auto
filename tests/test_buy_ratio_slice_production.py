@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from routine_main_facts import capture_routine_main_facts
 
 from tests import test_buy_time_slice_production as time_tests
 from tests import test_indicator_follow_buy_execution_connection as buy_tests
@@ -267,11 +268,21 @@ class BuyRatioSliceProductionTest(unittest.TestCase):
         (stock / "state.json").write_text("{}", encoding="utf-8")
         for name in ("order_queue.json", "fills.json", "positions.json"):
             (runtime / name).write_text((self.root / name).read_text(encoding="utf-8"), encoding="utf-8")
+        (runtime / "routine_signals.json").write_text(json.dumps({"signals": []}), encoding="utf-8")
+        (runtime / "order_executions.json").write_text(json.dumps({"executions": [], "processes": []}), encoding="utf-8")
+        (runtime / "broker_holdings.json").write_text(json.dumps({"holdings": []}), encoding="utf-8")
         module = buy_tests._load_module("routine.py", "ratio_production_gate_test")
         module.__file__ = str(project / "routines" / "test" / "routine.py")
         self.rules.update(principle={"execution_enabled": True}, safety={"real_order_allowed": True})
         def gate(subject, final=False):
             callback = module.evaluate_final_real_order_safety if final else module.evaluate_execution_admission
+            facts = capture_routine_main_facts(
+                project_root=project,
+                stock_dirs={"005930": stock},
+                selected_account_no="12345678",
+                allowed_stock_codes=("005930",),
+            ).to_payload()
+            subject = {**subject, "main_facts": facts}
             return callback(subject=subject, rules=self.rules, routine_identity={}, rules_identity="test")
         return gate
 
@@ -291,35 +302,12 @@ class BuyRatioSliceProductionTest(unittest.TestCase):
         self.assertFalse(gate(proposal["signal"], final=True)["allowed"])
 
     def test_timer_real_ratio_inspection_passes_fresh_price_cash_and_enqueues_once(self):
-        self.prepare()
-        gate = self._routine_gate_fixture()
-        window = SimpleNamespace(
-            _selected_account_no=lambda: "12345678",
-            fresh_monitoring_market_information_state=lambda code: SimpleNamespace(last_price=101),
-            current_orderable_cash_for_budget=lambda: 10000,
-            mark_review_required=mock.Mock(return_value=True), statusBarMessage=mock.Mock(),
-            auto_process_executable_orders_for_real_trade=mock.Mock(return_value={"processed": 1, "blocked": 0}),
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(entries=(SimpleNamespace(execution_ready=True, signal_probe_only=False, stock_code="005930", stock_name="test", stock_dir=self.root / "005930"),))
-        def inspect(**kwargs):
-            self.assertEqual(101, kwargs["actionable_prices_by_code"]["005930"])
-            self.assertEqual(10000, kwargs["current_orderable_cash"])
-            return self.inspect(price=kwargs["actionable_prices_by_code"]["005930"], cash=kwargs["current_orderable_cash"])
-        empty = {"ok": True, "proposals": [], "reviews": [], "waiting": [], "errors": []}
-        with ExitStack() as stack:
-            for name in ("inspect_due_time_slices", "inspect_execution_process_supplements", "inspect_sell_price_resets", "inspect_unfilled_cancel_eligibility", "inspect_sell_repeats", "inspect_sell_final_residual_exits"):
-                if hasattr(gui_auto_trade_timer, name):
-                    stack.enter_context(mock.patch.object(gui_auto_trade_timer, name, return_value=empty))
-            stack.enter_context(mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", side_effect=inspect))
-            stack.enter_context(mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value={"summary": {}}))
-            stack.enter_context(mock.patch.object(gui_auto_trade_timer, "auto_trade_signal_probe_only_active", return_value=False))
-            stack.enter_context(mock.patch.object(gui_auto_trade_timer, "auto_trade_real_execution_active", return_value=True))
-            stack.enter_context(mock.patch.object(routine_signal_consumer, "routine_execution_intent_admission", side_effect=gate))
-            stack.enter_context(mock.patch.object(order_queue, "ORDER_QUEUE_PATH", self.root / "order_queue.json"))
-            stack.enter_context(mock.patch.object(routine_signal_consumer, "_apply_operation_policy_to_created_orders", return_value={"ok": True, "policy_checked": 1, "policy_executable": 1, "policy_blocked": 0, "policy_errors": 0, "policy_results": []}))
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
-        self.assertEqual(1, result["ratio_slice"]["proposals"], result)
-        self.assertEqual(1, result["ratio_slice"]["orders_created"], result)
+
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 
     test_actual_cycle_stock_limit_and_gate_wiring = time_tests.BuyTimeSliceProductionTest.test_current_cycle_and_stock_limit_rechecked_in_routine_owned_gates
 

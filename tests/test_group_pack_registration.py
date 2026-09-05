@@ -31,9 +31,22 @@ class GroupPackRegistrationTest(unittest.TestCase):
                 "module_name": "indicator_follow_routine",
                 "rules_file": "rules.json",
                 "locators": {
-                    "evaluation": {"file": "routine.py", "callable": "evaluate"},
-                    "settings": {"file": "settings.py", "callable": "Dialog"},
+                    "evaluation": {
+                        "file": "routine.py",
+                        "callable": "evaluate",
+                        "market_bar_projection_callable": "market_bar_projection_request",
+                        "cycle_projection_callable": "project_cycle_context",
+                    },
+                    "settings": {
+                        "file": "settings.py",
+                        "callable": "Dialog",
+                        "registration_callable": "register_routine_instance_snapshot",
+                    },
                     "rule_mapper": {"file": "routine_rule_mapper.py"},
+                    "rule_commit_validator": {
+                        "file": "routine_rule_commit_validator.py",
+                        "callable": "validate_committed_rules",
+                    },
                     "execution_admission": {
                         "file": "routine.py",
                         "callable": "evaluate_execution_admission",
@@ -51,6 +64,12 @@ class GroupPackRegistrationTest(unittest.TestCase):
 def evaluate(context):
     return None
 
+def market_bar_projection_request(rules):
+    return {'projection': 'COMPLETED_TIMEFRAME'}
+
+def project_cycle_context(**facts):
+    return {'status': 'resolved'}
+
 def _allow(subject, rules, routine_identity, rules_identity):
     return {
         'allowed': True,
@@ -64,8 +83,14 @@ evaluate_final_real_order_safety = _allow
         return {
             "routines/indicator_follow/routine.json": routine_json,
             "routines/indicator_follow/routine.py": routine_code,
-            "routines/indicator_follow/settings.py": b"class Dialog:\n    pass\n",
+            "routines/indicator_follow/settings.py": (
+                b"class Dialog:\n    pass\n\n"
+                b"def register_routine_instance_snapshot(*args, **kwargs):\n    return {}\n"
+            ),
             "routines/indicator_follow/routine_rule_mapper.py": b"MAPPER = True\n",
+            "routines/indicator_follow/routine_rule_commit_validator.py": (
+                b"def validate_committed_rules(rules):\n    return {'ok': True}\n"
+            ),
             "routines/indicator_follow/rules.json": b"{}\n",
         }
 
@@ -128,7 +153,7 @@ evaluate_final_real_order_safety = _allow
         self.assertEqual(["지표추종매매", "지표추종매매_1"], [g.display_name for g in groups])
         self.assertEqual(first_mtime, second_mtime)
         self.assertEqual((), second.installed_files)
-        self.assertEqual(5, len(second.reused_files))
+        self.assertEqual(6, len(second.reused_files))
         self.assertTrue(registry_valid)
 
     def test_lowest_deleted_slot_is_reused(self) -> None:
@@ -246,6 +271,27 @@ evaluate_final_real_order_safety = _allow
         self.assertFalse(result.success)
         self.assertEqual("PACK_REGISTRATION_FAILED", result.error_code)
         self.assertIn("routine locator file does not exist", result.error)
+        self.assertFalse((root / "routines").exists())
+        self.assertFalse((root / "groups").exists())
+
+    def test_missing_declared_callback_fails_closed_and_rolls_back_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = self._payload()
+            payload["routines/indicator_follow/routine.py"] = payload[
+                "routines/indicator_follow/routine.py"
+            ].replace(
+                b"def market_bar_projection_request(rules):\n"
+                b"    return {'projection': 'COMPLETED_TIMEFRAME'}\n\n",
+                b"",
+            )
+            pack = self._write_pack(root, payload=payload)
+
+            result = register_group_pack(pack, project_root=root)
+
+        self.assertFalse(result.success)
+        self.assertEqual("PACK_REGISTRATION_FAILED", result.error_code)
+        self.assertIn("market_bar_projection_callable", result.error)
         self.assertFalse((root / "routines").exists())
         self.assertFalse((root / "groups").exists())
 

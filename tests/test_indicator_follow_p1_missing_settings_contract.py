@@ -206,13 +206,6 @@ class MapperContractTest(unittest.TestCase):
             "buy_cycle_ratio_value_line": "0.15",
             "buy_cycle_ratio_compare_combo": "이상",
             "buy_cycle_ratio_count_line": "3",
-            "buy_cycle_situation_mode_combo": "가격비교",
-            "buy_cycle_price_left_combo": "주문가",
-            "buy_cycle_price_right_combo": "현재가",
-            "buy_cycle_price_direction_combo": "상향",
-            "buy_cycle_price_value_line": "0.15",
-            "buy_cycle_price_compare_combo": "이상",
-            "buy_cycle_price_action_combo": "일괄취소",
         }
 
     def _execution_candidate(self, preview: dict, key: str) -> dict:
@@ -277,26 +270,34 @@ class MapperContractTest(unittest.TestCase):
         )
         self.assertNotIn("buy.execution.base", invalid_preview["mapped_paths"])
 
-    def test_cycle_is_signal_scoped_and_execution_locked(self) -> None:
+    def test_cycle_is_residual_only_recovery_and_connected(self) -> None:
         preview = self._preview({"cycle": self._cycle()})
         candidate = self._execution_candidate(preview, "cycle")
         policy = candidate["value"]
 
-        self.assertEqual("SIGNAL_SCOPED_BUY_CYCLE", policy["scope"])
+        self.assertEqual("SIGNAL_SCOPED_BUY_RECOVERY", policy["scope"])
         self.assertTrue(policy["requires_source_signal"])
         self.assertFalse(policy["autonomous_scheduler"])
-        self.assertEqual("REQUIRE_NEW_BUY_SIGNAL", policy["after_cycle_completion"])
+        self.assertTrue(policy["residual_only"])
+        self.assertTrue(policy["preserve_source_signal_id"])
+        self.assertTrue(policy["preserve_execution_process_id"])
+        self.assertTrue(policy["preserve_buy_round"])
+        self.assertEqual("COMPLETE_CURRENT_BUY_ROUND", policy["after_cycle_completion"])
         self.assertEqual("MULTI_RATIO", policy["point_policy"]["mode"])
-        self.assertEqual("CANCEL_BATCH", policy["situation_response"]["action"])
-        self.assertFalse(candidate["execution_connected"])
+        self.assertNotIn("situation_response", policy)
+        self.assertEqual({}, policy["unfilled_timeout_policy"])
+        self.assertEqual([], policy["buy_price_response_policies"])
+        self.assertTrue(candidate["execution_connected"])
 
-    def test_cycle_reset_option_is_connected_and_committable(self) -> None:
+    def test_cycle_has_no_independent_situation_authority_and_is_committable(self) -> None:
         cycle = self._cycle()
+        # A stale legacy key cannot recreate the retired cycle-local response.
         cycle["buy_cycle_price_action_combo"] = "매수리셋"
         preview = self._preview({"cycle": cycle})
         candidate = self._execution_candidate(preview, "cycle")
         self.assertTrue(candidate["execution_connected"])
         self.assertEqual("", candidate["execution_lock_reason"])
+        self.assertNotIn("situation_response", candidate["value"])
 
         session = self.mapper.build_rule_approval_session(
             preview,
@@ -320,7 +321,13 @@ class MapperContractTest(unittest.TestCase):
     def test_preview_keeps_three_active_concepts_separate(self) -> None:
         preview = self._preview({
             "base": self._base(active=True),
-            "repeat": {"apply_all_check": True, "detail_mode_combo": "능동매수"},
+            "repeat": {
+                "apply_all_check": True,
+                "detail_mode_combo": "능동매수",
+                "active_direction_combo": "상향",
+                "active_ratio_line": "0.7",
+                "active_compare_combo": "이하",
+            },
             "additional": self._additional(last=True, method="능동"),
         })
         execution = preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["execution"]
@@ -338,7 +345,7 @@ class MapperContractTest(unittest.TestCase):
         self.assertNotIn("additional feature", text)
         self.assertNotIn("cycle setting", text)
 
-    def test_connected_additional_can_commit_while_unsupported_cycle_stays_locked(self) -> None:
+    def test_connected_additional_and_recovery_cycle_can_commit_together(self) -> None:
         preview = self._preview({"additional": self._additional(price=True), "cycle": self._cycle()})
         session = self.mapper.build_rule_approval_session(preview, {
             "buy.execution.additional": "APPROVED",
@@ -347,13 +354,11 @@ class MapperContractTest(unittest.TestCase):
         pipeline = self.mapper.build_rule_pipeline_preview(self.rules, preview, session)
 
         self.assertEqual(
-            ["buy.execution.additional"],
+            ["buy.execution.additional", "buy.execution.cycle"],
             [item["target_path"] for item in pipeline["patch_preview"]["patches"]],
         )
-        reasons = {item["reason"] for item in pipeline["patch_preview"]["skipped_paths"]}
-        self.assertIn(self.mapper.CYCLE_OPTION_EXECUTION_LOCK_REASON, reasons)
         self.assertEqual(
-            ["buy.execution.additional"],
+            ["buy.execution.additional", "buy.execution.cycle"],
             [item["target_path"] for item in pipeline["apply_preview"]["applied_patches"]],
         )
 

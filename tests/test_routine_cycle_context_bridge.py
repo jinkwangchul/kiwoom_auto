@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import routine_signal_probe
+from routine_main_facts import build_routine_main_facts_from_projection
 
 
 class _RoutineModule:
@@ -17,6 +18,10 @@ class _RoutineModule:
 
     def __init__(self) -> None:
         self.context = None
+
+    @staticmethod
+    def market_bar_projection_request(_rules):
+        return {"projection": "COMPLETED_TIMEFRAME"}
 
     @staticmethod
     def project_cycle_context(**kwargs):
@@ -54,27 +59,48 @@ class RoutineCycleContextBridgeTest(unittest.TestCase):
                 json.dumps({"assigned_routine_instance_id": "INSTANCE_A"}),
                 encoding="utf-8",
             )
-            order_path = root / "order_queue.json"
-            fills_path = root / "fills.json"
-            positions_path = root / "positions.json"
-            order_path.write_text('{"orders": []}', encoding="utf-8")
-            fills_path.write_text('{"fills": []}', encoding="utf-8")
-            positions_path.write_text('{"positions": []}', encoding="utf-8")
+            main_facts = build_routine_main_facts_from_projection(
+                {
+                    "signals": [],
+                    "orders": [],
+                    "executions": [],
+                    "processes": [],
+                    "fills": [],
+                    "positions": [],
+                    "holdings": [],
+                    "stock_configs": {
+                        "005930": {"assigned_routine_instance_id": "INSTANCE_A"}
+                    },
+                    "stock_states": {
+                        "005930": {"trade_enabled": True, "status": "WATCHING"}
+                    },
+                    "selected_account_no": "",
+                    "allowed_stock_codes": ["005930"],
+                    "actionable_prices_by_code": {"005930": 71_000},
+                    "current_orderable_cash": None,
+                    "budget": {},
+                    "limits": {},
+                    "market": {
+                        "raw_candles_by_code": {"005930": []},
+                        "reference_prices_by_code": {"005930": 70_000},
+                    },
+                    "review": {},
+                }
+            ).to_payload()
             module = _RoutineModule()
 
             with (
-                mock.patch.object(routine_signal_probe, "ORDER_QUEUE_PATH", order_path),
-                mock.patch.object(routine_signal_probe, "FILLS_PATH", fills_path),
-                mock.patch.object(routine_signal_probe, "POSITIONS_PATH", positions_path),
                 mock.patch.object(routine_signal_probe, "_load_candles_from_stock_dir", return_value=[]),
                 mock.patch.object(routine_signal_probe, "read_reference_price", return_value=70_000),
+                mock.patch.object(routine_signal_probe, "_append_log"),
             ):
                 result = routine_signal_probe.probe_routine_for_stock(
                     module,
                     "지표추종매매",
                     stock_dir,
                     "TICK_1",
-                    actionable_price_reader=lambda _code, _name: 71_000,
+                    main_facts=main_facts,
+                    fresh_main_facts_provider=lambda: main_facts,
                 )
 
             self.assertEqual("HOLD", result["signal"])

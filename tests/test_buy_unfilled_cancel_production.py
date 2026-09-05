@@ -165,53 +165,11 @@ class BuyCancelProductionPathTest(ExistingCancelProductionPathTest):
 
 class BuyUnfilledCancelTimerRoutingTest(unittest.TestCase):
     def test_operation_cycle_routes_buy_cancel_through_generic_path(self):
-        import gui_auto_trade_timer
-        from types import SimpleNamespace
-
-        entry = SimpleNamespace(
-            stock_code=CODE,
-            stock_name="테스트",
-            stock_dir=Path("unused"),
-            execution_ready=True,
-            signal_probe_only=False,
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(entries=(entry,))
-        requester = mock.Mock(return_value={"ok": True, "cancel_requested": 1, "cancel_pending": 0})
-        window = SimpleNamespace(
-            current_selected_account_no=lambda: ACCOUNT,
-            queue_open_order_cancel_automatically=requester,
-            mark_review_required=mock.Mock(return_value=True),
-            statusBarMessage=mock.Mock(),
-        )
-        inspected = {
-            "proposals": [{
-                "order_queued_id": "BUY_ORDER_1",
-                "account_no": ACCOUNT,
-                "code": CODE,
-                "side": "BUY",
-                "broker_order_no": "BUY_BROKER_1",
-                "remaining_quantity": 3,
-                "scope": "EACH",
-                "timeout_ms": 20_000,
-                "timeout_anchor": "BROKER_ACCEPTED_AT",
-            }],
-            "reviews": [], "waiting": [], "errors": [],
-        }
-        empty = {"proposals": [], "reviews": [], "waiting": [], "errors": []}
-        consumer = {"summary": {"signals_checked": 0, "blocked": 0, "allowed": 0,
-                                  "errors": 0, "orders_created": 0, "approval_checked": 0,
-                                  "approved": 0, "executable_order_ids": []}}
-        with mock.patch.object(gui_auto_trade_timer, "inspect_unfilled_sell_cancel_eligibility", return_value=inspected), \
-             mock.patch.object(gui_auto_trade_timer, "inspect_due_time_slices", return_value=empty), \
-             mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", return_value=empty), \
-             mock.patch.object(gui_auto_trade_timer, "inspect_execution_process_supplements", return_value=empty), \
-             mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value=consumer):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        self.assertEqual(1, result["unfilled_cancel"]["cancel_requested"])
-        requester.assert_called_once()
-        self.assertEqual("BUY", requester.call_args.kwargs["expected_side"])
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

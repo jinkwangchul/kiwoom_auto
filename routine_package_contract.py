@@ -29,6 +29,8 @@ RULE_MAPPER_ROLE = "rule_mapper"
 RULE_COMMIT_VALIDATOR_ROLE = "rule_commit_validator"
 EXECUTION_ADMISSION_ROLE = "execution_admission"
 FINAL_SAFETY_ROLE = "final_safety"
+LIFECYCLE_ROLE = "lifecycle"
+STARTUP_RECOVERY_ROLE = "startup_recovery"
 
 
 class RoutineContractError(RuntimeError):
@@ -264,6 +266,128 @@ def evaluate_routine_gate(
         }
 
 
+def evaluate_routine_lifecycle(
+    *,
+    instance_id: str,
+    main_facts: dict[str, Any],
+    project_root: Path | str = PROJECT_ROOT,
+) -> dict[str, Any]:
+    """Invoke a routine-owned lifecycle coordinator and validate decisions."""
+    from routine_lifecycle_decision import validate_routine_lifecycle_decision
+
+    try:
+        instance, definition = definition_for_instance(instance_id, project_root=project_root)
+        rules, rules_identity = _read_effective_rules(instance)
+        routine_identity = {
+            "definition_id": str(definition.definition_id),
+            "routine_instance_id": str(instance.instance_id),
+        }
+        callback = load_routine_callable(definition, LIFECYCLE_ROLE)
+        raw = callback(
+            main_facts=deepcopy(main_facts),
+            rules=deepcopy(rules),
+            routine_identity=deepcopy(routine_identity),
+            rules_identity=rules_identity,
+        )
+        decisions = raw.get("decisions") if isinstance(raw, dict) else None
+        if not isinstance(decisions, list):
+            raise RoutineContractError("routine lifecycle result is invalid")
+        for decision in decisions:
+            valid, reason = validate_routine_lifecycle_decision(decision, main_facts=main_facts)
+            if not valid:
+                raise RoutineContractError(reason)
+            if decision.get("routine_identity") != routine_identity:
+                raise RoutineContractError("routine lifecycle identity mismatch")
+        return {
+            "ok": True,
+            "decisions": deepcopy(decisions),
+            "routine_identity": routine_identity,
+            "rules_identity": rules_identity,
+            "facts_revision": main_facts.get("revision"),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "decisions": [],
+            "reason": "ROUTINE_LIFECYCLE_UNAVAILABLE",
+            "errors": [f"ROUTINE_LIFECYCLE_UNAVAILABLE:{type(exc).__name__}"],
+            "routine_identity": {"routine_instance_id": str(instance_id or "").strip()},
+            "rules_identity": None,
+            "facts_revision": main_facts.get("revision") if isinstance(main_facts, dict) else None,
+        }
+
+
+def classify_routine_startup_recovery(
+    *,
+    instance_id: str,
+    signal_id: str,
+    main_facts: dict[str, Any],
+    project_root: Path | str = PROJECT_ROOT,
+) -> dict[str, Any]:
+    """Ask the owning routine to classify one startup-pending signal."""
+    from routine_main_facts import validate_routine_main_facts
+
+    try:
+        valid, reason = validate_routine_main_facts(main_facts)
+        if not valid:
+            raise RoutineContractError(reason)
+        instance, definition = definition_for_instance(instance_id, project_root=project_root)
+        rules, rules_identity = _read_effective_rules(instance)
+        routine_identity = {
+            "definition_id": str(definition.definition_id),
+            "routine_instance_id": str(instance.instance_id),
+        }
+        callback = load_routine_callable(definition, STARTUP_RECOVERY_ROLE)
+        raw = callback(
+            signal_id=str(signal_id or "").strip(),
+            main_facts=deepcopy(main_facts),
+            rules=deepcopy(rules),
+            routine_identity=deepcopy(routine_identity),
+            rules_identity=rules_identity,
+        )
+        if not isinstance(raw, dict) or raw.get("classification") not in {
+            "RECOVERABLE", "PENDING_VALID", "REVIEW_REQUIRED"
+        }:
+            raise RoutineContractError("routine startup recovery classification is invalid")
+        if raw.get("routine_identity") != routine_identity:
+            raise RoutineContractError("routine startup recovery identity mismatch")
+        if raw.get("rules_identity") != rules_identity:
+            raise RoutineContractError("routine startup recovery rules identity mismatch")
+        if str(raw.get("signal_id") or "").strip() != str(signal_id or "").strip():
+            raise RoutineContractError("routine startup recovery signal identity mismatch")
+        if (
+            raw.get("facts_revision") != main_facts.get("revision")
+            or raw.get("facts_snapshot_hash") != main_facts.get("snapshot_hash")
+        ):
+            raise RoutineContractError("routine startup recovery facts identity mismatch")
+        return deepcopy(raw)
+    except Exception as exc:
+        stock_code = ""
+        if isinstance(main_facts, dict):
+            signals = main_facts.get("signals")
+            if isinstance(signals, list):
+                match = next(
+                    (
+                        item for item in signals
+                        if isinstance(item, dict)
+                        and str(item.get("id") or "").strip() == str(signal_id or "").strip()
+                    ),
+                    None,
+                )
+                if isinstance(match, dict):
+                    stock_code = str(match.get("code") or "").strip().lstrip("A")
+        return {
+            "classification": "REVIEW_REQUIRED",
+            "reason": f"ROUTINE_STARTUP_RECOVERY_UNAVAILABLE:{type(exc).__name__}",
+            "signal_id": str(signal_id or "").strip(),
+            "stock_code": stock_code,
+            "routine_identity": {"routine_instance_id": str(instance_id or "").strip()},
+            "rules_identity": None,
+            "facts_revision": main_facts.get("revision") if isinstance(main_facts, dict) else None,
+            "facts_snapshot_hash": main_facts.get("snapshot_hash") if isinstance(main_facts, dict) else None,
+        }
+
+
 def routine_trace_contract(
     definition: RoutineDefinitionRecord,
 ) -> tuple[tuple[Path, ...], tuple[str, ...]]:
@@ -310,9 +434,15 @@ def validate_routine_definition_capabilities(
         EVALUATION_ROLE,
         SETTINGS_ROLE,
         RULE_MAPPER_ROLE,
+        RULE_COMMIT_VALIDATOR_ROLE,
         EXECUTION_ADMISSION_ROLE,
         FINAL_SAFETY_ROLE,
     )
+    locators = _definition_locators(definition)
+    if LIFECYCLE_ROLE in locators:
+        required_roles = (*required_roles, LIFECYCLE_ROLE)
+    if STARTUP_RECOVERY_ROLE in locators:
+        required_roles = (*required_roles, STARTUP_RECOVERY_ROLE)
     errors: list[str] = []
     resolved: dict[str, bool] = {}
     for role in required_roles:
@@ -327,6 +457,55 @@ def validate_routine_definition_capabilities(
         except Exception as exc:
             resolved[role] = False
             errors.append(f"{role}:{type(exc).__name__}")
+    # A locator may declare additional Production entry points in the same
+    # source module (for example settings registration and routine-owned
+    # signal projections).  Registration must resolve every declared callback;
+    # checking only the primary ``callable`` would let a packed routine install
+    # successfully and fail later in the Production caller.
+    required_additional_callables = {
+        EVALUATION_ROLE: (
+            "market_bar_projection_callable",
+            "cycle_projection_callable",
+        ),
+        SETTINGS_ROLE: ("registration_callable",),
+    }
+    checked_additional: set[tuple[str, str]] = set()
+    for role, callable_keys in required_additional_callables.items():
+        for callable_key in callable_keys:
+            capability = f"{role}.{callable_key}"
+            checked_additional.add((role, callable_key))
+            try:
+                if load_targets:
+                    load_routine_callable(
+                        definition,
+                        role,
+                        callable_key=callable_key,
+                    )
+                resolved[capability] = True
+            except Exception as exc:
+                resolved[capability] = False
+                errors.append(f"{capability}:{type(exc).__name__}")
+    for role, locator in locators.items():
+        if not isinstance(locator, dict):
+            continue
+        for callable_key in tuple(
+            key for key in locator
+            if key != "callable" and str(key).endswith("_callable")
+        ):
+            if (role, callable_key) in checked_additional:
+                continue
+            capability = f"{role}.{callable_key}"
+            try:
+                if load_targets:
+                    load_routine_callable(
+                        definition,
+                        role,
+                        callable_key=callable_key,
+                    )
+                resolved[capability] = True
+            except Exception as exc:
+                resolved[capability] = False
+                errors.append(f"{capability}:{type(exc).__name__}")
     return {
         "ok": not errors,
         "definition_id": definition.definition_id,

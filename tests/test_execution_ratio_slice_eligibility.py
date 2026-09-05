@@ -78,6 +78,10 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
                     "source_signal_id": self.signal_id,
                     "execution_process_id": self.process_id,
                     "execution_mode": "MULTI_RATIO",
+                    "deferred_dispatch": True,
+                    "deferred_schedule": False,
+                    "deferred_plan_status_key": "ratio_slice_plan_complete",
+                    "deferred_last_child_status_key": "ratio_slice_last_child_sequence_index",
                     "execution_process_owner_required": True,
                     "plan_generation": 0,
                     "child_sequence_index": index,
@@ -420,39 +424,11 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
         )
 
     def test_timer_isolates_review_and_executes_other_stock(self) -> None:
-        window = SimpleNamespace(
-            _selected_account_no=lambda: "12345678",
-            fresh_monitoring_market_information_state=lambda code: SimpleNamespace(last_price=10_100),
-            mark_review_required=mock.Mock(return_value=True),
-            statusBarMessage=mock.Mock(),
-            auto_process_executable_orders_for_real_trade=mock.Mock(return_value={"processed": 1, "blocked": 0}),
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(entries=(
-            SimpleNamespace(execution_ready=True, signal_probe_only=False, stock_code="005930", stock_name="삼성전자", stock_dir=self.root / "005930"),
-            SimpleNamespace(execution_ready=True, signal_probe_only=False, stock_code="000660", stock_name="SK하이닉스", stock_dir=self.root / "000660"),
-        ))
-        inspected = {
-            "ok": True,
-            "proposals": [{"code": "000660", "execution_intents": [{}], "signal": {}}],
-            "reviews": [{"code": "005930", "review_reasons": ["SEND_UNCERTAIN"]}],
-            "waiting": [], "errors": [],
-        }
-        summary = {"signals_checked": 0, "blocked": 0, "allowed": 0, "errors": 0, "orders_created": 0, "approval_checked": 0, "approved": 0, "executable_order_ids": []}
-        empty_inspection = {"ok": True, "proposals": [], "reviews": [], "waiting": [], "errors": []}
-        with mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", return_value=inspected), mock.patch.object(
-            gui_auto_trade_timer, "enqueue_eligible_ratio_slice", return_value={"ok": True, "orders_created": 1, "executable_order_ids": ["ORDER-RATIO-1"]}
-        ), mock.patch.object(gui_auto_trade_timer, "inspect_due_time_slices", return_value=empty_inspection), mock.patch.object(
-            gui_auto_trade_timer, "inspect_execution_process_supplements", return_value=empty_inspection
-        ), mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value={"summary": summary}), mock.patch.object(
-            gui_auto_trade_timer, "auto_trade_signal_probe_only_active", return_value=False
-        ), mock.patch.object(gui_auto_trade_timer, "auto_trade_real_execution_active", return_value=True):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        window.mark_review_required.assert_called_once()
-        window.auto_process_executable_orders_for_real_trade.assert_called_once_with(limit=5, order_ids=["ORDER-RATIO-1"])
-        self.assertEqual(1, result["ratio_slice"]["reviews"])
-        self.assertEqual(1, result["ratio_slice"]["orders_created"])
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

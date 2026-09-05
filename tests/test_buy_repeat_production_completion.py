@@ -33,10 +33,11 @@ class BuyRepeatProductionCompletionTest(unittest.TestCase):
         self.assertEqual(1, result["execution_intent"]["buy_round"])
         self.assertEqual("BASE", result["execution_intent"]["buy_phase"])
 
-    def test_active_buy_repeat_remains_fail_closed(self) -> None:
+    def test_active_buy_repeat_uses_confirmed_position_and_creates_exact_next_round(self) -> None:
         result = self.helper._build(cycle=self.helper._cycle(1), rules=self.helper._rules(repeat_mode="ACTIVE_BUY"))
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertEqual("ACTIVE_BUY_NOT_IMPLEMENTED", result["reason"])
+        self.assertEqual("READY", result["status"], result)
+        self.assertEqual(19, result["execution_intent"]["quantity"])
+        self.assertEqual("REPEAT_ACTIVE_BUY", result["execution_intent"]["active_buy_policy"]["policy"])
 
 
 if __name__ == "__main__":

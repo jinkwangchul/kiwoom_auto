@@ -52,6 +52,12 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
             "round_budget_value": 1,
             "budget_ratio": 2,
         }
+        if repeat_mode == "ACTIVE_BUY":
+            repeat.update({
+                "active_direction": "UP",
+                "active_ratio": 1,
+                "active_compare": "<=",
+            })
         if max_rounds is not None:
             repeat["max_buy_rounds"] = max_rounds
         return {
@@ -83,6 +89,8 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
             "pending_buy_rounds": [],
             "pending_buy_order_identities": [],
             "cycle_identity": "CYCLE_1" if confirmed else None,
+            "holding_qty": 1 if confirmed else 0,
+            "avg_price": 120.0 if confirmed else 0.0,
         }
         value.update(overrides)
         return value
@@ -103,6 +111,8 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
             "rules": rules if rules is not None else self._rules(),
             "reference_price": price,
             "routine_instance_id": "INSTANCE_A",
+            "code": "005930",
+            "tick_key": "2026-09-02T10:00:00",
         }
         if actionable_price is Ellipsis:
             context["actionable_current_price"] = price
@@ -201,16 +211,103 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
         self.assertEqual("BLOCKED", result["status"])
         self.assertEqual("BUY_ORDER_STILL_PENDING", result["reason"])
 
-    def test_max_round_active_buy_unresolved_and_pending_rules_fail_closed(self) -> None:
+    def test_max_round_active_buy_connected_and_pending_rules_fail_closed(self) -> None:
         exceeded = self._build(cycle=self._cycle(1), rules=self._rules(max_rounds=1))
         active_buy = self._build(cycle=self._cycle(1), rules=self._rules(repeat_mode="ACTIVE_BUY"))
         unresolved = self._build(cycle={"status": "unresolved", "unresolved_reason": "LEDGER_MISMATCH"})
         pending_only = self._build(rules={"indicator_follow_rule_pending": {"candidates": {"execution": {}}}})
 
         self.assertEqual("BUY_ROUND_COUNT_EXCEEDED", exceeded["reason"])
-        self.assertEqual("ACTIVE_BUY_NOT_IMPLEMENTED", active_buy["reason"])
+        self.assertEqual("READY", active_buy["status"])
+        self.assertEqual(19, active_buy["execution_intent"]["quantity"])
+        self.assertEqual("REPEAT_ACTIVE_BUY", active_buy["execution_intent"]["active_buy_policy"]["policy"])
         self.assertEqual("LEDGER_MISMATCH", unresolved["reason"])
         self.assertEqual("APPROVED_BASE_EXECUTION_RULE_MISSING", pending_only["reason"])
+
+    def test_active_buy_no_buy_and_wait_are_normal_no_order_results(self) -> None:
+        rules = self._rules(repeat_mode="ACTIVE_BUY")
+        no_buy = self._build(
+            rules=rules,
+            cycle=self._cycle(1, holding_qty=3, avg_price=13_100),
+            price=13_000,
+        )
+        wait = self._build(
+            rules=rules,
+            cycle=self._cycle(1, holding_qty=3, avg_price=50_000),
+            price=13_000,
+            actionable_price=14_000,
+        )
+
+        self.assertEqual("NO_BUY", no_buy["status"], no_buy)
+        self.assertEqual("ACTIVE_BUY_NOT_REQUIRED", no_buy["reason"])
+        self.assertIsNone(no_buy["execution_intent"])
+        self.assertEqual("WAIT", wait["status"], wait)
+        self.assertEqual("ACTIVE_BUY_WAIT_PRICE", wait["reason"])
+        self.assertIsNone(wait["execution_intent"])
+
+    def test_routine_maps_active_no_buy_to_normal_non_signal_without_block_flag(self) -> None:
+        routine = _load_module("routine.py", "indicator_follow_active_no_buy_routine_test")
+        with mock.patch.object(routine, "evaluate_indicator_follow_routine"), mock.patch.object(
+            routine, "signal_to_dict", return_value={"signal": "BUY", "reason": "indicator"},
+        ):
+            result = routine.evaluate({
+                "candles": [],
+                "rules": self._rules(repeat_mode="ACTIVE_BUY"),
+                "cycle": self._cycle(1, holding_qty=3, avg_price=13_100),
+                "stock_config": {"trade_amount_type": "QUANTITY", "buy_qty": 1},
+                "reference_price": 13_000,
+                "actionable_current_price": 13_000,
+                "routine_instance_id": "INSTANCE_A",
+            })
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual("NO_BUY", result["buy_execution_policy_status"])
+        self.assertEqual("ACTIVE_BUY_NOT_REQUIRED", result["buy_execution_no_order_reason"])
+        self.assertNotIn("buy_execution_blocked", result)
+        self.assertNotIn("execution_intent", result)
+
+    def test_repeat_active_total_quantity_flows_through_all_existing_buy_planners(self) -> None:
+        cases = []
+        single = self._rules(repeat_mode="ACTIVE_BUY", price_basis="ORDER_PRICE")
+        cases.append(("SINGLE_ORDER", single, 1))
+
+        hoga = self._rules(repeat_mode="ACTIVE_BUY", price_basis="ORDER_PRICE")
+        hoga["buy"]["execution"]["base"].update(
+            hoga_mode="MULTI", hoga_up=1, hoga_down=1,
+        )
+        cases.append(("MULTI_HOGA", hoga, 3))
+
+        timed = self._rules(repeat_mode="ACTIVE_BUY", price_basis="ORDER_PRICE")
+        timed["buy"]["execution"]["base"].update(
+            point_mode="MULTI_TIME", point_count=3, point_value=30,
+            point_unit="SECOND", point_range="WITHIN",
+            time_order_price_basis="ORDER_PRICE",
+        )
+        cases.append(("MULTI_TIME", timed, 3))
+
+        ratio = self._rules(repeat_mode="ACTIVE_BUY", price_basis="ORDER_PRICE")
+        ratio["buy"]["execution"]["base"].update(
+            point_mode="MULTI_RATIO", ratio_count=3,
+            ratio_left="ORDER_PRICE", ratio_right="CURRENT_PRICE",
+            ratio_direction="UP", ratio_value=0.15, ratio_compare=">=",
+        )
+        cases.append(("MULTI_RATIO", ratio, 3))
+
+        for mode, rules, child_count in cases:
+            with self.subTest(mode=mode):
+                result = self._build(rules=rules, cycle=self._cycle(1), price=100)
+                self.assertEqual("READY", result["status"], result)
+                intents = result["execution_intents"]
+                self.assertEqual(child_count, len(intents))
+                self.assertEqual(19, sum(item["quantity"] for item in intents))
+                self.assertEqual(
+                    {mode},
+                    {item.get("execution_mode") or "SINGLE_ORDER" for item in intents},
+                )
+                self.assertEqual(
+                    {"REPEAT_ACTIVE_BUY"},
+                    {item["active_buy_policy"]["policy"] for item in intents},
+                )
 
     def test_routine_signal_intent_reaches_common_candidate_without_recalculation(self) -> None:
         routine = _load_module("routine.py", "indicator_follow_buy_execution_routine_test")

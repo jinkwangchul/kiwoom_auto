@@ -568,8 +568,8 @@ class IndicatorFollowControlTabMixin:
         buy_grid.setVerticalSpacing(6)
         self.buy_overview_filter = self._make_buy_filter_overview_controls()
         self.buy_overview_method = self._make_buy_method_overview_controls(("base", "repeat", "price_compare"))
-        self.buy_overview_method_extra = self._make_buy_method_overview_controls(("situation", "additional", "cycle"))
-        self.buy_overview_finish = self._make_buy_avg_overview_controls(("exit", "close"))
+        self.buy_overview_method_extra = self._make_buy_method_overview_controls(("situation", "additional"))
+        self.buy_overview_finish = self._make_buy_avg_overview_controls(("cycle", "exit", "close"))
 
         buy_col1_widget = QWidget()
         buy_col1_layout = QVBoxLayout(buy_col1_widget)

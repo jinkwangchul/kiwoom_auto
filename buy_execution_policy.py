@@ -33,6 +33,159 @@ SUPPORTED_ROUND_OPERATORS = {"ADD", "MULTIPLY"}
 SUPPORTED_STARTING_BUDGET_TYPES = {"QUANTITY", "AMOUNT"}
 
 
+def calculate_active_buy_requirement(
+    *,
+    quantity: Any,
+    average_price: Any,
+    reference_price: Any,
+    actionable_price: Any,
+    direction: Any,
+    ratio_percent: Any,
+    comparator: Any,
+) -> dict[str, Any]:
+    """Return the minimum whole-share BUY needed to satisfy the average band.
+
+    This is deliberately policy-only: it does not trim to a budget, mutate a
+    round, write runtime data, or place/cancel an order.
+    """
+    q = _positive_int(quantity)
+    average = _positive_float(average_price)
+    reference = _positive_float(reference_price)
+    price = _positive_float(actionable_price)
+    ratio = _safe_float(ratio_percent)
+    direction_token = str(direction or "").strip().upper()
+    comparator_token = str(comparator or "").strip().upper()
+    pair_valid = (
+        direction_token in {"UP", "DOWN"}
+        and comparator_token in {">=", "<="}
+    ) or (
+        direction_token == "BOTH"
+        and comparator_token in {"WITHIN", "OUTSIDE"}
+    )
+    base = {
+        "quantity": q,
+        "average_price": average,
+        "reference_price": reference,
+        "actionable_price": price,
+        "direction": direction_token,
+        "ratio_percent": ratio,
+        "comparator": comparator_token,
+    }
+    if (
+        q is None
+        or average is None
+        or reference is None
+        or price is None
+        or not math.isfinite(average)
+        or not math.isfinite(reference)
+        or not math.isfinite(price)
+        or ratio is None
+        or not math.isfinite(ratio)
+        or ratio < 0
+        or not pair_valid
+    ):
+        return {**base, "status": "INVALID", "reason": "ACTIVE_BUY_INPUT_INVALID"}
+
+    lower = reference * (1.0 - ratio / 100.0)
+    upper = reference * (1.0 + ratio / 100.0)
+    base.update({"lower_price": lower, "upper_price": upper})
+
+    def satisfied(value: float) -> bool:
+        if direction_token == "UP":
+            return value >= upper if comparator_token == ">=" else value <= upper
+        if direction_token == "DOWN":
+            return value >= lower if comparator_token == ">=" else value <= lower
+        if comparator_token == "WITHIN":
+            return lower <= value <= upper
+        return value < lower or value > upper
+
+    if satisfied(average):
+        return {
+            **base,
+            "status": "NO_BUY",
+            "reason": "ACTIVE_BUY_NOT_REQUIRED",
+            "required_quantity": 0,
+            "required_cost": 0.0,
+            "projected_average": average,
+        }
+
+    strict = direction_token == "BOTH" and comparator_token == "OUTSIDE"
+    target: float
+    desired: str
+    if direction_token == "UP":
+        target = upper
+        desired = "ABOVE" if comparator_token == ">=" else "BELOW"
+    elif direction_token == "DOWN":
+        target = lower
+        desired = "ABOVE" if comparator_token == ">=" else "BELOW"
+    elif comparator_token == "WITHIN":
+        if average > upper:
+            target, desired = upper, "BELOW"
+        else:
+            target, desired = lower, "ABOVE"
+    else:
+        if price < lower:
+            target, desired = lower, "BELOW"
+        elif price > upper:
+            target, desired = upper, "ABOVE"
+        else:
+            return {**base, "status": "WAIT", "reason": "ACTIVE_BUY_WAIT_PRICE"}
+
+    if (desired == "ABOVE" and price <= target) or (
+        desired == "BELOW" and price >= target
+    ):
+        return {
+            **base,
+            "status": "WAIT",
+            "reason": "ACTIVE_BUY_WAIT_PRICE",
+            "target_price": target,
+        }
+
+    denominator = target - price
+    continuous = q * (average - target) / denominator
+    if not math.isfinite(continuous) or continuous <= 0:
+        return {
+            **base,
+            "status": "WAIT",
+            "reason": "ACTIVE_BUY_WAIT_PRICE",
+            "target_price": target,
+        }
+    required = math.floor(continuous) + 1 if strict else math.ceil(continuous)
+    required = max(1, required)
+
+    def projected(extra: int) -> float:
+        return (average * q + price * extra) / (q + extra)
+
+    projected_average = projected(required)
+    if not satisfied(projected_average):
+        # For inclusive one-sided conditions the next whole share can be the
+        # first valid integer after floating-point rounding. A zero-width
+        # WITHIN band, however, may have no integer solution at all.
+        required += 1
+        projected_average = projected(required)
+    if not satisfied(projected_average):
+        return {
+            **base,
+            "status": "WAIT",
+            "reason": "ACTIVE_BUY_WAIT_INTEGER_SOLUTION",
+            "target_price": target,
+        }
+    while required > 1 and satisfied(projected(required - 1)):
+        required -= 1
+        projected_average = projected(required)
+    return {
+        **base,
+        "status": "READY",
+        "reason": "ACTIVE_BUY_REQUIRED",
+        "target_price": target,
+        "required_quantity": required,
+        "required_cost": required * price,
+        "projected_average": projected_average,
+        "continuous_quantity": continuous,
+        "strict_boundary": strict,
+    }
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -212,20 +365,23 @@ def _repeat_budget(
     if detail_mode not in SUPPORTED_DETAIL_MODES:
         return None, None, None, evidence, ["INVALID_REPEAT_DETAIL_MODE"]
     if detail_mode == "ACTIVE_BUY":
-        evidence["required_inputs"] = [
-            "current_price",
-            "confirmed_average_buy_price",
-            "active_direction",
-            "active_ratio",
-            "active_compare",
-        ]
-        evidence["active_buy"] = {
-            "direction": repeat_rule.get("active_direction"),
-            "ratio": repeat_rule.get("active_ratio"),
-            "compare": repeat_rule.get("active_compare"),
-            "implemented": False,
-        }
-        return None, None, None, evidence, ["ACTIVE_BUY_NOT_IMPLEMENTED"]
+        calculation = calculate_active_buy_requirement(
+            quantity=budget_context.get("position_quantity"),
+            average_price=budget_context.get("confirmed_average_buy_price"),
+            reference_price=budget_context.get("active_reference_price"),
+            actionable_price=budget_context.get("actionable_acquisition_price"),
+            direction=repeat_rule.get("active_direction"),
+            ratio_percent=repeat_rule.get("active_ratio"),
+            comparator=repeat_rule.get("active_compare"),
+        )
+        evidence["active_buy_calculation"] = deepcopy(calculation)
+        if calculation.get("status") != "READY":
+            return None, None, None, evidence, [str(calculation.get("reason") or "ACTIVE_BUY_INPUT_INVALID")]
+        required_quantity = _positive_int(calculation.get("required_quantity"))
+        required_cost = _positive_float(calculation.get("required_cost"))
+        if required_quantity is None or required_cost is None:
+            return None, None, None, evidence, ["ACTIVE_BUY_CALCULATION_INVALID"]
+        return required_cost, required_quantity, "ACTIVE_BUY_REQUIRED_QUANTITY", evidence, []
     if current_price is None:
         return None, None, None, evidence, ["CURRENT_PRICE_VALUE_MISSING"]
     budget: float | None = None

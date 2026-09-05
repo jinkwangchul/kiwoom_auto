@@ -309,7 +309,6 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(0)
         grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
 
         cycle_column = QWidget()
         cycle_layout = QVBoxLayout(cycle_column)
@@ -326,7 +325,10 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         finish_layout.setContentsMargins(0, 0, 0, 0)
         finish_layout.setSpacing(4)
         if show_finish:
-            grid.addWidget(finish_column, 0, 1 if show_cycle else 0)
+            # BUY 화면에서는 Recovery 순환설정이 이탈조건/회차마감보다
+            # 항상 위에 놓인다. 두 영역을 나란히 배치하지 않는다.
+            grid.addWidget(finish_column, 1 if show_cycle else 0, 0)
+            self.buy_finish_column_widget = finish_column
         else:
             finish_column.setParent(box)
             finish_column.hide()
@@ -504,79 +506,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         update_cycle_time_mode()
         update_cycle_ratio_compare()
 
-        cycle_situation_row = add_row()
-        cycle_situation_combo = make_combo(["미체결", "가격비교"], "가격비교", 116)
-        cycle_situation_stack = QStackedWidget()
-        cycle_situation_stack.setFixedHeight(26)
-        cycle_situation_row.addWidget(cycle_situation_combo)
-        cycle_situation_row.addWidget(make_label("|", 8, Qt.AlignCenter))
-        cycle_situation_row.addWidget(cycle_situation_stack)
-
-        cycle_pending_widget = QWidget()
-        cycle_pending_layout = QHBoxLayout(cycle_pending_widget)
-        cycle_pending_layout.setContentsMargins(0, 0, 0, 0)
-        cycle_pending_layout.setSpacing(4)
-        cycle_pending_scope_combo = make_combo(["매회", "일괄"], "매회", 66)
-        cycle_pending_value_line = make_line("10", 34)
-        cycle_pending_unit_combo = make_combo(["분", "초", "봉"], "초", 60)
-        cycle_pending_layout.addWidget(cycle_pending_scope_combo)
-        cycle_pending_layout.addWidget(make_label("기준", 36))
-        cycle_pending_layout.addWidget(cycle_pending_value_line)
-        cycle_pending_layout.addWidget(cycle_pending_unit_combo)
-        cycle_pending_layout.addWidget(make_label("후 주문취소", 86))
-        cycle_pending_layout.addStretch(1)
-        cycle_situation_stack.addWidget(cycle_pending_widget)
-
-        cycle_price_widget = QWidget()
-        cycle_price_layout = QHBoxLayout(cycle_price_widget)
-        cycle_price_layout.setContentsMargins(0, 0, 0, 0)
-        cycle_price_layout.setSpacing(4)
-        cycle_price_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-        cycle_price_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 92)
-        cycle_price_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
-        cycle_price_value_line = make_line("0.15", 46)
-        cycle_price_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
-        cycle_price_action_combo = make_combo(["매수리셋", "일괄취소"], "일괄취소", 100)
-        cancel_batch_index = cycle_price_action_combo.findText("일괄취소")
-        cancel_batch_item = (
-            cycle_price_action_combo.model().item(cancel_batch_index)
-            if cancel_batch_index >= 0 and hasattr(cycle_price_action_combo.model(), "item")
-            else None
-        )
-        if cancel_batch_item is not None:
-            cancel_batch_item.setEnabled(False)
-            cancel_batch_item.setToolTip("CYCLE_OPTION_EXECUTION_NOT_CONNECTED")
-        cycle_price_action_combo.setToolTip(
-            "일괄취소는 CYCLE_OPTION_EXECUTION_NOT_CONNECTED 상태로 예약되어 있습니다."
-        )
-        cycle_price_layout.addWidget(cycle_price_left_combo)
-        cycle_price_layout.addWidget(make_label("대비", 36))
-        cycle_price_layout.addWidget(cycle_price_right_combo)
-        cycle_price_layout.addWidget(cycle_price_direction_combo)
-        cycle_price_layout.addWidget(cycle_price_value_line)
-        cycle_price_layout.addWidget(make_label("%", 14))
-        cycle_price_layout.addWidget(cycle_price_compare_combo)
-        cycle_price_layout.addWidget(cycle_price_action_combo)
-        cycle_price_layout.addStretch(1)
-        cycle_situation_stack.addWidget(cycle_price_widget)
-        cycle_situation_row.addStretch(1)
-
-        def update_cycle_situation_mode(*_args):
-            cycle_situation_stack.setCurrentIndex(0 if cycle_situation_combo.currentText().strip() == "미체결" else 1)
-
-        def update_cycle_price_compare(*_args):
-            sync_buy_direction_comparator(cycle_price_direction_combo, cycle_price_compare_combo)
-
-        cycle_situation_combo.currentTextChanged.connect(update_cycle_situation_mode)
-        cycle_price_direction_combo.currentTextChanged.connect(update_cycle_price_compare)
-        update_cycle_situation_mode()
-        update_cycle_price_compare()
-
         if show_cycle:
-            self.avg_policy_group = QButtonGroup(self)
-            self.avg_round_increase_check = cycle_hoga_combo
-            self.avg_amount_increase_check = cycle_time_combo
-            self.avg_active_buy_check = cycle_situation_combo
             self.buy_cycle_hoga_mode_combo = cycle_hoga_combo
             self.buy_cycle_order_combo = cycle_order_combo
             self.buy_cycle_hoga_up_line = cycle_hoga_up_line
@@ -593,20 +523,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             self.buy_cycle_ratio_value_line = cycle_ratio_value_line
             self.buy_cycle_ratio_compare_combo = cycle_ratio_compare_combo
             self.buy_cycle_ratio_count_line = cycle_ratio_count_line
-            self.buy_cycle_situation_mode_combo = cycle_situation_combo
-            self.buy_cycle_pending_scope_combo = cycle_pending_scope_combo
-            self.buy_cycle_pending_value_line = cycle_pending_value_line
-            self.buy_cycle_pending_unit_combo = cycle_pending_unit_combo
-            self.buy_cycle_price_left_combo = cycle_price_left_combo
-            self.buy_cycle_price_right_combo = cycle_price_right_combo
-            self.buy_cycle_price_direction_combo = cycle_price_direction_combo
-            self.buy_cycle_price_value_line = cycle_price_value_line
-            self.buy_cycle_price_compare_combo = cycle_price_compare_combo
-            self.buy_cycle_price_action_combo = cycle_price_action_combo
-            # 순환설정과 이탈조건/회차마감이 별도 박스로 분리되어도
-            # 제한시간 비활성 조건을 유지하기 위한 안전 참조.
             self._buy_cycle_time_combo = cycle_time_combo
-            self._buy_cycle_situation_combo = cycle_situation_combo
             self.buy_cycle_column_widget = cycle_column
 
             # 이탈조건 박스가 별도 호출에서 이미 만들어졌거나 이후 만들어지는 경우를 모두 처리한다.
@@ -697,37 +614,13 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         def update_exit_price_compare(*_args):
             sync_buy_direction_comparator(exit_price_direction_combo, exit_price_compare_combo)
 
-        cycle_time_source = getattr(self, "_buy_cycle_time_combo", None)
-        cycle_situation_source = getattr(self, "_buy_cycle_situation_combo", None)
-
         def update_exit_widgets_enabled(*_args):
             set_widgets_enabled(exit_price_widgets, exit_price_check.isChecked())
             set_widgets_enabled(exit_count_widgets, exit_count_check.isChecked())
-
-            # 순환설정에서 시간 기반 제어가 이미 사용 중이면 이탈조건의
-            # 제한시간은 중복 시간 조건이 되므로 선택/입력을 막는다.
-            # 순환설정과 이탈조건/회차마감은 현재 서로 다른 박스에서 생성될 수
-            # 있으므로 로컬 클로저가 아니라 self에 저장한 현재 순환 콤보를 참조한다.
-            def _is_live_widget(widget):
-                try:
-                    return widget is not None and not sip.isdeleted(widget)
-                except Exception:
-                    return False
-
-            if _is_live_widget(cycle_time_source):
-                cycle_time_active = cycle_time_source.currentText().strip() == "다중시간"
-            else:
-                cycle_time_active = False
-
-            if _is_live_widget(cycle_situation_source):
-                cycle_pending_active = cycle_situation_source.currentText().strip() == "미체결"
-            else:
-                cycle_pending_active = False
-            exit_time_blocked = cycle_time_active or cycle_pending_active
-            if exit_time_blocked:
-                exit_time_check.setChecked(False)
-            exit_time_check.setEnabled(not exit_time_blocked)
-            set_widgets_enabled(exit_time_widgets, (not exit_time_blocked) and exit_time_check.isChecked())
+            # Recovery exit timeout owns its own first-recovery anchor.  It is
+            # independent from MULTI_TIME scheduling and unfilled timeout.
+            exit_time_check.setEnabled(True)
+            set_widgets_enabled(exit_time_widgets, exit_time_check.isChecked())
             update_cycle_close_policy()
 
         exit_price_direction_combo.currentTextChanged.connect(update_exit_price_compare)
@@ -735,15 +628,6 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
             self._buy_exit_time_state_updaters = []
         self._buy_exit_time_state_updaters.append(update_exit_widgets_enabled)
 
-        cycle_time_signal_source = cycle_time_source
-        cycle_situation_signal_source = cycle_situation_source
-        for combo in (cycle_time_signal_source, cycle_situation_signal_source):
-            try:
-                if combo is not None and not sip.isdeleted(combo):
-                    combo.currentTextChanged.connect(update_exit_widgets_enabled)
-                    combo.currentIndexChanged.connect(update_exit_widgets_enabled)
-            except RuntimeError:
-                pass
         for check in exit_checks:
             check.toggled.connect(update_exit_widgets_enabled)
             check.stateChanged.connect(update_exit_widgets_enabled)
@@ -773,12 +657,5 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
 
         update_exit_widgets_enabled()
         update_cycle_close_policy()
-
-        # 기존 저장/로드 코드가 평단관리 속성명을 찾을 가능성에 대비해 일부 별칭은 유지한다.
-        if show_cycle:
-            self.avg_policy_group = QButtonGroup(self)
-            self.avg_round_increase_check = cycle_hoga_combo
-            self.avg_amount_increase_check = cycle_time_combo
-            self.avg_active_buy_check = cycle_situation_combo
 
         return box

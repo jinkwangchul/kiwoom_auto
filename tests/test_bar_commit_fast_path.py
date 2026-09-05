@@ -309,6 +309,9 @@ class TriggerProvenanceTests(unittest.TestCase):
                 captured_context.update(context)
                 return {"signal": "BUY", "reason": "test", "signal_index": 0}
 
+            def market_bar_projection_request(_rules):
+                return {"projection": "COMPLETED_TIMEFRAME"}
+
             def enqueue(result, **_kwargs):
                 queued_payload.update(result)
                 return {"status": "queued", "id": "signal-A"}
@@ -329,7 +332,11 @@ class TriggerProvenanceTests(unittest.TestCase):
                 return_value=[dict(_candle(), timeframe_minutes=1, trade_date="2026-08-20")],
             ), patch.object(routine_signal_probe, "enqueue_routine_signal", side_effect=enqueue):
                 result = routine_signal_probe.probe_routine_for_stock(
-                    SimpleNamespace(evaluate=evaluate, ROUTINE_TYPE="test"),
+                    SimpleNamespace(
+                        evaluate=evaluate,
+                        market_bar_projection_request=market_bar_projection_request,
+                        ROUTINE_TYPE="test",
+                    ),
                     "TestRoutine",
                     stock_dir,
                     "2026-08-20 10:15",

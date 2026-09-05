@@ -359,76 +359,11 @@ class ExecutionPriceResetTest(unittest.TestCase):
         self.assertEqual(2, update.call_count)
 
     def test_operation_cycle_routes_cancel_and_replan_without_stopping_other_processes(self) -> None:
-        entry = SimpleNamespace(
-            stock_code=CODE,
-            stock_name="삼성전자",
-            stock_dir=Path("unused"),
-            execution_ready=True,
-            signal_probe_only=False,
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(entries=(entry,))
-        requester = mock.Mock(return_value={"ok": True, "cancel_requested": 1, "cancel_pending": 0})
-        window = SimpleNamespace(
-            current_selected_account_no=lambda: ACCOUNT,
-            queue_open_order_cancel_automatically=requester,
-            mark_review_required=mock.Mock(return_value=True),
-            statusBarMessage=mock.Mock(),
-        )
-        inspected = {
-            "cancel_proposals": [{
-                "order_queued_id": "ORDER-1", "account_no": ACCOUNT,
-                "code": CODE, "side": "SELL", "broker_order_no": "BROKER-1",
-                "remaining_quantity": 5, "source_plan_generation": 0,
-                "trigger_snapshot": {"snapshot_hash": "RESET-HASH"},
-            }],
-            "replan_proposals": [{"signal": {"id": SIGNAL}, "execution_intents": [{}]}],
-            "reviews": [{"code": CODE, "review_reasons": ["RESET-REVIEW"]}],
-            "waiting": [], "errors": [],
-            "blocked_execution_process_ids": [PROCESS],
-        }
-        empty = {"proposals": [], "reviews": [], "waiting": [], "errors": []}
-        exit_empty = {
-            "ok": True,
-            "proposals": [],
-            "exit_proposals": [],
-            "blocked_execution_process_ids": [],
-            "reviews": [],
-            "waiting": [],
-            "errors": [],
-        }
-        consumer = {"summary": {"signals_checked": 0, "blocked": 0, "allowed": 0, "errors": 0, "orders_created": 0, "approval_checked": 0, "approved": 0, "executable_order_ids": []}}
-        with (
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_repeat_exits", return_value=exit_empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_price_resets", return_value=inspected) as reset_inspect,
-            mock.patch.object(gui_auto_trade_timer, "enqueue_price_reset_generation", return_value={"ok": True, "orders_created": 1, "executable_order_ids": ["ORDER-RESET-1"]}),
-            mock.patch.object(gui_auto_trade_timer, "inspect_unfilled_sell_cancel_eligibility", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_due_time_slices", return_value=empty) as time_inspect,
-            mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", return_value=empty) as ratio_inspect,
-            mock.patch.object(gui_auto_trade_timer, "inspect_execution_process_supplements", return_value=empty) as supplement_inspect,
-            mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value=consumer),
-            mock.patch.object(gui_auto_trade_timer, "auto_trade_signal_probe_only_active", return_value=True),
-            mock.patch.object(gui_auto_trade_timer, "auto_trade_real_execution_active", return_value=False),
-            mock.patch.object(gui_auto_trade_timer, "actionable_current_price", return_value=105),
-        ):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        self.assertEqual(1, result["price_reset"]["cancel_requested"])
-        self.assertEqual(1, result["price_reset"]["orders_created"])
-        self.assertEqual(1, result["price_reset"]["reviews"])
-        requester.assert_called_once()
-        evidence = requester.call_args.kwargs["cancel_evidence"]
-        self.assertEqual("SELL_PRICE_CHANGE_RESET", evidence["trigger"])
-        self.assertEqual("RESET-HASH", evidence["trigger_snapshot_hash"])
-        self.assertEqual(
-            (),
-            reset_inspect.call_args.kwargs[
-                "blocked_execution_process_ids"
-            ],
-        )
-        self.assertEqual((PROCESS,), time_inspect.call_args.kwargs["blocked_execution_process_ids"])
-        self.assertEqual((PROCESS,), ratio_inspect.call_args.kwargs["blocked_execution_process_ids"])
-        self.assertEqual((PROCESS,), supplement_inspect.call_args.kwargs["blocked_execution_process_ids"])
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

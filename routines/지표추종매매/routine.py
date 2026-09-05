@@ -140,7 +140,11 @@ def evaluate_execution_admission(
         if reason:
             return _gate_result(False, reason, routine_identity, rules_identity)
     if allowed and callable(inspect_buy_time_slice_continuation):
-        reason = inspect_buy_time_slice_continuation(subject=subject, rules=rules, project_root=Path(__file__).resolve().parents[2])
+        reason = inspect_buy_time_slice_continuation(
+            subject=subject,
+            rules=rules,
+            main_facts=subject.get("main_facts"),
+        )
         if reason:
             return _gate_result(False, reason, routine_identity, rules_identity)
     return _gate_result(
@@ -170,7 +174,11 @@ def evaluate_final_real_order_safety(
         if reason:
             return _gate_result(False, reason, routine_identity, rules_identity)
     if allowed and callable(inspect_buy_time_slice_continuation):
-        reason = inspect_buy_time_slice_continuation(subject=subject, rules=rules, project_root=Path(__file__).resolve().parents[2])
+        reason = inspect_buy_time_slice_continuation(
+            subject=subject,
+            rules=rules,
+            main_facts=subject.get("main_facts"),
+        )
         if reason:
             return _gate_result(False, reason, routine_identity, rules_identity)
     return _gate_result(
@@ -241,6 +249,7 @@ def project_cycle_context(
     order_queue: Any,
     fills: Any,
     positions: Any,
+    signals: Any,
 ) -> dict[str, Any]:
     if not callable(project_indicator_follow_cycle):
         return {
@@ -266,9 +275,8 @@ def project_cycle_context(
     # existing consumer.  Project it read-only into the cycle so a future BUY
     # signal is blocked without introducing another runtime writer/state file.
     try:
-        signals_path = Path(__file__).resolve().parents[2] / "runtime" / "routine_signals.json"
-        root = json.loads(signals_path.read_text(encoding="utf-8"))
-        records = root.get("signals") if isinstance(root, dict) else None
+        root = signals if isinstance(signals, dict) else {}
+        records = root.get("signals")
         current_cycle_identity = str(projection.get("cycle_identity") or "").strip()
         if isinstance(records, list) and current_cycle_identity:
             candidates = _matching_buy_exit_evidence(
@@ -293,6 +301,28 @@ def get_routine_info() -> dict[str, Any]:
         "execution_enabled": EXECUTION_ENABLED,
         "signal_only": True,
         "engine": _ENGINE_SOURCE,
+    }
+
+
+def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any]:
+    """Declare the market/bar primitive required by Indicator Follow.
+
+    OCR 0/N-bar semantics remain routine-owned.  Main only supplies the
+    requested forming-base-bar or completed-timeframe projection.
+    """
+    rules = rules if isinstance(rules, dict) else {}
+    buy = rules.get("buy") if isinstance(rules.get("buy"), dict) else {}
+    filters = buy.get("filters") if isinstance(buy.get("filters"), dict) else {}
+    ocr = filters.get("ocr") if isinstance(filters.get("ocr"), dict) else {}
+    sell = rules.get("sell") if isinstance(rules.get("sell"), dict) else {}
+    signals = sell.get("signals") if isinstance(sell.get("signals"), dict) else {}
+    needs_forming_base_bar = "order_delay_bars" in ocr or any(
+        isinstance(signal, dict) and "order_delay_bars" in signal
+        for signal in signals.values()
+    )
+    return {
+        "projection": "FORMING_BASE_BAR" if needs_forming_base_bar else "COMPLETED_TIMEFRAME",
+        "ocr_delay_semantics": "ROUTINE_OWNED",
     }
 
 
@@ -385,8 +415,50 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
         except Exception:
             pass
 
-    signal = evaluate_indicator_follow_routine(candles, config, context)
-    result = signal_to_dict(signal)
+    sell_context = dict(context)
+    sell_context["_indicator_follow_evaluate_side"] = "SELL"
+    buy_context = dict(context)
+    buy_context["_indicator_follow_evaluate_side"] = "BUY"
+    sell_result = signal_to_dict(
+        evaluate_indicator_follow_routine(candles, config, sell_context)
+    )
+    buy_result = signal_to_dict(
+        evaluate_indicator_follow_routine(candles, config, buy_context)
+    )
+    sell_true = str(sell_result.get("signal") or "").strip().upper() == "SELL"
+    buy_true = str(buy_result.get("signal") or "").strip().upper() == "BUY"
+    cycle_for_conflict = context.get("cycle") if isinstance(context.get("cycle"), dict) else {}
+    holding_qty = cycle_for_conflict.get("holding_qty", cycle_for_conflict.get("confirmed_holding_quantity", 0))
+    try:
+        has_holding = int(holding_qty or 0) > 0
+    except (TypeError, ValueError):
+        has_holding = False
+    if sell_true and buy_true:
+        result = sell_result if has_holding else buy_result
+        result["signal_conflict_evidence"] = {
+            "conflict": "BUY_AND_SELL_TRUE",
+            "holding_quantity": holding_qty,
+            "fallback": "SELL_WHEN_HOLDING_ELSE_BUY",
+            "selected_side": result.get("signal"),
+            "buy_signal_index": buy_result.get("signal_index"),
+            "sell_signal_index": sell_result.get("signal_index"),
+        }
+    elif sell_true:
+        result = sell_result
+    else:
+        result = buy_result
+    if (
+        context.get("forming_base_bar_projection") is True
+        and str(result.get("signal") or "").strip().upper() in {"BUY", "SELL"}
+        and candles
+    ):
+        result["signal_source_index"] = result.get("signal_index")
+        result["signal_activation_index"] = len(candles) - 1
+        result["signal_index"] = len(candles) - 1
+        activation = candles[-1].get("bar_time") if isinstance(candles[-1], dict) else None
+        if activation:
+            result["signal_activation_bar_time"] = activation
+        result["signal_delay_anchor"] = "FOLLOWING_BASE_BAR_ENTRY"
     signal_runtime_policy = config.get("signal_runtime_policy") if isinstance(config, dict) else None
     if isinstance(signal_runtime_policy, dict):
         result["signal_runtime_policy"] = dict(signal_runtime_policy)
@@ -431,6 +503,10 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
                         if isinstance(execution_intents, list) and execution_intents:
                             result["execution_intents"] = execution_intents
                         result["buy_execution_policy_status"] = "READY"
+                    elif execution.get("status") in {"NO_BUY", "WAIT"}:
+                        result["signal"] = None
+                        result["buy_execution_policy_status"] = execution.get("status")
+                        result["buy_execution_no_order_reason"] = execution.get("reason")
                     else:
                         result["signal"] = None
                         result["buy_execution_blocked"] = True

@@ -12,8 +12,9 @@ from typing import Any
 
 from execution_provenance_contract import plan_generation, validate_child_set, validate_process_record
 from account_auto_trade_budget_consumption import (
-    project_time_slice_buy_budget, _order_code, _order_side, _record_account,
+    project_deferred_buy_budget_scope, _order_code, _order_side, _record_account,
 )
+from routine_main_facts import records_from_routine_main_facts
 from execution_unfilled_cancel_eligibility import cancel_effect_state
 
 
@@ -188,7 +189,7 @@ def inspect_buy_slice_funding(
     selected_signal = deepcopy(signal)
     selected_signal["execution_intent"] = selected
     selected_signal["execution_intents"] = [selected]
-    budget = project_time_slice_buy_budget(
+    budget = project_deferred_buy_budget_scope(
         order=selected_signal, order_records=orders, fill_records=fills,
         candidate_amount=amount,
     )
@@ -269,6 +270,7 @@ def inspect_due_time_slices(
     fills_path: str | Path = FILLS_PATH,
     positions_path: str | Path = POSITIONS_PATH,
     holdings_path: str | Path = HOLDINGS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select at most one safe due child per signal without mutating Runtime."""
     account_no = _text(selected_account_no)
@@ -297,7 +299,11 @@ def inspect_due_time_slices(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in sources:
-        values, error = _read(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)

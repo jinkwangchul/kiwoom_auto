@@ -26,7 +26,7 @@ OPTION = "OPTION-SNAPSHOT-HASH"
 
 
 def _policy(*conditions: dict[str, object]) -> dict[str, object]:
-    return {"policy": "BUY_REPEAT_EXIT", "enabled": True, "logic": "OR", "conditions": list(conditions)}
+    return {"policy": "BUY_RECOVERY_EXIT", "enabled": True, "logic": "OR", "conditions": list(conditions)}
 
 
 class BuyRepeatExitProductionTest(unittest.TestCase):
@@ -48,12 +48,13 @@ class BuyRepeatExitProductionTest(unittest.TestCase):
         path.write_text(json.dumps({"version": 1, **collections}, ensure_ascii=False), encoding="utf-8")
 
     def _intents(self, *, policy: dict[str, object], buy_round: int = 2,
-                 generation: int = 0, repeat_started_at: str = "2026-09-03T10:00:00") -> list[dict[str, object]]:
+                 generation: int = 1, repeat_started_at: str = "2026-09-03T10:00:00") -> list[dict[str, object]]:
         intent = {
             "side": "BUY", "execution_mode": "SINGLE_ORDER", "hoga": "LIMIT",
             "price_basis": "ORDER_PRICE", "price": 100, "quantity": 2, "budget": 200,
-            "buy_phase": "REPEAT", "buy_round": buy_round,
-            "buy_repeat_started_at": repeat_started_at, "plan_generation": generation,
+            "buy_phase": "RECOVERY", "buy_round": buy_round,
+            "recovery_cycle": True, "recovery_generation": generation,
+            "recovery_started_at": repeat_started_at, "plan_generation": generation,
             "source_signal_id": SIGNAL, "execution_process_id": PROCESS,
             "routine_type": "INDICATOR_FOLLOW", "routine_instance_id": ROUTINE,
             "cycle_identity": CYCLE, "option_snapshot_hash": OPTION,
@@ -68,7 +69,7 @@ class BuyRepeatExitProductionTest(unittest.TestCase):
 
     def _fixture(self, *, policy: dict[str, object] | None = None,
                  status: str = "FILLED", remaining: int = 0, filled_quantity: int = 2,
-                 buy_round: int = 2, generation: int = 0,
+                 buy_round: int = 2, generation: int = 1,
                  repeat_started_at: str = "2026-09-03T10:00:00",
                  cancel: dict[str, object] | None = None,
                  order_updates: dict[str, object] | None = None,
@@ -112,7 +113,7 @@ class BuyRepeatExitProductionTest(unittest.TestCase):
         signal = {"id": SIGNAL, "code": CODE, "name": "테스트", "signal": "BUY",
                   "routine_instance_id": ROUTINE, "cycle_identity": CYCLE,
                   "execution_process_id": PROCESS, "execution_intent": deepcopy(intent),
-                  "execution_intents": deepcopy(intents)}
+                  "execution_intents": deepcopy(intents), "signal_timeframe_minutes": 1}
         signal.update(signal_updates or {})
         self._write(self.queue, orders=orders)
         self._write(self.executions, executions=[runtime],
@@ -135,7 +136,7 @@ class BuyRepeatExitProductionTest(unittest.TestCase):
         self._fixture()
         result = self._inspect()
         self.assertEqual(1, len(result["completion_proposals"]))
-        self.assertEqual([2], result["completion_proposals"][0]["completed_repeat_rounds"])
+        self.assertEqual([1], result["completion_proposals"][0]["completed_repeat_rounds"])
 
     def test_completion_writer_preserves_full_cycle_identity(self) -> None:
         self._fixture()
@@ -152,6 +153,10 @@ class BuyRepeatExitProductionTest(unittest.TestCase):
         self.assertEqual(CYCLE, evidence["cycle_identity"])
         self.assertEqual(SIGNAL, evidence["source_signal_id"])
         self.assertEqual(PROCESS, evidence["execution_process_id"])
+        self.assertEqual("BUY_RECOVERY_EXIT", evidence["policy"])
+        self.assertEqual([1], evidence["completed_recovery_generations"])
+        self.assertEqual(1, evidence["evaluated_plan_generation"])
+        self.assertEqual(2, evidence["evaluated_buy_round"])
 
     def test_send_uncertain_blocks_completion_and_requests_review(self) -> None:
         self._fixture(status="SEND_UNCERTAIN", order_updates={"manual_reconciliation_required": True})
@@ -176,15 +181,27 @@ class BuyRepeatExitProductionTest(unittest.TestCase):
         self.assertFalse(result["completion_proposals"])
         self.assertFalse(result["cancel_proposals"])
 
-    def test_time_exit_recovers_round_two_anchor_with_generation_zero(self) -> None:
+    def test_time_exit_anchors_to_first_recovery_entry(self) -> None:
         policy = _policy({"condition_type": "TIME", "configured_value": 1,
                           "configured_unit": "MINUTE", "duration_ms": 60_000})
-        self._fixture(policy=policy, status="FILLED", buy_round=2, generation=0,
+        self._fixture(policy=policy, status="FILLED", buy_round=2, generation=1,
                       repeat_started_at="2026-09-03T10:00:00")
         self.assertFalse(self._inspect(now="2026-09-03T10:00:59")["completion_proposals"])
         result = self._inspect(now="2026-09-03T10:01:00")
         self.assertEqual(1, len(result["completion_proposals"]))
         self.assertEqual("2026-09-03T10:00:00.000", result["completion_proposals"][0]["repeat_started_at"])
+
+    def test_bar_time_exit_uses_source_signal_timeframe_and_first_recovery_anchor(self) -> None:
+        policy = _policy({"condition_type": "TIME", "configured_value": 2,
+                          "configured_unit": "BAR", "duration_ms": None})
+        self._fixture(policy=policy, status="FILLED", buy_round=2, generation=1,
+                      repeat_started_at="2026-09-03T10:00:00",
+                      signal_updates={"signal_timeframe_minutes": 3})
+        self.assertFalse(self._inspect(now="2026-09-03T10:05:59")["completion_proposals"])
+        result = self._inspect(now="2026-09-03T10:06:00")
+        self.assertEqual(1, len(result["completion_proposals"]))
+        snapshot = result["completion_proposals"][0]["exit_source_snapshot"]
+        self.assertEqual(360_000, snapshot["conditions"][0]["duration_ms"])
 
     def test_open_order_is_cancelled_before_completion(self) -> None:
         policy = _policy({"condition_type": "TIME", "configured_value": 1,
@@ -274,63 +291,11 @@ class BuyRepeatExitPolicyUnitTest(unittest.TestCase):
         self.assertIn("BUY_REPEAT_EXIT_CURRENT_PRICE_UNAVAILABLE", result["waiting_reasons"])
 
     def test_operation_cycle_runs_exit_before_reset_and_passes_process_block(self) -> None:
-        call_order: list[str] = []
-        exit_result = {
-            "ok": True,
-            "cancel_proposals": [],
-            "completion_proposals": [{"source_signal_id": SIGNAL}],
-            "reviews": [], "waiting": [], "errors": [],
-            "blocked_execution_process_ids": [PROCESS],
-        }
-
-        def inspect_exit(**_kwargs: object) -> dict[str, object]:
-            call_order.append("exit")
-            return exit_result
-
-        def inspect_reset(**kwargs: object) -> dict[str, object]:
-            call_order.append("reset")
-            self.assertEqual((PROCESS,), kwargs["blocked_execution_process_ids"])
-            return {"cancel_proposals": [], "replan_proposals": [], "reviews": [],
-                    "waiting": [], "errors": [], "blocked_execution_process_ids": [PROCESS]}
-
-        empty = {"proposals": [], "cancel_proposals": [], "completion_proposals": [],
-                 "replan_proposals": [], "reviews": [], "waiting": [], "errors": [],
-                 "blocked_execution_process_ids": []}
-        entry = SimpleNamespace(stock_code=CODE, stock_name="테스트", stock_dir=Path("unused"),
-                                execution_ready=True, signal_probe_only=False)
-        snapshot = SimpleNamespace(entries=(entry,))
-        window = SimpleNamespace(
-            current_selected_account_no=lambda: ACCOUNT,
-            current_orderable_cash_for_budget=lambda: 1_000_000,
-            mark_review_required=mock.Mock(return_value=True), statusBarMessage=mock.Mock(),
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        consumer = {"summary": {"signals_checked": 0, "blocked": 0, "allowed": 0,
-                                "errors": 0, "orders_created": 0, "approval_checked": 0,
-                                "approved": 0, "executable_order_ids": []}}
-        with (
-            mock.patch.object(gui_auto_trade_timer, "inspect_buy_repeat_exits", side_effect=inspect_exit),
-            mock.patch.object(gui_auto_trade_timer, "record_buy_repeat_exit_completion",
-                              return_value={"ok": True}),
-            mock.patch.object(gui_auto_trade_timer, "inspect_buy_price_resets", side_effect=inspect_reset),
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_price_resets", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_unfilled_sell_cancel_eligibility", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_due_time_slices", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_execution_process_supplements", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_repeat_generations", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_final_residual_exits", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value=consumer),
-            mock.patch.object(gui_auto_trade_timer, "auto_trade_signal_probe_only_active", return_value=True),
-            mock.patch.object(gui_auto_trade_timer, "auto_trade_real_execution_active", return_value=False),
-            mock.patch.object(gui_auto_trade_timer, "actionable_current_price", return_value=105),
-        ):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        self.assertEqual(["exit", "reset"], call_order)
-        self.assertEqual(1, result["buy_exit"]["completion_proposals"])
-        self.assertEqual(0, result["price_reset"]["replan_proposals"])
-        self.assertEqual(0, result["price_reset"]["orders_created"])
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

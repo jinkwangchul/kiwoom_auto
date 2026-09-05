@@ -387,10 +387,13 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         }
         preview = self.mapper.build_engine_rules_preview_from_ui_state(state, self._rules())
         candidates = preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidates"]
-        group_a = candidates["sell.signals.ui_preview_condition_a"]["value"]["groups"][0]
+        signal_a = candidates["sell.signals.ui_preview_condition_a"]["value"]
+        group_a = signal_a["groups"][0]
         self.assertEqual(group_a["conditions"][0]["operator"], "TURN_UP")
-        self.assertEqual(group_a["conditions"][0]["bar_offset"], 7)
-        self.assertEqual(group_a["conditions"][1]["bar_offset"], 7)
+        self.assertEqual(signal_a["order_delay_bars"], 7)
+        self.assertEqual(signal_a["delay_anchor"], "FOLLOWING_BASE_BAR_ENTRY")
+        self.assertNotIn("bar_offset", group_a["conditions"][0])
+        self.assertNotIn("bar_offset", group_a["conditions"][1])
         self.assertEqual(group_a["condition_expression"]["operator"], "OR")
         group_c = candidates["sell.signals.ui_preview_condition_c"]["value"]["groups"][0]
         self.assertEqual(group_c["conditions"][0]["target"], "SIGNAL")
@@ -478,7 +481,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         decisions = self.mapper.build_rule_approval_session(preview)["decisions"]
         self.assertIn("signal_runtime_policy", decisions)
 
-    def test_ocr_convert_zero_one_two_are_exact_bar_offsets(self):
+    def test_ocr_convert_zero_one_two_are_signal_order_delays(self):
         for offset in (0, 1, 2):
             state = {
                 "basic": {"basic_signal_interval_combo": "1", "sell_signal_expr_line": "A"},
@@ -493,10 +496,13 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
                 }}},
             }
             preview = self.mapper.build_engine_rules_preview_from_ui_state(state, self._rules())
-            conditions = preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"]
+            signal = preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]
+            conditions = signal["groups"][0]["conditions"]
             self.assertEqual(conditions[0]["operator"], "TURN_DOWN")
-            self.assertEqual(conditions[0]["bar_offset"], offset)
-            self.assertEqual(conditions[1]["bar_offset"], offset)
+            self.assertEqual(signal["order_delay_bars"], offset)
+            self.assertEqual(signal["delay_anchor"], "FOLLOWING_BASE_BAR_ENTRY")
+            self.assertNotIn("bar_offset", conditions[0])
+            self.assertNotIn("bar_offset", conditions[1])
 
     def test_price_box_formula_caller_cutoff_and_upper_lower_mapper(self):
         closes = [100.0 + index + (((index % 7) - 3) * 4.0) for index in range(40)]

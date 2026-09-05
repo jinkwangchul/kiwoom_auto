@@ -664,42 +664,12 @@ class RetirementServiceAndHostTests(unittest.TestCase):
 
 class StaleSignalReentryAuditTests(unittest.TestCase):
     def test_operation_pipeline_passes_execution_ready_cutoff_to_consumer(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            stock_dir = Path(temp) / "012210_Stock"
-            stock_dir.mkdir()
-            _write_json(
-                stock_dir / "state.json",
-                {"ignore_signals_before": "2026-08-26 14:00:00"},
-            )
-            entry = SimpleNamespace(
-                stock_code="012210",
-                stock_dir=stock_dir,
-                execution_ready=True,
-                signal_probe_only=True,
-            )
-            snapshot = SimpleNamespace(entries=(entry,))
-            window = SimpleNamespace(statusBarMessage=Mock())
-            consumer = Mock(return_value={"summary": {}})
-            with patch.object(
-                gui_auto_trade_timer,
-                "consume_pending_routine_signals_dry_run",
-                consumer,
-            ), patch.object(
-                gui_auto_trade_timer,
-                "observe_owner_failure_transition",
-            ):
-                gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
-
-        consumer.assert_called_once_with(
-            limit=5,
-            mark_previewed=True,
-            write_order_queue=True,
-            apply_approval=True,
-            allowed_stock_codes=("012210",),
-            signal_cutoff_by_stock_code={
-                "012210": "2026-08-26 14:00:00"
-            },
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
+
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 
     def test_restart_cutoff_excludes_old_signal_and_allows_new_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

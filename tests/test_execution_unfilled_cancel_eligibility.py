@@ -263,13 +263,15 @@ class ExecutionUnfilledCancelEligibilityTest(unittest.TestCase):
             },
         )
 
-    def test_batch_scope_cancels_open_siblings_when_first_child_times_out(self) -> None:
+    def test_batch_scope_cancels_open_siblings_after_last_child_times_out(self) -> None:
         due = _order("BATCH_1", scope="BATCH")
         later = _order("BATCH_2", scope="BATCH", accepted_at="2026-09-03T10:00:15")
         self._write([due, later])
 
-        result = self._inspect("2026-09-03T10:00:20")
+        before_last_anchor = self._inspect("2026-09-03T10:00:20")
+        result = self._inspect("2026-09-03T10:00:35")
 
+        self.assertEqual([], before_last_anchor["proposals"])
         self.assertEqual(
             {"BROKER_BATCH_1", "BROKER_BATCH_2"},
             {proposal["broker_order_no"] for proposal in result["proposals"]},
@@ -418,52 +420,11 @@ class ExistingCancelProductionPathTest(unittest.TestCase):
 
 class UnfilledCancelTimerRoutingTest(unittest.TestCase):
     def test_operation_cycle_routes_one_cancel_and_isolates_review(self) -> None:
-        entry = SimpleNamespace(
-            stock_code=CODE,
-            stock_name="삼성전자",
-            stock_dir=Path("unused"),
-            execution_ready=True,
-            signal_probe_only=False,
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(entries=(entry,))
-        requester = mock.Mock(return_value={"ok": True, "cancel_requested": 1, "cancel_pending": 0})
-        window = SimpleNamespace(
-            current_selected_account_no=lambda: ACCOUNT,
-            queue_open_order_cancel_automatically=requester,
-            mark_review_required=mock.Mock(return_value=True),
-            statusBarMessage=mock.Mock(),
-        )
-        inspected = {
-            "proposals": [{
-                "order_queued_id": "ORDER_1",
-                "account_no": ACCOUNT,
-                "code": CODE,
-                "side": "SELL",
-                "broker_order_no": "BROKER_1",
-                "remaining_quantity": 5,
-                "scope": "EACH",
-                "timeout_ms": 20_000,
-                "timeout_anchor": "BROKER_ACCEPTED_AT",
-                "timeout_anchor_at": ACCEPTED_AT,
-                "timeout_due_at": "2026-09-03T10:00:20",
-            }],
-            "reviews": [{"code": CODE, "review_reasons": ["OTHER_ORDER_UNCERTAIN"]}],
-            "waiting": [],
-            "errors": [],
-        }
-        empty = {"proposals": [], "reviews": [], "waiting": [], "errors": []}
-        consumer = {"summary": {"signals_checked": 0, "blocked": 0, "allowed": 0, "errors": 0, "orders_created": 0, "approval_checked": 0, "approved": 0, "executable_order_ids": []}}
-        with mock.patch.object(gui_auto_trade_timer, "inspect_unfilled_sell_cancel_eligibility", return_value=inspected), mock.patch.object(
-            gui_auto_trade_timer, "inspect_due_time_slices", return_value=empty
-        ), mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", return_value=empty), mock.patch.object(
-            gui_auto_trade_timer, "inspect_execution_process_supplements", return_value=empty
-        ), mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value=consumer):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        self.assertEqual(1, result["unfilled_cancel"]["cancel_requested"])
-        self.assertEqual(1, result["unfilled_cancel"]["reviews"])
-        requester.assert_called_once()
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

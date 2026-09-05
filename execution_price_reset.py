@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 from typing import Any
+from routine_main_facts import records_from_routine_main_facts
 
 from execution_price_comparison import (
     evaluate_percent_comparison,
@@ -46,6 +47,40 @@ _ACTIVE_CANCEL = _PRE_DISPATCH | {"BROKER_ACCEPTED", "SEND_UNCERTAIN"}
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _apply_deferred_dispatch_contract(intents: list[dict[str, Any]]) -> None:
+    """Stamp the routine-owned deferred contract before Main sees a replan."""
+    for intent in intents:
+        mode = _text(intent.get("execution_mode")).upper()
+        if mode not in {"MULTI_TIME", "MULTI_RATIO"}:
+            continue
+        scheduled = mode == "MULTI_TIME"
+        intent["deferred_dispatch"] = True
+        intent["deferred_schedule"] = scheduled
+        intent["deferred_plan_status_key"] = (
+            "time_slice_plan_complete" if scheduled else "ratio_slice_plan_complete"
+        )
+        intent["deferred_last_child_status_key"] = (
+            "time_slice_last_child_sequence_index"
+            if scheduled else "ratio_slice_last_child_sequence_index"
+        )
+        if _text(intent.get("side")).upper() == "BUY":
+            plan = _as_dict(
+                intent.get("multi_time_plan") if scheduled else intent.get("multi_ratio_plan")
+            )
+            ceiling = intent.get("approved_round_budget")
+            if ceiling is None:
+                ceiling = plan.get("approved_round_budget")
+            cycle_identity = _text(intent.get("cycle_identity")) or "PENDING_CYCLE"
+            intent["budget_scope_required"] = True
+            intent["approved_budget_ceiling"] = ceiling
+            intent["budget_scope_member"] = {
+                "routine_instance_id": intent.get("routine_instance_id"),
+                "stock_code": intent.get("code"),
+                "side": "BUY",
+                "round_identity": f"{cycle_identity}:BUY_ROUND:{intent.get('buy_round')}",
+            }
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -411,6 +446,7 @@ def build_sell_generation_intents(
     else:
         raise ValueError(f"SELL_PRICE_RESET_EXECUTION_MODE_UNSUPPORTED:{mode}")
 
+    _apply_deferred_dispatch_contract(intents)
     return materialize_execution_intent_children(
         intents,
         source_signal_id=source_signal_id,
@@ -430,6 +466,21 @@ def _buy_price_reset_policy(intent: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _buy_price_response_policies(intent: dict[str, Any]) -> list[dict[str, Any]]:
+    values = intent.get("buy_price_response_policies")
+    if isinstance(values, list):
+        policies = [deepcopy(item) for item in values if isinstance(item, dict)]
+        if len(policies) == len(values) and all(
+            item.get("enabled") is True
+            and _text(item.get("action")).upper() in {"RESET", "CANCEL_BATCH"}
+            for item in policies
+        ):
+            return policies
+        return []
+    legacy = _buy_price_reset_policy(intent)
+    return [legacy] if legacy else []
+
+
 def _record_order_price(record: dict[str, Any]) -> float | None:
     intent = _intent(record)
     for source in (record, intent, _as_dict(record.get("child_plan")), _as_dict(intent.get("child_plan"))):
@@ -441,7 +492,20 @@ def _record_order_price(record: dict[str, Any]) -> float | None:
 
 def _clean_buy_template(template: dict[str, Any]) -> dict[str, Any]:
     value = deepcopy(template)
-    for field in ("execution_id", "provenance_approved_at", "process_record", "schedule_anchor_at", "scheduled_at"):
+    for field in (
+        "execution_id",
+        "provenance_approved_at",
+        "process_record",
+        "schedule_anchor_at",
+        "scheduled_at",
+        "recovery_cycle",
+        "recovery_generation",
+        "recovery_started_at",
+        "confirmed_residual_quantity",
+        "recovery_source_snapshot_hash",
+        "recovery_source_original_order_nos",
+        "recovery_source_cancel_ids",
+    ):
         value.pop(field, None)
     return value
 
@@ -458,6 +522,7 @@ def build_buy_generation_intents(
     current_price: float | None,
     source_snapshot_hash: str,
     generated_at: datetime,
+    quantity_override: int | None = None,
 ) -> list[dict[str, Any]]:
     """Materialize a same-round BUY reset generation from remaining budget."""
     mode = _text(template.get("execution_mode")).upper() or "SINGLE_ORDER"
@@ -467,8 +532,8 @@ def build_buy_generation_intents(
     if base_price is None or base_price <= 0:
         raise ValueError("BUY_PRICE_RESET_CURRENT_PRICE_UNAVAILABLE")
     budget = float(remaining_budget)
-    quantity = int(budget // base_price)
-    if quantity <= 0:
+    quantity = _positive_int(quantity_override) if quantity_override is not None else int(budget // base_price)
+    if quantity is None or quantity <= 0:
         raise ValueError("BUY_PRICE_RESET_REMAINING_BUDGET_BELOW_ONE_SHARE")
     common = _clean_buy_template(template)
     common.update({
@@ -563,6 +628,7 @@ def build_buy_generation_intents(
         })
     else:
         raise ValueError(f"BUY_PRICE_RESET_EXECUTION_MODE_UNSUPPORTED:{mode}")
+    _apply_deferred_dispatch_contract(intents)
     return materialize_execution_intent_children(
         intents, source_signal_id=source_signal_id, execution_process_id=process_id,
         plan_generation_value=generation,
@@ -595,6 +661,7 @@ def inspect_buy_price_resets(
     positions_path: str | Path = POSITIONS_PATH,
     holdings_path: str | Path = HOLDINGS_PATH,
     signals_path: str | Path = SIGNALS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Inspect BUY price-reset evidence without mutating durable state."""
     paths = (
@@ -609,7 +676,11 @@ def inspect_buy_price_resets(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in paths:
-        values, error = _read(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)
@@ -635,7 +706,7 @@ def inspect_buy_price_resets(
     for order in originals:
         intent = _intent(order)
         process_id = _text(order.get("execution_process_id") or intent.get("execution_process_id"))
-        if process_id and _buy_price_reset_policy(intent):
+        if process_id and _buy_price_response_policies(intent):
             by_process.setdefault(process_id, []).append(order)
     result = {**empty, "ok": True}
     max_cancels = max(0, int(cancel_limit or 0))
@@ -712,8 +783,8 @@ def inspect_buy_price_resets(
                           and _text(item.get("execution_process_id")) == process_id
                           and plan_generation(item.get("plan_generation")) == generation]
         template = signal_intents[0] if signal_intents else _intent(next(iter(latest_orders.values())))
-        policy = _buy_price_reset_policy(template)
-        if not policy:
+        policies = _buy_price_response_policies(template)
+        if not policies:
             reasons.append("BUY_PRICE_RESET_POLICY_MISMATCH")
         option_hashes = {_text(item.get("option_snapshot_hash") or _intent(item).get("option_snapshot_hash"))
                         for item in process_orders}
@@ -741,10 +812,8 @@ def inspect_buy_price_resets(
             elif (_text(runtime.get("execution_process_id")) != process_id
                   or plan_generation(runtime.get("plan_generation")) != generation):
                 reasons.append(f"BUY_PRICE_RESET_RUNTIME_IDENTITY_MISMATCH:{execution_id}")
-        left_source = _text(policy.get("left_source")).upper()
-        right_source = _text(policy.get("right_source")).upper()
         current_price = prices.get(code)
-        order_price = positive_price(policy.get("order_price")) or _record_order_price(representative)
+        order_price = _record_order_price(representative)
         position_matches = [item for item in loaded["positions"]
                             if _text(item.get("account_no")) == account_no and _text(item.get("code")) == code]
         average_price = positive_price(position_matches[0].get("average_price")) if len(position_matches) == 1 else None
@@ -755,39 +824,76 @@ def inspect_buy_price_resets(
             holding_qty = _nonnegative_int(holding_matches[0].get("holding_quantity"))
             if position_qty is not None and holding_qty is not None and position_qty != holding_qty:
                 reasons.append("BUY_PRICE_RESET_POSITION_BROKER_MISMATCH")
-        if "CURRENT_PRICE" in {left_source, right_source} and current_price is None:
+        if any(
+            "CURRENT_PRICE" in {
+                _text(item.get("left_source")).upper(),
+                _text(item.get("right_source")).upper(),
+            }
+            for item in policies
+        ) and current_price is None:
             result["waiting"].append({"execution_process_id": process_id, "code": code,
                                        "reason": "BUY_PRICE_RESET_CURRENT_PRICE_UNAVAILABLE"})
             blocked.add(process_id)
             continue
-        left_price = resolve_price_source(left_source, order_price=order_price,
-                                          current_price=current_price, average_price=average_price)
-        right_price = resolve_price_source(right_source, order_price=order_price,
-                                           current_price=current_price, average_price=average_price)
-        threshold = positive_price(policy.get("threshold_percent"))
-        triggered = False
-        observed: float | None = None
+        policy: dict[str, Any] = {}
+        left_price: float | None = None
+        right_price: float | None = None
+        threshold: float | None = None
+        triggered_policies: list[tuple[dict[str, Any], float, float, float, float]] = []
         if not reasons:
-            if left_price is None or right_price is None or threshold is None:
-                reasons.append("BUY_PRICE_RESET_TRIGGER_SOURCE_INVALID")
-            else:
-                triggered, observed = evaluate_percent_comparison(
-                    left=left_price, right=right_price,
-                    direction=_text(policy.get("direction")).upper(),
-                    compare=_text(policy.get("compare")).upper(), threshold=threshold,
+            for candidate in policies:
+                candidate_left = resolve_price_source(
+                    _text(candidate.get("left_source")).upper(),
+                    order_price=positive_price(candidate.get("order_price")) or order_price,
+                    current_price=current_price,
+                    average_price=average_price,
                 )
-                if observed is None:
-                    reasons.append("BUY_PRICE_RESET_TRIGGER_POLICY_INVALID")
+                candidate_right = resolve_price_source(
+                    _text(candidate.get("right_source")).upper(),
+                    order_price=positive_price(candidate.get("order_price")) or order_price,
+                    current_price=current_price,
+                    average_price=average_price,
+                )
+                candidate_threshold = positive_price(candidate.get("threshold_percent"))
+                if candidate_left is None or candidate_right is None or candidate_threshold is None:
+                    reasons.append("BUY_PRICE_RESPONSE_TRIGGER_SOURCE_INVALID")
+                    break
+                hit, candidate_observed = evaluate_percent_comparison(
+                    left=candidate_left,
+                    right=candidate_right,
+                    direction=_text(candidate.get("direction")).upper(),
+                    compare=_text(candidate.get("compare")).upper(),
+                    threshold=candidate_threshold,
+                )
+                if hit is None or candidate_observed is None:
+                    reasons.append("BUY_PRICE_RESPONSE_TRIGGER_POLICY_INVALID")
+                    break
+                if hit:
+                    triggered_policies.append(
+                        (candidate, candidate_left, candidate_right, candidate_threshold, candidate_observed)
+                    )
         if reasons:
             result["reviews"].append(_buy_review(process_id=process_id, signal_id=signal_id,
                                                   code=code, name=name, reasons=reasons))
             blocked.add(process_id)
             continue
-        if not triggered:
-            result["waiting"].append({"execution_process_id": process_id, "code": code,
-                                       "reason": "BUY_PRICE_RESET_THRESHOLD_NOT_MET",
-                                       "observed_percent": observed, "threshold_percent": threshold})
+        if len(triggered_policies) > 1 and len({
+            _text(item[0].get("action")).upper() for item in triggered_policies
+        }) > 1:
+            result["reviews"].append(_buy_review(
+                process_id=process_id,
+                signal_id=signal_id,
+                code=code,
+                name=name,
+                reasons=["BUY_PRICE_RESPONSE_MULTIPLE_SLOTS_TRIGGERED"],
+            ))
+            blocked.add(process_id)
             continue
+        if not triggered_policies:
+            result["waiting"].append({"execution_process_id": process_id, "code": code,
+                                       "reason": "BUY_PRICE_RESPONSE_THRESHOLD_NOT_MET"})
+            continue
+        policy, left_price, right_price, threshold, observed = triggered_policies[0]
         blocked.add(process_id)
         trigger_snapshot = _reset_snapshot(
             process_id=process_id, generation=generation, policy=policy,
@@ -855,6 +961,7 @@ def inspect_buy_price_resets(
                     "code": code, "side": "BUY", "broker_order_no": broker_no,
                     "remaining_quantity": remaining, "execution_process_id": process_id,
                     "source_signal_id": signal_id, "source_plan_generation": generation,
+                    "trigger_action": _text(policy.get("action")).upper(),
                     "trigger_snapshot": deepcopy(trigger_snapshot),
                 })
                 if len(result["cancel_proposals"]) >= max_cancels:
@@ -866,8 +973,13 @@ def inspect_buy_price_resets(
             result["waiting"].append({"execution_process_id": process_id, "code": code,
                                        "reason": "BUY_PRICE_RESET_CANCEL_EFFECT_PENDING"})
             continue
+        cancel_trigger = (
+            "BUY_PRICE_CHANGE_RESET"
+            if _text(policy.get("action")).upper() == "RESET"
+            else "BUY_PRICE_CHANGE_CANCEL_BATCH"
+        )
         reset_cancels = [item for item in process_cancels
-                         if _text(_cancel_evidence(item).get("trigger")).upper() == "BUY_PRICE_CHANGE_RESET"
+                         if _text(_cancel_evidence(item).get("trigger")).upper() == cancel_trigger
                          and plan_generation(_cancel_evidence(item).get("source_plan_generation")) == generation]
         for cancel in reset_cancels:
             if _text(cancel.get("status")).upper() not in {"CANCELLED", "CANCELED", "PARTIAL_CANCELLED"}:
@@ -875,14 +987,75 @@ def inspect_buy_price_resets(
                                            "reason": "BUY_PRICE_RESET_CANCEL_EFFECT_PENDING"})
                 break
         else:
+            if _text(policy.get("action")).upper() == "CANCEL_BATCH":
+                result["waiting"].append({
+                    "execution_process_id": process_id,
+                    "code": code,
+                    "reason": "BUY_PRICE_CANCEL_RECOVERY_REQUIRED",
+                    "source_plan_generation": generation,
+                    "trigger_snapshot": deepcopy(trigger_snapshot),
+                })
+                continue
+            buy_round_value = template.get("buy_round")
+            if not isinstance(buy_round_value, int) or isinstance(buy_round_value, bool):
+                buy_round_value = next(
+                    (_nonnegative_int(item.get("buy_round") or _intent(item).get("buy_round"))
+                     for item in process_orders
+                     if _nonnegative_int(item.get("buy_round") or _intent(item).get("buy_round")) is not None),
+                    0,
+                )
+            buy_round = int(buy_round_value or 0)
+
+            reset_template = template
+            budget_orders = latest_orders
+            fill_evidence_orders = latest_orders
+            if template.get("recovery_cycle") is True:
+                base_by_generation: dict[int, dict[str, list[dict[str, Any]]]] = {}
+                all_round_orders: dict[str, list[dict[str, Any]]] = {}
+                for order in process_orders:
+                    intent = _intent(order)
+                    order_round = _nonnegative_int(order.get("buy_round") or intent.get("buy_round"))
+                    if order_round != buy_round:
+                        continue
+                    execution_id = _text(order.get("execution_id") or intent.get("execution_id"))
+                    if not execution_id:
+                        continue
+                    all_round_orders.setdefault(execution_id, []).append(order)
+                    if intent.get("recovery_cycle") is True:
+                        continue
+                    base_generation = plan_generation(order.get("plan_generation", intent.get("plan_generation")))
+                    base_by_generation.setdefault(base_generation, {}).setdefault(execution_id, []).append(order)
+                if not base_by_generation:
+                    result["reviews"].append(_buy_review(
+                        process_id=process_id,
+                        signal_id=signal_id,
+                        code=code,
+                        name=name,
+                        reasons=["BUY_PRICE_RESET_BASE_GENERATION_MISSING"],
+                    ))
+                    continue
+                original_generation = min(base_by_generation)
+                budget_orders = {
+                    execution_id: _latest(records)
+                    for execution_id, records in base_by_generation[original_generation].items()
+                }
+                fill_evidence_orders = {
+                    execution_id: _latest(records)
+                    for execution_id, records in all_round_orders.items()
+                }
+                reset_template = _intent(next(iter(budget_orders.values())))
+
             planned_budget = 0.0
-            filled_cost = 0.0
-            for execution_id, order in latest_orders.items():
+            for order in budget_orders.values():
                 intent = _intent(order)
                 qty = _positive_int(order.get("quantity") or intent.get("quantity")) or 0
                 price = _record_order_price(order)
                 budget_value = positive_price(order.get("budget")) or positive_price(intent.get("budget"))
                 planned_budget += budget_value if budget_value is not None else ((qty * price) if price else 0)
+            filled_cost = 0.0
+            for execution_id, order in fill_evidence_orders.items():
+                intent = _intent(order)
+                price = _record_order_price(order)
                 execution_fill_count = 0
                 for fill in loaded["fills"]:
                     if _text(fill.get("execution_id")) != execution_id:
@@ -925,18 +1098,9 @@ def inspect_buy_price_resets(
                                                       code=code, name=name,
                                                       reasons=["BUY_PRICE_RESET_OPTION_SNAPSHOT_HASH_MISMATCH"]))
                 continue
-            buy_round_value = template.get("buy_round")
-            if not isinstance(buy_round_value, int) or isinstance(buy_round_value, bool):
-                buy_round_value = next(
-                    (_nonnegative_int(item.get("buy_round") or _intent(item).get("buy_round"))
-                     for item in process_orders
-                     if _nonnegative_int(item.get("buy_round") or _intent(item).get("buy_round")) is not None),
-                    0,
-                )
-            buy_round = int(buy_round_value or 0)
             try:
                 intents = build_buy_generation_intents(
-                    template=template, source_signal_id=signal_id,
+                    template=reset_template, source_signal_id=signal_id,
                     process_id=process_id, option_snapshot_hash=next(iter(option_hashes)),
                     generation=generation + 1, buy_round=buy_round,
                     remaining_budget=remaining_budget, current_price=current_price,
@@ -975,6 +1139,7 @@ def inspect_sell_price_resets(
     positions_path: str | Path = POSITIONS_PATH,
     holdings_path: str | Path = HOLDINGS_PATH,
     signals_path: str | Path = SIGNALS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Inspect reset triggers and return cancel-first or replan proposals without writes."""
     paths = (
@@ -989,7 +1154,11 @@ def inspect_sell_price_resets(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in paths:
-        values, error = _read(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)

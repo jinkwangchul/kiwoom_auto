@@ -357,7 +357,10 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
             "execution_method": "ROUTINE",
             "order": deepcopy(order),
         }
-        with mock.patch.object(
+        with mock.patch(
+            "auto_trade_order_execution_boundary.signal_dispatch_block_reasons",
+            return_value=[],
+        ), mock.patch.object(
             self.boundary,
             "auto_trade_execution_block_reasons",
             return_value=[],
@@ -407,7 +410,10 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
             "blocked_reasons": ["TEST_STOP_BEFORE_RUNTIME_COMMIT"],
             "issues": ["TEST_STOP_BEFORE_RUNTIME_COMMIT"],
         }
-        with mock.patch.object(
+        with mock.patch(
+            "auto_trade_order_execution_boundary.signal_dispatch_block_reasons",
+            return_value=[]
+        ), mock.patch.object(
             self.boundary, "read_order_from_queue_by_id", side_effect=reads
         ), mock.patch.object(
             self.boundary, "auto_trade_execution_block_reasons", return_value=[]

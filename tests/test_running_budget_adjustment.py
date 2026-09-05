@@ -282,7 +282,13 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             observed.append((str(context["routine"]), int(context["stock_config"]["buy_amount"])))
             return {"signal": "BUY", "reason": "fixture"}
 
-        module = SimpleNamespace(ROUTINE_TYPE="FIXTURE", evaluate=evaluate)
+        module = SimpleNamespace(
+            ROUTINE_TYPE="FIXTURE",
+            evaluate=evaluate,
+            market_bar_projection_request=lambda _rules: {
+                "projection": "COMPLETED_TIMEFRAME"
+            },
+        )
         queue_ids = iter(("signal-a", "signal-b"))
 
         def enqueue(*_args, **_kwargs):

@@ -182,6 +182,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "bar.bar_minutes",
                 "buy.filters.ocr",
                 "buy.filters.rsi",
+                "buy.execution.repeat",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c",
             ],
@@ -202,8 +203,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             result["postponed"],
             [
                 "buy method mapping is postponed",
-                "repeat buy mapping is postponed",
-                "completion policy mapping is postponed",
+                "completion policy mapping requires BUY base execution",
             ],
         )
         self.assertEqual(len(result["legacy_notices"]), 2)
@@ -657,7 +657,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(commit_preview["final_diff"], [])
         self.assertIn("approval session has no approved patches", commit_preview["blocked_reasons"])
 
-    def test_buy_ocr_same_threshold_has_no_commit_diff(self):
+    def test_buy_ocr_same_threshold_migrates_signal_delay_contract(self):
         current_rules = deepcopy(self.current_rules)
         current_rules.setdefault("buy", {}).setdefault("filters", {})["ocr"] = {
             "enabled": True,
@@ -704,10 +704,15 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             {"approval_session_dirty": False},
         )
 
-        self.assertEqual(patch_preview["patches"], [])
-        self.assertFalse(commit_preview["commit_allowed"])
-        self.assertEqual(commit_preview["final_diff"], [])
-        self.assertIn("approval session has no approved patches", commit_preview["blocked_reasons"])
+        self.assertEqual(1, len(patch_preview["patches"]))
+        self.assertEqual("buy.filters.ocr", patch_preview["patches"][0]["target_path"])
+        self.assertEqual(0, patch_preview["patches"][0]["value"]["order_delay_bars"])
+        self.assertEqual(
+            "FOLLOWING_BASE_BAR_ENTRY",
+            patch_preview["patches"][0]["value"]["delay_anchor"],
+        )
+        self.assertTrue(commit_preview["commit_allowed"])
+        self.assertEqual(1, len(commit_preview["final_diff"]))
 
     def test_sell_add_signal_candidate_does_not_replace_macd_sell(self):
         result = self._build_preview()
@@ -817,6 +822,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "bar.bar_minutes",
                 "buy.filters.ocr",
                 "buy.filters.rsi",
+                "buy.execution.repeat",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c",
             ],
@@ -2579,6 +2585,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "bar.bar_minutes",
                 "buy.filters.ocr",
                 "buy.filters.rsi",
+                "buy.execution.repeat",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c",
             ],
@@ -3599,6 +3606,13 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             },
             "execution_connected": True,
             "execution_lock_reason": "",
+            "buy_completion_policy": {
+                "policy": "BUY_RECOVERY_TERMINAL_COMPLETION",
+                "residual_zero": "COMPLETE_CURRENT_BUY_ROUND",
+                "exit_triggered": "CANCEL_CONFIRM_FILL_THEN_COMPLETE_CURRENT_STATE",
+                "preserve_position": True,
+                "next_buy_requires_new_signal": True,
+            },
         })
         self.assertEqual(execution["repeat"]["value"], {
             "buy_phase": "REPEAT",
@@ -3635,6 +3649,12 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                     "apply_all_check": True,
                     "detail_mode_combo": ui_value,
                 }
+                if rule_value == "ACTIVE_BUY":
+                    state["buy_ui"]["repeat"].update({
+                        "active_direction_combo": "상향",
+                        "active_ratio_line": "0.7",
+                        "active_compare_combo": "이하",
+                    })
 
                 result = self.mapper.build_engine_rules_preview_from_ui_state(
                     state,

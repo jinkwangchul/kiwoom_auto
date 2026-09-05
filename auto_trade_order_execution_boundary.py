@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from account_auto_trade_budget_consumption import (
     canonical_buy_candidate_amount,
-    project_time_slice_buy_budget,
+    project_deferred_buy_budget_scope,
     project_account_auto_trade_budget_consumption,
     project_system_total_budget_buy_admission,
 )
@@ -68,6 +68,8 @@ from kiwoom_send_order_safety_gate import evaluate_kiwoom_send_order_safety
 from order_queued_review_service import review_order_queued_record
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 from routine_package_contract import FINAL_SAFETY_ROLE, evaluate_routine_gate
+from routine_main_facts import capture_routine_main_facts_for_subject
+from execution_signal_ownership_guard import signal_dispatch_block_reasons
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1492,12 +1494,12 @@ class AutoTradeOrderExecutionBoundary:
         if queue_reason:
             return {"ok": False, "stage": "fresh_buy_queue_evidence", "blocked_reasons": [queue_reason]}
         intent = order.get("execution_intent")
-        if isinstance(intent, dict) and intent.get("execution_mode") in {"MULTI_TIME", "MULTI_RATIO"}:
+        if isinstance(intent, dict) and intent.get("budget_scope_required") is True:
             try:
                 fills = json.loads(queue_path.with_name("fills.json").read_text(encoding="utf-8"))["fills"]
                 if not isinstance(fills, list) or any(not isinstance(fill, dict) for fill in fills):
                     raise ValueError("fills ledger must contain objects")
-                round_admission = project_time_slice_buy_budget(
+                round_admission = project_deferred_buy_budget_scope(
                     order=order, order_records=orders, fill_records=fills,
                     candidate_amount=requested_exposure,
                 )
@@ -1505,7 +1507,7 @@ class AutoTradeOrderExecutionBoundary:
                 round_admission = {"available": False, "admitted": False, "reason": str(exc)}
             if round_admission.get("admitted") is not True:
                 return {"ok": False, "stage": "fresh_buy_time_slice_round_budget",
-                        "blocked_reasons": [round_admission.get("reason") or "TIME_SLICE budget unavailable"],
+                        "blocked_reasons": [round_admission.get("reason") or "BUY budget scope unavailable"],
                         "round_budget_admission": round_admission}
         other_orders = [item for item in orders if not self._same_order_identity(item, order)]
         account_no = str(environment.get("selected_account_no") or "").strip()
@@ -1661,10 +1663,20 @@ class AutoTradeOrderExecutionBoundary:
         ).strip()
         if not instance_id:
             return ["routine instance identity is unavailable"]
+        subject = dict(order)
+        requires_facts = (
+            intent.get("side") == "BUY"
+            and intent.get("deferred_dispatch") is True
+        )
+        if requires_facts:
+            try:
+                subject["main_facts"] = capture_routine_main_facts_for_subject(order).to_payload()
+            except Exception as exc:
+                return [f"routine Main facts are unavailable: {type(exc).__name__}"]
         result = evaluate_routine_gate(
             instance_id=instance_id,
             role=FINAL_SAFETY_ROLE,
-            subject=order,
+            subject=subject,
         )
         if result.get("allowed") is True:
             return []
@@ -2896,6 +2908,15 @@ class AutoTradeOrderExecutionBoundary:
         if order_dict.get("status") != "EXECUTABLE":
             return observed_execution({"processed": False, "stage": "executable_status", "order_id": order_id, "blocked_reasons": ["target record status is not EXECUTABLE"]}, "EXECUTION_ENABLE", False)
 
+        ownership_reasons = signal_dispatch_block_reasons(order_dict)
+        if ownership_reasons:
+            return observed_execution({
+                "processed": False,
+                "stage": "signal_ownership_guard",
+                "order_id": order_id,
+                "blocked_reasons": ownership_reasons,
+            }, "EXECUTION_ENABLE", False)
+
         auto_reasons = self.auto_trade_execution_block_reasons(order_dict)
         if auto_reasons:
             return observed_execution({"processed": False, "stage": "auto_trade_runtime_state", "order_id": order_id, "blocked_reasons": auto_reasons}, "EXECUTION_ENABLE", False)
@@ -3025,6 +3046,17 @@ class AutoTradeOrderExecutionBoundary:
                 "current_price_pre_hash_result": pre_hash_current_price,
             }, "FINAL_GUARD", False)
 
+        ownership_reasons = signal_dispatch_block_reasons(effective_order_dict)
+        if ownership_reasons:
+            return observed_execution({
+                "processed": False,
+                "stage": "signal_ownership_guard_recheck",
+                "order_id": order_id,
+                "blocked_reasons": ownership_reasons,
+                "execution_enable_result": enable_result,
+                "real_preflight_result": preflight_result,
+            }, "FINAL_GUARD", False)
+
         runtime_commit = self.commit_execution_runtime_for_preview(
             effective_order_dict,
             guard,
@@ -3146,6 +3178,19 @@ class AutoTradeOrderExecutionBoundary:
             "FINAL_GUARD",
             True,
         )
+        ownership_reasons = signal_dispatch_block_reasons(effective_order_dict)
+        if ownership_reasons:
+            return observed_execution({
+                "processed": False,
+                "stage": "signal_ownership_final_dispatch_guard",
+                "order_id": order_id,
+                "order_queued_id": order_queued_id,
+                "blocked_reasons": ownership_reasons,
+                "execution_enable_result": enable_result,
+                "real_preflight_result": preflight_result,
+                "runtime_commit_result": runtime_commit,
+                "queue_commit_result": queue_commit,
+            }, "FINAL_GUARD", False)
         send_order_result = self.send_order_for_order_queued_automatically(
             order_queued_id,
             queue_path=queue_path,

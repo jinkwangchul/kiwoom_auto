@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 from typing import Any
+from routine_main_facts import records_from_routine_main_facts
 
 from execution_price_comparison import evaluate_percent_comparison, resolve_price_source
 from execution_price_reset import build_sell_generation_intents
@@ -152,6 +153,17 @@ def _exit_policy(repeat_policy: dict[str, Any]) -> dict[str, Any]:
     ):
         return policy
     return {}
+
+
+def _completion_policy(repeat_policy: dict[str, Any]) -> str:
+    explicit = _text(repeat_policy.get("completion_policy")).upper()
+    if explicit in {"CARRY_TO_NEXT_SIGNAL", "MARKET_SELL_REMAINING"}:
+        return explicit
+    exit_policy = _exit_policy(repeat_policy)
+    conditions = exit_policy.get("conditions") if exit_policy else None
+    if isinstance(conditions, list):
+        return "MARKET_SELL_REMAINING" if conditions else "CARRY_TO_NEXT_SIGNAL"
+    return ""
 
 
 def _review(
@@ -524,6 +536,7 @@ def inspect_sell_repeat_generations(
     positions_path: str | Path = POSITIONS_PATH,
     holdings_path: str | Path = HOLDINGS_PATH,
     signals_path: str | Path = SIGNALS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Propose at most one safe next generation per completed SELL process."""
     paths = (
@@ -538,7 +551,11 @@ def inspect_sell_repeat_generations(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in paths:
-        values, error = _read(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)
@@ -546,6 +563,7 @@ def inspect_sell_repeat_generations(
         "ok": not errors,
         "proposals": [],
         "exit_proposals": [],
+        "carryover_proposals": [],
         "blocked_execution_process_ids": [],
         "reviews": [],
         "waiting": [],
@@ -578,6 +596,7 @@ def inspect_sell_repeat_generations(
 
     proposals: list[dict[str, Any]] = []
     exit_proposals: list[dict[str, Any]] = []
+    carryover_proposals: list[dict[str, Any]] = []
     exit_blocked_processes: set[str] = set()
     reviews: list[dict[str, Any]] = []
     waiting: list[dict[str, Any]] = []
@@ -589,7 +608,7 @@ def inspect_sell_repeat_generations(
     }
 
     for process_id, process_orders in by_process.items():
-        if process_id in blocked or len(proposals) >= max_proposals:
+        if process_id in blocked or len(proposals) + len(carryover_proposals) >= max_proposals:
             continue
         source_ids = {
             _text(item.get("source_signal_id") or _intent(item).get("source_signal_id"))
@@ -627,6 +646,32 @@ def inspect_sell_repeat_generations(
                 ))
                 if exit_only:
                     exit_blocked_processes.add(process_id)
+            continue
+        existing_carryover = _as_dict(signal.get("sell_carryover_evidence"))
+        if existing_carryover:
+            if (
+                _text(existing_carryover.get("execution_process_id")) == process_id
+                and _text(existing_carryover.get("source_signal_id")) in {"", signal_id}
+                and _text(existing_carryover.get("carryover_source_snapshot_hash"))
+            ):
+                waiting.append({
+                    "execution_process_id": process_id,
+                    "code": code,
+                    "reason": "SELL_CARRYOVER_ALREADY_RECORDED",
+                    "carryover_source_snapshot_hash": existing_carryover.get(
+                        "carryover_source_snapshot_hash"
+                    ),
+                })
+                exit_blocked_processes.add(process_id)
+            else:
+                reviews.append(_review(
+                    process_id=process_id,
+                    signal_id=signal_id,
+                    code=code,
+                    name=name,
+                    reasons=["SELL_CARRYOVER_EVIDENCE_IDENTITY_INVALID"],
+                ))
+                exit_blocked_processes.add(process_id)
             continue
         reasons: list[str] = []
         if len(source_ids) != 1:
@@ -844,6 +889,51 @@ def inspect_sell_repeat_generations(
             if exit_only:
                 exit_blocked_processes.add(process_id)
             continue
+        completion_policy = _completion_policy(policy)
+        if not completion_policy:
+            reviews.append(_review(
+                process_id=process_id,
+                signal_id=signal_id,
+                code=code,
+                name=name,
+                reasons=["SELL_COMPLETION_POLICY_INVALID"],
+            ))
+            exit_blocked_processes.add(process_id)
+            continue
+        if completion_policy == "CARRY_TO_NEXT_SIGNAL":
+            snapshot = _repeat_snapshot(
+                process_id=process_id,
+                generation=generation,
+                policy=policy,
+                latest_orders=latest_orders,
+                position=position,
+                holding=holding,
+            )
+            carryover_proposals.append({
+                "execution_process_id": process_id,
+                "source_signal_id": signal_id,
+                "code": code,
+                "name": name,
+                "signal_status": _text(signal.get("status")).upper() or "PREVIEWED",
+                "completion_policy": completion_policy,
+                "terminal_plan_generation": generation,
+                "retained_holding_quantity": holding_quantity,
+                "retained_available_quantity": available_quantity,
+                "retained_position_quantity": position_quantity,
+                "retained_average_price": position.get("average_price"),
+                "retained_total_cost": position.get("total_cost"),
+                "carryover_completed_at": current_at.isoformat(timespec="milliseconds"),
+                "carryover_source_snapshot_hash": snapshot.get("snapshot_hash"),
+                "carryover_source_snapshot": snapshot,
+                "reason": "SELL_COMPLETED_WITH_POSITION_CARRYOVER",
+            })
+            exit_blocked_processes.add(process_id)
+            waiting.append({
+                "execution_process_id": process_id,
+                "code": code,
+                "reason": "SELL_CARRYOVER_TERMINAL_READY",
+            })
+            continue
         repeat_started_at = _repeat_started_at(process_orders, all_signal_intents)
         repeat_count = _completed_repeat_count(process_orders)
         exit_evaluation = _evaluate_exit_policy(
@@ -1003,6 +1093,7 @@ def inspect_sell_repeat_generations(
         "ok": not bool(errors),
         "proposals": proposals,
         "exit_proposals": exit_proposals,
+        "carryover_proposals": carryover_proposals,
         "blocked_execution_process_ids": sorted(exit_blocked_processes),
         "reviews": reviews,
         "waiting": waiting,

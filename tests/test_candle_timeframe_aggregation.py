@@ -251,6 +251,10 @@ class RoutineSignalProbeTimeframeIntegrationTests(unittest.TestCase):
             ROUTINE_TYPE = "TEST"
             context = None
 
+            @staticmethod
+            def market_bar_projection_request(_rules):
+                return {"projection": "COMPLETED_TIMEFRAME"}
+
             @classmethod
             def evaluate(cls, context):
                 cls.context = context
@@ -288,6 +292,10 @@ class RoutineSignalProbeTimeframeIntegrationTests(unittest.TestCase):
 
     def test_invalid_applied_timeframe_fails_without_evaluating_raw_candles(self) -> None:
         class MustNotRunRoutine:
+            @staticmethod
+            def market_bar_projection_request(_rules):
+                return {"projection": "COMPLETED_TIMEFRAME"}
+
             @staticmethod
             def evaluate(_context):
                 raise AssertionError("evaluate must not run")

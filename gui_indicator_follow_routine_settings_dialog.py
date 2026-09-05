@@ -81,6 +81,45 @@ from routine_instance_registry import (
     load_routine_definitions,
     routine_instance_by_id,
 )
+
+
+def normalize_buy_situation_ui_state(value):
+    """Normalize legacy Situation Response state into the current exclusive UI."""
+    state = deepcopy(value) if isinstance(value, dict) else {}
+    has_new_slots = any(str(key).startswith(("setting1_", "setting2_")) for key in state)
+    if not has_new_slots and "type_combo" in state:
+        state["unfilled_enabled_check"] = state.get("type_combo") == "미체결"
+        state["price_enabled_check"] = state.get("type_combo") == "가격비교"
+        common = {
+            "left_combo": state.get("left_combo"),
+            "right_combo": state.get("right_combo"),
+            "ratio_line": state.get("ratio_line"),
+            "compare_combo": state.get("compare_combo"),
+            "action_combo": state.get("action_combo"),
+        }
+        common["direction_combo"] = state.get("direction_combo")
+        state.update({f"setting1_{key}": item for key, item in common.items()})
+        state.update({f"setting2_{key}": item for key, item in common.items()})
+        state["setting1_enabled_check"] = True
+        state["setting2_enabled_check"] = False
+    if has_new_slots or "price_enabled_check" in state:
+        state["setting1_enabled_check"] = True
+        if state.get("setting2_enabled_check") is False:
+            state["setting2_left_combo"] = "무설정"
+        elif state.get("setting2_enabled_check") is True and state.get("setting2_left_combo") in {None, "", "무설정"}:
+            state["setting2_left_combo"] = "주문가"
+    # The two top-level Situation Response modes are mutually exclusive. A
+    # legacy state that contains both is displayed fail-closed with neither
+    # mode selected; the user must explicitly choose one before applying.
+    if state.get("unfilled_enabled_check") is True and state.get("price_enabled_check") is True:
+        state["unfilled_enabled_check"] = False
+        state["price_enabled_check"] = False
+    for key in (
+        "left_combo", "right_combo", "direction_combo", "ratio_line",
+        "compare_combo", "action_combo", "detail_stack", "type_combo",
+    ):
+        state.pop(key, None)
+    return state
 from routine_instance_repository import RoutineInstanceRepository
 from event_journal_production import append_production_event
 
@@ -538,10 +577,10 @@ class IndicatorFollowRoutineSettingsDialog(
             "- 직전회차주문가 대비 현재주문가\n"
             "- 마지막+1 회차\n"
             "- 다중지점 마지막회차 능동매수\n"
-            "- 지원되는 순환설정\n\n"
+            "- 반복매수 평단관리 능동매수\n"
+            "- 지원되는 순환설정 및 순환 가격비교 일괄취소\n\n"
             "예약 유지:\n"
-            "- 평단관리 능동매수 (ACTIVE_BUY_NOT_IMPLEMENTED)\n"
-            "- 순환 가격비교 일괄취소 (CYCLE_OPTION_EXECUTION_NOT_CONNECTED)"
+            "- 주가비교매수 능동매수 (ACTIVE_BUY_NOT_IMPLEMENTED)"
         )
         layout.addWidget(text, 1)
 
@@ -2698,7 +2737,7 @@ class IndicatorFollowRoutineSettingsDialog(
                 result=result,
             )
             self._apply_prefixed_ui_values(
-                buy_ui.get("situation", {}),
+                normalize_buy_situation_ui_state(buy_ui.get("situation", {})),
                 "buy_situation_response_",
                 result=result,
             )
@@ -2873,6 +2912,11 @@ class IndicatorFollowRoutineSettingsDialog(
                 else "이상"
             ),
         }
+        situation_state = normalize_buy_situation_ui_state(
+            self._collect_prefixed_ui_values_without_prefix(
+                "buy_situation_response_",
+            )
+        )
         buy_ui = {
             "signal_filter": {
                 **self._collect_prefixed_ui_values(("buy_ocr_",)),
@@ -2896,9 +2940,7 @@ class IndicatorFollowRoutineSettingsDialog(
                 buy_price_compare_names,
                 "buy_price_compare_",
             ),
-            "situation": self._collect_prefixed_ui_values_without_prefix(
-                "buy_situation_response_",
-            ),
+            "situation": situation_state,
             "additional": {
                 "last_plus_one": self._collect_named_ui_values_without_prefix(
                     [
@@ -2918,17 +2960,7 @@ class IndicatorFollowRoutineSettingsDialog(
                     "action": "SKIP_CURRENT_GENERATION",
                 },
             },
-            "cycle": {
-                **self._collect_named_ui_values_without_prefix(
-                    [
-                        "avg_round_increase_check",
-                        "avg_amount_increase_check",
-                        "avg_active_buy_check",
-                    ],
-                    "avg_",
-                ),
-                **self._collect_prefixed_ui_values(("buy_cycle_",)),
-            },
+            "cycle": self._collect_prefixed_ui_values(("buy_cycle_",)),
             "exit": self._collect_prefixed_ui_values(("buy_exit_",)),
             "close": {},
             "legacy_summary": {},

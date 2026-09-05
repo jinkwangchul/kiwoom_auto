@@ -173,6 +173,10 @@ class DecisionTraceFollowupStagesTest(unittest.TestCase):
             ROUTINE_TYPE = "TEST"
 
             @staticmethod
+            def market_bar_projection_request(_rules):
+                return {"projection": "COMPLETED_TIMEFRAME"}
+
+            @staticmethod
             def evaluate(_context):
                 return {"signal": "BUY", "reason": "test", "details": []}
 

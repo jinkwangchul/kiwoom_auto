@@ -16,9 +16,11 @@ from krx_tick_price import move_krx_price_by_ticks
 try:
     from .routine_sell_execution import _time_offsets_milliseconds, _time_unit_milliseconds
     from .routine_cycle_projection import project_indicator_follow_cycle
+    from .routine_strategy_identity import indicator_follow_cycle_identity
 except ImportError:
     from routine_sell_execution import _time_offsets_milliseconds, _time_unit_milliseconds
     from routine_cycle_projection import project_indicator_follow_cycle
+    from routine_strategy_identity import indicator_follow_cycle_identity
 
 
 STATUS_READY = "READY"
@@ -117,46 +119,71 @@ def inspect_buy_execution_support(*, subject: dict[str, Any], rules: dict[str, A
                 or (_positive_int(intent.get("buy_round")) or 0) > 1):
             repeat = _as_dict(execution.get("repeat"))
             if repeat.get("detail_mode") == "ACTIVE_BUY":
-                return "ACTIVE_BUY_NOT_IMPLEMENTED"
-            if "detail_mode" in repeat and repeat["detail_mode"] not in ("ROUND", "BUDGET"):
+                if (
+                    repeat.get("active_direction") not in {"UP", "DOWN", "BOTH"}
+                    or repeat.get("active_compare") not in {">=", "<=", "WITHIN", "OUTSIDE"}
+                    or not nonnegative_number(repeat.get("active_ratio"))
+                    or (
+                        repeat.get("active_direction") in {"UP", "DOWN"}
+                        and repeat.get("active_compare") not in {">=", "<="}
+                    )
+                    or (
+                        repeat.get("active_direction") == "BOTH"
+                        and repeat.get("active_compare") not in {"WITHIN", "OUTSIDE"}
+                    )
+                ):
+                    return "ACTIVE_BUY_POLICY_INVALID"
+            if "detail_mode" in repeat and repeat["detail_mode"] not in ("ROUND", "BUDGET", "ACTIVE_BUY"):
                 return "INVALID_REPEAT_DETAIL_MODE"
     return ""
 
 
-def inspect_buy_time_slice_continuation(*, subject: dict[str, Any], rules: dict[str, Any], project_root: Path) -> str:
+def inspect_buy_time_slice_continuation(
+    *,
+    subject: dict[str, Any],
+    rules: dict[str, Any],
+    main_facts: dict[str, Any] | None = None,
+) -> str:
     """Recheck this routine's cycle and current stock limit at its two gates.
 
-    Generic dispatch owns cash/account/round consumption. This routine alone
-    interprets buy_round, cycle and maximum-round settings. Reads only existing
-    canonical ledgers and the same running config projection as signal probing.
+    Generic dispatch owns cash/account/ceiling consumption. This routine alone
+    interprets buy_round, cycle and maximum-round settings. Main injects one
+    immutable facts projection; the routine never opens Main SoT files.
     """
     intent = _as_dict(subject.get("execution_intent"))
     if intent.get("side") != "BUY" or intent.get("execution_mode") not in {"MULTI_TIME", "MULTI_RATIO"}:
         return ""
-    from stock_repository import StockRepository
     from running_budget_adjustment import project_running_budget_adjustment_config
-    def read(path: Path) -> dict[str, Any]:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("object required")
-        return value
+    from routine_main_facts import validate_routine_main_facts
 
     try:
+        facts = main_facts if isinstance(main_facts, dict) else _as_dict(subject.get("main_facts"))
+        valid, reason = validate_routine_main_facts(facts)
+        if not valid:
+            return reason
         code = str(subject.get("code") or "").strip()
         instance = str(intent.get("routine_instance_id") or "").strip()
         if not code or not instance:
             return "BUY_TIME_SLICE_CYCLE_IDENTITY_MISSING"
-        stock_dir = StockRepository(project_root=project_root).resolve_stock_dir(code)
-        config = read(stock_dir / "config.json")
-        state = read(stock_dir / "state.json")
+        configs = _as_dict(facts.get("stock_configs"))
+        states = _as_dict(facts.get("stock_states"))
+        config = _as_dict(configs.get(code))
+        state = _as_dict(states.get(code))
+        if code not in configs or code not in states or not config:
+            return "BUY_TIME_SLICE_CURRENT_CONTEXT_UNAVAILABLE"
         if config.get("assigned_routine_instance_id") != instance:
             return "BUY_TIME_SLICE_ASSIGNMENT_CHANGED"
         config, _ = project_running_budget_adjustment_config(config, state)
-        queue = read(project_root / "runtime" / "order_queue.json")
-        fills = read(project_root / "runtime" / "fills.json")
+        orders = facts.get("orders")
+        fill_records = facts.get("fills")
+        position_records = facts.get("positions")
+        if not all(isinstance(value, list) for value in (orders, fill_records, position_records)):
+            return "BUY_TIME_SLICE_CURRENT_CONTEXT_UNAVAILABLE"
+        queue = {"orders": deepcopy(orders)}
+        fills = {"fills": deepcopy(fill_records)}
         cycle = project_indicator_follow_cycle(
             code=code, routine_instance_id=instance, order_queue=queue, fills=fills,
-            positions=read(project_root / "runtime" / "positions.json"),
+            positions={"positions": deepcopy(position_records)},
         )
         if cycle.get("status") != "resolved":
             return "BUY_TIME_SLICE_CYCLE_UNRESOLVED"
@@ -185,7 +212,7 @@ def inspect_buy_time_slice_continuation(*, subject: dict[str, Any], rules: dict[
             if used + amount > limit:
                 return "BUY_TIME_SLICE_STOCK_LIMIT_EXCEEDED"
         return ""
-    except (OSError, ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError):
         return "BUY_TIME_SLICE_CURRENT_CONTEXT_UNAVAILABLE"
 
 
@@ -251,6 +278,22 @@ def _hoga_offsets(up_count: int, down_count: int) -> list[int]:
 def _split_quantity(total_quantity: int, child_count: int) -> list[int]:
     quotient, remainder = divmod(total_quantity, child_count)
     return [quotient + (1 if index < remainder else 0) for index in range(child_count)]
+
+
+def _deferred_budget_contract(intent: dict[str, Any], ceiling: float) -> dict[str, Any]:
+    """Routine-owned opaque scope request consumed generically by Main."""
+    cycle_identity = str(intent.get("cycle_identity") or "PENDING_CYCLE").strip()
+    round_identity = f"{cycle_identity}:BUY_ROUND:{intent.get('buy_round')}"
+    return {
+        "budget_scope_required": True,
+        "approved_budget_ceiling": ceiling,
+        "budget_scope_member": {
+            "routine_instance_id": intent.get("routine_instance_id"),
+            "stock_code": intent.get("code"),
+            "side": "BUY",
+            "round_identity": round_identity,
+        },
+    }
 
 
 def _multi_hoga_execution_intents(
@@ -449,69 +492,35 @@ def _cycle_planning_rules(rules: dict[str, Any]) -> tuple[dict[str, Any], dict[s
     if not cycle_policy:
         return deepcopy(rules), None, ""
     if (
-        cycle_policy.get("scope") != "SIGNAL_SCOPED_BUY_CYCLE"
+        cycle_policy.get("scope") != "SIGNAL_SCOPED_BUY_RECOVERY"
         or cycle_policy.get("requires_source_signal") is not True
         or cycle_policy.get("autonomous_scheduler") is not False
-        or cycle_policy.get("after_cycle_completion") != "REQUIRE_NEW_BUY_SIGNAL"
+        or cycle_policy.get("residual_only") is not True
+        or cycle_policy.get("preserve_source_signal_id") is not True
+        or cycle_policy.get("preserve_execution_process_id") is not True
+        or cycle_policy.get("preserve_buy_round") is not True
+        or cycle_policy.get("increment_plan_generation_only") is not True
+        or cycle_policy.get("new_budget_allowed") is not False
+        or cycle_policy.get("new_round_allowed") is not False
+        or cycle_policy.get("active_buy_increment_allowed") is not False
+        or cycle_policy.get("after_cycle_completion") != "COMPLETE_CURRENT_BUY_ROUND"
         or cycle_policy.get("execution_connected") is not True
     ):
         return deepcopy(rules), cycle_policy, "CYCLE_OPTION_EXECUTION_NOT_CONNECTED"
     order = _as_dict(cycle_policy.get("order_policy"))
     point = _as_dict(cycle_policy.get("point_policy"))
-    situation = _as_dict(cycle_policy.get("situation_response"))
-    if situation.get("mode") == "PRICE_COMPARE" and situation.get("action") == "CANCEL_BATCH":
+    unfilled = cycle_policy.get("unfilled_timeout_policy")
+    price_responses = cycle_policy.get("buy_price_response_policies")
+    if (
+        not order
+        or not point
+        or not isinstance(unfilled, dict)
+        or not isinstance(price_responses, list)
+        or any(not isinstance(item, dict) for item in price_responses)
+    ):
         return deepcopy(rules), cycle_policy, "CYCLE_OPTION_EXECUTION_NOT_CONNECTED"
-
-    planned = deepcopy(rules)
-    planned_execution = planned.setdefault("buy", {}).setdefault("execution", {})
-    base = planned_execution.setdefault("base", {})
-    base.update({
-        "hoga_mode": order.get("hoga_mode"),
-        "order_price_basis": order.get("order_price_basis"),
-        "hoga_up": order.get("hoga_up"),
-        "hoga_down": order.get("hoga_down"),
-        "point_mode": point.get("mode"),
-    })
-    if point.get("mode") == "MULTI_TIME":
-        base.update({
-            "point_value": point.get("value"),
-            "point_unit": point.get("unit"),
-            "point_range": point.get("range"),
-            "point_count": point.get("count"),
-            "time_order_price_basis": point.get("order_price_basis"),
-        })
-    elif point.get("mode") == "MULTI_RATIO":
-        base.update({
-            "ratio_left": point.get("left_source"),
-            "ratio_right": point.get("right_source"),
-            "ratio_direction": point.get("direction"),
-            "ratio_value": point.get("ratio_percent"),
-            "ratio_compare": point.get("comparator"),
-            "ratio_count": point.get("count"),
-        })
-    if situation.get("mode") == "UNFILLED":
-        base["unfilled_timeout_policy"] = {
-            "policy": "CANCEL_PENDING_ORDER",
-            "enabled": True,
-            "action": "CANCEL",
-            "scope": situation.get("scope"),
-            "configured_value": situation.get("configured_value"),
-            "configured_unit": situation.get("configured_unit"),
-        }
-    elif situation.get("mode") == "PRICE_COMPARE" and situation.get("action") == "RESET":
-        base["buy_price_reset_policy"] = {
-            "policy": "BUY_PRICE_CHANGE_RESET",
-            "enabled": True,
-            "action": "RESET",
-            "left_source": situation.get("left_source"),
-            "right_source": situation.get("right_source"),
-            "direction": situation.get("direction"),
-            "threshold_percent": situation.get("ratio_percent"),
-            "compare": situation.get("comparator"),
-        }
-    else:
-        return deepcopy(rules), cycle_policy, "CYCLE_OPTION_EXECUTION_NOT_CONNECTED"
-    return planned, cycle_policy, ""
+    # Recovery policy must never replace the normal first-generation planner.
+    return deepcopy(rules), cycle_policy, ""
 
 
 def _last_plus_one_planning_rules(
@@ -655,11 +664,18 @@ def _multi_time_execution_intents(intent: dict[str, Any], context: dict[str, Any
         "buy_round": intent.get("buy_round"),
     }
     children = []
+    budget_contract = _deferred_budget_contract(intent, budget)
     for index, (qty, offset) in enumerate(zip(_split_quantity(quantity, count), offsets), 1):
         children.append({
-            **deepcopy(intent), "quantity": qty, "budget": qty * price,
+            **deepcopy(intent), **deepcopy(budget_contract),
+            "quantity": qty, "budget": qty * price,
             "price": price, "price_basis": price_basis, "hoga": "LIMIT",
             "execution_mode": "MULTI_TIME", "execution_process_owner_required": True,
+            "deferred_dispatch": True,
+            "signal_ownership_exclusive_while_pending": True,
+            "deferred_schedule": True,
+            "deferred_plan_status_key": "time_slice_plan_complete",
+            "deferred_last_child_status_key": "time_slice_last_child_sequence_index",
             "plan_generation": 0, "child_kind": "TIME_SLICE",
             "child_sequence_index": index, "child_sequence_total": count,
             "planned_total_quantity": quantity, "multi_time_plan": deepcopy(plan),
@@ -766,9 +782,16 @@ def _multi_ratio_execution_intents(intent: dict[str, Any], context: dict[str, An
         **{key: base[key] for key in ("ratio_left", "ratio_right", "ratio_direction", "ratio_compare")},
         "ratio_value": threshold,
     }
+    budget_contract = _deferred_budget_contract(intent, budget)
     children = [{
-        **deepcopy(intent), "quantity": qty, "budget": qty * price, "hoga": "LIMIT",
+        **deepcopy(intent), **deepcopy(budget_contract),
+        "quantity": qty, "budget": qty * price, "hoga": "LIMIT",
         "execution_mode": "MULTI_RATIO", "execution_process_owner_required": True,
+        "deferred_dispatch": True,
+        "signal_ownership_exclusive_while_pending": True,
+        "deferred_schedule": False,
+        "deferred_plan_status_key": "ratio_slice_plan_complete",
+        "deferred_last_child_status_key": "ratio_slice_last_child_sequence_index",
         "plan_generation": 0, "child_kind": "RATIO_SLICE",
         "child_sequence_index": index, "child_sequence_total": count,
         "planned_total_quantity": quantity, "multi_ratio_plan": deepcopy(plan),
@@ -792,6 +815,8 @@ def _budget_context(
     rules: dict[str, Any],
     cycle: dict[str, Any],
     sizing_reference_price: float,
+    active_reference_price: float | None = None,
+    actionable_acquisition_price: float | None = None,
 ) -> dict[str, Any]:
     mode = str(stock_config.get("trade_amount_type") or "QUANTITY").strip().upper()
     budget: dict[str, Any] = {
@@ -800,6 +825,10 @@ def _budget_context(
         "base_buy_budget": _positive_float(cycle.get("base_filled_buy_amount")),
         "previous_buy_budget": _positive_float(cycle.get("last_filled_buy_amount")),
         "max_buy_rounds": _maximum_rounds(stock_config, rules),
+        "position_quantity": cycle.get("holding_qty"),
+        "confirmed_average_buy_price": cycle.get("avg_price"),
+        "active_reference_price": active_reference_price,
+        "actionable_acquisition_price": actionable_acquisition_price,
     }
     account_budget = _as_dict(cycle.get("account_budget"))
     if account_budget:
@@ -1020,14 +1049,23 @@ def build_indicator_follow_buy_intent(
             blocked["decision"] = {"matched": False, "observed_percent": observed, "occurrence_consumed": False}
             return blocked
 
+    cycle_identity = indicator_follow_cycle_identity(
+        cycle=cycle, signal=signal, runtime_context=runtime_context, side="BUY"
+    )
     signal.update({
         "side": "BUY",
         "sizing_reference_price": sizing_reference_price,
         "routine_type": "INDICATOR_FOLLOW",
         "routine_instance_id": runtime_context.get("routine_instance_id"),
-        "cycle_identity": cycle.get("cycle_identity"),
+        "cycle_identity": cycle_identity,
         "confirmed_previous_round": confirmed_round,
     })
+    if not cycle_identity:
+        signal.update({
+            "routine_scope_identity_required": True,
+            "routine_scope_identity_field": "cycle_identity",
+            "routine_scope_identity_namespace": "INDICATOR_FOLLOW_CYCLE",
+        })
     if price_basis == "CURRENT_PRICE":
         signal["current_price"] = actionable_price
     elif price_basis == "ORDER_PRICE":
@@ -1037,6 +1075,8 @@ def build_indicator_follow_buy_intent(
         rules=planning_rules,
         cycle=cycle,
         sizing_reference_price=sizing_reference_price,
+        active_reference_price=reference_price,
+        actionable_acquisition_price=actionable_order_price,
     )
     if last_plus_one:
         approved_budget = _positive_float(cycle.get("last_normal_round_approved_budget"))
@@ -1054,13 +1094,60 @@ def build_indicator_follow_buy_intent(
         budget_context=budget_context,
     )
     if preview.get("status") != STATUS_READY:
-        issues = _as_dict(preview.get("execution_policy_result")).get("issues")
+        policy_result = _as_dict(preview.get("execution_policy_result"))
+        active_calculation = _as_dict(
+            _as_dict(_as_dict(policy_result.get("evidence")).get("budget_calculation")).get(
+                "active_buy_calculation"
+            )
+        )
+        active_status = str(active_calculation.get("status") or "").strip().upper()
+        if active_status in {"NO_BUY", "WAIT"}:
+            return {
+                "status": active_status,
+                "reason": active_calculation.get("reason"),
+                "execution_intent": None,
+                "execution_intents": [],
+                "preview": preview,
+                "active_buy_calculation": deepcopy(active_calculation),
+            }
+        issues = policy_result.get("issues")
         reason = issues[0] if isinstance(issues, list) and issues else "BUY_EXECUTION_POLICY_BLOCKED"
         return {"status": "BLOCKED", "reason": reason, "execution_intent": None, "preview": preview}
 
     intent = deepcopy(_as_dict(preview.get("execution_intent")))
     intent["confirmed_previous_round"] = confirmed_round
     intent["actionable_order_price"] = actionable_order_price
+    intent["cycle_identity"] = cycle_identity
+    if not cycle_identity:
+        intent.update({
+            "routine_scope_identity_required": True,
+            "routine_scope_identity_field": "cycle_identity",
+            "routine_scope_identity_namespace": "INDICATOR_FOLLOW_CYCLE",
+        })
+    # Routine-owned opaque scope. Generic queue code may compare this value,
+    # but must not infer BUY round, mode, or deferred-plan semantics.
+    intent["signal_ownership_scope"] = {
+        "routine_type": str(intent.get("routine_type") or "INDICATOR_FOLLOW").strip().upper(),
+        "routine_instance_id": str(intent.get("routine_instance_id") or "").strip(),
+        "side": "BUY",
+    }
+    repeat_rule = _as_dict(_execution_rules(planning_rules).get("repeat"))
+    if next_round > 1 and repeat_rule.get("detail_mode") == "ACTIVE_BUY":
+        policy_result = _as_dict(preview.get("execution_policy_result"))
+        calculation = _as_dict(
+            _as_dict(policy_result.get("evidence")).get("budget_calculation")
+        ).get("active_buy_calculation")
+        if not isinstance(calculation, dict) or calculation.get("status") != "READY":
+            return _blocked("ACTIVE_BUY_CALCULATION_EVIDENCE_MISSING")
+        intent["active_buy_policy"] = {
+            "policy": "REPEAT_ACTIVE_BUY",
+            "direction": repeat_rule.get("active_direction"),
+            "ratio_percent": repeat_rule.get("active_ratio"),
+            "comparator": repeat_rule.get("active_compare"),
+            "reference_price": reference_price,
+        }
+        intent["active_buy_calculation"] = deepcopy(calculation)
+        intent["active_buy_required_quantity"] = calculation.get("required_quantity")
     if branch_evidence is not None:
         intent["buy_price_compare_branch"] = branch_evidence
     if last_plus_one:
@@ -1085,7 +1172,7 @@ def build_indicator_follow_buy_intent(
     exit_policy = _as_dict(base.get("buy_exit_policy"))
     if exit_policy:
         if (
-            exit_policy.get("policy") != "BUY_REPEAT_EXIT"
+            exit_policy.get("policy") != "BUY_RECOVERY_EXIT"
             or exit_policy.get("enabled") is not True
             or str(exit_policy.get("logic") or "").upper() != "OR"
             or not isinstance(exit_policy.get("conditions"), list)
@@ -1093,6 +1180,18 @@ def build_indicator_follow_buy_intent(
         ):
             return _blocked("BUY_EXIT_POLICY_INVALID")
         intent["buy_exit_policy"] = deepcopy(exit_policy)
+    response_policies = base.get("buy_price_response_policies")
+    if isinstance(response_policies, list):
+        normalized_responses = [deepcopy(item) for item in response_policies if isinstance(item, dict)]
+        if len(normalized_responses) != len(response_policies) or any(
+            item.get("enabled") is not True
+            or item.get("action") not in {"RESET", "CANCEL_BATCH"}
+            or item.get("direction") not in {"UP", "DOWN"}
+            for item in normalized_responses
+        ):
+            return _blocked("BUY_PRICE_RESPONSE_POLICY_INVALID")
+        if normalized_responses:
+            intent["buy_price_response_policies"] = normalized_responses
     reset_policy = _as_dict(base.get("buy_price_reset_policy"))
     if reset_policy.get("enabled") is True:
         if (reset_policy.get("policy") != "BUY_PRICE_CHANGE_RESET"
@@ -1126,15 +1225,16 @@ def build_indicator_follow_buy_intent(
 
     if cycle_policy is not None:
         cycle_snapshot = {
-            "scope": "SIGNAL_SCOPED_BUY_CYCLE",
+            **deepcopy(cycle_policy),
+            "scope": "SIGNAL_SCOPED_BUY_RECOVERY",
             "requires_source_signal": True,
             "autonomous_scheduler": False,
-            "after_cycle_completion": "REQUIRE_NEW_BUY_SIGNAL",
+            "after_cycle_completion": "COMPLETE_CURRENT_BUY_ROUND",
         }
         intents = [deepcopy(item) for item in result.get("execution_intents", []) if isinstance(item, dict)]
         for item in intents:
-            item["cycle_scope"] = "SIGNAL_SCOPED_BUY_CYCLE"
-            item["signal_scoped_cycle"] = deepcopy(cycle_snapshot)
+            item["cycle_scope"] = "SIGNAL_SCOPED_BUY_RECOVERY"
+            item["buy_recovery_cycle_policy"] = deepcopy(cycle_snapshot)
         result["execution_intents"] = intents
         result["execution_intent"] = intents[0]
 

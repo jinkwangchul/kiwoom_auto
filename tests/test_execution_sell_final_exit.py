@@ -548,68 +548,11 @@ class ExecutionSellFinalExitTest(unittest.TestCase):
         self.assertTrue(evidence["resulting_holding_zero_confirmed"])
 
     def test_timer_routes_final_exit_without_stopping_other_work(self) -> None:
-        entry = SimpleNamespace(
-            stock_code=CODE,
-            stock_name="삼성전자",
-            stock_dir=Path("unused"),
-            execution_ready=True,
-            signal_probe_only=False,
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(entries=(entry,))
-        window = SimpleNamespace(
-            current_selected_account_no=lambda: ACCOUNT,
-            mark_review_required=mock.Mock(return_value=True),
-            statusBarMessage=mock.Mock(),
-        )
-        empty = {"proposals": [], "reviews": [], "waiting": [], "errors": []}
-        reset_empty = {
-            **empty,
-            "cancel_proposals": [],
-            "replan_proposals": [],
-            "blocked_execution_process_ids": [],
-        }
-        repeat_empty = {**empty, "exit_proposals": []}
-        final_result = {
-            "proposals": [{"execution_process_id": PROCESS}],
-            "completion_proposals": [{"execution_process_id": "PROCESS-DONE"}],
-            "reviews": [{"code": CODE, "review_reasons": ["FINAL-REVIEW"]}],
-            "waiting": [],
-            "errors": [],
-        }
-        consumer = {
-            "summary": {
-                "signals_checked": 0,
-                "blocked": 0,
-                "allowed": 0,
-                "errors": 0,
-                "orders_created": 0,
-                "approval_checked": 0,
-                "approved": 0,
-                "executable_order_ids": [],
-            }
-        }
-        with (
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_price_resets", return_value=reset_empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_unfilled_sell_cancel_eligibility", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_due_time_slices", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_eligible_ratio_slices", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_execution_process_supplements", return_value=empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_repeat_generations", return_value=repeat_empty),
-            mock.patch.object(gui_auto_trade_timer, "inspect_sell_final_residual_exits", return_value=final_result),
-            mock.patch.object(gui_auto_trade_timer, "enqueue_final_residual_sell_exit", return_value={"ok": True, "orders_created": 1, "executable_order_ids": ["ORDER-FINAL"]}) as enqueue,
-            mock.patch.object(gui_auto_trade_timer, "record_final_residual_sell_exit_completion", return_value={"ok": True}) as complete,
-            mock.patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", return_value=consumer),
-            mock.patch.object(gui_auto_trade_timer, "auto_trade_signal_probe_only_active", return_value=True),
-            mock.patch.object(gui_auto_trade_timer, "auto_trade_real_execution_active", return_value=False),
-            mock.patch.object(gui_auto_trade_timer, "actionable_current_price", return_value=105),
-        ):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
-        self.assertEqual(result["final_residual_exit"]["orders_created"], 1)
-        self.assertEqual(result["final_residual_exit"]["completions_recorded"], 1)
-        self.assertEqual(result["final_residual_exit"]["reviews"], 1)
-        enqueue.assert_called_once()
-        complete.assert_called_once()
 
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

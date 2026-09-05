@@ -1441,6 +1441,9 @@ def evaluate_indicator_follow_routine(
     """
     cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
     observer = context.get("decision_trace_observer") if isinstance(context, dict) else None
+    evaluate_side = str(
+        context.get("_indicator_follow_evaluate_side") or ""
+    ).strip().upper() if isinstance(context, dict) else ""
     if isinstance(context, dict) and isinstance(context.get("candles"), list):
         candles = context["candles"]
 
@@ -1459,7 +1462,10 @@ def evaluate_indicator_follow_routine(
     profit_rate_sell_cfg = _profit_rate_sell_section(sell_cfg)
     condition_sell_signals = _condition_sell_signals(sell_cfg)
 
-    buy_delay = int(buy_cfg.get("delay_bar", 1) or 0)
+    buy_ocr_cfg = _buy_ocr_filter_config(cfg, buy_cfg)
+    buy_delay = int(
+        buy_ocr_cfg.get("order_delay_bars", buy_cfg.get("delay_bar", 1)) or 0
+    )
     sell_delay = int(macd_sell_cfg.get("delay_bar", sell_cfg.get("delay_bar", 1)) or 0)
 
     # SELL을 먼저 평가한다.
@@ -1468,13 +1474,17 @@ def evaluate_indicator_follow_routine(
     sell_index = _delay_index(candles, sell_delay)
     condition_sell_passed: dict[str, bool] = {}
     condition_sell_results = {}
+    condition_sell_indexes: dict[str, int] = {}
     for signal_name, signal_cfg in condition_sell_signals.items():
+        signal_delay = int(signal_cfg.get("order_delay_bars", sell_delay) or 0)
+        signal_index = _delay_index(candles, signal_delay)
+        condition_sell_indexes[signal_name] = signal_index
         signal_groups = signal_cfg.get("groups", []) if isinstance(signal_cfg.get("groups"), list) else []
         if bool(signal_cfg.get("enabled", True)):
             passed, results = evaluate_groups_or(
                 signal_groups,
                 series_map,
-                sell_index,
+                signal_index,
                 observer,
                 f"sell.signals.{signal_name}.groups",
             )
@@ -1577,7 +1587,7 @@ def evaluate_indicator_follow_routine(
         "result": sell_passed,
     })
 
-    if sell_passed:
+    if sell_passed and evaluate_side != "BUY":
         matched = [
             result.group_name
             for signal_name in active_sell_names
@@ -1592,7 +1602,18 @@ def evaluate_indicator_follow_routine(
             for result in condition_sell_results.get(signal_name, [])
             for detail in result.details
         ] + profit_details
-        return RoutineSignal("SELL", f"매도조건 충족({sell_logic})", matched, details, sell_index, sell_delay)
+        matched_indexes = [
+            condition_sell_indexes[name]
+            for name in active_sell_names
+            if condition_sell_passed.get(name)
+            and name in condition_sell_indexes
+        ]
+        selected_index = max(matched_indexes, default=sell_index)
+        selected_delay = max(len(candles) - 1 - selected_index, 0)
+        return RoutineSignal("SELL", f"매도조건 충족({sell_logic})", matched, details, selected_index, selected_delay)
+
+    if evaluate_side == "SELL":
+        return RoutineSignal(None, "매도조건 미충족", [], [], sell_index, sell_delay)
 
     buy_index = _delay_index(candles, buy_delay)
     buy_groups = buy_cfg.get("groups", []) if isinstance(buy_cfg.get("groups"), list) else []

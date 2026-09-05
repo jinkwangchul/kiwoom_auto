@@ -13,6 +13,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
+from routine_main_facts import records_from_routine_main_facts
 
 from execution_provenance_contract import (
     materialize_execution_intent_children,
@@ -323,6 +324,7 @@ def inspect_sell_final_residual_exits(
     *,
     selected_account_no: str,
     allowed_stock_codes: tuple[str, ...] | list[str] | set[str] | None = None,
+    blocked_execution_process_ids: tuple[str, ...] | list[str] | set[str] | None = None,
     now: datetime | None = None,
     proposal_limit: int = 5,
     order_queue_path: str | Path = ORDER_QUEUE_PATH,
@@ -331,6 +333,7 @@ def inspect_sell_final_residual_exits(
     positions_path: str | Path = POSITIONS_PATH,
     holdings_path: str | Path = HOLDINGS_PATH,
     signals_path: str | Path = SIGNALS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Propose one final MARKET child per durable repeat-exit evidence."""
     paths = (
@@ -345,7 +348,11 @@ def inspect_sell_final_residual_exits(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in paths:
-        values, error = _read(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)
@@ -368,6 +375,11 @@ def inspect_sell_final_residual_exits(
     )
     if not account_no or (allowed_stock_codes is not None and not allowed):
         return result
+    blocked = {
+        _text(value)
+        for value in (blocked_execution_process_ids or [])
+        if _text(value)
+    }
     current_at = now or datetime.now()
     max_proposals = max(0, int(proposal_limit or 0))
     runtime_executions = {
@@ -382,6 +394,8 @@ def inspect_sell_final_residual_exits(
             continue
         signal_id = _text(signal.get("id"))
         process_id = _text(exit_evidence.get("execution_process_id"))
+        if process_id in blocked:
+            continue
         code = _text(signal.get("code"))
         name = _text(signal.get("name"))
         if allowed is not None and code not in allowed:

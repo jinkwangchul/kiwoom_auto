@@ -440,6 +440,7 @@ class IndicatorFollowSellExecutionConnectionTest(unittest.TestCase):
         self.assertEqual("ORDER_PRICE", repeat["execution_template"]["price_basis"])
         self.assertEqual(15_000, repeat["unfilled_timeout_policy"]["timeout_ms"])
         self.assertTrue(repeat["exit_policy_snapshot"]["exit_price_check"])
+        self.assertEqual("MARKET_SELL_REMAINING", repeat["completion_policy"])
         self.assertEqual("OR", repeat["exit_policy"]["logic"])
         self.assertEqual("PRICE", repeat["exit_policy"]["conditions"][0]["condition_type"])
         self.assertEqual(
@@ -447,6 +448,14 @@ class IndicatorFollowSellExecutionConnectionTest(unittest.TestCase):
             repeat["exit_policy"]["conditions"][0]["orientation"],
         )
         self.assertTrue(repeat["plan_snapshot_hash"])
+
+        setting["exit_price_check"] = False
+        carryover = self._build(context=self._context(rules=rules))
+        self.assertEqual("READY", carryover["status"], carryover)
+        self.assertEqual(
+            "CARRY_TO_NEXT_SIGNAL",
+            carryover["execution_intent"]["sell_repeat_policy"]["completion_policy"],
+        )
 
     def test_repeat_exit_count_and_time_are_normalized_without_new_runtime_state(self) -> None:
         rules = self._rules()
@@ -658,52 +667,12 @@ class IndicatorFollowSellExecutionConnectionTest(unittest.TestCase):
         self.assertEqual(5, boundary.process_executable_order_for_auto_trade.call_count)
 
     def test_timer_targets_every_new_multi_child_beyond_legacy_limit(self) -> None:
-        child_ids = [f"CHILD-{index}" for index in range(1, 8)]
-        window = SimpleNamespace(
-            statusBarMessage=mock.Mock(),
-            auto_process_executable_orders_for_real_trade=mock.Mock(
-                return_value={"processed": 7, "blocked": 0}
-            ),
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(
-            entries=(
-                SimpleNamespace(
-                    execution_ready=True,
-                    stock_code="005930",
-                    stock_dir=None,
-                ),
-            )
-        )
-        summary = {
-            "signals_checked": 1,
-            "blocked": 0,
-            "allowed": 1,
-            "errors": 0,
-            "orders_created": 7,
-            "approval_checked": 7,
-            "approved": 7,
-            "executable_order_ids": child_ids,
-        }
-        with mock.patch.object(
-            gui_auto_trade_timer,
-            "consume_pending_routine_signals_dry_run",
-            return_value={"summary": summary},
-        ), mock.patch.object(
-            gui_auto_trade_timer,
-            "auto_trade_signal_probe_only_active",
-            return_value=False,
-        ), mock.patch.object(
-            gui_auto_trade_timer,
-            "auto_trade_real_execution_active",
-            return_value=True,
-        ):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        self.assertEqual(7, result["orders_processed"])
-        window.auto_process_executable_orders_for_real_trade.assert_called_once_with(
-            limit=7,
-            order_ids=child_ids,
-        )
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 
     def test_multi_hoga_children_reach_generic_execution_preview_with_one_process(self) -> None:
         result = self._build(

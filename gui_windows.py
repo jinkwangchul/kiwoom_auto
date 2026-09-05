@@ -1605,6 +1605,7 @@ from routine_instance_repository import RoutineInstanceRepository
 from routine_package_contract import (
     SETTINGS_ROLE,
     RoutineContractError,
+    classify_routine_startup_recovery,
     load_routine_callable,
 )
 from stock_repository import (
@@ -7434,12 +7435,45 @@ class MainWindow(QMainWindow):
         self._startup_runtime_initialization_result = (
             initialize_pristine_startup_runtime()
         )
-        result = assess_startup_recovery(
-            stock_state_paths=stock_state_paths,
-            assignment_reconciliation_summary=(
+        assessment_kwargs = {
+            "stock_state_paths": stock_state_paths,
+            "assignment_reconciliation_summary": (
                 self._assignment_startup_reconciliation_result
             ),
-        )
+            "routine_recovery_classifier": classify_routine_startup_recovery,
+        }
+        result = assess_startup_recovery(**assessment_kwargs)
+        review_marker = getattr(self, "mark_review_required", None)
+        marked_routine_review = False
+        stock_dirs_by_code = {
+            stock_dir.name.partition("_")[0].strip().lstrip("A"): stock_dir
+            for stock_dir in self.all_runtime_stock_dirs()
+        }
+        for review in result.get("routine_recovery_reviews", []):
+            if not isinstance(review, dict):
+                continue
+            code = str(review.get("stock_code") or "").strip().lstrip("A")
+            stock_dir = stock_dirs_by_code.get(code)
+            if stock_dir is None or not callable(review_marker):
+                continue
+            current_state = read_json_dict(stock_dir / "state.json")
+            if current_state.get("review_required") is True:
+                continue
+            _code, separator, name = stock_dir.name.partition("_")
+            marked_routine_review = bool(review_marker(
+                stock_dir,
+                code,
+                name if separator else "",
+                {
+                    "review_reasons": [
+                        str(review.get("reason") or "ROUTINE_STARTUP_RECOVERY_REVIEW_REQUIRED")
+                    ],
+                    "review_location": "ROUTINE_STARTUP_RECOVERY",
+                },
+                source="ROUTINE_STARTUP_RECOVERY",
+            )) or marked_routine_review
+        if marked_routine_review:
+            result = assess_startup_recovery(**assessment_kwargs)
         self._startup_recovery_result = result
         status = str(result.get("status") or "INVALID_RUNTIME")
         if (

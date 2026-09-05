@@ -4,6 +4,9 @@
   "files": [
     "routines/지표추종매매/routine.json",
     "routines/지표추종매매/routine.py",
+    "routines/지표추종매매/routine_lifecycle.py",
+    "routines/지표추종매매/routine_startup_recovery.py",
+    "routines/지표추종매매/routine_strategy_identity.py",
     "routines/지표추종매매/rules.json",
     "routines/지표추종매매/routine_buy_execution.py",
     "routines/지표추종매매/routine_sell_execution.py",

@@ -267,6 +267,19 @@ def materialize_execution_intent_children(
     )[:24].upper()
     requested_process_id = _text(execution_process_id)
     process_id = requested_process_id or f"EXEC_PROCESS_{process_digest}"
+    budget_scope_required = any(item.get("budget_scope_required") is True for item in intents)
+    budget_scope_ids = {
+        _text(item.get("budget_scope_id"))
+        for item in intents
+        if _text(item.get("budget_scope_id"))
+    }
+    if len(budget_scope_ids) > 1:
+        raise ValueError("EXECUTION_INTENT_BUDGET_SCOPE_MISMATCH")
+    budget_scope_id = (
+        next(iter(budget_scope_ids))
+        if budget_scope_ids
+        else (f"BUDGET_SCOPE_{stable_hash(process_id)[:24].upper()}" if budget_scope_required else "")
+    )
     for index, intent in enumerate(intents, start=1):
         existing_signal_id = _text(intent.get("source_signal_id"))
         if existing_signal_id and existing_signal_id != signal_id:
@@ -276,6 +289,10 @@ def materialize_execution_intent_children(
             raise ValueError("EXECUTION_INTENT_PROCESS_ID_MISMATCH")
         intent["source_signal_id"] = signal_id
         intent["execution_process_id"] = process_id
+        if budget_scope_required:
+            if intent.get("budget_scope_required") is not True:
+                raise ValueError("EXECUTION_INTENT_BUDGET_SCOPE_REQUIREMENT_MISMATCH")
+            intent["budget_scope_id"] = budget_scope_id
         intent["plan_generation"] = generation
         intent["execution_id"] = (
             f"EXEC_CHILD_{stable_hash(process_id)[:16].upper()}"

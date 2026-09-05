@@ -93,12 +93,11 @@ def _materialize_time_slice_schedule(
     *,
     created_at: str,
 ) -> list[dict[str, Any]]:
-    modes = {
-        str(item.get("execution_mode") or "").strip().upper()
-        for item in execution_intents
-    }
-    if modes != {"MULTI_TIME"}:
+    schedule_contract = {item.get("deferred_schedule") is True for item in execution_intents}
+    if schedule_contract == {False}:
         return execution_intents
+    if schedule_contract != {True}:
+        raise ValueError("DEFERRED_SCHEDULE_CONTRACT_MISMATCH")
     try:
         anchor = datetime.fromisoformat(created_at)
     except ValueError as exc:
@@ -252,6 +251,33 @@ def _failure(operation: str, reason: str, fields: dict[str, Any]) -> dict[str, A
     result["path"] = str(QUEUE_PATH)
     result["manual_review_required"] = True
     return result
+
+
+def _materialize_requested_routine_scope_identity(
+    intent: dict[str, Any],
+    *,
+    signal_record_id: str,
+    stock_code: str,
+) -> None:
+    """Materialize a routine-requested opaque identity without interpreting it."""
+    if str(intent.get("cycle_identity") or "").strip():
+        return
+    if intent.get("routine_scope_identity_required") is not True:
+        return
+    field = str(intent.get("routine_scope_identity_field") or "").strip()
+    namespace = str(intent.get("routine_scope_identity_namespace") or "").strip().upper()
+    if field != "cycle_identity" or not namespace:
+        raise ValueError("ROUTINE_SCOPE_IDENTITY_CONTRACT_INVALID")
+    material = "|".join(
+        (
+            namespace,
+            str(signal_record_id or "").strip(),
+            str(intent.get("routine_instance_id") or "").strip(),
+            str(stock_code or "").strip().lstrip("A"),
+            str(intent.get("side") or "").strip().upper(),
+        )
+    )
+    intent[field] = f"{namespace}_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32].upper()}"
 
 
 Mutation = Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]]
@@ -497,6 +523,12 @@ def enqueue_routine_signal(
                 record[field] = value
         if isinstance(result.get("signal_runtime_policy"), dict):
             record["signal_runtime_policy"] = deepcopy(result["signal_runtime_policy"])
+        if isinstance(result.get("signal_conflict_evidence"), dict):
+            record["signal_conflict_evidence"] = deepcopy(result["signal_conflict_evidence"])
+        if isinstance(result.get("evaluation_facts_identity"), dict):
+            record["evaluation_facts_identity"] = deepcopy(
+                result["evaluation_facts_identity"]
+            )
         for field in (
             "signal_bar_time",
             "signal_bar_close",
@@ -516,66 +548,92 @@ def enqueue_routine_signal(
         if isinstance(result.get("execution_intents"), list) and result["execution_intents"]:
             record["execution_intents"] = deepcopy(result["execution_intents"])
 
+        def materialize_record(target: dict[str, Any], *, record_id: str, anchor: str) -> None:
+            target["id"] = record_id
+            execution_intents = target.get("execution_intents")
+            if isinstance(execution_intents, list) and execution_intents:
+                for execution_intent in execution_intents:
+                    if not isinstance(execution_intent, dict):
+                        raise ValueError("execution_intents must contain only objects")
+                    _materialize_requested_routine_scope_identity(
+                        execution_intent,
+                        signal_record_id=record_id,
+                        stock_code=code,
+                    )
+                execution_intents = _materialize_time_slice_schedule(
+                    execution_intents,
+                    created_at=anchor,
+                )
+                materialized = materialize_execution_intent_children(
+                    execution_intents,
+                    source_signal_id=record_id,
+                )
+                target["execution_intents"] = materialized
+                target["execution_intent"] = deepcopy(materialized[0])
+            execution_intent = target.get("execution_intent")
+            if isinstance(execution_intent, dict):
+                _materialize_requested_routine_scope_identity(
+                    execution_intent,
+                    signal_record_id=record_id,
+                    stock_code=code,
+                )
+                if not str(execution_intent.get("source_signal_id") or "").strip():
+                    execution_intent["source_signal_id"] = record_id
+                target["cycle_identity"] = execution_intent.get("cycle_identity")
+
         dedupe_key = _make_dedupe_key(record)
         for old in signals:
-            # A deferred BUY plan still owns its round between terminal child
-            # orders. Do not admit a second signal simply because no child is
-            # open at this instant. This is inside the existing queue lock.
+            # A routine may declare an opaque signal-ownership scope exclusive
+            # while its queued work is pending. The generic queue compares the
+            # scope only; it does not interpret side, round, mode, or plan kind.
             old_intent = old.get("execution_intent") or {}
             new_intent = record.get("execution_intent") or {}
-            if (
-                signal == "BUY" and old.get("status") == STATUS_PENDING
-                and old.get("code") == code
-                and isinstance(old_intent, dict) and isinstance(new_intent, dict)
-                and old_intent.get("side") == "BUY"
-                and old_intent.get("execution_mode") in {"MULTI_TIME", "MULTI_RATIO"}
-                and old_intent.get("routine_instance_id") == new_intent.get("routine_instance_id")
-                and isinstance(old.get("execution_intents"), list) and old["execution_intents"]
-            ):
-                return False, {"status": "duplicate", "reason": "BUY_DEFERRED_PLAN_PENDING",
-                               "path": str(QUEUE_PATH), "id": old.get("id", "")}
+            old_scope = old_intent.get("signal_ownership_scope")
+            new_scope = new_intent.get("signal_ownership_scope")
             if _make_dedupe_key(old) == dedupe_key:
+                new_facts_identity = record.get("evaluation_facts_identity")
+                if (
+                    old.get("status") == STATUS_PENDING
+                    and isinstance(new_facts_identity, dict)
+                    and new_facts_identity != old.get("evaluation_facts_identity")
+                ):
+                    old_id = str(old.get("id") or "").strip()
+                    old_created_at = str(old.get("created_at") or created_at)
+                    record["created_at"] = old_created_at
+                    record["updated_at"] = created_at
+                    materialize_record(record, record_id=old_id, anchor=old_created_at)
+                    old.clear()
+                    old.update(record)
+                    return True, {
+                        "status": "refreshed",
+                        "reason": "STALE_SIGNAL_REEVALUATED",
+                        "path": str(QUEUE_PATH),
+                        "id": old_id,
+                    }
                 return False, {
                     "status": "duplicate",
                     "reason": "동일 신호 이미 존재",
                     "path": str(QUEUE_PATH),
                     "id": old.get("id", ""),
                 }
+            if (
+                old.get("status") == STATUS_PENDING
+                and old.get("code") == code
+                and isinstance(old_intent, dict) and isinstance(new_intent, dict)
+                and old_intent.get("signal_ownership_exclusive_while_pending") is True
+                and isinstance(old_scope, dict) and bool(old_scope)
+                and old_scope == new_scope
+            ):
+                return False, {"status": "duplicate", "reason": "BUY_DEFERRED_PLAN_PENDING",
+                               "path": str(QUEUE_PATH), "id": old.get("id", "")}
 
         base_id = (
             f"{created_at.replace('-', '').replace(':', '').replace(' ', '_')}"
             f"_{code}_{signal}_{len(signals) + 1}"
         )
         existing_ids = {str(item.get("id", "")) for item in signals}
-        record["id"] = base_id if base_id not in existing_ids else f"{base_id}_{uuid4().hex[:8]}"
-        execution_intents = record.get("execution_intents")
-        if isinstance(execution_intents, list) and execution_intents:
-            for execution_intent in execution_intents:
-                if not isinstance(execution_intent, dict):
-                    raise ValueError("execution_intents must contain only objects")
-                if not str(execution_intent.get("cycle_identity") or "").strip():
-                    execution_intent["cycle_identity"] = f"CYCLE_{record['id']}"
-            execution_intents = _materialize_time_slice_schedule(
-                execution_intents,
-                created_at=created_at,
-            )
-            materialized = materialize_execution_intent_children(
-                execution_intents,
-                source_signal_id=record["id"],
-            )
-            record["execution_intents"] = materialized
-            record["execution_intent"] = deepcopy(materialized[0])
-        execution_intent = record.get("execution_intent")
-        if isinstance(execution_intent, dict) and not str(
-            execution_intent.get("source_signal_id") or ""
-        ).strip():
-            execution_intent["source_signal_id"] = record["id"]
-        if isinstance(execution_intent, dict) and not str(
-            execution_intent.get("cycle_identity") or ""
-        ).strip():
-            execution_intent["cycle_identity"] = f"CYCLE_{record['id']}"
-        if isinstance(execution_intent, dict):
-            record["cycle_identity"] = execution_intent.get("cycle_identity")
+        record_id = base_id if base_id not in existing_ids else f"{base_id}_{uuid4().hex[:8]}"
+        materialize_record(record, record_id=record_id, anchor=created_at)
         signals.append(record)
         return True, {
             "status": "queued",

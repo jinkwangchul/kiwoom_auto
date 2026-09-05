@@ -9,6 +9,11 @@ from typing import Any
 from execution_provenance_contract import stable_hash
 
 try:
+    from .routine_strategy_identity import indicator_follow_cycle_identity
+except ImportError:
+    from routine_strategy_identity import indicator_follow_cycle_identity
+
+try:
     from krx_tick_price import move_krx_price_by_ticks
 except Exception:  # pragma: no cover
     move_krx_price_by_ticks = None
@@ -494,6 +499,11 @@ def _repeat_execution_policy(
         "sell_price_reset_policy": reset_policy,
         "exit_policy_snapshot": exit_snapshot,
         "exit_policy": exit_policy,
+        "completion_policy": (
+            "MARKET_SELL_REMAINING"
+            if exit_conditions
+            else "CARRY_TO_NEXT_SIGNAL"
+        ),
     }
     snapshot["plan_snapshot_hash"] = stable_hash(snapshot)
     return snapshot, ""
@@ -594,15 +604,24 @@ def build_indicator_follow_sell_intent(
         or signal.get("id")
         or runtime_context.get("source_signal_id")
     )
+    cycle_identity = indicator_follow_cycle_identity(
+        cycle=cycle, signal=signal, runtime_context=runtime_context, side="SELL"
+    )
     common_intent = {
         "side": "SELL",
         "budget": None,
         "routine_type": "INDICATOR_FOLLOW",
         "routine_instance_id": routine_instance_id,
         "source_signal_id": source_signal_id or None,
-        "cycle_identity": cycle.get("cycle_identity"),
+        "cycle_identity": cycle_identity,
         "sell_method_set": method_set,
     }
+    if not cycle_identity:
+        common_intent.update({
+            "routine_scope_identity_required": True,
+            "routine_scope_identity_field": "cycle_identity",
+            "routine_scope_identity_namespace": "INDICATOR_FOLLOW_CYCLE",
+        })
     if unfilled_timeout_policy is not None:
         common_intent["unfilled_timeout_policy"] = unfilled_timeout_policy
     if price_reset_policy is not None:
@@ -681,6 +700,10 @@ def build_indicator_follow_sell_intent(
                     "hoga": hoga,
                     "hoga_mode": "SINGLE",
                     "execution_mode": "MULTI_RATIO",
+                    "deferred_dispatch": True,
+                    "deferred_schedule": False,
+                    "deferred_plan_status_key": "ratio_slice_plan_complete",
+                    "deferred_last_child_status_key": "ratio_slice_last_child_sequence_index",
                     "execution_process_owner_required": True,
                     "plan_generation": 0,
                     "child_sequence_index": index,
@@ -788,6 +811,10 @@ def build_indicator_follow_sell_intent(
                     "hoga": "LIMIT",
                     "hoga_mode": "SINGLE",
                     "execution_mode": "MULTI_TIME",
+                    "deferred_dispatch": True,
+                    "deferred_schedule": True,
+                    "deferred_plan_status_key": "time_slice_plan_complete",
+                    "deferred_last_child_status_key": "time_slice_last_child_sequence_index",
                     "execution_process_owner_required": True,
                     "plan_generation": 0,
                     "child_sequence_index": index,

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from typing import Any
+from routine_main_facts import records_from_routine_main_facts
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -169,6 +170,7 @@ def inspect_unfilled_cancel_eligibility(
     now: datetime | None = None,
     limit: int = 5,
     order_queue_path: str | Path = ORDER_QUEUE_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return timeout-qualified original orders without writing Queue or calling Broker."""
     account_no = _text(selected_account_no)
@@ -179,17 +181,22 @@ def inspect_unfilled_cancel_eligibility(
     )
     if not account_no or (allowed_stock_codes is not None and not allowed):
         return {"ok": True, "proposals": [], "reviews": [], "waiting": [], "errors": []}
-    try:
-        root = json.loads(Path(order_queue_path).read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {
-            "ok": False,
-            "proposals": [],
-            "reviews": [],
-            "waiting": [],
-            "errors": [f"ORDER_QUEUE_READ_FAILED:{exc}"],
-        }
-    orders = root.get("orders") if isinstance(root, dict) else None
+    if main_facts is not None:
+        orders, facts_error = records_from_routine_main_facts(main_facts, "orders")
+        if facts_error:
+            return {"ok": False, "proposals": [], "reviews": [], "waiting": [], "errors": [facts_error]}
+    else:
+        try:
+            root = json.loads(Path(order_queue_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "proposals": [],
+                "reviews": [],
+                "waiting": [],
+                "errors": [f"ORDER_QUEUE_READ_FAILED:{exc}"],
+            }
+        orders = root.get("orders") if isinstance(root, dict) else None
     if not isinstance(orders, list) or any(not isinstance(item, dict) for item in orders):
         return {
             "ok": False,
@@ -334,6 +341,9 @@ def inspect_unfilled_cancel_eligibility(
             "routine_instance_id": routine_instance_id,
             "source_signal_id": source_signal_id,
             "execution_process_id": process_id,
+            "source_plan_generation": intent.get("plan_generation", order.get("plan_generation")),
+            "buy_round": intent.get("buy_round", order.get("buy_round")),
+            "child_sequence_index": intent.get("child_sequence_index", order.get("child_sequence_index")),
             "remaining_quantity": remaining,
             "scope": scope,
             "timeout_ms": timeout_ms,
@@ -383,7 +393,57 @@ def inspect_unfilled_cancel_eligibility(
         if item["active_cancel"]:
             waiting.append({"order_queued_id": item["order_queued_id"], "reason": "ACTIVE_CANCEL_EXISTS"})
             continue
-        if not item["due"]:
+        if item["scope"] == "BATCH":
+            process_originals = [
+                order for order in orders
+                if _text(order.get("execution_process_id") or _execution_intent(order).get("execution_process_id"))
+                == item["execution_process_id"]
+                and _text(order.get("order_action") or _request_preview(order).get("order_action") or "NEW").upper()
+                in {"NEW", "MODIFY"}
+            ]
+            expected_total = max(
+                (
+                    _positive_int(_execution_intent(order).get("child_sequence_total")) or 1
+                    for order in process_originals
+                ),
+                default=1,
+            )
+            submitted = [
+                order for order in process_originals
+                if _timeout_anchor(order)[0] is not None
+            ]
+            if len({
+                _text(_execution_intent(order).get("execution_id") or order.get("execution_id") or order.get("id"))
+                for order in submitted
+            }) < expected_total:
+                waiting.append({
+                    "order_queued_id": item["order_queued_id"],
+                    "execution_process_id": item["execution_process_id"],
+                    "reason": "BATCH_LAST_CHILD_NOT_SUBMITTED",
+                })
+                continue
+            anchors = [_timeout_anchor(order)[0] for order in submitted]
+            anchors = [anchor for anchor in anchors if anchor is not None]
+            if not anchors:
+                waiting.append({"order_queued_id": item["order_queued_id"], "reason": "BATCH_SUBMISSION_ANCHOR_MISSING"})
+                continue
+            batch_anchor = max(anchors)
+            batch_due = batch_anchor + timedelta(milliseconds=item["timeout_ms"])
+            if current < batch_due:
+                waiting.append({
+                    "order_queued_id": item["order_queued_id"],
+                    "reason": "TIMEOUT_NOT_REACHED",
+                    "timeout_anchor": "LAST_CHILD_BROKER_ACCEPTED_AT",
+                    "timeout_anchor_at": batch_anchor.isoformat(timespec="milliseconds"),
+                    "timeout_due_at": batch_due.isoformat(timespec="milliseconds"),
+                })
+                continue
+            for target in by_process.get(item["execution_process_id"], [item]):
+                target["timeout_anchor"] = "LAST_CHILD_BROKER_ACCEPTED_AT"
+                target["timeout_anchor_at"] = batch_anchor.isoformat(timespec="milliseconds")
+                target["timeout_due_at"] = batch_due.isoformat(timespec="milliseconds")
+                target["due"] = True
+        elif not item["due"]:
             waiting.append({"order_queued_id": item["order_queued_id"], "reason": "TIMEOUT_NOT_REACHED"})
             continue
         targets = [item]

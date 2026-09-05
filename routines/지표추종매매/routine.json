@@ -35,7 +35,9 @@
     "locators":  {
                      "evaluation":  {
                                          "file":  "routine.py",
-                                         "callable":  "evaluate"
+                                         "callable":  "evaluate",
+                                         "market_bar_projection_callable":  "market_bar_projection_request",
+                                         "cycle_projection_callable":  "project_cycle_context"
                                      },
                      "settings":  {
                                        "project_file":  "gui_indicator_follow_routine_settings_dialog.py",
@@ -56,7 +58,15 @@
                      "final_safety":  {
                                             "file":  "routine.py",
                                             "callable":  "evaluate_final_real_order_safety"
-                                        }
+                                        },
+                     "lifecycle":  {
+                                         "file":  "routine_lifecycle.py",
+                                         "callable":  "evaluate_lifecycle"
+                                     },
+                     "startup_recovery":  {
+                                                "file":  "routine_startup_recovery.py",
+                                                "callable":  "classify_startup_recovery"
+                                     }
                  },
     "decision_trace":  {
                             "engine_files":  [

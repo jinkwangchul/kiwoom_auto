@@ -171,6 +171,29 @@ def _get_path_value(data: dict[str, Any], path: str) -> Any:
     return current
 
 
+def _delete_path_value(data: dict[str, Any], path: str) -> bool:
+    """Delete one canonical leaf without manufacturing a replacement policy."""
+    parts = path.split(".")
+    current: Any = data
+    parents: list[tuple[dict[str, Any], str]] = []
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current or not isinstance(current[part], dict):
+            return False
+        parents.append((current, part))
+        current = current[part]
+    leaf = parts[-1]
+    if not isinstance(current, dict) or leaf not in current:
+        return False
+    current.pop(leaf)
+    for parent, key in reversed(parents):
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            parent.pop(key, None)
+        else:
+            break
+    return True
+
+
 def _build_signal_runtime_policy_candidate(basic: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     if "basic_duplicate_signal_combo" not in basic and "basic_error_policy_combo" not in basic:
         return None
@@ -268,7 +291,7 @@ def _preview_diff_note(path: str) -> str:
             "BUY additional policy connected to the Routine-owned P2 execution consumer."
         ),
         BUY_EXECUTION_CYCLE_PATH: (
-            "Signal-scoped BUY cycle policy; unsupported CANCEL_BATCH remains execution-locked."
+            "Signal-scoped BUY residual-recovery cycle policy."
         ),
         SELL_METHOD_SELECTED_SETS_PATH: (
             "UI preview-only SELL method selected sets policy candidate."
@@ -425,9 +448,6 @@ def _build_buy_osc_conditions(signal_filter: dict[str, Any], warnings: list[str]
     elif signal_filter.get("buy_ocr_value_line") not in (None, ""):
         warnings.append("buy OCR threshold is not fully mapped")
 
-    if signal_filter.get("buy_ocr_bar_line") not in (None, "", "0"):
-        warnings.append("buy OCR bar offset is not supported by the current condition engine")
-
     return conditions
 
 
@@ -444,12 +464,19 @@ def _build_buy_ocr_filter_candidate(signal_filter: dict[str, Any], warnings: lis
         warnings.append("buy OCR filter candidate was not generated")
         return None
 
+    delay_bars = _safe_int(signal_filter.get("buy_ocr_bar_line", 0))
+    if delay_bars is None or delay_bars < 0:
+        warnings.append("buy OCR order delay is not a non-negative integer")
+        return None
     return {
         "path": BUY_OCR_FILTER_PATH,
         "value": {
             "enabled": True,
             "conditions_logic": "AND",
             "conditions": conditions,
+            "order_delay_bars": delay_bars,
+            "delay_anchor": "FOLLOWING_BASE_BAR_ENTRY",
+            "zero_bar_mode": "CURRENT_INCOMPLETE_BASE_BAR",
         },
     }
 
@@ -818,6 +845,17 @@ def _ratio_compare_token(value: Any) -> str | None:
     })
 
 
+def _is_valid_direction_comparator_pair(
+    direction: str | None,
+    comparator: str | None,
+) -> bool:
+    if direction in {"UP", "DOWN"}:
+        return comparator in {">=", "<="}
+    if direction == "BOTH":
+        return comparator in {"WITHIN", "OUTSIDE"}
+    return False
+
+
 def _detail_mode_token(value: Any) -> str | None:
     return _choice_token(value, {
         "\ud68c\ucc28\uae30\uc900": "ROUND",
@@ -1021,6 +1059,9 @@ def _build_buy_execution_additional_candidate(
 def _build_buy_execution_cycle_candidate(
     cycle: dict[str, Any],
     warnings: list[str],
+    *,
+    unfilled_timeout_policy: dict[str, Any] | None = None,
+    price_response_policies: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if not cycle or not any(str(key).startswith("buy_cycle_") for key in cycle):
         return None
@@ -1079,58 +1120,21 @@ def _build_buy_execution_cycle_candidate(
             warnings.append("buy cycle MULTI_RATIO policy is invalid")
             return None
 
-    situation_mode = _choice_token(cycle.get("buy_cycle_situation_mode_combo"), {
-        "미체결": "UNFILLED",
-        "가격비교": "PRICE_COMPARE",
-    })
-    situation: dict[str, Any]
-    if situation_mode == "UNFILLED":
-        situation = {
-            "mode": "UNFILLED",
-            "action": "CANCEL",
-            "scope": {"매회": "EACH", "일괄": "BATCH"}.get(cycle.get("buy_cycle_pending_scope_combo")),
-            "configured_value": _nonnegative_float(cycle.get("buy_cycle_pending_value_line")),
-            "configured_unit": _point_unit_token(cycle.get("buy_cycle_pending_unit_combo")),
-            "anchor": "BROKER_ACCEPTED_AT",
-        }
-        if situation["scope"] not in {"EACH", "BATCH"} or situation["configured_value"] is None \
-                or situation["configured_unit"] not in {"SECOND", "MINUTE", "BAR"}:
-            warnings.append("buy cycle unfilled policy is invalid")
-            return None
-    elif situation_mode == "PRICE_COMPARE":
-        situation = {
-            "mode": "PRICE_COMPARE",
-            "left_source": _price_basis_token(cycle.get("buy_cycle_price_left_combo")),
-            "right_source": _price_basis_token(cycle.get("buy_cycle_price_right_combo")),
-            "direction": _direction_token(cycle.get("buy_cycle_price_direction_combo")),
-            "ratio_percent": _nonnegative_float(cycle.get("buy_cycle_price_value_line")),
-            "comparator": _ratio_compare_token(cycle.get("buy_cycle_price_compare_combo")),
-            "action": {"매수리셋": "RESET", "일괄취소": "CANCEL_BATCH"}.get(cycle.get("buy_cycle_price_action_combo")),
-        }
-        if (
-            situation["left_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-            or situation["right_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-            or situation["direction"] not in {"UP", "DOWN", "BOTH"}
-            or situation["ratio_percent"] is None
-            or situation["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
-            or situation["action"] not in {"RESET", "CANCEL_BATCH"}
-        ):
-            warnings.append("buy cycle price response is invalid")
-            return None
-    else:
-        warnings.append("buy cycle situation mode is invalid")
-        return None
-
-    connected = not (
-        situation.get("mode") == "PRICE_COMPARE"
-        and situation.get("action") == "CANCEL_BATCH"
-    )
-    lock_reason = "" if connected else CYCLE_OPTION_EXECUTION_LOCK_REASON
+    connected = True
+    lock_reason = ""
     value = {
-        "scope": "SIGNAL_SCOPED_BUY_CYCLE",
+        "scope": "SIGNAL_SCOPED_BUY_RECOVERY",
         "requires_source_signal": True,
         "autonomous_scheduler": False,
-        "after_cycle_completion": "REQUIRE_NEW_BUY_SIGNAL",
+        "residual_only": True,
+        "preserve_source_signal_id": True,
+        "preserve_execution_process_id": True,
+        "preserve_buy_round": True,
+        "increment_plan_generation_only": True,
+        "new_budget_allowed": False,
+        "new_round_allowed": False,
+        "active_buy_increment_allowed": False,
+        "after_cycle_completion": "COMPLETE_CURRENT_BUY_ROUND",
         "order_policy": {
             "hoga_mode": hoga_mode,
             "order_price_basis": order_price_basis,
@@ -1138,7 +1142,13 @@ def _build_buy_execution_cycle_candidate(
             "hoga_down": hoga_down,
         },
         "point_policy": point_policy,
-        "situation_response": situation,
+        # Situation Response is a single authority shared by the base and all
+        # residual-Recovery generations.  The cycle UI owns only how an
+        # already-confirmed residual is redistributed.
+        "unfilled_timeout_policy": deepcopy(_as_dict(unfilled_timeout_policy)),
+        "buy_price_response_policies": deepcopy(
+            price_response_policies if isinstance(price_response_policies, list) else []
+        ),
         "execution_connected": connected,
         "execution_lock_reason": lock_reason,
     }
@@ -1194,6 +1204,15 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
         "ratio_compare": _ratio_compare_token(base.get("ratio_compare_combo")),
         "ratio_count": _safe_int(base.get("ratio_count_line")),
     }
+    if (
+        value["point_mode"] == "MULTI_RATIO"
+        and not _is_valid_direction_comparator_pair(
+            value["ratio_direction"],
+            value["ratio_compare"],
+        )
+    ):
+        warnings.append("buy base MULTI_RATIO direction/comparator pair is invalid")
+        return None
     last_round_active_buy, active_execution_lock = _build_last_round_active_buy_policy(
         base,
         value["point_mode"],
@@ -1217,6 +1236,79 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
     }
 
 
+def _build_buy_price_response_policies(
+    situation: dict[str, Any],
+    warnings: list[str],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Build the two independent normal-BUY price response slots."""
+    if not _truthy_ui(situation.get("price_enabled_check")):
+        return [], True
+    policies: list[dict[str, Any]] = []
+    valid = True
+    for slot in ("setting1", "setting2"):
+        if situation.get(f"{slot}_enabled_check") is False:
+            continue
+        direction = _direction_token(situation.get(f"{slot}_direction_combo"))
+        policy = {
+            "slot": slot.upper(),
+            "enabled": True,
+            "left_source": _price_basis_token(situation.get(f"{slot}_left_combo")),
+            "right_source": _price_basis_token(situation.get(f"{slot}_right_combo")),
+            "direction": direction,
+            "threshold_percent": _nonnegative_float(situation.get(f"{slot}_ratio_line")),
+            "compare": _ratio_compare_token(situation.get(f"{slot}_compare_combo")),
+            "action": {"매수리셋": "RESET", "일괄취소": "CANCEL_BATCH"}.get(
+                situation.get(f"{slot}_action_combo")
+            ),
+        }
+        if (
+            policy["left_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or policy["right_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or policy["threshold_percent"] is None
+            or policy["threshold_percent"] <= 0
+            or policy["direction"] not in {"UP", "DOWN", "BOTH"}
+            or not _is_valid_direction_comparator_pair(policy["direction"], policy["compare"])
+            or policy["action"] not in {"RESET", "CANCEL_BATCH"}
+        ):
+            warnings.append(f"buy situation price slot {slot.upper()} is invalid")
+            valid = False
+        policies.append(policy)
+    if not policies:
+        warnings.append("buy situation price response requires at least one enabled slot")
+        return [], False
+
+    # UP/DOWN >= thresholds are mutually exclusive (apart from a zero/equality
+    # boundary).  Any overlapping pair with different actions must be rejected
+    # at registration instead of inventing a runtime priority.
+    if len(policies) == 2 and policies[0].get("action") != policies[1].get("action"):
+        same_basis = (
+            policies[0].get("left_source") == policies[1].get("left_source")
+            and policies[0].get("right_source") == policies[1].get("right_source")
+        )
+        first, second = policies
+        directions = {first.get("direction"), second.get("direction")}
+        non_overlapping = bool(
+            same_basis
+            and (
+                (
+                    directions == {"UP", "DOWN"}
+                    and first.get("compare") == ">="
+                    and second.get("compare") == ">="
+                )
+                or (
+                    first.get("direction") == second.get("direction") == "BOTH"
+                    and {first.get("compare"), second.get("compare")} == {"WITHIN", "OUTSIDE"}
+                    and float(next(item for item in policies if item.get("compare") == "WITHIN").get("threshold_percent"))
+                    <= float(next(item for item in policies if item.get("compare") == "OUTSIDE").get("threshold_percent"))
+                )
+            )
+        )
+        if not non_overlapping:
+            warnings.append("buy situation price response slots can trigger conflicting actions")
+            valid = False
+    return policies, valid
+
+
 def _build_buy_exit_policy(exit_state: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     """Normalize the BUY repeat-exit controls into the execution rule.
 
@@ -1234,7 +1326,7 @@ def _build_buy_exit_policy(exit_state: dict[str, Any], warnings: list[str]) -> d
         else:
             conditions.append({
                 "condition_type": "COUNT",
-                "target_repeat_generations": value,
+                "target_recovery_generations": value,
                 "initial_generation_included": False,
             })
     if _truthy_ui(exit_state.get("buy_exit_time_check")):
@@ -1248,7 +1340,7 @@ def _build_buy_exit_policy(exit_state: dict[str, Any], warnings: list[str]) -> d
                 "condition_type": "TIME",
                 "configured_value": value,
                 "configured_unit": unit,
-                "anchor": "FIRST_REPEAT_GENERATION_AT",
+                "anchor": "FIRST_RECOVERY_ENTERED_AT",
             }
             if unit_ms is not None:
                 duration = value * unit_ms
@@ -1284,11 +1376,11 @@ def _build_buy_exit_policy(exit_state: dict[str, Any], warnings: list[str]) -> d
     if not conditions:
         return None
     policy = {
-        "policy": "BUY_REPEAT_EXIT",
+        "policy": "BUY_RECOVERY_EXIT",
         "enabled": True,
         "logic": "OR",
         "conditions": conditions,
-        "completion_behavior": "BLOCK_FUTURE_BUY_ROUNDS",
+        "completion_behavior": "COMPLETE_CURRENT_BUY_ROUND",
     }
     policy["snapshot_hash"] = _stable_hash(policy)
     return policy
@@ -1299,9 +1391,16 @@ def _build_buy_execution_repeat_candidate(
     warnings: list[str],
     *,
     legacy_base: dict[str, Any] | None = None,
+    existing_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if not _truthy_ui(repeat.get("apply_all_check")):
-        return None
+    if "apply_all_check" in repeat and not _truthy_ui(repeat.get("apply_all_check")):
+        if not _as_dict(existing_policy):
+            return None
+        return {
+            "path": BUY_EXECUTION_REPEAT_PATH,
+            "operation": "remove_execution_policy",
+            "value": {"enabled": False, "apply_all": False},
+        }
 
     detail_mode_value = repeat.get("detail_mode_combo")
     if detail_mode_value in (None, ""):
@@ -1318,6 +1417,18 @@ def _build_buy_execution_repeat_candidate(
         "active_ratio": _safe_float(repeat.get("active_ratio_line")),
         "active_compare": _ratio_compare_token(repeat.get("active_compare_combo")),
     }
+    if value["detail_mode"] == "ACTIVE_BUY":
+        ratio = value["active_ratio"]
+        if (
+            ratio is None
+            or not isfinite(ratio)
+            or ratio < 0
+            or not _is_valid_direction_comparator_pair(
+                value["active_direction"], value["active_compare"]
+            )
+        ):
+            warnings.append("buy repeat ACTIVE_BUY policy is invalid")
+            return None
     return {
         "path": BUY_EXECUTION_REPEAT_PATH,
         "operation": "set_execution_policy",
@@ -1770,9 +1881,9 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
 
     conditions: list[dict[str, Any]] = []
     turn_text = str(condition_a.get("ocr_direction_combo", condition_a.get("ocr_turn_combo", ""))).strip()
-    raw_bar_offset = condition_a.get("ocr_convert_line", 0)
-    bar_offset = _safe_int(raw_bar_offset)
-    if bar_offset is None or bar_offset < 0:
+    raw_order_delay = condition_a.get("ocr_convert_line", 0)
+    order_delay_bars = _safe_int(raw_order_delay)
+    if order_delay_bars is None or order_delay_bars < 0:
         warnings.append("sell condition A OCR convert bar is not a non-negative integer")
         return None
     if turn_text:
@@ -1792,8 +1903,6 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
             "operator": turn_operator,
             "description": "UI preview: sell condition A OCR/OSC turn condition",
         })
-        if "ocr_convert_line" in condition_a:
-            conditions[-1]["bar_offset"] = bar_offset
 
     raw_threshold = condition_a.get("ocr_value_line")
     if raw_threshold not in (None, ""):
@@ -1813,8 +1922,6 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
             "value": threshold,
             "description": "UI preview: sell condition A OCR/OSC threshold condition",
         })
-        if "ocr_convert_line" in condition_a:
-            conditions[-1]["bar_offset"] = bar_offset
 
     return conditions
 
@@ -1886,6 +1993,9 @@ def _build_sell_condition_a_signal_candidate(condition_a: dict[str, Any], warnin
             "preview_candidate": True,
             "groups_logic": "OR",
             "groups": [group],
+            "order_delay_bars": _safe_int(condition_a.get("ocr_convert_line", 0)),
+            "delay_anchor": "FOLLOWING_BASE_BAR_ENTRY",
+            "zero_bar_mode": "CURRENT_INCOMPLETE_BASE_BAR",
         },
     }
 
@@ -2306,47 +2416,107 @@ def build_engine_rules_preview_from_ui_state(
         _set_path_value(preview_rules, BUY_COMPOSITE_FILTER_PATH, buy_composite_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["composite"] = buy_composite_filter_candidate
 
+    invalid_base_multi_ratio_pair = (
+        _point_mode_token(execution_base.get("time_mode_combo")) == "MULTI_RATIO"
+        and not _is_valid_direction_comparator_pair(
+            _direction_token(execution_base.get("ratio_direction_combo")),
+            _ratio_compare_token(execution_base.get("ratio_compare_combo")),
+        )
+    )
     buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, validation_warnings)
     buy_exit_policy = _build_buy_exit_policy(_as_dict(buy_ui.get("exit")), validation_warnings)
     # Situation timeout belongs to the existing base execution policy and
     # therefore follows the same Pending/Approval/Commit path.
-    situation = _as_dict(buy_ui.get("situation"))
+    situation = deepcopy(_as_dict(buy_ui.get("situation")))
+    if "type_combo" in situation and not any(
+        str(key).startswith(("setting1_", "setting2_")) for key in situation
+    ):
+        situation["unfilled_enabled_check"] = situation.get("type_combo") == "미체결"
+        situation["price_enabled_check"] = situation.get("type_combo") == "가격비교"
+        for slot in ("setting1", "setting2"):
+            for field in ("left_combo", "right_combo", "ratio_line", "compare_combo", "action_combo"):
+                situation[f"{slot}_{field}"] = situation.get(field)
+            situation[f"{slot}_direction_combo"] = situation.get("direction_combo")
+        situation["setting1_enabled_check"] = True
+        situation["setting2_enabled_check"] = False
+    price_response_policies, price_response_valid = _build_buy_price_response_policies(
+        situation,
+        validation_warnings,
+    )
+    situation_mode_conflict = (
+        _truthy_ui(situation.get("unfilled_enabled_check"))
+        and _truthy_ui(situation.get("price_enabled_check"))
+    )
+    if situation_mode_conflict:
+        validation_warnings.append("buy situation unfilled and price response are mutually exclusive")
+    invalid_price_reset_pair = (
+        situation_mode_conflict
+        or (_truthy_ui(situation.get("price_enabled_check")) and not price_response_valid)
+    )
+    if invalid_price_reset_pair:
+        buy_execution_base_candidate = None
     old_base = _as_dict(_as_dict(_as_dict(source_rules.get("buy")).get("execution")).get("base"))
-    if not buy_execution_base_candidate and old_base and ("type_combo" in situation or buy_exit_policy is not None):
+    if (
+        not buy_execution_base_candidate
+        and not invalid_base_multi_ratio_pair
+        and not invalid_price_reset_pair
+        and old_base
+        and (
+            "type_combo" in situation
+            or "unfilled_enabled_check" in situation
+            or "price_enabled_check" in situation
+            or buy_exit_policy is not None
+        )
+    ):
         buy_execution_base_candidate = {"path": BUY_EXECUTION_BASE_PATH,
             "operation": "set_execution_policy", "value": deepcopy(old_base),
             "execution_connected": True,
             "execution_lock_reason": ""}
     if buy_execution_base_candidate:
         value = buy_execution_base_candidate["value"]
-        if "type_combo" not in situation and "unfilled_timeout_policy" in old_base:
+        if "unfilled_enabled_check" not in situation and "unfilled_timeout_policy" in old_base:
             value["unfilled_timeout_policy"] = deepcopy(old_base["unfilled_timeout_policy"])
-        if "type_combo" not in situation and "buy_price_reset_policy" in old_base:
-            value["buy_price_reset_policy"] = deepcopy(old_base["buy_price_reset_policy"])
-        elif situation.get("type_combo") == "미체결":
+        elif _truthy_ui(situation.get("unfilled_enabled_check")):
+            timeout_scope = {"매회": "EACH", "일괄": "BATCH"}.get(
+                situation.get("unfilled_scope_combo")
+            )
+            timeout_value = _safe_float(situation.get("unfilled_time_line"))
+            timeout_unit = _point_unit_token(situation.get("unfilled_unit_combo"))
+            if (
+                timeout_scope not in {"EACH", "BATCH"}
+                or timeout_value is None
+                or timeout_value < 0
+                or timeout_unit not in {"SECOND", "MINUTE", "BAR"}
+            ):
+                validation_warnings.append("buy situation unfilled timeout is invalid")
+                buy_execution_base_candidate = None
+            else:
+                value["unfilled_timeout_policy"] = {
+                    "policy": "CANCEL_PENDING_ORDER", "enabled": True, "action": "CANCEL",
+                    "scope": timeout_scope,
+                    "configured_value": timeout_value,
+                    "configured_unit": timeout_unit,
+                    "anchor": "BROKER_ACCEPTED_AT",
+                }
+        elif "unfilled_enabled_check" in situation:
             value["unfilled_timeout_policy"] = {
-                "policy": "CANCEL_PENDING_ORDER", "enabled": True, "action": "CANCEL",
-                "scope": {"매회": "EACH", "일괄": "BATCH"}.get(situation.get("unfilled_scope_combo")),
-                "configured_value": _safe_float(situation.get("unfilled_time_line")),
-                "configured_unit": _point_unit_token(situation.get("unfilled_unit_combo")),
-                "anchor": "BROKER_ACCEPTED_AT",
+                "policy": "CANCEL_PENDING_ORDER", "enabled": False,
             }
-        elif "type_combo" in situation:
-            # Price reset/cancel is still reserved; do not retain an active
-            # timeout from a previously selected situation page.
-            value["unfilled_timeout_policy"] = {"policy": "CANCEL_PENDING_ORDER", "enabled": False}
-        if situation.get("type_combo") == "가격비교" and situation.get("action_combo") == "매수리셋":
-            value["buy_price_reset_policy"] = {
-                "policy": "BUY_PRICE_CHANGE_RESET",
-                "enabled": True,
-                "action": "RESET",
-                "left_source": _price_basis_token(situation.get("left_combo")),
-                "right_source": _price_basis_token(situation.get("right_combo")),
-                "direction": _direction_token(situation.get("direction_combo")),
-                "threshold_percent": _safe_float(situation.get("ratio_line")),
-                "compare": _ratio_compare_token(situation.get("compare_combo")),
-            }
-        elif "type_combo" in situation:
+        if "price_enabled_check" not in situation and "buy_price_response_policies" in old_base:
+            value["buy_price_response_policies"] = deepcopy(old_base["buy_price_response_policies"])
+        if _truthy_ui(situation.get("price_enabled_check")) and price_response_valid:
+            value["buy_price_response_policies"] = deepcopy(price_response_policies)
+            reset_policies = [item for item in price_response_policies if item.get("action") == "RESET"]
+            value["buy_price_reset_policy"] = (
+                {
+                    "policy": "BUY_PRICE_CHANGE_RESET",
+                    **deepcopy(reset_policies[0]),
+                }
+                if len(reset_policies) == 1
+                else {"policy": "BUY_PRICE_CHANGE_RESET", "enabled": False}
+            )
+        elif "price_enabled_check" in situation:
+            value["buy_price_response_policies"] = []
             value["buy_price_reset_policy"] = {
                 "policy": "BUY_PRICE_CHANGE_RESET", "enabled": False,
             }
@@ -2356,6 +2526,13 @@ def build_engine_rules_preview_from_ui_state(
             # Preserve an existing canonical policy when this UI snapshot did
             # not include editable exit controls.
             value["buy_exit_policy"] = deepcopy(old_base["buy_exit_policy"])
+        value["buy_completion_policy"] = {
+            "policy": "BUY_RECOVERY_TERMINAL_COMPLETION",
+            "residual_zero": "COMPLETE_CURRENT_BUY_ROUND",
+            "exit_triggered": "CANCEL_CONFIRM_FILL_THEN_COMPLETE_CURRENT_STATE",
+            "preserve_position": True,
+            "next_buy_requires_new_signal": True,
+        }
     if buy_execution_base_candidate:
         _set_buy_execution_policy_value(
             preview_rules,
@@ -2373,13 +2550,19 @@ def build_engine_rules_preview_from_ui_state(
         execution_repeat,
         validation_warnings,
         legacy_base=execution_base,
+        existing_policy=_as_dict(
+            _as_dict(_as_dict(source_rules.get("buy")).get("execution")).get("repeat")
+        ),
     )
     if buy_execution_repeat_candidate:
-        _set_buy_execution_policy_value(
-            preview_rules,
-            BUY_EXECUTION_REPEAT_PATH,
-            buy_execution_repeat_candidate["value"],
-        )
+        if buy_execution_repeat_candidate.get("operation") == "remove_execution_policy":
+            _delete_path_value(preview_rules, BUY_EXECUTION_REPEAT_PATH)
+        else:
+            _set_buy_execution_policy_value(
+                preview_rules,
+                BUY_EXECUTION_REPEAT_PATH,
+                buy_execution_repeat_candidate["value"],
+            )
         preview_candidates.setdefault("execution", {})["repeat"] = buy_execution_repeat_candidate
 
     buy_execution_additional_candidate = _build_buy_execution_additional_candidate(
@@ -2399,9 +2582,20 @@ def build_engine_rules_preview_from_ui_state(
                 f"{buy_execution_additional_candidate.get('execution_lock_reason') or P1_EXECUTION_LOCK_REASON}"
             )
 
+    cycle_response_source = (
+        _as_dict(buy_execution_base_candidate.get("value"))
+        if isinstance(buy_execution_base_candidate, dict)
+        else old_base
+    )
     buy_execution_cycle_candidate = _build_buy_execution_cycle_candidate(
         execution_cycle,
         validation_warnings,
+        unfilled_timeout_policy=_as_dict(cycle_response_source.get("unfilled_timeout_policy")),
+        price_response_policies=(
+            cycle_response_source.get("buy_price_response_policies")
+            if isinstance(cycle_response_source.get("buy_price_response_policies"), list)
+            else []
+        ),
     )
     if buy_execution_cycle_candidate:
         _set_buy_execution_policy_value(
@@ -2496,7 +2690,8 @@ def build_engine_rules_preview_from_ui_state(
         postponed.append("buy method mapping is postponed")
     if not buy_execution_repeat_candidate:
         postponed.append("repeat buy mapping is postponed")
-    postponed.append("completion policy mapping is postponed")
+    if not buy_execution_base_candidate:
+        postponed.append("completion policy mapping requires BUY base execution")
 
     mapped_paths = [
         BAR_MINUTES_PATH,
@@ -2644,7 +2839,9 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
     buy_execution_repeat = _as_dict(_as_dict(candidates.get("execution")).get("repeat"))
     if buy_execution_repeat:
         execution_path = str(buy_execution_repeat.get("path") or BUY_EXECUTION_REPEAT_PATH)
-        candidate_paths[execution_path] = "set_execution_policy"
+        candidate_paths[execution_path] = str(
+            buy_execution_repeat.get("operation") or "set_execution_policy"
+        )
 
     buy_execution_additional = _as_dict(_as_dict(candidates.get("execution")).get("additional"))
     if buy_execution_additional:
@@ -3297,6 +3494,17 @@ def build_approved_rule_patch_preview(
 
         if path == BUY_EXECUTION_REPEAT_PATH:
             execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+            if execution_candidate.get("operation") == "remove_execution_policy":
+                if _get_path_value(current, BUY_EXECUTION_REPEAT_PATH) is _MISSING:
+                    skipped_paths.append(_patch_skipped(path, "BUY execution repeat policy is already absent"))
+                    continue
+                patches.append({
+                    "source_path": BUY_EXECUTION_REPEAT_PATH,
+                    "target_path": BUY_EXECUTION_REPEAT_PATH,
+                    "operation": "remove_execution_policy",
+                    "risk": "medium",
+                })
+                continue
             candidate_value = _execution_policy_value(execution_candidate)
             if not candidate_value:
                 skipped_paths.append(_patch_skipped(path, "BUY execution repeat value is not available"))
@@ -3615,6 +3823,21 @@ def apply_approved_rule_patch_preview(
             })
             continue
 
+        if operation == "remove_execution_policy":
+            if target_path != BUY_EXECUTION_REPEAT_PATH:
+                skipped_patches.append(_apply_skipped(patch, "unsupported execution policy removal path"))
+                warnings.append(f"unsupported execution policy removal path: {target_path}")
+                continue
+            if not _delete_path_value(applied_rules_preview, target_path):
+                skipped_patches.append(_apply_skipped(patch, "execution policy is already absent"))
+                continue
+            applied_patches.append({
+                "source_path": patch.get("source_path"),
+                "target_path": target_path,
+                "operation": operation,
+            })
+            continue
+
         if operation == "set_method_policy":
             if target_path not in _SELL_METHOD_PATHS:
                 skipped_patches.append(_apply_skipped(patch, "unsupported method policy target path"))
@@ -3861,6 +4084,15 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "operation": "set_execution_policy",
             "change_type": "set_buy_execution_repeat",
             "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "remove_execution_policy" and target_path == BUY_EXECUTION_REPEAT_PATH:
+        diffs.append({
+            "path": BUY_EXECUTION_REPEAT_PATH,
+            "operation": "remove_execution_policy",
+            "change_type": "remove_buy_execution_repeat",
             "replace": False,
         })
         return diffs
@@ -4423,8 +4655,19 @@ def approve_engine_rule_candidates(
 
     if BUY_EXECUTION_REPEAT_PATH in approved_paths:
         execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+        if execution_candidate.get("operation") == "remove_execution_policy":
+            if _delete_path_value(approved_rules, BUY_EXECUTION_REPEAT_PATH):
+                applied_paths.append(BUY_EXECUTION_REPEAT_PATH)
+            elif _get_path_value(approved_rules, BUY_EXECUTION_REPEAT_PATH) is _MISSING:
+                applied_paths.append(BUY_EXECUTION_REPEAT_PATH)
+            else:
+                skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
+                warnings.append("BUY execution repeat removal failed")
+            execution_candidate = {}
         candidate_value = _execution_policy_value(execution_candidate)
-        if not candidate_value:
+        if BUY_EXECUTION_REPEAT_PATH in applied_paths:
+            pass
+        elif not candidate_value:
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
             warnings.append("BUY execution repeat approval skipped: value is not available")
         elif _set_buy_execution_policy_value(
@@ -4627,8 +4870,11 @@ def compare_engine_rules_preview(
                 _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
             )
         elif path == BUY_EXECUTION_REPEAT_PATH:
-            preview_value = _execution_policy_value(
-                _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+            repeat_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+            preview_value = (
+                _MISSING
+                if repeat_candidate.get("operation") == "remove_execution_policy"
+                else _execution_policy_value(repeat_candidate)
             )
         elif path in {BUY_EXECUTION_ADDITIONAL_PATH, BUY_EXECUTION_CYCLE_PATH}:
             preview_value = _execution_policy_value(

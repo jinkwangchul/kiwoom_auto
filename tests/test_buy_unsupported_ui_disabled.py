@@ -36,19 +36,13 @@ class BuyConnectedUiActivationTest(unittest.TestCase):
         self.dialog.buy_additional_active_method_combo.setCurrentText("능동")
         self.assertTrue(self.dialog.buy_additional_active_direction_combo.isEnabled())
 
-    def test_connected_cycle_is_enabled_but_cancel_batch_remains_reserved(self) -> None:
+    def test_connected_cycle_has_no_second_situation_response_authority(self) -> None:
         box = self.dialog._make_buy_avg_overview_controls(("cycle",))
         self.addCleanup(dispose_qt_widget, box)
         self.assertTrue(self.dialog.buy_cycle_column_widget.isEnabled())
         self.assertTrue(self.dialog.buy_cycle_hoga_mode_combo.isEnabled())
-        reset_index = self.dialog.buy_cycle_price_action_combo.findText("매수리셋")
-        cancel_index = self.dialog.buy_cycle_price_action_combo.findText("일괄취소")
-        self.assertTrue(self.dialog.buy_cycle_price_action_combo.model().item(reset_index).isEnabled())
-        self.assertFalse(self.dialog.buy_cycle_price_action_combo.model().item(cancel_index).isEnabled())
-        self.assertIn(
-            "CYCLE_OPTION_EXECUTION_NOT_CONNECTED",
-            self.dialog.buy_cycle_price_action_combo.toolTip(),
-        )
+        self.assertFalse(hasattr(self.dialog, "buy_cycle_situation_mode_combo"))
+        self.assertFalse(hasattr(self.dialog, "buy_cycle_price_action_combo"))
 
 
 if __name__ == "__main__":

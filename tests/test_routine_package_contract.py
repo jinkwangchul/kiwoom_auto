@@ -33,9 +33,22 @@ class RoutinePackageContractTest(unittest.TestCase):
             "entry_file": evaluation_file,
             "rules_file": "rules.json",
             "locators": {
-                "evaluation": {"file": evaluation_file, "callable": "evaluate"},
-                "settings": {"file": "settings.py", "callable": "SettingsDialog"},
+                "evaluation": {
+                    "file": evaluation_file,
+                    "callable": "evaluate",
+                    "market_bar_projection_callable": "market_bar_projection_request",
+                    "cycle_projection_callable": "project_cycle_context",
+                },
+                "settings": {
+                    "file": "settings.py",
+                    "callable": "SettingsDialog",
+                    "registration_callable": "register_routine_instance_snapshot",
+                },
                 "rule_mapper": {"file": "mapper.py"},
+                "rule_commit_validator": {
+                    "file": "validator.py",
+                    "callable": "validate_committed_rules",
+                },
                 "execution_admission": {
                     "file": evaluation_file,
                     "callable": "admit",
@@ -53,6 +66,12 @@ class RoutinePackageContractTest(unittest.TestCase):
             f"""
 def evaluate(context):
     return {{'signal': '{side}', 'definition': '{definition_id}'}}
+
+def market_bar_projection_request(rules):
+    return {{'projection': 'COMPLETED_TIMEFRAME'}}
+
+def project_cycle_context(**facts):
+    return {{'status': 'resolved'}}
 
 def _result(allowed, routine_identity, rules_identity, reason=''):
     return {{
@@ -73,9 +92,15 @@ def final_safety(subject, rules, routine_identity, rules_identity):
             encoding="utf-8",
         )
         (package / "settings.py").write_text(
-            "class SettingsDialog:\n    pass\n", encoding="utf-8"
+            "class SettingsDialog:\n    pass\n\n"
+            "def register_routine_instance_snapshot(*args, **kwargs):\n    return {}\n",
+            encoding="utf-8",
         )
         (package / "mapper.py").write_text("MAPPER_ID = '" + definition_id + "'\n", encoding="utf-8")
+        (package / "validator.py").write_text(
+            "def validate_committed_rules(rules):\n    return {'ok': True}\n",
+            encoding="utf-8",
+        )
         (package / "rules.json").write_text("{}\n", encoding="utf-8")
 
         instance_id = {

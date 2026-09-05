@@ -55,33 +55,48 @@ def _cycle_policy(*, hoga: str = "SINGLE", point: str = "NONE", situation: str =
             left_source="ORDER_PRICE", right_source="CURRENT_PRICE", direction="UP",
             ratio_percent=0.5, comparator=">=", count=3,
         )
-    response = {
-        "mode": "UNFILLED", "action": "CANCEL", "scope": "EACH",
-        "configured_value": 5, "configured_unit": "SECOND", "anchor": "BROKER_ACCEPTED_AT",
+    unfilled = {
+        "policy": "CANCEL_PENDING_ORDER", "enabled": True, "action": "CANCEL",
+        "scope": "EACH", "configured_value": 5,
+        "configured_unit": "SECOND", "anchor": "BROKER_ACCEPTED_AT",
     }
+    price_responses = []
     if situation == "RESET":
-        response = {
-            "mode": "PRICE_COMPARE", "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
-            "direction": "UP", "ratio_percent": 1.0, "comparator": ">=", "action": "RESET",
-        }
+        unfilled = {"policy": "CANCEL_PENDING_ORDER", "enabled": False}
+        price_responses = [{
+            "slot": "SETTING1", "enabled": True, "left_source": "ORDER_PRICE",
+            "right_source": "CURRENT_PRICE", "direction": "UP",
+            "threshold_percent": 1.0, "compare": ">=", "action": "RESET",
+        }]
     elif situation == "CANCEL_BATCH":
-        response = {
-            "mode": "PRICE_COMPARE", "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
-            "direction": "UP", "ratio_percent": 1.0, "comparator": ">=", "action": "CANCEL_BATCH",
-        }
+        unfilled = {"policy": "CANCEL_PENDING_ORDER", "enabled": False}
+        price_responses = [{
+            "slot": "SETTING1", "enabled": True, "left_source": "ORDER_PRICE",
+            "right_source": "CURRENT_PRICE", "direction": "UP",
+            "threshold_percent": 1.0, "compare": ">=", "action": "CANCEL_BATCH",
+        }]
     return {
-        "scope": "SIGNAL_SCOPED_BUY_CYCLE",
+        "scope": "SIGNAL_SCOPED_BUY_RECOVERY",
         "requires_source_signal": True,
         "autonomous_scheduler": False,
-        "after_cycle_completion": "REQUIRE_NEW_BUY_SIGNAL",
+        "residual_only": True,
+        "preserve_source_signal_id": True,
+        "preserve_execution_process_id": True,
+        "preserve_buy_round": True,
+        "increment_plan_generation_only": True,
+        "new_budget_allowed": False,
+        "new_round_allowed": False,
+        "active_buy_increment_allowed": False,
+        "after_cycle_completion": "COMPLETE_CURRENT_BUY_ROUND",
         "order_policy": {
             "hoga_mode": hoga, "order_price_basis": "ORDER_PRICE" if hoga == "MULTI" else "CURRENT_PRICE",
             "hoga_up": 1 if hoga == "MULTI" else 0, "hoga_down": 1 if hoga == "MULTI" else 0,
         },
         "point_policy": point_policy,
-        "situation_response": response,
-        "execution_connected": situation != "CANCEL_BATCH",
-        "execution_lock_reason": "" if situation != "CANCEL_BATCH" else "CYCLE_OPTION_EXECUTION_NOT_CONNECTED",
+        "unfilled_timeout_policy": unfilled,
+        "buy_price_response_policies": price_responses,
+        "execution_connected": True,
+        "execution_lock_reason": "",
     }
 
 
@@ -252,7 +267,7 @@ class SignalScopedCycleConsumerTest(unittest.TestCase):
         rules["buy"]["execution"]["cycle"] = _cycle_policy(**kwargs)
         return rules
 
-    def test_single_hoga_time_ratio_reuse_existing_planners(self) -> None:
+    def test_normal_first_buy_planner_is_not_overridden_by_recovery_policy(self) -> None:
         cases = (({}, "SINGLE", 1), ({"hoga": "MULTI"}, "MULTI_HOGA", 3),
                  ({"point": "MULTI_TIME"}, "MULTI_TIME", 3), ({"point": "MULTI_RATIO"}, "MULTI_RATIO", 3))
         for options, mode, count in cases:
@@ -261,10 +276,9 @@ class SignalScopedCycleConsumerTest(unittest.TestCase):
                     rules=self.rules(**options), config={"trade_amount_type": "QUANTITY", "buy_qty": 3}, price=100,
                 )
                 self.assertEqual("READY", result["status"], result)
-                self.assertEqual(count, len(result["execution_intents"]))
-                self.assertEqual({mode}, {item.get("execution_mode", "SINGLE") for item in result["execution_intents"]})
-                self.assertTrue(all(item["cycle_scope"] == "SIGNAL_SCOPED_BUY_CYCLE" for item in result["execution_intents"]))
-                self.assertTrue(all(item["signal_scoped_cycle"]["autonomous_scheduler"] is False for item in result["execution_intents"]))
+                self.assertEqual(1, len(result["execution_intents"]))
+                self.assertEqual({"SINGLE"}, {item.get("execution_mode", "SINGLE") for item in result["execution_intents"]})
+                self.assertTrue(all(item["buy_recovery_cycle_policy"]["scope"] == "SIGNAL_SCOPED_BUY_RECOVERY" for item in result["execution_intents"]))
 
     def test_plan_is_deterministic_and_children_do_not_increment_round(self) -> None:
         first = self.helper._build(rules=self.rules(point="MULTI_TIME"),
@@ -274,13 +288,13 @@ class SignalScopedCycleConsumerTest(unittest.TestCase):
         self.assertEqual(first["execution_intents"], second["execution_intents"])
         self.assertEqual({1}, {item["buy_round"] for item in first["execution_intents"]})
 
-    def test_cycle_situation_reuses_timeout_and_reset_and_blocks_unsupported(self) -> None:
+    def test_shared_situation_contract_is_carried_for_recovery_without_changing_base_flow(self) -> None:
         timeout = self.helper._build(rules=self.rules(), price=100)
         reset = self.helper._build(rules=self.rules(situation="RESET"), price=100)
-        unsupported = self.helper._build(rules=self.rules(situation="CANCEL_BATCH"), price=100)
-        self.assertEqual(5000, timeout["execution_intent"]["unfilled_timeout_policy"]["timeout_ms"])
-        self.assertEqual("BUY_PRICE_CHANGE_RESET", reset["execution_intent"]["buy_price_reset_policy"]["policy"])
-        self.assertEqual("CYCLE_OPTION_EXECUTION_NOT_CONNECTED", unsupported["reason"])
+        cancel_batch = self.helper._build(rules=self.rules(situation="CANCEL_BATCH"), price=100)
+        self.assertTrue(timeout["execution_intent"]["buy_recovery_cycle_policy"]["unfilled_timeout_policy"]["enabled"])
+        self.assertEqual("RESET", reset["execution_intent"]["buy_recovery_cycle_policy"]["buy_price_response_policies"][0]["action"])
+        self.assertEqual("CANCEL_BATCH", cancel_batch["execution_intent"]["buy_recovery_cycle_policy"]["buy_price_response_policies"][0]["action"])
 
     def test_no_source_signal_means_no_plan(self) -> None:
         result = bridge.build_indicator_follow_buy_intent(

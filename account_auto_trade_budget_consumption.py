@@ -397,34 +397,34 @@ def project_account_auto_trade_budget_consumption(
     }
 
 
-def project_time_slice_buy_budget(
+def project_deferred_buy_budget_scope(
     *,
     order: Mapping[str, Any],
     order_records: list[dict[str, Any]],
     fill_records: list[dict[str, Any]],
     candidate_amount: object,
 ) -> dict[str, Any]:
-    """Recheck an immutable deferred BUY round ceiling using Queue/Fill facts.
+    """Recheck one routine-requested opaque BUY budget scope.
 
     Open predecessor orders wait (including their reserved unfilled amount).
     Terminal partial cancellation consumes only the confirmed cumulative Fill
-    cost, never the original requested quantity. No writes or quantity scaling.
+    cost, never the original requested quantity.  Main compares only the
+    routine-provided opaque scope/member identity and never interprets a
+    routine's mode, round, generation, or plan structure.
     """
     from chejan_event_recorder import _fill_ledger_summary
 
     intent = _as_dict(order.get("execution_intent")) or dict(order)
-    if intent.get("side") != "BUY" or intent.get("execution_mode") not in {"MULTI_TIME", "MULTI_RATIO"}:
+    if intent.get("side") != "BUY" or intent.get("budget_scope_required") is not True:
         return {"available": True, "admitted": True, "reason": "NOT_APPLICABLE"}
     try:
-        plan_key = "multi_ratio_plan" if intent.get("execution_mode") == "MULTI_RATIO" else "multi_time_plan"
-        plan = _as_dict(intent.get(plan_key))
-        budget = _integer(plan.get("approved_round_budget"), field="approved round budget", minimum=1)
-        amount = _integer(candidate_amount, field="due BUY amount", minimum=1)
-        process_id = _text(intent.get("execution_process_id"))
-        signal_id = _text(intent.get("source_signal_id"))
+        budget = _integer(intent.get("approved_budget_ceiling"), field="approved budget ceiling", minimum=1)
+        amount = _integer(candidate_amount, field="requested BUY amount", minimum=1)
+        scope_id = _text(intent.get("budget_scope_id"))
+        member = _as_dict(intent.get("budget_scope_member"))
         own_id = _text(intent.get("execution_id"))
-        if not process_id or not signal_id or not own_id:
-            raise ValueError("TIME_SLICE_BUY_IDENTITY_MISSING")
+        if not scope_id or not member or not own_id:
+            raise ValueError("BUY_BUDGET_SCOPE_IDENTITY_MISSING")
         consumed = Decimal(0)
         reserved = 0
         grouped: dict[str, dict[str, Any]] = {}
@@ -432,8 +432,8 @@ def project_time_slice_buy_budget(
             if _order_action(record) == "CANCEL":
                 continue
             other = _as_dict(record.get("execution_intent"))
-            pid = _text(record.get("execution_process_id") or other.get("execution_process_id"))
-            if pid != process_id:
+            other_scope = _text(record.get("budget_scope_id") or other.get("budget_scope_id"))
+            if other_scope != scope_id:
                 continue
             eid = _text(record.get("execution_id") or other.get("execution_id"))
             if not eid:
@@ -441,9 +441,12 @@ def project_time_slice_buy_budget(
             if eid == own_id:
                 continue
             if (
-                _text(record.get("source_signal_id") or other.get("source_signal_id")) != signal_id
-                or other.get("buy_round") != intent.get("buy_round")
-                or other.get(plan_key) != plan
+                _as_dict(record.get("budget_scope_member") or other.get("budget_scope_member")) != member
+                or _integer(
+                    record.get("approved_budget_ceiling", other.get("approved_budget_ceiling")),
+                    field="approved budget ceiling",
+                    minimum=1,
+                ) != budget
                 or _order_side(record) != "BUY"
                 or _record_account(record) != _text(intent.get("account_no"))
                 or _order_code(record) != _order_code(dict(order))
@@ -478,17 +481,23 @@ def project_time_slice_buy_budget(
                 reserved += _order_quantity(record, status=status) * _order_price(record)
             elif status not in _TERMINAL_STATUSES | {"BLOCKED", "BLOCKED_POLICY"}:
                 reserved += canonical_buy_candidate_amount(record)
-        # Round consumption is historical BUY fill cost, not current holdings:
-        # selling some holdings must not reopen this round's spending ceiling.
+        # Scope consumption is historical BUY fill cost, not current holdings:
+        # a later SELL must not reopen the routine-approved spending ceiling.
         remaining = Decimal(budget) - consumed - reserved
         return {
             "available": True, "admitted": reserved == 0 and Decimal(amount) <= remaining,
             "waiting": reserved > 0,
             "reason": "TIME_SLICE_BUY_OPEN_ORDER_PENDING" if reserved else (
                 "TIME_SLICE_BUY_ROUND_BUDGET_EXCEEDED" if Decimal(amount) > remaining else ""),
-            "approved_round_budget": budget, "consumed_amount": float(consumed),
+            "budget_scope_id": scope_id,
+            "approved_budget_ceiling": budget, "consumed_amount": float(consumed),
             "open_buy_reservation": reserved, "remaining_round_budget": float(remaining),
             "candidate_buy_amount": amount,
         }
     except (ValueError, TypeError, KeyError) as exc:
         return {"available": False, "admitted": False, "reason": str(exc)}
+
+
+def project_time_slice_buy_budget(**kwargs: Any) -> dict[str, Any]:
+    """Compatibility name for the generic opaque-scope projector."""
+    return project_deferred_buy_budget_scope(**kwargs)

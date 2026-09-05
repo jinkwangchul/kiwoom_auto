@@ -207,6 +207,22 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             },
         ), patch.object(
             operation_timer,
+            "capture_routine_main_facts",
+            return_value=SimpleNamespace(
+                to_payload=lambda: {
+                    "revision": "FACTS-1",
+                    "snapshot_hash": "HASH-1",
+                    "stock_configs": {
+                        "111111": {"assigned_routine_instance_id": "INSTANCE-A"}
+                    },
+                }
+            ),
+        ), patch.object(
+            operation_timer,
+            "evaluate_routine_lifecycle",
+            return_value={"ok": True, "decisions": []},
+        ), patch.object(
+            operation_timer,
             "project_execution_universe",
             return_value=SimpleNamespace(
                 entries=(

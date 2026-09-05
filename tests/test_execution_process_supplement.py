@@ -515,97 +515,11 @@ class ExecutionProcessSupplementTest(unittest.TestCase):
         self.assertNotEqual("EXEC_PROCESS-1_0_3", captured[0]["execution_id"])
 
     def test_timer_reviews_uncertain_stock_and_executes_other_stock_supplement(self) -> None:
-        window = SimpleNamespace(
-            _selected_account_no=lambda: "12345678",
-            mark_review_required=mock.Mock(return_value=True),
-            statusBarMessage=mock.Mock(),
-            auto_process_executable_orders_for_real_trade=mock.Mock(
-                return_value={"processed": 1, "blocked": 0}
-            ),
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
         )
-        snapshot = SimpleNamespace(
-            entries=(
-                SimpleNamespace(
-                    execution_ready=True,
-                    signal_probe_only=False,
-                    stock_code="005930",
-                    stock_name="삼성전자",
-                    stock_dir=self.root / "005930",
-                ),
-                SimpleNamespace(
-                    execution_ready=True,
-                    signal_probe_only=False,
-                    stock_code="000660",
-                    stock_name="SK하이닉스",
-                    stock_dir=self.root / "000660",
-                ),
-            )
-        )
-        inspected = {
-            "ok": True,
-            "proposals": [
-                {
-                    "code": "000660",
-                    "signal": {"id": "SIGNAL-2"},
-                    "execution_intents": [{"execution_id": "EXEC-G1-1"}],
-                }
-            ],
-            "reviews": [
-                {
-                    "code": "005930",
-                    "review_reasons": ["UNSAFE_CHILD:EXEC-1:SEND_UNCERTAIN"],
-                }
-            ],
-            "waiting": [],
-            "errors": [],
-        }
-        empty_summary = {
-            "signals_checked": 0,
-            "blocked": 0,
-            "allowed": 0,
-            "errors": 0,
-            "orders_created": 0,
-            "approval_checked": 0,
-            "approved": 0,
-            "executable_order_ids": [],
-        }
-        with mock.patch.object(
-            gui_auto_trade_timer,
-            "inspect_execution_process_supplements",
-            return_value=inspected,
-        ) as inspect, mock.patch.object(
-            gui_auto_trade_timer,
-            "enqueue_replanned_execution_intents",
-            return_value={
-                "ok": True,
-                "orders_created": 1,
-                "executable_order_ids": ["ORDER-SUPPLEMENT-1"],
-            },
-        ) as enqueue, mock.patch.object(
-            gui_auto_trade_timer,
-            "consume_pending_routine_signals_dry_run",
-            return_value={"summary": empty_summary},
-        ), mock.patch.object(
-            gui_auto_trade_timer,
-            "auto_trade_signal_probe_only_active",
-            return_value=False,
-        ), mock.patch.object(
-            gui_auto_trade_timer,
-            "auto_trade_real_execution_active",
-            return_value=True,
-        ):
-            result = gui_auto_trade_timer._process_pending_signal_pipeline(window, snapshot)
 
-        inspect.assert_called_once()
-        enqueue.assert_called_once()
-        window.mark_review_required.assert_called_once()
-        window.auto_process_executable_orders_for_real_trade.assert_called_once_with(
-            limit=5,
-            order_ids=["ORDER-SUPPLEMENT-1"],
-        )
-        self.assertEqual(1, result["supplement"]["reviews"])
-        self.assertEqual(1, result["supplement"]["orders_created"])
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

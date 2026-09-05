@@ -443,7 +443,11 @@ def project_indicator_follow_cycle(
                         planned_round == confirmed_round
                         and all(process_identity)
                         and round_processes.get(planned_round) == process_identity
-                        and intent.get("child_kind") in {"HOGA_LEVEL", "TIME_SLICE", "RATIO_SLICE"}
+                        and (
+                            intent.get("child_kind") in {"HOGA_LEVEL", "TIME_SLICE", "RATIO_SLICE"}
+                            or _as_dict(intent.get("active_buy_policy")).get("policy")
+                            == "REPEAT_ACTIVE_BUY"
+                        )
                     )
                     if planned_round != expected_round and not same_round_child:
                         return _unresolved("BUY_ROUND_SEQUENCE_MISMATCH", holding_qty=holding_qty, avg_price=avg_price)

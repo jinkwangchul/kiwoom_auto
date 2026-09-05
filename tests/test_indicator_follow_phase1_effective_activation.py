@@ -522,8 +522,8 @@ class IndicatorFollowExecutionKillSwitchTest(unittest.TestCase):
                 return_value={"orders": []},
             ), mock.patch.object(
                 routine_signal_consumer,
-                "signal_to_order_candidate",
-                return_value=order,
+                "signal_to_order_candidates",
+                return_value=[order],
             ), mock.patch.object(
                 routine_signal_consumer,
                 "append_order_candidates",

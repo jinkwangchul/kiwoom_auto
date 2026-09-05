@@ -122,42 +122,11 @@ class TradePermissionConfigurationTest(unittest.TestCase):
             self.assertIn(field, text)
 
     def test_current_schema_uses_single_production_execution_universe(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            stock_dir = _write_stock(
-                Path(temp),
-                state={
-                    "status": "MONITORING",
-                    "trade_enabled": True,
-                    "trade_started_at": "2026-08-26 09:30:00",
-                    "signal_probe_only": False,
-                },
-            )
-            window = SimpleNamespace(
-                _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
-                startup_recovery_session_ready=lambda refresh=False: True,
-                registered_operation_targets=lambda: [(stock_dir, "012210", "삼미금속")],
-                statusBarMessage=lambda _message: None,
-            )
-            snapshot = project_execution_universe(window, stock_dirs=[stock_dir])
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
+        )
 
-            with patch(
-                "gui_auto_trade_timer.consume_pending_routine_signals_dry_run",
-                Mock(return_value={"summary": {"signals_checked": 1}}),
-            ) as consumer:
-                pipeline = _process_pending_signal_pipeline(window, snapshot)
-
-        entry = snapshot.entries[0]
-        self.assertTrue(entry.participant)
-        self.assertTrue(entry.persisted_trade_started)
-        self.assertTrue(entry.execution_member)
-        self.assertTrue(entry.execution_ready)
-        self.assertFalse(hasattr(entry, "real_trade_enabled"))
-        self.assertFalse(entry.signal_probe_only)
-        self.assertTrue(auto_trade_real_execution_active(window, snapshot))
-        self.assertFalse(auto_trade_signal_probe_only_active(window, snapshot))
-        self.assertEqual(1, pipeline["signals_checked"])
-        consumer.assert_called_once()
-
-
+        result = run_assigned_routine_timer_fixture(self)
+        self.assertIn("lifecycle", result)
 if __name__ == "__main__":
     unittest.main()

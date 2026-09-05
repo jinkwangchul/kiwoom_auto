@@ -149,22 +149,52 @@ class BuyExecutionPolicyTest(unittest.TestCase):
         self.assertEqual(100000, result["round_budget"])
         self.assertEqual("PREVIOUS_BUDGET", result["budget_reference"])
 
-    def test_active_buy_remains_explicitly_unimplemented(self):
+    def test_active_buy_uses_position_and_actionable_price_for_exact_quantity(self):
         repeat = self._rules()["buy"]["execution"]["repeat"]
         repeat.update(
             detail_mode="ACTIVE_BUY",
-            active_direction="DOWN",
-            active_ratio=0.7,
+            active_direction="UP",
+            active_ratio=1,
             active_compare="<=",
         )
         result = self._evaluate(
+            signal_context=self._signal(order_price=13000, current_price=13000),
             approved_rules=self._rules(repeat=repeat),
             runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=3,
+                confirmed_average_buy_price=50000,
+                active_reference_price=13000,
+                actionable_acquisition_price=13000,
+                total_budget=20000000,
+                remaining_budget=20000000,
+            ),
         )
 
-        self.assertEqual(STATUS_BLOCKED, result["status"])
-        self.assertIn("ACTIVE_BUY_NOT_IMPLEMENTED", result["issues"])
-        self.assertFalse(result["evidence"]["budget_calculation"]["active_buy"]["implemented"])
+        self.assertEqual(STATUS_READY, result["status"], result)
+        self.assertEqual(851, result["quantity"])
+        self.assertEqual("ACTIVE_BUY_REQUIRED_QUANTITY", result["budget_reference"])
+        self.assertEqual(
+            851,
+            result["evidence"]["budget_calculation"]["active_buy_calculation"]["required_quantity"],
+        )
+
+        limited = self._evaluate(
+            signal_context=self._signal(order_price=13000, current_price=13000),
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=3,
+                confirmed_average_buy_price=50000,
+                active_reference_price=13000,
+                actionable_acquisition_price=13000,
+                total_budget=20000000,
+                remaining_budget=1000000,
+            ),
+        )
+        self.assertEqual(STATUS_BLOCKED, limited["status"])
+        self.assertEqual(851, limited["quantity"])
+        self.assertIn("ROUND_BUDGET_EXCEEDS_REMAINING_BUDGET", limited["issues"])
 
     def test_only_explicit_max_rounds_limits_buy_round(self):
         result = self._evaluate(

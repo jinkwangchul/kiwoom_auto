@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
+from routine_main_facts import records_from_routine_main_facts
 
 from execution_provenance_contract import (
     materialize_execution_intent_children,
@@ -281,6 +282,7 @@ def inspect_execution_process_supplements(
     positions_path: str | Path = POSITIONS_PATH,
     broker_holdings_path: str | Path = BROKER_HOLDINGS_PATH,
     routine_signals_path: str | Path = ROUTINE_SIGNALS_PATH,
+    main_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return safe supplement proposals and per-process review/wait results."""
     paths = (
@@ -295,7 +297,11 @@ def inspect_execution_process_supplements(
     loaded: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
     for path, field, optional in paths:
-        values, error = _read_list(path, field, optional=optional)
+        values, error = (
+            records_from_routine_main_facts(main_facts, field, optional=optional)
+            if main_facts is not None
+            else _read_list(path, field, optional=optional)
+        )
         loaded[field] = values
         if error:
             errors.append(error)

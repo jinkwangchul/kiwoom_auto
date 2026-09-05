@@ -139,6 +139,23 @@ from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fix
 
 
 class StartupRecoverySessionResumeTest(unittest.TestCase):
+    def _startup_classifier(self, classification: str, reason: str = ""):
+        def classify(*, instance_id: str, signal_id: str, main_facts: dict[str, object]):
+            signal = next(
+                item for item in main_facts["signals"]
+                if isinstance(item, dict) and item.get("id") == signal_id
+            )
+            return {
+                "classification": classification,
+                "reason": reason,
+                "signal_id": signal_id,
+                "stock_code": signal.get("code"),
+                "routine_instance_id": instance_id,
+                "facts_revision": main_facts.get("revision"),
+                "facts_snapshot_hash": main_facts.get("snapshot_hash"),
+            }
+        return classify
+
     def _write(self, path: Path, field: str, items: list[dict[str, object]]) -> None:
         path.write_text(
             json.dumps(
@@ -388,51 +405,34 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             self.assertEqual("REVIEW_REQUIRED", result["status"])
             self.assertIn("SIG_1", " ".join(result["review_reasons"]))
 
-    def test_valid_pending_multi_time_plan_is_not_an_unfinished_signal_review(self) -> None:
+    def test_routine_pending_valid_result_is_not_an_unfinished_signal_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = self._runtime(root)
-            process_id = "PROCESS-TIME-1"
             signal_id = "SIG-TIME-1"
-            intents = []
-            for index, scheduled_at in enumerate(
-                ("2026-09-02T10:00:00.000", "2026-09-02T10:00:30.000"),
-                start=1,
-            ):
-                intents.append(
-                    {
-                        "execution_id": f"EXEC-TIME-{index}",
-                        "execution_process_id": process_id,
-                        "source_signal_id": signal_id,
-                        "plan_generation": 0,
-                        "child_sequence_index": index,
-                        "child_sequence_total": 2,
-                        "child_kind": "TIME_SLICE",
-                        "child_plan": {
-                            "planned_quantity": 1,
-                            "scheduled_at": scheduled_at,
-                        },
-                        "execution_mode": "MULTI_TIME",
-                    }
-                )
             self._write(
                 paths["routine_signals_path"],
                 "signals",
                 [
                     {
                         "id": signal_id,
+                        "code": "005930",
+                        "routine_instance_id": "INSTANCE_A",
                         "status": "PENDING",
-                        "execution_intents": intents,
+                        "routine_owned_plan": {"opaque": True},
                     }
                 ],
             )
 
-            result = assess_startup_recovery(**paths)
+            result = assess_startup_recovery(
+                **paths,
+                routine_recovery_classifier=self._startup_classifier("PENDING_VALID"),
+            )
 
             self.assertEqual("RESUME_READY", result["status"])
             self.assertNotIn(signal_id, " ".join(result["review_reasons"]))
 
-    def test_invalid_pending_multi_time_plan_still_requires_review(self) -> None:
+    def test_routine_review_result_requires_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = self._runtime(root)
@@ -442,65 +442,45 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 [
                     {
                         "id": "SIG-TIME-BROKEN",
+                        "code": "005930",
+                        "routine_instance_id": "INSTANCE_A",
                         "status": "PENDING",
-                        "execution_intents": [
-                            {
-                                "execution_id": "EXEC-TIME-1",
-                                "execution_process_id": "PROCESS-TIME-1",
-                                "source_signal_id": "SIG-TIME-BROKEN",
-                                "plan_generation": 0,
-                                "child_sequence_index": 1,
-                                "child_sequence_total": 1,
-                                "child_kind": "TIME_SLICE",
-                                "child_plan": {"planned_quantity": 1},
-                                "execution_mode": "MULTI_TIME",
-                            }
-                        ],
+                        "routine_owned_plan": {"opaque": True},
                     }
                 ],
             )
 
-            result = assess_startup_recovery(**paths)
+            result = assess_startup_recovery(
+                **paths,
+                routine_recovery_classifier=self._startup_classifier(
+                    "REVIEW_REQUIRED", "STARTUP_ROUTINE_PLAN_INVALID"
+                ),
+            )
 
             self.assertEqual("REVIEW_REQUIRED", result["status"])
             self.assertIn("SIG-TIME-BROKEN", " ".join(result["review_reasons"]))
 
-    def test_valid_pending_multi_ratio_plan_is_not_an_unfinished_signal_review(self) -> None:
+    def test_routine_recoverable_result_is_not_an_unfinished_signal_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = self._runtime(root)
             signal_id = "SIG-RATIO-1"
-            process_id = "PROCESS-RATIO-1"
-            ratio_plan = {
-                "ratio_left": "ORDER_PRICE",
-                "ratio_right": "CURRENT_PRICE",
-                "ratio_direction": "UP",
-                "ratio_value": 0.15,
-                "ratio_compare": ">=",
-                "planned_child_count": 2,
-            }
-            intents = [
-                {
-                    "execution_id": f"EXEC-RATIO-{index}",
-                    "execution_process_id": process_id,
-                    "source_signal_id": signal_id,
-                    "plan_generation": 0,
-                    "child_sequence_index": index,
-                    "child_sequence_total": 2,
-                    "child_kind": "RATIO_SLICE",
-                    "child_plan": {"planned_quantity": 1, "ratio_step_index": index},
-                    "execution_mode": "MULTI_RATIO",
-                    "multi_ratio_plan": ratio_plan,
-                }
-                for index in (1, 2)
-            ]
             self._write(
                 paths["routine_signals_path"],
                 "signals",
-                [{"id": signal_id, "status": "PENDING", "execution_intents": intents}],
+                [{
+                    "id": signal_id,
+                    "code": "005930",
+                    "routine_instance_id": "INSTANCE_A",
+                    "status": "PENDING",
+                    "routine_owned_plan": {"opaque": True},
+                }],
             )
 
-            result = assess_startup_recovery(**paths)
+            result = assess_startup_recovery(
+                **paths,
+                routine_recovery_classifier=self._startup_classifier("RECOVERABLE"),
+            )
 
             self.assertEqual("RESUME_READY", result["status"])
             self.assertNotIn(signal_id, " ".join(result["review_reasons"]))
@@ -567,100 +547,12 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
         timer_window.stop_operation_timers.assert_called_once_with()
 
     def test_real_auto_trade_state_allows_pending_signal_consumer(self) -> None:
-        class Parent:
-            def refresh_all(self) -> None:
-                return None
+        from tests.indicator_follow_assigned_timer_fixture import (
+            run_assigned_routine_timer_fixture,
+        )
 
-        class TimerWindow:
-            def __init__(self, routine_dir: Path) -> None:
-                self.routine_dir = routine_dir
-                self._last_time_policy_minute_key = "2026-07-16 09:00"
-                self.status_messages: list[str] = []
-                self.auto_execution_calls: list[int] = []
-
-            def isVisible(self) -> bool:
-                return True
-
-            def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
-                return True
-
-            def current_time_policy_minute_key(self) -> str:
-                return "2026-07-16 09:01"
-
-            def recalculate_all_status_by_operation_policy(self, *_args, **_kwargs) -> dict[str, int]:
-                return {"changed": 0, "failed": 0}
-
-            def capture_stock_table_view_state(self) -> tuple[set[str], int]:
-                return set(), 0
-
-            def refresh_all(self) -> None:
-                return None
-
-            def restore_stock_table_view_state(self, *_args) -> None:
-                return None
-
-            def parent(self) -> Parent:
-                return Parent()
-
-            def current_selected_routine_dir(self) -> Path:
-                return self.routine_dir
-
-            def statusBarMessage(self, message: str) -> None:
-                self.status_messages.append(message)
-
-            def auto_process_executable_orders_for_real_trade(self, *, limit: int = 5) -> dict[str, object]:
-                self.auto_execution_calls.append(limit)
-                return {"processed": 1, "blocked": 0, "results": []}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            routine_dir = Path(tmp) / "routine"
-            stock_dir = routine_dir / "003550_LG"
-            stock_dir.mkdir(parents=True)
-            (stock_dir / "config.json").write_text("{}", encoding="utf-8")
-            (stock_dir / "state.json").write_text(
-                json.dumps(
-                    {
-                        "status": "RUNNING",
-                        "trade_enabled": True,
-                        "signal_probe_only": False,
-                        "review_required": False,
-                        "ignore_signals_before": "2026-08-26 09:30:00",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            window = TimerWindow(routine_dir)
-            attach_participant_owner(window, {"003550"})
-            consumer = Mock(return_value={"summary": {"signals_checked": 1, "orders_created": 1}})
-
-            with patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
-                self.assertTrue(auto_trade_real_execution_active(window))
-            with patch.object(gui_auto_trade_timer, "probe_all_enabled_routine_stocks_once", return_value={"logged": 0, "error": 0}), patch.object(
-                gui_auto_trade_timer,
-                "consume_pending_routine_signals_dry_run",
-                consumer,
-            ), patch.object(
-                gui_auto_trade_timer,
-                "auto_trade_continue_pending_close_liquidations",
-                return_value={"processed": 0, "blocked": 0},
-            ), patch.object(
-                gui_auto_trade_timer,
-                "auto_trade_continue_pending_manual_ats_liquidations",
-                return_value={"processed": 0, "failed": 0},
-            ), patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
-                auto_trade_run_operation_cycle(window)
-
-            consumer.assert_called_once_with(
-                limit=5,
-                mark_previewed=True,
-                write_order_queue=True,
-                apply_approval=True,
-                allowed_stock_codes=("003550",),
-                signal_cutoff_by_stock_code={
-                    "003550": "2026-08-26 09:30:00"
-                },
-            )
-            self.assertEqual([5], window.auto_execution_calls)
+        result = run_assigned_routine_timer_fixture(self, code="003550")
+        self.assertIn("lifecycle", result)
 
     def test_real_auto_trade_consumer_stays_blocked_without_trade_enabled(self) -> None:
         class Window:
