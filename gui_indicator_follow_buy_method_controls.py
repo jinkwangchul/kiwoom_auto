@@ -988,30 +988,13 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_situation_response_compare_combo = price_one_compare
         self.buy_situation_response_action_combo = price_one_action
 
-        mutual_update = {"active": False}
-
         def update_unfilled(*_args):
-            if mutual_update["active"]:
-                return
-            if unfilled_enabled_check.isChecked() and price_enabled_check.isChecked():
-                mutual_update["active"] = True
-                price_enabled_check.setChecked(False)
-                mutual_update["active"] = False
             enabled = unfilled_enabled_check.isChecked()
             for widget in (unfilled_scope_combo, unfilled_time_line, unfilled_unit_combo):
                 widget.setEnabled(enabled)
             unfilled_order_cancel_label.setEnabled(enabled)
-            update_price_one()
-            update_price_two()
 
         def update_price(*_args):
-            if mutual_update["active"]:
-                return
-            if price_enabled_check.isChecked() and unfilled_enabled_check.isChecked():
-                mutual_update["active"] = True
-                unfilled_enabled_check.setChecked(False)
-                mutual_update["active"] = False
-            update_unfilled()
             update_price_one()
             update_price_two()
 

@@ -210,16 +210,6 @@ def validate_committed_rules(
     response_path = "buy.execution.base.buy_price_response_policies"
     if _path_exists(post_rules, response_path):
         policies = _get_path(post_rules, response_path)
-        base_policy = _get_path(post_rules, "buy.execution.base") if _path_exists(
-            post_rules, "buy.execution.base"
-        ) else {}
-        unfilled_policy = base_policy.get("unfilled_timeout_policy") if isinstance(base_policy, dict) else None
-        situation_modes_exclusive = not (
-            isinstance(unfilled_policy, dict)
-            and unfilled_policy.get("enabled") is True
-            and isinstance(policies, list)
-            and bool(policies)
-        )
         valid = isinstance(policies, list) and all(
             isinstance(item, dict)
             and item.get("slot") in {"SETTING1", "SETTING2"}
@@ -235,7 +225,6 @@ def validate_committed_rules(
             and item.get("threshold_percent") > 0
             for item in policies
         )
-        valid = valid and situation_modes_exclusive
         if isinstance(policies, list) and len(policies) == 2:
             up, down = policies
             same_basis = (
@@ -258,7 +247,6 @@ def validate_committed_rules(
             if not disjoint and up.get("action") != down.get("action"):
                 valid = False
         add_check("buy_price_response_slots_valid", valid)
-        add_check("buy_situation_response_modes_exclusive", situation_modes_exclusive)
         if not valid:
             add_unexpected(response_path, "conflicting or invalid BUY price response slots")
     exit_path = "buy.execution.base.buy_exit_policy"

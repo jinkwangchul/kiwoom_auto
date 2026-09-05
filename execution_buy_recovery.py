@@ -118,8 +118,8 @@ def _recovery_template(template: dict[str, Any], quantity: int, signal: dict[str
     value["price_basis"] = order.get("order_price_basis")
     value["order_price_basis"] = order.get("order_price_basis")
     # Situation Response owns both the base flow and every Recovery generation.
-    # Recovery only redistributes the confirmed residual; it must not invent a
-    # second, mutually-exclusive timeout/price-response authority.
+    # Recovery only redistributes the confirmed residual; it preserves the
+    # independently enabled timeout and price-response policies.
     if unfilled.get("enabled") is True:
         configured_value = unfilled.get("configured_value")
         configured_unit = _text(unfilled.get("configured_unit")).upper()

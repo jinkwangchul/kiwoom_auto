@@ -2443,15 +2443,8 @@ def build_engine_rules_preview_from_ui_state(
         situation,
         validation_warnings,
     )
-    situation_mode_conflict = (
-        _truthy_ui(situation.get("unfilled_enabled_check"))
-        and _truthy_ui(situation.get("price_enabled_check"))
-    )
-    if situation_mode_conflict:
-        validation_warnings.append("buy situation unfilled and price response are mutually exclusive")
     invalid_price_reset_pair = (
-        situation_mode_conflict
-        or (_truthy_ui(situation.get("price_enabled_check")) and not price_response_valid)
+        _truthy_ui(situation.get("price_enabled_check")) and not price_response_valid
     )
     if invalid_price_reset_pair:
         buy_execution_base_candidate = None

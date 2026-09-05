@@ -84,7 +84,7 @@ from routine_instance_registry import (
 
 
 def normalize_buy_situation_ui_state(value):
-    """Normalize legacy Situation Response state into the current exclusive UI."""
+    """Normalize legacy Situation Response state into independent controls."""
     state = deepcopy(value) if isinstance(value, dict) else {}
     has_new_slots = any(str(key).startswith(("setting1_", "setting2_")) for key in state)
     if not has_new_slots and "type_combo" in state:
@@ -108,12 +108,6 @@ def normalize_buy_situation_ui_state(value):
             state["setting2_left_combo"] = "무설정"
         elif state.get("setting2_enabled_check") is True and state.get("setting2_left_combo") in {None, "", "무설정"}:
             state["setting2_left_combo"] = "주문가"
-    # The two top-level Situation Response modes are mutually exclusive. A
-    # legacy state that contains both is displayed fail-closed with neither
-    # mode selected; the user must explicitly choose one before applying.
-    if state.get("unfilled_enabled_check") is True and state.get("price_enabled_check") is True:
-        state["unfilled_enabled_check"] = False
-        state["price_enabled_check"] = False
     for key in (
         "left_combo", "right_combo", "direction_combo", "ratio_line",
         "compare_combo", "action_combo", "detail_stack", "type_combo",

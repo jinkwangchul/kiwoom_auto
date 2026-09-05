@@ -73,7 +73,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
             },
         )
 
-    def test_unfilled_and_price_are_exclusive_and_two_price_rows_round_trip(self) -> None:
+    def test_unfilled_and_price_are_independent_and_two_price_rows_round_trip(self) -> None:
         self.assertFalse(hasattr(self.dialog, "buy_situation_response_type_combo"))
         self.dialog.buy_situation_response_unfilled_enabled_check.setChecked(False)
         self.dialog.buy_situation_response_price_enabled_check.setChecked(False)
@@ -92,7 +92,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
         self.assertFalse(self.dialog.buy_situation_response_price_enabled_check.isChecked())
 
         self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
-        self.assertFalse(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
+        self.assertTrue(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
         self.assertTrue(self.dialog.buy_situation_response_price_enabled_check.isChecked())
         self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
         self.assertTrue(self.dialog.buy_situation_response_setting2_enabled_check.isChecked())
@@ -111,7 +111,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
         self.assertFalse(applied["sync_errors"])
         actual = self._state()["buy_ui"]["situation"]
         self.assertEqual(expected, actual)
-        self.assertFalse(actual["unfilled_enabled_check"])
+        self.assertTrue(actual["unfilled_enabled_check"])
         self.assertTrue(actual["price_enabled_check"])
         self.assertTrue(actual["setting1_enabled_check"])
         self.assertTrue(actual["setting2_enabled_check"])
@@ -142,7 +142,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
         self.assertTrue(all("background-color" not in combo.styleSheet() for combo in placeholder_combos))
         self.assertNotIn("background-color", placeholder_lines[0].styleSheet())
 
-    def test_legacy_both_situation_modes_apply_fail_closed(self) -> None:
+    def test_explicit_both_situation_modes_apply_preserves_both(self) -> None:
         applied = self.dialog.apply_indicator_follow_ui_state({
             "buy_ui": {
                 "situation": {
@@ -156,10 +156,10 @@ class SituationAndExitUiContractTest(unittest.TestCase):
 
         self.assertFalse(applied["sync_errors"])
         actual = self._state()["buy_ui"]["situation"]
-        self.assertFalse(actual["unfilled_enabled_check"])
-        self.assertFalse(actual["price_enabled_check"])
+        self.assertTrue(actual["unfilled_enabled_check"])
+        self.assertTrue(actual["price_enabled_check"])
 
-    def test_raw_both_situation_modes_are_rejected_before_candidate(self) -> None:
+    def test_raw_both_situation_modes_are_preserved_in_candidate(self) -> None:
         state = self._state()
         situation = state["buy_ui"]["situation"]
         situation.update({
@@ -174,11 +174,11 @@ class SituationAndExitUiContractTest(unittest.TestCase):
         execution = preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"].get(
             "execution", {}
         )
-        self.assertNotIn("base", execution)
-        self.assertIn(
-            "buy situation unfilled and price response are mutually exclusive",
-            preview["validation_warnings"],
-        )
+        base = execution["base"]["value"]
+        self.assertTrue(base["unfilled_timeout_policy"]["enabled"])
+        self.assertEqual("EACH", base["unfilled_timeout_policy"]["scope"])
+        self.assertEqual("CANCEL_BATCH", base["buy_price_response_policies"][0]["action"])
+        self.assertNotIn("mutually exclusive", " ".join(preview["validation_warnings"]))
 
     def test_conflicting_price_slots_are_rejected_before_candidate(self) -> None:
         state = self._state()
