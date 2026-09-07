@@ -17,11 +17,14 @@ from mock_validation_contract import (
     MOCK_CURRENT_INDEX_SCHEMA_VERSION,
     MOCK_EVENT_SCHEMA_VERSION,
     MOCK_HISTORY_SCHEMA_VERSION,
+    MOCK_SETTINGS_SCHEMA_VERSION,
     MockValidationError,
     canonical_json_bytes,
     clean_text,
+    default_mock_settings_document,
     normalized_stock_code,
     payload_hash,
+    validate_mock_settings_document,
     validate_session_document,
 )
 
@@ -202,6 +205,57 @@ class MockValidationRepository:
             for _stock_code, session_id in sorted(self.current_session_ids().items())
         )
 
+    def read_settings(self) -> dict[str, Any]:
+        document = self.read_object(
+            "settings.json",
+            default=default_mock_settings_document(),
+        )
+        return validate_mock_settings_document(document)
+
+    def write_settings(
+        self,
+        *,
+        mock_tax_enabled: bool,
+        mock_tax_rate: int | float,
+        expected_revision: int | None = None,
+        updated_at: str = "",
+    ) -> dict[str, Any]:
+        with self._lock:
+            before = self.read_settings()
+            revision = int(before["revision"])
+            if expected_revision is not None and revision != expected_revision:
+                raise MockValidationError("MOCK_SETTINGS_REVISION_CONFLICT")
+            candidate = {
+                "schema_version": MOCK_SETTINGS_SCHEMA_VERSION,
+                "revision": revision + 1,
+                "mock_tax_enabled": mock_tax_enabled,
+                "mock_tax_rate": mock_tax_rate,
+            }
+            if clean_text(updated_at):
+                candidate["updated_at"] = clean_text(updated_at)
+            checked = validate_mock_settings_document(candidate)
+            if (
+                self._target("settings.json").is_file()
+                and before["mock_tax_enabled"] == checked["mock_tax_enabled"]
+                and before["mock_tax_rate"] == checked["mock_tax_rate"]
+            ):
+                return {
+                    "changed": False,
+                    "document": before,
+                    "revision": revision,
+                }
+            write = self._atomic_write(
+                "settings.json",
+                checked,
+                validator=validate_mock_settings_document,
+            )
+            return {
+                "changed": True,
+                "document": checked,
+                "revision": checked["revision"],
+                "write": write,
+            }
+
     def _write_current_index(self, stock_code: str, session_id: str | None) -> None:
         relative = Path("runtime") / "current_sessions.json"
         index = self.read_object(
@@ -365,6 +419,58 @@ class MockValidationRepository:
         if supplied != payload_hash(check):
             raise MockValidationError("MOCK_HISTORY_HASH_MISMATCH")
         return history
+
+    def purge_ended_session_lifecycle(
+        self,
+        session_id: str,
+        *,
+        stock_code: str,
+    ) -> dict[str, Any]:
+        """Remove one completed Mock registration lifecycle after index removal.
+
+        Event evidence is deleted last.  Therefore a failure cannot leave a
+        still-current registration with its journal already removed, and a
+        failed physical purge retains the journal needed to diagnose it.
+        """
+
+        clean_session_id = clean_text(session_id)
+        clean_stock_code = normalized_stock_code(stock_code)
+        session_relative = self._session_relative(clean_session_id)
+        history_relative = Path("history") / f"{clean_session_id}.json"
+        events_relative = Path("events") / f"{clean_session_id}.json"
+        with self._lock:
+            document = self.read_session(clean_session_id)
+            session = document["session"]
+            if session["stock_code"] != clean_stock_code:
+                raise MockValidationError("MOCK_PURGE_STOCK_IDENTITY_MISMATCH")
+            if session["state"] != "ENDED":
+                raise MockValidationError("MOCK_PURGE_REQUIRES_ENDED_SESSION")
+            if self.current_session_id(clean_stock_code) == clean_session_id:
+                raise MockValidationError("MOCK_PURGE_REQUIRES_INDEX_REMOVAL")
+
+            history = self.read_history(clean_session_id)
+            if (
+                history.get("validation_session_id") != clean_session_id
+                or history.get("session_document", {}).get("session", {}).get("stock_code")
+                != clean_stock_code
+            ):
+                raise MockValidationError("MOCK_PURGE_HISTORY_IDENTITY_MISMATCH")
+            self.read_events(clean_session_id)
+
+            removed: list[str] = []
+            # Keep the event journal until every non-event lifecycle artifact
+            # has been removed successfully.
+            for relative in (session_relative, history_relative, events_relative):
+                target = self._target(relative)
+                if target.exists():
+                    target.unlink()
+                    removed.append(str(relative).replace("\\", "/"))
+            return {
+                "validation_session_id": clean_session_id,
+                "stock_code": clean_stock_code,
+                "removed": tuple(removed),
+                "events_remaining": len(self.read_events(clean_session_id)),
+            }
 
 
 __all__ = ["DEFAULT_MOCK_VALIDATION_ROOT", "MockValidationRepository"]

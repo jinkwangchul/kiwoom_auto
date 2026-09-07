@@ -38,10 +38,8 @@ from gui_ats_utils import (
     auto_trade_operation_session_phase,
     auto_trade_setting_regular_market_active_now,
     manual_ats_active_now,
-    manual_ats_execution_method_label,
     manual_ats_enabled_labels,
 )
-from manual_ats_runtime import manual_ats_runtime_execution_method_result
 from stock_code_contract import normalize_stock_code
 from gui_window_policy import persistent_feature_owner
 from operation_command_service import (
@@ -532,12 +530,6 @@ def auto_trade_setting_row_projection(
         and normal_operation
         and activation_phase.get("ats_session_active") is True
     )
-    if ats_method_active:
-        method_result = manual_ats_runtime_execution_method_result(runtime_state)
-        if method_result.get("ok") is True:
-            method_text = manual_ats_execution_method_label(
-                method_result.get("execution_method")
-            ) or "루틴"
     liquidation_text = auto_trade_setting_liquidation_text(
         stock_config,
         display_status,

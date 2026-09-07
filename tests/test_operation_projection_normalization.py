@@ -880,8 +880,8 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
         state = self._state(sessions=("extra1",), method="MARKET")
         cases = (
             (datetime(2026, 8, 27, 7, 59, 59), "PRE_OPERATION_BOUNDARY", "감시/대기", "루틴", False),
-            (datetime(2026, 8, 27, 8, 0, 0), "ACTIVE_SESSION", "매수/매도", "시장가", True),
-            (datetime(2026, 8, 27, 8, 49, 59), "ACTIVE_SESSION", "매수/매도", "시장가", True),
+            (datetime(2026, 8, 27, 8, 0, 0), "ACTIVE_SESSION", "매수/매도", "루틴", True),
+            (datetime(2026, 8, 27, 8, 49, 59), "ACTIVE_SESSION", "매수/매도", "루틴", True),
             (datetime(2026, 8, 27, 8, 50, 0), "PRE_OPERATION_BOUNDARY", "감시/대기", "루틴", False),
             (datetime(2026, 8, 27, 8, 59, 59), "PRE_OPERATION_BOUNDARY", "감시/대기", "루틴", False),
             (datetime(2026, 8, 27, 9, 0, 0), "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY", "감시/대기", "루틴", True),
@@ -910,7 +910,7 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
             (datetime(2026, 8, 27, 15, 19, 59), "ACTIVE_SESSION", "매수/매도", "루틴", True),
             (datetime(2026, 8, 27, 15, 20, 0), "INTER_SESSION_NON_TRADING_GAP", "감시/대기", "루틴", False),
             (datetime(2026, 8, 27, 15, 39, 59), "INTER_SESSION_NON_TRADING_GAP", "감시/대기", "루틴", False),
-            (datetime(2026, 8, 27, 15, 40, 0), "ACTIVE_SESSION", "매수/매도", "현재가", True),
+            (datetime(2026, 8, 27, 15, 40, 0), "ACTIVE_SESSION", "매수/매도", "루틴", True),
             (datetime(2026, 8, 27, 19, 50, 0), "FINAL_END", "감시/대기", "루틴", False),
         )
         for now_dt, phase, status, method, method_active in cases:
@@ -920,20 +920,22 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
                 self.assertEqual(status, row["display_status"])
                 self.assertEqual(method, row["method_text"])
                 self.assertIs(row["method_cell_active"], method_active)
-                if method in {"시장가", "현재가"}:
-                    self.assertEqual("-", row["liquidation_text"])
+                self.assertEqual(
+                    (
+                        "-"
+                        if now_dt.hour == 15 and now_dt.minute == 40
+                        else "5분/시장가"
+                    ),
+                    row["liquidation_text"],
+                )
 
-    def test_multiple_ats_sessions_and_all_execution_methods(self) -> None:
+    def test_multiple_ats_sessions_ignore_legacy_execution_method(self) -> None:
         config = {
             "operation_mode": "CONTINUOUS",
             "start_time": "09:30:00",
             "end_buy_time": "13:30:00",
         }
-        for method, expected in (
-            ("ROUTINE", "루틴"),
-            ("MARKET", "시장가"),
-            ("CURRENT_PRICE", "현재가"),
-        ):
+        for method in ("ROUTINE", "MARKET", "CURRENT_PRICE"):
             state = self._state(sessions=("extra1", "extra2"), method=method)
             for now_dt in (
                 datetime(2026, 8, 27, 8, 10),
@@ -942,7 +944,7 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
                 with self.subTest(method=method, now=now_dt.time()):
                     row = self._row(config, state, now_dt)
                     self.assertEqual("ACTIVE_SESSION", row["projection_phase"])
-                    self.assertEqual(expected, row["method_text"])
+                    self.assertEqual("루틴", row["method_text"])
                     self.assertIs(row["method_cell_active"], True)
                     self.assertEqual("-", row["liquidation_text"])
 

@@ -178,8 +178,6 @@ class StockContextMenuCallbacks:
     time_reset: Callable[[], None] | None = None
     ats_state: Callable[[], dict[str, bool]] | None = None
     ats_toggle: Callable[[str, bool, str], None] | None = None
-    ats_execution_method_state: Callable[[], dict[str, object]] | None = None
-    ats_execution_method_set: Callable[[str, str], None] | None = None
     ats_liquidation_available: Callable[[], bool] | None = None
     ats_liquidation: Callable[
         [str, dict[str, bool], tuple[str, ...], tuple[str, ...]],
@@ -830,6 +828,7 @@ def _add_ats_settings_menu(
     execution_method_state_getter: Callable[[], dict[str, object]] | None = None,
     execution_method_setter: Callable[[str, str], None] | None = None,
     liquidation_available_getter: Callable[[], bool] | None = None,
+    include_execution_method: bool = True,
 ):
     visible_keys = manual_ats_visible_session_keys()
     labels = manual_ats_session_labels()
@@ -848,31 +847,36 @@ def _add_ats_settings_menu(
         action.setProperty("atsSessionKey", key)
         session_actions.append((key, label, action))
 
-    ats_menu.addSeparator()
-    method_menu = ats_menu.addMenu("주문방식")
-    method_state_value = (
-        execution_method_state_getter()
-        if execution_method_state_getter is not None
-        else {"ok": True, "execution_method": "ROUTINE", "mixed": False}
-    )
-    method_state = dict(method_state_value) if isinstance(method_state_value, dict) else {}
-    current_method = str(method_state.get("execution_method") or "").strip().upper()
+    method_menu = None
+    method_state: dict[str, object] = {}
     method_actions: list[tuple[str, str, object]] = []
-    for method_key, method_label in (
-        ("ROUTINE", "루틴"),
-        ("MARKET", "시장가"),
-        ("CURRENT_PRICE", "현재가"),
-    ):
-        action = method_menu.addAction(method_label)
-        selected = method_state.get("ok") is True and current_method == method_key
-        action.setIcon(_menu_status_icon(selected))
-        action.setProperty("atsExecutionMethod", method_key)
-        action.setProperty("atsExecutionMethodCurrent", selected)
-        method_actions.append((method_key, method_label, action))
-    if method_state.get("ok") is not True:
-        set_tool_tip = getattr(method_menu, "setToolTip", None)
-        if callable(set_tool_tip):
-            set_tool_tip("저장된 주문방식을 확인할 수 없습니다.")
+    if include_execution_method:
+        ats_menu.addSeparator()
+        method_menu = ats_menu.addMenu("주문방식")
+        method_state_value = (
+            execution_method_state_getter()
+            if execution_method_state_getter is not None
+            else {"ok": True, "execution_method": "ROUTINE", "mixed": False}
+        )
+        method_state = (
+            dict(method_state_value) if isinstance(method_state_value, dict) else {}
+        )
+        current_method = str(method_state.get("execution_method") or "").strip().upper()
+        for method_key, method_label in (
+            ("ROUTINE", "루틴"),
+            ("MARKET", "시장가"),
+            ("CURRENT_PRICE", "현재가"),
+        ):
+            action = method_menu.addAction(method_label)
+            selected = method_state.get("ok") is True and current_method == method_key
+            action.setIcon(_menu_status_icon(selected))
+            action.setProperty("atsExecutionMethod", method_key)
+            action.setProperty("atsExecutionMethodCurrent", selected)
+            method_actions.append((method_key, method_label, action))
+        if method_state.get("ok") is not True:
+            set_tool_tip = getattr(method_menu, "setToolTip", None)
+            if callable(set_tool_tip):
+                set_tool_tip("저장된 주문방식을 확인할 수 없습니다.")
 
     ats_menu.addSeparator()
     action_market = ats_menu.addAction("시장가")
@@ -1004,53 +1008,157 @@ def show_monitor_stock_context_menu(
         if isinstance(projected, dict):
             mock_context = projected
     if mock_context.get("current") is True:
-        mock_menu = menu.addMenu("모의검증")
-        action_mock_start = mock_menu.addAction("운영시작")
-        action_mock_early = mock_menu.addAction("조기마감")
-        action_mock_immediate = mock_menu.addAction("즉시청산")
-        mock_menu.addSeparator()
-        action_mock_tax = mock_menu.addAction("모의세금 0.20%")
-        action_mock_tax.setCheckable(True)
-        action_mock_tax.setChecked(bool(mock_context.get("tax_enabled") is True))
-        action_mock_event = mock_menu.addAction("모의 이벤트")
-        action_mock_review = mock_menu.addAction("모의검토관리")
-        action_mock_reset = mock_menu.addAction("종목리셋")
-        mock_menu.addSeparator()
-        action_mock_return = mock_menu.addAction("모의검증 종료/복귀")
+        action_mock_start = menu.addAction("운영시작")
         action_mock_start.setEnabled(bool(mock_context.get("can_start")))
-        action_mock_early.setEnabled(bool(mock_context.get("can_early_close")))
-        action_mock_immediate.setEnabled(bool(mock_context.get("can_immediate")))
-        action_mock_tax.setEnabled(bool(mock_context.get("can_tax")))
+        menu.addSeparator()
+        action_select_all = menu.addAction("전체선택")
+        action_clear_selection = menu.addAction("선택해제")
+
+        menu.addSeparator()
+        early_close = _add_early_close_menu(
+            menu,
+            has_selection=has_selection,
+            operation_policy={},
+        )
+        can_early_close = bool(mock_context.get("can_early_close"))
+        early_close["menu"].setEnabled(can_early_close)
+        for key in ("market", "current", "carry"):
+            early_close[key].setEnabled(can_early_close)
+        for key in ("routine", "profit_loss", "cancel"):
+            early_close[key].setEnabled(False)
+
+        individual = _add_individual_liquidation_menu(
+            menu,
+            has_selection=has_selection,
+            operation_policy={},
+        )
+        can_immediate = bool(mock_context.get("can_immediate"))
+        individual["menu"].setEnabled(can_immediate)
+        individual["market"].setEnabled(can_immediate)
+        individual["current"].setEnabled(can_immediate)
+        individual["carry"].setEnabled(False)
+        individual["time_menu"].setEnabled(False)
+
+        menu.addSeparator()
+        action_mock_register = menu.addAction("종목등록")
+        action_mock_unregister = menu.addAction("등록해제")
+        action_mock_register.setEnabled(callbacks.mock_create is not None)
+        action_mock_unregister.setEnabled(bool(mock_context.get("can_unregister")))
+
+        action_open_charts = None
+        if callbacks.open_charts is not None:
+            menu.addSeparator()
+            action_open_charts = menu.addAction("간이차트")
+            action_open_charts.setEnabled(has_selection)
+
+        menu.addSeparator()
+        action_mock_reset = menu.addAction("종목리셋")
         action_mock_reset.setEnabled(bool(mock_context.get("can_reset")))
-        action_mock_return.setEnabled(bool(mock_context.get("can_return")))
         menu._mock_validation_actions = {
             "start": action_mock_start,
-            "early_close": action_mock_early,
-            "immediate_liquidation": action_mock_immediate,
-            "tax": action_mock_tax,
-            "event": action_mock_event,
-            "review": action_mock_review,
+            "select_all": action_select_all,
+            "clear_selection": action_clear_selection,
+            "early_close": early_close,
+            "individual_liquidation": individual,
+            "register": action_mock_register,
+            "unregister": action_mock_unregister,
+            "chart": action_open_charts,
             "reset": action_mock_reset,
-            "return": action_mock_return,
         }
+        registrar = getattr(menu, "register_persistent_action", None)
+        if callable(registrar):
+            def refresh_mock_actions() -> None:
+                try:
+                    refreshed = callbacks.mock_actions()
+                except Exception:
+                    refreshed = {}
+                if not isinstance(refreshed, dict) or refreshed.get("current") is not True:
+                    menu.invalidate_persistent_context()
+                    return
+                mock_context.clear()
+                mock_context.update(refreshed)
+                action_mock_start.setEnabled(bool(refreshed.get("can_start")))
+                refreshed_early = bool(refreshed.get("can_early_close"))
+                early_close["menu"].setEnabled(refreshed_early)
+                for key in ("market", "current", "carry"):
+                    early_close[key].setEnabled(refreshed_early)
+                refreshed_immediate = bool(refreshed.get("can_immediate"))
+                individual["menu"].setEnabled(refreshed_immediate)
+                individual["market"].setEnabled(refreshed_immediate)
+                individual["current"].setEnabled(refreshed_immediate)
+                action_mock_reset.setEnabled(bool(refreshed.get("can_reset")))
+                action_mock_unregister.setEnabled(bool(refreshed.get("can_unregister")))
+
+            def run_mock_action(key: str, *args) -> None:
+                callback = mock_context.get(key)
+                if callable(callback):
+                    callback(*args)
+                refresh_mock_actions()
+
+            registrar(action_mock_start, lambda: run_mock_action("start"))
+            registrar(action_mock_reset, lambda: run_mock_action("reset"))
+            if action_open_charts is not None:
+                registrar(action_open_charts, callbacks.open_charts)
+            for key, method in (
+                ("market", "시장가즉시"),
+                ("current", "현재가즉시"),
+                ("carry", "이월"),
+            ):
+                registrar(
+                    early_close[key],
+                    lambda method=method: run_mock_action("early_close", method),
+                )
+            for key, method in (("market", "시장가"), ("current", "현재가")):
+                registrar(
+                    individual[key],
+                    lambda method=method: run_mock_action(
+                        "immediate_liquidation",
+                        method,
+                        "",
+                    ),
+                )
+            registrar(action_select_all, callbacks.select_all, terminal=True)
+            registrar(action_clear_selection, callbacks.clear_selection, terminal=True)
+            registrar(action_mock_register, callbacks.mock_create, terminal=True)
+            registrar(
+                action_mock_unregister,
+                lambda: run_mock_action("unregister"),
+                terminal=True,
+            )
         chosen = menu.exec_(global_pos)
+        if callable(registrar):
+            return
         dispatch = {
             action_mock_start: mock_context.get("start"),
-            action_mock_early: mock_context.get("early_close"),
-            action_mock_immediate: mock_context.get("immediate_liquidation"),
-            action_mock_event: mock_context.get("event"),
-            action_mock_review: mock_context.get("review"),
             action_mock_reset: mock_context.get("reset"),
-            action_mock_return: mock_context.get("return"),
+            action_mock_unregister: mock_context.get("unregister"),
+            action_select_all: callbacks.select_all,
+            action_clear_selection: callbacks.clear_selection,
+            action_mock_register: callbacks.mock_create,
+            action_open_charts: callbacks.open_charts,
         }
-        if chosen == action_mock_tax and action_mock_tax.isEnabled():
-            callback = mock_context.get("set_tax")
-            if callable(callback):
-                callback(action_mock_tax.isChecked())
-            return
         callback = dispatch.get(chosen)
         if callable(callback) and chosen is not None and chosen.isEnabled():
             callback()
+            return
+        early_methods = {
+            early_close["market"]: "시장가즉시",
+            early_close["current"]: "현재가즉시",
+            early_close["carry"]: "이월",
+        }
+        if chosen in early_methods and chosen.isEnabled():
+            callback = mock_context.get("early_close")
+            if callable(callback):
+                callback(early_methods[chosen])
+            return
+        immediate_methods = {
+            individual["market"]: "시장가",
+            individual["current"]: "현재가",
+        }
+        if chosen in immediate_methods and chosen.isEnabled():
+            callback = mock_context.get("immediate_liquidation")
+            if callable(callback):
+                callback(immediate_methods[chosen], "")
         return
     operation_policy = _context_menu_operation_policy()
     targets = list(selected_targets or [])
@@ -1131,9 +1239,8 @@ def show_monitor_stock_context_menu(
             has_selection=has_selection,
             state_getter=callbacks.ats_state,
             toggle=callbacks.ats_toggle,
-            execution_method_state_getter=callbacks.ats_execution_method_state,
-            execution_method_setter=callbacks.ats_execution_method_set,
             liquidation_available_getter=callbacks.ats_liquidation_available,
+            include_execution_method=False,
         )
         ats_settings["menu"].setEnabled(
             availability.ats_settings_allowed
@@ -1499,12 +1606,6 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         time_reset=window_callback("reset_selected_schedule_to_global"),
         ats_state=lambda: window_callback("selected_manual_ats_state")(selected),
         ats_toggle=window_callback("set_selected_manual_ats_flag"),
-        ats_execution_method_state=lambda: window_callback(
-            "selected_manual_ats_execution_method_state"
-        )(selected),
-        ats_execution_method_set=lambda method, label: window_callback(
-            "set_selected_manual_ats_execution_method"
-        )(method, label, selected),
         ats_liquidation_available=lambda: (
             window_callback("selected_manual_ats_liquidation_available")(selected)
         ),

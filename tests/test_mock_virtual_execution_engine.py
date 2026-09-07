@@ -304,12 +304,66 @@ class MockVirtualExecutionEngineTest(unittest.TestCase):
         policy = MockExecutionPolicy(1, "LOGIN-1", 2, 2, commission_rate=0.001)
         result = self.submit(side="SELL", qty=5, book=_book(bids=((100, 5),)), policy=policy)
         pnl = next(v for v in result["document"]["pnl"] if v["routine_instance_id"] == "A")
-        self.assertEqual((50, 0.5, 1, 48.5), (pnl["realized_pnl"], pnl["commission"], pnl["mock_tax"], pnl["net_pnl"]))
+        self.assertEqual(
+            (50, 50, 0.5, 1, 98.5),
+            (pnl["realized_pnl"], pnl["unrealized_pnl"], pnl["commission"], pnl["mock_tax"], pnl["net_pnl"]),
+        )
+
+    def test_sell_loss_is_valid_signed_realized_pnl(self):
+        self.seed_position(qty=10, average=110)
+        result = self.submit(side="SELL", qty=5, book=_book(bids=((100, 5),)))
+        pnl = next(v for v in result["document"]["pnl"] if v["routine_instance_id"] == "A")
+        self.assertEqual(
+            (-50, -50, 0, 1, -101),
+            (pnl["realized_pnl"], pnl["unrealized_pnl"], pnl["commission"], pnl["mock_tax"], pnl["net_pnl"]),
+        )
+
+    def test_mark_to_market_tracks_signed_unrealized_pnl_idempotently(self):
+        self.seed_position(qty=2, average=100)
+        marked = self.engine.mark_to_market(
+            SESSION_ID, "A", current_price=90, market_identity="MMK-LOSS",
+            command_id="MC-mark-loss",
+        )
+        replay = self.engine.mark_to_market(
+            SESSION_ID, "A", current_price=90, market_identity="MMK-LOSS",
+            command_id="MC-mark-loss",
+        )
+        pnl = next(v for v in marked["document"]["pnl"] if v["routine_instance_id"] == "A")
+        self.assertEqual((-20, -20, -20), (pnl["unrealized_pnl"], pnl["gross_pnl"], pnl["net_pnl"]))
+        self.assertEqual("MMK-LOSS", pnl["market_identity"])
+        self.assertTrue(replay["duplicate"])
+
+    def test_realized_loss_and_costs_reduce_later_buy_cash_capacity(self):
+        self.submit(qty=10, book=_book(asks=((100, 10),)), budget=1_000, command="MC-cash-buy")
+        self.submit(
+            side="SELL", qty=10, book=_book(bids=((90, 10),), sequence=2),
+            budget=1_000, command="MC-cash-sell",
+        )
+        blocked = self.submit(
+            kind="LIMIT", qty=10, price=100,
+            book=_book(asks=((110, 100),), sequence=3),
+            budget=1_000, command="MC-cash-over",
+        )
+        accepted = self.submit(
+            kind="LIMIT", qty=8, price=100,
+            book=_book(asks=((110, 100),), sequence=4),
+            budget=1_000, command="MC-cash-within",
+        )
+        self.assertEqual((RESULT_BLOCKED, "MOCK_EXECUTION_BUDGET_EXCEEDED"), (blocked["status"], blocked["reason"]))
+        self.assertEqual(RESULT_ACCEPTED, accepted["status"])
 
     def test_tax_disabled(self):
         disabled_id = "MV-00000000000000000000000000000302"
         self.service.end_stock_session(SESSION_ID, command_id="MC-end")
-        self.service.create_stock_session(reference_snapshot=_reference(), validation_session_id=disabled_id, command_id="MC-create-2", mock_tax_enabled=False)
+        self.repository.write_settings(
+            mock_tax_enabled=False,
+            mock_tax_rate=0.002,
+        )
+        self.service.create_stock_session(
+            reference_snapshot=_reference(),
+            validation_session_id=disabled_id,
+            command_id="MC-create-2",
+        )
         self.service.start_stock_mock_session(disabled_id, command_id="MC-start-2")
         self.service.set_instance_position(disabled_id, "A", holding_qty=1, available_qty=1, average_price=90, realized_cost_basis=90, command_id="MC-pos-2")
         result = self.engine.submit_order(disabled_id, routine_instance_id="A", side="SELL", order_type="MARKET", requested_qty=1, limit_price=None, market=_book(bids=((100, 1),)), policy=self.policy, command_id="MC-sell-2")
@@ -369,14 +423,17 @@ class MockVirtualExecutionEngineTest(unittest.TestCase):
         self.assertIn("VIRTUAL_ORDER_FILLED", event_types)
         self.assertEqual(result["order"]["mock_order_id"], again["order"]["mock_order_id"])
 
-    def test_structural_error_can_stop_stock_session_for_review(self):
+    def test_structural_error_isolates_only_source_instance(self):
         result = self.engine.escalate_structural_review(
             SESSION_ID, routine_instance_id="B", reason_code="MOCK_LEDGER_CORRUPTION",
             reason="ledger conflict", command_id="MC-review",
         )
         self.assertTrue(result["stopped"])
-        self.assertEqual("REVIEW_STOPPED", result["document"]["session"]["state"])
-        self.assertEqual("B", result["document"]["review"]["source_routine_instance_id"])
+        self.assertEqual("RUNNING", result["document"]["session"]["state"])
+        self.assertFalse(result["document"]["review"]["review_required"])
+        self.assertEqual("ERROR", result["document"]["instance_execution"]["B"]["state"])
+        self.assertTrue(result["document"]["instance_execution"]["A"]["progression_allowed"])
+        self.assertTrue(result["document"]["instance_execution"]["C"]["progression_allowed"])
 
     def test_session_not_running_rejects_order(self):
         self.service.reset_stock_session(SESSION_ID, command_id="MC-reset")

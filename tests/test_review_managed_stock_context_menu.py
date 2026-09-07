@@ -160,14 +160,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             time_reset=Mock(),
             ats_state=Mock(return_value={}),
             ats_toggle=Mock(),
-            ats_execution_method_state=Mock(
-                return_value={
-                    "ok": True,
-                    "execution_method": "ROUTINE",
-                    "mixed": False,
-                }
-            ),
-            ats_execution_method_set=Mock(),
             ats_liquidation_available=Mock(return_value=False),
             ats_liquidation=Mock(),
             set_operation_exclusion=Mock(),

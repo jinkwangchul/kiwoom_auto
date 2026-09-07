@@ -41,8 +41,37 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             projection = repository.realtime_monitoring_universe()
 
         self.assertEqual(("005930",), projection.target_stock_codes)
+        self.assertEqual(
+            ("005930", "ABC123"),
+            projection.initial_snapshot_target_stock_codes,
+        )
         self.assertEqual(("ABC123",), projection.unsupported_stock_codes)
         self.assertEqual(3, projection.source_record_count)
+
+    def test_alphanumeric_stock_is_snapshot_target_but_not_realtime_target(self) -> None:
+        repository = StockRepository()
+        codes = ("000080", "0009K0", "005380", "032680")
+        with patch.object(
+            repository,
+            "list_stocks",
+            return_value=[
+                _record(code, instance_id="INSTANCE-1") for code in codes
+            ],
+        ), patch(
+            "stock_repository.load_persisted_routine_instances",
+            return_value=[SimpleNamespace(instance_id="INSTANCE-1")],
+        ):
+            projection = repository.realtime_monitoring_universe()
+
+        self.assertEqual(
+            ("000080", "005380", "032680"),
+            projection.target_stock_codes,
+        )
+        self.assertEqual(
+            ("000080", "0009K0", "005380", "032680"),
+            projection.initial_snapshot_target_stock_codes,
+        )
+        self.assertEqual(("0009K0",), projection.unsupported_stock_codes)
 
     def test_stopped_review_current_assignment_remains_registered(self) -> None:
         repository = StockRepository()
@@ -60,9 +89,15 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
 
     def test_operation_host_entry_is_read_only_thin_projection(self) -> None:
         projection = SimpleNamespace(
-            target_stock_codes=("005930", "006400"),
-            unsupported_stock_codes=("ABC123",),
-            source_record_count=3,
+            target_stock_codes=("000080", "005380", "032680"),
+            initial_snapshot_target_stock_codes=(
+                "000080",
+                "0009K0",
+                "005380",
+                "032680",
+            ),
+            unsupported_stock_codes=("0009K0",),
+            source_record_count=4,
         )
         market = SimpleNamespace(
             sync_monitoring_targets=Mock(
@@ -76,8 +111,18 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             repository_type.return_value.realtime_monitoring_universe.return_value = projection
             result = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
 
-        market.sync_monitoring_targets.assert_called_once_with(("005930", "006400"))
-        self.assertEqual(("ABC123",), result["unsupported_stock_codes"])
+        market.sync_monitoring_targets.assert_called_once_with(
+            ("000080", "0009K0", "005380", "032680")
+        )
+        self.assertEqual(
+            ("000080", "0009K0", "005380", "032680"),
+            result["monitoring_target_stock_codes"],
+        )
+        self.assertEqual(
+            ("000080", "005380", "032680"),
+            result["realtime_target_stock_codes"],
+        )
+        self.assertEqual(("0009K0",), result["unsupported_stock_codes"])
 
 
 class LoginTimeMonitoringIntegrationTests(unittest.TestCase):

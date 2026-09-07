@@ -382,12 +382,20 @@ class AutoTradeOperationHost(QObject):
 
         try:
             projection = StockRepository().realtime_monitoring_universe()
+            initial_snapshot_targets = tuple(
+                getattr(
+                    projection,
+                    "initial_snapshot_target_stock_codes",
+                    projection.target_stock_codes,
+                )
+            )
             result = self._market_data_host.sync_monitoring_targets(
-                projection.target_stock_codes
+                initial_snapshot_targets
             )
             response = dict(result) if isinstance(result, dict) else {}
             response.update(
-                monitoring_target_stock_codes=projection.target_stock_codes,
+                monitoring_target_stock_codes=initial_snapshot_targets,
+                realtime_target_stock_codes=projection.target_stock_codes,
                 unsupported_stock_codes=projection.unsupported_stock_codes,
                 source_record_count=projection.source_record_count,
             )

@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
 
-from mock_validation_contract import MockValidationError
+from mock_validation_contract import (
+    INSTANCE_ERROR,
+    MockValidationError,
+    instance_effective_settings,
+    payload_hash,
+    validate_instance_effective_settings,
+    validate_reference_snapshot,
+)
 from mock_validation_reference_snapshot import build_mock_reference_snapshot
 from mock_validation_repository import MockValidationRepository
 from mock_validation_session_service import MockValidationSessionService
@@ -42,6 +51,19 @@ def _reference() -> dict:
         rules_by_instance_id={value: {"version": 1, "instance": value} for value in ("A", "B", "C")},
         created_at="2026-09-03T08:59:00+09:00",
     )
+
+
+def _display_contract() -> dict:
+    return {
+        "initial_buy": {
+            "mode": "QUANTITY",
+            "badge": "주수",
+            "value": 1,
+            "value_text": "1주",
+        },
+        "operation_schedule": {"display_text": "09:00~13:30"},
+        "liquidation": {"display_text": "5분/시장가"},
+    }
 
 
 def _file_hash(path: Path) -> str | None:
@@ -88,6 +110,391 @@ class MockValidationFoundationTest(unittest.TestCase):
         self.assertTrue(document["session"]["mock_tax_enabled"])
         self.assertEqual(0.002, document["session"]["mock_tax_rate"])
 
+    def test_session_creation_persists_caller_resolved_production_defaults(self) -> None:
+        settings = {
+            instance_id: {
+                "initial_buy": {"mode": "AMOUNT", "value": 765_432},
+                "operation_schedule": {
+                    "start_time": "10:17:00",
+                    "end_buy_time": "14:23:00",
+                },
+                "operation_mode": "CONTINUOUS",
+                "manual_ats": {
+                    "selected_sessions": [],
+                },
+            }
+            for instance_id in ("A", "B", "C")
+        }
+
+        created = self.service.create_stock_session(
+            reference_snapshot=_reference(),
+            effective_settings_by_instance=settings,
+            validation_session_id=self.session_id,
+            command_id="MC-create-provider-defaults",
+        )["document"]
+
+        self.assertEqual(settings, created["effective_settings_by_instance"])
+        self.assertEqual(
+            settings,
+            MockValidationRepository(self.root).read_session(self.session_id)[
+                "effective_settings_by_instance"
+            ],
+        )
+
+    def test_legacy_execution_method_is_preserved_as_storage_evidence_but_ignored(self) -> None:
+        settings = {
+            "initial_buy": {"mode": "QUANTITY", "value": 3},
+            "operation_schedule": {
+                "start_time": "09:00:00",
+                "end_buy_time": "13:30:00",
+            },
+            "operation_mode": "CONTINUOUS",
+            "manual_ats": {
+                "selected_sessions": ["extra1"],
+                "execution_method": "MARKET",
+            },
+        }
+
+        stored = validate_instance_effective_settings(
+            settings,
+            preserve_legacy_representation=True,
+        )
+        effective = validate_instance_effective_settings(settings)
+
+        self.assertEqual("MARKET", stored["manual_ats"]["execution_method"])
+        self.assertNotIn("execution_method", effective["manual_ats"])
+
+    def test_instance_effective_settings_are_mutable_waiting_only_and_restart_safe(self) -> None:
+        created = self.create()["document"]
+        frozen_hash = created["reference_snapshot"]["snapshot_hash"]
+        sibling_before = deepcopy(instance_effective_settings(created, "B"))
+        sibling_state_before = payload_hash(
+            {
+                "settings": sibling_before,
+                "execution": created["instance_execution"]["B"],
+                "position": next(
+                    item for item in created["positions"]
+                    if item["routine_instance_id"] == "B"
+                ),
+                "cycle": created["cycle_state_by_instance"]["B"],
+                "progression": created["progression_by_instance"]["B"],
+            }
+        )
+        changed = self.service.set_instance_effective_settings(
+            self.session_id,
+            routine_instance_id="A",
+            initial_buy={"mode": "AMOUNT", "value": 500_000},
+            operation_schedule={
+                "start_time": "10:15:00",
+                "end_buy_time": "14:05:00",
+            },
+            operation_mode="CONTINUOUS",
+            manual_ats={
+                "selected_sessions": ["extra2"],
+            },
+            command_id="MC-settings-A",
+        )["document"]
+        expected = {
+            "initial_buy": {"mode": "AMOUNT", "value": 500_000},
+            "operation_schedule": {
+                "start_time": "10:15:00",
+                "end_buy_time": "14:05:00",
+            },
+            "operation_mode": "CONTINUOUS",
+            "manual_ats": {
+                "selected_sessions": ["extra2"],
+            },
+        }
+        self.assertEqual(expected, instance_effective_settings(changed, "A"))
+        self.assertEqual(sibling_before, instance_effective_settings(changed, "B"))
+        self.assertEqual(
+            sibling_state_before,
+            payload_hash(
+                {
+                    "settings": instance_effective_settings(changed, "B"),
+                    "execution": changed["instance_execution"]["B"],
+                    "position": next(
+                        item for item in changed["positions"]
+                        if item["routine_instance_id"] == "B"
+                    ),
+                    "cycle": changed["cycle_state_by_instance"]["B"],
+                    "progression": changed["progression_by_instance"]["B"],
+                }
+            ),
+        )
+        self.assertEqual(frozen_hash, changed["reference_snapshot"]["snapshot_hash"])
+
+        restarted = MockValidationRepository(self.root).read_session(self.session_id)
+        self.assertEqual(expected, instance_effective_settings(restarted, "A"))
+        self.service.start_stock_mock_session(self.session_id, command_id="MC-start-settings")
+        with self.assertRaisesRegex(
+            MockValidationError,
+            "MOCK_INSTANCE_SETTINGS_REQUIRE_WAITING",
+        ):
+            self.service.set_instance_effective_settings(
+                self.session_id,
+                routine_instance_id="A",
+                initial_buy={"mode": "QUANTITY", "value": 3},
+                command_id="MC-running-edit",
+            )
+
+    def test_legacy_manual_modes_project_canonically_without_read_backfill(self) -> None:
+        self.create()
+        session_path = self.root / "runtime" / "sessions" / f"{self.session_id}.json"
+        raw = json.loads(session_path.read_text(encoding="utf-8"))
+        for instance_id, legacy_mode in (("A", "MANUAL"), ("B", "MANUAL_ATS")):
+            settings = raw["effective_settings_by_instance"][instance_id]
+            settings["operation_mode"] = legacy_mode
+            settings.pop("manual_ats", None)
+        session_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        before = session_path.read_bytes()
+
+        projected = self.repository.read_session(self.session_id)
+
+        settings_a = instance_effective_settings(projected, "A")
+        settings_b = instance_effective_settings(projected, "B")
+        self.assertEqual("CONTINUOUS", settings_a["operation_mode"])
+        self.assertEqual([], settings_a["manual_ats"]["selected_sessions"])
+        self.assertEqual("CONTINUOUS", settings_b["operation_mode"])
+        self.assertEqual(
+            ["extra1", "extra2", "extra3"],
+            settings_b["manual_ats"]["selected_sessions"],
+        )
+        self.assertEqual(before, session_path.read_bytes())
+
+        changed = self.service.set_instance_effective_settings(
+            self.session_id,
+            routine_instance_id="A",
+            initial_buy={"mode": "QUANTITY", "value": 7},
+            command_id="MC-canonicalize-edited-legacy-A",
+        )["document"]
+        self.assertEqual("CONTINUOUS", changed["effective_settings_by_instance"]["A"]["operation_mode"])
+        self.assertIn("manual_ats", changed["effective_settings_by_instance"]["A"])
+        self.assertEqual("MANUAL_ATS", changed["effective_settings_by_instance"]["B"]["operation_mode"])
+        self.assertNotIn("manual_ats", changed["effective_settings_by_instance"]["B"])
+
+    def test_instance_reset_preserves_mutable_effective_settings(self) -> None:
+        self.create()
+        expected = self.service.set_instance_effective_settings(
+            self.session_id,
+            routine_instance_id="B",
+            initial_buy={"mode": "QUANTITY", "value": 3},
+            operation_schedule={
+                "start_time": "10:30:00",
+                "end_buy_time": "13:45:00",
+            },
+            operation_mode="MANUAL",
+            command_id="MC-settings-B",
+        )["document"]["effective_settings_by_instance"]["B"]
+        self.service.start_stock_mock_session(self.session_id, command_id="MC-start-reset-settings")
+        self.service.set_instance_position(
+            self.session_id,
+            "B",
+            holding_qty=4,
+            available_qty=4,
+            average_price=100,
+            realized_cost_basis=400,
+            command_id="MC-position-reset-settings",
+        )
+        self.service.stop_for_instance_error(
+            self.session_id,
+            source_routine_instance_id="B",
+            reason_code="MOCK_SETTINGS_RESET_TEST",
+            reason="reset preserves settings",
+            command_id="MC-error-reset-settings",
+        )
+        self.assertEqual(
+            INSTANCE_ERROR,
+            self.repository.read_session(self.session_id)["instance_execution"]["B"]["state"],
+        )
+        result = self.service.reset_routine_instance(
+            self.session_id,
+            routine_instance_id="B",
+            command_id="MC-reset-settings-B",
+        )["document"]
+        position = next(
+            item for item in result["positions"]
+            if item["routine_instance_id"] == "B"
+        )
+        self.assertEqual("WAITING", result["instance_execution"]["B"]["state"])
+        self.assertEqual((0, 0, 0), (
+            position["holding_qty"],
+            position["average_price"],
+            position["realized_cost_basis"],
+        ))
+        self.assertEqual(expected, instance_effective_settings(result, "B"))
+
+    def test_frozen_display_contract_is_copied_hashed_and_persisted(self) -> None:
+        source = _display_contract()
+        reference = build_mock_reference_snapshot(
+            stock={"code": "005930", "name": "삼성전자", "stock_path": "stocks/005930_삼성전자"},
+            routine_instances=[
+                {
+                    "instance_id": "A",
+                    "definition_id": "indicator-follow",
+                    "routine_type": "INDICATOR_FOLLOW",
+                    "display_name": "루틴 A",
+                }
+            ],
+            rules_by_instance_id={"A": {"version": 1}},
+            display_contract=source,
+            created_at="2026-09-03T08:59:00+09:00",
+        )
+        source["initial_buy"]["value"] = 99
+        source["operation_schedule"]["display_text"] = "10:00~12:00"
+
+        self.assertEqual(_display_contract(), reference["display_contract"])
+        self.assertEqual(
+            payload_hash({key: value for key, value in reference.items() if key != "snapshot_hash"}),
+            reference["snapshot_hash"],
+        )
+        created = self.service.create_stock_session(
+            reference_snapshot=reference,
+            validation_session_id=self.session_id,
+            command_id="MC-create-display-contract",
+        )["document"]
+        reloaded = self.repository.read_session(self.session_id)
+        self.assertEqual(_display_contract(), created["reference_snapshot"]["display_contract"])
+        self.assertEqual(_display_contract(), reloaded["reference_snapshot"]["display_contract"])
+
+    def test_display_contract_tamper_and_invalid_semantics_fail_closed(self) -> None:
+        reference = build_mock_reference_snapshot(
+            stock={"code": "005930", "name": "삼성전자", "stock_path": "stocks/005930_삼성전자"},
+            routine_instances=[
+                {
+                    "instance_id": "A",
+                    "definition_id": "indicator-follow",
+                    "routine_type": "INDICATOR_FOLLOW",
+                    "display_name": "루틴 A",
+                }
+            ],
+            rules_by_instance_id={"A": {"version": 1}},
+            display_contract=_display_contract(),
+            created_at="2026-09-03T08:59:00+09:00",
+        )
+        tampered = deepcopy(reference)
+        tampered["display_contract"]["initial_buy"]["value"] = 7
+        with self.assertRaisesRegex(MockValidationError, "MOCK_REFERENCE_SNAPSHOT_HASH_MISMATCH"):
+            validate_reference_snapshot(tampered)
+
+        invalid = _display_contract()
+        invalid["initial_buy"]["badge"] = "금액"
+        with self.assertRaisesRegex(MockValidationError, "MOCK_INITIAL_BUY_BADGE_INVALID"):
+            build_mock_reference_snapshot(
+                stock={"code": "005930", "name": "삼성전자", "stock_path": "stocks/005930_삼성전자"},
+                routine_instances=[
+                    {
+                        "instance_id": "A",
+                        "definition_id": "indicator-follow",
+                        "routine_type": "INDICATOR_FOLLOW",
+                        "display_name": "루틴 A",
+                    }
+                ],
+                rules_by_instance_id={"A": {"version": 1}},
+                display_contract=invalid,
+                created_at="2026-09-03T08:59:00+09:00",
+            )
+
+    def test_common_tax_settings_missing_file_uses_canonical_default(self) -> None:
+        settings_path = self.root / "settings.json"
+
+        self.assertFalse(settings_path.exists())
+        self.assertEqual(
+            {
+                "schema_version": "mock_validation_settings_v1",
+                "revision": 0,
+                "mock_tax_enabled": True,
+                "mock_tax_rate": 0.002,
+            },
+            self.repository.read_settings(),
+        )
+        self.assertFalse(settings_path.exists())
+
+    def test_common_tax_settings_persist_enabled_and_rate_across_repository_restart(self) -> None:
+        saved = self.repository.write_settings(
+            mock_tax_enabled=False,
+            mock_tax_rate=0.0037,
+            updated_at="2026-09-03T09:00:00+09:00",
+        )
+
+        self.assertTrue(saved["changed"])
+        restarted = MockValidationRepository(self.root)
+        settings = restarted.read_settings()
+        self.assertFalse(settings["mock_tax_enabled"])
+        self.assertEqual(0.0037, settings["mock_tax_rate"])
+        self.assertEqual(1, settings["revision"])
+
+    def test_saving_initial_default_materializes_settings_sot(self) -> None:
+        settings_path = self.root / "settings.json"
+
+        saved = self.repository.write_settings(
+            mock_tax_enabled=True,
+            mock_tax_rate=0.002,
+        )
+
+        self.assertTrue(saved["changed"])
+        self.assertTrue(settings_path.is_file())
+        self.assertEqual(1, self.repository.read_settings()["revision"])
+
+    def test_new_session_inherits_latest_common_tax_settings(self) -> None:
+        self.repository.write_settings(
+            mock_tax_enabled=False,
+            mock_tax_rate=0.0043,
+        )
+
+        document = self.create()["document"]
+
+        self.assertFalse(document["session"]["mock_tax_enabled"])
+        self.assertEqual(0.0043, document["session"]["mock_tax_rate"])
+
+    def test_session_creation_ignores_production_account_state_and_starts_zero(self) -> None:
+        production_state = {
+            "holding_qty": 100,
+            "average_price": 70_000,
+            "pending_orders": [{"order_no": "REAL-1", "remaining_qty": 25}],
+            "realized_pnl": 12_345,
+            "unrealized_pnl": 67_890,
+            "account_cash": 9_999_999,
+        }
+        reference = build_mock_reference_snapshot(
+            stock={
+                "code": "005930",
+                "name": "삼성전자",
+                "stock_path": "stocks/005930_삼성전자",
+                **production_state,
+            },
+            routine_instances=[
+                {
+                    "instance_id": "A",
+                    "definition_id": "indicator-follow",
+                    "routine_type": "INDICATOR_FOLLOW",
+                    "display_name": "루틴 A",
+                    "group_id": "group-1",
+                }
+            ],
+            rules_by_instance_id={"A": {"version": 1}},
+            created_at="2026-09-03T08:59:00+09:00",
+        )
+
+        document = self.service.create_stock_session(
+            reference_snapshot=reference,
+            validation_session_id=self.session_id,
+            command_id="MC-create-zero-base",
+        )["document"]
+
+        self.assertEqual([], document["orders"])
+        self.assertEqual([], document["fills"])
+        self.assertEqual(0, document["positions"][0]["holding_qty"])
+        self.assertEqual(0, document["positions"][0]["average_price"])
+        self.assertEqual(0, document["pnl"][0]["realized_pnl"])
+        self.assertEqual(0, document["pnl"][0]["unrealized_pnl"])
+        self.assertFalse(
+            set(production_state).intersection(document["reference_snapshot"])
+        )
+
     def test_stock_start_uses_one_timestamp_and_has_no_instance_start_api(self) -> None:
         result = self.start()
         document = result["document"]
@@ -129,7 +536,7 @@ class MockValidationFoundationTest(unittest.TestCase):
         self.assertEqual(0, pnl["B"]["net_pnl"])
         self.assertEqual(0, pnl["C"]["net_pnl"])
 
-    def test_instance_error_stops_whole_session_and_blocks_progression(self) -> None:
+    def test_instance_error_isolates_only_source_instance(self) -> None:
         self.start()
         result = self.service.stop_for_instance_error(
             self.session_id,
@@ -139,17 +546,101 @@ class MockValidationFoundationTest(unittest.TestCase):
             command_id="MC-error-B",
         )
         document = result["document"]
-        self.assertEqual("REVIEW_STOPPED", document["session"]["state"])
-        self.assertEqual("B", document["review"]["source_routine_instance_id"])
-        self.assertEqual({False}, {item["progression_allowed"] for item in document["instance_execution"].values()})
-        with self.assertRaisesRegex(MockValidationError, "MOCK_SESSION_NOT_RUNNING"):
+        self.assertEqual("RUNNING", document["session"]["state"])
+        self.assertFalse(document["review"]["review_required"])
+        self.assertEqual(INSTANCE_ERROR, document["instance_execution"]["B"]["state"])
+        self.assertFalse(document["instance_execution"]["B"]["progression_allowed"])
+        self.assertTrue(document["instance_execution"]["A"]["progression_allowed"])
+        self.assertTrue(document["instance_execution"]["C"]["progression_allowed"])
+        created = self.service.create_order(
+            self.session_id, routine_instance_id="A", side="BUY", order_type="LIMIT",
+            requested_qty=1, requested_price=1, command_id="MC-after-instance-error",
+        )
+        self.assertEqual("A", created["order"]["routine_instance_id"])
+        with self.assertRaisesRegex(MockValidationError, "MOCK_INSTANCE_PROGRESSION_BLOCKED"):
             self.service.create_order(
-                self.session_id, routine_instance_id="A", side="BUY", order_type="LIMIT",
-                requested_qty=1, requested_price=1, command_id="MC-after-review",
+                self.session_id, routine_instance_id="B", side="BUY", order_type="LIMIT",
+                requested_qty=1, requested_price=1, command_id="MC-blocked-instance",
             )
         event_types = [item["event_type"] for item in self.repository.read_events(self.session_id)]
         self.assertIn("INSTANCE_ERROR", event_types)
-        self.assertIn("SESSION_REVIEW_STOPPED", event_types)
+        self.assertNotIn("SESSION_REVIEW_STOPPED", event_types)
+
+    def test_instance_reset_zeroes_only_target_and_preserves_siblings(self) -> None:
+        self.start()
+        for instance_id, quantity in (("A", 1), ("B", 2), ("C", 3)):
+            order = self.service.create_order(
+                self.session_id,
+                routine_instance_id=instance_id,
+                side="BUY",
+                order_type="LIMIT",
+                requested_qty=quantity,
+                requested_price=10,
+                command_id=f"MC-order-{instance_id}",
+            )["order"]
+            self.service.transition_order(
+                self.session_id,
+                order["mock_order_id"],
+                "OPEN",
+                command_id=f"MC-open-{instance_id}",
+            )
+            if instance_id == "B":
+                self.service.append_fill(
+                    self.session_id,
+                    mock_order_id=order["mock_order_id"],
+                    qty=1,
+                    price=10,
+                    market_snapshot_identity="MKT-reset-B",
+                    command_id="MC-fill-B",
+                )
+            self.service.set_instance_position(
+                self.session_id,
+                instance_id,
+                holding_qty=quantity,
+                available_qty=quantity,
+                average_price=10,
+                realized_cost_basis=quantity * 10,
+                command_id=f"MC-position-{instance_id}",
+            )
+        self.service.stop_for_instance_error(
+            self.session_id,
+            source_routine_instance_id="B",
+            reason_code="MOCK_TEST_ERROR",
+            reason="B failure",
+            command_id="MC-error-B-reset",
+        )
+        before = self.repository.read_session(self.session_id)
+
+        def sibling_state(document, instance_id):
+            return payload_hash({
+                "orders": [item for item in document["orders"] if item["routine_instance_id"] == instance_id],
+                "fills": [item for item in document["fills"] if item["routine_instance_id"] == instance_id],
+                "position": next(item for item in document["positions"] if item["routine_instance_id"] == instance_id),
+                "pnl": next(item for item in document["pnl"] if item["routine_instance_id"] == instance_id),
+                "execution": document["instance_execution"][instance_id],
+                "cycle": document["cycle_state_by_instance"][instance_id],
+                "progression": document["progression_by_instance"][instance_id],
+            })
+
+        sibling_hashes = {key: sibling_state(before, key) for key in ("A", "C")}
+        events_before = self.repository.read_events(self.session_id)
+        result = self.service.reset_routine_instance(
+            self.session_id,
+            routine_instance_id="B",
+            command_id="MC-reset-B",
+        )
+        document = result["document"]
+        self.assertFalse(any(item["routine_instance_id"] == "B" for item in document["orders"]))
+        self.assertFalse(any(item["routine_instance_id"] == "B" for item in document["fills"]))
+        position = next(item for item in document["positions"] if item["routine_instance_id"] == "B")
+        pnl = next(item for item in document["pnl"] if item["routine_instance_id"] == "B")
+        self.assertEqual((0, 0, 0), (position["holding_qty"], position["average_price"], pnl["net_pnl"]))
+        self.assertEqual("WAITING", document["instance_execution"]["B"]["state"])
+        self.assertFalse(document["instance_execution"]["B"]["error_code"])
+        self.assertEqual(sibling_hashes, {key: sibling_state(document, key) for key in ("A", "C")})
+        events_after = self.repository.read_events(self.session_id)
+        self.assertEqual(len(events_before) + 1, len(events_after))
+        self.assertEqual("INSTANCE_RESET", events_after[-1]["event_type"])
 
     def test_reset_zeroes_all_current_state_preserves_history_and_does_not_start(self) -> None:
         self.start()
@@ -314,7 +805,22 @@ class MockValidationFoundationTest(unittest.TestCase):
         protected_files = (PROJECT_ROOT / "operation_policy.json",)
         before_trees = _tree_hashes(*production_roots)
         before_files = {str(path): _file_hash(path) for path in protected_files}
-        self.start()
+        self.create()
+        self.service.set_instance_effective_settings(
+            self.session_id,
+            routine_instance_id="A",
+            initial_buy={"mode": "AMOUNT", "value": 500_000},
+            operation_schedule={
+                "start_time": "10:30:00",
+                "end_buy_time": "13:30:00",
+            },
+            operation_mode="MANUAL_ATS",
+            command_id="MC-settings-isolation",
+        )
+        self.service.start_stock_mock_session(
+            self.session_id,
+            command_id="MC-start-isolation",
+        )
         self.service.stop_for_instance_error(
             self.session_id, source_routine_instance_id="C",
             reason_code="ISOLATION", reason="test", command_id="MC-isolation",

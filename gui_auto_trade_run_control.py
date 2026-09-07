@@ -1670,15 +1670,10 @@ def _single_start_failure_user_message(
         )
     if reason == "ALREADY_RUNNING":
         return f"{subject} 이미 운영 중입니다."
-    if reason == "MOCK_VALIDATION_ACTIVE":
-        return f"{subject} 모의검증 중이므로 실운영을 시작할 수 없습니다."
-    if reason in {
-        "MOCK_MEMBERSHIP_CHECK_FAILED",
-        "OPERATION_START_EXCLUSION_CHECK_FAILED",
-    }:
+    if reason == "OPERATION_START_EXCLUSION_CHECK_FAILED":
         return (
-            f"{label}의 모의검증 상태를 확인하지 못했습니다.\n"
-            "상태를 다시 확인한 뒤 실운영을 시작하십시오."
+            f"{label}의 운영 제외조건을 확인하지 못했습니다.\n"
+            "상태를 다시 확인한 뒤 운영을 시작하십시오."
         )
     if reason == "MISSING_REQUIRED_SETTINGS":
         return (
@@ -3222,11 +3217,7 @@ def _operation_start_all_excluded_payload(
         {
             "ok": False,
             "reason": reason or "NO_STARTABLE_TARGETS",
-            "user_message": (
-                "모의검증 중인 종목은 실운영을 시작할 수 없습니다."
-                if reasons == {"MOCK_VALIDATION_ACTIVE"}
-                else "운영시작 제외조건을 확인하지 못해 안전하게 차단했습니다."
-            ),
+            "user_message": "운영시작 제외조건을 확인하지 못해 안전하게 차단했습니다.",
             "completed": (),
             "started_count": 0,
             "failed_count": 0,
@@ -3326,7 +3317,7 @@ def _execute_full_operation_start(
             status_message = getattr(host, "statusBarMessage", None)
             if callable(status_message):
                 status_message(
-                    "모의검증 중인 종목은 실운영을 시작할 수 없습니다."
+                    "운영시작 제외조건을 확인하지 못해 안전하게 차단했습니다."
                     if start_exclusions
                     else "운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요."
                 )

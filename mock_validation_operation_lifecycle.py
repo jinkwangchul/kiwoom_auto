@@ -14,10 +14,13 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 from mock_validation_contract import (
+    INSTANCE_ERROR,
+    INSTANCE_VALIDATION_STOPPED,
     ORDER_CANCEL_PENDING,
     ORDER_OPEN,
     ORDER_PARTIAL_FILL,
     SESSION_CLOSING,
+    SESSION_ENDED,
     SESSION_REVIEW_STOPPED,
     SESSION_RUNNING,
     SESSION_WAITING,
@@ -39,6 +42,7 @@ OPERATION_RUNNING = "RUNNING"
 OPERATION_CLOSING = "CLOSING"
 OPERATION_ENDED = "ENDED"
 OPERATION_REVIEW_STOPPED = "REVIEW_STOPPED"
+OPERATION_VALIDATION_STOPPED = "VALIDATION_STOPPED"
 
 OUTCOME_DONE = "DONE"
 OUTCOME_CARRYOVER_DONE = "CARRYOVER_DONE"
@@ -102,7 +106,13 @@ def normalize_close_method(value: Any) -> str:
 def _root(document: dict[str, Any]) -> dict[str, Any]:
     root = document.setdefault(
         "mock_operation_lifecycle",
-        {"version": 1, "current": None, "history": [], "commands": {}},
+        {
+            "version": 1,
+            "current": None,
+            "history": [],
+            "commands": {},
+            "instance_operations": {},
+        },
     )
     if (
         not isinstance(root, dict)
@@ -110,6 +120,9 @@ def _root(document: dict[str, Any]) -> dict[str, Any]:
         or not isinstance(root.get("commands"), dict)
     ):
         raise MockValidationError("MOCK_OPERATION_STATE_INVALID")
+    instance_operations = root.setdefault("instance_operations", {})
+    if not isinstance(instance_operations, dict):
+        raise MockValidationError("MOCK_INSTANCE_OPERATION_LEDGER_INVALID")
     return root
 
 
@@ -126,6 +139,25 @@ def _positions(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _validate_operation_integrity(document: dict[str, Any]) -> None:
     root = _root(document)
+    for instance_id, operation in root["instance_operations"].items():
+        if instance_id not in document.get("instance_execution", {}):
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_IDENTITY_MISMATCH")
+        if not isinstance(operation, dict):
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_INVALID")
+        if clean_text(operation.get("routine_instance_id")) != instance_id:
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_IDENTITY_MISMATCH")
+        if not clean_text(operation.get("operation_session_id")).startswith("MS-"):
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_IDENTITY_INVALID")
+        if operation.get("state") not in {
+            OPERATION_RUNNING,
+            OPERATION_CLOSING,
+            OPERATION_ENDED,
+            OPERATION_REVIEW_STOPPED,
+            OPERATION_VALIDATION_STOPPED,
+        }:
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_STATE_INVALID")
+        if not isinstance(operation.get("processed_cycles"), dict):
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_CYCLE_LEDGER_INVALID")
     history_ids = [
         clean_text(item.get("operation_session_id"))
         for item in root["history"]
@@ -143,7 +175,8 @@ def _validate_operation_integrity(document: dict[str, Any]) -> None:
     if not clean_text(current.get("operation_session_id")).startswith("MS-"):
         raise MockValidationError("MOCK_OPERATION_IDENTITY_INVALID")
     if current.get("state") not in {
-        OPERATION_RUNNING, OPERATION_CLOSING, OPERATION_ENDED, OPERATION_REVIEW_STOPPED,
+        OPERATION_RUNNING, OPERATION_CLOSING, OPERATION_ENDED,
+        OPERATION_REVIEW_STOPPED, OPERATION_VALIDATION_STOPPED,
     }:
         raise MockValidationError("MOCK_OPERATION_STATE_INVALID")
     _date_text(current.get("trading_date"))
@@ -155,6 +188,52 @@ def _validate_operation_integrity(document: dict[str, Any]) -> None:
 
 def _live_orders(document: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in document.get("orders", ()) if item.get("state") in _LIVE]
+
+
+def _instance_live_orders(
+    document: dict[str, Any], routine_instance_id: str
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _live_orders(document)
+        if clean_text(item.get("routine_instance_id")) == routine_instance_id
+    ]
+
+
+def instance_operation_state(
+    document: dict[str, Any], routine_instance_id: str
+) -> dict[str, Any] | None:
+    """Return a defensive Mock-only Instance operation snapshot."""
+
+    instance_id = clean_text(routine_instance_id)
+    root = document.get("mock_operation_lifecycle")
+    operations = root.get("instance_operations") if isinstance(root, dict) else None
+    operation = operations.get(instance_id) if isinstance(operations, dict) else None
+    return deepcopy(operation) if isinstance(operation, dict) else None
+
+
+def _sync_instance_container_state(document: dict[str, Any]) -> None:
+    """Keep the stock Session as a container, never as an Instance owner."""
+
+    root = _root(document)
+    current = root.get("current")
+    if isinstance(current, dict) and current.get("state") in {
+        OPERATION_RUNNING,
+        OPERATION_CLOSING,
+        OPERATION_REVIEW_STOPPED,
+    }:
+        return
+    active = any(
+        isinstance(item, dict)
+        and item.get("state") in {OPERATION_RUNNING, OPERATION_CLOSING}
+        for item in root["instance_operations"].values()
+    )
+    if document["session"].get("state") != SESSION_REVIEW_STOPPED:
+        document["session"]["state"] = SESSION_RUNNING if active else SESSION_WAITING
+        if not active:
+            document["session"].update(
+                {"started_at": "", "start_identity": ""}
+            )
 
 
 def evaluate_mock_operation_completion(
@@ -188,11 +267,6 @@ def evaluate_mock_operation_completion(
         if int(item.get("holding_qty", 0) or 0) > 0
     }
     if method == CLOSE_CARRYOVER:
-        if operation.get("long_hold_enabled") is not True:
-            return {
-                "outcome": OUTCOME_REVIEW_REQUIRED if final_close_boundary else OUTCOME_NOT_READY,
-                "reason": "MOCK_LONG_HOLD_NOT_ENABLED",
-            }
         return {
             "outcome": OUTCOME_CARRYOVER_DONE,
             "reason": "MOCK_CARRYOVER_QUALIFIED",
@@ -200,11 +274,15 @@ def evaluate_mock_operation_completion(
         }
     if not remaining:
         return {"outcome": OUTCOME_DONE, "reason": "MOCK_LIQUIDATION_COMPLETE"}
-    culprit = sorted(remaining)[0]
+    if final_close_boundary:
+        return {
+            "outcome": OUTCOME_CARRYOVER_DONE,
+            "reason": "MOCK_RESIDUAL_POSITION_CARRIED",
+            "remaining_by_instance": remaining,
+        }
     return {
-        "outcome": OUTCOME_REVIEW_REQUIRED if final_close_boundary else OUTCOME_NOT_READY,
-        "reason": "MOCK_CLOSE_RESIDUAL" if final_close_boundary else "MOCK_LIQUIDATION_REMAINING",
-        "source_routine_instance_id": culprit,
+        "outcome": OUTCOME_NOT_READY,
+        "reason": "MOCK_LIQUIDATION_REMAINING",
         "remaining_by_instance": remaining,
     }
 
@@ -221,6 +299,13 @@ def mock_validation_end_eligibility(document: dict[str, Any]) -> dict[str, Any]:
     current = root.get("current") if isinstance(root, dict) else None
     if isinstance(current, dict) and current.get("state") in {OPERATION_RUNNING, OPERATION_CLOSING}:
         return {"eligible": False, "reason": "MOCK_OPERATION_ACTIVE"}
+    instance_operations = root.get("instance_operations") if isinstance(root, dict) else None
+    if isinstance(instance_operations, dict) and any(
+        isinstance(item, dict)
+        and item.get("state") in {OPERATION_RUNNING, OPERATION_CLOSING}
+        for item in instance_operations.values()
+    ):
+        return {"eligible": False, "reason": "MOCK_INSTANCE_OPERATION_ACTIVE"}
     return {"eligible": True, "reason": ""}
 
 
@@ -296,8 +381,6 @@ class MockOperationLifecycleCoordinator:
             raise MockValidationError("MOCK_OPERATION_ALREADY_ACTIVE")
         if before["session"]["state"] != SESSION_WAITING:
             raise MockValidationError("MOCK_OPERATION_START_STATE_INVALID")
-        if before["review"].get("review_required") is True:
-            raise MockValidationError("MOCK_OPERATION_REVIEW_UNRESOLVED")
         if any(item.get("trading_date") == date_text for item in root["history"]):
             raise MockValidationError("MOCK_OPERATION_TRADING_DATE_ALREADY_USED")
         timestamp = as_of.isoformat(timespec="microseconds")
@@ -316,7 +399,7 @@ class MockOperationLifecycleCoordinator:
             "outcome": "",
             "operation_policy_snapshot": policy_snapshot,
             "close_policy_snapshot": None,
-            "long_hold_enabled": bool(policy_snapshot.get("long_hold_enabled", False)),
+            "long_hold_enabled": True,
             "immediate_commands": {},
             "liquidation_by_instance": {},
             "processed_cycles": {},
@@ -337,6 +420,8 @@ class MockOperationLifecycleCoordinator:
                 "start_identity": operation_id,
             })
             for item in document["instance_execution"].values():
+                if item.get("state") in {INSTANCE_ERROR, INSTANCE_VALIDATION_STOPPED}:
+                    continue
                 item.update({
                     "state": SESSION_RUNNING,
                     "started_at": timestamp,
@@ -353,6 +438,236 @@ class MockOperationLifecycleCoordinator:
         self._event(document, event_type="OPERATION_SESSION_CREATED", identity=operation_id, timestamp=timestamp)
         self._event(document, event_type="OPERATION_STARTED", identity=command, timestamp=timestamp)
         return {"status": "STARTED", "duplicate": False, "operation": deepcopy(operation), "document": document}
+
+    def start_instance_operation(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        trading_date: date | str,
+        as_of: datetime,
+        operation_policy_snapshot: dict[str, Any] | None = None,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Start exactly one Mock Routine Instance inside its stock container."""
+
+        if as_of.tzinfo is None:
+            raise MockValidationError("MOCK_OPERATION_TIMESTAMP_INVALID")
+        date_text = _date_text(trading_date)
+        command = clean_text(command_id)
+        before = self.repository.read_session(session_id)
+        _validate_operation_integrity(before)
+        instance_id = clean_text(routine_instance_id)
+        if instance_id not in before.get("instance_execution", {}):
+            raise MockValidationError("MOCK_ROUTINE_INSTANCE_NOT_IN_SESSION")
+        if before["session"].get("state") in {SESSION_REVIEW_STOPPED}:
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_START_STATE_INVALID")
+        if before["session"].get("state") not in {SESSION_WAITING, SESSION_RUNNING}:
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_START_STATE_INVALID")
+        execution = before["instance_execution"][instance_id]
+        if execution.get("state") == INSTANCE_ERROR:
+            raise MockValidationError("MOCK_INSTANCE_ERROR_STOPPED")
+        if execution.get("state") == INSTANCE_VALIDATION_STOPPED:
+            raise MockValidationError("MOCK_INSTANCE_VALIDATION_STOPPED")
+        root = _root(before)
+        stock_operation = root.get("current")
+        if isinstance(stock_operation, dict) and stock_operation.get("state") in {
+            OPERATION_RUNNING,
+            OPERATION_CLOSING,
+        }:
+            raise MockValidationError("MOCK_STOCK_OPERATION_ALREADY_ACTIVE")
+        if command in root["commands"]:
+            return {"status": "NOOP", "duplicate": True, "document": before}
+        previous = root["instance_operations"].get(instance_id)
+        if isinstance(previous, dict):
+            if previous.get("state") in {OPERATION_RUNNING, OPERATION_CLOSING}:
+                return {"status": "NOOP", "duplicate": True, "document": before}
+            if previous.get("state") == OPERATION_ENDED:
+                raise MockValidationError("MOCK_INSTANCE_OPERATION_ENDED")
+        timestamp = as_of.isoformat(timespec="microseconds")
+        operation_id = deterministic_mock_identity(
+            "MS", session_id, instance_id, date_text, command
+        )
+        operation = {
+            "operation_session_id": operation_id,
+            "routine_instance_id": instance_id,
+            "trading_date": date_text,
+            "state": OPERATION_RUNNING,
+            "started_at": timestamp,
+            "closing_requested_at": "",
+            "ended_at": "",
+            "close_source": "",
+            "close_reason": "",
+            "close_method": "",
+            "outcome": "",
+            "operation_policy_snapshot": deepcopy(operation_policy_snapshot or {}),
+            "close_policy_snapshot": None,
+            "processed_cycles": {},
+        }
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            state = _root(document)
+            state["instance_operations"][instance_id] = deepcopy(operation)
+            state["commands"][command] = {
+                "operation": "START_INSTANCE_OPERATION",
+                "applied_at": timestamp,
+                "entity_id": operation_id,
+            }
+            document["session"].update(
+                {
+                    "state": SESSION_RUNNING,
+                    "started_at": document["session"].get("started_at") or timestamp,
+                    "ended_at": "",
+                    "start_identity": document["session"].get("start_identity")
+                    or operation_id,
+                }
+            )
+            document["instance_execution"][instance_id].update(
+                {
+                    "state": SESSION_RUNNING,
+                    "started_at": timestamp,
+                    "progression_allowed": True,
+                    "operation_session_id": operation_id,
+                    "operation_started_at": timestamp,
+                }
+            )
+            return document
+
+        document = self.repository.mutate_session(
+            session_id, mutation, expected_revision=before["revision"]
+        )["document"]
+        self._event(
+            document,
+            event_type="OPERATION_SESSION_CREATED",
+            identity=operation_id,
+            timestamp=timestamp,
+            instance_id=instance_id,
+            payload={"instance_operation": True},
+        )
+        self._event(
+            document,
+            event_type="OPERATION_STARTED",
+            identity=command,
+            timestamp=timestamp,
+            instance_id=instance_id,
+            payload={"instance_operation": True},
+        )
+        return {
+            "status": "STARTED",
+            "duplicate": False,
+            "operation": deepcopy(operation),
+            "document": document,
+        }
+
+    def request_instance_early_close(
+        self, session_id: str, *, routine_instance_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self._request_instance_close(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            source="EARLY",
+            **kwargs,
+        )
+
+    def request_instance_immediate_liquidation(
+        self, session_id: str, *, routine_instance_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        method = normalize_close_method(kwargs.get("method"))
+        if method == CLOSE_CARRYOVER:
+            raise MockValidationError("MOCK_IMMEDIATE_LIQUIDATION_METHOD_INVALID")
+        kwargs["method"] = method
+        return self._request_instance_close(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            source="IMMEDIATE",
+            **kwargs,
+        )
+
+    def _request_instance_close(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        source: str,
+        method: str,
+        reason: str,
+        as_of: datetime,
+        command_id: str,
+    ) -> dict[str, Any]:
+        if as_of.tzinfo is None:
+            raise MockValidationError("MOCK_OPERATION_TIMESTAMP_INVALID")
+        close_method = normalize_close_method(method)
+        command = clean_text(command_id)
+        instance_id = clean_text(routine_instance_id)
+        before = self.repository.read_session(session_id)
+        _validate_operation_integrity(before)
+        if instance_id not in before.get("instance_execution", {}):
+            raise MockValidationError("MOCK_ROUTINE_INSTANCE_NOT_IN_SESSION")
+        root = _root(before)
+        if command in root["commands"]:
+            return {"status": "NOOP", "duplicate": True, "document": before}
+        operation = root["instance_operations"].get(instance_id)
+        allowed_states = {OPERATION_RUNNING}
+        if source == "IMMEDIATE":
+            allowed_states.add(OPERATION_CLOSING)
+        if (
+            not isinstance(operation, dict)
+            or operation.get("state") not in allowed_states
+        ):
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_CLOSE_STATE_INVALID")
+        timestamp = as_of.isoformat(timespec="microseconds")
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            state = _root(document)
+            current = state["instance_operations"][instance_id]
+            current.update(
+                {
+                    "state": OPERATION_CLOSING,
+                    "closing_requested_at": current.get("closing_requested_at")
+                    or timestamp,
+                    "close_source": source,
+                    "close_reason": clean_text(reason),
+                    "close_method": close_method,
+                    "close_policy_snapshot": {
+                        "source": source,
+                        "method": close_method,
+                        "reason": clean_text(reason),
+                        "captured_at": timestamp,
+                    },
+                }
+            )
+            state["commands"][command] = {
+                "operation": f"{source}_INSTANCE_CLOSE",
+                "applied_at": timestamp,
+                "entity_id": current["operation_session_id"],
+            }
+            document["instance_execution"][instance_id].update(
+                {"state": SESSION_CLOSING, "progression_allowed": False}
+            )
+            _sync_instance_container_state(document)
+            return document
+
+        document = self.repository.mutate_session(
+            session_id, mutation, expected_revision=before["revision"]
+        )["document"]
+        self._event(
+            document,
+            event_type=(
+                "IMMEDIATE_LIQUIDATION_REQUESTED"
+                if source == "IMMEDIATE"
+                else "EARLY_CLOSE_REQUESTED"
+            ),
+            identity=command,
+            timestamp=timestamp,
+            instance_id=instance_id,
+            reason=reason,
+            payload={"instance_operation": True, "method": close_method},
+        )
+        return {
+            "status": "REQUESTED" if source == "IMMEDIATE" else "CLOSING",
+            "duplicate": False,
+            "document": document,
+        }
 
     def request_normal_close(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         return self._request_close(session_id, source="NORMAL", **kwargs)
@@ -386,9 +701,7 @@ class MockOperationLifecycleCoordinator:
         operation = root.get("current")
         if not isinstance(operation, dict) or operation.get("state") != OPERATION_RUNNING:
             raise MockValidationError("MOCK_OPERATION_CLOSE_STATE_INVALID")
-        carry_enabled = operation.get("long_hold_enabled") if long_hold_enabled is None else bool(long_hold_enabled)
-        if close_method == CLOSE_CARRYOVER and carry_enabled is not True:
-            raise MockValidationError("MOCK_LONG_HOLD_NOT_ENABLED")
+        carry_enabled = True
         timestamp = as_of.isoformat(timespec="microseconds")
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
@@ -415,6 +728,8 @@ class MockOperationLifecycleCoordinator:
             }
             document["session"]["state"] = SESSION_CLOSING
             for item in document["instance_execution"].values():
+                if item.get("state") in {INSTANCE_ERROR, INSTANCE_VALIDATION_STOPPED}:
+                    continue
                 item.update({"state": SESSION_CLOSING, "progression_allowed": False})
             return document
 
@@ -630,7 +945,7 @@ class MockOperationLifecycleCoordinator:
         if operation.get("state") == OPERATION_ENDED:
             return {"status": "NOOP", "reason": "MOCK_OPERATION_ALREADY_ENDED", "document": before}
         if operation.get("state") == OPERATION_REVIEW_STOPPED or before["review"].get("review_required") is True:
-            return {"status": "REVIEW_STOPPED", "reason": "MOCK_OPERATION_REVIEW_STOPPED", "document": before}
+            return {"status": "INSTANCE_ERROR", "reason": "MOCK_LEGACY_REVIEW_STATE", "document": before}
         if operation.get("state") != OPERATION_CLOSING:
             return {"status": "WAIT", "reason": "MOCK_OPERATION_NOT_CLOSING", "document": before}
         timestamp = as_of.isoformat(timespec="microseconds")
@@ -659,7 +974,18 @@ class MockOperationLifecycleCoordinator:
 
         if close_orders:
             if final_close_boundary:
-                return self._review_residual(session_id, operation, close_orders[0], cycle_id, as_of, market)
+                order = close_orders[0]
+                result = self.engine.request_cancel(
+                    session_id,
+                    order["mock_order_id"],
+                    command_id=deterministic_mock_identity(
+                        "MC", session_id, cycle_id, order["mock_order_id"], "FINAL_CARRY_CANCEL"
+                    ),
+                    allow_closing=True,
+                )
+                return self._finish_cycle(
+                    session_id, cycle_id, timestamp, "FINAL_CARRY_CANCEL", result
+                )
             ready, reason, _ = self._market_ready(
                 market, policy, as_of,
                 require_trade=operation.get("close_method") == CLOSE_CURRENT_PRICE,
@@ -689,17 +1015,6 @@ class MockOperationLifecycleCoordinator:
         completion = evaluate_mock_operation_completion(before, final_close_boundary=final_close_boundary)
         if completion["outcome"] in {OUTCOME_DONE, OUTCOME_CARRYOVER_DONE}:
             return self._complete(session_id, completion, cycle_id, as_of)
-        if completion["outcome"] == OUTCOME_REVIEW_REQUIRED:
-            culprit = completion.get("source_routine_instance_id") or sorted(before["instance_execution"])[0]
-            synthetic = {
-                "routine_instance_id": culprit,
-                "requested_qty": completion.get("remaining_by_instance", {}).get(culprit, 0),
-                "filled_qty": 0,
-                "remaining_qty": completion.get("remaining_by_instance", {}).get(culprit, 0),
-                "mock_order_id": "",
-            }
-            return self._review_residual(session_id, operation, synthetic, cycle_id, as_of, market)
-
         ready, reason, current_price = self._market_ready(
             market, policy, as_of,
             require_trade=operation.get("close_method") == CLOSE_CURRENT_PRICE,
@@ -709,6 +1024,11 @@ class MockOperationLifecycleCoordinator:
         positions = _positions(before)
         created: list[dict[str, Any]] = []
         for instance_id in sorted(positions):
+            if before["instance_execution"][instance_id].get("state") in {
+                INSTANCE_ERROR,
+                INSTANCE_VALIDATION_STOPPED,
+            }:
+                continue
             qty = int(positions[instance_id].get("available_qty", 0) or 0)
             if qty <= 0:
                 continue
@@ -750,28 +1070,295 @@ class MockOperationLifecycleCoordinator:
             )
         return {"status": "PROGRESSED", "action": "LIQUIDATION_STARTED", "orders": created, "document": document}
 
+    def process_instance_operation_cycle(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        lifecycle_cycle_id: str,
+        as_of: datetime,
+        market: MockMarketSnapshot | None,
+        policy: MockExecutionPolicy,
+    ) -> dict[str, Any]:
+        """Advance only one Instance close lifecycle and its Mock ledgers."""
+
+        if as_of.tzinfo is None:
+            raise MockValidationError("MOCK_OPERATION_TIMESTAMP_INVALID")
+        instance_id = clean_text(routine_instance_id)
+        cycle_id = clean_text(lifecycle_cycle_id)
+        before = self.repository.read_session(session_id)
+        _validate_operation_integrity(before)
+        if instance_id not in before.get("instance_execution", {}):
+            raise MockValidationError("MOCK_ROUTINE_INSTANCE_NOT_IN_SESSION")
+        operation = _root(before)["instance_operations"].get(instance_id)
+        if not isinstance(operation, dict):
+            return {
+                "status": "NOOP",
+                "reason": "MOCK_INSTANCE_OPERATION_NOT_STARTED",
+                "document": before,
+            }
+        if cycle_id in operation["processed_cycles"]:
+            return {
+                "status": "NOOP",
+                "reason": "MOCK_INSTANCE_OPERATION_CYCLE_ALREADY_PROCESSED",
+                "document": before,
+            }
+        if operation.get("state") == OPERATION_ENDED:
+            return {
+                "status": "NOOP",
+                "reason": "MOCK_INSTANCE_OPERATION_ALREADY_ENDED",
+                "document": before,
+            }
+        if operation.get("state") != OPERATION_CLOSING:
+            return {
+                "status": "WAIT",
+                "reason": "MOCK_INSTANCE_OPERATION_NOT_CLOSING",
+                "document": before,
+            }
+
+        timestamp = as_of.isoformat(timespec="microseconds")
+        live = _instance_live_orders(before, instance_id)
+        pending = [item for item in live if item.get("state") == ORDER_CANCEL_PENDING]
+        if pending:
+            order = pending[0]
+            result = self.engine.finalize_cancel(
+                session_id,
+                order["mock_order_id"],
+                command_id=deterministic_mock_identity(
+                    "MC", session_id, instance_id, cycle_id,
+                    order["mock_order_id"], "CANCEL_EFFECT",
+                ),
+                allow_closing=True,
+            )
+            return self._finish_instance_cycle(
+                session_id, instance_id, cycle_id, timestamp,
+                "CANCEL_EFFECT", result,
+            )
+
+        close_prefix = f"MOCK_INSTANCE_CLOSE:{operation['operation_session_id']}:"
+        close_orders = [
+            item
+            for item in live
+            if clean_text(item.get("child_identity")).startswith(close_prefix)
+        ]
+        other_orders = [item for item in live if item not in close_orders]
+        if other_orders:
+            order = other_orders[0]
+            result = self.engine.request_cancel(
+                session_id,
+                order["mock_order_id"],
+                command_id=deterministic_mock_identity(
+                    "MC", session_id, instance_id, cycle_id,
+                    order["mock_order_id"], "INSTANCE_CLOSE_CANCEL",
+                ),
+                allow_closing=True,
+            )
+            return self._finish_instance_cycle(
+                session_id, instance_id, cycle_id, timestamp,
+                "CANCEL_REQUEST", result,
+            )
+
+        if close_orders:
+            ready, reason, _ = self._market_ready(
+                market,
+                policy,
+                as_of,
+                require_trade=operation.get("close_method") == CLOSE_CURRENT_PRICE,
+            )
+            if not ready:
+                return self._finish_instance_cycle(
+                    session_id, instance_id, cycle_id, timestamp, "WAIT",
+                    {"status": "WAIT", "reason": reason},
+                )
+            order = close_orders[0]
+            result = self.engine.process_orderbook(
+                session_id,
+                order["mock_order_id"],
+                market=market,
+                policy=policy,
+                command_id=deterministic_mock_identity(
+                    "MC", session_id, instance_id, cycle_id,
+                    order["mock_order_id"], "LIQUIDATION_PROGRESS",
+                ),
+                allow_closing=True,
+            )
+            return self._finish_instance_cycle(
+                session_id, instance_id, cycle_id, timestamp,
+                "LIQUIDATION_PROGRESS", result,
+            )
+
+        position = next(
+            item
+            for item in before["positions"]
+            if item.get("routine_instance_id") == instance_id
+        )
+        quantity = int(position.get("available_qty", 0) or 0)
+        if operation.get("close_method") == CLOSE_CARRYOVER or quantity <= 0:
+            outcome = (
+                OUTCOME_CARRYOVER_DONE
+                if operation.get("close_method") == CLOSE_CARRYOVER
+                else OUTCOME_DONE
+            )
+            return self._complete_instance(
+                session_id,
+                instance_id,
+                cycle_id,
+                as_of,
+                outcome=outcome,
+            )
+
+        ready, reason, current_price = self._market_ready(
+            market,
+            policy,
+            as_of,
+            require_trade=operation.get("close_method") == CLOSE_CURRENT_PRICE,
+        )
+        if not ready:
+            return self._finish_instance_cycle(
+                session_id, instance_id, cycle_id, timestamp, "WAIT",
+                {"status": "WAIT", "reason": reason},
+            )
+        order_type = (
+            "MARKET" if operation.get("close_method") == CLOSE_MARKET else "LIMIT"
+        )
+        result = self.engine.submit_order(
+            session_id,
+            routine_instance_id=instance_id,
+            side="SELL",
+            order_type=order_type,
+            requested_qty=quantity,
+            limit_price=None if order_type == "MARKET" else current_price,
+            market=market,
+            policy=policy,
+            generation=0,
+            child_identity=f"{close_prefix}{instance_id}",
+            command_id=deterministic_mock_identity(
+                "MC", session_id, instance_id, cycle_id, "LIQUIDATE"
+            ),
+            allow_closing=True,
+        )
+        if result.get("status") == RESULT_BLOCKED:
+            raise MockValidationError(
+                clean_text(result.get("reason")) or "MOCK_LIQUIDATION_BLOCKED"
+            )
+        return self._finish_instance_cycle(
+            session_id, instance_id, cycle_id, timestamp,
+            "LIQUIDATION_STARTED", result,
+        )
+
+    def _finish_instance_cycle(
+        self,
+        session_id: str,
+        instance_id: str,
+        cycle_id: str,
+        timestamp: str,
+        action: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        before = self.repository.read_session(session_id)
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            operation = _root(document)["instance_operations"][instance_id]
+            operation["processed_cycles"][cycle_id] = {
+                "action": action,
+                "recorded_at": timestamp,
+                "reason": clean_text(result.get("reason")),
+            }
+            return document
+
+        document = self.repository.mutate_session(
+            session_id, mutation, expected_revision=before["revision"]
+        )["document"]
+        return {
+            "status": clean_text(result.get("status")) or "PROGRESSED",
+            "reason": clean_text(result.get("reason")),
+            "action": action,
+            "document": document,
+        }
+
+    def _complete_instance(
+        self,
+        session_id: str,
+        instance_id: str,
+        cycle_id: str,
+        as_of: datetime,
+        *,
+        outcome: str,
+    ) -> dict[str, Any]:
+        timestamp = as_of.isoformat(timespec="microseconds")
+        before = self.repository.read_session(session_id)
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            root = _root(document)
+            operation = root["instance_operations"][instance_id]
+            operation.update(
+                {"state": OPERATION_ENDED, "ended_at": timestamp, "outcome": outcome}
+            )
+            operation["processed_cycles"][cycle_id] = {
+                "action": outcome,
+                "recorded_at": timestamp,
+                "reason": (
+                    "MOCK_INSTANCE_CARRYOVER_QUALIFIED"
+                    if outcome == OUTCOME_CARRYOVER_DONE
+                    else "MOCK_INSTANCE_LIQUIDATION_COMPLETE"
+                ),
+            }
+            execution = document["instance_execution"][instance_id]
+            execution.update(
+                {
+                    "state": SESSION_ENDED,
+                    "progression_allowed": False,
+                    "last_operation_session_id": operation["operation_session_id"],
+                    "operation_session_id": "",
+                }
+            )
+            if outcome == OUTCOME_DONE:
+                cycle = document["cycle_state_by_instance"].get(instance_id)
+                if isinstance(cycle, dict) and cycle.get("active") is True:
+                    cycle.update({"active": False, "completed_at": timestamp})
+            _sync_instance_container_state(document)
+            return document
+
+        document = self.repository.mutate_session(
+            session_id, mutation, expected_revision=before["revision"]
+        )["document"]
+        self._event(
+            document,
+            event_type=(
+                "OPERATION_CARRYOVER_DONE"
+                if outcome == OUTCOME_CARRYOVER_DONE
+                else "OPERATION_DONE"
+            ),
+            identity=cycle_id,
+            timestamp=timestamp,
+            instance_id=instance_id,
+            payload={"instance_operation": True},
+        )
+        return {
+            "status": outcome,
+            "action": outcome,
+            "document": document,
+        }
+
     def _review_structural(
         self, session_id: str, cycle_id: str, as_of: datetime,
         error: MockValidationError,
     ) -> dict[str, Any]:
         timestamp = as_of.isoformat(timespec="microseconds")
         before = self.repository.read_session(session_id)
-        instance_id = sorted(before.get("instance_execution", {}))[0]
+        instance_ids = sorted(before.get("instance_execution", {}))
+        instance_id = instance_ids[0]
         reason = clean_text(error) or "MOCK_OPERATION_INTEGRITY_FAILURE"
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
             root = document.get("mock_operation_lifecycle")
             current = root.get("current") if isinstance(root, dict) else None
             if isinstance(current, dict):
-                current.update({
-                    "state": OPERATION_REVIEW_STOPPED,
-                    "outcome": OUTCOME_REVIEW_REQUIRED,
-                    "integrity_error": reason,
-                })
+                current["integrity_error"] = reason
                 cycles = current.get("processed_cycles")
                 if isinstance(cycles, dict):
                     cycles[cycle_id] = {
-                        "action": OUTCOME_REVIEW_REQUIRED,
+                        "action": "INSTANCE_ERROR",
                         "recorded_at": timestamp,
                         "reason": reason,
                     }
@@ -781,24 +1368,24 @@ class MockOperationLifecycleCoordinator:
             session_id, mutation, expected_revision=before["revision"]
         )["document"]
         service = MockValidationSessionService(self.repository, now_factory=lambda: timestamp)
-        stopped = service.stop_for_instance_error(
-            session_id,
-            source_routine_instance_id=instance_id,
-            reason_code="MOCK_OPERATION_INTEGRITY_FAILURE",
-            reason=reason,
-            command_id=deterministic_mock_identity("MC", session_id, cycle_id, "OPERATION_INTEGRITY"),
-        )
-        self._event(
-            stopped["document"], event_type="OPERATION_REVIEW_STOPPED",
-            identity=cycle_id, timestamp=timestamp, instance_id=instance_id,
-            reason="MOCK_OPERATION_INTEGRITY_FAILURE",
-            payload={"error": reason},
-        )
+        stopped_document = document
+        for affected_id in instance_ids:
+            stopped = service.stop_for_instance_error(
+                session_id,
+                source_routine_instance_id=affected_id,
+                reason_code="MOCK_OPERATION_INTEGRITY_FAILURE",
+                reason=reason,
+                command_id=deterministic_mock_identity(
+                    "MC", session_id, cycle_id, affected_id, "OPERATION_INTEGRITY"
+                ),
+                source_category="MOCK_OPERATION_LIFECYCLE",
+            )
+            stopped_document = stopped["document"]
         return {
-            "status": OUTCOME_REVIEW_REQUIRED,
-            "action": OUTCOME_REVIEW_REQUIRED,
+            "status": "INSTANCE_ERROR",
+            "action": "INSTANCE_ERROR",
             "reason": reason,
-            "document": stopped["document"],
+            "document": stopped_document,
         }
 
     def _finish_cycle(
@@ -856,6 +1443,8 @@ class MockOperationLifecycleCoordinator:
                 root["history"].append(deepcopy(operation))
             document["session"].update({"state": SESSION_WAITING, "started_at": "", "start_identity": ""})
             for instance_id, item in document["instance_execution"].items():
+                if item.get("state") in {INSTANCE_ERROR, INSTANCE_VALIDATION_STOPPED}:
+                    continue
                 item.update({
                     "state": SESSION_WAITING,
                     "progression_allowed": False,
@@ -937,6 +1526,7 @@ class MockOperationLifecycleCoordinator:
             reason_code="MOCK_CLOSE_RESIDUAL",
             reason="Mock liquidation left an unresolved residual position",
             command_id=deterministic_mock_identity("MC", session_id, cycle_id, "RESIDUAL_REVIEW"),
+            source_category="MOCK_OPERATION_LIFECYCLE",
         )
         self._event(
             stopped["document"], event_type="OPERATION_REVIEW_STOPPED",
@@ -960,12 +1550,14 @@ __all__ = [
     "OPERATION_CLOSING",
     "OPERATION_ENDED",
     "OPERATION_REVIEW_STOPPED",
+    "OPERATION_VALIDATION_STOPPED",
     "OPERATION_RUNNING",
     "OUTCOME_CARRYOVER_DONE",
     "OUTCOME_DONE",
     "OUTCOME_NOT_READY",
     "OUTCOME_REVIEW_REQUIRED",
     "evaluate_mock_operation_completion",
+    "instance_operation_state",
     "mock_validation_end_eligibility",
     "normalize_close_method",
 ]

@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Callable, Iterable
 
 from mock_validation_contract import (
+    INSTANCE_ERROR,
     ORDER_CANCELED,
     ORDER_CANCEL_PENDING,
     ORDER_CREATED,
@@ -67,6 +68,18 @@ def _decimal(value: Any, reason: str, *, positive: bool = False) -> Decimal:
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise MockValidationError(reason) from exc
     if not number.is_finite() or number < 0 or (positive and number <= 0):
+        raise MockValidationError(reason)
+    return number
+
+
+def _signed_decimal(value: Any, reason: str) -> Decimal:
+    if isinstance(value, bool):
+        raise MockValidationError(reason)
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise MockValidationError(reason) from exc
+    if not number.is_finite():
         raise MockValidationError(reason)
     return number
 
@@ -207,8 +220,8 @@ class MockVirtualExecutionEngine:
         allowed_states = {SESSION_RUNNING, SESSION_CLOSING} if allow_closing else {SESSION_RUNNING}
         if document["session"]["state"] not in allowed_states:
             raise MockValidationError("MOCK_SESSION_NOT_RUNNING")
-        if document["review"].get("review_required") is True:
-            raise MockValidationError("MOCK_SESSION_REVIEW_STOPPED")
+        if document["instance_execution"][instance_id].get("state") == INSTANCE_ERROR:
+            raise MockValidationError("MOCK_INSTANCE_ERROR_STOPPED")
         if (
             document["instance_execution"][instance_id].get("progression_allowed") is not True
             and not allow_closing
@@ -398,7 +411,15 @@ class MockVirtualExecutionEngine:
             except MockValidationError:
                 return self._blocked(before, command_id=command, instance_id=instance_id, reason="MOCK_EXECUTION_BUDGET_UNAVAILABLE", now_text=timestamp)
             invested = _decimal(position.get("realized_cost_basis", 0), "MOCK_POSITION_COST_BASIS_INVALID")
-            available = budget - invested - self._active_buy_reservation(before, instance_id)
+            pnl = self._pnl(before, instance_id)
+            cash_balance = (
+                budget
+                - invested
+                + _signed_decimal(pnl.get("realized_pnl", 0), "MOCK_PNL_REALIZED_INVALID")
+                - _decimal(pnl.get("commission", 0), "MOCK_PNL_COMMISSION_INVALID")
+                - _decimal(pnl.get("mock_tax", 0), "MOCK_PNL_TAX_INVALID")
+            )
+            available = cash_balance - self._active_buy_reservation(before, instance_id)
             reserve = requested_price * quantity if requested_price is not None else available
             if available < 0 or reserve > available:
                 return self._blocked(before, command_id=command, instance_id=instance_id, reason="MOCK_EXECUTION_BUDGET_EXCEEDED", now_text=timestamp)
@@ -581,8 +602,29 @@ class MockVirtualExecutionEngine:
             position["holding_qty"] = new_qty
             position["average_price"] = 0 if new_qty == 0 else position["average_price"]
             position["realized_cost_basis"] = 0 if new_qty == 0 else _number(new_basis)
-            if document["session"].get("mock_tax_enabled") is True:
-                tax = gross * _decimal(document["session"].get("mock_tax_rate", 0), "MOCK_TAX_RATE_INVALID")
+            operation_root = document.get("mock_operation_lifecycle")
+            operation = (
+                operation_root.get("current")
+                if isinstance(operation_root, dict)
+                else None
+            )
+            operation_policy = (
+                operation.get("operation_policy_snapshot")
+                if isinstance(operation, dict)
+                else None
+            )
+            tax_policy = (
+                operation_policy
+                if isinstance(operation_policy, dict)
+                and "mock_tax_enabled" in operation_policy
+                and "mock_tax_rate" in operation_policy
+                else document["session"]
+            )
+            if tax_policy.get("mock_tax_enabled") is True:
+                tax = gross * _decimal(
+                    tax_policy.get("mock_tax_rate", 0),
+                    "MOCK_TAX_RATE_INVALID",
+                )
         order["filled_qty"] = int(order["filled_qty"]) + fill_qty
         order["remaining_qty"] = int(order["requested_qty"]) - int(order["filled_qty"])
         order["state"] = ORDER_FILLED if order["remaining_qty"] == 0 else ORDER_PARTIAL_FILL
@@ -599,10 +641,15 @@ class MockVirtualExecutionEngine:
                 order["reserved_budget"] = _number(max(Decimal(0), current_reserve - gross))
             if order["state"] == ORDER_FILLED:
                 order["reserved_budget"] = 0
-        pnl["realized_pnl"] = _number(_decimal(pnl.get("realized_pnl", 0), "MOCK_PNL_REALIZED_INVALID") + realized)
+        pnl["realized_pnl"] = _number(_signed_decimal(pnl.get("realized_pnl", 0), "MOCK_PNL_REALIZED_INVALID") + realized)
         pnl["commission"] = _number(_decimal(pnl.get("commission", 0), "MOCK_PNL_COMMISSION_INVALID") + commission)
         pnl["mock_tax"] = _number(_decimal(pnl.get("mock_tax", 0), "MOCK_PNL_TAX_INVALID") + tax)
-        gross_pnl = _decimal(pnl["realized_pnl"], "MOCK_PNL_REALIZED_INVALID") + _decimal(pnl.get("unrealized_pnl", 0), "MOCK_PNL_UNREALIZED_INVALID")
+        mark_unrealized = (
+            (price - _decimal(position.get("average_price", 0), "MOCK_POSITION_AVERAGE_PRICE_INVALID"))
+            * int(position.get("holding_qty", 0) or 0)
+        )
+        pnl["unrealized_pnl"] = _number(mark_unrealized)
+        gross_pnl = _signed_decimal(pnl["realized_pnl"], "MOCK_PNL_REALIZED_INVALID") + mark_unrealized
         pnl["gross_pnl"] = _number(gross_pnl)
         pnl["net_pnl"] = _number(gross_pnl - _decimal(pnl["commission"], "MOCK_PNL_COMMISSION_INVALID") - _decimal(pnl["mock_tax"], "MOCK_PNL_TAX_INVALID"))
         pnl["updated_at"] = timestamp
@@ -644,6 +691,58 @@ class MockVirtualExecutionEngine:
         position = self._position(document, instance_id)
         reserved = self._active_sell_reservation(document, instance_id)
         position["available_qty"] = max(0, int(position["holding_qty"]) - reserved)
+
+    def mark_to_market(
+        self,
+        session_id: str,
+        routine_instance_id: str,
+        *,
+        current_price: int | float,
+        market_identity: str,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update the existing isolated PnL ledger from one fresh market fact."""
+        command = clean_text(command_id) or new_mock_identity("MC")
+        before = self.repository.read_session(session_id)
+        instance_id = self._instance(before, routine_instance_id)
+        self._progression(before, instance_id)
+        previous = self._command_result(before, command)
+        if previous is not None:
+            return {"status": RESULT_NOOP, "duplicate": True, "document": before}
+        price = _decimal(current_price, "MOCK_MARK_TO_MARKET_PRICE_INVALID", positive=True)
+        identity = clean_text(market_identity)
+        if not identity:
+            raise MockValidationError("MOCK_MARK_TO_MARKET_IDENTITY_MISSING")
+        timestamp = self._now().isoformat(timespec="microseconds")
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            position = self._position(document, instance_id)
+            pnl = self._pnl(document, instance_id)
+            quantity = int(position.get("holding_qty", 0) or 0)
+            average = _decimal(position.get("average_price", 0), "MOCK_POSITION_AVERAGE_PRICE_INVALID")
+            unrealized = (price - average) * quantity if quantity > 0 else Decimal(0)
+            realized = _signed_decimal(pnl.get("realized_pnl", 0), "MOCK_PNL_REALIZED_INVALID")
+            commission = _decimal(pnl.get("commission", 0), "MOCK_PNL_COMMISSION_INVALID")
+            tax = _decimal(pnl.get("mock_tax", 0), "MOCK_PNL_TAX_INVALID")
+            gross = realized + unrealized
+            pnl.update({
+                "unrealized_pnl": _number(unrealized),
+                "gross_pnl": _number(gross),
+                "net_pnl": _number(gross - commission - tax),
+                "updated_at": timestamp,
+                "market_identity": identity,
+                "mark_price": _number(price),
+            })
+            document["applied_commands"][command] = {
+                "operation": "VIRTUAL_MARK_TO_MARKET",
+                "applied_at": timestamp,
+                "entity_id": instance_id,
+                "market_identity": identity,
+            }
+            return document
+
+        result = self.repository.mutate_session(session_id, mutation, expected_revision=before["revision"])
+        return {"status": RESULT_PROGRESS, "duplicate": False, **result}
 
     def process_orderbook(
         self,
@@ -880,6 +979,7 @@ class MockVirtualExecutionEngine:
         return service.stop_for_instance_error(
             session_id, source_routine_instance_id=routine_instance_id,
             reason_code=reason_code, reason=reason, command_id=command_id,
+            source_category="MOCK_VIRTUAL_EXECUTION",
         )
 
 

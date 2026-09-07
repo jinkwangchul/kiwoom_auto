@@ -8,9 +8,7 @@ gui_ats_utils.py
 
 from __future__ import annotations
 
-from copy import deepcopy
 from datetime import datetime
-import math
 from typing import Callable
 
 from state_policy import (
@@ -20,24 +18,7 @@ from state_policy import (
     read_operation_policy,
     seconds_from_hhmmss,
 )
-from manual_ats_runtime import (
-    INVALID_ATS_EXECUTION_METHOD,
-    manual_ats_runtime_execution_method_result,
-    manual_ats_runtime_selected_keys,
-    normalize_manual_ats_execution_method,
-)
-
-
-ATS_EXECUTION_METHOD_LABELS = {
-    "ROUTINE": "루틴",
-    "MARKET": "시장가",
-    "CURRENT_PRICE": "현재가",
-}
-
-
-def manual_ats_execution_method_label(value: object) -> str:
-    normalized = normalize_manual_ats_execution_method(value)
-    return ATS_EXECUTION_METHOD_LABELS.get(normalized or "", "")
+from manual_ats_runtime import manual_ats_runtime_selected_keys
 
 
 def manual_ats_session_labels() -> dict[str, str]:
@@ -385,101 +366,6 @@ def auto_trade_operation_activation_phase(
         "ats_session_active": ats_active,
         "regular_session_active": regular_active,
         "session_phase": phase,
-    }
-
-
-def project_manual_ats_execution_order(
-    order: dict[str, object],
-    config: dict[str, object],
-    state: dict[str, object],
-    *,
-    now_dt: datetime | None = None,
-    current_price: object = None,
-    current_price_getter: Callable[[str], object] | None = None,
-    session_phase: dict[str, object] | None = None,
-) -> dict[str, object]:
-    """Apply the persisted ATS method to one existing BUY/SELL order in memory."""
-    original = deepcopy(order) if isinstance(order, dict) else {}
-    phase = session_phase or auto_trade_operation_session_phase(
-        config if isinstance(config, dict) else {},
-        state if isinstance(state, dict) else {},
-        now_dt=now_dt,
-    )
-    base = {
-        "ok": True,
-        "applied": False,
-        "execution_method": "ROUTINE",
-        "order": original,
-        "reason_code": "ATS_EXECUTION_METHOD_NOT_ACTIVE",
-        "session_phase": phase,
-    }
-    side = str(original.get("side") or "").strip().upper()
-    if side not in {"BUY", "SELL"} or not ats_execution_method_active_for_phase(phase):
-        return base
-
-    method_result = manual_ats_runtime_execution_method_result(state)
-    if method_result.get("ok") is not True:
-        return {
-            **base,
-            "ok": False,
-            "execution_method": None,
-            "reason_code": INVALID_ATS_EXECUTION_METHOD,
-            "blocked_reasons": [INVALID_ATS_EXECUTION_METHOD],
-            "method_result": method_result,
-        }
-
-    method = str(method_result.get("execution_method") or "ROUTINE")
-    if method == "ROUTINE":
-        return {
-            **base,
-            "execution_method": method,
-            "reason_code": "ATS_EXECUTION_METHOD_ROUTINE",
-            "method_result": method_result,
-        }
-
-    effective = deepcopy(original)
-    order_intent = effective.get("order_intent")
-    intent = deepcopy(order_intent) if isinstance(order_intent, dict) else {}
-    if method == "MARKET":
-        effective["price"] = 0
-        intent["hoga"] = "MARKET"
-    else:
-        if current_price is None and callable(current_price_getter):
-            try:
-                current_price = current_price_getter(
-                    str(original.get("code") or "").strip().lstrip("A")
-                )
-            except Exception:
-                current_price = None
-        if isinstance(current_price, bool):
-            valid_price = False
-        else:
-            try:
-                numeric_price = float(current_price)
-                valid_price = math.isfinite(numeric_price) and numeric_price > 0
-            except (TypeError, ValueError):
-                valid_price = False
-        if not valid_price:
-            return {
-                **base,
-                "ok": False,
-                "execution_method": method,
-                "reason_code": "ATS_CURRENT_PRICE_UNAVAILABLE",
-                "blocked_reasons": ["ATS_CURRENT_PRICE_UNAVAILABLE"],
-                "method_result": method_result,
-                "current_price": current_price,
-            }
-        effective["price"] = int(numeric_price) if numeric_price.is_integer() else numeric_price
-        intent["hoga"] = "CURRENT_PRICE"
-    effective["order_intent"] = intent
-    return {
-        **base,
-        "applied": True,
-        "execution_method": method,
-        "order": effective,
-        "reason_code": f"ATS_EXECUTION_METHOD_{method}_APPLIED",
-        "method_result": method_result,
-        "current_price": current_price if method == "CURRENT_PRICE" else None,
     }
 
 

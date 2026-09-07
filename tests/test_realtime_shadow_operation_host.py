@@ -13,7 +13,6 @@ import gui_main_table_loader as main_loader
 from budget_command import inspect_budget_value_entry
 from candle_timeframe_aggregation import SEOUL_TIMEZONE
 from gui_auto_trade_operation_host import AutoTradeOperationHost
-from gui_ats_utils import project_manual_ats_execution_order
 from gui_market_data_host import (
     HighResolutionMarketState,
     InitialMarketSnapshotState,
@@ -572,35 +571,11 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
         self.assertEqual(70_000, morning.last_price)
         self.assertEqual(70_000, late.last_price)
 
-    def test_budget_command_and_ats_current_price_share_actionable_result(self) -> None:
+    def test_budget_command_uses_actionable_market_result(self) -> None:
         stock_dir = Path("stocks/005930_삼성전자")
         request = stock_dir / "config.json"
         self.market._initial_market_snapshot_states["005930"] = self._snapshot()
         window = SimpleNamespace(main_monitoring_auto_trade_operation_host=lambda: self.host)
-        phase = {
-            "evaluable": True,
-            "mode": "CONTINUOUS",
-            "phase": "ACTIVE_SESSION",
-            "active": True,
-            "active_sessions": ("extra1",),
-            "future_session_exists": False,
-            "final_session_ended": False,
-            "sessions": (),
-            "invalid_sessions": (),
-        }
-        order = {
-            "code": "005930",
-            "side": "BUY",
-            "price": 1,
-            "order_intent": {"side": "BUY", "hoga": "LIMIT"},
-        }
-        state = {
-            "manual_ats_selection": {
-                "selected_sessions": ["extra1"],
-                "execution_method": "CURRENT_PRICE",
-            }
-        }
-
         fresh_price = self.market.fresh_monitoring_market_information_state
         configuration_price = self.market.configuration_market_information_state
         with patch.object(
@@ -613,40 +588,16 @@ class ActionableRealtimePriceContractTests(unittest.TestCase):
             side_effect=lambda code: configuration_price(code, now_dt=self._now(30)),
         ):
             snapshot_budget = inspect_budget_value_entry(window, request)
-            snapshot_ats = project_manual_ats_execution_order(
-                order,
-                {"operation_mode": "CONTINUOUS"},
-                state,
-                current_price_getter=lambda code: getattr(
-                    self.host.fresh_monitoring_market_information_state(code),
-                    "last_price",
-                    None,
-                ),
-                session_phase=phase,
-            )
             self.market._high_resolution_market_states["005930"] = self._realtime(
                 day=30, price=73_000
             )
             realtime_budget = inspect_budget_value_entry(window, request)
-            realtime_ats = project_manual_ats_execution_order(
-                order,
-                {"operation_mode": "CONTINUOUS"},
-                state,
-                current_price_getter=lambda code: getattr(
-                    self.host.fresh_monitoring_market_information_state(code),
-                    "last_price",
-                    None,
-                ),
-                session_phase=phase,
-            )
 
         self.assertTrue(snapshot_budget["allowed"])
         self.assertEqual(72_000, snapshot_budget["current_price"])
         self.assertEqual("SNAPSHOT", snapshot_budget["price_source"])
-        self.assertEqual("ATS_CURRENT_PRICE_UNAVAILABLE", snapshot_ats["reason_code"])
         self.assertTrue(realtime_budget["allowed"])
         self.assertEqual("REALTIME", realtime_budget["price_source"])
-        self.assertEqual(73_000, realtime_ats["order"]["price"])
 
 
 class RealtimeSyncFailureIsolationTests(unittest.TestCase):

@@ -610,6 +610,45 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             ),
         )
 
+    def test_alphanumeric_initial_snapshot_populates_production_tooltip(self) -> None:
+        self.market.sync_monitoring_targets(("0009K0",))
+        self.assertEqual(
+            ("0009K0",),
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args.args[0],
+        )
+
+        self.market._on_initial_market_snapshot_result(
+            self._snapshot_result(stock_code="0009K0")
+        )
+        state = self.market.monitoring_market_information_state("0009K0")
+        tooltip = main_loader.main_stock_row_tooltip_from_projection(
+            {
+                "market": "KOSDAQ",
+                "stock_code": "0009K0",
+                "stock_name": "에임드바이오",
+                "nxt_available": True,
+                "stock_status": "정상",
+            },
+            state,
+        )
+
+        self.assertEqual("0009K0", state.stock_code)
+        self.assertIsNone(self.market.high_resolution_market_state("0009K0"))
+        for expected in (
+            "0009K0 에임드바이오",
+            "KOSDAQ",
+            "상태 정상",
+            "NXT",
+            "현재가 70,000",
+            "시가 69,000",
+            "고가 71,000",
+            "저가 68,000",
+            "등락률 +1.25%",
+            "전일대비 -12.43%",
+            "체결강도 117.2",
+        ):
+            self.assertIn(expected, tooltip)
+
     def test_realtime_fields_override_snapshot_and_blank_fields_keep_snapshot(self) -> None:
         observed: list[dict[str, object]] = []
         self.market.market_data_observed.connect(observed.append)

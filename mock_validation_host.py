@@ -16,7 +16,11 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from manual_ats_runtime import VALID_SESSION_KEYS
+
 from mock_validation_contract import (
+    INSTANCE_ERROR,
+    INSTANCE_VALIDATION_STOPPED,
     ORDER_CANCEL_PENDING,
     ORDER_OPEN,
     ORDER_PARTIAL_FILL,
@@ -27,6 +31,8 @@ from mock_validation_contract import (
     SESSION_WAITING,
     MockValidationError,
     deterministic_mock_identity,
+    instance_effective_settings,
+    new_mock_identity,
     normalized_stock_code,
     payload_hash,
 )
@@ -43,6 +49,8 @@ from mock_validation_operation_lifecycle import (
     CLOSE_CURRENT_PRICE,
     CLOSE_MARKET,
     MockOperationLifecycleCoordinator,
+    OPERATION_CLOSING,
+    instance_operation_state,
 )
 from mock_validation_repository import MockValidationRepository
 from mock_validation_session_service import MockValidationSessionService
@@ -450,6 +458,10 @@ class MockValidationHost:
                 deepcopy(item)
                 for item in current.get("orders", ())
                 if item.get("state") in _LIVE_ORDER_STATES
+                and current.get("instance_execution", {})
+                .get(item.get("routine_instance_id"), {})
+                .get("state")
+                not in {INSTANCE_ERROR, INSTANCE_VALIDATION_STOPPED}
             ]
             for order in live_orders:
                 command = deterministic_mock_identity(
@@ -459,6 +471,12 @@ class MockValidationHost:
                     evidence.content_identity,
                     evidence.kind,
                 )
+                instance_state = (
+                    current.get("instance_execution", {})
+                    .get(order.get("routine_instance_id"), {})
+                    .get("state")
+                )
+                order_allow_closing = allow_closing or instance_state == SESSION_CLOSING
                 if evidence.kind == "ORDERBOOK":
                     self.engine.process_orderbook(
                         current["session"]["validation_session_id"],
@@ -466,7 +484,7 @@ class MockValidationHost:
                         market=self._market_for_orderbook(evidence.payload),
                         policy=policy,
                         command_id=command,
-                        allow_closing=allow_closing,
+                        allow_closing=order_allow_closing,
                     )
                 else:
                     self.engine.process_trade(
@@ -475,50 +493,168 @@ class MockValidationHost:
                         trade=evidence.payload,
                         policy=policy,
                         command_id=command,
-                        allow_closing=allow_closing,
+                        allow_closing=order_allow_closing,
                     )
 
-    def _review_error(self, document: dict[str, Any], reason: str) -> None:
+    def _review_error(
+        self,
+        document: dict[str, Any],
+        reason: str,
+        *,
+        routine_instance_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        """Isolate an execution error to its affected Mock Instance(s)."""
+
         session_id = document["session"]["validation_session_id"]
-        if document["session"].get("state") in {SESSION_REVIEW_STOPPED, SESSION_ENDED}:
+        if document["session"].get("state") == SESSION_ENDED:
             return
-        instance_ids = sorted(document.get("instance_execution", {}))
+        instance_ids = list(
+            routine_instance_ids
+            if routine_instance_ids is not None
+            else tuple(sorted(document.get("instance_execution", {})))
+        )
         if not instance_ids:
             return
-        command = deterministic_mock_identity("MC", session_id, reason, "HOST_REVIEW")
-        self.session_service.stop_for_instance_error(
-            session_id,
-            source_routine_instance_id=instance_ids[0],
-            reason_code=reason,
-            reason=reason,
-            command_id=command,
-        )
+        for instance_id in instance_ids:
+            command = deterministic_mock_identity(
+                "MC", session_id, instance_id, reason, "HOST_INSTANCE_ERROR"
+            )
+            self.session_service.stop_for_instance_error(
+                session_id,
+                source_routine_instance_id=instance_id,
+                reason_code=reason,
+                reason=reason,
+                command_id=command,
+                source_category="MOCK_HOST",
+            )
 
     def _operation_snapshot(self) -> dict[str, Any]:
         source = self._operation_policy_provider()
         policy = deepcopy(source) if isinstance(source, dict) else {}
-        review = policy.get("review_policy")
-        policy["long_hold_enabled"] = bool(
-            isinstance(review, dict) and review.get("long_term_holding_enabled") is True
-        )
+        # Mock positions are always allowed to carry independently.  Production
+        # Review/long-hold policy is not an authority for the Mock domain.
+        policy["long_hold_enabled"] = True
         return policy
+
+    @staticmethod
+    def _enabled_extra_session_keys(policy: dict[str, Any]) -> tuple[str, ...]:
+        sessions = policy.get("extra_sessions")
+        if not isinstance(sessions, list):
+            return VALID_SESSION_KEYS
+        return tuple(
+            key
+            for index, key in enumerate(VALID_SESSION_KEYS)
+            if index >= len(sessions)
+            or not isinstance(sessions[index], dict)
+            or bool(sessions[index].get("enabled", True))
+        )
+
+    def _instance_effective_settings(
+        self,
+        document: dict[str, Any],
+        instance_id: str,
+        *,
+        operation_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        settings = instance_effective_settings(document, instance_id)
+        raw_by_instance = document.get("effective_settings_by_instance")
+        raw = (
+            raw_by_instance.get(instance_id)
+            if isinstance(raw_by_instance, dict)
+            else None
+        )
+        if (
+            isinstance(raw, dict)
+            and str(raw.get("operation_mode") or "").strip().upper() == "MANUAL_ATS"
+            and "manual_ats" not in raw
+        ):
+            policy = (
+                operation_policy
+                if isinstance(operation_policy, dict)
+                else self._operation_policy_provider()
+            )
+            settings["manual_ats"]["selected_sessions"] = list(
+                self._enabled_extra_session_keys(
+                    policy if isinstance(policy, dict) else {}
+                )
+            )
+        return settings
 
     def start_stock_operation(self, stock_code: Any, *, as_of: datetime | None = None) -> dict[str, Any]:
         document = self.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        self.session_service.sync_common_tax_to_waiting_session(
+            document["session"]["validation_session_id"]
+        )
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
         now = as_of or self._now()
+        operation_policy = self._operation_snapshot()
         result = self.lifecycle.start_stock_operation(
             document["session"]["validation_session_id"],
             trading_date=now.date(),
             as_of=now,
             operation_policy_snapshot={
-                **self._operation_snapshot(),
+                **operation_policy,
                 "mock_tax_enabled": document["session"]["mock_tax_enabled"],
                 "mock_tax_rate": document["session"]["mock_tax_rate"],
+                "mock_effective_settings_by_instance": {
+                    instance_id: self._instance_effective_settings(
+                        document,
+                        instance_id,
+                        operation_policy=operation_policy,
+                    )
+                    for instance_id in document["instance_execution"]
+                },
             },
             command_id=deterministic_mock_identity(
                 "MC", document["session"]["validation_session_id"], now.date(), "OPERATION_START"
+            ),
+        )
+        self._publish_projection_if_changed()
+        return result
+
+    def start_instance_operation(
+        self,
+        stock_code: Any,
+        routine_instance_id: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        if document["session"].get("state") == SESSION_WAITING:
+            self.session_service.sync_common_tax_to_waiting_session(
+                document["session"]["validation_session_id"]
+            )
+            document = self.current_session(stock_code)
+            if document is None:
+                raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        now = as_of or self._now()
+        session_id = document["session"]["validation_session_id"]
+        operation_policy = self._operation_snapshot()
+        result = self.lifecycle.start_instance_operation(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            trading_date=now.date(),
+            as_of=now,
+            operation_policy_snapshot={
+                **operation_policy,
+                "mock_tax_enabled": document["session"]["mock_tax_enabled"],
+                "mock_tax_rate": document["session"]["mock_tax_rate"],
+                "mock_instance_effective_settings": self._instance_effective_settings(
+                    document,
+                    routine_instance_id,
+                    operation_policy=operation_policy,
+                ),
+            },
+            command_id=deterministic_mock_identity(
+                "MC", session_id, routine_instance_id,
+                document.get("revision", 0),
+                now.isoformat(timespec="microseconds"), "INSTANCE_OPERATION_START",
             ),
         )
         self._publish_projection_if_changed()
@@ -543,8 +679,40 @@ class MockValidationHost:
         self._publish_projection_if_changed()
         return result
 
+    def request_instance_early_close(
+        self,
+        stock_code: Any,
+        routine_instance_id: str,
+        *,
+        method: str = CLOSE_MARKET,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        now = as_of or self._now()
+        session_id = document["session"]["validation_session_id"]
+        result = self.lifecycle.request_instance_early_close(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            method=method,
+            reason="사용자 Instance 조기마감",
+            as_of=now,
+            command_id=deterministic_mock_identity(
+                "MC", session_id, routine_instance_id,
+                document.get("revision", 0),
+                now.isoformat(timespec="microseconds"), "INSTANCE_EARLY_CLOSE",
+            ),
+        )
+        self._publish_projection_if_changed()
+        return result
+
     def request_immediate_liquidation(
-        self, stock_code: Any, *, as_of: datetime | None = None
+        self,
+        stock_code: Any,
+        *,
+        method: str = CLOSE_MARKET,
+        as_of: datetime | None = None,
     ) -> dict[str, Any]:
         document = self.current_session(stock_code)
         if document is None:
@@ -559,11 +727,106 @@ class MockValidationHost:
             command_id=deterministic_mock_identity(
                 "MC", document["session"]["validation_session_id"], operation_id, "IMMEDIATE_LIQUIDATION"
             ),
-            method=CLOSE_MARKET,
+            method=method,
             reason="사용자 즉시청산",
         )
         self._publish_projection_if_changed()
         return result
+
+    def request_instance_immediate_liquidation(
+        self,
+        stock_code: Any,
+        routine_instance_id: str,
+        *,
+        method: str = CLOSE_MARKET,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        now = as_of or self._now()
+        session_id = document["session"]["validation_session_id"]
+        result = self.lifecycle.request_instance_immediate_liquidation(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            method=method,
+            reason="사용자 Instance 즉시청산",
+            as_of=now,
+            command_id=deterministic_mock_identity(
+                "MC", session_id, routine_instance_id,
+                document.get("revision", 0),
+                now.isoformat(timespec="microseconds"),
+                "INSTANCE_IMMEDIATE_LIQUIDATION",
+            ),
+        )
+        self._publish_projection_if_changed()
+        return result
+
+    def stop_instance_validation(
+        self,
+        stock_code: Any,
+        routine_instance_id: str,
+        *,
+        command_id: str | None = None,
+        source: str = "OPERATOR_UI",
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        now = self._now().isoformat(timespec="microseconds")
+        result = self.session_service.stop_instance_validation(
+            document["session"]["validation_session_id"],
+            routine_instance_id=routine_instance_id,
+            command_id=command_id or new_mock_identity("MC"),
+            source=source,
+            requested_at=now,
+        )
+        self._publish_projection_if_changed()
+        return result
+
+    def instance_context_state(
+        self, stock_code: Any, routine_instance_id: str
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            return {"current": False}
+        instance_id = str(routine_instance_id or "").strip()
+        execution = document.get("instance_execution", {}).get(instance_id)
+        if not isinstance(execution, dict):
+            return {"current": False}
+        operation = instance_operation_state(document, instance_id)
+        operation_state = operation.get("state", "") if operation else ""
+        session_state = document["session"].get("state", "")
+        root = document.get("mock_operation_lifecycle")
+        stock_operation = root.get("current") if isinstance(root, dict) else None
+        stock_operation_active = (
+            isinstance(stock_operation, dict)
+            and stock_operation.get("state") in {"RUNNING", "CLOSING"}
+        )
+        ended = session_state == SESSION_ENDED or execution.get("state") == SESSION_ENDED
+        return {
+            "current": True,
+            "validation_session_id": document["session"]["validation_session_id"],
+            "routine_instance_id": instance_id,
+            "state": execution.get("state", ""),
+            "operation_state": operation_state,
+            "can_start": (
+                not ended
+                and not stock_operation_active
+                and session_state in {SESSION_WAITING, SESSION_RUNNING}
+                and execution.get("state") == SESSION_WAITING
+                and operation_state not in {"RUNNING", "CLOSING", "ENDED"}
+            ),
+            "can_early_close": operation_state == "RUNNING",
+            "can_immediate": operation_state in {"RUNNING", "CLOSING"},
+            "can_validation_stop": execution.get("state") in {
+                SESSION_RUNNING,
+                SESSION_CLOSING,
+                INSTANCE_ERROR,
+            },
+            "can_chart": not ended,
+            "can_reset": not ended,
+        }
 
     @staticmethod
     def _operation(document: dict[str, Any]) -> dict[str, Any] | None:
@@ -591,7 +854,7 @@ class MockValidationHost:
             raise MockValidationError("MOCK_LIQUIDATION_MINUTES_INVALID")
         now_seconds = now.hour * 3600 + now.minute * 60 + now.second
         session_id = document["session"]["validation_session_id"]
-        long_hold = bool(snapshot.get("long_hold_enabled", False))
+        long_hold = True
         auto_enabled = snapshot.get("auto_close_enabled", True) is not False
         if auto_enabled and now_seconds >= max(0, end_seconds - minutes * 60) and now_seconds < end_seconds:
             self.lifecycle.request_auto_close(
@@ -612,12 +875,120 @@ class MockValidationHost:
                 long_hold_enabled=long_hold,
             )
 
+    @staticmethod
+    def _seconds_in_window(now_seconds: int, start: Any, end: Any) -> bool:
+        start_seconds = _clock_seconds(start)
+        end_seconds = _clock_seconds(end)
+        if start_seconds is None or end_seconds is None or start_seconds == end_seconds:
+            return False
+        if start_seconds < end_seconds:
+            return start_seconds <= now_seconds < end_seconds
+        return now_seconds >= start_seconds or now_seconds < end_seconds
+
+    def _mock_market_session_phase(
+        self,
+        settings: dict[str, Any],
+        now: datetime,
+    ) -> tuple[bool, bool]:
+        mode = str(settings.get("operation_mode") or "").strip().upper()
+        if mode == "SCHEDULED":
+            return True, False
+        policy = self._operation_policy_provider()
+        policy = policy if isinstance(policy, dict) else {}
+        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
+        regular = policy.get("regular_market")
+        if isinstance(regular, dict) and self._seconds_in_window(
+            now_seconds,
+            regular.get("start_time", "09:00:00"),
+            regular.get("end_time", "15:20:00"),
+        ):
+            return True, False
+        if mode != "CONTINUOUS":
+            return False, False
+        manual_ats = settings.get("manual_ats")
+        selected = set(
+            manual_ats.get("selected_sessions", ())
+            if isinstance(manual_ats, dict)
+            else ()
+        )
+        if not selected:
+            return False, False
+        sessions = policy.get("extra_sessions")
+        if not isinstance(sessions, list):
+            return False, False
+        for index, session in enumerate(sessions[: len(VALID_SESSION_KEYS)]):
+            key = VALID_SESSION_KEYS[index]
+            if (
+                key in selected
+                and isinstance(session, dict)
+                and session.get("enabled", True) is not False
+                and self._seconds_in_window(
+                    now_seconds,
+                    session.get("start_time"),
+                    session.get("end_time"),
+                )
+            ):
+                return True, True
+        return False, False
+
+    def _mock_market_session_open(
+        self,
+        settings: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        return self._mock_market_session_phase(settings, now)[0]
+
+    def _operation_effective_settings(
+        self, document: dict[str, Any], instance_id: str
+    ) -> dict[str, Any]:
+        operation = instance_operation_state(document, instance_id)
+        snapshot = (
+            operation.get("operation_policy_snapshot")
+            if isinstance(operation, dict)
+            else None
+        )
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        direct = snapshot.get("mock_instance_effective_settings")
+        if isinstance(direct, dict):
+            return deepcopy(direct)
+        by_instance = snapshot.get("mock_effective_settings_by_instance")
+        if isinstance(by_instance, dict) and isinstance(by_instance.get(instance_id), dict):
+            return deepcopy(by_instance[instance_id])
+        return self._instance_effective_settings(document, instance_id)
+
+    def _auto_start_scheduled_instances(
+        self, document: dict[str, Any], now: datetime
+    ) -> dict[str, Any]:
+        session_id = document["session"]["validation_session_id"]
+        if document["session"].get("state") not in {SESSION_WAITING, SESSION_RUNNING}:
+            return document
+        stock_code = document["session"]["stock_code"]
+        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
+        for instance_id in sorted(document.get("instance_execution", {})):
+            current = self.repository.read_session(session_id)
+            execution = current.get("instance_execution", {}).get(instance_id, {})
+            if execution.get("state") != SESSION_WAITING:
+                continue
+            settings = instance_effective_settings(current, instance_id)
+            if settings.get("operation_mode") != "SCHEDULED":
+                continue
+            schedule = settings["operation_schedule"]
+            if not self._seconds_in_window(
+                now_seconds,
+                schedule["start_time"],
+                schedule["end_buy_time"],
+            ):
+                continue
+            self.start_instance_operation(stock_code, instance_id, as_of=now)
+        return self.repository.read_session(session_id)
+
     def _process_stock(self, document: dict[str, Any], now: datetime) -> None:
         stock_code = document["session"]["stock_code"]
         reason = self._integrity_errors.pop(stock_code, "")
         if reason:
             self._review_error(document, reason)
             return
+        document = self._auto_start_scheduled_instances(document, now)
         state = document["session"]["state"]
         if state in {SESSION_WAITING, SESSION_REVIEW_STOPPED, SESSION_ENDED}:
             # Keep the transport buffer bounded, but never advance an order in
@@ -633,16 +1004,70 @@ class MockValidationHost:
                 candles = self._candles_provider(document)
                 second_identity = now.replace(microsecond=0).isoformat()
                 for instance_id in sorted(document.get("instance_execution", {})):
-                    self.routine_adapter.evaluate_cycle(
+                    current = self.repository.read_session(session_id)
+                    execution = current.get("instance_execution", {}).get(instance_id, {})
+                    if execution.get("progression_allowed") is not True:
+                        continue
+                    settings = self._operation_effective_settings(current, instance_id)
+                    market_open, _ats_active = self._mock_market_session_phase(
+                        settings, now
+                    )
+                    if not market_open:
+                        continue
+                    schedule = settings["operation_schedule"]
+                    now_seconds = now.hour * 3600 + now.minute * 60 + now.second
+                    new_buy_allowed = (
+                        settings.get("operation_mode") != "SCHEDULED"
+                        or self._seconds_in_window(
+                            now_seconds,
+                            schedule["start_time"],
+                            schedule["end_buy_time"],
+                        )
+                    )
+                    try:
+                        self.routine_adapter.evaluate_cycle(
+                            session_id,
+                            routine_instance_id=instance_id,
+                            candles=candles,
+                            market=market,
+                            policy=policy,
+                            evaluation_cycle_id=deterministic_mock_identity(
+                                "MC", session_id, instance_id, second_identity, "ROUTINE"
+                            ),
+                            evaluated_at=now,
+                            new_buy_allowed=new_buy_allowed,
+                        )
+                    except Exception as exc:
+                        reason = str(exc) or type(exc).__name__
+                        self._review_error(
+                            current,
+                            reason,
+                            routine_instance_ids=(instance_id,),
+                        )
+            if policy is not None:
+                refreshed = self.repository.read_session(session_id)
+                root = refreshed.get("mock_operation_lifecycle")
+                operations = (
+                    root.get("instance_operations", {})
+                    if isinstance(root, dict)
+                    else {}
+                )
+                for instance_id in sorted(operations):
+                    current = self.repository.read_session(session_id)
+                    operation = instance_operation_state(current, instance_id)
+                    if not operation or operation.get("state") != OPERATION_CLOSING:
+                        continue
+                    self.lifecycle.process_instance_operation_cycle(
                         session_id,
                         routine_instance_id=instance_id,
-                        candles=candles,
+                        lifecycle_cycle_id=deterministic_mock_identity(
+                            "MC", session_id, instance_id,
+                            now.replace(microsecond=0).isoformat(),
+                            "INSTANCE_LIFECYCLE",
+                        ),
+                        as_of=now,
                         market=market,
                         policy=policy,
-                        evaluation_cycle_id=deterministic_mock_identity(
-                            "MC", session_id, instance_id, second_identity, "ROUTINE"
-                        ),
-                        evaluated_at=now,
                     )
             refreshed = self.repository.read_session(session_id)
             self._trigger_due_close(refreshed, now)
@@ -701,9 +1126,15 @@ class MockValidationHost:
                 "revision": document.get("revision"),
                 "session": document.get("session"),
                 "review": document.get("review"),
+                "instance_execution": document.get("instance_execution"),
+                "effective_settings_by_instance": document.get(
+                    "effective_settings_by_instance"
+                ),
+                "cycle_state_by_instance": document.get("cycle_state_by_instance"),
+                "progression_by_instance": document.get("progression_by_instance"),
                 "positions": document.get("positions"),
                 "pnl": document.get("pnl"),
-                "operation": self._operation(document),
+                "operation": document.get("mock_operation_lifecycle"),
             })
         return payload_hash(sessions)
 

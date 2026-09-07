@@ -287,6 +287,7 @@ class StockRecord:
 @dataclass(frozen=True)
 class RealtimeMonitoringUniverseProjection:
     target_stock_codes: tuple[str, ...]
+    initial_snapshot_target_stock_codes: tuple[str, ...]
     unsupported_stock_codes: tuple[str, ...]
     source_record_count: int
 
@@ -822,6 +823,7 @@ class StockRepository:
             target_stock_codes=tuple(
                 sorted(code for code in valid_codes if code not in unsupported)
             ),
+            initial_snapshot_target_stock_codes=tuple(sorted(valid_codes)),
             unsupported_stock_codes=unsupported,
             source_record_count=len(records),
         )

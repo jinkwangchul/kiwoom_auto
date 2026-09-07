@@ -43,6 +43,10 @@ class _UiPreferenceSettings:
 
 
 class RunningBudgetAdjustmentContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = gui_windows.QApplication.instance() or gui_windows.QApplication([])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.stock_dir = Path(self.temp.name) / "stocks" / "005930_삼성전자"
@@ -90,6 +94,59 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
             apply_limit=apply_limit,
             adjusted_limit_amount=adjusted_limit_amount,
             confirmed_at="2026-08-28 10:00:00",
+        )
+
+    def test_mock_context_reuses_dialog_and_only_removes_limit_option(self) -> None:
+        owner = gui_windows.QWidget()
+        self.addCleanup(owner.deleteLater)
+        common = {
+            "stock_code": "005930",
+            "stock_name": "삼성전자",
+            "current_price": 100,
+            "config": {"trade_amount_type": "AMOUNT", "buy_amount": 300},
+            "minimum_amount": 150,
+            "pending_adjustment": {
+                "apply_policy": "NEXT_CYCLE",
+            },
+            "timing_selection_enabled": True,
+            "configuration_price_available": True,
+        }
+        production = gui_windows.RunningBudgetAdjustmentDialog(
+            owner,
+            **common,
+        )
+        mock = gui_windows.RunningBudgetAdjustmentDialog(
+            owner,
+            **common,
+            show_limit_option=False,
+        )
+        self.addCleanup(production.deleteLater)
+        self.addCleanup(mock.deleteLater)
+
+        self.assertIsNotNone(production.apply_limit_checkbox)
+        self.assertEqual(
+            "한도금액에 새 설정값 적용",
+            production.apply_limit_checkbox.text(),
+        )
+        self.assertIsNone(mock.apply_limit_checkbox)
+        self.assertEqual(production.size(), mock.size())
+        self.assertEqual(
+            production.current_price_label.text(),
+            mock.current_price_label.text(),
+        )
+        self.assertEqual(production.current_badge.text(), mock.current_badge.text())
+        self.assertEqual(production.value_edit.text(), mock.value_edit.text())
+        self.assertTrue(production.next_cycle_checkbox.isChecked())
+        self.assertTrue(mock.next_cycle_checkbox.isChecked())
+        self.assertEqual(
+            0,
+            len(
+                [
+                    checkbox
+                    for checkbox in mock.findChildren(gui_windows.QCheckBox)
+                    if "한도금액" in checkbox.text()
+                ]
+            ),
         )
 
     def _project(self) -> tuple[dict[str, object], dict[str, object]]:

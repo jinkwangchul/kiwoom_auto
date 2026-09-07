@@ -43,6 +43,7 @@ from PyQt5.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QDoubleValidator,
     QIntValidator,
     QPainter,
     QPalette,
@@ -62,6 +63,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
@@ -138,6 +140,28 @@ class _DoubleClickActionButton(QPushButton):
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+
+class _InlineMockTaxRateEdit(QLineEdit):
+    """Commit an inline percentage on Enter/focus-out and restore on Escape."""
+
+    commitRequested = pyqtSignal()
+    cancelRequested = pyqtSignal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.commitRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.cancelRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.commitRequested.emit()
 
 
 class _TextOnlyPopupComboBox(QComboBox):
@@ -1373,12 +1397,16 @@ from gui_main_table_loader import (
     ROUTINE_MONITORING_HEADERS,
     ROUTINE_PARENT_AGGREGATE_ROLE,
     ROUTINE_PARENT_AGGREGATE_VALUES_ROLE,
+    ROUTINE_AGGREGATE_LEADING_GAP,
     ROUTINE_PARENT_PROFIT_ROLE,
     ROUTINE_PARENT_COLLAPSED_ROLE,
+    ROUTINE_MOCK_EFFECTIVE_SETTINGS_ROLE,
     ROUTINE_PARENT_NAME_ROLE,
     ROUTINE_COMPLETION_STATUSES,
     ROUTINE_ROW_CHILD,
     ROUTINE_ROW_KIND_ROLE,
+    ROUTINE_ROW_MOCK_INSTANCE,
+    ROUTINE_ROW_MOCK_STOCK,
     ROUTINE_ROW_PARENT,
     ROUTINE_ROW_STOCK,
     ROUTINE_PARENT_CHECKBOX_OFFSET,
@@ -1412,6 +1440,7 @@ from gui_main_table_loader import (
     main_group_instance_relation_id,
     main_stock_configuration_market_information_state,
     main_stock_fresh_market_information_state,
+    main_stock_resolved_initial_buy_display,
     main_stock_resolved_starting_budget,
     routine_instance_suggested_buy_limits,
     routine_stock_column_widths,
@@ -1423,11 +1452,13 @@ from gui_main_table_loader import (
     main_sort_running_table_by_column,
     main_load_routine_table,
     main_load_running_stock_table,
+    main_budget_display_auth_state,
     main_monitoring_table_font,
     main_monitoring_cell_font,
     main_stock_row_tooltip_from_projection,
     routine_instance_consumed_text,
     stock_buy_limit_state,
+    SERVER_AUTH_COMPLETE,
 )
 from routine_tree_title_display import tree_title_text
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
@@ -1459,6 +1490,8 @@ from gui_main_stock_context_menu import (
     execute_main_monitoring_selective_start,
     show_main_monitoring_stock_context_menu,
 )
+from gui_schedule_window import ScheduleOperationDialog
+from gui_config_utils import default_config
 from gui_auto_trade_context_menu import (
     CONTEXT_MENU_DANGER_TEXT_COLOR,
     set_menu_action_text_color,
@@ -1488,6 +1521,7 @@ from gui_auto_trade_status_ops import (
     auto_trade_set_stock_operation_exclusion,
     handle_auto_trade_operation_mode_double_click,
 )
+from state_policy import read_global_schedule
 from gui_routine_policy import can_unassign_active_routine_from_stock
 from group_complete_deletion_service import (
     collect_group_deletion_scope,
@@ -1497,6 +1531,8 @@ from group_pack_registration import register_group_pack
 from group_pack_packing import pack_group
 from gui_auto_trade_policy import (
     auto_trade_current_session_operation_participant_codes,
+    auto_trade_operation_display,
+    auto_trade_setting_liquidation_text,
     auto_trade_start_budget_current_running,
     auto_trade_start_budget_mutation_decision,
     operation_policy_section,
@@ -1546,6 +1582,7 @@ from runtime_io import read_json_dict
 from routine_order_permission import canonical_stock_trading_time_status
 from gui_operation_environment import (
     default_buffer_response_policy,
+    effective_amount_starting_budget,
     floor_money_to_won,
     read_buffer_response_policy,
     read_system_budget_policy,
@@ -1679,7 +1716,11 @@ from production_recovery_state_registry import (
 from startup_runtime_initializer import initialize_pristine_startup_runtime
 from operation_command_service import MODE_EARLY_CLOSE
 from close_liquidation_transition_service import POLICY_MARKET
-from mock_validation_contract import MockValidationError
+from mock_validation_contract import MockValidationError, instance_effective_settings
+from mock_validation_context_menu import (
+    mock_context_target_for_row,
+    show_mock_monitoring_context_menu,
+)
 from mock_validation_host import MockValidationHost
 from mock_validation_operation_lifecycle import mock_validation_end_eligibility
 from mock_validation_reference_snapshot import build_mock_reference_snapshot
@@ -1688,6 +1729,8 @@ from mock_validation_ui_projection import (
     MockEventReaderAdapter,
     mock_operation_start_exclusion_reason,
 )
+from mock_validation_quick_chart import open_mock_instance_quick_chart
+from manual_ats_runtime import VALID_SESSION_KEYS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -2306,6 +2349,36 @@ class _RoutineTreeInteractionController(QObject):
             cell_rect.height(),
         )
 
+    def _mock_stock_expand_rect(self, index) -> QRect:
+        cell_rect = self.table.visualRect(index)
+        arrow_font = QFont(self.table.font())
+        arrow_font.setBold(True)
+        arrow_width = QFontMetrics(arrow_font).horizontalAdvance("▶") + 4
+        return QRect(
+            cell_rect.left() + ROUTINE_STOCK_TEXT_OFFSET + 2,
+            cell_rect.top(),
+            arrow_width,
+            cell_rect.height(),
+        )
+
+    def _mock_instance_name_rect(self, index) -> QRect:
+        token_rect = self._stock_legacy_metric_rect(index, 0)
+        if token_rect.isNull():
+            return QRect()
+        name = str(index.data(Qt.DisplayRole) or "").strip()
+        left = (
+            token_rect.left()
+            + ROUTINE_CHILD_CHECKBOX_OFFSET
+            + ROUTINE_PROFIT_LED_BOX_SIZE
+            + ROUTINE_PROFIT_LED_GAP
+        )
+        return QRect(
+            left,
+            token_rect.top(),
+            QFontMetrics(self.table.font()).horizontalAdvance(name),
+            token_rect.height(),
+        )
+
     def _stock_metric_rect(self, index, target_column: int) -> QRect:
         if target_column == 11:
             return self._stock_main_metric_rect(index, 4)
@@ -2369,6 +2442,51 @@ class _RoutineTreeInteractionController(QObject):
             if index.isValid() and index.column() == 0:
                 cell_rect = self.table.visualRect(index)
                 row_kind = str(index.data(ROUTINE_ROW_KIND_ROLE) or "")
+                if row_kind == ROUTINE_ROW_MOCK_STOCK:
+                    if (
+                        event.type() == QEvent.MouseButtonPress
+                        and event.button() == Qt.LeftButton
+                        and self._mock_stock_expand_rect(index).contains(event.pos())
+                    ):
+                        self.window.toggle_mock_routine_stock_expansion(index.row())
+                        event.accept()
+                        return True
+                    return super().eventFilter(watched, event)
+                if (
+                    row_kind == ROUTINE_ROW_MOCK_INSTANCE
+                    and event.type() == QEvent.MouseButtonDblClick
+                    and event.button() == Qt.LeftButton
+                ):
+                    if self._mock_instance_name_rect(index).contains(event.pos()):
+                        target = mock_context_target_for_row(self.window, index.row())
+                        if target is not None and open_mock_instance_quick_chart(
+                            self.window, target
+                        ) is not None:
+                            event.accept()
+                            return True
+                        return super().eventFilter(watched, event)
+                    initial_buy_rect = self._stock_legacy_metric_rect(index, 1)
+                    initial_buy_parts = _initial_buy_component_rects(initial_buy_rect)
+                    if initial_buy_parts["badge"].contains(event.pos()):
+                        self.window.toggle_mock_routine_instance_initial_buy_mode(
+                            index.row()
+                        )
+                        event.accept()
+                        return True
+                    if initial_buy_parts["value"].contains(event.pos()):
+                        self.window.open_mock_routine_instance_initial_buy_dialog(
+                            index.row()
+                        )
+                        event.accept()
+                        return True
+                    operation_rect = self._stock_legacy_metric_rect(index, 2)
+                    if operation_rect.contains(event.pos()):
+                        self.window.toggle_mock_routine_instance_operation_mode(
+                            index.row()
+                        )
+                        event.accept()
+                        return True
+                    return super().eventFilter(watched, event)
                 if row_kind == ROUTINE_ROW_STOCK:
                     limit_rect = self._stock_metric_rect(index, 11)
                     if (
@@ -2591,6 +2709,16 @@ class _ClippedTextItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def _routine_stock_identity_indent(row_kind: object) -> int:
+    """Indent only a Mock child identity, never its following virtual slots."""
+
+    return (
+        ROUTINE_CHILD_CHECKBOX_OFFSET
+        if str(row_kind or "") == ROUTINE_ROW_MOCK_INSTANCE
+        else 0
+    )
+
+
 class _RoutineTreeItemDelegate(QStyledItemDelegate):
     """Paint the first-column hierarchy without text-based indentation."""
 
@@ -2700,7 +2828,86 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.CE_ItemViewItem, base_option, painter, option.widget)
 
         row_kind = str(index.data(ROUTINE_ROW_KIND_ROLE) or "")
-        if row_kind == ROUTINE_ROW_STOCK:
+        if row_kind == ROUTINE_ROW_MOCK_STOCK:
+            painter.save()
+            painter.setFont(option.font)
+            values = index.data(ROUTINE_STOCK_VALUES_ROLE)
+            if not isinstance(values, (list, tuple)):
+                values = [self.display_text(index, option.widget)]
+            display_tokens = index.data(ROUTINE_STOCK_DISPLAY_ROLE)
+            if not isinstance(display_tokens, (list, tuple)):
+                display_tokens = ()
+            token = self._stock_token(display_tokens, 0)
+            text = str(
+                token.get("text")
+                if token.get("text") not in (None, "")
+                else values[0] if values else ""
+            )
+            token_font = self._stock_token_font(option.font, token)
+            token_pen = self._stock_token_foreground(token, option, visually_enabled=True)
+            painter.setFont(token_font)
+            painter.setPen(token_pen)
+            start_x = option.rect.left() + ROUTINE_STOCK_TEXT_OFFSET + 2
+            metrics_data = index.data(ROUTINE_STOCK_METRICS_ROLE)
+            profit_metric = (
+                metrics_data[0]
+                if isinstance(metrics_data, (list, tuple)) and metrics_data
+                else None
+            )
+            profit_width = (
+                routine_instance_grid_columns(token_font)["profit"]
+                if profit_metric is not None
+                else 0
+            )
+            title_width = max(
+                0,
+                option.rect.right()
+                - start_x
+                - profit_width
+                - (ROUTINE_AGGREGATE_LEADING_GAP if profit_metric is not None else 0),
+            )
+            title_text = painter.fontMetrics().elidedText(
+                text,
+                Qt.ElideRight,
+                title_width,
+            )
+            painter.drawText(
+                QRect(start_x, option.rect.top(), title_width, option.rect.height()),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                title_text,
+            )
+            if profit_metric is not None:
+                profit_left = (
+                    start_x
+                    + painter.fontMetrics().horizontalAdvance(title_text)
+                    + ROUTINE_AGGREGATE_LEADING_GAP
+                )
+                profit_data = index.data(ROUTINE_PARENT_PROFIT_ROLE)
+                profit_color = (
+                    profit_data[1]
+                    if isinstance(profit_data, (list, tuple)) and len(profit_data) == 2
+                    else None
+                )
+                draw_stock_position_metric_display(
+                    painter,
+                    QRect(
+                        profit_left,
+                        option.rect.top(),
+                        profit_width,
+                        option.rect.height(),
+                    ),
+                    profit_metric,
+                    color=(
+                        token_pen
+                        if option.state & QStyle.State_Selected
+                        else profit_color
+                    ),
+                    outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
+                    show_label=True,
+                )
+            painter.restore()
+            return
+        if row_kind in {ROUTINE_ROW_STOCK, ROUTINE_ROW_MOCK_INSTANCE}:
             painter.save()
             painter.setFont(option.font)
             visually_enabled = index.data(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE) is not False
@@ -2757,7 +2964,8 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     visually_enabled=visually_enabled,
                 )
                 if column == 0:
-                    stock_led_left = cell_rect.left()
+                    identity_indent = _routine_stock_identity_indent(row_kind)
+                    stock_led_left = cell_rect.left() + identity_indent
                     _draw_routine_profit_led(
                         painter,
                         row_rect=option.rect,
@@ -2766,7 +2974,9 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         visually_enabled=visually_enabled,
                     )
                     text_rect = cell_rect.adjusted(
-                        ROUTINE_PROFIT_LED_BOX_SIZE + ROUTINE_PROFIT_LED_GAP,
+                        identity_indent
+                        + ROUTINE_PROFIT_LED_BOX_SIZE
+                        + ROUTINE_PROFIT_LED_GAP,
                         0,
                         -2,
                         0,
@@ -2811,16 +3021,20 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         )
                         painter.restore()
                     continue
-                if column == 1:
+                if column == 1 and row_kind in {
+                    ROUTINE_ROW_STOCK,
+                    ROUTINE_ROW_MOCK_INSTANCE,
+                }:
                     initial_buy = index.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
                     if not isinstance(initial_buy, dict):
                         initial_buy = {}
-                    _draw_initial_buy_display(
-                        painter,
-                        cell_rect,
-                        initial_buy,
-                    )
-                    continue
+                    if initial_buy:
+                        _draw_initial_buy_display(
+                            painter,
+                            cell_rect,
+                            initial_buy,
+                        )
+                        continue
                 if column == 3:
                     led_size = min(
                         ROUTINE_PROFIT_LED_SIZE,
@@ -2851,13 +3065,20 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     painter.setPen(token_pen)
                     if column == 7:
                         metric_texts = _routine_stock_metric_texts(
-                            list(values),
+                            (
+                                list(values)
+                                if row_kind == ROUTINE_ROW_STOCK
+                                else list(values[:10])
+                            ),
                             tuple(metrics_data),
-                            include_consumed=bool(
-                                getattr(
-                                    option.widget,
-                                    "_main_stock_limit_expanded",
-                                    False,
+                            include_consumed=(
+                                row_kind == ROUTINE_ROW_STOCK
+                                and bool(
+                                    getattr(
+                                        option.widget,
+                                        "_main_stock_limit_expanded",
+                                        False,
+                                    )
                                 )
                             ),
                         )
@@ -3432,6 +3653,7 @@ class RunningBudgetAdjustmentDialog(QDialog):
         timing_selection_enabled: bool = True,
         configuration_price_available: bool | None = None,
         apply_limit_checked: bool = False,
+        show_limit_option: bool = True,
     ) -> None:
         super().__init__(owner)
         self.stock_code = str(stock_code or "").strip()
@@ -3456,6 +3678,7 @@ class RunningBudgetAdjustmentDialog(QDialog):
             else None
         )
         self.timing_selection_enabled = bool(timing_selection_enabled)
+        self.show_limit_option = bool(show_limit_option)
         self.mode = (
             "AMOUNT"
             if str(self.config.get("trade_amount_type", "QUANTITY")).upper()
@@ -3615,14 +3838,16 @@ class RunningBudgetAdjustmentDialog(QDialog):
         root.addLayout(timing_row)
         root.addSpacing(9)
 
-        self.apply_limit_checkbox = QCheckBox("한도금액에 새 설정값 적용")
-        self.apply_limit_checkbox.setChecked(bool(apply_limit_checked))
-        limit_row = QHBoxLayout()
-        limit_row.setContentsMargins(checkbox_indent, 0, 0, 0)
-        limit_row.addWidget(self.apply_limit_checkbox)
-        limit_row.addStretch(1)
-        root.addLayout(limit_row)
-        root.addSpacing(9)
+        self.apply_limit_checkbox = None
+        if self.show_limit_option:
+            self.apply_limit_checkbox = QCheckBox("한도금액에 새 설정값 적용")
+            self.apply_limit_checkbox.setChecked(bool(apply_limit_checked))
+            limit_row = QHBoxLayout()
+            limit_row.setContentsMargins(checkbox_indent, 0, 0, 0)
+            limit_row.addWidget(self.apply_limit_checkbox)
+            limit_row.addStretch(1)
+            root.addLayout(limit_row)
+            root.addSpacing(9)
 
         self.validation_label = QLabel()
         self.validation_label.setStyleSheet("color: #B91C1C;")
@@ -3774,7 +3999,10 @@ class RunningBudgetAdjustmentDialog(QDialog):
                 if self.immediate_checkbox.isChecked()
                 else "NEXT_CYCLE"
             ),
-            "apply_limit": self.apply_limit_checkbox.isChecked(),
+            "apply_limit": bool(
+                self.apply_limit_checkbox is not None
+                and self.apply_limit_checkbox.isChecked()
+            ),
         }
         self.accept()
 
@@ -3946,6 +4174,7 @@ class MainWindow(QMainWindow):
         self._collapsed_routine_instance_ids: set[str] = set()
         self._collapsed_main_group_ids: set[str] = set()
         self._collapsed_main_group_instance_ids: set[str] = set()
+        self._collapsed_mock_validation_stock_keys: set[tuple[str, str]] = set()
         self._routine_definition_enabled: dict[str, bool] = {}
         self._routine_instance_selection: dict[str, bool] = {}
         self._routine_stock_selection: dict[str, bool] = {}
@@ -4018,6 +4247,7 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows = QPushButton("모든창닫기")
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
+        self.btn_review_manage = QPushButton("검토관리")
         self.btn_review_required = QPushButton()
         self.btn_market_data_monitoring = QPushButton("모니터링")
         self.btn_group_pack_register = QPushButton("그룹등록")
@@ -5053,6 +5283,12 @@ class MainWindow(QMainWindow):
         if bool(getattr(self, "_mock_validation_ui_enabled", False)):
             badge_specs.append(("mock", "모의"))
         for key, label_text in badge_specs:
+            if key == "mock":
+                mock_separator = create_summary_separator(
+                    "mainRoutineSummaryMockSeparator"
+                )
+                layout.addWidget(mock_separator)
+                self._main_routine_summary_mock_separator = mock_separator
             badge = (
                 getattr(self, "btn_review_required", None)
                 if key == "review"
@@ -5104,6 +5340,58 @@ class MainWindow(QMainWindow):
                     "mainRoutineSummaryStockSeparator"
                 )
                 layout.addWidget(stock_separator)
+
+            if key == "mock":
+                tax_badge = QFrame()
+                tax_badge.setObjectName("mainRoutineMockTaxRateBadge")
+                tax_layout = QHBoxLayout(tax_badge)
+                tax_layout.setContentsMargins(
+                    badge_horizontal_padding,
+                    0,
+                    badge_horizontal_padding,
+                    0,
+                )
+                tax_layout.setSpacing(badge_body_spacing)
+                tax_label = QLabel("적용세율")
+                tax_label.setObjectName("mainRoutineMockTaxRateLabel")
+                tax_label.setFont(summary_font)
+                tax_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                tax_edit = _InlineMockTaxRateEdit("0.20")
+                tax_edit.setObjectName("mainRoutineMockTaxRateEdit")
+                tax_edit.setFont(summary_font)
+                tax_edit.setAlignment(Qt.AlignCenter)
+                tax_edit.setFixedWidth(metrics.horizontalAdvance("000.00") + 2)
+                validator = QDoubleValidator(0.0, 100.0, 2, tax_edit)
+                validator.setNotation(QDoubleValidator.StandardNotation)
+                tax_edit.setValidator(validator)
+                # Normal scope starts disabled.  Do this before persistence
+                # signals are connected so construction cannot save defaults.
+                tax_edit.setEnabled(False)
+                tax_percent = QLabel("%")
+                tax_percent.setObjectName("mainRoutineMockTaxRatePercent")
+                tax_percent.setFont(summary_font)
+                tax_percent.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                tax_layout.addWidget(tax_label)
+                tax_layout.addWidget(tax_edit)
+                tax_layout.addWidget(tax_percent)
+                tax_width = (
+                    badge_horizontal_padding * 2
+                    + metrics.horizontalAdvance("적용세율")
+                    + tax_edit.width()
+                    + metrics.horizontalAdvance("%")
+                    + badge_body_spacing * 2
+                )
+                tax_badge.setFixedSize(tax_width, badge_height)
+                tax_edit.commitRequested.connect(
+                    lambda: MainWindow._commit_main_mock_tax_rate(self)
+                )
+                tax_edit.cancelRequested.connect(
+                    lambda: MainWindow._cancel_main_mock_tax_rate_edit(self)
+                )
+                layout.addWidget(tax_badge)
+                self._main_routine_mock_tax_rate_badge = tax_badge
+                self._main_routine_mock_tax_rate_edit = tax_edit
+                self._main_routine_mock_tax_rate_saved_text = "0.20"
 
         self._main_routine_summary_count_labels = count_labels
         self._main_routine_summary_count_buttons = count_buttons
@@ -5214,6 +5502,58 @@ class MainWindow(QMainWindow):
                 f" color: {color}; border: none; background: transparent; padding: 0;"
                 "}"
             )
+        tax_badge = getattr(
+            self,
+            "_main_routine_mock_tax_rate_badge",
+            None,
+        )
+        if tax_badge is not None:
+            mock_active = bool(active_by_key["mock"])
+            was_active = bool(
+                getattr(self, "_main_routine_mock_tax_rate_badge_active", False)
+            )
+            was_initialized = bool(
+                getattr(self, "_main_routine_mock_tax_rate_badge_initialized", False)
+            )
+            tax_badge.setVisible(True)
+            tax_badge.setEnabled(mock_active)
+            tax_edit = getattr(self, "_main_routine_mock_tax_rate_edit", None)
+            if tax_edit is not None:
+                tax_edit.setEnabled(mock_active)
+            tax_badge.setStyleSheet(
+                "QFrame#mainRoutineMockTaxRateBadge {"
+                " background-color: transparent;"
+                f" border: 1px solid {AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR};"
+                " border-radius: 4px; padding: 0; margin: 0;"
+                "}"
+                "QFrame#mainRoutineMockTaxRateBadge:disabled {"
+                " background-color: transparent;"
+                " border: 1px solid #D1D5DB;"
+                "}"
+                "QFrame#mainRoutineMockTaxRateBadge QLabel {"
+                f" color: {MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR};"
+                " border: none; background: transparent; padding: 0; margin: 0;"
+                "}"
+                "QFrame#mainRoutineMockTaxRateBadge QLabel:disabled {"
+                " color: #9CA3AF;"
+                " border: none; background: transparent; padding: 0; margin: 0;"
+                "}"
+                "QLineEdit#mainRoutineMockTaxRateEdit,"
+                "QLineEdit#mainRoutineMockTaxRateEdit:focus {"
+                f" color: {MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR};"
+                " border: none;"
+                " background: transparent; padding: 0; margin: 0;"
+                "}"
+                "QLineEdit#mainRoutineMockTaxRateEdit:disabled {"
+                " color: #9CA3AF;"
+                " border: none;"
+                " background: transparent; padding: 0; margin: 0;"
+                "}"
+            )
+            self._main_routine_mock_tax_rate_badge_active = mock_active
+            self._main_routine_mock_tax_rate_badge_initialized = True
+            if not was_initialized or (mock_active and not was_active):
+                MainWindow._refresh_main_mock_tax_rate_badge(self)
 
     def _review_required_window_is_open(self) -> bool:
         window = getattr(self, "review_required_window", None)
@@ -5372,8 +5712,13 @@ class MainWindow(QMainWindow):
             " padding: 0 6px;"
             "}"
         )
+        mock_scope = MainWindow._current_main_routine_stock_scope(self) == "mock"
         valid_only = bool(self._main_routine_valid_only)
         if self._main_routine_valid_button is not None:
+            self._main_routine_valid_button.setEnabled(not mock_scope)
+            self._main_routine_valid_button.setCursor(
+                Qt.ArrowCursor if mock_scope else Qt.PointingHandCursor
+            )
             self._main_routine_valid_button.setChecked(valid_only)
             valid_text_color = (
                 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
@@ -5393,6 +5738,7 @@ class MainWindow(QMainWindow):
                     f" max-height: {self._main_routine_valid_button.height() - 2}px;"
                     "}"
                 )
+                + disabled_style
             )
             valid_separator = getattr(
                 self,
@@ -5425,7 +5771,7 @@ class MainWindow(QMainWindow):
             frozenset(),
         )
         for metric, button in self._main_routine_metric_buttons.items():
-            enabled = metric in available_metrics
+            enabled = not mock_scope and metric in available_metrics
             button.setEnabled(enabled)
             button.setCursor(
                 Qt.PointingHandCursor if enabled else Qt.ArrowCursor
@@ -5452,7 +5798,10 @@ class MainWindow(QMainWindow):
 
         initial_buy_button = self._main_routine_initial_buy_sort_button
         if initial_buy_button is not None:
-            initial_buy_enabled = self._main_routine_initial_buy_badge_enabled()
+            initial_buy_enabled = (
+                not mock_scope
+                and self._main_routine_initial_buy_badge_enabled()
+            )
             next_mode = self._main_routine_initial_buy_sort_next_mode
             badge_text = "금액" if next_mode == "AMOUNT" else "주수"
             badge_color = (
@@ -5473,7 +5822,10 @@ class MainWindow(QMainWindow):
                 + disabled_style
             )
 
-        column_sort_enabled = self._main_routine_display_level == "stock"
+        column_sort_enabled = (
+            not mock_scope
+            and self._main_routine_display_level == "stock"
+        )
         for sort_key, button in self._main_routine_column_sort_buttons.items():
             button.setEnabled(column_sort_enabled)
             button.setCursor(
@@ -5499,21 +5851,32 @@ class MainWindow(QMainWindow):
             )
         MainWindow._update_main_routine_summary_badge_styles(self)
 
-    def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str, str], ...]:
-        selected_keys: list[tuple[str, str, str, str, str]] = []
+    @staticmethod
+    def _main_routine_row_selection_key(item) -> tuple[str, str, str, str, str, str]:
+        row_kind = str(item.data(ROUTINE_ROW_KIND_ROLE) or "")
+        tooltip_projection = item.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
+        mock_session_id = (
+            str(tooltip_projection.get("validation_session_id") or "").strip()
+            if row_kind in {ROUTINE_ROW_MOCK_STOCK, ROUTINE_ROW_MOCK_INSTANCE}
+            and isinstance(tooltip_projection, dict)
+            else ""
+        )
+        return (
+            row_kind,
+            str(item.data(ROUTINE_GROUP_ID_ROLE) or ""),
+            str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
+            str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
+            str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
+            mock_session_id,
+        )
+
+    def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str, str, str], ...]:
+        selected_keys: list[tuple[str, str, str, str, str, str]] = []
         for index in self.routine_table.selectionModel().selectedRows():
             item = self.routine_table.item(index.row(), 0)
             if item is None:
                 continue
-            selected_keys.append(
-                (
-                    str(item.data(ROUTINE_ROW_KIND_ROLE) or ""),
-                    str(item.data(ROUTINE_GROUP_ID_ROLE) or ""),
-                    str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
-                    str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
-                    str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
-                )
-            )
+            selected_keys.append(MainWindow._main_routine_row_selection_key(item))
         return tuple(selected_keys)
 
     def _reload_main_routine_table_preserving_view(self) -> None:
@@ -5527,13 +5890,7 @@ class MainWindow(QMainWindow):
             item = self.routine_table.item(row, 0)
             if item is None:
                 continue
-            key = (
-                str(item.data(ROUTINE_ROW_KIND_ROLE) or ""),
-                str(item.data(ROUTINE_GROUP_ID_ROLE) or ""),
-                str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
-                str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
-                str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
-            )
+            key = MainWindow._main_routine_row_selection_key(item)
             if key in wanted:
                 selection_model.select(
                     self.routine_table.model().index(row, 0),
@@ -5595,6 +5952,30 @@ class MainWindow(QMainWindow):
         """Keep Production bottom commands inert while the Mock overlay is open."""
 
         mock_scope = MainWindow._current_main_routine_stock_scope(self) == "mock"
+        review_button = getattr(self, "btn_review_manage", None)
+        if review_button is not None:
+            if mock_scope:
+                if not hasattr(self, "_mock_scope_review_button_state"):
+                    self._mock_scope_review_button_state = (
+                        review_button.isVisible(),
+                        review_button.isEnabled(),
+                        review_button.text(),
+                    )
+                review_button.setVisible(False)
+                review_button.setEnabled(False)
+            else:
+                original_state = getattr(
+                    self,
+                    "_mock_scope_review_button_state",
+                    None,
+                )
+                if isinstance(original_state, tuple) and len(original_state) == 3:
+                    review_button.setVisible(bool(original_state[0]))
+                    review_button.setEnabled(bool(original_state[1]))
+                    review_button.setText(str(original_state[2]))
+                    del self._mock_scope_review_button_state
+                else:
+                    review_button.setText("검토관리")
         buttons = tuple(
             button
             for button in (
@@ -5613,7 +5994,7 @@ class MainWindow(QMainWindow):
         if mock_scope:
             for button in buttons:
                 button.setEnabled(False)
-                button.setToolTip("모의 종목은 우클릭 모의 메뉴에서 조작합니다.")
+                button.setToolTip("모의 종목은 우클릭 메뉴에서 조작합니다.")
             return
         for button in buttons:
             button.setToolTip(self._mock_scope_original_tooltips.get(id(button), ""))
@@ -5739,16 +6120,100 @@ class MainWindow(QMainWindow):
             for instance in selected
         ]
         try:
-            snapshot = build_mock_reference_snapshot(
-                stock={
-                    "code": target.code,
-                    "name": target.name,
-                    "stock_path": str(target.stock_dir.resolve()),
+            stock_reference = {
+                "code": target.code,
+                "name": target.name,
+                "stock_path": str(target.stock_dir.resolve()),
+            }
+            stock_config = default_config()
+            budget_defaults = starting_budget_defaults()
+            default_mode = str(
+                stock_config.get("trade_amount_type") or ""
+            ).strip().upper()
+            if default_mode == "AMOUNT":
+                initial_value = main_stock_resolved_starting_budget(
+                    self,
+                    stock_reference,
+                    {
+                        **stock_config,
+                        "trade_amount_type": "AMOUNT",
+                        "buy_amount": 0,
+                    },
+                    policy={"starting_budget_defaults": budget_defaults},
+                )
+                if not initial_value:
+                    raise ValueError("MOCK_DEFAULT_INITIAL_BUY_PRICE_UNAVAILABLE")
+            else:
+                default_mode = "QUANTITY"
+                initial_value = int(budget_defaults["quantity"])
+            schedule_defaults = read_global_schedule()
+            default_operation_mode = str(
+                stock_config.get("operation_mode") or ""
+            ).strip().upper()
+            if default_operation_mode not in {"SCHEDULED", "CONTINUOUS"}:
+                raise ValueError("MOCK_DEFAULT_OPERATION_MODE_INVALID")
+            initial_buy = main_stock_resolved_initial_buy_display(
+                self,
+                stock_reference,
+                {
+                    **stock_config,
+                    "trade_amount_type": default_mode,
+                    "buy_qty": initial_value if default_mode == "QUANTITY" else 0,
+                    "buy_amount": initial_value if default_mode == "AMOUNT" else 0,
                 },
+                policy={"starting_budget_defaults": budget_defaults},
+            )
+            initial_buy = {
+                **initial_buy,
+                "value": int(initial_value),
+                "value_text": (
+                    f"{int(initial_value):,}원"
+                    if default_mode == "AMOUNT"
+                    else f"{int(initial_value):,}주"
+                ),
+            }
+            operation_text = (
+                f"{schedule_defaults['start_time'][:5]}~"
+                f"{schedule_defaults['end_buy_time'][:5]}"
+                if default_operation_mode == "SCHEDULED"
+                else "수동"
+            )
+            liquidation_text = auto_trade_setting_liquidation_text(stock_config)
+            display_contract = {
+                "initial_buy": {
+                    key: initial_buy.get(key)
+                    for key in ("mode", "badge", "value", "value_text")
+                },
+                "operation_schedule": {"display_text": operation_text},
+                "liquidation": {"display_text": liquidation_text},
+            }
+            snapshot = build_mock_reference_snapshot(
+                stock=stock_reference,
                 routine_instances=snapshot_records,
                 rules_by_instance_id=rules_by_instance_id,
+                display_contract=display_contract,
             )
-            actions.create_waiting_session(snapshot)
+            effective_settings = {
+                str(getattr(instance, "instance_id", "") or ""): {
+                    "initial_buy": {
+                        "mode": default_mode,
+                        "value": int(initial_value),
+                    },
+                    "operation_schedule": {
+                        "start_time": schedule_defaults["start_time"],
+                        "end_buy_time": schedule_defaults["end_buy_time"],
+                    },
+                    "operation_mode": default_operation_mode,
+                    "manual_ats": {
+                        "selected_sessions": [],
+                    },
+                }
+                for instance in selected
+            }
+            actions.create_waiting_session(
+                snapshot,
+                effective_settings_by_instance=effective_settings,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "모의검증", f"모의검증 종목을 만들지 못했습니다.\n사유: {exc}")
             return False
@@ -5765,13 +6230,11 @@ class MainWindow(QMainWindow):
         return {
             "current": True,
             "state": state,
-            "tax_enabled": bool(document["session"].get("mock_tax_enabled") is True),
             "can_start": state == "WAITING",
             "can_early_close": state == "RUNNING",
             "can_immediate": state in {"RUNNING", "CLOSING"},
-            "can_tax": state == "WAITING",
             "can_reset": state == "REVIEW_STOPPED",
-            "can_return": return_eligibility.get("eligible") is True,
+            "can_unregister": return_eligibility.get("eligible") is True,
         }
 
     def _mock_action_result(self, title: str, operation) -> None:
@@ -5788,48 +6251,160 @@ class MainWindow(QMainWindow):
             lambda: self.mock_validation_ui_actions.start(stock_code),
         )
 
-    def early_close_mock_validation_stock(self, stock_code: str) -> None:
+    def early_close_mock_validation_stock(
+        self,
+        stock_code: str,
+        method: str,
+    ) -> None:
         self._mock_action_result(
             "모의 조기마감",
-            lambda: self.mock_validation_ui_actions.early_close(stock_code),
+            lambda: self.mock_validation_ui_actions.early_close(
+                stock_code,
+                method=method,
+            ),
         )
 
-    def immediate_liquidate_mock_validation_stock(self, stock_code: str) -> None:
+    def immediate_liquidate_mock_validation_stock(
+        self,
+        stock_code: str,
+        method: str,
+    ) -> None:
+        method_label = "시장가" if method == "시장가" else "현재가"
         if QMessageBox.question(
             self,
             "모의 즉시청산",
-            "선택한 모의 종목을 즉시 시장가 청산하시겠습니까?",
+            f"선택한 모의 종목을 즉시 {method_label} 청산하시겠습니까?",
         ) != QMessageBox.Yes:
             return
         self._mock_action_result(
             "모의 즉시청산",
-            lambda: self.mock_validation_ui_actions.immediate_liquidation(stock_code),
+            lambda: self.mock_validation_ui_actions.immediate_liquidation(
+                stock_code,
+                method=method,
+            ),
         )
 
-    def set_mock_validation_tax(self, stock_code: str, enabled: bool) -> None:
-        self._mock_action_result(
-            "모의세금",
-            lambda: self.mock_validation_ui_actions.set_tax(stock_code, enabled),
-        )
+    @staticmethod
+    def _mock_tax_rate_percent_text(rate: object) -> str:
+        return f"{float(rate or 0) * 100:.2f}"
 
-    def open_mock_validation_event_window(self, stock_code: str) -> None:
+    def _refresh_main_mock_tax_rate_badge(self) -> None:
+        edit = getattr(self, "_main_routine_mock_tax_rate_edit", None)
+        actions = getattr(self, "mock_validation_ui_actions", None)
+        if edit is None or actions is None:
+            return
+        try:
+            settings = actions.common_tax_settings()
+            text = MainWindow._mock_tax_rate_percent_text(
+                settings.get("mock_tax_rate", 0.002)
+            )
+        except Exception:
+            LOGGER.exception("Mock tax settings read failed")
+            return
+        self._main_routine_mock_tax_rate_saved_text = text
+        edit.setText(text)
+
+    def _commit_main_mock_tax_rate(self) -> None:
+        edit = getattr(self, "_main_routine_mock_tax_rate_edit", None)
+        actions = getattr(self, "mock_validation_ui_actions", None)
+        if edit is None or actions is None:
+            return
+        previous = str(
+            getattr(self, "_main_routine_mock_tax_rate_saved_text", "0.20")
+        )
+        try:
+            percent = Decimal(edit.text().strip())
+            if not percent.is_finite() or percent < 0 or percent > 100:
+                raise ValueError("MOCK_TAX_RATE_INVALID")
+            current = actions.common_tax_settings()
+            result = actions.set_common_tax_settings(
+                enabled=current.get("mock_tax_enabled") is True,
+                rate=float(percent / Decimal("100")),
+            )
+            settings = (
+                result.get("settings")
+                if isinstance(result, dict)
+                and isinstance(result.get("settings"), dict)
+                else actions.common_tax_settings()
+            )
+            normalized = MainWindow._mock_tax_rate_percent_text(
+                settings.get("mock_tax_rate", 0.002)
+            )
+        except Exception:
+            edit.setText(previous)
+            status_bar = getattr(self, "statusBar", None)
+            if callable(status_bar):
+                status_bar().showMessage("적용 세율을 확인해 주세요.", 5000)
+            return
+        self._main_routine_mock_tax_rate_saved_text = normalized
+        edit.setText(normalized)
+        status_bar = getattr(self, "statusBar", None)
+        if callable(status_bar):
+            status_bar().showMessage("모의 적용세율을 저장했습니다.", 5000)
+
+    def _cancel_main_mock_tax_rate_edit(self) -> None:
+        edit = getattr(self, "_main_routine_mock_tax_rate_edit", None)
+        if edit is None:
+            return
+        blocked = edit.blockSignals(True)
+        try:
+            edit.setText(
+                str(
+                    getattr(
+                        self,
+                        "_main_routine_mock_tax_rate_saved_text",
+                        "0.20",
+                    )
+                )
+            )
+            edit.clearFocus()
+        finally:
+            edit.blockSignals(blocked)
+
+    def open_mock_validation_event_window(
+        self,
+        stock_code: str,
+        *,
+        expected_validation_session_id: str = "",
+    ) -> None:
         document = self.mock_validation_host.current_session(stock_code)
         if document is None:
             return
+        session = document["session"]
+        session_id = str(session["validation_session_id"] or "").strip()
+        expected = str(expected_validation_session_id or "").strip()
+        if expected and session_id != expected:
+            return
         current = getattr(self, "mock_validation_event_window", None)
         if current is not None and not sip.isdeleted(current):
+            if getattr(self, "_mock_validation_event_window_identity", None) == (
+                session_id,
+                session["stock_code"],
+            ):
+                current.show()
+                current.raise_()
+                current.activateWindow()
+                return
             current.close()
         window = EventRecordPrototypeWindow(
             self,
             reader=MockEventReaderAdapter(
                 self.mock_validation_host.repository,
-                document["session"]["validation_session_id"],
+                session_id,
             ),
         )
-        window.setWindowTitle("모의검증 이벤트")
+        window.setWindowTitle(
+            f"운영일지 - {session['stock_code']} {session['stock_name']}"
+        )
         window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.mock_validation_event_window = window
+        self._mock_validation_event_window_identity = (
+            session_id,
+            session["stock_code"],
+        )
         window.show()
+        window.raise_()
+        window.activateWindow()
 
     def open_mock_validation_review_window(self, stock_code: str) -> None:
         document = self.mock_validation_host.current_session(stock_code)
@@ -5872,21 +6447,6 @@ class MainWindow(QMainWindow):
         )
         if dialog is not None:
             dialog.accept()
-
-    def choose_mock_validation_return_destination(self, stock_code: str) -> str:
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("모의검증 종료/복귀")
-        dialog.setText("모의검증 종료 후 복귀할 상태를 선택하세요.")
-        destinations = {
-            dialog.addButton("운영대기", QMessageBox.AcceptRole): "WAITING",
-            dialog.addButton("운영제외", QMessageBox.ActionRole): "EXCLUDED",
-            dialog.addButton("미지정", QMessageBox.ActionRole): "UNASSIGNED",
-            dialog.addButton("등록해제", QMessageBox.DestructiveRole): "UNREGISTERED",
-        }
-        cancel = dialog.addButton("취소", QMessageBox.RejectRole)
-        dialog.setDefaultButton(cancel)
-        dialog.exec_()
-        return destinations.get(dialog.clickedButton(), "")
 
     def _set_main_routine_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
@@ -5989,6 +6549,7 @@ class MainWindow(QMainWindow):
             self.btn_start,
             self.btn_auto_trade_setting,
             self.btn_log_view,
+            self.btn_review_manage,
             self.btn_close_all_windows,
             self.btn_exit,
         ]
@@ -6146,9 +6707,15 @@ class MainWindow(QMainWindow):
             {0},
             accept_index=lambda index: str(
                 index.data(ROUTINE_ROW_KIND_ROLE) or ""
-            ) == ROUTINE_ROW_STOCK,
+            )
+            in {
+                ROUTINE_ROW_STOCK,
+                ROUTINE_ROW_MOCK_STOCK,
+            },
             accept_position=lambda index, pos: (
-                _routine_stock_code_rect(self.routine_table, index).contains(pos)
+                str(index.data(ROUTINE_ROW_KIND_ROLE) or "")
+                == ROUTINE_ROW_MOCK_STOCK
+                or _routine_stock_code_rect(self.routine_table, index).contains(pos)
                 or _routine_stock_name_rect(self.routine_table, index).contains(pos)
             ),
             tooltip_point_size=(self.routine_table.font().pointSizeF() * 1.1),
@@ -6426,6 +6993,9 @@ class MainWindow(QMainWindow):
             self.close_all_persistent_feature_windows
         )
         self.btn_log_view.clicked.connect(self.open_event_record_window)
+        self.btn_review_manage.clicked.connect(
+            self.open_current_domain_review_window
+        )
         self.btn_review_required.clicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
         self.routine_table.customContextMenuRequested.connect(self.open_routine_context_menu)
@@ -9170,6 +9740,382 @@ class MainWindow(QMainWindow):
             self._collapsed_main_group_ids.add(group_id)
         self.load_routine_table()
 
+    def toggle_mock_routine_stock_expansion(self, row: int) -> None:
+        item = self.routine_table.item(row, 0)
+        if (
+            item is None
+            or str(item.data(ROUTINE_ROW_KIND_ROLE) or "")
+            != ROUTINE_ROW_MOCK_STOCK
+        ):
+            return
+        projection = item.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
+        session_id = (
+            str(projection.get("validation_session_id") or "").strip()
+            if isinstance(projection, dict)
+            else ""
+        )
+        stock_code = str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+        if not session_id or not stock_code:
+            return
+        collapsed = getattr(
+            self,
+            "_collapsed_mock_validation_stock_keys",
+            None,
+        )
+        if not isinstance(collapsed, set):
+            collapsed = set()
+            self._collapsed_mock_validation_stock_keys = collapsed
+        key = (session_id, stock_code)
+        if key in collapsed:
+            collapsed.discard(key)
+        else:
+            collapsed.add(key)
+        self._reload_main_routine_table_preserving_view()
+
+    def _mock_routine_instance_edit_target(
+        self,
+        row: int,
+        *,
+        allowed_states: frozenset[str] = frozenset({"WAITING"}),
+        show_state_error: bool = True,
+    ) -> tuple[
+        str,
+        str,
+        str,
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ] | None:
+        item = self.routine_table.item(row, 0)
+        if (
+            item is None
+            or str(item.data(ROUTINE_ROW_KIND_ROLE) or "")
+            != ROUTINE_ROW_MOCK_INSTANCE
+        ):
+            return None
+        stock_code = str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+        instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+        projection = item.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
+        session_id = (
+            str(projection.get("validation_session_id") or "").strip()
+            if isinstance(projection, dict)
+            else ""
+        )
+        host = getattr(self, "mock_validation_host", None)
+        document = host.current_session(stock_code) if host is not None else None
+        if (
+            not stock_code
+            or not instance_id
+            or not session_id
+            or not isinstance(document, dict)
+            or document.get("session", {}).get("validation_session_id") != session_id
+            or instance_id not in document.get("instance_execution", {})
+        ):
+            return None
+        execution_state = str(
+            document["instance_execution"][instance_id].get("state") or ""
+        ).strip().upper()
+        if execution_state not in allowed_states:
+            if show_state_error:
+                show_toast(
+                    self,
+                    "현재 운영 상태에서는 모의 시작예산을 변경할 수 없습니다."
+                    if allowed_states != frozenset({"WAITING"})
+                    else "모의 Instance 설정은 운영대기 상태에서만 변경할 수 있습니다.",
+                )
+            return None
+        return (
+            session_id,
+            stock_code,
+            instance_id,
+            instance_effective_settings(document, instance_id),
+            document,
+            dict(projection) if isinstance(projection, dict) else {},
+        )
+
+    @staticmethod
+    def _mock_instance_operation_identity(
+        document: dict[str, object], instance_id: str
+    ) -> str:
+        lifecycle = document.get("mock_operation_lifecycle")
+        if not isinstance(lifecycle, dict):
+            return ""
+        operations = lifecycle.get("instance_operations")
+        operation = operations.get(instance_id) if isinstance(operations, dict) else None
+        if not isinstance(operation, dict):
+            operation = lifecycle.get("current")
+        return (
+            str(operation.get("operation_session_id") or "").strip()
+            if isinstance(operation, dict)
+            else ""
+        )
+
+    def _mock_start_budget_edit_authorized(self) -> bool:
+        if main_budget_display_auth_state(self) == SERVER_AUTH_COMPLETE:
+            return True
+        show_toast(self, "서버 인증 완료 후 모의 시작예산을 변경할 수 있습니다.")
+        return False
+
+    def _mock_operation_settings_edit_authorized(self) -> bool:
+        if main_budget_display_auth_state(self) == SERVER_AUTH_COMPLETE:
+            return True
+        show_toast(self, "서버 인증 완료 후 모의 운영설정을 변경할 수 있습니다.")
+        return False
+
+    def _mock_start_budget_current_price(self, stock_code: str) -> float | None:
+        host = getattr(self, "mock_validation_host", None)
+        market_store = getattr(host, "market_store", None)
+        latest_trade = getattr(market_store, "latest_trade", None)
+        trade = latest_trade(stock_code) if callable(latest_trade) else None
+        price = safe_float_value(getattr(trade, "current_price", None), 0.0)
+        if price > 0:
+            return price
+        market_state = main_stock_configuration_market_information_state(
+            self,
+            {"code": stock_code},
+        )
+        price = safe_float_value(getattr(market_state, "last_price", None), 0.0)
+        return price if price > 0 else None
+
+    def _write_mock_routine_instance_settings(
+        self,
+        row: int,
+        **changes: object,
+    ) -> bool:
+        target = self._mock_routine_instance_edit_target(row)
+        actions = getattr(self, "mock_validation_ui_actions", None)
+        if target is None or actions is None:
+            return False
+        _session_id, stock_code, instance_id, _settings, _document, _projection = target
+        try:
+            result = actions.set_instance_effective_settings(
+                stock_code,
+                instance_id,
+                **changes,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "모의 Instance 설정",
+                f"설정을 저장하지 못했습니다.\n사유: {exc}",
+            )
+            return False
+        self._reload_main_routine_table_preserving_view()
+        return bool(isinstance(result, dict))
+
+    def toggle_mock_routine_instance_initial_buy_mode(self, row: int) -> None:
+        if not self._mock_start_budget_edit_authorized():
+            return
+        target = self._mock_routine_instance_edit_target(row)
+        if target is None:
+            return
+        settings = target[3]
+        initial = settings["initial_buy"]
+        next_mode = "AMOUNT" if initial["mode"] == "QUANTITY" else "QUANTITY"
+        current_price = self._mock_start_budget_current_price(target[1])
+        defaults = starting_budget_defaults()
+        next_value = (
+            effective_amount_starting_budget(
+                current_price,
+                defaults["amount_multiplier"],
+            )
+            if next_mode == "AMOUNT"
+            else int(defaults["quantity"])
+        )
+        if current_price is None or not next_value:
+            show_toast(self, MainWindow._start_budget_price_unavailable_message())
+            return
+        self._write_mock_routine_instance_settings(
+            row,
+            initial_buy={"mode": next_mode, "value": int(next_value)},
+        )
+
+    def open_mock_routine_instance_initial_buy_dialog(self, row: int) -> None:
+        if not self._mock_start_budget_edit_authorized():
+            return
+        target = self._mock_routine_instance_edit_target(
+            row,
+            allowed_states=frozenset({"WAITING", "RUNNING"}),
+        )
+        if target is None:
+            return
+        session_id, stock_code, instance_id, settings, document, projection = target
+        initial = settings["initial_buy"]
+        mode = str(initial["mode"]).strip().upper()
+        current_price = self._mock_start_budget_current_price(stock_code)
+        if current_price is None:
+            show_toast(self, MainWindow._start_budget_price_unavailable_message())
+            return
+        execution_state = str(
+            document["instance_execution"][instance_id].get("state") or ""
+        ).strip().upper()
+        adjustment = document.get("initial_buy_adjustments_by_instance", {}).get(
+            instance_id
+        )
+        minimum_amount = (
+            effective_amount_starting_budget(
+                current_price,
+                starting_budget_defaults()["amount_multiplier"],
+            )
+            if mode == "AMOUNT"
+            else None
+        )
+        dialog = RunningBudgetAdjustmentDialog(
+            self,
+            stock_code=stock_code,
+            stock_name=str(projection.get("stock_name") or ""),
+            current_price=current_price,
+            config={
+                "trade_amount_type": mode,
+                "buy_amount" if mode == "AMOUNT" else "buy_qty": int(
+                    initial["value"]
+                ),
+            },
+            minimum_amount=minimum_amount,
+            pending_adjustment=(
+                adjustment if isinstance(adjustment, dict) else None
+            ),
+            timing_selection_enabled=execution_state == "RUNNING",
+            configuration_price_available=True,
+            apply_limit_checked=False,
+            show_limit_option=False,
+        )
+        self._running_budget_adjustment_dialog = dialog
+        accepted = False
+        request: dict[str, object] = {}
+        try:
+            accepted = dialog.exec_() == QDialog.Accepted
+            request = dict(dialog.result)
+        finally:
+            self._running_budget_adjustment_dialog = None
+            dialog.deleteLater()
+        if not accepted or not request:
+            return
+        actions = getattr(self, "mock_validation_ui_actions", None)
+        if actions is None:
+            return
+        try:
+            actions.set_instance_initial_buy(
+                stock_code,
+                instance_id,
+                mode=mode,
+                value=safe_int_value(request.get("value"), 0),
+                apply_policy=str(request.get("apply_timing") or ""),
+                expected_validation_session_id=session_id,
+                expected_revision=int(document.get("revision", -1)),
+                expected_operation_session_id=(
+                    MainWindow._mock_instance_operation_identity(
+                        document, instance_id
+                    )
+                ),
+                requested_at=dialog.requested_at,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "모의 시작예산 설정",
+                f"설정을 저장하지 못했습니다.\n사유: {exc}",
+            )
+            return
+        self._reload_main_routine_table_preserving_view()
+        show_toast(self, "기본예산을 변경했습니다.")
+
+    def toggle_mock_routine_instance_operation_mode(self, row: int) -> None:
+        if not self._mock_operation_settings_edit_authorized():
+            return
+        target = self._mock_routine_instance_edit_target(row)
+        if target is None:
+            return
+        settings = target[3]
+        current_mode = str(settings.get("operation_mode") or "").strip().upper()
+        next_mode = "CONTINUOUS" if current_mode == "SCHEDULED" else "SCHEDULED"
+        changes: dict[str, object] = {"operation_mode": next_mode}
+        if next_mode == "SCHEDULED":
+            changes["operation_schedule"] = read_global_schedule()
+            manual_ats = dict(settings["manual_ats"])
+            if manual_ats["selected_sessions"]:
+                manual_ats["selected_sessions"] = []
+                changes["manual_ats"] = manual_ats
+        self._write_mock_routine_instance_settings(row, **changes)
+
+    def open_mock_routine_instance_schedule_dialog(self, row: int) -> None:
+        if not self._mock_operation_settings_edit_authorized():
+            return
+        target = self._mock_routine_instance_edit_target(row)
+        if target is None:
+            return
+        settings = target[3]
+        if str(settings.get("operation_mode") or "").strip().upper() != "SCHEDULED":
+            return
+        schedule = settings["operation_schedule"]
+        dialog = ScheduleOperationDialog(
+            self,
+            start_time=str(schedule["start_time"]),
+            end_buy_time=str(schedule["end_buy_time"]),
+            selected_count=1,
+        )
+        dialog.setWindowTitle("종목 시간 예외 설정")
+        try:
+            accepted = dialog.exec_() == QDialog.Accepted
+            requested_schedule = {
+                "start_time": dialog.start_time(),
+                "end_buy_time": dialog.end_buy_time(),
+            }
+        finally:
+            dialog.deleteLater()
+        if not accepted:
+            return
+        self._write_mock_routine_instance_settings(
+            row,
+            operation_schedule=requested_schedule,
+        )
+
+    def reset_mock_routine_instance_schedule(self, row: int) -> None:
+        if not self._mock_operation_settings_edit_authorized():
+            return
+        target = self._mock_routine_instance_edit_target(row)
+        if target is None:
+            return
+        if str(target[3].get("operation_mode") or "").strip().upper() != "SCHEDULED":
+            return
+        self._write_mock_routine_instance_settings(
+            row,
+            operation_schedule=read_global_schedule(),
+        )
+
+    def mock_routine_instance_ats_state(self, row: int) -> dict[str, bool]:
+        target = self._mock_routine_instance_edit_target(
+            row,
+            show_state_error=False,
+        )
+        if target is None:
+            return {}
+        selected = set(target[3]["manual_ats"]["selected_sessions"])
+        return {key: key in selected for key in VALID_SESSION_KEYS}
+
+    def set_mock_routine_instance_ats_flag(
+        self,
+        row: int,
+        flag_key: str,
+        enabled: bool,
+        _label: str,
+    ) -> None:
+        if not self._mock_operation_settings_edit_authorized():
+            return
+        target = self._mock_routine_instance_edit_target(row)
+        if target is None or target[3]["operation_mode"] != "CONTINUOUS":
+            return
+        manual_ats = dict(target[3]["manual_ats"])
+        selected = set(manual_ats["selected_sessions"])
+        if enabled:
+            selected.add(str(flag_key))
+        else:
+            selected.discard(str(flag_key))
+        manual_ats["selected_sessions"] = [
+            key for key in VALID_SESSION_KEYS if key in selected
+        ]
+        self._write_mock_routine_instance_settings(row, manual_ats=manual_ats)
+
     def toggle_routine_instance_expansion(self, row: int) -> None:
         item = self.routine_table.item(row, 0)
         if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
@@ -11552,6 +12498,13 @@ class MainWindow(QMainWindow):
         if first_item is None:
             return
         row_kind = str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "")
+        if row_kind in {ROUTINE_ROW_MOCK_STOCK, ROUTINE_ROW_MOCK_INSTANCE}:
+            show_mock_monitoring_context_menu(
+                self,
+                position,
+                expected_row_kind=row_kind,
+            )
+            return
         if row_kind == ROUTINE_ROW_STOCK:
             show_main_monitoring_stock_context_menu(self, position)
             return
@@ -12357,6 +13310,11 @@ class MainWindow(QMainWindow):
                 target_type="APPLICATION",
                 target_id="kiwoom_auto",
             )
+
+    def open_current_domain_review_window(self) -> None:
+        if MainWindow._current_main_routine_stock_scope(self) != "mock":
+            self.open_review_required_window()
+        return
 
     def open_review_required_window(self) -> None:
         window = getattr(self, "review_required_window", None)

@@ -17,7 +17,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFontMetrics
-from PyQt5.QtWidgets import QApplication, QHBoxLayout, QStyle, QTableWidget, QWidget
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QStyle,
+    QTableWidget,
+    QWidget,
+)
 
 import gui_main_table_loader as table_loader
 import gui_windows
@@ -829,6 +838,233 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertNotIn("_create_main_routine_excluded_badge", source)
         finally:
             container.close()
+            summary.close()
+            routine_table.close()
+
+    def test_mock_badge_is_independent_overlay_after_noninteractive_separator(self) -> None:
+        routine_table = QTableWidget()
+        tax_state = {"mock_tax_enabled": False, "mock_tax_rate": 0.002}
+        tax_saves = []
+
+        class TaxActions:
+            @staticmethod
+            def common_tax_settings():
+                return dict(tax_state)
+
+            @staticmethod
+            def set_common_tax_settings(*, enabled, rate):
+                tax_state.update(
+                    mock_tax_enabled=bool(enabled),
+                    mock_tax_rate=float(rate),
+                )
+                tax_saves.append((bool(enabled), float(rate)))
+                return {"settings": dict(tax_state)}
+
+        host = SimpleNamespace(
+            _mock_validation_ui_enabled=True,
+            _set_main_routine_excluded_only=lambda: None,
+            _set_main_routine_valid_only=lambda _enabled: None,
+            _main_routine_valid_only=True,
+            _main_routine_display_level="stock",
+            _main_routine_stock_scope="all",
+            mock_validation_ui_actions=TaxActions(),
+            routine_table=routine_table,
+        )
+        summary = MainWindow._create_main_routine_summary(host)
+        try:
+            projection = {
+                "count_badges": (
+                    ("group", "그룹", 1),
+                    ("routine", "루틴", 1),
+                    ("stock", "종목", 1),
+                    ("operation", "운영", 0),
+                    ("waiting", "대기", 1),
+                    ("excluded", "제외", 0),
+                    ("review", "검토", 0),
+                    ("mock", "모의", 1),
+                ),
+                "profit_value_text": "0 / 0.00%",
+                "profit_color": profit_loss_value_color(0),
+            }
+            MainWindow._update_main_routine_summary(host, projection)
+
+            labels = host._main_routine_summary_count_labels
+            self.assertEqual("1", labels["waiting"][1].text())
+            self.assertEqual("1", labels["mock"][1].text())
+            separator = host._main_routine_summary_mock_separator
+            self.assertEqual("|", separator.text())
+            self.assertTrue(separator.testAttribute(Qt.WA_TransparentForMouseEvents))
+            self.assertNotIsInstance(separator, QPushButton)
+            layout_widgets = [
+                summary.layout().itemAt(index).widget()
+                for index in range(summary.layout().count())
+            ]
+            review_badge = labels["review"][0].parentWidget()
+            mock_badge = labels["mock"][0].parentWidget()
+            tax_badge = host._main_routine_mock_tax_rate_badge
+            tax_edit = host._main_routine_mock_tax_rate_edit
+            self.assertEqual(
+                [review_badge, separator, mock_badge, tax_badge],
+                layout_widgets[
+                    layout_widgets.index(review_badge):layout_widgets.index(tax_badge) + 1
+                ],
+            )
+            self.assertTrue(tax_badge.isVisibleTo(summary))
+            self.assertFalse(tax_badge.isEnabled())
+            self.assertFalse(tax_edit.isEnabled())
+            self.assertEqual("0.20", tax_edit.text())
+            self.assertEqual(mock_badge.height(), tax_badge.height())
+            self.assertIs(summary, tax_badge.parentWidget())
+            self.assertFalse(mock_badge.isAncestorOf(tax_edit))
+            self.assertFalse(hasattr(host, "_main_routine_mock_tax_settings_button"))
+            summary.show()
+            self.app.processEvents()
+            inactive_geometry = tax_badge.geometry()
+            tax_edit.setFocus()
+            self.app.processEvents()
+            self.assertFalse(tax_edit.hasFocus())
+
+            host._main_routine_stock_scope = "mock"
+            MainWindow._update_main_routine_summary_badge_styles(host)
+            self.assertTrue(tax_badge.isVisibleTo(summary))
+            self.assertTrue(tax_badge.isEnabled())
+            self.assertTrue(tax_edit.isEnabled())
+            self.assertEqual(inactive_geometry, tax_badge.geometry())
+            self.assertEqual("0.20", tax_edit.text())
+            tax_edit.setText("0.2")
+            QTest.keyClick(tax_edit, Qt.Key_Return)
+            self.assertEqual((False, 0.002), tax_saves[-1])
+            self.assertEqual("0.20", tax_edit.text())
+            tax_edit.setText("0.37")
+            QTest.keyClick(tax_edit, Qt.Key_Return)
+            self.assertEqual((False, 0.0037), tax_saves[-1])
+            self.assertEqual("0.37", tax_edit.text())
+            self.assertFalse(tax_state["mock_tax_enabled"])
+
+            tax_edit.setText("0.99")
+            QTest.keyClick(tax_edit, Qt.Key_Escape)
+            self.assertEqual("0.37", tax_edit.text())
+            self.assertEqual(2, len(tax_saves))
+
+            tax_edit.setText("0.42")
+            tax_edit.setFocus()
+            self.app.processEvents()
+            tax_edit.clearFocus()
+            self.app.processEvents()
+            self.assertEqual((False, 0.0042), tax_saves[-1])
+            self.assertEqual("0.42", tax_edit.text())
+
+            host._main_routine_stock_scope = "all"
+            MainWindow._update_main_routine_summary_badge_styles(host)
+            self.assertTrue(tax_badge.isVisibleTo(summary))
+            self.assertFalse(tax_badge.isEnabled())
+            self.assertFalse(tax_edit.isEnabled())
+            self.assertEqual("0.42", tax_edit.text())
+            self.assertEqual(inactive_geometry, tax_badge.geometry())
+            host._main_routine_stock_scope = "mock"
+            MainWindow._update_main_routine_summary_badge_styles(host)
+            self.assertTrue(tax_badge.isVisibleTo(summary))
+            self.assertTrue(tax_badge.isEnabled())
+            self.assertTrue(tax_edit.isEnabled())
+            self.assertEqual("0.42", tax_edit.text())
+            zero_projection = dict(
+                projection,
+                count_badges=projection["count_badges"][:-1]
+                + (("mock", "모의", 0),),
+            )
+            MainWindow._update_main_routine_summary(host, zero_projection)
+            self.assertEqual("0", labels["mock"][1].text())
+            self.assertTrue(mock_badge.isVisibleTo(summary))
+            self.assertTrue(tax_badge.isVisibleTo(summary))
+        finally:
+            summary.close()
+            routine_table.close()
+
+    def test_mock_count_overlay_never_reclassifies_production_counts(self) -> None:
+        production = {
+            "count_badges": (
+                ("operation", "운영", 0),
+                ("waiting", "대기", 1),
+                ("excluded", "제외", 0),
+                ("review", "검토", 0),
+            ),
+            "counts_text": "운영(0)  대기(1)  제외(0)  검토(0)",
+        }
+
+        with_mock = table_loader._append_mock_registration_overlay(production, 1)
+
+        self.assertEqual(
+            production["count_badges"],
+            with_mock["count_badges"][:-1],
+        )
+        self.assertEqual(("mock", "모의", 1), with_mock["count_badges"][-1])
+        self.assertEqual(
+            "운영(0)  대기(1)  제외(0)  검토(0)  |  모의(1)",
+            with_mock["counts_text"],
+        )
+        self.assertEqual(
+            "운영(0)  대기(1)  제외(0)  검토(0)",
+            production["counts_text"],
+        )
+
+        production_changed = dict(
+            production,
+            count_badges=(
+                ("operation", "운영", 1),
+                ("waiting", "대기", 0),
+                ("excluded", "제외", 0),
+                ("review", "검토", 0),
+            ),
+            counts_text="운영(1)  대기(0)  제외(0)  검토(0)",
+        )
+        after_production_change = table_loader._append_mock_registration_overlay(
+            production_changed,
+            1,
+        )
+        self.assertEqual(("mock", "모의", 1), after_production_change["count_badges"][-1])
+
+    def test_inline_mock_tax_rate_is_one_borderless_transparent_badge(self) -> None:
+        routine_table = QTableWidget()
+        host = SimpleNamespace(
+            _mock_validation_ui_enabled=True,
+            _set_main_routine_excluded_only=lambda: None,
+            _set_main_routine_valid_only=lambda _enabled: None,
+            _main_routine_valid_only=True,
+            _main_routine_display_level="stock",
+            _main_routine_stock_scope="mock",
+            mock_validation_ui_actions=SimpleNamespace(
+                common_tax_settings=lambda: {
+                    "mock_tax_enabled": True,
+                    "mock_tax_rate": 0.002,
+                }
+            ),
+            routine_table=routine_table,
+        )
+        summary = MainWindow._create_main_routine_summary(host)
+        try:
+            badge = host._main_routine_mock_tax_rate_badge
+            edit = host._main_routine_mock_tax_rate_edit
+            style = badge.styleSheet().lower()
+            label = badge.findChild(QLabel, "mainRoutineMockTaxRateLabel")
+            percent = badge.findChild(QLabel, "mainRoutineMockTaxRatePercent")
+            self.assertEqual("mainRoutineMockTaxRateBadge", badge.objectName())
+            self.assertEqual("mainRoutineMockTaxRateEdit", edit.objectName())
+            self.assertEqual("적용세율", label.text())
+            self.assertEqual("0.20", edit.text())
+            self.assertEqual("%", percent.text())
+            self.assertEqual(2, edit.validator().decimals())
+            self.assertNotIn("border-bottom", style)
+            self.assertIn("border: none", style)
+            self.assertIn("background: transparent", style)
+            self.assertIn("qlineedit#mainroutinemocktaxrateedit:focus", style)
+            self.assertIn("qlineedit#mainroutinemocktaxrateedit:disabled", style)
+            self.assertIn("#9ca3af", style)
+            self.assertFalse(hasattr(gui_windows, "_MockTaxSettingsDialog"))
+            self.assertNotIn(
+                "open_mock_validation_tax_settings",
+                inspect.getsource(MainWindow),
+            )
+        finally:
             summary.close()
             routine_table.close()
 

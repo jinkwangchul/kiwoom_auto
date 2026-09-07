@@ -27,6 +27,7 @@ def build_mock_reference_snapshot(
     stock: Mapping[str, Any],
     routine_instances: list[Any] | tuple[Any, ...],
     rules_by_instance_id: Mapping[str, Mapping[str, Any]],
+    display_contract: Mapping[str, Any] | None = None,
     created_at: str | None = None,
 ) -> dict[str, Any]:
     """Copy Production read models into an immutable Mock-owned snapshot.
@@ -77,6 +78,8 @@ def build_mock_reference_snapshot(
         "routine_instances": records,
         "snapshot_created_at": clean_text(created_at) or now_text(),
     }
+    if display_contract is not None:
+        snapshot["display_contract"] = deepcopy(dict(display_contract))
     snapshot["snapshot_hash"] = payload_hash(snapshot)
     return validate_reference_snapshot(snapshot)
 

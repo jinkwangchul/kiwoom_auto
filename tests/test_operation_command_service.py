@@ -3221,7 +3221,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             ["ATS 장전", "ATS 야간", "시장가", "현재가"],
             [action.text for action in ats_menu.actions if not action.separator],
         )
-        self.assertEqual(2, sum(action.separator for action in ats_menu.actions))
+        self.assertEqual(1, sum(action.separator for action in ats_menu.actions))
         self.assertTrue(ats_menu.actions[0].property("atsSessionCurrent"))
         self.assertFalse(ats_menu.actions[1].property("atsSessionCurrent"))
         self.assertTrue(ats_menu.actions[3].enabled)

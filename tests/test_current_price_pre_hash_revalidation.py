@@ -351,12 +351,6 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
         self.current_price = None
         order = self._order()
         before = self._write_queue(order)
-        ats_result = {
-            "ok": True,
-            "applied": False,
-            "execution_method": "ROUTINE",
-            "order": deepcopy(order),
-        }
         with mock.patch(
             "auto_trade_order_execution_boundary.signal_dispatch_block_reasons",
             return_value=[],
@@ -364,10 +358,6 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
             self.boundary,
             "auto_trade_execution_block_reasons",
             return_value=[],
-        ), mock.patch.object(
-            self.boundary,
-            "project_ats_execution_order",
-            return_value=ats_result,
         ), mock.patch(
             "auto_trade_order_execution_boundary.commit_execution_enable"
         ) as enable_commit, mock.patch(
@@ -399,12 +389,6 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
             {"ok": True, "order": enabled, "blocked_reasons": []},
             {"ok": True, "order": real_ready, "blocked_reasons": []},
         ]
-        ats_result = {
-            "ok": True,
-            "applied": False,
-            "execution_method": "ROUTINE",
-            "order": deepcopy(order),
-        }
         preview_block = {
             "ok": False,
             "blocked_reasons": ["TEST_STOP_BEFORE_RUNTIME_COMMIT"],
@@ -417,8 +401,6 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
             self.boundary, "read_order_from_queue_by_id", side_effect=reads
         ), mock.patch.object(
             self.boundary, "auto_trade_execution_block_reasons", return_value=[]
-        ), mock.patch.object(
-            self.boundary, "project_ats_execution_order", return_value=ats_result
         ), mock.patch.object(
             self.boundary,
             "_fresh_buy_dispatch_preflight",

@@ -1360,6 +1360,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                 state_getter=lambda: dict(runtime_state),
                 toggle=toggle,
                 liquidation_available_getter=lambda: any(runtime_state.values()),
+                include_execution_method=False,
             )
         menu = ats["menu"]
         menu.show()

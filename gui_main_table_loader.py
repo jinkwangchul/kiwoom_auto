@@ -60,6 +60,7 @@ from running_budget_adjustment import (
 from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_BADGE_HEIGHT,
     RatioMetricDisplay,
+    STOCK_POSITION_METRIC_SAMPLES,
     apply_auto_trade_plain_metric_item_style,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
@@ -94,6 +95,7 @@ from gui_auto_trade_integrity import (
 )
 from gui_auto_trade_policy import (
     auto_trade_start_budget_current_running,
+    auto_trade_setting_liquidation_text,
     auto_trade_stock_operation_category,
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
@@ -116,7 +118,7 @@ from gui_main_routine_selection import (
     routine_instance_checked,
     sync_routine_selection_state,
 )
-from mock_validation_ui_projection import current_mock_projections
+from mock_validation_ui_projection import current_mock_monitoring_trees
 
 
 ROUTINE_MONITORING_HEADERS = (
@@ -224,11 +226,14 @@ ROUTINE_PARENT_PROFIT_ROLE = Qt.UserRole + 222
 ROUTINE_GROUP_ID_ROLE = Qt.UserRole + 223
 ROUTINE_GROUP_PATH_ROLE = Qt.UserRole + 224
 ROUTINE_STOCK_TOOLTIP_DATA_ROLE = Qt.UserRole + 225
+ROUTINE_MOCK_EFFECTIVE_SETTINGS_ROLE = Qt.UserRole + 226
 _MAIN_PNL_STATIC_CACHE_ATTR = "_main_pnl_refresh_static_cache"
 _MAIN_REFRESH_READ_CONTEXT_ATTR = "_main_refresh_read_context"
 ROUTINE_ROW_PARENT = "group"
 ROUTINE_ROW_CHILD = "instance"
 ROUTINE_ROW_STOCK = "stock"
+ROUTINE_ROW_MOCK_STOCK = "mock_stock"
+ROUTINE_ROW_MOCK_INSTANCE = "mock_instance"
 MAIN_STOCK_OPERATION_CATEGORY_LABELS = {
     "operation": "운영",
     "waiting": "대기",
@@ -1858,7 +1863,6 @@ def _instance_stock_counts(
         dynamic_stocks.append(
             (stock, inspection.state, inspection.review_required)
         )
-    mock_codes = _current_mock_stock_codes(window)
     for stock, state, review_required in dynamic_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
         if stock_paths is not None and stock_path not in stock_paths:
@@ -1868,8 +1872,6 @@ def _instance_stock_counts(
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
         stock_identity = normalize_stock_code(code) or stock_path
-        if stock_identity in mock_codes:
-            continue
         if stock_identity in seen_stock_identities:
             continue
         seen_stock_identities.add(stock_identity)
@@ -2411,11 +2413,25 @@ def _update_main_routine_summary(
             )
         if _mock_host(window) is not None:
             mock_count = len(_current_mock_stock_codes(window))
-            projection["count_badges"] = tuple(projection["count_badges"]) + (
-                ("mock", "모의", mock_count),
-            )
-            projection["counts_text"] = f"{projection['counts_text']}  모의({mock_count})"
+            projection = _append_mock_registration_overlay(projection, mock_count)
         update(projection)
+
+
+def _append_mock_registration_overlay(
+    production_projection: dict[str, object],
+    mock_count: int,
+) -> dict[str, object]:
+    """Add the independent Mock count without changing Production categories."""
+
+    projection = dict(production_projection)
+    projection["count_badges"] = tuple(projection.get("count_badges", ())) + (
+        ("mock", "모의", max(0, int(mock_count))),
+    )
+    projection["counts_text"] = (
+        f"{str(projection.get('counts_text', '')).rstrip()}"
+        f"  |  모의({max(0, int(mock_count))})"
+    )
+    return projection
 
 
 def _mock_host(window):
@@ -2464,81 +2480,357 @@ def _main_routine_structure_stock_scope(window) -> str:
     )
 
 
+def _legacy_mock_display_contract(window, repository, tree: dict[str, object]) -> dict[str, object]:
+    """Project legacy Mock display slots from Production config without mutating it."""
+
+    stock_path = str(tree.get("stock_path", "") or "").strip()
+    project_root_value = getattr(repository, "project_root", None)
+    if not stock_path or project_root_value in (None, ""):
+        return {}
+    project_root = Path(project_root_value).resolve()
+    stock_dir = (project_root / stock_path).resolve()
+    try:
+        stock_dir.relative_to(project_root)
+    except ValueError:
+        return {}
+    config = read_json_dict(stock_dir / "config.json")
+    if not isinstance(config, dict) or not config:
+        return {}
+    stock = {
+        "code": str(tree.get("stock_code", "") or ""),
+        "name": str(tree.get("stock_name", "") or ""),
+        "stock_path": stock_path,
+    }
+    operation_display = auto_trade_operation_display(config)
+    return {
+        "initial_buy": main_stock_resolved_initial_buy_display(window, stock, config),
+        "operation_schedule": {"display_text": operation_display[0]},
+        "operation_display": operation_display,
+        "liquidation": {"display_text": auto_trade_setting_liquidation_text(config)},
+    }
+
+
 def _load_mock_routine_table(window) -> None:
-    """Render one stock-centric row per current Mock session."""
+    """Render the Mock-only Stock -> Routine Instance monitoring tree."""
 
     host = _mock_host(window)
     repository = getattr(host, "repository", None)
-    rows = current_mock_projections(repository) if repository is not None else ()
+    market_store = getattr(host, "market_store", None)
+    current_prices: dict[str, int | float | None] = {}
+    if repository is not None and market_store is not None:
+        latest_trade = getattr(market_store, "latest_trade", None)
+        if callable(latest_trade):
+            for stock_code in repository.current_session_ids():
+                trade = latest_trade(stock_code)
+                current_prices[stock_code] = (
+                    getattr(trade, "current_price", None) if trade is not None else None
+                )
+    trees = (
+        current_mock_monitoring_trees(
+            repository,
+            current_price_by_stock=current_prices,
+        )
+        if repository is not None
+        else ()
+    )
+    stock_tooltip_metadata_by_code = _stock_library_tooltip_metadata_by_code()
+    rows: list[dict[str, object]] = []
+    collapsed_mock_stock_keys = getattr(
+        window,
+        "_collapsed_mock_validation_stock_keys",
+        set(),
+    )
+    if not isinstance(collapsed_mock_stock_keys, set):
+        collapsed_mock_stock_keys = set()
+
+    def mock_instance_metrics(child: dict[str, object]) -> tuple[tuple[object, ...], str]:
+        holding_metric, price_metric, _profit_metric, _pending_metric, _amount, _rate = (
+            stock_position_metric_values(
+                holding_qty=child.get("holding_qty", 0),
+                avg_price=child.get("average_price", 0),
+                current_price=child.get("current_price"),
+                buy_pending_qty=child.get("buy_pending_qty", 0),
+                sell_pending_qty=child.get("sell_pending_qty", 0),
+            )
+        )
+        cost_basis = safe_float_value(child.get("realized_cost_basis"), 0.0)
+        holding_metric = replace(
+            holding_metric,
+            value2=format_number_value(cost_basis),
+        )
+        gross_pnl = safe_float_value(child.get("gross_pnl"), 0.0)
+        net_pnl = safe_float_value(child.get("net_pnl"), 0.0)
+        net_rate = (net_pnl / cost_basis) * 100.0 if cost_basis > 0 else 0.0
+        profit_metric = RatioMetricDisplay(
+            label="수익",
+            value1=format_signed_money(net_pnl),
+            value2=format_signed_percent(net_rate),
+            value1_sample=STOCK_POSITION_METRIC_SAMPLES["수익"][0],
+            value2_sample=STOCK_POSITION_METRIC_SAMPLES["수익"][1],
+        )
+        trade_metric = RatioMetricDisplay(
+            label="매매",
+            value1=f"{safe_int_value(child.get('buy_trade_count'), 0):,}",
+            value2=f"{safe_int_value(child.get('sell_trade_count'), 0):,}",
+            value1_sample=STOCK_POSITION_METRIC_SAMPLES["매매"][0],
+            value2_sample=STOCK_POSITION_METRIC_SAMPLES["매매"][1],
+        )
+        signal, _display_text, _color = routine_profit_signal(gross_pnl, net_pnl)
+        return (
+            (holding_metric, price_metric, profit_metric, trade_metric),
+            routine_profit_led_state_from_signal(signal),
+        )
+
+    for tree in trees:
+        code = str(tree.get("stock_code", "") or "")
+        name = str(tree.get("stock_name", "") or "")
+        validation_session_id = str(
+            tree.get("validation_session_id", "") or ""
+        ).strip()
+        mock_stock_key = (validation_session_id, code)
+        collapsed = mock_stock_key in collapsed_mock_stock_keys
+        stock_metadata = stock_tooltip_metadata_by_code.get(
+            code.upper().lstrip("A"),
+            {},
+        )
+        stock_tooltip_projection = {
+            "market": stock_metadata.get("market", ""),
+            "stock_code": code,
+            "stock_name": name,
+            "current_price": current_prices.get(code),
+            "nxt_available": bool(stock_metadata.get("nxt_available") is True),
+            "stock_state": {},
+            "stock_status": stock_metadata.get("status", ""),
+        }
+        parent_profit_metric = RatioMetricDisplay(
+            label="수익",
+            value1=format_signed_money(tree.get("profit_amount", 0)),
+            value2=format_signed_percent(tree.get("profit_rate", 0), digits=2),
+            value1_sample=STOCK_POSITION_METRIC_SAMPLES["수익"][0],
+            value2_sample=STOCK_POSITION_METRIC_SAMPLES["수익"][1],
+        )
+        parent_profit_text = ratio_metric_text(parent_profit_metric)
+        parent_profit_color = profit_loss_value_color(tree.get("profit_amount", 0))
+        parent_values = [
+            f"{'▶' if collapsed else '▼'} {code} {name} "
+            f"({int(tree.get('routine_instance_count', 0) or 0)})"
+        ]
+        rows.append(
+            {
+                "kind": ROUTINE_ROW_MOCK_STOCK,
+                "tree": tree,
+                "instance": None,
+                "values": parent_values,
+                "stock_tooltip_projection": dict(stock_tooltip_projection),
+                "metrics": (parent_profit_metric,),
+                "parent_profit": (parent_profit_text, parent_profit_color),
+                "collapsed": collapsed,
+                "tokens": tuple(
+                    {"text": value, "bold": index == 0}
+                    for index, value in enumerate(parent_values)
+                ),
+            }
+        )
+        if collapsed:
+            continue
+        legacy_display_contract: dict[str, object] | None = None
+        for child in tree.get("children", ()):
+            if not isinstance(child, dict):
+                continue
+            state = str(child.get("state") or "").strip().upper()
+            status_color = {
+                "RUNNING": "#16A34A",
+                "CLOSING": "#D97706",
+                "ERROR": "#DC2626",
+            }.get(state, "#9CA3AF")
+            metrics, profit_led = mock_instance_metrics(child)
+            if (
+                child.get("effective_settings_mutable") is True
+                or child.get("display_contract_frozen") is True
+            ):
+                display_contract = (
+                    child.get("display_contract")
+                    if isinstance(child.get("display_contract"), dict)
+                    else {}
+                )
+            else:
+                if legacy_display_contract is None:
+                    legacy_display_contract = _legacy_mock_display_contract(
+                        window,
+                        repository,
+                        tree,
+                    )
+                display_contract = legacy_display_contract
+            initial_buy = (
+                display_contract.get("initial_buy")
+                if isinstance(display_contract.get("initial_buy"), dict)
+                else {}
+            )
+            schedule = (
+                display_contract.get("operation_schedule")
+                if isinstance(display_contract.get("operation_schedule"), dict)
+                else {}
+            )
+            operation_display = child.get("operation_display")
+            if operation_display is None:
+                operation_display = display_contract.get("operation_display")
+            official_operation_display = (
+                tuple(operation_display)
+                if isinstance(operation_display, (list, tuple))
+                and len(operation_display) == 4
+                else None
+            )
+            liquidation = (
+                display_contract.get("liquidation")
+                if isinstance(display_contract.get("liquidation"), dict)
+                else {}
+            )
+            initial_buy_text = (
+                f"{initial_buy.get('badge')} {initial_buy.get('value_text')}"
+                if initial_buy
+                else ""
+            )
+            values = [
+                str(child.get("routine_instance_name") or child.get("routine_instance_id") or "-"),
+                initial_buy_text,
+                str(
+                    official_operation_display[0]
+                    if official_operation_display is not None
+                    else schedule.get("display_text") or ""
+                ),
+                "●",
+                str(child.get("state_label") or "-"),
+                "루틴",
+                str(liquidation.get("display_text") or ""),
+                ratio_metric_text(metrics[0]),
+                ratio_metric_text(metrics[1]),
+                ratio_metric_text(metrics[2]),
+                ratio_metric_text(metrics[3]),
+            ]
+            tokens = []
+            for index, value in enumerate(values):
+                token = {"text": value}
+                if index == 3:
+                    token["foreground"] = status_color
+                elif index == 2 and official_operation_display is not None:
+                    token = _item_style_snapshot(
+                        create_auto_trade_operation_item(official_operation_display)
+                    )
+                elif index == 4 and child.get("error") is True:
+                    token["foreground"] = "#DC2626"
+                elif index == 9:
+                    token["foreground"] = profit_loss_value_color(child.get("net_pnl", 0)).lower()
+                tokens.append(token)
+            rows.append(
+                {
+                    "kind": ROUTINE_ROW_MOCK_INSTANCE,
+                    "tree": tree,
+                    "instance": child,
+                    "values": values,
+                    "tokens": tuple(tokens),
+                    "metrics": metrics,
+                    "profit_led": profit_led,
+                    "initial_buy": initial_buy,
+                    "effective_settings": (
+                        child.get("effective_settings")
+                        if isinstance(child.get("effective_settings"), dict)
+                        else {}
+                    ),
+                }
+            )
     _clear_routine_table_cell_widgets(window.routine_table)
     clear_spans = getattr(window.routine_table, "clearSpans", None)
     if callable(clear_spans):
         clear_spans()
     window.routine_table.setRowCount(0)
     window.routine_table.setRowCount(len(rows))
-    for row, projection in enumerate(rows):
-        code = str(projection.get("stock_code", "") or "")
-        name = str(projection.get("stock_name", "") or "")
-        instance_ids = tuple(projection.get("routine_instance_ids", ()) or ())
-        instance_id = str(instance_ids[0]) if instance_ids else ""
-        instance_summary = str(projection.get("routine_summary", "") or "-")
-        state_label = str(projection.get("state_label", "") or "-")
-        operation_state = str(projection.get("operation_state", "") or "-")
-        culprit = str(projection.get("review_culprit", "") or "-")
-        holding = int(projection.get("holding_qty", 0) or 0)
-        pnl = projection.get("net_pnl", 0)
-        values = [
-            f"{code} {name}",
-            state_label,
-            str(len(instance_ids)),
-            "모의",
-            operation_state,
-            culprit,
-            f"{holding:,}주",
-            "-",
-            f"{float(pnl):+,.0f}원",
-            "-",
-        ]
-        display_tokens = tuple({"text": value} for value in values)
+    for row, row_data in enumerate(rows):
+        tree = row_data["tree"]
+        child = row_data["instance"]
+        code = str(tree.get("stock_code", "") or "")
+        name = str(tree.get("stock_name", "") or "")
+        instance_id = str(child.get("routine_instance_id", "") or "") if isinstance(child, dict) else ""
+        values = list(row_data["values"])
+        display_tokens = tuple(row_data["tokens"])
+        tooltip_projection = None
+        if row_data["kind"] == ROUTINE_ROW_MOCK_STOCK:
+            row_stock_tooltip_projection = row_data.get("stock_tooltip_projection", {})
+            tooltip_projection = {
+                **(
+                    row_stock_tooltip_projection
+                    if isinstance(row_stock_tooltip_projection, dict)
+                    else {}
+                ),
+                "mock_validation": True,
+                "validation_session_id": tree.get("validation_session_id", ""),
+                "routine_instance_id": "",
+                "state": "",
+            }
+        elif row_data["kind"] == ROUTINE_ROW_MOCK_INSTANCE:
+            tooltip_projection = {
+                "mock_validation": True,
+                "validation_session_id": tree.get("validation_session_id", ""),
+                "routine_instance_id": instance_id,
+                "state": child.get("state", "") if isinstance(child, dict) else "",
+            }
         tooltip = (
-            f"모의검증 종목: {code} {name}\n"
-            f"상태: {state_label}\n"
-            f"루틴: {instance_summary}\n"
-            f"보유: {holding:,}주 / 손익: {float(pnl):+,.0f}원"
+            main_stock_row_tooltip_from_projection(tooltip_projection)
+            if row_data["kind"] == ROUTINE_ROW_MOCK_STOCK
+            and isinstance(tooltip_projection, dict)
+            else ""
         )
-        if projection.get("review_required"):
-            tooltip += (
-                f"\n검토 사유: {projection.get('review_reason') or '-'}"
-                f"\n원인 루틴: {culprit}"
-            )
-        for column, value in enumerate(values):
+        for column, value in enumerate(values[: window.routine_table.columnCount()]):
             item = SortableTableWidgetItem(value)
-            item.setData(ROUTINE_ROW_KIND_ROLE, ROUTINE_ROW_STOCK)
+            item.setData(ROUTINE_ROW_KIND_ROLE, row_data["kind"])
             item.setData(ROUTINE_GROUP_ID_ROLE, "mock_validation")
             item.setData(ROUTINE_GROUP_PATH_ROLE, "")
-            item.setData(ROUTINE_DEFINITION_ID_ROLE, "indicator_follow")
+            item.setData(
+                ROUTINE_DEFINITION_ID_ROLE,
+                str(child.get("routine_definition_id", "") or "") if isinstance(child, dict) else "",
+            )
             item.setData(ROUTINE_INSTANCE_ID_ROLE, instance_id)
             item.setData(ROUTINE_STOCK_CODE_ROLE, code)
             item.setData(ROUTINE_STOCK_NAME_ROLE, name)
-            item.setData(ROUTINE_STOCK_PATH_ROLE, projection.get("stock_path", ""))
+            item.setData(ROUTINE_STOCK_PATH_ROLE, tree.get("stock_path", ""))
             item.setData(ROUTINE_STOCK_VALUES_ROLE, values)
             item.setData(ROUTINE_STOCK_DISPLAY_ROLE, display_tokens)
-            item.setData(ROUTINE_STOCK_METRICS_ROLE, ())
-            item.setData(ROUTINE_STOCK_PROFIT_LED_ROLE, "gray")
-            item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, True)
+            item.setData(ROUTINE_STOCK_METRICS_ROLE, row_data.get("metrics", ()))
             item.setData(
-                ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
-                {
-                    "stock_code": code,
-                    "stock_name": name,
-                    "mock_validation": True,
-                    "validation_session_id": projection.get("validation_session_id", ""),
-                    "state": projection.get("state", ""),
-                },
+                ROUTINE_STOCK_INITIAL_BUY_ROLE,
+                row_data.get("initial_buy", {}),
             )
-            if column == 0:
+            item.setData(
+                ROUTINE_MOCK_EFFECTIVE_SETTINGS_ROLE,
+                row_data.get("effective_settings", {}),
+            )
+            item.setData(
+                ROUTINE_STOCK_PROFIT_LED_ROLE,
+                row_data.get("profit_led") if isinstance(child, dict) else None,
+            )
+            item.setData(
+                ROUTINE_PARENT_PROFIT_ROLE,
+                row_data.get("parent_profit")
+                if row_data["kind"] == ROUTINE_ROW_MOCK_STOCK
+                else None,
+            )
+            item.setData(
+                ROUTINE_PARENT_COLLAPSED_ROLE,
+                bool(row_data.get("collapsed"))
+                if row_data["kind"] == ROUTINE_ROW_MOCK_STOCK
+                else False,
+            )
+            item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, True)
+            if isinstance(tooltip_projection, dict):
+                item.setData(
+                    ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
+                    tooltip_projection,
+                )
+            if column == 0 and tooltip:
                 item.setToolTip(tooltip)
             window.routine_table.setItem(row, column, item)
+        set_span = getattr(window.routine_table, "setSpan", None)
+        if callable(set_span):
+            set_span(row, 0, 1, window.routine_table.columnCount())
         set_row_height = getattr(window.routine_table, "setRowHeight", None)
         if callable(set_row_height):
             set_row_height(row, ROUTINE_STOCK_ROW_HEIGHT)
@@ -2547,10 +2839,7 @@ def _load_mock_routine_table(window) -> None:
         definitions, instances = _main_pnl_refresh_routine_metadata(window)
         counts = _instance_stock_counts(window=window, stock_scope="normal")
         projection = _main_routine_summary_projection(definitions, instances, counts)
-        projection["count_badges"] = tuple(projection["count_badges"]) + (
-            ("mock", "모의", len(rows)),
-        )
-        projection["counts_text"] = f"{projection['counts_text']}  모의({len(rows)})"
+        projection = _append_mock_registration_overlay(projection, len(trees))
         updater(projection)
 
 

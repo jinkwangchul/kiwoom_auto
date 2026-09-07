@@ -20,7 +20,6 @@ from account_auto_trade_budget_consumption import (
     project_system_total_budget_buy_admission,
 )
 from gui_auto_trade_integrity import is_emergency_stopped_state
-from gui_ats_utils import project_manual_ats_execution_order
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_close_routine_order_allowed,
@@ -2478,37 +2477,6 @@ class AutoTradeOrderExecutionBoundary:
             }
         return {"found": False, "state": {}, "config": {}, "stock_dir": "", "issues": ["runtime stock state is not found"]}
 
-    def project_ats_execution_order(
-        self,
-        order: dict[str, object],
-        *,
-        now_dt: datetime | None = None,
-    ) -> dict[str, object]:
-        runtime = self.auto_trade_runtime_state_for_order(order)
-        if runtime.get("found") is not True:
-            return {
-                "ok": False,
-                "applied": False,
-                "execution_method": None,
-                "order": deepcopy(order),
-                "reason_code": "ATS_RUNTIME_STATE_UNAVAILABLE",
-                "blocked_reasons": list(runtime.get("issues") or ["ATS_RUNTIME_STATE_UNAVAILABLE"]),
-            }
-        state = runtime.get("state")
-        config = runtime.get("config")
-        state_dict = state if isinstance(state, dict) else {}
-        config_dict = config if isinstance(config, dict) else {}
-        callback = self._context.fresh_current_price
-        result = project_manual_ats_execution_order(
-            order,
-            config_dict,
-            state_dict,
-            now_dt=now_dt,
-            current_price_getter=callback if callable(callback) else None,
-        )
-        result["stock_dir"] = str(runtime.get("stock_dir") or "")
-        return result
-
     def auto_trade_execution_block_reasons(self, order: dict[str, object]) -> list[str]:
         rule_safety_reasons = self.routine_real_order_block_reasons(order)
         if rule_safety_reasons:
@@ -2921,35 +2889,9 @@ class AutoTradeOrderExecutionBoundary:
         if auto_reasons:
             return observed_execution({"processed": False, "stage": "auto_trade_runtime_state", "order_id": order_id, "blocked_reasons": auto_reasons}, "EXECUTION_ENABLE", False)
 
-        ats_execution_method = self.project_ats_execution_order(order_dict)
-        if ats_execution_method.get("ok") is not True:
-            return {
-                "processed": False,
-                "stage": "ats_execution_method",
-                "order_id": order_id,
-                "blocked_reasons": list(
-                    ats_execution_method.get("blocked_reasons") or []
-                ),
-                "ats_execution_method_result": ats_execution_method,
-            }
-        projected_order = ats_execution_method.get("order")
-        projected_order_dict = (
-            projected_order if isinstance(projected_order, dict) else order_dict
-        )
         pre_hash_current_price = self.finalize_current_price_before_hash(
-            projected_order_dict,
+            order_dict,
             queue_path=queue_path,
-            execution_method=(
-                ats_execution_method.get("execution_method")
-                if ats_execution_method.get("applied") is True
-                else None
-            ),
-            resolved_current_price=(
-                ats_execution_method.get("current_price")
-                if ats_execution_method.get("applied") is True
-                and ats_execution_method.get("execution_method") == "CURRENT_PRICE"
-                else None
-            ),
         )
         if pre_hash_current_price.get("ok") is not True:
             return {
@@ -2960,12 +2902,11 @@ class AutoTradeOrderExecutionBoundary:
                     pre_hash_current_price.get("blocked_reasons")
                     or ["CURRENT_PRICE pre-hash revalidation failed"]
                 ),
-                "ats_execution_method_result": ats_execution_method,
                 "current_price_pre_hash_result": pre_hash_current_price,
             }
         finalized_order = pre_hash_current_price.get("order")
         finalized_order_dict = (
-            finalized_order if isinstance(finalized_order, dict) else projected_order_dict
+            finalized_order if isinstance(finalized_order, dict) else order_dict
         )
 
         enable_snapshot = self.queue_file_snapshot(queue_path)
@@ -3042,7 +2983,6 @@ class AutoTradeOrderExecutionBoundary:
                 "blocked_reasons": list(execution_preview.get("blocked_reasons") or execution_preview.get("issues") or []),
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
-                "ats_execution_method_result": ats_execution_method,
                 "current_price_pre_hash_result": pre_hash_current_price,
             }, "FINAL_GUARD", False)
 
@@ -3074,7 +3014,6 @@ class AutoTradeOrderExecutionBoundary:
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
                 "execution_preview_result": execution_preview,
-                "ats_execution_method_result": ats_execution_method,
                 "current_price_pre_hash_result": pre_hash_current_price,
                 "runtime_commit_result": runtime_commit,
             }, "FINAL_GUARD", False)
@@ -3093,7 +3032,6 @@ class AutoTradeOrderExecutionBoundary:
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
                 "execution_preview_result": execution_preview,
-                "ats_execution_method_result": ats_execution_method,
                 "current_price_pre_hash_result": pre_hash_current_price,
                 "runtime_commit_result": runtime_commit,
             }, "FINAL_GUARD", False)
@@ -3205,7 +3143,6 @@ class AutoTradeOrderExecutionBoundary:
             "blocked_reasons": list(send_order_result.get("blocked_reasons") or send_order_result.get("issues") or []),
             "execution_enable_result": enable_result,
             "real_preflight_result": preflight_result,
-            "ats_execution_method_result": ats_execution_method,
             "current_price_pre_hash_result": pre_hash_current_price,
             "execution_preview_result": execution_preview,
             "runtime_commit_result": runtime_commit,

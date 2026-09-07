@@ -2470,10 +2470,8 @@ from gui_auto_trade_close import (
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
     auto_trade_save_selected_manual_ats_state,
-    auto_trade_selected_manual_ats_execution_method_state,
     auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
-    auto_trade_set_selected_manual_ats_execution_method,
     auto_trade_set_selected_manual_ats_flag,
 )
 from gui_auto_trade_timer import (
@@ -6223,12 +6221,6 @@ class AutoTradeSettingWindow(QDialog):
             selected,
         )
 
-    def selected_manual_ats_execution_method_state(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> dict[str, object]:
-        return auto_trade_selected_manual_ats_execution_method_state(self, selected)
-
     def save_selected_manual_ats_state(
         self,
         ats_state: dict[str, bool],
@@ -6244,19 +6236,6 @@ class AutoTradeSettingWindow(QDialog):
 
     def set_selected_manual_ats_flag(self, flag_key: str, enabled: bool, label: str) -> None:
         auto_trade_set_selected_manual_ats_flag(self, flag_key, enabled, label)
-
-    def set_selected_manual_ats_execution_method(
-        self,
-        execution_method: str,
-        label: str,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> dict[str, object]:
-        return auto_trade_set_selected_manual_ats_execution_method(
-            self,
-            execution_method,
-            label,
-            selected,
-        )
 
     def execute_selected_manual_ats_liquidation(
         self,
