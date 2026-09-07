@@ -56,37 +56,33 @@ class AtsExecutionMethodRemovalContractTest(unittest.TestCase):
                 state_getter=lambda: {"extra1": True},
                 toggle=Mock(),
                 liquidation_available_getter=lambda: True,
-                include_execution_method=False,
             )
 
-        self.assertIsNone(actions["method_menu"])
-        self.assertEqual((), actions["method_actions"])
         self.assertNotIn("주문방식", [action.text() for action in actions["menu"].actions()])
+        self.assertNotIn("루틴", [action.text() for action in actions["menu"].actions()])
         self.assertTrue(actions["session_actions"])
         self.assertEqual("시장가", actions["market"].text())
         self.assertEqual("현재가", actions["current"].text())
 
-    def test_shared_mock_menu_contract_is_unchanged(self) -> None:
+    def test_shared_menu_has_no_generic_ats_order_method(self) -> None:
         menu = QMenu()
-        setter = Mock()
-        actions = _add_ats_settings_menu(
-            menu,
-            has_selection=True,
-            state_getter=lambda: {"extra1": True},
-            toggle=Mock(),
-            execution_method_state_getter=lambda: {
-                "ok": True,
-                "execution_method": "ROUTINE",
-                "mixed": False,
-            },
-            execution_method_setter=setter,
-            liquidation_available_getter=None,
-        )
+        with patch(
+            "gui_auto_trade_context_menu.manual_ats_visible_session_keys",
+            return_value=("extra1",),
+        ):
+            actions = _add_ats_settings_menu(
+                menu,
+                has_selection=True,
+                state_getter=lambda: {"extra1": True},
+                toggle=Mock(),
+                liquidation_available_getter=None,
+            )
 
-        self.assertEqual(
-            ["루틴", "시장가", "현재가"],
-            [label for _key, label, _action in actions["method_actions"]],
-        )
+        self.assertNotIn("주문방식", [action.text() for action in actions["menu"].actions()])
+        self.assertNotIn("루틴", [action.text() for action in actions["menu"].actions()])
+        self.assertTrue(actions["session_actions"])
+        self.assertEqual("시장가", actions["market"].text())
+        self.assertEqual("현재가", actions["current"].text())
 
     def test_execution_boundary_has_no_generic_ats_order_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

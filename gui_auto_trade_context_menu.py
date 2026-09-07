@@ -825,10 +825,7 @@ def _add_ats_settings_menu(
     has_selection: bool,
     state_getter: Callable[[], dict[str, bool]] | None,
     toggle: Callable[[str, bool, str], None] | None,
-    execution_method_state_getter: Callable[[], dict[str, object]] | None = None,
-    execution_method_setter: Callable[[str, str], None] | None = None,
     liquidation_available_getter: Callable[[], bool] | None = None,
-    include_execution_method: bool = True,
 ):
     visible_keys = manual_ats_visible_session_keys()
     labels = manual_ats_session_labels()
@@ -846,37 +843,6 @@ def _add_ats_settings_menu(
         action.setProperty("atsSessionCurrent", selected)
         action.setProperty("atsSessionKey", key)
         session_actions.append((key, label, action))
-
-    method_menu = None
-    method_state: dict[str, object] = {}
-    method_actions: list[tuple[str, str, object]] = []
-    if include_execution_method:
-        ats_menu.addSeparator()
-        method_menu = ats_menu.addMenu("주문방식")
-        method_state_value = (
-            execution_method_state_getter()
-            if execution_method_state_getter is not None
-            else {"ok": True, "execution_method": "ROUTINE", "mixed": False}
-        )
-        method_state = (
-            dict(method_state_value) if isinstance(method_state_value, dict) else {}
-        )
-        current_method = str(method_state.get("execution_method") or "").strip().upper()
-        for method_key, method_label in (
-            ("ROUTINE", "루틴"),
-            ("MARKET", "시장가"),
-            ("CURRENT_PRICE", "현재가"),
-        ):
-            action = method_menu.addAction(method_label)
-            selected = method_state.get("ok") is True and current_method == method_key
-            action.setIcon(_menu_status_icon(selected))
-            action.setProperty("atsExecutionMethod", method_key)
-            action.setProperty("atsExecutionMethodCurrent", selected)
-            method_actions.append((method_key, method_label, action))
-        if method_state.get("ok") is not True:
-            set_tool_tip = getattr(method_menu, "setToolTip", None)
-            if callable(set_tool_tip):
-                set_tool_tip("저장된 주문방식을 확인할 수 없습니다.")
 
     ats_menu.addSeparator()
     action_market = ats_menu.addAction("시장가")
@@ -929,10 +895,6 @@ def _add_ats_settings_menu(
         "current_state": current_state,
         "session_actions": tuple(session_actions),
         "toggle_session": toggle_session,
-        "method_menu": method_menu,
-        "method_state": method_state,
-        "method_actions": tuple(method_actions),
-        "execution_method_setter": execution_method_setter,
         "market": action_market,
         "current": action_current,
     }
@@ -956,13 +918,6 @@ def _dispatch_ats_settings_action(
                 toggle_session(key, label)
             elif toggle is not None:
                 toggle(key, not bool(current_state.get(key, False)), label)
-            return True
-
-    for method_key, method_label, action in actions.get("method_actions", ()):
-        if chosen == action:
-            setter = actions.get("execution_method_setter")
-            if callable(setter):
-                setter(method_key, method_label)
             return True
 
     method = ""
@@ -1240,7 +1195,6 @@ def show_monitor_stock_context_menu(
             state_getter=callbacks.ats_state,
             toggle=callbacks.ats_toggle,
             liquidation_available_getter=callbacks.ats_liquidation_available,
-            include_execution_method=False,
         )
         ats_settings["menu"].setEnabled(
             availability.ats_settings_allowed
@@ -1395,8 +1349,6 @@ def show_monitor_stock_context_menu(
         and _menu_entry_enabled(ats_settings["menu"])
     ):
         for _key, _label, action in ats_settings["session_actions"]:
-            allow(action, True)
-        for _key, _label, action in ats_settings["method_actions"]:
             allow(action, True)
         allow(ats_settings["market"], True)
         allow(ats_settings["current"], True)

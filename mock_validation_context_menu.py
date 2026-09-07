@@ -242,7 +242,6 @@ def show_mock_monitoring_context_menu(
                 row, key, enabled, label
             ),
             liquidation_available_getter=None,
-            include_execution_method=False,
         )
         ats_settings["menu"].setEnabled(settings_editable)
     chart_action = menu.addAction("간이차트")
