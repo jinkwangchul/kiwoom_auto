@@ -50,6 +50,25 @@ def _opt10080_rows(candles: list[dict[str, object]]) -> list[dict[str, object]]:
     ]
 
 
+def _chart_candle_supply(rows, **kwargs):
+    candles = completed_timeframe_candles(
+        rows,
+        kwargs["rules"],
+        now=kwargs["as_of"],
+        session_windows=kwargs.get("session_windows"),
+    )
+    return {
+        "available": bool(candles),
+        "availability_state": "AVAILABLE" if candles else "HISTORY_INSUFFICIENT",
+        "candles": candles,
+        "timeframe_minutes": kwargs["rules"]["bar"]["bar_minutes"],
+        "available_minute_candles": len(rows),
+        "completeness": {"completed_only": True},
+        "freshness": {},
+        "source_identity": "TEST-CANDLE-SUPPLY",
+    }
+
+
 class StockNxtCapabilityProjectionTests(unittest.TestCase):
     def test_verified_library_is_the_only_nxt_capability_source(self) -> None:
         cases = (
@@ -98,6 +117,49 @@ class StockNxtCapabilityProjectionTests(unittest.TestCase):
                     )
                 self.assertIs(expected, actual)
 
+    def test_chart_market_sessions_use_the_same_verified_nxt_capability(self) -> None:
+        for nxt_available, expected_names in (
+            (False, ["KRX"]),
+            (True, ["NXT_PRE", "KRX", "NXT_AFTER"]),
+            (None, ["KRX"]),
+        ):
+            with self.subTest(nxt_available=nxt_available), patch.object(
+                stock_instance_day_projection,
+                "_stock_nxt_availability",
+                return_value=nxt_available,
+            ):
+                projected = stock_instance_day_projection.chart_market_session_projection(
+                    "005930",
+                    Path("unused"),
+                )
+            self.assertIs(nxt_available, projected["market_eligibility"]["nxt"])
+            self.assertEqual(
+                expected_names,
+                [item["name"] for item in projected["market_sessions"]],
+            )
+            self.assertEqual(
+                (
+                    [("KRX", "09:00:00", "15:30:00")]
+                    if nxt_available is not True
+                    else [
+                        ("NXT_PRE", "08:00:00", "08:50:00"),
+                        ("KRX", "09:00:00", "15:30:00"),
+                        ("NXT_AFTER", "15:40:00", "20:00:00"),
+                    ]
+                ),
+                [
+                    (item["name"], item["start_time"], item["end_time"])
+                    for item in projected["market_sessions"]
+                ],
+            )
+
+    def test_chart_operation_method_badge_is_not_an_independent_ats_mode(self) -> None:
+        label = stock_instance_day_projection.chart_operation_method_badge_label
+        self.assertEqual("수동", label("CONTINUOUS", ats_selected=False))
+        self.assertEqual("ATS", label("CONTINUOUS", ats_selected=True))
+        self.assertEqual("시간", label("SCHEDULED", ats_selected=False))
+        self.assertEqual("시간", label("SCHEDULED", ats_selected=True))
+
 
 class CandleDayPersistenceTests(unittest.TestCase):
     def test_current_day_merge_preserves_over_300_and_deduplicates_minutes(self) -> None:
@@ -129,7 +191,7 @@ class CandleDayPersistenceTests(unittest.TestCase):
             self.assertEqual(projected[-1]["bar_time"], "2026-08-10T15:15:00+09:00")
             self.assertEqual(projected[-1]["close"], 480)
 
-    def test_new_trade_day_drops_previous_day_without_new_file_layout(self) -> None:
+    def test_new_trade_day_preserves_previous_day_in_canonical_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "005930_삼성전자"
             save_candles(stock_dir, _raw_candles(10, day="2026-08-09"), max_count=600)
@@ -142,8 +204,9 @@ class CandleDayPersistenceTests(unittest.TestCase):
                     _opt10080_rows(_raw_candles(3)),
                 )
 
-            self.assertEqual(len(saved), 3)
-            self.assertTrue(all(str(item["time"]).startswith("20260810") for item in saved))
+            self.assertEqual(len(saved), 13)
+            self.assertTrue(any(str(item["time"]).startswith("20260809") for item in saved))
+            self.assertTrue(any(str(item["time"]).startswith("20260810") for item in saved))
 
 
 class AutomaticCandleRefreshTests(unittest.TestCase):
@@ -197,9 +260,9 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
 
             self.assertTrue(first["accepted"])
             self.assertTrue(second["accepted"])
-            self.assertEqual([call["count"] for call in calls], [600, 3])
+            self.assertEqual([call["count"] for call in calls], [600, 600])
             self.assertTrue(all(call["interval"] == 1 for call in calls))
-            self.assertTrue(all(call["max_count"] == 600 for call in calls))
+            self.assertTrue(all(call["max_count"] == 200_000 for call in calls))
             self.assertEqual(len(completions), 2)
 
     def test_request_batch_is_bounded_and_round_robin_ready(self) -> None:
@@ -228,6 +291,36 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             self.assertEqual(len(requested), 15)
             self.assertEqual(result["skipped_by_limit"], 5)
             self.assertEqual(result["request_spacing_ms"], 1000)
+
+    def test_warmup_over_limit_fails_closed_without_tr_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock_dir(Path(temp))
+            request = Mock()
+            window = SimpleNamespace(
+                kiwoom_api=SimpleNamespace(
+                    is_available=lambda: True,
+                    is_connected=lambda: True,
+                    request_minute_candles=request,
+                ),
+                candle_history_required_count=lambda _code: 200_001,
+            )
+            completed: list[dict[str, object]] = []
+            with patch.object(auto_candle_refresh, "all_registered_stock_dirs", return_value=[stock_dir]), patch.object(
+                auto_candle_refresh.QTimer,
+                "singleShot",
+                side_effect=lambda _delay, callback: callback(),
+            ):
+                auto_candle_refresh.refresh_operation_candles(
+                    window,
+                    "2026-08-10 10:00",
+                    on_complete=completed.append,
+                )
+
+            request.assert_not_called()
+            evidence = completed[0]["fail_closed"][0]
+            self.assertEqual("CANDLE_WARMUP_LIMIT_EXCEEDED", evidence["reason"])
+            self.assertEqual(200_001, evidence["required_minute_candles"])
+            self.assertEqual(200_000, evidence["maximum_minute_candles"])
 
     def test_refresh_targets_prefers_registered_operation_targets_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -461,13 +554,31 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
             with patch.object(
                 stock_instance_day_projection,
                 "routine_instance_by_id",
-                return_value=SimpleNamespace(rules_path=rules_path),
+                return_value=SimpleNamespace(
+                    rules_path=rules_path,
+                    definition_id="definition-1",
+                ),
+            ), patch.object(
+                stock_instance_day_projection,
+                "routine_definition_by_id",
+                return_value=object(),
+            ), patch.object(
+                stock_instance_day_projection,
+                "load_routine_callable",
+                return_value=lambda _rules: {
+                    "projection": "COMPLETED_TIMEFRAME",
+                    "warmup_bars": 1,
+                },
             ):
                 projected = stock_instance_day_projection.project_stock_instance_day(
                     "005930",
                     "2026-08-10",
                     project_root=root,
                     now=datetime(2026, 8, 10, 9, 10, tzinfo=SEOUL_TIMEZONE),
+                    candle_provider=lambda **kwargs: _chart_candle_supply(
+                        load_candles(stock_dir),
+                        **kwargs,
+                    ),
                 )
 
         self.assertEqual(projected["instance_id"], "instance-1")
@@ -493,6 +604,118 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
             stock_instance_day_projection.CHART_PROJECTION_VALID,
             projected["projection_status"],
         )
+
+    def test_day_projection_forwards_applied_interval_and_provider_supply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = root / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "assigned_routine_instance_id": "instance-1",
+                        "name": "삼성전자",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text("{}", encoding="utf-8")
+            (root / "operation_policy.json").write_text(
+                json.dumps(
+                    {
+                        "regular_market": {
+                            "start_time": "09:00:00",
+                            "end_time": "15:20:00",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rules_path = root / "rules.json"
+            instance = SimpleNamespace(
+                rules_path=rules_path,
+                definition_id="definition-1",
+                display_name="지표추종-A",
+            )
+            calls = []
+
+            def provider(**kwargs):
+                calls.append(kwargs)
+                interval = kwargs["rules"]["bar"]["bar_minutes"]
+                return {
+                    "available": True,
+                    "availability_state": "AVAILABLE",
+                    "candles": [
+                        {
+                            "bar_time": "2026-08-09T09:00:00+09:00",
+                            "open": 90,
+                            "high": 91,
+                            "low": 89,
+                            "close": 90,
+                            "volume": 10,
+                            "timeframe_minutes": interval,
+                            "is_complete": True,
+                        },
+                        {
+                            "bar_time": "2026-08-10T09:00:00+09:00",
+                            "open": 100,
+                            "high": 101,
+                            "low": 99,
+                            "close": 100,
+                            "volume": 20,
+                            "timeframe_minutes": interval,
+                            "is_complete": False,
+                        },
+                    ],
+                    "timeframe_minutes": interval,
+                    "available_minute_candles": 1000,
+                    "completeness": {"forming_included": True},
+                    "freshness": {"as_of": kwargs["as_of"].isoformat()},
+                    "source_identity": f"SOURCE-{interval}",
+                }
+
+            with patch.object(
+                stock_instance_day_projection,
+                "routine_instance_by_id",
+                return_value=instance,
+            ), patch.object(
+                stock_instance_day_projection,
+                "routine_definition_by_id",
+                return_value=object(),
+            ), patch.object(
+                stock_instance_day_projection,
+                "load_routine_callable",
+                return_value=lambda _rules: {
+                    "projection": "FORMING_BASE_BAR",
+                    "warmup_bars": 2,
+                },
+            ):
+                for interval in (1, 5, 120, 240):
+                    rules_path.write_text(
+                        json.dumps({"bar": {"bar_minutes": interval}}),
+                        encoding="utf-8",
+                    )
+                    projected = stock_instance_day_projection.project_stock_instance_day(
+                        "005930",
+                        "2026-08-10",
+                        project_root=root,
+                        now=datetime(2026, 8, 10, 9, 1, tzinfo=SEOUL_TIMEZONE),
+                        candle_provider=provider,
+                    )
+                    self.assertEqual(interval, projected["bar_minutes"])
+                    self.assertEqual(2, len(projected["candles"]))
+                    self.assertFalse(projected["candles"][-1]["is_complete"])
+                    self.assertTrue(projected["completeness"]["forming_included"])
+                    self.assertEqual(f"SOURCE-{interval}", projected["source_identity"])
+
+            self.assertEqual(
+                [1, 5, 120, 240],
+                [call["rules"]["bar"]["bar_minutes"] for call in calls],
+            )
+            self.assertTrue(
+                all(call["projection_request"]["projection"] == "FORMING_BASE_BAR" for call in calls)
+            )
+            self.assertTrue(all(call["consumer_scope"] == "PRODUCTION" for call in calls))
 
     def test_actual_fill_delta_contract_keeps_cost_but_drops_time_and_order_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -588,18 +811,36 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
                 json.dumps({"bar": {"bar_minutes": 5}}),
                 encoding="utf-8",
             )
-            instance = SimpleNamespace(rules_path=rules_path)
+            instance = SimpleNamespace(
+                rules_path=rules_path,
+                definition_id="definition-1",
+            )
 
             with patch.object(
                 stock_instance_day_projection,
                 "routine_instance_by_id",
                 return_value=instance,
+            ), patch.object(
+                stock_instance_day_projection,
+                "routine_definition_by_id",
+                return_value=object(),
+            ), patch.object(
+                stock_instance_day_projection,
+                "load_routine_callable",
+                return_value=lambda _rules: {
+                    "projection": "COMPLETED_TIMEFRAME",
+                    "warmup_bars": 1,
+                },
             ):
                 empty = stock_instance_day_projection.project_stock_instance_day(
                     "005930",
                     "2026-08-10",
                     project_root=root,
                     now=datetime(2026, 8, 10, 9, 2, tzinfo=SEOUL_TIMEZONE),
+                    candle_provider=lambda **kwargs: _chart_candle_supply(
+                        load_candles(stock_dir),
+                        **kwargs,
+                    ),
                 )
                 save_candles(stock_dir, _raw_candles(1), max_count=600)
                 not_ready = stock_instance_day_projection.project_stock_instance_day(
@@ -607,6 +848,10 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
                     "2026-08-10",
                     project_root=root,
                     now=datetime(2026, 8, 10, 9, 2, tzinfo=SEOUL_TIMEZONE),
+                    candle_provider=lambda **kwargs: _chart_candle_supply(
+                        load_candles(stock_dir),
+                        **kwargs,
+                    ),
                 )
 
             with patch.object(
@@ -852,13 +1097,33 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
             with patch.object(
                 stock_instance_day_projection,
                 "routine_instance_by_id",
-                return_value=SimpleNamespace(rules_path=rules_path),
+                return_value=SimpleNamespace(
+                    rules_path=rules_path,
+                    definition_id="definition-1",
+                ),
+            ), patch.object(
+                stock_instance_day_projection,
+                "routine_definition_by_id",
+                return_value=object(),
+            ), patch.object(
+                stock_instance_day_projection,
+                "load_routine_callable",
+                return_value=lambda _rules: {
+                    "projection": "COMPLETED_TIMEFRAME",
+                    "warmup_bars": 1,
+                },
             ):
                 projected = stock_instance_day_projection.project_stock_instance_day(
                     "005930",
                     "2026-08-10",
                     project_root=root,
                     now=datetime(2026, 8, 10, 9, 10, tzinfo=SEOUL_TIMEZONE),
+                    candle_provider=lambda **_kwargs: {
+                        "available": False,
+                        "availability_state": "CANDLE_DATA_MALFORMED",
+                        "candles": [],
+                        "available_minute_candles": 0,
+                    },
                 )
 
         self.assertEqual([], projected["candles"])

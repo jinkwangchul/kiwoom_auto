@@ -27,7 +27,7 @@ from kiwoom_market_data_authority import (
 )
 
 
-BOOTSTRAP_REQUEST_COUNT = DEFAULT_CANDLES_MAX_COUNT
+BOOTSTRAP_REQUEST_COUNT = 600
 INCREMENTAL_REQUEST_COUNT = 3
 MAX_REQUESTS_PER_CYCLE = 15
 REQUEST_SPACING_MS = 1_000
@@ -230,6 +230,8 @@ def refresh_operation_candles(
         "incremental_requested": 0,
         "realtime_skipped": 0,
         "reconciliation_requested": 0,
+        "warmup_limit_exceeded": 0,
+        "fail_closed": [],
         "max_requests_per_cycle": MAX_REQUESTS_PER_CYCLE,
         "request_spacing_ms": REQUEST_SPACING_MS,
     }
@@ -279,10 +281,35 @@ def refresh_operation_candles(
             summary["realtime_skipped"] += 1
             QTimer.singleShot(0, lambda: request_next(index + 1))
             return
-        bootstrap = code not in completed_codes and not _already_bootstrapped(stock_dir, trade_date, as_of)
         reconciliation = decision.get("decision") == REALTIME_RECONCILIATION
+        required_count_getter = getattr(window, "candle_history_required_count", None)
+        required_count = (
+            int(required_count_getter(code))
+            if callable(required_count_getter)
+            else BOOTSTRAP_REQUEST_COUNT
+        )
+        if required_count > DEFAULT_CANDLES_MAX_COUNT:
+            summary["warmup_limit_exceeded"] += 1
+            summary["failed"] += 1
+            summary["fail_closed"].append(
+                {
+                    "stock_code": code,
+                    "reason": "CANDLE_WARMUP_LIMIT_EXCEEDED",
+                    "required_minute_candles": required_count,
+                    "maximum_minute_candles": DEFAULT_CANDLES_MAX_COUNT,
+                }
+            )
+            QTimer.singleShot(0, lambda: request_next(index + 1))
+            return
+        stored_count = len(load_candles(stock_dir))
+        bootstrap = (
+            stored_count < required_count
+            or (code not in completed_codes and not _already_bootstrapped(stock_dir, trade_date, as_of))
+        )
         count = INCREMENTAL_REQUEST_COUNT if reconciliation else (
-            BOOTSTRAP_REQUEST_COUNT if bootstrap else INCREMENTAL_REQUEST_COUNT
+            min(max(required_count, 1), DEFAULT_CANDLES_MAX_COUNT)
+            if bootstrap
+            else INCREMENTAL_REQUEST_COUNT
         )
         summary["requested"] += 1
         if reconciliation:

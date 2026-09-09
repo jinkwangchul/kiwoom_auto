@@ -578,12 +578,100 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         repository, service, _, adapter, selected = self.build({"A": _sell_rules()}, signal="SELL")
         no_holding = self.evaluate(adapter)
         self.assertEqual("SELL_HOLDING_QUANTITY_INVALID", no_holding["reason"])
+        replay = self.evaluate(adapter, at=NOW.replace(microsecond=999999))
+        self.assertEqual(RESULT_NOOP, replay["status"])
+        self.assertEqual(
+            1,
+            len([
+                event
+                for event in repository.read_events(SESSION_ID)
+                if event["event_type"] == "ROUTINE_EVALUATED"
+            ]),
+        )
+        self.assertEqual("RUNNING", repository.read_session(SESSION_ID)["instance_execution"]["A"]["state"])
         self.seed_holding(repository, service, qty=3)
         sold = self.evaluate(adapter, cycle="C2")
         self.assertEqual(RESULT_PROGRESSED, sold["status"])
         self.assertEqual(("SELL", 3), (sold["orders"][0]["side"], sold["orders"][0]["filled_qty"]))
         self.assertEqual(0, next(item for item in repository.read_session(SESSION_ID)["positions"] if item["routine_instance_id"] == "A")["holding_qty"])
         self.assertEqual("SELL", selected["value"])
+
+    def test_routine_evaluated_event_binds_operation_and_authoritative_signal_bar(self):
+        repository, _, _, adapter, _ = self.build({"A": _sell_rules()}, signal="SELL")
+        adapter._evaluator = lambda *_args: {
+            "signal": "SELL",
+            "reason": "fixture",
+            "signal_index": 0,
+        }
+        result = adapter.evaluate_cycle(
+            SESSION_ID,
+            routine_instance_id="A",
+            candles=[
+                {
+                    "bar_time": "2026-09-03T10:00:00+09:00",
+                    "close": 100,
+                    "volume": 10,
+                    "timeframe_minutes": 5,
+                }
+            ],
+            market=_market(),
+            policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+            evaluation_cycle_id="C-SIGNAL-MARKER",
+            evaluated_at=NOW,
+        )
+        self.assertEqual("SELL_HOLDING_QUANTITY_INVALID", result["reason"])
+        event = next(
+            item
+            for item in repository.read_events(SESSION_ID)
+            if item["event_type"] == "ROUTINE_EVALUATED"
+        )
+        self.assertEqual("SELL", event["payload"]["signal"])
+        self.assertEqual("2026-09-03T10:00:00+09:00", event["payload"]["signal_bar_time"])
+        self.assertEqual(100, event["payload"]["signal_bar_close"])
+        self.assertEqual(5, event["payload"]["signal_timeframe_minutes"])
+        self.assertTrue(event["payload"]["operation_identity"])
+
+    def test_evaluation_uses_current_operation_rules_snapshot(self):
+        repository, _, engine, _, _ = self.build({"A": _buy_rules(qty=1)})
+        current_rules = _buy_rules(qty=7)
+        before = repository.read_session(SESSION_ID)
+
+        def snapshot(document):
+            document.setdefault("mock_operation_lifecycle", {"instance_operations": {}})[
+                "instance_operations"
+            ]["A"] = {
+                "routine_instance_id": "A",
+                "operation_session_id": "MS-current-rules",
+                "state": "RUNNING",
+                "operation_policy_snapshot": {
+                    "mock_instance_rules_snapshot": deepcopy(current_rules),
+                },
+            }
+            return document
+
+        repository.mutate_session(SESSION_ID, snapshot, expected_revision=before["revision"])
+        observed = {}
+
+        def evaluator(_candles, rules, _context):
+            observed["rules"] = deepcopy(rules)
+            return {"signal": "", "reason": "fixture"}
+
+        adapter = MockIndicatorFollowRoutineAdapter(
+            repository,
+            engine,
+            now_factory=lambda: NOW,
+            evaluator=evaluator,
+        )
+        result = self.evaluate(adapter)
+
+        self.assertEqual(RESULT_NO_SIGNAL, result["status"])
+        self.assertEqual(7, observed["rules"]["mock_validation"]["stock_config"]["buy_qty"])
+        event = next(
+            item
+            for item in repository.read_events(SESSION_ID)
+            if item["event_type"] == "ROUTINE_EVALUATED"
+        )
+        self.assertEqual(payload_hash(current_rules), event["payload"]["rules_hash"])
 
     def test_market_single_modes_use_virtual_orderbook_without_production_price_fallback(self):
         buy_rules = _buy_rules(qty=2)

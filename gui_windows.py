@@ -4259,15 +4259,22 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._apply_main_control_window_width()
         self._connect_events()
+        operation_host = self.main_monitoring_auto_trade_operation_host()
+        market_host_getter = getattr(operation_host, "market_data_host", None)
+        market_host = market_host_getter() if callable(market_host_getter) else None
         self.mock_validation_host = MockValidationHost(
             self.kiwoom_api,
             project_root=PROJECT_ROOT,
             projection_changed=self._on_mock_validation_projection_changed,
+            candles_provider=getattr(market_host, "project_routine_candles", None),
+            candle_observation_updater=getattr(market_host, "sync_candle_observation_targets", None),
         )
         self.mock_validation_ui_actions = MockValidationUIActions(
             self.mock_validation_host
         )
-        operation_host = self.main_monitoring_auto_trade_operation_host()
+        application = QApplication.instance()
+        if application is not None:
+            application.aboutToQuit.connect(self._shutdown_mock_validation_host)
         self._pending_main_market_information_codes: set[str] = set()
         self._main_market_information_refresh_timer = QTimer(self)
         self._main_market_information_refresh_timer.setSingleShot(True)
@@ -4277,8 +4284,6 @@ class MainWindow(QMainWindow):
         self._main_market_information_refresh_timer.timeout.connect(
             self._refresh_main_market_information_rows
         )
-        market_host_getter = getattr(operation_host, "market_data_host", None)
-        market_host = market_host_getter() if callable(market_host_getter) else None
         market_data_observed = getattr(market_host, "market_data_observed", None)
         if market_data_observed is not None and callable(
             getattr(market_data_observed, "connect", None)
@@ -6098,7 +6103,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "모의검증", "모의검증 실행 기반을 사용할 수 없습니다.")
             return False
         if host.current_session(target.code) is not None:
-            QMessageBox.information(self, "모의검증", "이미 진행 중인 모의검증 종목입니다.")
+            show_toast(self, "이미 진행 중인 모의검증 종목입니다.")
             return False
         selected = self._select_mock_validation_instances(target)
         if not selected:
@@ -9821,7 +9826,7 @@ class MainWindow(QMainWindow):
                     self,
                     "현재 운영 상태에서는 모의 시작예산을 변경할 수 없습니다."
                     if allowed_states != frozenset({"WAITING"})
-                    else "모의 Instance 설정은 운영대기 상태에서만 변경할 수 있습니다.",
+                    else "모의검증 진행 중에는 설정을 변경할 수 없습니다.",
                 )
             return None
         return (
@@ -13276,6 +13281,16 @@ class MainWindow(QMainWindow):
         )
         return accepted
 
+    def _shutdown_mock_validation_host(self) -> None:
+        mock_host = getattr(self, "mock_validation_host", None)
+        shutdown_mock = getattr(mock_host, "shutdown", None)
+        if callable(shutdown_mock):
+            shutdown_mock()
+            return
+        dispose_mock = getattr(mock_host, "dispose", None)
+        if callable(dispose_mock):
+            dispose_mock()
+
     def closeEvent(self, event) -> None:
         """Stop the single operation host only when the main program closes."""
         if not self._confirm_main_window_exit_if_required():
@@ -13291,10 +13306,7 @@ class MainWindow(QMainWindow):
         timer = getattr(self, "_pnl_refresh_timer", None)
         if timer is not None:
             timer.stop()
-        mock_host = getattr(self, "mock_validation_host", None)
-        dispose_mock = getattr(mock_host, "dispose", None)
-        if callable(dispose_mock):
-            dispose_mock()
+        self._shutdown_mock_validation_host()
         host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
         shutdown = getattr(host, "shutdown", None)
         if callable(shutdown):

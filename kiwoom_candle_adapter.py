@@ -213,13 +213,11 @@ def _commit_normalized_minute_candles_for_stock(
     stock_code = str(code or "").strip()
     stock_name = str(name or "").strip()
     stock_dir = StockRepository().resolve_stock_dir(stock_code, stock_name)
-    target_date = identity_time.date()
-
     with candle_commit_lock(stock_dir):
         merged_by_minute: dict[Any, dict[str, Any]] = {}
         for candle in load_candles(stock_dir) + incoming:
             bar_time = candle_market_datetime(candle)
-            if bar_time is None or bar_time.date() != target_date:
+            if bar_time is None:
                 continue
             merged_by_minute[bar_time] = candle
         merged = [merged_by_minute[key] for key in sorted(merged_by_minute)]

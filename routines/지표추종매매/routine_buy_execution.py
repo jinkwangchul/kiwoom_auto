@@ -882,7 +882,14 @@ def _buy_price_compare_branch_planning_rules(
         str(condition.get("branch_id") or ""): str(condition.get("operator") or "")
         for condition in branch_conditions
     }
-    if boundary != {"BELOW_OR_EQUAL": "<=", "ABOVE": ">"}:
+    if (
+        boundary.get("BELOW_OR_EQUAL"),
+        boundary.get("ABOVE"),
+    ) not in {
+        ("<=", ">"),
+        ("<", ">"),
+        ("<", ">="),
+    }:
         return rules, None, "BUY_PRICE_COMPARE_BRANCH_BOUNDARY_INVALID"
 
     average = _positive_float(average_price)
@@ -891,7 +898,12 @@ def _buy_price_compare_branch_planning_rules(
         return rules, None, "BUY_PRICE_COMPARE_BRANCH_EVIDENCE_UNAVAILABLE"
 
     def matches(operator: str) -> bool:
-        return {"<=": average <= order_price, ">": average > order_price}.get(operator, False)
+        return {
+            "<=": average <= order_price,
+            "<": average < order_price,
+            ">": average > order_price,
+            ">=": average >= order_price,
+        }.get(operator, False)
 
     matched = [condition for condition in branch_conditions if matches(str(condition.get("operator") or ""))]
     if len(matched) != 1:

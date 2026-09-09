@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QStackedWidget,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +33,35 @@ def set_buy_combo_item_enabled(combo, item_text, enabled, tooltip=""):
         item.setEnabled(enabled)
         if tooltip:
             item.setToolTip(tooltip)
+
+
+def _font_text_width(widget, text):
+    widget.ensurePolished()
+    metrics = widget.fontMetrics()
+    return max(
+        metrics.horizontalAdvance(text),
+        metrics.boundingRect(text).width(),
+    )
+
+
+def _set_checkbox_text_minimum_width(check_box, baseline=0):
+    """Keep compact BUY rows while allowing the complete localized text."""
+    style = check_box.style()
+    indicator_width = style.pixelMetric(QStyle.PM_IndicatorWidth, None, check_box)
+    label_spacing = style.pixelMetric(QStyle.PM_CheckBoxLabelSpacing, None, check_box)
+    safe_width = (
+        _font_text_width(check_box, check_box.text())
+        + indicator_width
+        + label_spacing
+        + 8
+    )
+    check_box.setMinimumWidth(max(int(baseline), safe_width))
+
+
+def _set_label_text_minimum_width(label, baseline=0):
+    label.setMinimumWidth(
+        max(int(baseline), _font_text_width(label, label.text()) + 8)
+    )
 
 
 class HogaTotalDisplay(QLabel):
@@ -288,10 +318,17 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addWidget(self.buy_last_round_active_row_widget)
 
         self.buy_last_round_active_check = QCheckBox("마지막회차 능동매수")
-        self.buy_last_round_active_check.setFixedWidth(138)
         self.buy_last_round_active_check.setFixedHeight(30)
         self.buy_last_round_active_check.setStyleSheet("font-size: 8pt;")
-        self.buy_last_round_active_set_price_label = make_label("설정가에 평단이", 102)
+        _set_checkbox_text_minimum_width(
+            self.buy_last_round_active_check,
+            baseline=138,
+        )
+        self.buy_last_round_active_set_price_label = make_label("설정가에 평단이")
+        _set_label_text_minimum_width(
+            self.buy_last_round_active_set_price_label,
+            baseline=102,
+        )
         self.buy_last_round_active_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         self.buy_last_round_active_ratio_line = make_line("0.45", 46)
         self.buy_last_round_active_percent_label = make_label("%", 14)
@@ -381,6 +418,7 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         self.buy_base_apply_all_check = DetailToggleCheckBox("기본매수설정을 전체매수에 적용")
         self.buy_base_apply_all_check.setStyleSheet("font-size: 9pt;")
+        _set_checkbox_text_minimum_width(self.buy_base_apply_all_check)
         apply_row.addWidget(self.buy_base_apply_all_check)
         apply_row.addStretch(1)
 
@@ -450,6 +488,7 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         self.buy_price_compare_check = DetailToggleCheckBox("주가비교매수")
         self.buy_price_compare_check.setStyleSheet("font-size: 9pt;")
+        _set_checkbox_text_minimum_width(self.buy_price_compare_check)
         price_compare_row.addWidget(self.buy_price_compare_check)
         price_compare_row.addStretch(1)
 
@@ -460,7 +499,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addWidget(self.buy_price_compare_detail_row_widget)
 
         self.buy_price_compare_left_label = make_label("평단가", 48)
-        self.buy_price_compare_condition_combo = make_combo(["<="], "<=", 54)
+        self.buy_price_compare_condition_combo = make_combo(["<=", "<"], "<=", 54)
         self.buy_price_compare_right_label = make_label("주문가", 48)
         self.buy_price_compare_mode_combo = make_combo(
             ["회차기준", "예산기준"], "회차기준", 116, ModeSwitchComboBox
@@ -508,7 +547,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addWidget(self.buy_price_compare_above_row_widget)
 
         self.buy_price_compare_above_left_label = make_label("평단가", 48)
-        self.buy_price_compare_above_condition_combo = make_combo([">"], ">", 54)
+        self.buy_price_compare_above_condition_combo = make_combo([">", ">="], ">", 54)
         self.buy_price_compare_above_right_label = make_label("주문가", 48)
         self.buy_price_compare_above_mode_combo = make_combo(
             ["회차기준", "예산기준", "능동매수"], "회차기준", 116, ModeSwitchComboBox
@@ -647,8 +686,42 @@ class IndicatorFollowBuyMethodControlsMixin:
                 return
             boundary_syncing["active"] = True
             try:
-                set_combo_items_preserving(price_condition_combo, ["<="], "<=")
-                set_combo_items_preserving(price_above_condition_combo, [">"], ">")
+                top_value = price_condition_combo.currentText().strip()
+                bottom_value = price_above_condition_combo.currentText().strip()
+
+                if source == "top":
+                    if top_value == "<=":
+                        set_combo_items_preserving(price_above_condition_combo, [">"], ">")
+                    else:
+                        set_combo_items_preserving(
+                            price_above_condition_combo,
+                            [">", ">="],
+                            bottom_value if bottom_value in {">", ">="} else ">",
+                        )
+                elif source == "bottom":
+                    if bottom_value == ">=":
+                        set_combo_items_preserving(price_condition_combo, ["<"], "<")
+                    else:
+                        set_combo_items_preserving(
+                            price_condition_combo,
+                            ["<=", "<"],
+                            top_value if top_value in {"<=", "<"} else "<=",
+                        )
+                elif top_value == "<=":
+                    set_combo_items_preserving(price_above_condition_combo, [">"], ">")
+                elif bottom_value == ">=":
+                    set_combo_items_preserving(price_condition_combo, ["<"], "<")
+                else:
+                    set_combo_items_preserving(
+                        price_condition_combo,
+                        ["<=", "<"],
+                        top_value if top_value in {"<=", "<"} else "<=",
+                    )
+                    set_combo_items_preserving(
+                        price_above_condition_combo,
+                        [">", ">="],
+                        bottom_value if bottom_value in {">", ">="} else ">",
+                    )
             finally:
                 boundary_syncing["active"] = False
 
@@ -710,6 +783,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_price_compare_skip_check = QCheckBox("직전회차주문가 대비 현재주문가")
         self.buy_price_compare_skip_check.setFixedHeight(30)
         self.buy_price_compare_skip_check.setStyleSheet("font-size: 8pt;")
+        _set_checkbox_text_minimum_width(self.buy_price_compare_skip_check)
         self.buy_price_compare_skip_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         self.buy_price_compare_skip_ratio_line = make_line("0.5", 46)
         self.buy_price_compare_skip_compare_combo = make_combo(["이하", "이상", "이내", "이탈"], "이하", 76)
@@ -728,9 +802,12 @@ class IndicatorFollowBuyMethodControlsMixin:
         layout.addWidget(self.buy_additional_active_row_widget)
 
         self.buy_additional_active_check = QCheckBox("마지막+1 회차")
-        self.buy_additional_active_check.setFixedWidth(138)
         self.buy_additional_active_check.setFixedHeight(30)
         self.buy_additional_active_check.setStyleSheet("font-size: 8pt;")
+        _set_checkbox_text_minimum_width(
+            self.buy_additional_active_check,
+            baseline=138,
+        )
         self.buy_additional_active_method_combo = make_combo(["시장가", "현재가", "능동"], "시장가", 100)
         additional_active_row.addWidget(self.buy_additional_active_check)
         additional_active_row.addWidget(self.buy_additional_active_method_combo)
@@ -990,11 +1067,15 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         def update_unfilled(*_args):
             enabled = unfilled_enabled_check.isChecked()
+            if enabled and price_enabled_check.isChecked():
+                price_enabled_check.setChecked(False)
             for widget in (unfilled_scope_combo, unfilled_time_line, unfilled_unit_combo):
                 widget.setEnabled(enabled)
             unfilled_order_cancel_label.setEnabled(enabled)
 
         def update_price(*_args):
+            if price_enabled_check.isChecked() and unfilled_enabled_check.isChecked():
+                unfilled_enabled_check.setChecked(False)
             update_price_one()
             update_price_two()
 

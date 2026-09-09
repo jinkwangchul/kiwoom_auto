@@ -244,9 +244,41 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             ("005930", "006400")
         )
         self.market.sync_targets(SimpleNamespace(execution_stock_codes=("005930",)))
-        self.owner.kiwoom_api.sync_realtime_shadow_targets.assert_called_once_with(
-            ("005930",)
+        self.assertEqual(
+            [("005930", "006400"), ("005930", "006400")],
+            [
+                item.args[0]
+                for item in self.owner.kiwoom_api.sync_realtime_shadow_targets.call_args_list
+            ],
         )
+
+    def test_candle_observation_joins_broker_monitoring_before_shadow_eligibility(self) -> None:
+        self.market.sync_monitoring_targets(("005930",))
+        self.owner.kiwoom_api.sync_realtime_monitoring_registration.reset_mock()
+        self.owner.kiwoom_api.sync_realtime_shadow_targets.reset_mock()
+
+        with patch("gui_market_data_host.QTimer.singleShot"):
+            self.market.sync_candle_observation_targets(
+                (
+                    {
+                        "stock_code": "000070",
+                        "rules": {"bar": {"bar_minutes": 5}},
+                        "projection_request": {
+                            "projection": "FORMING_BASE_BAR",
+                            "warmup_bars": 60,
+                        },
+                    },
+                )
+            )
+
+        self.owner.kiwoom_api.sync_realtime_monitoring_registration.assert_called_once_with(
+            ("000070", "005930")
+        )
+        self.owner.kiwoom_api.sync_realtime_shadow_targets.assert_called_once_with(
+            ("000070", "005930")
+        )
+        self.assertEqual(("005930",), self.market._production_monitoring_stock_codes)
+        self.assertEqual(("000070", "005930"), self.market._monitoring_target_stock_codes)
 
     def test_snapshot_is_requested_once_per_target_per_session_before_realtime(self) -> None:
         calls: list[str] = []

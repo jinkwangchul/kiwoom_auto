@@ -107,6 +107,18 @@ class RealtimeShadowBarTests(unittest.TestCase):
         self.assertFalse(bar.volume_complete)
         self.assertIsNone(bar.volume)
 
+    def test_current_bar_projects_forming_ohlcv_without_finalizing(self) -> None:
+        builder = RealtimeShadowBarBuilder()
+        builder.accept_tick(_tick("101501", 100, 1000, "+3"))
+        builder.accept_tick(_tick("101520", 105, 1010, "-4"))
+
+        current = builder.current_bar("005930")
+
+        self.assertIsNotNone(current)
+        self.assertEqual((100, 105, 100, 105), (current.open, current.high, current.low, current.close))
+        self.assertEqual(7, current.volume)
+        self.assertFalse(current.volume_complete)
+
     def test_consecutive_minute_volume_uses_previous_final_cumulative(self) -> None:
         builder = RealtimeShadowBarBuilder()
         for values in (("101500", 100, 100), ("101559", 101, 110), ("101600", 102, 120)):

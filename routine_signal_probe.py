@@ -28,11 +28,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from candle_timeframe_aggregation import (
-    aggregate_minute_candles,
+    candle_session_windows,
     candle_market_datetime,
     completed_timeframe_candles,
     parse_market_datetime,
+    project_candle_supply,
     read_canonical_bar_minutes,
+    required_minute_candles,
 )
 from execution_universe import (
     ExecutionUniverseSnapshot,
@@ -52,12 +54,14 @@ from routine_main_facts import (
     validate_routine_main_facts,
 )
 from gui_stock_data import find_library_stock_by_code
+from gui_ats_utils import manual_ats_selected_keys_and_source
 from gui_operation_ui_context import actionable_current_price
 from order_candidate_engine import read_reference_price
 from running_budget_adjustment import (
     project_running_budget_adjustment_config,
     transition_running_budget_adjustment_for_signal,
 )
+from state_policy import read_operation_policy
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -486,22 +490,45 @@ def probe_routine_for_stock(
                 "FORMING_BASE_BAR", "COMPLETED_TIMEFRAME"
             }:
                 raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
-            if projection_request["projection"] == "FORMING_BASE_BAR":
-                candles = aggregate_minute_candles(
-                    raw_candles,
-                    read_canonical_bar_minutes(instance_rules),
-                    now=tick_time,
-                )
+            projected_by_code = facts_market.get("candle_supply_by_code")
+            preprojected = (
+                projected_by_code.get(code)
+                if isinstance(projected_by_code, dict)
+                else None
+            )
+            requested_interval = read_canonical_bar_minutes(instance_rules)
+            requested_warmup = required_minute_candles(
+                requested_interval,
+                int(projection_request.get("warmup_bars") or 1),
+            )
+            if (
+                isinstance(preprojected, dict)
+                and str(preprojected.get("projection") or "").upper()
+                == str(projection_request.get("projection") or "").upper()
+                and int(preprojected.get("timeframe_minutes") or 0) == requested_interval
+                and int(preprojected.get("required_minute_candles") or 0)
+                == int(requested_warmup["required_minute_candles"])
+            ):
+                supply = deepcopy(preprojected)
             else:
-                candles = completed_timeframe_candles(
+                supply = project_candle_supply(
                     raw_candles,
                     instance_rules,
+                    projection_request,
                     now=tick_time,
+                    session_windows=facts_market.get("candle_session_windows"),
+                    forming_minute=(facts_market.get("forming_minute_by_code") or {}).get(code)
+                    if isinstance(facts_market.get("forming_minute_by_code"), dict)
+                    else None,
+                    completed_projector=completed_timeframe_candles,
                 )
-            candle_projection_error = ""
+            candles = list(supply.get("candles") or ())
+            candle_projection_error = "" if supply.get("available") is True else str(supply.get("reason") or "봉데이터 부족")
+            candle_projection_evidence = supply
         except ValueError as exc:
             candles = []
             candle_projection_error = str(exc)
+            candle_projection_evidence = {}
         evaluate = getattr(routine_module, "evaluate", None)
         if candle_projection_error:
             _observe_routine_contract_failure(
@@ -518,6 +545,7 @@ def probe_routine_for_stock(
                 "routine": routine_name,
                 "code": code,
                 "name": name,
+                "candle_projection": candle_projection_evidence,
             }
         elif not callable(evaluate):
             _observe_routine_contract_failure(
@@ -1166,6 +1194,45 @@ def probe_execution_stock_for_committed_bar(
             else None
         )
         budget = _production_account_budget_context(window)
+        projected_config = _read_json_dict(target_dir / "config.json")
+        projected_state = _read_json_dict(target_dir / "state.json")
+        selected_ats, _selection_source = manual_ats_selected_keys_and_source(
+            projected_config,
+            projected_state,
+        )
+        api_getter = getattr(window, "_kiwoom_api", None)
+        api = api_getter() if callable(api_getter) else None
+        forming_reader = getattr(api, "current_realtime_shadow_bar", None)
+        forming = forming_reader(code) if callable(forming_reader) else None
+        sessions = candle_session_windows(read_operation_policy(), selected_ats)
+        market_host_getter = getattr(window, "market_data_host", None)
+        market_host = market_host_getter() if callable(market_host_getter) else None
+        provider = getattr(market_host, "project_routine_candles", None)
+        applied_rules = (
+            _load_instance_rules(
+                str(projected_config.get("assigned_routine_instance_id") or "").strip()
+            )
+            if callable(provider)
+            else None
+        )
+        projection_reader = getattr(routine_module, "market_bar_projection_request", None)
+        projection_request = (
+            projection_reader(applied_rules)
+            if callable(provider) and callable(projection_reader)
+            else None
+        )
+        candle_supply = (
+            provider(
+                stock_code=code,
+                rules=applied_rules,
+                projection_request=projection_request,
+                as_of=parse_market_datetime(tick_key),
+                session_windows=sessions,
+                consumer_scope="PRODUCTION",
+            )
+            if callable(provider) and isinstance(projection_request, dict)
+            else None
+        )
         return capture_routine_main_facts(
             stock_dirs={code: target_dir},
             selected_account_no=account_no,
@@ -1176,6 +1243,11 @@ def probe_execution_stock_for_committed_bar(
             market={
                 "tick_key": tick_key,
                 "raw_candles_by_code": {code: _load_candles_from_stock_dir(target_dir)},
+                "forming_minute_by_code": {code: forming} if isinstance(forming, dict) else {},
+                "candle_session_windows": sessions,
+                "candle_supply_by_code": {code: candle_supply}
+                if isinstance(candle_supply, dict)
+                else {},
                 "reference_prices_by_code": {code: read_reference_price(code, name)},
             },
         ).to_payload()

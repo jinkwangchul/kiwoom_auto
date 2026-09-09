@@ -41,6 +41,17 @@ from mock_validation_contract import (
 from mock_validation_repository import MockValidationRepository
 
 
+def mock_instance_error_recovery_reset_allowed(
+    execution: dict[str, Any], operation: dict[str, Any] | None
+) -> bool:
+    return (
+        clean_text(execution.get("state")) == INSTANCE_ERROR
+        and execution.get("progression_allowed") is False
+        and isinstance(operation, dict)
+        and clean_text(operation.get("state")) == SESSION_RUNNING
+    )
+
+
 class MockValidationSessionService:
     """Mock operation API with stock registration and Instance-local execution."""
 
@@ -68,6 +79,98 @@ class MockValidationSessionService:
         if clean not in document["instance_execution"]:
             raise MockValidationError("MOCK_ROUTINE_INSTANCE_NOT_IN_SESSION")
         return clean
+
+    def stop_active_instances_for_application_boundary(
+        self,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        """Reuse Validation Stop for active Instances at shutdown/restart."""
+
+        boundary_source = clean_text(source)
+        stopped: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for stock_code, session_id in sorted(self.repository.current_session_ids().items()):
+            try:
+                document = self.repository.read_session(session_id)
+            except Exception as exc:
+                errors.append(
+                    {
+                        "stock_code": clean_text(stock_code),
+                        "validation_session_id": clean_text(session_id),
+                        "routine_instance_id": "",
+                        "reason": str(exc) or type(exc).__name__,
+                    }
+                )
+                continue
+            for instance_id in sorted(document.get("instance_execution", {})):
+                execution = document["instance_execution"].get(instance_id, {})
+                if execution.get("state") == INSTANCE_ERROR:
+                    # ERROR recovery/reset remains an operator-owned contract;
+                    # application restart must not consume or rewrite it.
+                    continue
+                lifecycle = document.get("mock_operation_lifecycle")
+                operations = (
+                    lifecycle.get("instance_operations")
+                    if isinstance(lifecycle, dict)
+                    else None
+                )
+                operation = operations.get(instance_id) if isinstance(operations, dict) else None
+                operation_state = (
+                    clean_text(operation.get("state"))
+                    if isinstance(operation, dict)
+                    else ""
+                )
+                if (
+                    execution.get("state") not in {SESSION_RUNNING, SESSION_CLOSING}
+                    and operation_state not in {SESSION_RUNNING, SESSION_CLOSING}
+                ):
+                    continue
+                operation_id = (
+                    clean_text(operation.get("operation_session_id"))
+                    if isinstance(operation, dict)
+                    else clean_text(execution.get("operation_session_id"))
+                )
+                command_id = deterministic_mock_identity(
+                    "MC",
+                    session_id,
+                    instance_id,
+                    operation_id or document.get("revision", 0),
+                    boundary_source,
+                    "APPLICATION_BOUNDARY_VALIDATION_STOP",
+                )
+                try:
+                    result = self.stop_instance_validation(
+                        session_id,
+                        routine_instance_id=instance_id,
+                        command_id=command_id,
+                        source=boundary_source,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "stock_code": clean_text(stock_code),
+                            "validation_session_id": clean_text(session_id),
+                            "routine_instance_id": clean_text(instance_id),
+                            "reason": str(exc) or type(exc).__name__,
+                        }
+                    )
+                    continue
+                stopped.append(
+                    {
+                        "stock_code": clean_text(stock_code),
+                        "validation_session_id": clean_text(session_id),
+                        "routine_instance_id": clean_text(instance_id),
+                        "operation_session_id": operation_id,
+                        "result": result,
+                    }
+                )
+                document = self.repository.read_session(session_id)
+        return {
+            "source": boundary_source,
+            "stopped": tuple(stopped),
+            "errors": tuple(errors),
+        }
 
     @staticmethod
     def _require_progression(document: dict[str, Any], instance_id: str) -> str:
@@ -587,7 +690,34 @@ class MockValidationSessionService:
         if before["session"]["state"] == SESSION_ENDED:
             raise MockValidationError("MOCK_ENDED_SESSION_IMMUTABLE")
         before_state = clean_text(before["instance_execution"][instance_id].get("state"))
-        if before_state not in {SESSION_RUNNING, SESSION_CLOSING, INSTANCE_ERROR}:
+        lifecycle_before = before.get("mock_operation_lifecycle")
+        operations_before = (
+            lifecycle_before.get("instance_operations")
+            if isinstance(lifecycle_before, dict)
+            else None
+        )
+        operation_before = (
+            deepcopy(operations_before.get(instance_id))
+            if isinstance(operations_before, dict)
+            and isinstance(operations_before.get(instance_id), dict)
+            else None
+        )
+        boundary_source = clean_text(source) in {
+            "APPLICATION_SHUTDOWN",
+            "APPLICATION_RESTART_RECOVERY",
+        }
+        operation_before_state = (
+            clean_text(operation_before.get("state"))
+            if isinstance(operation_before, dict)
+            else ""
+        )
+        if (
+            before_state not in {SESSION_RUNNING, SESSION_CLOSING, INSTANCE_ERROR}
+            and not (
+                boundary_source
+                and operation_before_state in {SESSION_RUNNING, SESSION_CLOSING}
+            )
+        ):
             raise MockValidationError("MOCK_INSTANCE_VALIDATION_STOP_STATE_INVALID")
         requested = clean_text(requested_at) or self._now()
         completed_at = self._now()
@@ -668,16 +798,31 @@ class MockValidationSessionService:
                         "close_reason": "사용자 검증정지",
                     }
                 )
-            stock_operation_active = isinstance(current, dict) and current.get("state") in {
-                SESSION_RUNNING,
-                SESSION_CLOSING,
-            }
             sibling_active = isinstance(operations, dict) and any(
                 key != instance_id
                 and isinstance(item, dict)
                 and item.get("state") in {SESSION_RUNNING, SESSION_CLOSING}
                 for key, item in operations.items()
             )
+            if (
+                boundary_source
+                and not sibling_active
+                and isinstance(current, dict)
+                and current.get("state") in {SESSION_RUNNING, SESSION_CLOSING}
+            ):
+                current.update(
+                    {
+                        "state": INSTANCE_VALIDATION_STOPPED,
+                        "ended_at": completed_at,
+                        "outcome": INSTANCE_VALIDATION_STOPPED,
+                        "close_source": clean_text(source),
+                        "close_reason": "프로그램 경계 모의검증 종료",
+                    }
+                )
+            stock_operation_active = isinstance(current, dict) and current.get("state") in {
+                SESSION_RUNNING,
+                SESSION_CLOSING,
+            }
             if not stock_operation_active and not sibling_active:
                 document["session"].update(
                     {"state": SESSION_WAITING, "started_at": "", "start_identity": ""}
@@ -708,6 +853,11 @@ class MockValidationSessionService:
             "source": clean_text(source) or "OPERATOR_UI",
             "result": "COMPLETED",
         }
+        if evidence["source"] in {
+            "APPLICATION_SHUTDOWN",
+            "APPLICATION_RESTART_RECOVERY",
+        }:
+            evidence["operation_snapshot"] = operation_before
         self._event(
             session_id=session_id,
             stock_code=session["stock_code"],
@@ -777,6 +927,7 @@ class MockValidationSessionService:
         before = self.repository.read_session(session_id)
         instance_id = self._require_instance(before, routine_instance_id)
         lifecycle = before.get("mock_operation_lifecycle")
+        operation = None
         if isinstance(lifecycle, dict) and "instance_operations" in lifecycle:
             operations = lifecycle.get("instance_operations")
             if not isinstance(operations, dict):
@@ -797,11 +948,68 @@ class MockValidationSessionService:
             }
         if before["session"]["state"] == SESSION_ENDED:
             raise MockValidationError("MOCK_ENDED_SESSION_IMMUTABLE")
-        if before["instance_execution"][instance_id].get("state") == SESSION_ENDED:
+        execution = before["instance_execution"][instance_id]
+        if execution.get("state") == SESSION_ENDED:
             raise MockValidationError("MOCK_ENDED_INSTANCE_IMMUTABLE")
+        error_recovery_reset = mock_instance_error_recovery_reset_allowed(
+            execution, operation
+        )
+        if (
+            execution.get("state") in {SESSION_RUNNING, SESSION_CLOSING}
+            or (
+                isinstance(operation, dict)
+                and operation.get("state") in {SESSION_RUNNING, SESSION_CLOSING}
+                and not error_recovery_reset
+            )
+        ):
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_ACTIVE")
         reset_at = self._now()
+        cancellable_states = {
+            ORDER_CREATED,
+            ORDER_OPEN,
+            ORDER_PARTIAL_FILL,
+            ORDER_CANCEL_PENDING,
+        }
+        target_order_ids = tuple(
+            clean_text(item.get("mock_order_id"))
+            for item in before.get("orders", ())
+            if error_recovery_reset
+            and item.get("routine_instance_id") == instance_id
+            and item.get("state") in cancellable_states
+        )
+        target_order_states = {
+            clean_text(item.get("mock_order_id")): clean_text(item.get("state"))
+            for item in before.get("orders", ())
+            if clean_text(item.get("mock_order_id")) in target_order_ids
+        }
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            if error_recovery_reset:
+                for index, order in enumerate(document["orders"]):
+                    if (
+                        order.get("routine_instance_id") != instance_id
+                        or order.get("state") not in cancellable_states
+                    ):
+                        continue
+                    transitioned = order
+                    if transitioned["state"] in {ORDER_OPEN, ORDER_PARTIAL_FILL}:
+                        transitioned = transition_mock_order(
+                            transitioned,
+                            ORDER_CANCEL_PENDING,
+                            occurred_at=reset_at,
+                        )
+                    if transitioned["state"] in {
+                        ORDER_CREATED,
+                        ORDER_CANCEL_PENDING,
+                    }:
+                        transitioned = transition_mock_order(
+                            transitioned,
+                            ORDER_CANCELED,
+                            occurred_at=reset_at,
+                        )
+                    transitioned["resting"] = False
+                    transitioned["reserved_budget"] = 0
+                    document["orders"][index] = transitioned
             document["orders"] = [
                 item
                 for item in document["orders"]
@@ -897,6 +1105,26 @@ class MockValidationSessionService:
             mutation,
             expected_revision=before["revision"],
         )
+        for order_id in target_order_ids:
+            if target_order_states.get(order_id) in {ORDER_OPEN, ORDER_PARTIAL_FILL}:
+                self._event(
+                    session_id=session_id,
+                    stock_code=result["document"]["session"]["stock_code"],
+                    event_type="VIRTUAL_ORDER_CANCEL_PENDING",
+                    timestamp=reset_at,
+                    command_id=f"{command}:ORDER:{order_id}:PENDING",
+                    routine_instance_id=instance_id,
+                    payload={"mock_order_id": order_id, "source": "ERROR_RESET"},
+                )
+            self._event(
+                session_id=session_id,
+                stock_code=result["document"]["session"]["stock_code"],
+                event_type="VIRTUAL_ORDER_CANCELED",
+                timestamp=reset_at,
+                command_id=f"{command}:ORDER:{order_id}:CANCELED",
+                routine_instance_id=instance_id,
+                payload={"mock_order_id": order_id, "source": "ERROR_RESET"},
+            )
         self._event(
             session_id=session_id,
             stock_code=result["document"]["session"]["stock_code"],
@@ -904,6 +1132,15 @@ class MockValidationSessionService:
             timestamp=reset_at,
             command_id=command,
             routine_instance_id=instance_id,
+            payload=(
+                {
+                    "error_recovery_reset": True,
+                    "cancelled_order_count": len(target_order_ids),
+                    "cancelled_order_ids": list(target_order_ids),
+                }
+                if error_recovery_reset
+                else None
+            ),
         )
         return {"reset": True, "duplicate": False, **result}
 

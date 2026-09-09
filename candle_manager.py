@@ -19,7 +19,7 @@ from typing import Any
 
 
 CANDLES_FILENAME = "candles.json"
-DEFAULT_CANDLES_MAX_COUNT = 600
+DEFAULT_CANDLES_MAX_COUNT = 200_000
 
 _CANDLE_LOCKS: dict[str, threading.RLock] = {}
 _CANDLE_LOCKS_GUARD = threading.Lock()

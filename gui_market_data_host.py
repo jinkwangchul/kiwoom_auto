@@ -18,6 +18,9 @@ from candle_timeframe_aggregation import (
     SEOUL_TIMEZONE,
     candle_market_datetime,
     parse_market_datetime,
+    project_candle_supply,
+    read_canonical_bar_minutes,
+    required_minute_candles,
 )
 from event_journal_production import observe_production_exception
 from kiwoom_market_data_authority import (
@@ -176,6 +179,12 @@ class MarketDataHost(QObject):
             str, InitialMarketSnapshotState
         ] = {}
         self._monitoring_target_stock_codes: tuple[str, ...] = ()
+        self._production_monitoring_stock_codes: tuple[str, ...] = ()
+        self._execution_shadow_stock_codes: tuple[str, ...] = ()
+        self._candle_observation_stock_codes: tuple[str, ...] = ()
+        self._candle_execution_required_by_stock: dict[str, int] = {}
+        self._candle_observation_required_by_stock: dict[str, int] = {}
+        self._last_candle_observation_refresh_minute = ""
         # In-flight only.  A completed request is represented by an actual
         # valid InitialMarketSnapshotState, not by this deduplication marker.
         self._initial_snapshot_requested_stock_codes: set[str] = set()
@@ -260,7 +269,19 @@ class MarketDataHost(QObject):
     def sync_targets(self, snapshot) -> dict[str, object]:
         """Sync only Shadow/authority targets supplied by the execution universe."""
         try:
-            target_codes = tuple(getattr(snapshot, "execution_stock_codes", ()))
+            self._execution_shadow_stock_codes = tuple(getattr(snapshot, "execution_stock_codes", ()))
+            self._candle_execution_required_by_stock = {
+                code: count
+                for code, count in self._candle_execution_required_by_stock.items()
+                if code in self._execution_shadow_stock_codes
+            }
+            target_codes = tuple(
+                sorted(
+                    set(self._production_monitoring_stock_codes)
+                    | set(self._execution_shadow_stock_codes)
+                    | set(self._candle_observation_stock_codes)
+                )
+            )
             sync = getattr(self.kiwoom_api, "sync_realtime_shadow_targets", None)
             if not callable(sync):
                 # Compatibility for older test doubles; Production KiwoomApi owns
@@ -273,6 +294,7 @@ class MarketDataHost(QObject):
                     "active": False,
                     "reason_code": "REALTIME_SHADOW_API_UNAVAILABLE",
                 }
+
             result = sync(target_codes)
             registration = result.get("snapshot") if isinstance(result, dict) else None
             identity = (
@@ -306,6 +328,140 @@ class MarketDataHost(QObject):
                 "error": str(exc),
             }
 
+    def sync_candle_observation_targets(self, stock_codes: object) -> dict[str, object]:
+        """Keep non-executing Candle consumers in the existing Shadow pipeline."""
+        previous_codes = tuple(self._candle_observation_stock_codes)
+        previous_requirements = dict(self._candle_observation_required_by_stock)
+        candidates = stock_codes if isinstance(stock_codes, (list, tuple, set, frozenset)) else ()
+        requested: dict[str, int] = {}
+        normalized_codes: set[str] = set()
+        for item in candidates:
+            if isinstance(item, dict):
+                code = str(item.get("stock_code") or "").strip()
+                if not code:
+                    continue
+                normalized_codes.add(code)
+                try:
+                    interval = read_canonical_bar_minutes(item.get("rules"))
+                    request = item.get("projection_request") if isinstance(item.get("projection_request"), dict) else {}
+                    requirement = required_minute_candles(interval, int(request.get("warmup_bars") or 1))
+                    requested[code] = max(requested.get(code, 0), int(requirement["required_minute_candles"]))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                code = str(item or "").strip()
+                if code:
+                    normalized_codes.add(code)
+        self._candle_observation_stock_codes = tuple(
+            sorted(normalized_codes)
+        )
+        self._candle_observation_required_by_stock = requested
+        targets = tuple(
+            sorted(
+                set(self._production_monitoring_stock_codes)
+                | set(self._execution_shadow_stock_codes)
+                | set(self._candle_observation_stock_codes)
+            )
+        )
+        monitoring_result = self.sync_monitoring_targets(
+            getattr(self, "_production_monitoring_stock_codes", ())
+        )
+        result = (
+            monitoring_result.get("shadow_sync")
+            if isinstance(monitoring_result, dict)
+            and isinstance(monitoring_result.get("shadow_sync"), dict)
+            else None
+        )
+        if result is None:
+            sync = getattr(self.kiwoom_api, "sync_realtime_shadow_targets", None)
+            if not callable(sync):
+                return {"ok": False, "reason_code": "REALTIME_SHADOW_API_UNAVAILABLE"}
+            result = sync(targets)
+        if self._candle_observation_stock_codes:
+            minute_key = datetime.now(SEOUL_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+            changed = (
+                previous_codes != self._candle_observation_stock_codes
+                or previous_requirements != requested
+            )
+            if changed or getattr(self, "_last_candle_observation_refresh_minute", "") != minute_key:
+                self._last_candle_observation_refresh_minute = minute_key
+                QTimer.singleShot(0, lambda: self.refresh_operation_candles(minute_key))
+        else:
+            self._last_candle_observation_refresh_minute = ""
+        return result
+
+    def candle_history_required_count(self, stock_code: object) -> int:
+        code = str(stock_code or "").strip()
+        declared = max(
+            int(self._candle_execution_required_by_stock.get(code, 0)),
+            int(self._candle_observation_required_by_stock.get(code, 0)),
+        )
+        return declared if declared > 0 else 600
+
+    def registered_operation_targets(self) -> tuple[tuple[Path, str, str], ...]:
+        codes = tuple(sorted(set(self._execution_shadow_stock_codes) | set(self._candle_observation_stock_codes)))
+        return tuple((StockRepository().resolve_stock_dir(code), code, "") for code in codes)
+
+    def project_routine_candles(
+        self,
+        *,
+        stock_code: object,
+        rules: dict[str, Any] | None,
+        projection_request: dict[str, Any] | None,
+        as_of: datetime | None = None,
+        session_windows: object = None,
+        consumer_scope: str = "PRODUCTION",
+    ) -> dict[str, Any]:
+        """Supply one Routine Instance from Production-owned Candle facts."""
+        code = str(stock_code or "").strip()
+        request = projection_request if isinstance(projection_request, dict) else {}
+        projection = str(request.get("projection") or "").strip().upper()
+        try:
+            interval = read_canonical_bar_minutes(rules)
+            warmup = required_minute_candles(interval, int(request.get("warmup_bars") or 1))
+        except (TypeError, ValueError) as exc:
+            return {"available": False, "stock_code": code, "candles": [], "availability_state": "INTERVAL_UNSUPPORTED", "reason": str(exc)}
+        base = {"stock_code": code, "timeframe_minutes": interval, "projection": projection, **warmup}
+        requirement_attribute = (
+            "_candle_observation_required_by_stock"
+            if str(consumer_scope or "").strip().upper() == "MOCK"
+            else "_candle_execution_required_by_stock"
+        )
+        try:
+            history_requirements = object.__getattribute__(self, requirement_attribute)
+        except (AttributeError, RuntimeError):
+            history_requirements = None
+        if isinstance(history_requirements, dict):
+            history_requirements[code] = max(
+                int(history_requirements.get(code, 0)),
+                int(warmup["required_minute_candles"]),
+            )
+        if not warmup["within_limit"]:
+            return {**base, "available": False, "candles": [], "availability_state": "WARMUP_LIMIT_EXCEEDED"}
+        raw = load_candles(StockRepository().resolve_stock_dir(code))
+        source_hash = canonical_candle_content_hash(raw) if raw else ""
+        forming = None
+        if projection == "FORMING_BASE_BAR":
+            current_reader = getattr(self.kiwoom_api, "current_realtime_shadow_bar", None)
+            forming = current_reader(code) if callable(current_reader) else None
+        now = as_of or datetime.now(SEOUL_TIMEZONE)
+        result = project_candle_supply(
+            raw,
+            rules,
+            request,
+            now=now,
+            session_windows=session_windows,
+            forming_minute=forming if isinstance(forming, dict) else None,
+        )
+        source_rows = list(raw)
+        if isinstance(forming, dict):
+            source_rows.append(dict(forming))
+        return {
+            **result,
+            "stock_code": code,
+            "source_identity": canonical_candle_content_hash(source_rows) if source_rows else source_hash,
+        }
+
     def sync_monitoring_targets(self, stock_codes: object) -> dict[str, object]:
         """Sync the Broker registration set independently of execution readiness."""
 
@@ -318,7 +474,7 @@ class MarketDataHost(QObject):
                 "reason_code": "REALTIME_MONITORING_API_UNAVAILABLE",
             }
         try:
-            targets = tuple(
+            production_targets = tuple(
                 sorted(
                     {
                         str(code or "").strip()
@@ -326,6 +482,9 @@ class MarketDataHost(QObject):
                         if str(code or "").strip()
                     }
                 )
+            )
+            targets = tuple(
+                sorted(set(production_targets) | set(self._candle_observation_stock_codes))
             )
             previous_targets = set(self._monitoring_target_stock_codes)
             session_getter = getattr(self.kiwoom_api, "broker_session_snapshot", None)
@@ -341,6 +500,7 @@ class MarketDataHost(QObject):
                 self._clear_session_state()
                 self._market_data_authority.ensure_session(*requested_identity)
                 self._realtime_shadow_session_identity = requested_identity
+            self._production_monitoring_stock_codes = production_targets
 
             removed = previous_targets.difference(targets)
             for code in removed:
@@ -430,9 +590,25 @@ class MarketDataHost(QObject):
                 self._market_data_authority.ensure_session(*identity)
                 self._realtime_shadow_session_identity = identity
                 self._monitoring_target_stock_codes = targets
+                self._production_monitoring_stock_codes = production_targets
             if isinstance(result, dict):
                 projection = dict(result)
                 projection["initial_snapshot"] = snapshot_result
+                shadow_sync = getattr(
+                    self.kiwoom_api,
+                    "sync_realtime_shadow_targets",
+                    None,
+                )
+                if callable(shadow_sync) and result.get("ok") is True:
+                    projection["shadow_sync"] = shadow_sync(
+                        tuple(
+                            sorted(
+                                set(self._production_monitoring_stock_codes)
+                                | set(self._execution_shadow_stock_codes)
+                                | set(self._candle_observation_stock_codes)
+                            )
+                        )
+                    )
                 return projection
             return {
                 "ok": False,
@@ -555,10 +731,13 @@ class MarketDataHost(QObject):
             self._clear_session_state()
             self._realtime_shadow_session_identity = identity
         execution_codes = tuple(getattr(snapshot, "execution_stock_codes", ()))
-        self._market_data_authority.sync_targets(execution_codes)
+        candle_codes = tuple(
+            sorted(set(execution_codes) | set(self._candle_observation_stock_codes))
+        )
+        self._market_data_authority.sync_targets(candle_codes)
         refresh_inflight = bool(getattr(self, "_automatic_candle_refresh_inflight", False))
         promoted: list[str] = []
-        for code in execution_codes:
+        for code in candle_codes:
             unresolved = any(key[0] == code for key in self._pending_shadow_comparisons)
             state = self._market_data_authority.snapshot(code)
             readiness_valid = bool(
@@ -1091,6 +1270,7 @@ class MarketDataHost(QObject):
         self._high_resolution_market_states.clear()
         self._initial_market_snapshot_states.clear()
         self._monitoring_target_stock_codes = ()
+        self._production_monitoring_stock_codes = ()
         self._initial_snapshot_requested_stock_codes.clear()
         self._initial_snapshot_request_attempts_by_stock.clear()
         self._raw_tick_received_count_by_stock.clear()

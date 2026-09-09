@@ -17,6 +17,7 @@ from pathlib import Path
 import sys
 from typing import Any, Callable
 
+from candle_timeframe_aggregation import candle_market_datetime
 from engines.signal_result import signal_to_dict
 from execution_price_comparison import evaluate_percent_comparison, resolve_price_source
 from mock_validation_contract import (
@@ -110,6 +111,15 @@ def _pure_lifecycle_evaluator() -> Callable[..., dict[str, Any]]:
     return lifecycle_module.evaluate_lifecycle
 
 
+@lru_cache(maxsize=1)
+def _market_projection_requester() -> Callable[[dict[str, Any] | None], dict[str, Any]]:
+    routine_module = _load_file_module("routine.py", "mock_validation_indicator_follow_routine_contract")
+    requester = getattr(routine_module, "market_bar_projection_request", None)
+    if not callable(requester):
+        raise MockValidationError("MOCK_ROUTINE_MARKET_PROJECTION_REQUEST_UNAVAILABLE")
+    return requester
+
+
 def _positive_number(value: Any) -> int | float | None:
     if isinstance(value, bool):
         return None
@@ -139,6 +149,32 @@ def _signal_payload(value: Any) -> dict[str, Any]:
         return signal_to_dict(value)
     except Exception as exc:
         raise MockValidationError("MOCK_ROUTINE_SIGNAL_RESULT_INVALID") from exc
+
+
+def _signal_marker_payload(
+    signal: dict[str, Any],
+    candles: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    side = clean_text(signal.get("signal")).upper()
+    index = signal.get("signal_activation_index", signal.get("signal_index"))
+    if side not in {"BUY", "SELL"} or not isinstance(index, int) or isinstance(index, bool):
+        return {}
+    if not candles or not -len(candles) <= index < len(candles):
+        return {}
+    candle = candles[index]
+    if not isinstance(candle, dict):
+        return {}
+    bar_time = candle_market_datetime(candle)
+    close = candle.get("close")
+    if bar_time is None or close in (None, ""):
+        return {}
+    return {
+        "signal_bar_time": bar_time.isoformat(timespec="seconds"),
+        "signal_bar_close": close,
+        "signal_timeframe_minutes": candle.get("timeframe_minutes"),
+        "signal_trade_date": clean_text(candle.get("trade_date")) or bar_time.date().isoformat(),
+        "signal_input_hash": payload_hash(list(candles)),
+    }
 
 
 def _reference_price(candles: tuple[dict[str, Any], ...]) -> int | float | None:
@@ -186,6 +222,24 @@ def _mock_settings(rules: dict[str, Any]) -> tuple[dict[str, Any], int | float |
     if budget is None:
         budget = _positive_number(rules.get("starting_budget"))
     return stock_config, budget
+
+
+def _operation_rules(document: dict[str, Any], instance_id: str) -> dict[str, Any] | None:
+    lifecycle = document.get("mock_operation_lifecycle")
+    operations = lifecycle.get("instance_operations") if isinstance(lifecycle, dict) else None
+    operation = operations.get(instance_id) if isinstance(operations, dict) else None
+    if not isinstance(operation, dict):
+        operation = lifecycle.get("current") if isinstance(lifecycle, dict) else None
+    snapshot = operation.get("operation_policy_snapshot") if isinstance(operation, dict) else None
+    if not isinstance(snapshot, dict):
+        return None
+    direct = snapshot.get("mock_instance_rules_snapshot")
+    if isinstance(direct, dict):
+        return deepcopy(direct)
+    by_instance = snapshot.get("mock_rules_snapshot_by_instance")
+    if isinstance(by_instance, dict) and isinstance(by_instance.get(instance_id), dict):
+        return deepcopy(by_instance[instance_id])
+    return None
 
 
 def _operation_effective_settings(
@@ -522,6 +576,7 @@ class MockIndicatorFollowRoutineAdapter:
         timestamp: str,
         reason: str,
         status: str = RESULT_BLOCKED,
+        evaluation_completed: bool = False,
     ) -> dict[str, Any]:
         session_id = document["session"]["validation_session_id"]
         episode, should_record = self._normal_block_episode(
@@ -549,6 +604,22 @@ class MockIndicatorFollowRoutineAdapter:
                 session_id,
                 instance_id,
                 episode_id=episode["episode_id"],
+            )
+        if evaluation_completed:
+            before_mark = self.repository.read_session(session_id)
+
+            def mark(document_value: dict[str, Any]) -> dict[str, Any]:
+                self._progression(document_value, instance_id)["evaluation_cycles"][cycle_id] = {
+                    "result": status,
+                    "reason": reason,
+                    "recorded_at": timestamp,
+                }
+                return document_value
+
+            self.repository.mutate_session(
+                session_id,
+                mark,
+                expected_revision=before_mark["revision"],
             )
         return {
             "status": status,
@@ -1602,6 +1673,9 @@ class MockIndicatorFollowRoutineAdapter:
             execution_budget=None,
         )
 
+    def market_bar_projection_request(self, rules: dict[str, Any] | None) -> dict[str, Any]:
+        return deepcopy(_market_projection_requester()(rules))
+
     def evaluate_cycle(
         self,
         session_id: str,
@@ -1613,6 +1687,7 @@ class MockIndicatorFollowRoutineAdapter:
         evaluation_cycle_id: str,
         evaluated_at: datetime | None = None,
         new_buy_allowed: bool = True,
+        candle_availability: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = self._evaluate_cycle_impl(
             session_id,
@@ -1623,6 +1698,7 @@ class MockIndicatorFollowRoutineAdapter:
             evaluation_cycle_id=evaluation_cycle_id,
             evaluated_at=evaluated_at,
             new_buy_allowed=new_buy_allowed,
+            candle_availability=candle_availability,
         )
         normal_block = result.pop("_normal_block_episode", False) is True
         if (
@@ -1651,6 +1727,7 @@ class MockIndicatorFollowRoutineAdapter:
         evaluation_cycle_id: str,
         evaluated_at: datetime | None = None,
         new_buy_allowed: bool = True,
+        candle_availability: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         instance_id = clean_text(routine_instance_id)
         cycle_id = clean_text(evaluation_cycle_id)
@@ -1672,6 +1749,19 @@ class MockIndicatorFollowRoutineAdapter:
                     document, instance_id=instance_id, cycle_id=cycle_id,
                     timestamp=timestamp, reason="MOCK_INSTANCE_PROGRESSION_BLOCKED", status=RESULT_WAIT,
                 )
+            availability = candle_availability if isinstance(candle_availability, dict) else {}
+            if availability.get("reason") == "CANDLE_WARMUP_LIMIT_EXCEEDED":
+                blocked = self._normal_block(
+                    document,
+                    instance_id=instance_id,
+                    cycle_id=cycle_id,
+                    timestamp=timestamp,
+                    reason="CANDLE_WARMUP_LIMIT_EXCEEDED",
+                    status=RESULT_WAIT,
+                )
+                blocked["required_minute_candles"] = availability.get("required_minute_candles")
+                blocked["maximum_minute_candles"] = availability.get("maximum_minute_candles")
+                return blocked
             reference = _instance_reference(document, instance_id)
             if clean_text(reference.get("routine_type")).upper() not in {"INDICATOR_FOLLOW", "지표추종매매"}:
                 return self._normal_block(
@@ -1706,7 +1796,12 @@ class MockIndicatorFollowRoutineAdapter:
                         ),
                     )
                     document = marked["document"]
-            rules = deepcopy(reference["rules_snapshot"])
+            rules = _operation_rules(document, instance_id) or deepcopy(reference["rules_snapshot"])
+            reference = {
+                **deepcopy(reference),
+                "rules_snapshot": deepcopy(rules),
+                "rules_hash": payload_hash(rules),
+            }
             stock_config, execution_budget = _mock_settings(rules)
             stock_config, execution_budget = _apply_effective_initial_buy(
                 stock_config,
@@ -1856,6 +1951,7 @@ class MockIndicatorFollowRoutineAdapter:
                 return self._normal_block(
                     document, instance_id=instance_id, cycle_id=cycle_id,
                     timestamp=timestamp, reason="BUY_EXIT_ACTIVE", status=RESULT_WAIT,
+                    evaluation_completed=True,
                 )
             self._event(
                 document,
@@ -1863,7 +1959,13 @@ class MockIndicatorFollowRoutineAdapter:
                 event_type="ROUTINE_EVALUATED",
                 identity=cycle_id,
                 timestamp=timestamp,
-                payload={"signal": signal.get("signal"), "rules_hash": reference["rules_hash"]},
+                payload={
+                    "signal": signal.get("signal"),
+                    "rules_hash": reference["rules_hash"],
+                    "operation_identity": self._operation_identity(document, instance_id),
+                    "evaluation_cycle_id": cycle_id,
+                    **_signal_marker_payload(signal, evaluation.candles),
+                },
             )
             side = clean_text(signal.get("signal")).upper()
             if side not in {"BUY", "SELL"}:
@@ -1885,28 +1987,33 @@ class MockIndicatorFollowRoutineAdapter:
                     timestamp=timestamp,
                     reason="MOCK_SCHEDULED_END_BUY_REACHED",
                     status=RESULT_WAIT,
+                    evaluation_completed=True,
                 )
             explicit_signal_id = clean_text(signal.get("source_signal_id") or signal.get("signal_id") or signal.get("id"))
             if explicit_signal_id and any(item.get("source_signal_id") == explicit_signal_id for item in progression["plans"]):
                 return self._normal_block(
                     document, instance_id=instance_id, cycle_id=cycle_id,
                     timestamp=timestamp, reason="MOCK_SOURCE_SIGNAL_ALREADY_PROCESSED", status=RESULT_WAIT,
+                    evaluation_completed=True,
                 )
             if side == "SELL":
                 if int(position["holding_qty"]) <= 0 or int(position["available_qty"]) <= 0:
                     return self._normal_block(
                         document, instance_id=instance_id, cycle_id=cycle_id,
                         timestamp=timestamp, reason="SELL_HOLDING_QUANTITY_INVALID",
+                        evaluation_completed=True,
                     )
                 if cycle.get("active") is not True:
                     return self._normal_block(
                         document, instance_id=instance_id, cycle_id=cycle_id,
                         timestamp=timestamp, reason="MOCK_SELL_ACTIVE_CYCLE_REQUIRED",
+                        evaluation_completed=True,
                     )
             elif self._active_orders(document, instance_id):
                 return self._normal_block(
                     document, instance_id=instance_id, cycle_id=cycle_id,
                     timestamp=timestamp, reason="BLOCKED_ACTIVE_ORDER", status=RESULT_WAIT,
+                    evaluation_completed=True,
                 )
             self._event(
                 document,
@@ -1935,6 +2042,7 @@ class MockIndicatorFollowRoutineAdapter:
                 return self._normal_block(
                     document, instance_id=instance_id, cycle_id=cycle_id,
                     timestamp=timestamp, reason=clean_text(build_result.get("reason")) or "MOCK_EXECUTION_PLAN_BLOCKED",
+                    evaluation_completed=True,
                 )
             intents = build_result.get("execution_intents")
             if not isinstance(intents, list) or not intents:
@@ -1952,6 +2060,7 @@ class MockIndicatorFollowRoutineAdapter:
                     return self._normal_block(
                         document, instance_id=instance_id, cycle_id=cycle_id,
                         timestamp=timestamp, reason="SELL_MULTI_HOGA_QUANTITY_BELOW_CHILD_COUNT",
+                        evaluation_completed=True,
                     )
             plan_budget = execution_budget or _positive_number(intents[0].get("budget"))
             plan = self._build_plan(

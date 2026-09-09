@@ -647,6 +647,38 @@ def operation_mode_change_decision(
 REGULAR_SESSION_START_TIME = "09:00:00"
 REGULAR_SESSION_END_TIME = "15:20:00"
 
+# Read-only exchange sessions used by market-data presentation.  These are
+# deliberately separate from configurable operation/buy windows.
+EXCHANGE_REGULAR_SESSION_RANGES = (
+    ("KRX", "09:00:00", "15:30:00"),
+)
+EXCHANGE_NXT_SESSION_RANGES = (
+    ("NXT_PRE", "08:00:00", "08:50:00"),
+    *EXCHANGE_REGULAR_SESSION_RANGES,
+    ("NXT_AFTER", "15:40:00", "20:00:00"),
+)
+
+
+def actual_exchange_session_ranges(
+    *,
+    nxt_available: object,
+) -> tuple[dict[str, str], ...]:
+    """Project actual exchange sessions from verified stock eligibility."""
+
+    source = (
+        EXCHANGE_NXT_SESSION_RANGES
+        if nxt_available is True
+        else EXCHANGE_REGULAR_SESSION_RANGES
+    )
+    return tuple(
+        {
+            "name": name,
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+        for name, start_time, end_time in source
+    )
+
 
 def in_regular_manual_session(now_dt: datetime | None = None) -> bool:
     """정규 매매 허용 시간 안인지 판단한다. operation_policy.json 값이 있으면 우선 사용한다."""

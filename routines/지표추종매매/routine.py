@@ -320,9 +320,47 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
         isinstance(signal, dict) and "order_delay_bars" in signal
         for signal in signals.values()
     )
+    indicators = rules.get("indicators") if isinstance(rules.get("indicators"), dict) else {}
+    periods: list[int] = [3]
+
+    def collect_periods(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                collect_periods(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                collect_periods(child, key)
+        elif key in {"period", "fast", "slow", "signal"}:
+            try:
+                period = int(value)
+            except (TypeError, ValueError):
+                return
+            if period > 0:
+                periods.append(period)
+
+    collect_periods(indicators)
+    collect_periods(buy)
+    collect_periods(sell)
+    macd = indicators.get("macd") if isinstance(indicators.get("macd"), dict) else {}
+    try:
+        macd_warmup = int(macd.get("slow", 0) or 0) + int(macd.get("signal", 0) or 0)
+    except (TypeError, ValueError):
+        macd_warmup = 0
+    if macd_warmup > 0:
+        periods.append(macd_warmup)
+    moving_averages = indicators.get("moving_averages")
+    if isinstance(moving_averages, list):
+        for value in moving_averages:
+            try:
+                period = int(value)
+            except (TypeError, ValueError):
+                continue
+            if period > 0:
+                periods.append(period)
     return {
         "projection": "FORMING_BASE_BAR" if needs_forming_base_bar else "COMPLETED_TIMEFRAME",
         "ocr_delay_semantics": "ROUTINE_OWNED",
+        "warmup_bars": max(periods),
     }
 
 

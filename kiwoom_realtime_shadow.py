@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import math
 from typing import Any
@@ -217,6 +217,7 @@ class _CurrentShadowBar:
     volume_baseline: int | float | None
     last_cumulative_volume: int | float | None
     volume_reliable: bool
+    observed_volume: int | float
 
 
 class RealtimeShadowBarBuilder:
@@ -289,6 +290,7 @@ class RealtimeShadowBarBuilder:
             volume_baseline=volume_baseline,
             last_cumulative_volume=tick.cumulative_volume,
             volume_reliable=bool(volume_reliable),
+            observed_volume=tick.trade_volume_abs or 0,
         )
 
     @staticmethod
@@ -298,6 +300,7 @@ class RealtimeShadowBarBuilder:
         current.close = tick.current_price
         current.last_tick_time = tick.market_datetime
         current.tick_count += 1
+        current.observed_volume += tick.trade_volume_abs or 0
         if tick.cumulative_volume is None:
             current.volume_reliable = False
             return
@@ -347,6 +350,14 @@ class RealtimeShadowBarBuilder:
             connection_epoch=current.tick.connection_epoch,
             login_session_id=current.tick.login_session_id,
         )
+
+    def current_bar(self, stock_code: object) -> RealtimeShadowBar | None:
+        """Return the process-local forming minute without committing it."""
+        current = self._current_by_stock.get(str(stock_code or "").strip())
+        if current is None:
+            return None
+        bar = self._finalize(current)
+        return replace(bar, volume=current.observed_volume, volume_complete=False)
 
 
 def compare_shadow_bar_to_canonical(

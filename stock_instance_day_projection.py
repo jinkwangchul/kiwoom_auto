@@ -9,14 +9,12 @@ from decimal import Decimal, InvalidOperation
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from candle_manager import load_candles
 from broker_holding_recorder import _reconciliation_status as broker_holding_reconciliation_status
 from candle_timeframe_aggregation import (
     SEOUL_TIMEZONE,
-    completed_timeframe_candles,
-    filter_candles_by_trade_date,
+    candle_session_windows,
     read_canonical_bar_minutes,
 )
 from execution_queue_writer import read_execution_queue_records
@@ -30,9 +28,11 @@ from confirmable_pnl_cycle_service import (
     project_confirmable_cumulative_pnl,
 )
 from gui_review_utils import current_price_from_state
-from routine_instance_registry import routine_instance_by_id
+from routine_instance_registry import routine_definition_by_id, routine_instance_by_id
+from routine_package_contract import EVALUATION_ROLE, load_routine_callable
 from runtime_io import read_json_dict
 from state_policy import (
+    actual_exchange_session_ranges,
     auto_trade_status_display,
     normalize_operation_mode,
     normalized_hhmmss_or_empty,
@@ -76,6 +76,40 @@ def _stock_nxt_availability(stock_code: object, root: Path) -> bool | None:
         value = record.get("nxt_available")
         return value if value is True or value is False else None
     return None
+
+
+def chart_market_session_projection(
+    stock_code: object,
+    root: Path,
+) -> dict[str, Any]:
+    """Project one verified eligibility and its actual exchange sessions."""
+
+    nxt_available = _stock_nxt_availability(stock_code, root)
+    return {
+        "nxt_available": nxt_available,
+        "market_eligibility": {
+            "krx": True,
+            "nxt": nxt_available,
+        },
+        "market_sessions": [
+            dict(item)
+            for item in actual_exchange_session_ranges(
+                nxt_available=nxt_available,
+            )
+        ],
+    }
+
+
+def chart_operation_method_badge_label(
+    operation_mode: object,
+    *,
+    ats_selected: bool,
+) -> str:
+    """Return the shared compact operation-method badge literal."""
+
+    if normalize_operation_mode(operation_mode) != "CONTINUOUS":
+        return "시간"
+    return "ATS" if ats_selected else "수동"
 
 
 def _json_file_malformed(path: Path, *, list_field: str | None = None) -> bool:
@@ -662,6 +696,7 @@ def project_stock_instance_day(
     *,
     project_root: str | Path = PROJECT_ROOT,
     now: datetime | None = None,
+    candle_provider: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Project completed candles, exact signal markers, and order linkage."""
     root = Path(project_root)
@@ -690,8 +725,6 @@ def project_stock_instance_day(
         diagnostics["issues"].append("CONFIG_DATA_MALFORMED")
     if _json_file_malformed(stock_dir / "state.json"):
         diagnostics["issues"].append("STATE_DATA_MALFORMED")
-    if _json_file_malformed(stock_dir / "candles.json", list_field="candles"):
-        diagnostics["issues"].append("CANDLE_DATA_MALFORMED")
     if _json_file_malformed(
         root / "runtime" / "routine_signals.json",
         list_field="signals",
@@ -706,22 +739,69 @@ def project_stock_instance_day(
     if not rules:
         diagnostics["issues"].append("INSTANCE_RULES_UNAVAILABLE")
 
-    raw_day = filter_candles_by_trade_date(load_candles(stock_dir), trade_date)
-    diagnostics["raw_candle_count"] = len(raw_day)
     candles: list[dict[str, Any]] = []
     bar_minutes: int | None = None
+    candle_supply: dict[str, Any] = {
+        "available": False,
+        "candles": [],
+        "availability_state": "SOURCE_UNAVAILABLE",
+    }
     if rules:
         try:
             bar_minutes = read_canonical_bar_minutes(rules)
-            candles = completed_timeframe_candles(
-                raw_day,
-                rules,
-                now=_projection_as_of(trade_date, now),
-            )
         except ValueError as exc:
             diagnostics["issues"].append(f"BAR_PROJECTION_ERROR:{exc}")
+        if callable(candle_provider) and instance is not None and bar_minutes is not None:
+            definition = routine_definition_by_id(
+                instance.definition_id,
+                project_root=root,
+            )
+            if definition is None:
+                raise ValueError("ROUTINE_DEFINITION_UNAVAILABLE")
+            request_reader = load_routine_callable(
+                definition,
+                EVALUATION_ROLE,
+                callable_key="market_bar_projection_callable",
+            )
+            routine_projection_request = request_reader(rules)
+            if not isinstance(routine_projection_request, dict):
+                raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
+            projection_request = chart_candle_projection_request(
+                routine_projection_request
+            )
+            candle_supply = candle_provider(
+                stock_code=stock_code,
+                rules=rules,
+                projection_request=projection_request,
+                as_of=_projection_as_of(trade_date, now),
+                session_windows=candle_session_windows(
+                    read_json_dict(root / "operation_policy.json"),
+                    manual_ats_runtime_selected_keys(state),
+                ),
+                consumer_scope="PRODUCTION",
+            )
+            if not isinstance(candle_supply, dict):
+                raise TypeError("Production Candle provider returned a non-object")
+            supplied = candle_supply.get("candles", [])
+            if not isinstance(supplied, list):
+                raise TypeError("Production Candle provider returned invalid candles")
+            candles = [deepcopy(item) for item in supplied if isinstance(item, dict)]
+            supplied_interval = candle_supply.get("timeframe_minutes")
+            if isinstance(supplied_interval, int) and supplied_interval > 0:
+                bar_minutes = supplied_interval
+            availability_state = str(
+                candle_supply.get("availability_state") or ""
+            ).upper()
+            if "MALFORMED" in availability_state or "CORRUPT" in availability_state:
+                diagnostics["issues"].append(availability_state)
+    diagnostics["raw_candle_count"] = int(
+        candle_supply.get("available_minute_candles", 0) or 0
+    )
     diagnostics["completed_candle_count"] = len(candles)
     diagnostics["completed_input_hash"] = market_window_hash(candles) if candles else ""
+    diagnostics["candle_availability_state"] = str(
+        candle_supply.get("availability_state") or ""
+    ).strip()
 
     malformed_or_failed = any(
         "MALFORMED" in str(issue).upper()
@@ -734,9 +814,9 @@ def project_stock_instance_day(
         projection_status = CHART_PROJECTION_REFRESH_FAILED
     elif not instance_id or not rules:
         projection_status = CHART_PROJECTION_RULES_UNAVAILABLE
-    elif candles:
+    elif candle_supply.get("available") is True and candles:
         projection_status = CHART_PROJECTION_VALID
-    elif raw_day:
+    elif diagnostics["raw_candle_count"] > 0:
         projection_status = CHART_PROJECTION_NOT_READY
     else:
         projection_status = CHART_PROJECTION_NO_DAY_DATA
@@ -797,7 +877,8 @@ def project_stock_instance_day(
         root,
     )
     ats_session_ranges = _selected_ats_session_ranges(config, state, root)
-    nxt_available = _stock_nxt_availability(stock_code, root)
+    market_projection = chart_market_session_projection(stock_code, root)
+    nxt_available = market_projection["nxt_available"]
     instance_name = str(
         getattr(instance, "display_name", "")
         or config.get("routine_instance_name")
@@ -871,6 +952,12 @@ def project_stock_instance_day(
         "operation_mode": normalized_operation_mode,
         "operation_mode_display": operation_mode_display(normalized_operation_mode),
         "operation_title_display": operation_title_display,
+        "chart_domain_label": "KRX",
+        "chart_operation_method_label": chart_operation_method_badge_label(
+            normalized_operation_mode,
+            ats_selected=bool(ats_session_ranges),
+        ),
+        "chart_bar_label": f"{bar_minutes}분봉" if bar_minutes else "-",
         "operation_start_time": operation_start_time,
         "operation_end_buy_time": operation_end_buy_time,
         "operation_time": (
@@ -879,7 +966,7 @@ def project_stock_instance_day(
             else f"{operation_start_time[:5]}~{operation_end_buy_time[:5]}"
         ),
         "ats_session_ranges": ats_session_ranges,
-        "nxt_available": nxt_available,
+        **market_projection,
         "current_status": current_status,
         "current_status_display": auto_trade_status_display(current_status),
         **cumulative_pnl,
@@ -891,6 +978,10 @@ def project_stock_instance_day(
         "average_price": average_price if average_price_visible else None,
         "average_price_visible": average_price_visible,
         "candles": candles,
+        "candle_availability": deepcopy(candle_supply),
+        "completeness": deepcopy(candle_supply.get("completeness", {})),
+        "freshness": deepcopy(candle_supply.get("freshness", {})),
+        "source_identity": str(candle_supply.get("source_identity") or "").strip(),
         "buy_signal_markers": [marker for marker in markers if marker["signal"] == "BUY"],
         "sell_signal_markers": [marker for marker in markers if marker["signal"] == "SELL"],
         "buy_signal_count": sum(1 for marker in markers if marker["signal"] == "BUY"),
@@ -904,3 +995,15 @@ def project_stock_instance_day(
         "actual_fill_source": "runtime/fills.json→runtime/order_executions.json→runtime/order_queue.json",
         "diagnostics": diagnostics,
     }
+
+
+def chart_candle_projection_request(
+    routine_projection_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep the Routine projection kind while separating Chart display from warm-up."""
+
+    if not isinstance(routine_projection_request, dict):
+        raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
+    request = deepcopy(routine_projection_request)
+    request.pop("warmup_bars", None)
+    return request

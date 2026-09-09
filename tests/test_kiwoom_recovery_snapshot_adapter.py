@@ -359,6 +359,44 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.assertFalse(results[0]["changed"])
         self.assertEqual([], self.api.bar_committed.values)
 
+    def test_minute_candle_continuation_accumulates_requested_history(self) -> None:
+        results: list[dict[str, object]] = []
+        committed_rows: list[dict[str, object]] = []
+        requested = self.api.request_minute_candles(
+            "005930",
+            count=3,
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+        rows = [
+            {"time": f"20260908090{index}", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+            for index in range(3)
+        ]
+        saved_function = self.module.commit_minute_candles_for_stock
+
+        def commit(_code, _name, received, **_kwargs):
+            committed_rows.extend(received)
+            return self.minute_commit_result()
+
+        self.module.commit_minute_candles_for_stock = commit
+        try:
+            with patch.object(
+                self.api,
+                "_read_opt10080_rows",
+                side_effect=(rows[:2], rows[2:]),
+            ):
+                self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "2")
+                self.assertEqual([], results)
+                self.assertIn(rqname, self.api._pending_tr)
+                self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
+        finally:
+            self.module.commit_minute_candles_for_stock = saved_function
+
+        self.assertEqual(rows, committed_rows)
+        self.assertEqual(1, len(results))
+        self.assertTrue(results[0]["ok"], results[0])
+        self.assertEqual(3, results[0]["rows_count"])
+
     def test_minute_candle_failed_commit_finishes_once_without_event(self) -> None:
         results: list[dict[str, object]] = []
         requested = self.api.request_minute_candles("005930", callback=results.append)

@@ -160,6 +160,7 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
                 )
                 self.assertEqual("#16a34a", display.status_color)
                 self.assertEqual("#5c4300", display.liquidation_color)
+                self.assertTrue(display.status_active)
 
         status_helper.assert_called_once()
         method_helper.assert_called_once_with("매수/매도", config, state)

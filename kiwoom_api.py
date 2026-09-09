@@ -1016,6 +1016,23 @@ class KiwoomApi(QObject):
             "snapshot": self._realtime_shadow_registration,
         }
 
+    def current_realtime_shadow_bar(self, stock_code: object) -> dict[str, Any] | None:
+        """Expose the current process-local forming minute without committing it."""
+        self._ensure_realtime_shadow_state()
+        bar = self._realtime_shadow_builder.current_bar(stock_code)
+        if bar is None:
+            return None
+        payload = bar.to_payload()
+        return {
+            "time": str(payload.get("bar_time") or ""),
+            "open": payload.get("open"),
+            "high": payload.get("high"),
+            "low": payload.get("low"),
+            "close": payload.get("close"),
+            "volume": payload.get("volume"),
+            "is_complete": False,
+        }
+
     def sync_realtime_shadow_registration(
         self,
         stock_codes: object,
@@ -2705,11 +2722,14 @@ class KiwoomApi(QObject):
         except (TypeError, ValueError):
             clean_interval = 1
         try:
-            clean_count = max(int(count), 1)
+            clean_count = min(max(int(count), 1), DEFAULT_CANDLES_MAX_COUNT)
         except (TypeError, ValueError):
             clean_count = 300
         try:
-            clean_max_count = max(int(max_count), clean_count)
+            clean_max_count = min(
+                max(int(max_count), clean_count),
+                DEFAULT_CANDLES_MAX_COUNT,
+            )
         except (TypeError, ValueError):
             clean_max_count = DEFAULT_CANDLES_MAX_COUNT
 
@@ -2737,10 +2757,7 @@ class KiwoomApi(QObject):
         }
 
         def start_timeout(_result: Any) -> None:
-            QTimer.singleShot(
-                self.MINUTE_CANDLE_TR_TIMEOUT_MS,
-                lambda request_name=rqname: self._expire_minute_candle_request(request_name),
-            )
+            self._arm_minute_candle_timeout(rqname, self._pending_tr.get(rqname))
 
         def fail_request(result: Any, error: str) -> dict[str, Any]:
             pending = self._pending_tr.pop(rqname, None)
@@ -2781,7 +2798,36 @@ class KiwoomApi(QObject):
             "result": dispatched.get("result"),
         }
 
-    def _expire_minute_candle_request(self, rqname: str) -> None:
+    def _arm_minute_candle_timeout(
+        self,
+        rqname: str,
+        pending: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(pending, dict) or pending.get("type") != "minute_candles":
+            return
+        generation = int(pending.get("timeout_generation") or 0) + 1
+        pending["timeout_generation"] = generation
+        QTimer.singleShot(
+            self.MINUTE_CANDLE_TR_TIMEOUT_MS,
+            lambda request_name=str(rqname), expected=generation: self._expire_minute_candle_request(
+                request_name,
+                expected_generation=expected,
+            ),
+        )
+
+    def _expire_minute_candle_request(
+        self,
+        rqname: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
+        current = self._pending_tr.get(str(rqname))
+        if (
+            isinstance(current, dict)
+            and expected_generation is not None
+            and int(current.get("timeout_generation") or 0) != int(expected_generation)
+        ):
+            return
         pending = self._pending_tr.pop(str(rqname), None)
         if not pending or pending.get("type") != "minute_candles":
             return
@@ -3453,15 +3499,38 @@ class KiwoomApi(QObject):
                 pending,
             )
             return
-        pending = self._pending_tr.pop(request_name, None)
-        if not pending or pending.get("type") != "minute_candles":
+        if pending.get("type") != "minute_candles":
             return
-        self._release_pending_tr_screen(request_name, pending)
-
         callback = pending.get("callback")
         try:
-            rows = self._read_opt10080_rows(str(trcode), str(rqname), int(pending.get("count") or 300))
-            pending["rows"] = rows
+            requested_count = int(pending.get("count") or 300)
+            accumulated = pending.setdefault("rows", [])
+            remaining = max(requested_count - len(accumulated), 1)
+            accumulated.extend(self._read_opt10080_rows(str(trcode), str(rqname), remaining))
+            if str(prev_next).strip() == "2" and len(accumulated) < requested_count:
+                pending["timeout_generation"] = int(pending.get("timeout_generation") or 0) + 1
+                dispatched = self._submit_governed_tr_request(
+                    rqname=request_name,
+                    trcode="opt10080",
+                    prev_next=2,
+                    screen_no=str(pending.get("screen_no") or ""),
+                    inputs=(
+                        ("종목코드", str(pending.get("code") or "")),
+                        ("틱범위", str(pending.get("interval") or 1)),
+                        ("수정주가구분", "1"),
+                    ),
+                    pending=pending,
+                    on_dispatched=lambda _result: self._arm_minute_candle_timeout(
+                        request_name,
+                        self._pending_tr.get(request_name),
+                    ),
+                )
+                if isinstance(dispatched, dict) and dispatched.get("ok") is True:
+                    return
+                raise RuntimeError(str(dispatched.get("error") if isinstance(dispatched, dict) else "minute candle continuation failed"))
+            pending = self._pending_tr.pop(request_name, pending)
+            self._release_pending_tr_screen(request_name, pending)
+            rows = list(accumulated[:requested_count])
             commit = commit_minute_candles_for_stock(
                 str(pending.get("code", "")),
                 str(pending.get("name", "")),
@@ -3497,6 +3566,8 @@ class KiwoomApi(QObject):
             if commit.ok and commit.readback_verified and commit.changed and commit.notification is not None:
                 self.bar_committed.emit(commit.notification.to_payload())
         except Exception as exc:
+            self._pending_tr.pop(request_name, None)
+            self._release_pending_tr_screen(request_name, pending)
             result = {
                 "ok": False,
                 "type": "minute_candles",

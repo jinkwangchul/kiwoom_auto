@@ -21,6 +21,7 @@
 
 import hashlib
 import json
+import re
 import sys
 import tempfile
 from copy import deepcopy
@@ -83,8 +84,142 @@ from routine_instance_registry import (
 )
 
 
+_SITUATION_RESPONSE_EXCLUSION_MESSAGE = (
+    "미체결과 가격비교는 동시에 사용할 수 없습니다.\n"
+    "둘 중 하나만 선택하세요."
+)
+_BUY_PRICE_COMPARE_BELOW_BUDGET_MESSAGE = (
+    "추가비교매수 하단 조건의 예산기준 설정이 올바르지 않습니다.\n"
+    "설정값을 확인하세요."
+)
+_INTERNAL_VALIDATION_MESSAGE = (
+    "설정 적용 전 내부 검증에 실패했습니다.\n"
+    "설정은 변경되지 않았습니다."
+)
+_REGISTRATION_VALIDATION_MESSAGE = "현재 설정을 검증하지 못해 루틴을 등록할 수 없습니다."
+_SETTINGS_SAVE_FAILURE_MESSAGE = (
+    "설정을 저장하지 못했습니다.\n"
+    "기존 설정은 변경되지 않았습니다."
+)
+_REGISTRATION_PROCESSING_FAILURE_MESSAGE = (
+    "루틴 등록 처리 중 오류가 발생했습니다.\n"
+    "설정과 저장 상태를 확인하세요."
+)
+_SETTINGS_CHANGE_PROCESSING_FAILURE_MESSAGE = (
+    "설정 변경 처리 중 오류가 발생했습니다.\n"
+    "기존 설정은 변경되지 않았습니다."
+)
+_RULES_LOAD_FAILURE_MESSAGE = (
+    "설정 파일을 불러오지 못했습니다.\n"
+    "파일과 저장 상태를 확인하세요."
+)
+
+
+def _validation_fallback_message(context):
+    return (
+        _REGISTRATION_VALIDATION_MESSAGE
+        if str(context or "").strip().lower() == "registration"
+        else _INTERNAL_VALIDATION_MESSAGE
+    )
+
+
+def _settings_validation_user_reason(reason, *, context="change"):
+    text = str(reason or "")
+    lowered = text.lower()
+    if (
+        "buy situation response modes are mutually exclusive" in lowered
+        or "buy unfilled and price-comparison situation responses are mutually exclusive" in lowered
+        or "buy_situation_response_modes_exclusive" in lowered
+    ):
+        return _SITUATION_RESPONSE_EXCLUSION_MESSAGE
+    price_compare_detail = re.search(
+        r"buy price compare (below|above) (round|budget) policy is invalid",
+        lowered,
+    )
+    if price_compare_detail:
+        direction = "하단" if price_compare_detail.group(1) == "below" else "상단"
+        basis = "회차기준" if price_compare_detail.group(2) == "round" else "예산기준"
+        if direction == "하단" and basis == "예산기준":
+            return _BUY_PRICE_COMPARE_BELOW_BUDGET_MESSAGE
+        return (
+            f"추가비교매수 {direction} 조건의 {basis} 설정이 올바르지 않습니다.\n"
+            "설정값을 확인하세요."
+        )
+    if "signal runtime policy" in lowered:
+        return "기본설정이 올바르지 않습니다.\n중복신호 처리와 오류발생 설정을 확인하세요."
+    if "bar_minutes" in lowered or "signal interval" in lowered:
+        return "신호검출 기준 분봉 설정이 올바르지 않습니다.\n분봉 값을 확인하세요."
+    if "buy signal expression" in lowered:
+        return "매수 신호검출 조건 조합이 올바르지 않습니다.\n조건과 AND/OR/NOT 조합을 확인하세요."
+    if "buy" in lowered and (" ocr" in lowered or ".ocr" in lowered or "_ocr" in lowered):
+        return "매수 OCR 설정이 올바르지 않습니다.\n조건과 값을 확인하세요."
+    if (
+        "buy" in lowered and (" rsi" in lowered or ".rsi" in lowered or "_rsi" in lowered)
+    ) or "indicators.rsi" in lowered:
+        return "매수 RSI 설정이 올바르지 않습니다.\n기간과 조건값을 확인하세요."
+    if "buy" in lowered and ("buy ma " in lowered or "moving_average" in lowered):
+        return "매수 이동평균 설정이 올바르지 않습니다.\n이평 기간과 비교조건을 확인하세요."
+    if "buy" in lowered and "bollinger" in lowered:
+        return "매수 볼린저밴드 설정이 올바르지 않습니다.\n조건과 값을 확인하세요."
+    if "buy composite" in lowered or "buy_composite" in lowered:
+        return "매수 필터 조합 설정이 올바르지 않습니다.\n활성 그룹과 필터 조합을 확인하세요."
+    if "price compare" in lowered or "price_compare" in lowered:
+        if "overlap" in lowered or "operator" in lowered:
+            return (
+                "추가비교매수의 비교 연산자 조합이 올바르지 않습니다.\n"
+                "상단과 하단 조건을 확인하세요."
+            )
+        return "추가비교매수 설정이 올바르지 않습니다.\n비교조건과 매수기준을 확인하세요."
+    if (
+        "buy situation" in lowered
+        or "price response" in lowered
+        or "price_response" in lowered
+        or "unfilled timeout" in lowered
+        or "unfilled_timeout" in lowered
+        or "price-reset" in lowered
+        or "price_reset" in lowered
+    ):
+        return "상황변화대응 설정이 올바르지 않습니다.\n활성 조건과 대응방식을 확인하세요."
+    if "buy cycle" in lowered or "buy_cycle" in lowered or "cycle_option" in lowered:
+        return "순환설정이 올바르지 않습니다.\n주문방식과 반복조건을 확인하세요."
+    if "buy repeat" in lowered or "buy_execution_repeat" in lowered:
+        return "반복매수 설정이 올바르지 않습니다.\n반복매수 조건과 값을 확인하세요."
+    if (
+        "buy additional" in lowered
+        or "previous-round" in lowered
+        or "last+1" in lowered
+        or "last-round active" in lowered
+    ):
+        return "추가매수 설정이 올바르지 않습니다.\n활성 조건과 매수방식을 확인하세요."
+    if "buy exit" in lowered or "repeat-exit" in lowered or "completion policy" in lowered:
+        return (
+            "매수 이탈조건 또는 회차마감 설정이 올바르지 않습니다.\n"
+            "활성 조건의 값을 확인하세요."
+        )
+    if (
+        "buy base" in lowered
+        or "buy.execution.base" in lowered
+        or "buy_execution_base" in lowered
+        or "base_multi_ratio" in lowered
+    ):
+        return "기본매수 설정이 올바르지 않습니다.\n매수방식과 세부 조건을 확인하세요."
+    if "sell signal expression" in lowered or "sell signal combination" in lowered:
+        return "매도 신호 조합이 올바르지 않습니다.\n조건과 논리 조합을 확인하세요."
+    if "sell condition a" in lowered or "condition_a" in lowered:
+        return "매도조건 A 설정이 올바르지 않습니다.\n활성 조건과 값을 확인하세요."
+    if "sell condition b" in lowered or "condition_b" in lowered:
+        return "매도조건 B 설정이 올바르지 않습니다.\n활성 조건과 값을 확인하세요."
+    if "sell condition c" in lowered or "condition_c" in lowered:
+        return "매도조건 C 설정이 올바르지 않습니다.\n활성 조건과 값을 확인하세요."
+    if "profit_rate_sell" in lowered or "profit rate" in lowered:
+        return "수익률 매도 설정이 올바르지 않습니다.\n수익률과 기준값을 확인하세요."
+    if "sell method" in lowered or "selected_sets" in lowered or "selected set" in lowered:
+        return "매도 설정을 하나만 선택하세요."
+    return _validation_fallback_message(context)
+
+
 def normalize_buy_situation_ui_state(value):
-    """Normalize legacy Situation Response state into independent controls."""
+    """Normalize legacy Situation Response state into mutually exclusive controls."""
     state = deepcopy(value) if isinstance(value, dict) else {}
     has_new_slots = any(str(key).startswith(("setting1_", "setting2_")) for key in state)
     if not has_new_slots and "type_combo" in state:
@@ -259,7 +394,7 @@ def register_routine_instance_snapshot(
 
     clean_definition_id = str(definition_id or "").strip()
     if not clean_definition_id:
-        QMessageBox.warning(owner, "루틴 등록", "현재 루틴 유형의 definition_id를 확인할 수 없습니다.")
+        QMessageBox.warning(owner, "루틴 등록", "현재 루틴 유형 정보를 확인할 수 없습니다.")
         return None
 
     existing_names = [
@@ -296,35 +431,84 @@ def register_routine_instance_snapshot(
     if dialog.exec_() != QDialog.Accepted or dialog.registration_request is None:
         return None
 
-    rules_result = rules_provider()
-    if rules_result.get("success") is not True:
+    try:
+        rules_result = rules_provider()
+    except Exception as exc:
+        owner._last_routine_registration_error = str(exc)
         QMessageBox.critical(
             owner,
             "루틴 등록 실패",
-            "현재 설정을 공식 rules 경로로 변환하지 못했습니다.\n"
-            f"{rules_result.get('error', '')}",
+            _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
+        )
+        return None
+    if not isinstance(rules_result, dict):
+        owner._last_routine_registration_error = "rules provider result is not a dict"
+        QMessageBox.critical(
+            owner,
+            "루틴 등록 실패",
+            _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
+        )
+        return None
+    if rules_result.get("success") is not True:
+        owner._last_routine_registration_error = str(
+            rules_result.get("internal_error")
+            or rules_result.get("internal_blocked_reasons")
+            or rules_result.get("error")
+            or ""
+        )
+        user_messages = []
+        if rules_result.get("user_messages_normalized") is True:
+            user_messages = [
+                str(item)
+                for item in (rules_result.get("user_messages") or [])
+                if str(item)
+            ]
+        QMessageBox.critical(
+            owner,
+            "루틴 등록 실패",
+            "\n".join(dict.fromkeys(user_messages))
+            if user_messages
+            else _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
         )
         return None
 
-    result = RoutineInstanceRepository(Path(__file__).resolve().parent).create_instance(
-        dialog.registration_request,
-        rules_result.get("rules", {}),
-    )
-    if not result.success or result.instance is None:
+    try:
+        result = RoutineInstanceRepository(Path(__file__).resolve().parent).create_instance(
+            dialog.registration_request,
+            rules_result.get("rules", {}),
+        )
+    except Exception as exc:
+        owner._last_routine_registration_error = str(exc)
         QMessageBox.critical(
             owner,
             "루틴 등록 실패",
-            result.error or "등록 루틴을 저장하지 못했습니다.",
+            _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
+        )
+        return None
+    if not result.success or result.instance is None:
+        user_error_codes = {
+            "DEFINITION_UNKNOWN",
+            "DISPLAY_NAME_REQUIRED",
+            "DISPLAY_NAME_DUPLICATE",
+            "BUY_LIMIT_ENABLED_INVALID",
+            "BUY_LIMIT_INVALID",
+        }
+        result_error = str(getattr(result, "error", "") or "")
+        result_error_code = str(getattr(result, "error_code", "") or "")
+        owner._last_routine_registration_error = result_error or result_error_code
+        QMessageBox.critical(
+            owner,
+            "루틴 등록 실패",
+            result_error
+            if result_error_code in user_error_codes and result_error
+            else _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
         )
         return None
 
     owner.last_registered_instance_id = result.instance.instance_id
-    success_message = (
-        f"'{result.instance.display_name}' 루틴을 비활성 상태로 등록했습니다."
-        if str(source_instance_display_name or "").strip()
-        else f"'{result.instance.display_name}' 루틴을 등록했습니다."
-    )
-    show_toast(owner, success_message)
+    success_message = f"'{result.instance.display_name}' 루틴을 등록했습니다."
+    notification_owner = persistent_feature_root(owner) or owner
+    show_toast(notification_owner, success_message)
     _refresh_routine_assignment_views(owner)
     return result.instance
 
@@ -453,7 +637,6 @@ class IndicatorFollowRoutineSettingsDialog(
 
         button_row = QHBoxLayout()
         self.reload_button = QPushButton("다시 불러오기")
-        self.validate_button = QPushButton("설정 검증")
         if self.settings_mode == "edit":
             self.save_button = QPushButton("변경")
         else:
@@ -465,21 +648,6 @@ class IndicatorFollowRoutineSettingsDialog(
         self.save_button.setEnabled(True)
 
         self.reload_button.clicked.connect(self.load_rules)
-        self.validate_button.clicked.connect(
-            lambda: QMessageBox.information(
-                self,
-                "설정 검증",
-                "\n".join(
-                    [
-                        f"신호 구조: {self.validation_signal_line.text()}",
-                        f"실주문 실행: {self.validation_execution_line.text()}",
-                        f"매도 구조: {self.validation_sell_line.text()}",
-                        f"매수 확장: {self.validation_buy_line.text()}",
-                    ]
-                ),
-            )
-        )
-        self.validate_button.clicked.connect(self._handle_validate_clicked)
         if self.settings_mode == "edit":
             self.save_button.clicked.connect(self.save_edit_settings_and_close)
         else:
@@ -487,7 +655,6 @@ class IndicatorFollowRoutineSettingsDialog(
         self.close_button.clicked.connect(self.close)
 
         button_row.addWidget(self.reload_button)
-        button_row.addWidget(self.validate_button)
         button_row.addStretch(1)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
@@ -629,7 +796,12 @@ class IndicatorFollowRoutineSettingsDialog(
         if not self.rules_path.exists():
             self.rules_data = {}
             self._update_window_title()
-            QMessageBox.warning(self, "rules.json 없음", f"rules.json을 찾을 수 없습니다.\n{self.rules_path}")
+            self._last_rules_load_error = f"rules file missing: {self.rules_path}"
+            QMessageBox.warning(
+                self,
+                "설정 파일 없음",
+                "설정 파일을 찾을 수 없습니다.\n파일과 저장 상태를 확인하세요.",
+            )
             self._clear_fields()
             return
 
@@ -639,7 +811,8 @@ class IndicatorFollowRoutineSettingsDialog(
         except Exception as exc:
             self.rules_data = {}
             self._update_window_title()
-            QMessageBox.critical(self, "로드 실패", f"rules.json 로드 실패\n{exc}")
+            self._last_rules_load_error = str(exc)
+            QMessageBox.critical(self, "로드 실패", _RULES_LOAD_FAILURE_MESSAGE)
             self._clear_fields()
             return
 
@@ -842,24 +1015,41 @@ class IndicatorFollowRoutineSettingsDialog(
     def build_registration_rules_from_current_ui_state(self):
         """Build a validated, non-writing rules snapshot for a new instance."""
         try:
-            rules_with_ui_state = self.build_rules_with_indicator_follow_ui_state()
             ui_state = self.collect_indicator_follow_ui_state()
             mapper = self._load_indicator_follow_rule_mapper()
-            pending_result = mapper.build_engine_rules_pending_from_ui_state(
+            validation = mapper.validate_settings_candidate(
                 ui_state,
-                rules_with_ui_state,
+                deepcopy(self.rules_data),
             )
-            pending_rules = pending_result.get("pending_rules", {})
-            pending = pending_rules.get("indicator_follow_rule_pending", {})
-            if not isinstance(pending_rules, dict) or not isinstance(pending, dict):
-                raise ValueError("공식 rules 변환 결과가 올바르지 않습니다.")
-            if pending.get("mode") == "error":
-                raise ValueError("공식 rules 변환 검증이 실패했습니다.")
+            if validation.get("valid") is not True:
+                blocked_reasons = list(
+                    validation.get("blocked_reasons") or ["설정 검증이 실패했습니다."]
+                )
+                user_reasons = list(dict.fromkeys(
+                    _settings_validation_user_reason(item, context="registration")
+                    for item in blocked_reasons
+                ))
+                return {
+                    "success": False,
+                    "rules": {},
+                    "validation": validation,
+                    "validation_warnings": [],
+                    "postponed": [],
+                    "internal_blocked_reasons": blocked_reasons,
+                    "user_messages": user_reasons,
+                    "user_messages_normalized": True,
+                    "error": "\n".join(user_reasons),
+                }
+            prospective_rules = validation.get("prospective_rules")
+            if not isinstance(prospective_rules, dict):
+                raise ValueError("검증된 적용 설정을 생성하지 못했습니다.")
             return {
                 "success": True,
-                "rules": pending_rules,
-                "validation_warnings": list(pending_result.get("validation_warnings", [])),
-                "postponed": list(pending_result.get("postponed", [])),
+                "rules": prospective_rules,
+                "rules_hash": validation.get("prospective_rules_hash"),
+                "validation": validation,
+                "validation_warnings": [],
+                "postponed": [],
                 "error": "",
             }
         except Exception as exc:
@@ -868,7 +1058,10 @@ class IndicatorFollowRoutineSettingsDialog(
                 "rules": {},
                 "validation_warnings": [],
                 "postponed": [],
-                "error": str(exc),
+                "internal_error": str(exc),
+                "user_messages": [_REGISTRATION_PROCESSING_FAILURE_MESSAGE],
+                "user_messages_normalized": True,
+                "error": _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
             }
 
     def open_registration_dialog(self):
@@ -887,20 +1080,151 @@ class IndicatorFollowRoutineSettingsDialog(
         return instance
 
     def save_edit_settings_and_close(self):
-        result = self.save_indicator_follow_ui_state_to_rules()
-        pending_writer = getattr(self, "save_indicator_follow_rule_pending_to_rules", None)
-        if result.get("success") is True and callable(pending_writer):
-            pending_result = pending_writer()
-            result["pending_save_result"] = pending_result
-            if pending_result.get("success") is not True:
-                result["success"] = False
-                result["error"] = (
-                    pending_result.get("error")
-                    or "설정 변경안 저장에 실패했습니다."
-                )
+        result = self.commit_current_settings()
         if result.get("success") is True:
             _refresh_routine_assignment_views(self)
             self.close()
+        else:
+            QMessageBox.warning(
+                self,
+                "설정 변경 실패",
+                str(
+                    (result.get("blocked_reasons") or [_SETTINGS_CHANGE_PROCESSING_FAILURE_MESSAGE])[0]
+                ),
+            )
+        return result
+
+    def commit_current_settings(self):
+        result = {
+            "success": False,
+            "ok": False,
+            "committed": False,
+            "stage": "SETTINGS_VALIDATION_BLOCKED",
+            "blocked_reasons": [],
+            "error": "",
+        }
+        instance, instance_error = self._effective_rule_instance()
+        if instance is None:
+            result["blocked_reasons"] = [instance_error]
+            return result
+
+        rules_path = Path(self.rules_path)
+        try:
+            current_rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        except Exception:
+            result["blocked_reasons"] = ["현재 적용 설정을 다시 읽을 수 없습니다."]
+            return result
+        if not isinstance(current_rules, dict):
+            result["blocked_reasons"] = ["현재 적용 설정 형식을 확인할 수 없습니다."]
+            return result
+
+        try:
+            mapper = self._load_indicator_follow_rule_mapper()
+            validation = mapper.validate_settings_candidate(
+                self.collect_indicator_follow_ui_state(),
+                current_rules,
+            )
+        except Exception as exc:
+            result["internal_error"] = str(exc)
+            result["blocked_reasons"] = [_SETTINGS_CHANGE_PROCESSING_FAILURE_MESSAGE]
+            return result
+        result["validation"] = validation
+        if validation.get("valid") is not True:
+            internal_reasons = list(
+                validation.get("blocked_reasons") or ["설정 검증이 실패했습니다."]
+            )
+            result["internal_blocked_reasons"] = internal_reasons
+            result["blocked_reasons"] = [
+                _settings_validation_user_reason(item, context="change")
+                for item in internal_reasons
+            ]
+            result["blocked_reasons"] = list(dict.fromkeys(result["blocked_reasons"]))
+            return result
+
+        apply_preview = validation.get("apply_preview")
+        apply_preview_hash = validation.get("apply_preview_hash")
+        current_rules_hash = validation.get("current_rules_hash")
+        commit_gate = {
+            "commit_allowed": True,
+            "routine_key": str(self.definition_id or "indicator_follow").strip(),
+            "rules_hash_check": {"current_rules_hash": current_rules_hash},
+            "apply_preview_hash": apply_preview_hash,
+            "apply_preview_hash_algorithm": "stable_json_sha256",
+            "commit_preview": {
+                "safety_checks": deepcopy(validation.get("safety_checks", {})),
+                "final_diff": deepcopy(validation.get("final_diff", [])),
+                "apply_preview_hash": apply_preview_hash,
+                "apply_preview_hash_algorithm": "stable_json_sha256",
+            },
+        }
+        try:
+            commit_result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                commit_gate,
+                {
+                    "allowed_rules_path": str(rules_path.resolve()),
+                    "expected_file_sha256": self._rule_file_sha256(rules_path),
+                    "expected_rules_hash": current_rules_hash,
+                },
+            )
+        except Exception as exc:
+            result["stage"] = "SETTINGS_COMMIT_ERROR"
+            result["internal_error"] = str(exc)
+            result["blocked_reasons"] = [_SETTINGS_CHANGE_PROCESSING_FAILURE_MESSAGE]
+            return result
+        result["commit_result"] = commit_result
+        if commit_result.get("ok") is not True:
+            if commit_result.get("backup_path"):
+                result["rollback_result"] = self._restore_rule_commit_after_failed_verification(
+                    commit_result
+                )
+            result["stage"] = "SETTINGS_COMMIT_BLOCKED"
+            result["internal_blocked_reasons"] = list(
+                commit_result.get("blocked_reasons") or ["검증된 설정을 적용하지 못했습니다."]
+            )
+            result["blocked_reasons"] = [_SETTINGS_SAVE_FAILURE_MESSAGE]
+            return result
+
+        try:
+            read_back = json.loads(rules_path.read_text(encoding="utf-8"))
+        except Exception:
+            read_back = None
+        expected_rules = validation.get("prospective_rules")
+        instance_after, _instance_error = self._effective_rule_instance()
+        read_back_checks = {
+            "expected_rules": isinstance(read_back, dict) and read_back == expected_rules,
+            "expected_hash": (
+                isinstance(read_back, dict)
+                and mapper._stable_hash(read_back) == validation.get("prospective_rules_hash")
+            ),
+            "expected_instance_identity": (
+                instance_after is not None
+                and str(instance_after.instance_id) == str(instance.instance_id)
+                and Path(instance_after.rules_path).resolve() == rules_path.resolve()
+            ),
+        }
+        result["read_back_checks"] = read_back_checks
+        if not all(read_back_checks.values()):
+            result["rollback_result"] = self._restore_rule_commit_after_failed_verification(
+                commit_result
+            )
+            result["stage"] = "SETTINGS_READ_BACK_BLOCKED"
+            result["blocked_reasons"] = ["적용 후 설정 확인이 일치하지 않아 변경 전 상태로 복구했습니다."]
+            return result
+
+        self.rules_data = read_back
+        self.rules = read_back
+        result.update(
+            {
+                "success": True,
+                "ok": True,
+                "committed": True,
+                "stage": "SETTINGS_APPLIED",
+                "blocked_reasons": [],
+                "post_rules_hash": commit_result.get("post_rules_hash"),
+            }
+        )
         return result
 
     def _load_indicator_follow_rule_mapper(self):
@@ -2450,6 +2774,10 @@ class IndicatorFollowRoutineSettingsDialog(
 
         def apply_order(item):
             widget = getattr(self, item[0], None)
+            if item[0] == "buy_price_compare_condition_combo":
+                return -2
+            if item[0] == "buy_price_compare_above_condition_combo":
+                return -1
             if isinstance(widget, QComboBox):
                 return 0
             if isinstance(widget, QLineEdit):
@@ -2558,8 +2886,8 @@ class IndicatorFollowRoutineSettingsDialog(
 
         if len(groups) > 2:
             message = (
-                "Composite setting exceeds the UI-supported group count. "
-                "Existing settings are preserved, but this screen cannot edit them."
+                "현재 매수 필터 조합은 이 화면에서 지원하는 그룹 수를 초과합니다. "
+                "기존 설정은 유지되지만 이 화면에서는 편집할 수 없습니다."
             )
             self._set_buy_composite_warning(message)
             result["skipped"].append({
