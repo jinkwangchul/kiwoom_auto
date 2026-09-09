@@ -105,6 +105,56 @@ class BuyPriceResetProductionTest(unittest.TestCase):
         self.assertEqual("BUY_PRICE_RESPONSE_THRESHOLD_NOT_MET", self.inspect(current_price=104)["waiting"][0]["reason"])
         self.assertEqual(1, len(self.inspect(current_price=105)["replan_proposals"]))
 
+    def test_two_triggered_slots_with_different_actions_use_existing_fail_closed_contract(self) -> None:
+        values = self.fixture(current_price=105)
+        policies = [
+            {
+                "slot": "SETTING1", "enabled": True,
+                "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+                "direction": "UP", "compare": ">=", "threshold_percent": 1,
+                "action": "RESET",
+            },
+            {
+                "slot": "SETTING2", "enabled": True,
+                "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+                "direction": "UP", "compare": ">=", "threshold_percent": 3,
+                "action": "CANCEL_BATCH",
+            },
+        ]
+        queue = json.loads(self.queue.read_text(encoding="utf-8"))
+        queue["orders"][0]["execution_intent"]["buy_price_response_policies"] = deepcopy(
+            policies
+        )
+        self.queue.write_text(json.dumps(queue), encoding="utf-8")
+        signals = json.loads(self.signals.read_text(encoding="utf-8"))
+        signals["signals"][0]["execution_intent"]["buy_price_response_policies"] = deepcopy(
+            policies
+        )
+        signals["signals"][0]["execution_intents"][0][
+            "buy_price_response_policies"
+        ] = deepcopy(policies)
+        self.signals.write_text(json.dumps(signals), encoding="utf-8")
+
+        result = inspect_buy_price_resets(
+            selected_account_no=ACCOUNT,
+            allowed_stock_codes=[CODE],
+            actionable_prices_by_code=values["prices"],
+            now=datetime.fromisoformat("2026-09-03T10:03:00"),
+            order_queue_path=self.queue,
+            order_executions_path=self.executions,
+            fills_path=self.fills,
+            positions_path=self.positions,
+            holdings_path=self.holdings,
+            signals_path=self.signals,
+        )
+
+        self.assertFalse(result["cancel_proposals"])
+        self.assertFalse(result["replan_proposals"])
+        self.assertEqual(
+            ["BUY_PRICE_RESPONSE_MULTIPLE_SLOTS_TRIGGERED"],
+            result["reviews"][0]["review_reasons"],
+        )
+
     def test_open_buy_requires_cancel_first(self) -> None:
         result = self.inspect(status="PARTIALLY_FILLED", remaining=6)
         self.assertEqual(1, len(result["cancel_proposals"]))

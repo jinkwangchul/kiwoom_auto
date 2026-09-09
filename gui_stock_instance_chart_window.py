@@ -38,11 +38,14 @@ from PyQt5.QtWidgets import (
 
 from candle_timeframe_aggregation import SEOUL_TIMEZONE, parse_market_datetime
 from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_BADGE_HEIGHT,
     AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
+    AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
     apply_auto_trade_setting_protection_row_style,
     auto_trade_operation_identity_color,
+    auto_trade_setting_badge_stylesheet,
     create_auto_trade_setting_status_item,
     profit_loss_value_color,
 )
@@ -62,6 +65,7 @@ from pnl_ui_refresh import (
     project_current_stock_pnl,
     project_current_stock_pnl_snapshot,
 )
+from state_policy import actual_exchange_session_ranges
 from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
@@ -78,15 +82,6 @@ ACTUAL_SELL_FILL_COLOR = QColor("#F97316")
 AVERAGE_PRICE_COLOR = QColor("#F59E0B")
 PROCESS_RAIL_COLOR = QColor("#6B7280")
 CHART_OPEN_STOCK_CODE_COLOR = "#2563EB"
-BASE_CHART_START_TIME = "09:00:00"
-BASE_CHART_END_TIME = "15:30:00"
-NXT_CHART_START_TIME = "08:00:00"
-NXT_CHART_END_TIME = "20:00:00"
-NXT_MARKET_SESSION_TIMES = (
-    (NXT_CHART_START_TIME, "08:50:00"),
-    (BASE_CHART_START_TIME, BASE_CHART_END_TIME),
-    ("16:00:00", NXT_CHART_END_TIME),
-)
 ProjectionProvider = Callable[[str, str], dict[str, Any]]
 ChartFactory = Callable[[QWidget], "StockInstanceCloseChart"]
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -126,6 +121,16 @@ def _main_monitoring_owner(parent: QWidget | None) -> QWidget | None:
         except RuntimeError:
             current = None
     return None
+
+
+def _production_candle_provider(parent: QWidget | None):
+    owner = _main_monitoring_owner(parent)
+    host_getter = getattr(owner, "main_monitoring_auto_trade_operation_host", None)
+    operation_host = host_getter() if callable(host_getter) else None
+    market_host_getter = getattr(operation_host, "market_data_host", None)
+    market_host = market_host_getter() if callable(market_host_getter) else None
+    provider = getattr(market_host, "project_routine_candles", None)
+    return provider if callable(provider) else None
 
 
 def _live_stock_instance_charts() -> list["StockInstanceChartWindow"]:
@@ -688,6 +693,7 @@ class StockOperationHeaderDisplay:
     method_color: str
     liquidation_color: str
     identity_color: str
+    status_active: bool = False
 
     @property
     def values(self) -> tuple[str, str, str]:
@@ -747,6 +753,7 @@ def _fallback_stock_operation_header_display(
             emergency_stopped=False,
             current_running=False,
         ),
+        status_active=False,
     )
 
 
@@ -897,6 +904,7 @@ def project_stock_operation_header_display(
                 ),
                 current_running=current_running,
             ),
+            status_active=status_cell_active,
         )
     except (OSError, RuntimeError, TypeError, ValueError):
         return _fallback_stock_operation_header_display(owner)
@@ -954,6 +962,27 @@ def _stock_instance_chart_pnl_display_width(font: QFont) -> int:
         "-99,999,999(-99.99%)",
     )
     return max(metrics.horizontalAdvance(value) for value in samples) + 4
+
+
+def _chart_operation_status_badge_label(
+    status_text: object,
+    *,
+    active: bool,
+) -> str:
+    status = str(status_text or "").strip()
+    if status in {"긴급정지", "검토종목"}:
+        return status
+    return "운영중" if active else "대기중"
+
+
+def _chart_header_badge_stylesheet(*, active: bool) -> str:
+    if active:
+        return auto_trade_setting_badge_stylesheet("QLabel")
+    return auto_trade_setting_badge_stylesheet(
+        "QLabel",
+        text_color=AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR,
+        border_color=AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR,
+    )
 
 
 def _button_content_vertical_margins(button: QPushButton) -> tuple[int, int]:
@@ -1793,7 +1822,7 @@ class StockInstanceCloseChart(QWidget):
         super().mousePressEvent(event)
 
 class StockInstanceChartWindow(QDialog):
-    """Read-only common window backed only by project_stock_instance_day()."""
+    """Read-only common window backed by one canonical Chart projection."""
 
     def __init__(
         self,
@@ -1812,7 +1841,18 @@ class StockInstanceChartWindow(QDialog):
         )
         self.stock_code = str(stock_code or "").strip()
         self.trade_date = str(trade_date or _today_trade_date()).strip()
-        self._projection_provider = projection_provider or project_stock_instance_day
+        if projection_provider is not None:
+            self._projection_provider = projection_provider
+        else:
+            candle_provider = _production_candle_provider(parent)
+            if candle_provider is None:
+                self._projection_provider = project_stock_instance_day
+            else:
+                self._projection_provider = lambda code, day: project_stock_instance_day(
+                    code,
+                    day,
+                    candle_provider=candle_provider,
+                )
         self.last_projection: dict[str, Any] = {}
         self.last_refresh_status = ""
         self._last_valid_projection_identity: tuple[str, str, int | None] | None = None
@@ -1844,6 +1884,7 @@ class StockInstanceChartWindow(QDialog):
 
         self.info_labels: dict[str, QLabel] = {}
         self.operation_info_labels: dict[str, QLabel] = {}
+        self.header_badges: dict[str, QLabel] = {}
         self.notice_label = QLabel()
         self.notice_label.setObjectName("stockInstanceChartNotice")
         self.notice_label.setWordWrap(True)
@@ -1860,6 +1901,9 @@ class StockInstanceChartWindow(QDialog):
             fill_selected.connect(self._on_actual_fill_marker_selected)
         self.process_rail.processSelected.connect(self._on_execution_process_selected)
         self._setup_ui()
+        required_height = max(self.minimumHeight(), self.minimumSizeHint().height())
+        self.setMinimumHeight(required_height)
+        self.resize(self.width(), required_height)
         self.refresh_projection()
         self._connect_operation_cycle_refresh()
         self._connect_bar_committed_refresh()
@@ -2164,7 +2208,8 @@ class StockInstanceChartWindow(QDialog):
             QWidget#stockInstanceCloseChart {
                 background: #FFFFFF;
             }
-            QLabel#stockInstanceChartInfoValue {
+            QLabel#stockInstanceChartInfoValue,
+            QLabel#stockInstanceChartRoutineValue {
                 color: #111827;
                 font-size: 17px;
                 font-weight: 700;
@@ -2206,6 +2251,14 @@ class StockInstanceChartWindow(QDialog):
         left_layout = QVBoxLayout(left_block)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
+        routine_value = QLabel("-")
+        routine_value.setObjectName("stockInstanceChartRoutineValue")
+        routine_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        routine_value.setMinimumWidth(0)
+        routine_value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        routine_value.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(routine_value)
+        self.info_labels["routine"] = routine_value
         stock_value = QLabel("-")
         stock_value.setObjectName("stockInstanceChartStockValue")
         stock_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -2239,6 +2292,26 @@ class StockInstanceChartWindow(QDialog):
         )
         self.operation_info_panel = operation_info
         left_layout.addWidget(operation_info, 0, Qt.AlignHCenter)
+
+        badge_row = QWidget()
+        badge_row.setObjectName("stockInstanceChartHeaderBadges")
+        badge_layout = QHBoxLayout(badge_row)
+        badge_layout.setContentsMargins(0, 0, 0, 0)
+        badge_layout.setSpacing(4)
+        for key in ("domain", "operation_method", "operation_status", "bar", "nxt"):
+            badge = QLabel("-")
+            badge.setObjectName(f"stockInstanceChartHeaderBadge{key.title().replace('_', '')}")
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setFont(QFont(badge_font))
+            badge.setFixedHeight(AUTO_TRADE_SETTING_BADGE_HEIGHT)
+            badge.setFocusPolicy(Qt.NoFocus)
+            badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            badge.setStyleSheet(_chart_header_badge_stylesheet(active=True))
+            badge_layout.addWidget(badge, 0, Qt.AlignVCenter)
+            self.header_badges[key] = badge
+        self.header_badge_row = badge_row
+        self.header_badge_layout = badge_layout
+        left_layout.addWidget(badge_row, 0, Qt.AlignHCenter)
         left_block.setMinimumWidth(operation_info.width())
         left_block.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.header_left_block = left_block
@@ -2385,6 +2458,57 @@ class StockInstanceChartWindow(QDialog):
     def _main_monitoring_window(self):
         return _main_monitoring_owner(persistent_feature_owner(self))
 
+    def _update_header_badges(
+        self,
+        *,
+        status_text: object,
+        status_active: bool,
+    ) -> None:
+        projection = self.last_projection if isinstance(self.last_projection, dict) else {}
+        operation_title = str(
+            projection.get("operation_title_display") or ""
+        ).strip()
+        method_fallback = {
+            "수동운영": "수동",
+            "수동+ATS": "ATS",
+            "시간운영": "시간",
+        }.get(operation_title, "-")
+        raw_bar_minutes = projection.get("bar_minutes")
+        bar_fallback = (
+            f"{raw_bar_minutes}분봉"
+            if isinstance(raw_bar_minutes, int)
+            and not isinstance(raw_bar_minutes, bool)
+            and raw_bar_minutes > 0
+            else "-"
+        )
+        eligibility = projection.get("market_eligibility")
+        eligibility = eligibility if isinstance(eligibility, dict) else {}
+        nxt_available = eligibility.get(
+            "nxt",
+            projection.get("nxt_available"),
+        )
+        values = {
+            "domain": str(projection.get("chart_domain_label") or "KRX").strip() or "KRX",
+            "operation_method": str(
+                projection.get("chart_operation_method_label") or method_fallback
+            ).strip() or "-",
+            "operation_status": _chart_operation_status_badge_label(
+                status_text,
+                active=status_active,
+            ),
+            "bar": str(projection.get("chart_bar_label") or bar_fallback).strip() or "-",
+            "nxt": "NXT",
+        }
+        for key, text in values.items():
+            badge = self.header_badges.get(key)
+            if badge is None:
+                continue
+            active = key != "nxt" or nxt_available is True
+            badge.setText(text)
+            badge.setEnabled(active)
+            badge.setStyleSheet(_chart_header_badge_stylesheet(active=active))
+            badge.setFixedWidth(max(36, badge.fontMetrics().horizontalAdvance(text) + 14))
+
     def _operation_stock_context(self) -> tuple[Path, str, str, str] | None:
         from runtime_io import read_json_dict
         from stock_repository import StockRepository
@@ -2460,6 +2584,10 @@ class StockInstanceChartWindow(QDialog):
                 continue
             label.setText(str(value or "-").strip() or "-")
             label.setStyleSheet(f"color: {color};")
+        self._update_header_badges(
+            status_text=display.status,
+            status_active=display.status_active,
+        )
 
     def _update_operation_button_state(self) -> None:
         self._update_operation_header_info()
@@ -2577,6 +2705,7 @@ class StockInstanceChartWindow(QDialog):
         _start, _end, visible_ranges = cls._chart_display_time_range(
             trade_date,
             data.get("nxt_available") is True,
+            data.get("market_sessions"),
         )
         if not visible_ranges:
             return False
@@ -2687,6 +2816,10 @@ class StockInstanceChartWindow(QDialog):
         self.last_refresh_status = status
 
     def _empty_chart_message(self, data: dict[str, Any]) -> str:
+        availability = data.get("candle_availability", {})
+        availability = availability if isinstance(availability, dict) else {}
+        if availability.get("available") is False:
+            return "기준봉 데이터가 아직 준비되지 않았습니다."
         diagnostics = data.get("diagnostics", {})
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
         raw_count = _nonnegative_count(diagnostics.get("raw_candle_count"), 0)
@@ -2698,18 +2831,26 @@ class StockInstanceChartWindow(QDialog):
     def _chart_display_time_range(
         trade_date: str,
         nxt_available: Any,
+        market_sessions: Any = None,
     ) -> tuple[
         datetime | None,
         datetime | None,
         list[tuple[datetime, datetime]],
     ]:
-        session_times = (
-            NXT_MARKET_SESSION_TIMES
-            if nxt_available is True
-            else ((BASE_CHART_START_TIME, BASE_CHART_END_TIME),)
+        sessions = (
+            market_sessions
+            if isinstance(market_sessions, (list, tuple)) and market_sessions
+            else actual_exchange_session_ranges(nxt_available=nxt_available)
         )
         visible_ranges: list[tuple[datetime, datetime]] = []
-        for start_time, end_time in session_times:
+        for session in sessions:
+            if isinstance(session, dict):
+                start_time = session.get("start_time")
+                end_time = session.get("end_time")
+            elif isinstance(session, (list, tuple)) and len(session) >= 2:
+                start_time, end_time = session[-2], session[-1]
+            else:
+                continue
             session_start = parse_market_datetime(f"{trade_date}T{start_time}")
             session_end = parse_market_datetime(f"{trade_date}T{end_time}")
             if session_start is None or session_end is None:
@@ -2747,6 +2888,7 @@ class StockInstanceChartWindow(QDialog):
             else "-"
         )
 
+        self.info_labels["routine"].setText(instance_name or "-")
         self.info_labels["stock"].setText(
             " ".join(part for part in (stock_code, stock_name) if part) or "-"
         )
@@ -2773,6 +2915,7 @@ class StockInstanceChartWindow(QDialog):
         x_range_start, x_range_end, visible_time_ranges = self._chart_display_time_range(
             projected_trade_date,
             data.get("nxt_available") is True,
+            data.get("market_sessions"),
         )
         self.chart.set_projection(
             candles,
@@ -2886,10 +3029,11 @@ class StockInstanceChartWindow(QDialog):
             label.setText("-")
         self.info_labels["stock"].setText(self.stock_code or "-")
         self._set_pnl_display(available=False)
-        error_message = "데이터 손상 또는 조회 오류로 차트를 표시할 수 없습니다."
+        error_message = "차트 데이터 조회 오류로 표시할 수 없습니다."
         x_range_start, x_range_end, visible_time_ranges = self._chart_display_time_range(
             self.trade_date,
             self.last_projection.get("nxt_available") is True,
+            self.last_projection.get("market_sessions"),
         )
         self.chart.set_projection(
             [],

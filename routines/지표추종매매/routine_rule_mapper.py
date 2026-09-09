@@ -8,10 +8,12 @@ warnings for values that are not safe to map yet.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from copy import deepcopy
 from datetime import datetime
 from math import isfinite
+from pathlib import Path
 from typing import Any
 
 from engines.condition_engine import parse_condition_expression
@@ -88,6 +90,7 @@ _BUY_EXECUTION_CANDIDATE_KEYS = {
 }
 P1_EXECUTION_LOCK_REASON = "MAPPED_BUT_EXECUTION_NOT_CONNECTED"
 CYCLE_OPTION_EXECUTION_LOCK_REASON = "CYCLE_OPTION_EXECUTION_NOT_CONNECTED"
+SUPPORTED_BAR_MINUTES = frozenset({1, 3, 5, 10, 15, 30, 60, 120, 240})
 RSI_INDICATOR_PATH = "indicators.rsi"
 SELL_METHOD_SELECTED_SETS_PATH = "sell.method.selected_sets"
 SELL_METHOD_SETTING_A_PATH = "sell.method.setting_a"
@@ -1277,35 +1280,6 @@ def _build_buy_price_response_policies(
         warnings.append("buy situation price response requires at least one enabled slot")
         return [], False
 
-    # UP/DOWN >= thresholds are mutually exclusive (apart from a zero/equality
-    # boundary).  Any overlapping pair with different actions must be rejected
-    # at registration instead of inventing a runtime priority.
-    if len(policies) == 2 and policies[0].get("action") != policies[1].get("action"):
-        same_basis = (
-            policies[0].get("left_source") == policies[1].get("left_source")
-            and policies[0].get("right_source") == policies[1].get("right_source")
-        )
-        first, second = policies
-        directions = {first.get("direction"), second.get("direction")}
-        non_overlapping = bool(
-            same_basis
-            and (
-                (
-                    directions == {"UP", "DOWN"}
-                    and first.get("compare") == ">="
-                    and second.get("compare") == ">="
-                )
-                or (
-                    first.get("direction") == second.get("direction") == "BOTH"
-                    and {first.get("compare"), second.get("compare")} == {"WITHIN", "OUTSIDE"}
-                    and float(next(item for item in policies if item.get("compare") == "WITHIN").get("threshold_percent"))
-                    <= float(next(item for item in policies if item.get("compare") == "OUTSIDE").get("threshold_percent"))
-                )
-            )
-        )
-        if not non_overlapping:
-            warnings.append("buy situation price response slots can trigger conflicting actions")
-            valid = False
     return policies, valid
 
 
@@ -1593,9 +1567,9 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
         if above_operator not in {">", ">="}:
             warnings.append(f"buy price compare above condition is not mapped: {price_compare.get('above_condition_combo')!r}")
             return None
-        # The two simultaneous Production branches have one exact, gap-free boundary.
-        below_operator = "<="
-        above_operator = ">"
+        if below_operator == "<=" and above_operator == ">=":
+            warnings.append("buy price compare branch operators overlap")
+            return None
         has_branch_policy_fields = any(
             key in price_compare
             for key in (
@@ -2439,6 +2413,12 @@ def build_engine_rules_preview_from_ui_state(
             situation[f"{slot}_direction_combo"] = situation.get("direction_combo")
         situation["setting1_enabled_check"] = True
         situation["setting2_enabled_check"] = False
+    invalid_situation_modes = (
+        _truthy_ui(situation.get("unfilled_enabled_check"))
+        and _truthy_ui(situation.get("price_enabled_check"))
+    )
+    if invalid_situation_modes:
+        validation_warnings.append("buy situation response modes are mutually exclusive")
     price_response_policies, price_response_valid = _build_buy_price_response_policies(
         situation,
         validation_warnings,
@@ -2446,12 +2426,13 @@ def build_engine_rules_preview_from_ui_state(
     invalid_price_reset_pair = (
         _truthy_ui(situation.get("price_enabled_check")) and not price_response_valid
     )
-    if invalid_price_reset_pair:
+    if invalid_situation_modes or invalid_price_reset_pair:
         buy_execution_base_candidate = None
     old_base = _as_dict(_as_dict(_as_dict(source_rules.get("buy")).get("execution")).get("base"))
     if (
         not buy_execution_base_candidate
         and not invalid_base_multi_ratio_pair
+        and not invalid_situation_modes
         and not invalid_price_reset_pair
         and old_base
         and (
@@ -2760,6 +2741,153 @@ def build_engine_rules_pending_from_ui_state(
         "legacy_notices": list(preview_result.get("legacy_notices", [])),
         "execution_locks": list(preview_result.get("execution_locks", [])),
         "warnings": list(preview_result.get("warnings", [])),
+    }
+
+
+def _load_committed_rules_validator():
+    validator_path = Path(__file__).resolve().with_name("routine_rule_commit_validator.py")
+    spec = importlib.util.spec_from_file_location(
+        "indicator_follow_routine_rule_commit_validator",
+        validator_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load committed-rules validator: {validator_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    validator = getattr(module, "validate_committed_rules", None)
+    if not callable(validator):
+        raise ImportError("validate_committed_rules is unavailable")
+    return validator
+
+
+def validate_settings_candidate(
+    ui_state: dict[str, Any],
+    current_rules: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Map and validate the current complete UI state without writing files."""
+    current = deepcopy(current_rules) if isinstance(current_rules, dict) else {}
+    state = deepcopy(ui_state) if isinstance(ui_state, dict) else {}
+    preview = build_engine_rules_preview_from_ui_state(state, current)
+    blocked_reasons = [str(item) for item in _as_list(preview.get("validation_warnings"))]
+    blocked_reasons.extend(str(item) for item in _as_list(preview.get("execution_locks")))
+
+    repeat = _as_dict(_as_dict(state.get("buy_ui")).get("repeat"))
+    repeat_inactive = (
+        "apply_all_check" in repeat
+        and not _truthy_ui(repeat.get("apply_all_check"))
+        and not _as_dict(_as_dict(_as_dict(current.get("buy")).get("execution")).get("repeat"))
+    )
+    for item in _as_list(preview.get("postponed")):
+        text = str(item)
+        if text == "repeat buy mapping is postponed" and repeat_inactive:
+            continue
+        blocked_reasons.append(text)
+
+    bar_minutes = _safe_int(_as_dict(state.get("basic")).get("basic_signal_interval_combo"))
+    if bar_minutes not in SUPPORTED_BAR_MINUTES:
+        blocked_reasons.append(
+            "bar.bar_minutes must be one of 1/3/5/10/15/30/60/120/240"
+        )
+
+    candidate_paths = _candidate_paths_from_preview(preview)
+    patch_preview = build_approved_rule_patch_preview(
+        current,
+        preview,
+        {"validated_paths": list(candidate_paths)},
+    )
+    apply_preview = apply_approved_rule_patch_preview(current, patch_preview)
+
+    skipped_paths = [
+        item
+        for item in _as_list(patch_preview.get("skipped_paths"))
+        if isinstance(item, dict) and not str(item.get("reason") or "").endswith(" is unchanged")
+    ]
+    skipped_patches = [
+        item for item in _as_list(apply_preview.get("skipped_patches")) if isinstance(item, dict)
+    ]
+    blocked_reasons.extend(
+        f"{item.get('path')}: {item.get('reason')}" for item in skipped_paths
+    )
+    blocked_reasons.extend(
+        f"{item.get('target_path')}: {item.get('reason')}" for item in skipped_patches
+    )
+    blocked_reasons.extend(str(item) for item in _as_list(patch_preview.get("warnings")))
+    blocked_reasons.extend(str(item) for item in _as_list(apply_preview.get("warnings")))
+
+    prospective = deepcopy(_as_dict(apply_preview.get("applied_rules_preview")))
+    prospective["indicator_follow_ui_state"] = {
+        "ui_state_version": "0.1",
+        "updated_at": _now_iso(),
+        "state": state,
+    }
+    apply_preview["applied_rules_preview"] = prospective
+    apply_preview.setdefault("applied_patches", []).append(
+        {
+            "source_path": "indicator_follow_ui_state",
+            "target_path": "indicator_follow_ui_state",
+            "operation": "set_ui_state",
+        }
+    )
+    apply_preview["summary"] = {
+        "patches": len(_as_list(patch_preview.get("patches"))) + 1,
+        "applied": len(_as_list(apply_preview.get("applied_patches"))),
+        "skipped": len(_as_list(apply_preview.get("skipped_patches"))),
+    }
+
+    final_diff: list[dict[str, Any]] = []
+    for patch in _as_list(patch_preview.get("patches")):
+        if isinstance(patch, dict):
+            final_diff.extend(_rule_commit_preview_diff_from_patch(patch))
+    final_diff.append(
+        {
+            "path": "indicator_follow_ui_state",
+            "operation": "set_ui_state",
+            "value": deepcopy(prospective["indicator_follow_ui_state"]),
+            "replace": False,
+        }
+    )
+
+    safety_checks = {
+        "rules_json_write": False,
+        "engine_connected": False,
+        "buy_groups_replace": False,
+        "macd_sell_replace": False,
+    }
+    routine_validation = _load_committed_rules_validator()(
+        pre_rules=current,
+        post_rules=prospective,
+        final_diff=final_diff,
+        safety_checks=safety_checks,
+    )
+    if routine_validation.get("ok") is not True:
+        blocked_reasons.extend(
+            f"{item.get('path')}: {item.get('reason')}"
+            for item in _as_list(routine_validation.get("unexpected_changes"))
+            if isinstance(item, dict)
+        )
+        blocked_reasons.extend(
+            str(item.get("name"))
+            for item in _as_list(routine_validation.get("checks"))
+            if isinstance(item, dict) and item.get("ok") is not True
+        )
+
+    unique_reasons = list(dict.fromkeys(reason for reason in blocked_reasons if reason))
+    apply_preview_hash = build_apply_preview_hash(apply_preview)
+    return {
+        "valid": not unique_reasons,
+        "blocked_reasons": unique_reasons,
+        "ui_state": state,
+        "preview_result": preview,
+        "patch_preview": patch_preview,
+        "apply_preview": apply_preview,
+        "prospective_rules": prospective,
+        "final_diff": final_diff,
+        "safety_checks": safety_checks,
+        "apply_preview_hash": apply_preview_hash,
+        "current_rules_hash": _stable_hash(current),
+        "prospective_rules_hash": _stable_hash(prospective),
+        "routine_validation": routine_validation,
+        "validation_rule_undefined": [],
     }
 
 
@@ -3219,17 +3347,22 @@ def build_approved_rule_patch_preview(
     current = _as_dict(current_rules)
     preview_candidates = _as_dict(_preview_candidate_namespace(_as_dict(preview_result)).get("candidates"))
     approval = _as_dict(approval_result)
-    approved_paths_value = approval.get("approved_paths")
+    validated_paths_value = approval.get("validated_paths")
+    direct_validation = isinstance(validated_paths_value, list)
+    approved_paths_value = (
+        validated_paths_value if direct_validation else approval.get("approved_paths")
+    )
     approved_paths = [str(path) for path in approved_paths_value] if isinstance(approved_paths_value, list) else []
     candidate_paths = _candidate_paths_from_preview(_as_dict(preview_result))
     patches: list[dict[str, Any]] = []
     skipped_paths: list[dict[str, str]] = []
     warnings: list[str] = []
 
-    for path, candidate_type in candidate_paths.items():
-        decision = _approval_decision_for_path(approval, path)
-        if decision != "APPROVED":
-            skipped_paths.append(_patch_skipped(path, f"decision is {decision}"))
+    if not direct_validation:
+        for path, candidate_type in candidate_paths.items():
+            decision = _approval_decision_for_path(approval, path)
+            if decision != "APPROVED":
+                skipped_paths.append(_patch_skipped(path, f"decision is {decision}"))
 
     for path in approved_paths:
         if path not in candidate_paths:
@@ -3611,9 +3744,10 @@ def build_approved_rule_patch_preview(
             if existing_signal is not _MISSING:
                 if existing_signal == signal:
                     skipped_paths.append(_patch_skipped(path, "sell signal is unchanged"))
-                else:
+                    continue
+                if not direct_validation:
                     skipped_paths.append(_patch_skipped(path, f"target path already exists: {target_path}"))
-                continue
+                    continue
 
             patches.append({
                 "source_path": path,
@@ -3901,10 +4035,6 @@ def apply_approved_rule_patch_preview(
                 warnings.append(f"unsupported signal target path: {target_path}")
                 continue
 
-            if _get_path_value(applied_rules_preview, target_path) is not _MISSING:
-                skipped_patches.append(_apply_skipped(patch, "target path already exists"))
-                continue
-
             sell_section = applied_rules_preview.setdefault("sell", {})
             if not isinstance(sell_section, dict):
                 skipped_patches.append(_apply_skipped(patch, "sell section is not a dict"))
@@ -3927,7 +4057,7 @@ def apply_approved_rule_patch_preview(
                 "source_path": patch.get("source_path"),
                 "target_path": target_path,
                 "operation": operation,
-                "added": True,
+                "added": _get_path_value(current_rules, target_path) is _MISSING,
             })
             continue
 
@@ -4138,11 +4268,15 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
 
     if operation == "add_signal" and target_path in {target for target, _key in _SELL_ADD_SIGNAL_TARGETS.values()}:
         signal = _as_dict(patch.get("signal"))
+        signal.pop("preview_candidate", None)
+        signal.pop("candidate_type", None)
+        signal["enabled"] = signal.get("enabled") is True
         diffs.append({
             "path": target_path,
             "operation": "add_signal",
             "change_type": "add_disabled_signal",
             "enabled": False,
+            "value": signal,
             "preserved": [
                 "sell.signals.macd_sell",
             ],

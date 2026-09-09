@@ -42,10 +42,27 @@ class MockValidationUIActions:
         return self.host.request_early_close(stock_code, method=method)
 
     def early_close_instance(
-        self, stock_code: str, routine_instance_id: str, *, method: str
+        self,
+        stock_code: str,
+        routine_instance_id: str,
+        *,
+        method: str,
+        profit_percent: Any = None,
+        loss_percent: Any = None,
     ) -> dict[str, Any]:
         return self.host.request_instance_early_close(
-            stock_code, routine_instance_id, method=method
+            stock_code,
+            routine_instance_id,
+            method=method,
+            profit_percent=profit_percent,
+            loss_percent=loss_percent,
+        )
+
+    def cancel_early_close_instance(
+        self, stock_code: str, routine_instance_id: str
+    ) -> dict[str, Any]:
+        return self.host.cancel_instance_early_close(
+            stock_code, routine_instance_id
         )
 
     def immediate_liquidation(
@@ -61,6 +78,21 @@ class MockValidationUIActions:
     ) -> dict[str, Any]:
         return self.host.request_instance_immediate_liquidation(
             stock_code, routine_instance_id, method=method
+        )
+
+    def individual_liquidation_instance(
+        self,
+        stock_code: str,
+        routine_instance_id: str,
+        *,
+        method: str,
+        minutes_before_regular_close: Any = "5",
+    ) -> dict[str, Any]:
+        return self.host.request_instance_individual_liquidation(
+            stock_code,
+            routine_instance_id,
+            method=method,
+            minutes_before_regular_close=minutes_before_regular_close,
         )
 
     def validation_stop_instance(
@@ -173,11 +205,26 @@ class MockValidationUIActions:
         self.host._publish_projection_if_changed()
         return result
 
-    def unregister(self, stock_code: str) -> dict[str, Any]:
+    def unregister(
+        self,
+        stock_code: str,
+        *,
+        expected_validation_session_id: str = "",
+    ) -> dict[str, Any]:
         """End only the Mock registration; Production state is never consulted."""
         document = self.host.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        expected_session_id = str(expected_validation_session_id or "").strip()
+        if (
+            expected_session_id
+            and document["session"]["validation_session_id"] != expected_session_id
+        ):
+            return {
+                "ok": False,
+                "reason": "MOCK_CONTEXT_TARGET_STALE",
+                "stage": "IDENTITY",
+            }
         eligibility = mock_validation_end_eligibility(document)
         if eligibility.get("eligible") is not True:
             return {"ok": False, "reason": eligibility.get("reason"), "stage": "ELIGIBILITY"}

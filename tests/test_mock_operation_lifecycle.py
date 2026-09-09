@@ -23,6 +23,8 @@ from mock_validation_operation_lifecycle import (
     CLOSE_CARRYOVER,
     CLOSE_CURRENT_PRICE,
     CLOSE_MARKET,
+    CLOSE_PROFIT_LOSS,
+    CLOSE_ROUTINE,
     MockOperationLifecycleCoordinator,
     OPERATION_ENDED,
     OPERATION_REVIEW_STOPPED,
@@ -32,6 +34,7 @@ from mock_validation_operation_lifecycle import (
     OUTCOME_REVIEW_REQUIRED,
     evaluate_mock_operation_completion,
     mock_validation_end_eligibility,
+    normalize_close_method,
 )
 from mock_validation_repository import MockValidationRepository
 from mock_validation_session_service import MockValidationSessionService
@@ -189,6 +192,9 @@ class MockOperationLifecycleTest(unittest.TestCase):
             command_id=command,
         )
 
+    def test_production_early_close_market_label_normalizes_to_mock_market(self):
+        self.assertEqual(CLOSE_MARKET, normalize_close_method("시장가즉시"))
+
     def test_instance_start_changes_only_target_execution(self):
         before = self.repository.read_session(SESSION_ID)
         siblings = {
@@ -265,6 +271,121 @@ class MockOperationLifecycleTest(unittest.TestCase):
             },
         )
 
+    def test_instance_routine_close_keeps_progression_until_final_sell_evidence(self):
+        started = self.start_instance("B")
+        operation_id = started["operation"]["operation_session_id"]
+        requested = self.coordinator.request_instance_early_close(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_ROUTINE,
+            reason="fixture",
+            as_of=self.clock["now"],
+            command_id="MC-routine-close-B",
+        )
+        operation = requested["document"]["mock_operation_lifecycle"]["instance_operations"]["B"]
+        self.assertEqual("RUNNING", operation["state"])
+        self.assertTrue(operation["close_pending"])
+        self.assertTrue(requested["document"]["instance_execution"]["B"]["progression_allowed"])
+
+        recorded = self.coordinator.record_instance_routine_final_sell(
+            SESSION_ID,
+            routine_instance_id="B",
+            as_of=self.clock["now"],
+            evaluation_cycle_id="EVAL-SELL-B",
+            result={
+                "signal": {"signal": "SELL"},
+                "plan_id": "PLAN-SELL-B",
+                "decision_id": "DECISION-SELL-B",
+            },
+        )
+        evidence = recorded["document"]["mock_operation_lifecycle"]["instance_operations"]["B"]["final_sell_evidence"]
+        self.assertEqual("PLAN-SELL-B", evidence["plan_id"])
+        self.assertEqual(operation_id, recorded["document"]["instance_execution"]["B"]["operation_session_id"])
+
+        completed = self.coordinator.complete_instance_routine_close_if_ready(
+            SESSION_ID,
+            routine_instance_id="B",
+            as_of=self.clock["now"],
+            lifecycle_cycle_id="ROUTINE-CLOSE-DONE-B",
+        )
+        self.assertEqual(OUTCOME_DONE, completed["status"])
+
+    def test_instance_early_close_cancel_restores_normal_progression_before_boundary(self):
+        self.start_instance("B")
+        self.coordinator.request_instance_early_close(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_MARKET,
+            reason="fixture",
+            as_of=self.clock["now"],
+            command_id="MC-market-close-B",
+        )
+        cancelled = self.coordinator.cancel_instance_early_close(
+            SESSION_ID,
+            routine_instance_id="B",
+            as_of=self.clock["now"],
+            command_id="MC-cancel-close-B",
+        )
+        operation = cancelled["document"]["mock_operation_lifecycle"]["instance_operations"]["B"]
+        self.assertEqual("RUNNING", operation["state"])
+        self.assertEqual("", operation["close_method"])
+        self.assertIsNotNone(operation["early_close_cancel_evidence"])
+        self.assertTrue(cancelled["document"]["instance_execution"]["B"]["progression_allowed"])
+
+    def test_profit_loss_close_snapshots_thresholds_without_inventing_execution(self):
+        self.start_instance("B")
+        requested = self.coordinator.request_instance_early_close(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_PROFIT_LOSS,
+            profit_percent="3.5",
+            loss_percent="2",
+            reason="fixture",
+            as_of=self.clock["now"],
+            command_id="MC-profit-loss-B",
+        )
+        operation = requested["document"]["mock_operation_lifecycle"]["instance_operations"]["B"]
+        self.assertEqual("RUNNING", operation["state"])
+        self.assertEqual(
+            {"profit_percent": 3.5, "loss_percent": 2.0},
+            {
+                key: operation["close_policy_snapshot"][key]
+                for key in ("profit_percent", "loss_percent")
+            },
+        )
+
+    def test_individual_carryover_snapshots_time_and_preserves_position(self):
+        self.start_instance("B")
+        self.position("B", 3)
+        requested = self.coordinator.request_instance_individual_liquidation(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_CARRYOVER,
+            minutes_before_regular_close="15",
+            reason="fixture",
+            as_of=self.clock["now"],
+            command_id="MC-individual-carry-B",
+        )
+        operation = requested["document"]["mock_operation_lifecycle"]["instance_operations"]["B"]
+        self.assertEqual(
+            15,
+            operation["individual_liquidation_time_snapshot"]["minutes_before_regular_close"],
+        )
+        completed = self.coordinator.process_instance_operation_cycle(
+            SESSION_ID,
+            routine_instance_id="B",
+            lifecycle_cycle_id="INDIVIDUAL-CARRY-B",
+            as_of=self.clock["now"],
+            market=_market(now=self.clock["now"]),
+            policy=self.policy,
+        )
+        self.assertEqual(OUTCOME_CARRYOVER_DONE, completed["status"])
+        position = next(
+            item for item in completed["document"]["positions"]
+            if item["routine_instance_id"] == "B"
+        )
+        self.assertEqual(3, position["holding_qty"])
+
     def test_instance_reset_is_zero_base_and_sibling_isolated(self):
         self.start_instance("B")
         self.position("B", 4)
@@ -273,6 +394,19 @@ class MockOperationLifecycleTest(unittest.TestCase):
             instance_id: self.instance_snapshot(before, instance_id)
             for instance_id in ("A", "C")
         }
+        with self.assertRaisesRegex(
+            MockValidationError, "MOCK_INSTANCE_OPERATION_ACTIVE"
+        ):
+            self.service.reset_routine_instance(
+                SESSION_ID,
+                routine_instance_id="B",
+                command_id="MC-reset-running-B",
+            )
+        self.service.stop_instance_validation(
+            SESSION_ID,
+            routine_instance_id="B",
+            command_id="MC-stop-before-reset-B",
+        )
         result = self.service.reset_routine_instance(
             SESSION_ID,
             routine_instance_id="B",

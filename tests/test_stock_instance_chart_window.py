@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QRectF, Qt
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMainWindow
 
 import gui_stock_instance_chart_window as chart_window
 from gui_stock_instance_chart_window import (
@@ -392,6 +393,79 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                 self.assertEqual(expected_end, end.strftime("%H:%M"))
                 window.close()
 
+    def test_shared_header_badges_follow_operation_state_bar_and_market_eligibility(self) -> None:
+        cases = (
+            ("CONTINUOUS", [], 3, False, "수동", "09:00", "15:30"),
+            (
+                "CONTINUOUS",
+                [{"start_time": "08:00:00", "end_time": "08:50:00"}],
+                120,
+                True,
+                "ATS",
+                "08:00",
+                "20:00",
+            ),
+            ("SCHEDULED", [], 60, True, "시간", "08:00", "20:00"),
+        )
+        header = chart_window.StockOperationHeaderDisplay(
+            status="매수/매도",
+            method="루틴",
+            liquidation="5분/시장가",
+            status_color="#16a34a",
+            method_color="#111827",
+            liquidation_color="#d97706",
+            identity_color="#111827",
+            status_active=True,
+        )
+        for mode, ats_ranges, minutes, nxt, method, expected_start, expected_end in cases:
+            with self.subTest(mode=mode, nxt=nxt), patch.object(
+                chart_window,
+                "project_stock_operation_header_display",
+                return_value=header,
+            ):
+                projected = _projection(
+                    operation_mode=mode,
+                    ats_session_ranges=ats_ranges,
+                    bar_minutes=minutes,
+                    nxt_available=nxt,
+                )
+                projected.update(
+                    {
+                        "chart_domain_label": "KRX",
+                        "chart_operation_method_label": method,
+                        "chart_bar_label": f"{minutes}분봉",
+                        "market_eligibility": {"krx": True, "nxt": nxt},
+                        "market_sessions": list(
+                            chart_window.actual_exchange_session_ranges(
+                                nxt_available=nxt
+                            )
+                        ),
+                    }
+                )
+                window = self._window(projected)
+                self.assertEqual(
+                    ["KRX", method, "운영중", f"{minutes}분봉", "NXT"],
+                    [
+                        window.header_badges[key].text()
+                        for key in (
+                            "domain",
+                            "operation_method",
+                            "operation_status",
+                            "bar",
+                            "nxt",
+                        )
+                    ],
+                )
+                self.assertIs(nxt, window.header_badges["nxt"].isEnabled())
+                self.assertEqual("지표추종-A", window.info_labels["routine"].text())
+                self.assertEqual("매수/매도", window.operation_info_labels["status"].text())
+                self.assertEqual("루틴", window.operation_info_labels["method"].text())
+                self.assertEqual("5분/시장가", window.operation_info_labels["liquidation"].text())
+                start, end = window.chart.fixed_time_range
+                self.assertEqual(expected_start, start.strftime("%H:%M"))
+                self.assertEqual(expected_end, end.strftime("%H:%M"))
+                window.close()
+
     def test_empty_nxt_chart_keeps_full_hourly_market_axis(self) -> None:
         window = self._window(_projection(
             candles=[],
@@ -524,11 +598,12 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                     window.windowTitle(),
                 )
                 self.assertEqual("005930 삼성전자", window.info_labels["stock"].text())
+                self.assertEqual("지표추종-A", window.info_labels["routine"].text())
                 self.assertEqual("+154,000(+3.25%)", window.info_labels["cumulative_pnl"].text())
                 self.assertNotIn("operation_mode", window.info_labels)
                 self.assertNotIn("operation_time", window.info_labels)
                 self.assertEqual(
-                    {"stock", "cumulative_pnl"},
+                    {"routine", "stock", "cumulative_pnl"},
                     set(window.info_labels),
                 )
                 self.assertTrue(
@@ -703,7 +778,8 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             )
         )
         self.assertEqual(820, window.minimumWidth())
-        self.assertEqual(428, window.minimumHeight())
+        self.assertGreaterEqual(window.minimumHeight(), 428)
+        self.assertGreaterEqual(window.minimumHeight(), window.minimumSizeHint().height())
         self.assertEqual(window.minimumSize(), window.size())
         window.close()
 
@@ -915,6 +991,47 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual("아직 오늘 기준봉이 없습니다.", not_completed.notice_label.text())
         self.assertEqual("아직 오늘 기준봉이 없습니다.", not_completed.chart.empty_message)
         not_completed.close()
+
+        provider_unavailable = _projection(
+            candles=[],
+            buys=[],
+            sells=[],
+            actual_orders=0,
+            raw_candle_count=0,
+        )
+        provider_unavailable["candle_availability"] = {
+            "available": False,
+            "availability_state": "SOURCE_UNAVAILABLE",
+        }
+        unavailable = self._window(provider_unavailable)
+        self.assertEqual(
+            "기준봉 데이터가 아직 준비되지 않았습니다.",
+            unavailable.notice_label.text(),
+        )
+        unavailable.close()
+
+    def test_default_projection_resolves_main_production_candle_provider(self) -> None:
+        owner = QMainWindow()
+        self.addCleanup(owner.close)
+        owner.routine_table = object()
+        provider = Mock()
+        market_host = SimpleNamespace(project_routine_candles=provider)
+        operation_host = SimpleNamespace(market_data_host=lambda: market_host)
+        owner.main_monitoring_auto_trade_operation_host = lambda: operation_host
+
+        with patch.object(
+            chart_window,
+            "project_stock_instance_day",
+            return_value=_projection(),
+        ) as projected:
+            window = StockInstanceChartWindow("005930", "2026-08-10", owner)
+
+        projected.assert_called_once_with(
+            "005930",
+            "2026-08-10",
+            candle_provider=provider,
+        )
+        window.close()
 
     def test_no_instance_and_malformed_projection_do_not_crash(self) -> None:
         no_instance = self._window(

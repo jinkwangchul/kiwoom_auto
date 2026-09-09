@@ -15,6 +15,29 @@ def _is_valid_direction_comparator_pair(direction: Any, comparator: Any) -> bool
     return False
 
 
+def _buy_price_compare_branch_operators_valid(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    conditions = value.get("conditions")
+    if not isinstance(conditions, list):
+        return False
+    operators = {
+        str(condition.get("branch_id") or ""): str(condition.get("operator") or "")
+        for condition in conditions
+        if isinstance(condition, dict) and condition.get("branch_id") in {"BELOW_OR_EQUAL", "ABOVE"}
+    }
+    if not operators:
+        return True
+    return (
+        operators.get("BELOW_OR_EQUAL"),
+        operators.get("ABOVE"),
+    ) in {
+        ("<=", ">"),
+        ("<", ">"),
+        ("<", ">="),
+    }
+
+
 def _path_exists(data: dict[str, Any], path: str) -> bool:
     current: Any = data
     for part in path.split("."):
@@ -125,6 +148,17 @@ def validate_committed_rules(
 
     add_check("json_root_dict", isinstance(post_rules, dict))
     add_check("buy_conditions_exists", _path_exists(post_rules, "buy.groups[0].conditions"))
+    price_compare_path = "buy.filters.price_compare"
+    if _path_exists(post_rules, price_compare_path):
+        price_compare_valid = _buy_price_compare_branch_operators_valid(
+            _get_path(post_rules, price_compare_path)
+        )
+        add_check("buy_price_compare_branch_operators_valid", price_compare_valid)
+        if not price_compare_valid:
+            add_unexpected(
+                price_compare_path,
+                "invalid or overlapping BUY price-compare branch operators",
+            )
     base_path = "buy.execution.base"
     if _path_exists(post_rules, base_path):
         base_policy = _get_path(post_rules, base_path)
@@ -225,30 +259,29 @@ def validate_committed_rules(
             and item.get("threshold_percent") > 0
             for item in policies
         )
-        if isinstance(policies, list) and len(policies) == 2:
-            up, down = policies
-            same_basis = (
-                up.get("left_source") == down.get("left_source")
-                and up.get("right_source") == down.get("right_source")
-            )
-            directions = {up.get("direction"), down.get("direction")}
-            disjoint = bool(
-                same_basis
-                and (
-                    (directions == {"UP", "DOWN"} and up.get("compare") == down.get("compare") == ">=")
-                    or (
-                        up.get("direction") == down.get("direction") == "BOTH"
-                        and {up.get("compare"), down.get("compare")} == {"WITHIN", "OUTSIDE"}
-                        and float(next(item for item in policies if item.get("compare") == "WITHIN").get("threshold_percent"))
-                        <= float(next(item for item in policies if item.get("compare") == "OUTSIDE").get("threshold_percent"))
-                    )
-                )
-            )
-            if not disjoint and up.get("action") != down.get("action"):
-                valid = False
         add_check("buy_price_response_slots_valid", valid)
         if not valid:
             add_unexpected(response_path, "conflicting or invalid BUY price response slots")
+    unfilled_enabled = (
+        _path_exists(post_rules, timeout_path)
+        and isinstance(_get_path(post_rules, timeout_path), dict)
+        and _get_path(post_rules, timeout_path).get("enabled") is True
+    )
+    price_response_enabled = (
+        _path_exists(post_rules, response_path)
+        and isinstance(_get_path(post_rules, response_path), list)
+        and any(
+            isinstance(item, dict) and item.get("enabled") is True
+            for item in _get_path(post_rules, response_path)
+        )
+    )
+    situation_modes_exclusive = not (unfilled_enabled and price_response_enabled)
+    add_check("buy_situation_response_modes_exclusive", situation_modes_exclusive)
+    if not situation_modes_exclusive:
+        add_unexpected(
+            "buy.execution.base",
+            "BUY unfilled and price-comparison situation responses are mutually exclusive",
+        )
     exit_path = "buy.execution.base.buy_exit_policy"
     if _path_exists(post_rules, exit_path):
         policy = _get_path(post_rules, exit_path)
@@ -447,6 +480,18 @@ def validate_committed_rules(
         if isinstance(diff, dict)
         and diff.get("operation") == "add_signal"
         and diff.get("path") in allowed_sell_signal_paths
+    ]
+    allowed_sell_signal_keys = {
+        allowed_sell_signal_paths[str(diff.get("path"))]
+        for diff in allowed_sell_signal_diffs
+    }
+    allowed_ui_state_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_ui_state"
+        and diff.get("path") == "indicator_follow_ui_state"
+        and isinstance(diff.get("value"), dict)
     ]
     allowed_profit_rate_signal_diffs = [
         diff
@@ -717,6 +762,11 @@ def validate_committed_rules(
                 isinstance(signal, dict) and signal.get("enabled") is True,
             )
             add_check("final_diff_sell_macd_preserved", _path_exists(post_rules, "sell.signals.macd_sell"))
+            expected_signal = diff.get("value")
+            matches = isinstance(expected_signal, dict) and signal == expected_signal
+            add_check(f"allowed_sell_signal_matches:{path}", matches)
+            if not matches:
+                add_unexpected(path, "allowed sell signal does not match the validated candidate")
         if operation == "set_signal":
             path = str(diff.get("path") or "")
             value = diff.get("value")
@@ -750,6 +800,20 @@ def validate_committed_rules(
             else:
                 add_check("final_diff_sell_method_policy_path_allowed", False, path)
                 add_unexpected(path or "<missing>", "unsupported sell method policy path")
+        if operation == "set_ui_state":
+            path = str(diff.get("path") or "")
+            value = diff.get("value")
+            matches = (
+                path == "indicator_follow_ui_state"
+                and isinstance(value, dict)
+                and post_rules.get("indicator_follow_ui_state") == value
+            )
+            add_check("final_diff_indicator_follow_ui_state_matches", matches)
+            if not matches:
+                add_unexpected(
+                    path or "indicator_follow_ui_state",
+                    "UI state does not match the validated candidate",
+                )
 
     if isinstance(pre_buy_groups, list) and isinstance(post_buy_groups, list) and pre_buy_groups and post_buy_groups:
         add_check("buy_non_target_groups_unchanged", pre_buy_groups[1:] == post_buy_groups[1:])
@@ -794,7 +858,9 @@ def validate_committed_rules(
                 add_check(f"existing_sell_signal_present:{key}", False)
                 add_unexpected(f"sell.signals.{key}", "existing sell signal deleted")
             else:
-                if key == "profit_rate_sell" and allowed_profit_rate_signal_diffs:
+                if key in allowed_sell_signal_keys:
+                    unchanged = isinstance(post_signals.get(key), dict)
+                elif key == "profit_rate_sell" and allowed_profit_rate_signal_diffs:
                     expected_signal = deepcopy(pre_signal) if isinstance(pre_signal, dict) else pre_signal
                     if isinstance(expected_signal, dict):
                         for diff in allowed_profit_rate_signal_diffs:
@@ -979,8 +1045,23 @@ def validate_committed_rules(
     if _path_exists(pre_normalized, "buy.groups[0].conditions") and _path_exists(post_normalized, "buy.groups[0].conditions"):
         _get_path(post_normalized, "buy.groups[0]")["conditions"] = deepcopy(_get_path(pre_normalized, "buy.groups[0].conditions"))
     if isinstance(post_normalized.get("sell", {}).get("signals"), dict) and allowed_sell_signal_diffs:
-        for signal_key in allowed_extra_keys:
-            post_normalized["sell"]["signals"].pop(signal_key, None)
+        for signal_key in allowed_sell_signal_keys:
+            if (
+                isinstance(pre_normalized.get("sell", {}).get("signals"), dict)
+                and signal_key in pre_normalized["sell"]["signals"]
+            ):
+                post_normalized["sell"]["signals"][signal_key] = deepcopy(
+                    pre_normalized["sell"]["signals"][signal_key]
+                )
+            else:
+                post_normalized["sell"]["signals"].pop(signal_key, None)
+    if allowed_ui_state_diffs:
+        if "indicator_follow_ui_state" in pre_normalized:
+            post_normalized["indicator_follow_ui_state"] = deepcopy(
+                pre_normalized["indicator_follow_ui_state"]
+            )
+        else:
+            post_normalized.pop("indicator_follow_ui_state", None)
 
     normalized_diff_paths = _diff_paths(pre_normalized, post_normalized)
     add_check("normalized_rules_deep_equal_outside_allowed_paths", not normalized_diff_paths)

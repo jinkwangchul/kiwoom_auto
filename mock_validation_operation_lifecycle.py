@@ -52,6 +52,8 @@ OUTCOME_REVIEW_REQUIRED = "REVIEW_REQUIRED"
 CLOSE_MARKET = "MARKET"
 CLOSE_CURRENT_PRICE = "CURRENT_PRICE"
 CLOSE_CARRYOVER = "CARRYOVER"
+CLOSE_ROUTINE = "ROUTINE"
+CLOSE_PROFIT_LOSS = "PROFIT_LOSS"
 
 _LIVE = {ORDER_OPEN, ORDER_PARTIAL_FILL, ORDER_CANCEL_PENDING}
 _REQUEST_EVENTS = {
@@ -89,6 +91,7 @@ def normalize_close_method(value: Any) -> str:
         "MARKET": CLOSE_MARKET,
         "MARKET_ORDER": CLOSE_MARKET,
         "시장가": CLOSE_MARKET,
+        "시장가즉시": CLOSE_MARKET,
         "CURRENT_PRICE": CLOSE_CURRENT_PRICE,
         "현재가": CLOSE_CURRENT_PRICE,
         "현재가즉시": CLOSE_CURRENT_PRICE,
@@ -96,6 +99,15 @@ def normalize_close_method(value: Any) -> str:
         "LONG_HOLD": CLOSE_CARRYOVER,
         "이월": CLOSE_CARRYOVER,
         "장기보유": CLOSE_CARRYOVER,
+        "ROUTINE": CLOSE_ROUTINE,
+        "ROUTINE_SIGNAL": CLOSE_ROUTINE,
+        "루틴": CLOSE_ROUTINE,
+        "루틴마감": CLOSE_ROUTINE,
+        "루틴매도신호": CLOSE_ROUTINE,
+        "PROFIT_LOSS": CLOSE_PROFIT_LOSS,
+        "PROFIT/LOSS": CLOSE_PROFIT_LOSS,
+        "손/익절": CLOSE_PROFIT_LOSS,
+        "익절/손절": CLOSE_PROFIT_LOSS,
     }
     result = aliases.get(text)
     if result is None:
@@ -467,8 +479,6 @@ class MockOperationLifecycleCoordinator:
         execution = before["instance_execution"][instance_id]
         if execution.get("state") == INSTANCE_ERROR:
             raise MockValidationError("MOCK_INSTANCE_ERROR_STOPPED")
-        if execution.get("state") == INSTANCE_VALIDATION_STOPPED:
-            raise MockValidationError("MOCK_INSTANCE_VALIDATION_STOPPED")
         root = _root(before)
         stock_operation = root.get("current")
         if isinstance(stock_operation, dict) and stock_operation.get("state") in {
@@ -502,6 +512,10 @@ class MockOperationLifecycleCoordinator:
             "outcome": "",
             "operation_policy_snapshot": deepcopy(operation_policy_snapshot or {}),
             "close_policy_snapshot": None,
+            "close_pending": False,
+            "final_sell_evidence": None,
+            "early_close_cancel_evidence": None,
+            "individual_liquidation_time_snapshot": None,
             "processed_cycles": {},
         }
 
@@ -569,6 +583,42 @@ class MockOperationLifecycleCoordinator:
             **kwargs,
         )
 
+    def request_instance_auto_close(
+        self, session_id: str, *, routine_instance_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self._request_instance_close(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            source="AUTO",
+            **kwargs,
+        )
+
+    @staticmethod
+    def _profit_loss_snapshot(
+        method: str,
+        profit_percent: Any,
+        loss_percent: Any,
+    ) -> dict[str, float]:
+        if method != CLOSE_PROFIT_LOSS:
+            return {}
+        result: dict[str, float] = {}
+        for key, raw in (
+            ("profit_percent", profit_percent),
+            ("loss_percent", loss_percent),
+        ):
+            if raw in (None, ""):
+                continue
+            try:
+                value = abs(float(raw))
+            except (TypeError, ValueError) as exc:
+                raise MockValidationError("MOCK_PROFIT_LOSS_THRESHOLD_INVALID") from exc
+            if value <= 0:
+                raise MockValidationError("MOCK_PROFIT_LOSS_THRESHOLD_INVALID")
+            result[key] = value
+        if not result:
+            raise MockValidationError("MOCK_PROFIT_LOSS_THRESHOLD_REQUIRED")
+        return result
+
     def request_instance_immediate_liquidation(
         self, session_id: str, *, routine_instance_id: str, **kwargs: Any
     ) -> dict[str, Any]:
@@ -583,6 +633,28 @@ class MockOperationLifecycleCoordinator:
             **kwargs,
         )
 
+    def request_instance_individual_liquidation(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        minutes_before_regular_close: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        try:
+            minutes = int(str(minutes_before_regular_close).strip() or "5")
+        except (TypeError, ValueError) as exc:
+            raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_TIME_INVALID") from exc
+        if minutes <= 0:
+            raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_TIME_INVALID")
+        return self._request_instance_close(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            source="IMMEDIATE",
+            individual_liquidation_minutes=minutes,
+            **kwargs,
+        )
+
     def _request_instance_close(
         self,
         session_id: str,
@@ -593,10 +665,16 @@ class MockOperationLifecycleCoordinator:
         reason: str,
         as_of: datetime,
         command_id: str,
+        profit_percent: Any = None,
+        loss_percent: Any = None,
+        individual_liquidation_minutes: int | None = None,
     ) -> dict[str, Any]:
         if as_of.tzinfo is None:
             raise MockValidationError("MOCK_OPERATION_TIMESTAMP_INVALID")
         close_method = normalize_close_method(method)
+        profit_loss = self._profit_loss_snapshot(
+            close_method, profit_percent, loss_percent
+        )
         command = clean_text(command_id)
         instance_id = clean_text(routine_instance_id)
         before = self.repository.read_session(session_id)
@@ -616,24 +694,36 @@ class MockOperationLifecycleCoordinator:
         ):
             raise MockValidationError("MOCK_INSTANCE_OPERATION_CLOSE_STATE_INVALID")
         timestamp = as_of.isoformat(timespec="microseconds")
+        deferred_close = close_method in {CLOSE_ROUTINE, CLOSE_PROFIT_LOSS}
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
             state = _root(document)
             current = state["instance_operations"][instance_id]
             current.update(
                 {
-                    "state": OPERATION_CLOSING,
+                    "state": OPERATION_RUNNING if deferred_close else OPERATION_CLOSING,
                     "closing_requested_at": current.get("closing_requested_at")
                     or timestamp,
                     "close_source": source,
                     "close_reason": clean_text(reason),
                     "close_method": close_method,
+                    "close_pending": deferred_close,
+                    "final_sell_evidence": None,
                     "close_policy_snapshot": {
                         "source": source,
                         "method": close_method,
                         "reason": clean_text(reason),
                         "captured_at": timestamp,
+                        **profit_loss,
                     },
+                    "individual_liquidation_time_snapshot": (
+                        {
+                            "minutes_before_regular_close": individual_liquidation_minutes,
+                            "captured_at": timestamp,
+                        }
+                        if individual_liquidation_minutes is not None
+                        else current.get("individual_liquidation_time_snapshot")
+                    ),
                 }
             )
             state["commands"][command] = {
@@ -642,7 +732,10 @@ class MockOperationLifecycleCoordinator:
                 "entity_id": current["operation_session_id"],
             }
             document["instance_execution"][instance_id].update(
-                {"state": SESSION_CLOSING, "progression_allowed": False}
+                {
+                    "state": SESSION_RUNNING if deferred_close else SESSION_CLOSING,
+                    "progression_allowed": deferred_close,
+                }
             )
             _sync_instance_container_state(document)
             return document
@@ -668,6 +761,170 @@ class MockOperationLifecycleCoordinator:
             "duplicate": False,
             "document": document,
         }
+
+    def cancel_instance_early_close(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        as_of: datetime,
+        command_id: str,
+    ) -> dict[str, Any]:
+        if as_of.tzinfo is None:
+            raise MockValidationError("MOCK_OPERATION_TIMESTAMP_INVALID")
+        instance_id = clean_text(routine_instance_id)
+        command = clean_text(command_id)
+        before = self.repository.read_session(session_id)
+        _validate_operation_integrity(before)
+        root = _root(before)
+        if command in root["commands"]:
+            return {"status": "NOOP", "duplicate": True, "document": before}
+        operation = root["instance_operations"].get(instance_id)
+        if (
+            not isinstance(operation, dict)
+            or clean_text(operation.get("close_source")).upper() != "EARLY"
+            or not clean_text(operation.get("close_method"))
+            or operation.get("final_sell_evidence")
+            or operation.get("processed_cycles")
+            or any(
+                clean_text(item.get("child_identity")).startswith(
+                    f"MOCK_INSTANCE_CLOSE:{operation.get('operation_session_id')}:"
+                )
+                for item in _instance_live_orders(before, instance_id)
+            )
+        ):
+            raise MockValidationError("MOCK_INSTANCE_EARLY_CLOSE_CANCEL_BLOCKED")
+        timestamp = as_of.isoformat(timespec="microseconds")
+        evidence = {
+            "command_id": command,
+            "cancelled_at": timestamp,
+            "previous_method": operation.get("close_method"),
+            "previous_snapshot": deepcopy(operation.get("close_policy_snapshot")),
+        }
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            state = _root(document)
+            current = state["instance_operations"][instance_id]
+            current.update(
+                {
+                    "state": OPERATION_RUNNING,
+                    "closing_requested_at": "",
+                    "close_source": "",
+                    "close_reason": "",
+                    "close_method": "",
+                    "close_pending": False,
+                    "close_policy_snapshot": None,
+                    "early_close_cancel_evidence": deepcopy(evidence),
+                }
+            )
+            state["commands"][command] = {
+                "operation": "CANCEL_INSTANCE_EARLY_CLOSE",
+                "applied_at": timestamp,
+                "entity_id": current["operation_session_id"],
+            }
+            document["instance_execution"][instance_id].update(
+                {"state": SESSION_RUNNING, "progression_allowed": True}
+            )
+            _sync_instance_container_state(document)
+            return document
+
+        document = self.repository.mutate_session(
+            session_id, mutation, expected_revision=before["revision"]
+        )["document"]
+        self._event(
+            document,
+            event_type="EARLY_CLOSE_CANCELLED",
+            identity=command,
+            timestamp=timestamp,
+            instance_id=instance_id,
+            payload={"instance_operation": True, **evidence},
+        )
+        return {"status": "CANCELLED", "duplicate": False, "document": document}
+
+    def record_instance_routine_final_sell(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        as_of: datetime,
+        evaluation_cycle_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        instance_id = clean_text(routine_instance_id)
+        signal = result.get("signal") if isinstance(result, dict) else None
+        if (
+            not isinstance(signal, dict)
+            or clean_text(signal.get("signal")).upper() != "SELL"
+            or not clean_text(result.get("plan_id"))
+        ):
+            return {"status": "NOOP", "document": self.repository.read_session(session_id)}
+        before = self.repository.read_session(session_id)
+        operation = _root(before)["instance_operations"].get(instance_id)
+        if (
+            not isinstance(operation, dict)
+            or operation.get("state") != OPERATION_RUNNING
+            or operation.get("close_pending") is not True
+            or operation.get("close_method") != CLOSE_ROUTINE
+            or operation.get("final_sell_evidence")
+        ):
+            return {"status": "NOOP", "document": before}
+        timestamp = as_of.isoformat(timespec="microseconds")
+        evidence = {
+            "evaluation_cycle_id": clean_text(evaluation_cycle_id),
+            "plan_id": clean_text(result.get("plan_id")),
+            "decision_id": clean_text(result.get("decision_id")),
+            "recorded_at": timestamp,
+        }
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            current = _root(document)["instance_operations"][instance_id]
+            current["final_sell_evidence"] = deepcopy(evidence)
+            current["close_pending"] = False
+            return document
+
+        document = self.repository.mutate_session(
+            session_id, mutation, expected_revision=before["revision"]
+        )["document"]
+        self._event(
+            document,
+            event_type="ROUTINE_CLOSE_FINAL_SELL_ACCEPTED",
+            identity=evidence["plan_id"],
+            timestamp=timestamp,
+            instance_id=instance_id,
+            payload={"instance_operation": True, **evidence},
+        )
+        return {"status": "RECORDED", "document": document}
+
+    def complete_instance_routine_close_if_ready(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        as_of: datetime,
+        lifecycle_cycle_id: str,
+    ) -> dict[str, Any]:
+        instance_id = clean_text(routine_instance_id)
+        before = self.repository.read_session(session_id)
+        operation = _root(before)["instance_operations"].get(instance_id)
+        if (
+            not isinstance(operation, dict)
+            or operation.get("state") != OPERATION_RUNNING
+            or operation.get("close_method") != CLOSE_ROUTINE
+            or not isinstance(operation.get("final_sell_evidence"), dict)
+        ):
+            return {"status": "NOOP", "document": before}
+        position = _positions(before)[instance_id]
+        if int(position.get("holding_qty", 0) or 0) > 0 or _instance_live_orders(
+            before, instance_id
+        ):
+            return {"status": "WAIT", "document": before}
+        return self._complete_instance(
+            session_id,
+            instance_id,
+            clean_text(lifecycle_cycle_id),
+            as_of,
+            outcome=OUTCOME_DONE,
+        )
 
     def request_normal_close(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         return self._request_close(session_id, source="NORMAL", **kwargs)
@@ -1546,6 +1803,8 @@ __all__ = [
     "CLOSE_CARRYOVER",
     "CLOSE_CURRENT_PRICE",
     "CLOSE_MARKET",
+    "CLOSE_PROFIT_LOSS",
+    "CLOSE_ROUTINE",
     "MockOperationLifecycleCoordinator",
     "OPERATION_CLOSING",
     "OPERATION_ENDED",

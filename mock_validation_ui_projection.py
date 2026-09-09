@@ -8,9 +8,13 @@ from datetime import datetime
 from typing import Any
 
 from gui_auto_trade_policy import auto_trade_operation_display
+from gui_ats_utils import (
+    auto_trade_operation_activation_phase,
+    auto_trade_operation_session_phase,
+)
+from manual_ats_runtime import VALID_SESSION_KEYS
 from mock_validation_contract import (
     INSTANCE_ERROR,
-    INSTANCE_VALIDATION_STOPPED,
     MockValidationError,
     clean_text,
     instance_initial_buy_adjustment,
@@ -54,6 +58,114 @@ def _record_by_instance(records: Any) -> dict[str, dict[str, Any]]:
     }
 
 
+def _mock_instance_trade_window_active(
+    operation: dict[str, Any], as_of: datetime
+) -> bool:
+    snapshot = operation.get("operation_policy_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    settings = snapshot.get("mock_instance_effective_settings")
+    settings = settings if isinstance(settings, dict) else {}
+    schedule = settings.get("operation_schedule")
+    schedule = schedule if isinstance(schedule, dict) else {}
+    config = {
+        "operation_mode": settings.get("operation_mode"),
+        "start_time": schedule.get("start_time"),
+        "end_buy_time": schedule.get("end_buy_time"),
+    }
+    manual_ats = settings.get("manual_ats")
+    selected = list(
+        manual_ats.get("selected_sessions", ())
+        if isinstance(manual_ats, dict)
+        else ()
+    )
+    state = {"manual_ats_selection": {"selected_sessions": selected}}
+    sessions = snapshot.get("extra_sessions")
+    sessions = sessions if isinstance(sessions, list) else []
+
+    def ats_reader(key: str) -> dict[str, Any]:
+        try:
+            index = VALID_SESSION_KEYS.index(key)
+        except ValueError:
+            return {}
+        session = sessions[index] if index < len(sessions) else None
+        return deepcopy(session) if isinstance(session, dict) else {}
+
+    phase = auto_trade_operation_session_phase(
+        config,
+        state,
+        now_dt=as_of,
+        operation_policy_reader=lambda: snapshot,
+        ats_session_reader=ats_reader,
+    )
+    activation = auto_trade_operation_activation_phase(
+        config,
+        state,
+        now_dt=as_of,
+        session_phase=phase,
+        operation_policy_reader=lambda: snapshot,
+    )
+    return activation.get("actual_trading_session_active") is True
+
+
+def _mock_instance_display_status(
+    document: dict[str, Any],
+    instance_id: str,
+    *,
+    state: str,
+    progression_allowed: bool,
+    live_orders: tuple[dict[str, Any], ...],
+    progression: dict[str, Any],
+    as_of: datetime,
+) -> tuple[str, bool, bool, bool]:
+    lifecycle = document.get("mock_operation_lifecycle")
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    instance_operations = lifecycle.get("instance_operations")
+    instance_operations = instance_operations if isinstance(instance_operations, dict) else {}
+    operation = instance_operations.get(instance_id)
+    if not isinstance(operation, dict):
+        current = lifecycle.get("current")
+        current_instance_id = clean_text(current.get("routine_instance_id")) if isinstance(current, dict) else ""
+        operation = current if isinstance(current, dict) and current_instance_id in {"", instance_id} else {}
+
+    review = document.get("review")
+    review = review if isinstance(review, dict) else {}
+    review_instance_id = clean_text(review.get("source_routine_instance_id"))
+    review_required = review.get("review_required") is True and review_instance_id in {"", instance_id}
+    if state == INSTANCE_ERROR or operation.get("state") == "REVIEW_STOPPED" or review_required:
+        return "검토종목", False, False, False
+
+    operation_state = clean_text(operation.get("state"))
+    if state in {"WAITING", "ENDED", "VALIDATION_STOPPED"}:
+        return "감시/대기", False, False, False
+    close_source = clean_text(operation.get("close_source")).upper()
+    close_method = clean_text(operation.get("close_method")).upper()
+    if close_source and close_method:
+        liquidation_active = clean_text(operation.get("close_method")).upper() in {
+            "MARKET",
+            "CURRENT_PRICE",
+        }
+        if close_source in {"NORMAL", "AUTO"}:
+            return "자동마감", True, False, liquidation_active
+        if close_source == "EARLY":
+            return "조기마감", True, False, liquidation_active
+        if close_source == "IMMEDIATE":
+            return "청산", True, False, liquidation_active
+    if state == "CLOSING" or operation_state == "CLOSING":
+        return "감시/대기", False, False, False
+
+    _ = live_orders, progression
+    if state == "RUNNING" and progression_allowed and operation_state == "RUNNING":
+        return (
+            "매수/매도"
+            if _mock_instance_trade_window_active(operation, as_of)
+            else "감시/대기",
+            True,
+            True,
+            False,
+        )
+    return "감시/대기", False, False, False
+
+
 def _instance_period(rules: Any) -> Any:
     if not isinstance(rules, dict):
         return ""
@@ -92,6 +204,7 @@ def mock_instance_projection(
     routine_instance_id: str,
     *,
     current_price: int | float | None = None,
+    as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Project one isolated Routine Instance without stock-level aggregation."""
 
@@ -188,11 +301,32 @@ def mock_instance_projection(
     )
     state = clean_text(execution.get("state")) or clean_text(document["session"].get("state"))
     is_error = state == INSTANCE_ERROR
+    (
+        display_status,
+        status_cell_active,
+        method_cell_active,
+        liquidation_phase_active,
+    ) = _mock_instance_display_status(
+        document,
+        instance_id,
+        state=state,
+        progression_allowed=execution.get("progression_allowed") is True,
+        live_orders=live_orders,
+        progression=progression,
+        as_of=as_of or datetime.now().astimezone(),
+    )
     rules = instance.get("rules_snapshot") if isinstance(instance.get("rules_snapshot"), dict) else {}
     mark_price = pnl.get("mark_price")
     effective_current_price = current_price if current_price is not None else mark_price
     last_side = clean_text(live_orders[-1].get("side")) if live_orders else ""
     trade_value = last_side or clean_text(cycle.get("side")) or clean_text(cycle.get("status"))
+    liquidation = (
+        effective_display_contract.get("liquidation")
+        if isinstance(effective_display_contract.get("liquidation"), dict)
+        else {}
+    )
+    liquidation_has_policy = clean_text(liquidation.get("display_text")) not in {"", "-"}
+    holding_qty = int(position.get("holding_qty", 0) or 0)
     return {
         "row_kind": "mock_routine_instance",
         "validation_session_id": document["session"]["validation_session_id"],
@@ -203,13 +337,13 @@ def mock_instance_projection(
         "routine_definition_id": clean_text(instance.get("routine_definition_id")),
         "routine_type": clean_text(instance.get("routine_type")),
         "state": state,
-        "state_label": "오류" if is_error else {
-            "WAITING": "운영대기",
-            "RUNNING": "운영중",
-            "CLOSING": "마감중",
-            "ENDED": "종료",
-            INSTANCE_VALIDATION_STOPPED: "검증정지",
-        }.get(state, state or "-"),
+        "display_status": display_status,
+        "status_cell_active": status_cell_active,
+        "method_cell_active": method_cell_active,
+        "liquidation_cell_active": bool(
+            liquidation_phase_active and holding_qty > 0 and liquidation_has_policy
+        ),
+        "liquidation_has_policy": liquidation_has_policy,
         "error": is_error,
         "status_led": "red" if is_error else "normal",
         "error_code": clean_text(execution.get("error_code")),
@@ -217,7 +351,7 @@ def mock_instance_projection(
         "error_occurred_at": clean_text(execution.get("error_occurred_at")),
         "started_at": clean_text(execution.get("started_at")),
         "period": _instance_period(rules),
-        "holding_qty": int(position.get("holding_qty", 0) or 0),
+        "holding_qty": holding_qty,
         "available_qty": int(position.get("available_qty", 0) or 0),
         "average_price": position.get("average_price", 0),
         "realized_cost_basis": position.get("realized_cost_basis", 0),
@@ -248,6 +382,7 @@ def mock_monitoring_tree_projection(
     document: dict[str, Any],
     *,
     current_price: int | float | None = None,
+    as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Return the Mock-only Stock -> Routine Instance monitoring tree."""
 
@@ -261,7 +396,12 @@ def mock_monitoring_tree_projection(
     )
     instance_ids = tuple(sorted(document.get("instance_execution", {})))
     children = tuple(
-        mock_instance_projection(document, instance_id, current_price=current_price)
+        mock_instance_projection(
+            document,
+            instance_id,
+            current_price=current_price,
+            as_of=as_of,
+        )
         for instance_id in instance_ids
     )
     profit_amount = sum(float(child.get("net_pnl", 0) or 0) for child in children)
@@ -298,12 +438,14 @@ def current_mock_monitoring_trees(
     repository: MockValidationRepository,
     *,
     current_price_by_stock: dict[str, int | float | None] | None = None,
+    as_of: datetime | None = None,
 ) -> tuple[dict[str, Any], ...]:
     prices = current_price_by_stock or {}
     rows = [
         mock_monitoring_tree_projection(
             document,
             current_price=prices.get(document["session"]["stock_code"]),
+            as_of=as_of,
         )
         for document in repository.current_sessions()
     ]
@@ -403,6 +545,27 @@ class MockEventReaderAdapter:
         events = self.repository.read_events(self.session_id)
         if not events:
             return {"events": [], "errors": [], "diagnostics": [], "count": 0}
+        operator_events: list[dict[str, Any]] = []
+        last_evaluation_by_scope: dict[tuple[str, str], tuple[str, str, str]] = {}
+        for event in events:
+            if not isinstance(event, dict) or clean_text(event.get("event_type")) != "ROUTINE_EVALUATED":
+                operator_events.append(event)
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            instance_id = clean_text(event.get("routine_instance_id"))
+            operation_identity = clean_text(payload.get("operation_identity"))
+            side = clean_text(payload.get("signal")).upper() or "NONE"
+            signature = (
+                side,
+                clean_text(payload.get("rules_hash")),
+                clean_text(payload.get("signal_bar_time")) if side in {"BUY", "SELL"} else "",
+            )
+            scope = (instance_id, operation_identity)
+            if last_evaluation_by_scope.get(scope) == signature:
+                continue
+            last_evaluation_by_scope[scope] = signature
+            operator_events.append(event)
+        events = operator_events
         document = self.repository.read_session(self.session_id)
         session = document.get("session") if isinstance(document.get("session"), dict) else {}
         stock_code = clean_text(session.get("stock_code"))

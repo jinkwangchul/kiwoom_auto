@@ -16,6 +16,11 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from candle_timeframe_aggregation import candle_session_windows
+from gui_ats_utils import (
+    auto_trade_operation_activation_phase,
+    auto_trade_operation_session_phase,
+)
 from manual_ats_runtime import VALID_SESSION_KEYS
 
 from mock_validation_contract import (
@@ -48,13 +53,19 @@ from mock_validation_operation_lifecycle import (
     CLOSE_CARRYOVER,
     CLOSE_CURRENT_PRICE,
     CLOSE_MARKET,
+    CLOSE_PROFIT_LOSS,
+    CLOSE_ROUTINE,
     MockOperationLifecycleCoordinator,
     OPERATION_CLOSING,
     instance_operation_state,
 )
 from mock_validation_repository import MockValidationRepository
-from mock_validation_session_service import MockValidationSessionService
+from mock_validation_session_service import (
+    MockValidationSessionService,
+    mock_instance_error_recovery_reset_allowed,
+)
 from mock_validation_virtual_execution import MockExecutionPolicy, MockVirtualExecutionEngine
+from routine_instance_registry import routine_instance_by_id
 
 
 _LIVE_ORDER_STATES = {ORDER_OPEN, ORDER_PARTIAL_FILL, ORDER_CANCEL_PENDING}
@@ -105,12 +116,16 @@ def _clock_seconds(text: Any) -> int | None:
 
 def _close_method(value: Any) -> str:
     text = str(value or "").strip().upper().replace(" ", "_")
-    if text in {"MARKET", "MARKET_ORDER", "시장가"}:
+    if text in {"MARKET", "MARKET_ORDER", "시장가", "시장가즉시"}:
         return CLOSE_MARKET
     if text in {"CURRENT_PRICE", "현재가", "현재가즉시"}:
         return CLOSE_CURRENT_PRICE
     if text in {"CARRYOVER", "LONG_HOLD", "이월", "장기보유"}:
         return CLOSE_CARRYOVER
+    if text in {"ROUTINE", "ROUTINE_SIGNAL", "루틴", "루틴마감", "루틴매도신호"}:
+        return CLOSE_ROUTINE
+    if text in {"PROFIT_LOSS", "PROFIT/LOSS", "손/익절", "익절/손절"}:
+        return CLOSE_PROFIT_LOSS
     raise MockValidationError("MOCK_CLOSE_POLICY_METHOD_UNSUPPORTED")
 
 
@@ -126,7 +141,8 @@ class MockValidationHost:
         now_factory: Callable[[], datetime] | None = None,
         projection_changed: Callable[[], None] | None = None,
         operation_policy_provider: Callable[[], dict[str, Any]] | None = None,
-        candles_provider: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
+        candles_provider: Callable[..., Any] | None = None,
+        candle_observation_updater: Callable[[object], Any] | None = None,
         max_buffered_evidence_per_stock: int = 10000,
     ) -> None:
         self.api = api
@@ -138,11 +154,22 @@ class MockValidationHost:
         self._now = now_factory or (lambda: datetime.now().astimezone())
         self._projection_changed = projection_changed
         self._operation_policy_provider = operation_policy_provider or self._read_operation_policy
-        self._candles_provider = candles_provider or self._read_candles
+        self._candles_provider = candles_provider
+        self._candle_observation_updater = candle_observation_updater
         self.max_buffered_evidence_per_stock = max(1, int(max_buffered_evidence_per_stock))
         self.session_service = MockValidationSessionService(
             self.repository,
             now_factory=lambda: self._now().isoformat(timespec="microseconds"),
+        )
+        self._restart_recovery_result = (
+            self.session_service.stop_active_instances_for_application_boundary(
+                source="APPLICATION_RESTART_RECOVERY"
+            )
+        )
+        self._restart_recovery_blocked_session_ids = frozenset(
+            clean_text(item.get("validation_session_id"))
+            for item in self._restart_recovery_result.get("errors", ())
+            if clean_text(item.get("validation_session_id"))
         )
         self.market_store = MockValidationMarketDataStore()
         self.engine = MockVirtualExecutionEngine(self.repository, now_factory=self._now)
@@ -172,24 +199,54 @@ class MockValidationHost:
             return {}
         return deepcopy(value) if isinstance(value, dict) else {}
 
-    @staticmethod
-    def _read_candles(document: dict[str, Any]) -> list[dict[str, Any]]:
-        reference = document.get("reference_snapshot", {}).get("stock_identity_reference", {})
-        path_text = reference.get("stock_path", "") if isinstance(reference, dict) else ""
-        if not str(path_text or "").strip():
-            return []
-        path = Path(str(path_text)) / "candles.json"
+    def _latest_applied_rules(
+        self,
+        routine_instance_id: str,
+        document: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        instance = routine_instance_by_id(
+            str(routine_instance_id or "").strip(),
+            project_root=self.project_root,
+        )
+        if instance is None or instance.rules_path is None:
+            reference_rules = self._operation_rules(document or {}, routine_instance_id)
+            if reference_rules:
+                return reference_rules
+            raise MockValidationError("MOCK_ROUTINE_RULES_SNAPSHOT_MISSING")
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        if isinstance(value, list):
-            return [deepcopy(item) for item in value if isinstance(item, dict)]
-        if isinstance(value, dict):
-            rows = value.get("candles")
-            if isinstance(rows, list):
-                return [deepcopy(item) for item in rows if isinstance(item, dict)]
-        return []
+            rules = json.loads(Path(instance.rules_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise MockValidationError("MOCK_ROUTINE_RULES_SNAPSHOT_MISSING") from exc
+        if not isinstance(rules, dict):
+            raise MockValidationError("MOCK_ROUTINE_RULES_SNAPSHOT_MISSING")
+        return deepcopy(rules)
+
+    @staticmethod
+    def _operation_rules(document: dict[str, Any], instance_id: str) -> dict[str, Any]:
+        operation = instance_operation_state(document, instance_id)
+        snapshot = (
+            operation.get("operation_policy_snapshot")
+            if isinstance(operation, dict)
+            else None
+        )
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        direct = snapshot.get("mock_instance_rules_snapshot")
+        if isinstance(direct, dict):
+            return deepcopy(direct)
+        by_instance = snapshot.get("mock_rules_snapshot_by_instance")
+        if isinstance(by_instance, dict) and isinstance(by_instance.get(instance_id), dict):
+            return deepcopy(by_instance[instance_id])
+        reference = next(
+            (
+                item
+                for item in document.get("reference_snapshot", {}).get("routine_instances", ())
+                if isinstance(item, dict)
+                and item.get("routine_instance_id") == instance_id
+            ),
+            {},
+        )
+        rules = reference.get("rules_snapshot") if isinstance(reference, dict) else {}
+        return deepcopy(rules) if isinstance(rules, dict) else {}
 
     def connect(self) -> None:
         if self._connected or self._disposed or self.api is None:
@@ -227,9 +284,33 @@ class MockValidationHost:
                 clear(reason="MOCK_HOST_DISPOSED")
             except Exception:
                 pass
+        if callable(self._candle_observation_updater):
+            try:
+                self._candle_observation_updater(())
+            except Exception:
+                pass
         self._connected = False
         self._disposed = True
         self._buffers.clear()
+
+    def shutdown(self) -> dict[str, Any]:
+        if self._disposed:
+            return {"source": "APPLICATION_SHUTDOWN", "stopped": (), "errors": ()}
+        result = self.session_service.stop_active_instances_for_application_boundary(
+            source="APPLICATION_SHUTDOWN"
+        )
+        self._restart_recovery_blocked_session_ids = frozenset(
+            {
+                *self._restart_recovery_blocked_session_ids,
+                *(
+                    clean_text(item.get("validation_session_id"))
+                    for item in result.get("errors", ())
+                    if clean_text(item.get("validation_session_id"))
+                ),
+            }
+        )
+        self.dispose()
+        return result
 
     def _on_login_state_changed(self, _payload: Any = None) -> None:
         self._buffers.clear()
@@ -268,6 +349,26 @@ class MockValidationHost:
 
     def sync_registration(self) -> dict[str, Any]:
         targets = tuple(sorted(self.current_stock_codes()))
+        if callable(self._candle_observation_updater):
+            requirements: list[dict[str, Any]] = []
+            for session_id in self.current_session_ids().values():
+                try:
+                    document = self.repository.read_session(session_id)
+                except Exception:
+                    continue
+                code = str(document.get("session", {}).get("stock_code") or "").strip()
+                for reference in document.get("reference_snapshot", {}).get("routine_instances", ()):
+                    if not isinstance(reference, dict):
+                        continue
+                    rules = reference.get("rules_snapshot")
+                    if not isinstance(rules, dict):
+                        continue
+                    requirements.append({
+                        "stock_code": code,
+                        "rules": rules,
+                        "projection_request": self.routine_adapter.market_bar_projection_request(rules),
+                    })
+            self._candle_observation_updater(requirements or targets)
         sync = getattr(self.api, "sync_mock_orderbook_registration", None)
         if not callable(sync):
             self.market_store.apply_registration_snapshot({"active": False})
@@ -280,6 +381,48 @@ class MockValidationHost:
         snapshot = result.get("snapshot") if isinstance(result, dict) else None
         self.market_store.apply_registration_snapshot(snapshot or {"active": False})
         return result if isinstance(result, dict) else {"ok": False, "active": False}
+
+    def _selected_candle_sessions(self, settings: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        policy = self._operation_policy_provider()
+        policy = policy if isinstance(policy, dict) else {}
+        selected = set(
+            settings.get("manual_ats", {}).get("selected_sessions", ())
+            if isinstance(settings.get("manual_ats"), dict)
+            else ()
+        )
+        return candle_session_windows(policy, selected)
+
+    def _instance_candle_projection(
+        self,
+        document: dict[str, Any],
+        *,
+        instance_id: str,
+        rules: dict[str, Any],
+        settings: dict[str, Any],
+        now: datetime,
+        projection_request: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not callable(self._candles_provider):
+            return {"available": False, "candles": [], "availability_state": "SOURCE_UNAVAILABLE", "reason": "봉데이터 부족"}
+        request = (
+            deepcopy(projection_request)
+            if isinstance(projection_request, dict)
+            else self.routine_adapter.market_bar_projection_request(rules)
+        )
+        stock_code = document["session"]["stock_code"]
+        value = self._candles_provider(
+            stock_code=stock_code,
+            rules=rules,
+            projection_request=request,
+            as_of=now,
+            session_windows=self._selected_candle_sessions(settings),
+            consumer_scope="MOCK",
+        )
+        if isinstance(value, dict):
+            return deepcopy(value)
+        if isinstance(value, (list, tuple)):
+            return {"available": bool(value), "candles": [deepcopy(item) for item in value if isinstance(item, dict)], "reason": "" if value else "봉데이터 부족"}
+        return {"available": False, "candles": [], "reason": "봉데이터 부족"}
 
     def _append_evidence(
         self,
@@ -584,6 +727,11 @@ class MockValidationHost:
         document = self.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        if (
+            document["session"]["validation_session_id"]
+            in self._restart_recovery_blocked_session_ids
+        ):
+            raise MockValidationError("MOCK_RESTART_RECOVERY_BLOCKED")
         self.session_service.sync_common_tax_to_waiting_session(
             document["session"]["validation_session_id"]
         )
@@ -592,6 +740,10 @@ class MockValidationHost:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
         now = as_of or self._now()
         operation_policy = self._operation_snapshot()
+        rules_snapshot_by_instance = {
+            instance_id: self._latest_applied_rules(instance_id, document)
+            for instance_id in document["instance_execution"]
+        }
         result = self.lifecycle.start_stock_operation(
             document["session"]["validation_session_id"],
             trading_date=now.date(),
@@ -600,6 +752,7 @@ class MockValidationHost:
                 **operation_policy,
                 "mock_tax_enabled": document["session"]["mock_tax_enabled"],
                 "mock_tax_rate": document["session"]["mock_tax_rate"],
+                "mock_rules_snapshot_by_instance": rules_snapshot_by_instance,
                 "mock_effective_settings_by_instance": {
                     instance_id: self._instance_effective_settings(
                         document,
@@ -626,6 +779,11 @@ class MockValidationHost:
         document = self.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        if (
+            document["session"]["validation_session_id"]
+            in self._restart_recovery_blocked_session_ids
+        ):
+            raise MockValidationError("MOCK_RESTART_RECOVERY_BLOCKED")
         if document["session"].get("state") == SESSION_WAITING:
             self.session_service.sync_common_tax_to_waiting_session(
                 document["session"]["validation_session_id"]
@@ -636,6 +794,7 @@ class MockValidationHost:
         now = as_of or self._now()
         session_id = document["session"]["validation_session_id"]
         operation_policy = self._operation_snapshot()
+        rules_snapshot = self._latest_applied_rules(routine_instance_id, document)
         result = self.lifecycle.start_instance_operation(
             session_id,
             routine_instance_id=routine_instance_id,
@@ -645,6 +804,7 @@ class MockValidationHost:
                 **operation_policy,
                 "mock_tax_enabled": document["session"]["mock_tax_enabled"],
                 "mock_tax_rate": document["session"]["mock_tax_rate"],
+                "mock_instance_rules_snapshot": rules_snapshot,
                 "mock_instance_effective_settings": self._instance_effective_settings(
                     document,
                     routine_instance_id,
@@ -685,6 +845,8 @@ class MockValidationHost:
         routine_instance_id: str,
         *,
         method: str = CLOSE_MARKET,
+        profit_percent: Any = None,
+        loss_percent: Any = None,
         as_of: datetime | None = None,
     ) -> dict[str, Any]:
         document = self.current_session(stock_code)
@@ -696,12 +858,40 @@ class MockValidationHost:
             session_id,
             routine_instance_id=routine_instance_id,
             method=method,
+            profit_percent=profit_percent,
+            loss_percent=loss_percent,
             reason="사용자 Instance 조기마감",
             as_of=now,
             command_id=deterministic_mock_identity(
                 "MC", session_id, routine_instance_id,
                 document.get("revision", 0),
                 now.isoformat(timespec="microseconds"), "INSTANCE_EARLY_CLOSE",
+            ),
+        )
+        self._publish_projection_if_changed()
+        return result
+
+    def cancel_instance_early_close(
+        self,
+        stock_code: Any,
+        routine_instance_id: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        now = as_of or self._now()
+        session_id = document["session"]["validation_session_id"]
+        result = self.lifecycle.cancel_instance_early_close(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            as_of=now,
+            command_id=deterministic_mock_identity(
+                "MC", session_id, routine_instance_id,
+                document.get("revision", 0),
+                now.isoformat(timespec="microseconds"),
+                "INSTANCE_EARLY_CLOSE_CANCEL",
             ),
         )
         self._publish_projection_if_changed()
@@ -762,6 +952,37 @@ class MockValidationHost:
         self._publish_projection_if_changed()
         return result
 
+    def request_instance_individual_liquidation(
+        self,
+        stock_code: Any,
+        routine_instance_id: str,
+        *,
+        method: str,
+        minutes_before_regular_close: Any = "5",
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        document = self.current_session(stock_code)
+        if document is None:
+            raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
+        now = as_of or self._now()
+        session_id = document["session"]["validation_session_id"]
+        result = self.lifecycle.request_instance_individual_liquidation(
+            session_id,
+            routine_instance_id=routine_instance_id,
+            method=method,
+            minutes_before_regular_close=minutes_before_regular_close,
+            reason="사용자 Instance 개별청산",
+            as_of=now,
+            command_id=deterministic_mock_identity(
+                "MC", session_id, routine_instance_id,
+                document.get("revision", 0),
+                now.isoformat(timespec="microseconds"),
+                "INSTANCE_INDIVIDUAL_LIQUIDATION",
+            ),
+        )
+        self._publish_projection_if_changed()
+        return result
+
     def stop_instance_validation(
         self,
         stock_code: Any,
@@ -797,6 +1018,10 @@ class MockValidationHost:
         operation = instance_operation_state(document, instance_id)
         operation_state = operation.get("state", "") if operation else ""
         session_state = document["session"].get("state", "")
+        restart_recovery_blocked = (
+            document["session"]["validation_session_id"]
+            in self._restart_recovery_blocked_session_ids
+        )
         root = document.get("mock_operation_lifecycle")
         stock_operation = root.get("current") if isinstance(root, dict) else None
         stock_operation_active = (
@@ -804,6 +1029,16 @@ class MockValidationHost:
             and stock_operation.get("state") in {"RUNNING", "CLOSING"}
         )
         ended = session_state == SESSION_ENDED or execution.get("state") == SESSION_ENDED
+        error_recovery_reset = mock_instance_error_recovery_reset_allowed(
+            execution, operation
+        )
+        early_close_cancelable = bool(
+            operation
+            and str(operation.get("close_source") or "").strip().upper() == "EARLY"
+            and str(operation.get("close_method") or "").strip()
+            and not operation.get("final_sell_evidence")
+            and not operation.get("processed_cycles")
+        )
         return {
             "current": True,
             "validation_session_id": document["session"]["validation_session_id"],
@@ -812,12 +1047,18 @@ class MockValidationHost:
             "operation_state": operation_state,
             "can_start": (
                 not ended
+                and not restart_recovery_blocked
                 and not stock_operation_active
                 and session_state in {SESSION_WAITING, SESSION_RUNNING}
-                and execution.get("state") == SESSION_WAITING
+                and execution.get("state")
+                in {SESSION_WAITING, INSTANCE_VALIDATION_STOPPED}
                 and operation_state not in {"RUNNING", "CLOSING", "ENDED"}
             ),
-            "can_early_close": operation_state == "RUNNING",
+            "can_early_close": (
+                operation_state == "RUNNING"
+                and not str((operation or {}).get("close_method") or "").strip()
+            ),
+            "can_early_close_cancel": early_close_cancelable,
             "can_immediate": operation_state in {"RUNNING", "CLOSING"},
             "can_validation_stop": execution.get("state") in {
                 SESSION_RUNNING,
@@ -825,7 +1066,17 @@ class MockValidationHost:
                 INSTANCE_ERROR,
             },
             "can_chart": not ended,
-            "can_reset": not ended,
+            "can_reset": (
+                not ended
+                and (
+                    (
+                        execution.get("state")
+                        not in {SESSION_RUNNING, SESSION_CLOSING}
+                        and operation_state not in {"RUNNING", "CLOSING"}
+                    )
+                    or error_recovery_reset
+                )
+            ),
         }
 
     @staticmethod
@@ -835,6 +1086,49 @@ class MockValidationHost:
         return current if isinstance(current, dict) else None
 
     def _trigger_due_close(self, document: dict[str, Any], now: datetime) -> None:
+        root = document.get("mock_operation_lifecycle")
+        instance_operations = (
+            root.get("instance_operations", {}) if isinstance(root, dict) else {}
+        )
+        session_id = document["session"]["validation_session_id"]
+        for instance_id in sorted(instance_operations):
+            operation = instance_operations.get(instance_id)
+            if (
+                not isinstance(operation, dict)
+                or operation.get("state") != "RUNNING"
+                or str(operation.get("close_method") or "").strip()
+            ):
+                continue
+            snapshot = operation.get("operation_policy_snapshot")
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            settings = self._operation_effective_settings(document, instance_id)
+            phase = self._mock_operation_activation_phase(
+                settings, now, operation_policy=snapshot
+            )
+            if phase.get("projection_phase") != "FINAL_END":
+                continue
+            auto_close = snapshot.get("auto_close")
+            auto_close = auto_close if isinstance(auto_close, dict) else {}
+            if snapshot.get("auto_close_enabled", True) is False:
+                continue
+            method = _close_method(auto_close.get("method", "루틴매도신호"))
+            self.lifecycle.request_instance_auto_close(
+                session_id,
+                routine_instance_id=instance_id,
+                method=method,
+                profit_percent=auto_close.get("profit_percent"),
+                loss_percent=auto_close.get("loss_percent"),
+                reason="자동마감 시간정책 도달",
+                as_of=now,
+                command_id=deterministic_mock_identity(
+                    "MC",
+                    session_id,
+                    instance_id,
+                    operation.get("operation_session_id"),
+                    "AUTO_CLOSE",
+                ),
+            )
+
         operation = self._operation(document)
         if operation is None or operation.get("state") != "RUNNING":
             return
@@ -853,7 +1147,6 @@ class MockValidationHost:
         except (TypeError, ValueError):
             raise MockValidationError("MOCK_LIQUIDATION_MINUTES_INVALID")
         now_seconds = now.hour * 3600 + now.minute * 60 + now.second
-        session_id = document["session"]["validation_session_id"]
         long_hold = True
         auto_enabled = snapshot.get("auto_close_enabled", True) is not False
         if auto_enabled and now_seconds >= max(0, end_seconds - minutes * 60) and now_seconds < end_seconds:
@@ -885,51 +1178,102 @@ class MockValidationHost:
             return start_seconds <= now_seconds < end_seconds
         return now_seconds >= start_seconds or now_seconds < end_seconds
 
-    def _mock_market_session_phase(
-        self,
+    @staticmethod
+    def _mock_operation_phase_inputs(
         settings: dict[str, Any],
-        now: datetime,
-    ) -> tuple[bool, bool]:
-        mode = str(settings.get("operation_mode") or "").strip().upper()
-        if mode == "SCHEDULED":
-            return True, False
-        policy = self._operation_policy_provider()
-        policy = policy if isinstance(policy, dict) else {}
-        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
-        regular = policy.get("regular_market")
-        if isinstance(regular, dict) and self._seconds_in_window(
-            now_seconds,
-            regular.get("start_time", "09:00:00"),
-            regular.get("end_time", "15:20:00"),
-        ):
-            return True, False
-        if mode != "CONTINUOUS":
-            return False, False
+        operation_policy: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], Callable[[str], dict[str, Any]]]:
+        schedule = settings.get("operation_schedule")
+        schedule = schedule if isinstance(schedule, dict) else {}
+        config = {
+            "operation_mode": settings.get("operation_mode"),
+            "start_time": schedule.get("start_time"),
+            "end_buy_time": schedule.get("end_buy_time"),
+        }
         manual_ats = settings.get("manual_ats")
-        selected = set(
+        selected = list(
             manual_ats.get("selected_sessions", ())
             if isinstance(manual_ats, dict)
             else ()
         )
-        if not selected:
-            return False, False
-        sessions = policy.get("extra_sessions")
-        if not isinstance(sessions, list):
-            return False, False
-        for index, session in enumerate(sessions[: len(VALID_SESSION_KEYS)]):
-            key = VALID_SESSION_KEYS[index]
-            if (
-                key in selected
-                and isinstance(session, dict)
-                and session.get("enabled", True) is not False
-                and self._seconds_in_window(
-                    now_seconds,
-                    session.get("start_time"),
-                    session.get("end_time"),
-                )
-            ):
-                return True, True
-        return False, False
+        state = {"manual_ats_selection": {"selected_sessions": selected}}
+        sessions = operation_policy.get("extra_sessions")
+        sessions = sessions if isinstance(sessions, list) else []
+
+        def ats_reader(key: str) -> dict[str, Any]:
+            try:
+                index = VALID_SESSION_KEYS.index(key)
+            except ValueError:
+                return {}
+            session = sessions[index] if index < len(sessions) else None
+            return deepcopy(session) if isinstance(session, dict) else {}
+
+        return config, state, ats_reader
+
+    def _mock_operation_activation_phase(
+        self,
+        settings: dict[str, Any],
+        now: datetime,
+        *,
+        operation_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        policy = (
+            operation_policy
+            if isinstance(operation_policy, dict)
+            else self._operation_policy_provider()
+        )
+        policy = policy if isinstance(policy, dict) else {}
+        config, state, ats_reader = self._mock_operation_phase_inputs(
+            settings, policy
+        )
+        session_phase = auto_trade_operation_session_phase(
+            config,
+            state,
+            now_dt=now,
+            operation_policy_reader=lambda: policy,
+            ats_session_reader=ats_reader,
+        )
+        return auto_trade_operation_activation_phase(
+            config,
+            state,
+            now_dt=now,
+            session_phase=session_phase,
+            operation_policy_reader=lambda: policy,
+        )
+
+    def _mock_market_session_phase(
+        self,
+        settings: dict[str, Any],
+        now: datetime,
+        *,
+        operation_policy: dict[str, Any] | None = None,
+    ) -> tuple[bool, bool]:
+        phase = self._mock_operation_activation_phase(
+            settings, now, operation_policy=operation_policy
+        )
+        return (
+            phase.get("actual_trading_session_active") is True,
+            phase.get("ats_session_active") is True,
+        )
+
+    def _routine_close_market_open(
+        self,
+        settings: dict[str, Any],
+        now: datetime,
+        operation_policy: dict[str, Any],
+    ) -> bool:
+        if str(settings.get("operation_mode") or "").strip().upper() != "SCHEDULED":
+            return self._mock_market_session_phase(
+                settings, now, operation_policy=operation_policy
+            )[0]
+        regular = operation_policy.get("regular_market")
+        regular = regular if isinstance(regular, dict) else {}
+        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
+        return self._seconds_in_window(
+            now_seconds,
+            regular.get("start_time", "09:00:00"),
+            regular.get("end_time", "15:20:00"),
+        )
 
     def _mock_market_session_open(
         self,
@@ -956,39 +1300,12 @@ class MockValidationHost:
             return deepcopy(by_instance[instance_id])
         return self._instance_effective_settings(document, instance_id)
 
-    def _auto_start_scheduled_instances(
-        self, document: dict[str, Any], now: datetime
-    ) -> dict[str, Any]:
-        session_id = document["session"]["validation_session_id"]
-        if document["session"].get("state") not in {SESSION_WAITING, SESSION_RUNNING}:
-            return document
-        stock_code = document["session"]["stock_code"]
-        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
-        for instance_id in sorted(document.get("instance_execution", {})):
-            current = self.repository.read_session(session_id)
-            execution = current.get("instance_execution", {}).get(instance_id, {})
-            if execution.get("state") != SESSION_WAITING:
-                continue
-            settings = instance_effective_settings(current, instance_id)
-            if settings.get("operation_mode") != "SCHEDULED":
-                continue
-            schedule = settings["operation_schedule"]
-            if not self._seconds_in_window(
-                now_seconds,
-                schedule["start_time"],
-                schedule["end_buy_time"],
-            ):
-                continue
-            self.start_instance_operation(stock_code, instance_id, as_of=now)
-        return self.repository.read_session(session_id)
-
     def _process_stock(self, document: dict[str, Any], now: datetime) -> None:
         stock_code = document["session"]["stock_code"]
         reason = self._integrity_errors.pop(stock_code, "")
         if reason:
             self._review_error(document, reason)
             return
-        document = self._auto_start_scheduled_instances(document, now)
         state = document["session"]["state"]
         if state in {SESSION_WAITING, SESSION_REVIEW_STOPPED, SESSION_ENDED}:
             # Keep the transport buffer bounded, but never advance an order in
@@ -1000,8 +1317,10 @@ class MockValidationHost:
         session_id = document["session"]["validation_session_id"]
         market = self.market_store.market_snapshot(stock_code)
         if state == SESSION_RUNNING:
+            self._trigger_due_close(
+                self.repository.read_session(session_id), now
+            )
             if policy is not None:
-                candles = self._candles_provider(document)
                 second_identity = now.replace(microsecond=0).isoformat()
                 for instance_id in sorted(document.get("instance_execution", {})):
                     current = self.repository.read_session(session_id)
@@ -1009,15 +1328,38 @@ class MockValidationHost:
                     if execution.get("progression_allowed") is not True:
                         continue
                     settings = self._operation_effective_settings(current, instance_id)
-                    market_open, _ats_active = self._mock_market_session_phase(
-                        settings, now
+                    rules = self._operation_rules(current, instance_id)
+                    candle_projection = self._instance_candle_projection(
+                        current,
+                        instance_id=instance_id,
+                        rules=rules,
+                        settings=settings,
+                        now=now,
                     )
+                    operation = instance_operation_state(current, instance_id) or {}
+                    operation_policy = operation.get("operation_policy_snapshot")
+                    operation_policy = (
+                        operation_policy if isinstance(operation_policy, dict) else {}
+                    )
+                    market_open, _ats_active = self._mock_market_session_phase(
+                        settings, now, operation_policy=operation_policy
+                    )
+                    routine_close = (
+                        operation.get("state") == "RUNNING"
+                        and operation.get("close_pending") is True
+                        and operation.get("close_method") == CLOSE_ROUTINE
+                    )
+                    if routine_close:
+                        market_open = self._routine_close_market_open(
+                            settings, now, operation_policy
+                        )
                     if not market_open:
                         continue
                     schedule = settings["operation_schedule"]
                     now_seconds = now.hour * 3600 + now.minute * 60 + now.second
                     new_buy_allowed = (
-                        settings.get("operation_mode") != "SCHEDULED"
+                        routine_close
+                        or settings.get("operation_mode") != "SCHEDULED"
                         or self._seconds_in_window(
                             now_seconds,
                             schedule["start_time"],
@@ -1025,17 +1367,35 @@ class MockValidationHost:
                         )
                     )
                     try:
-                        self.routine_adapter.evaluate_cycle(
+                        evaluation_cycle_id = deterministic_mock_identity(
+                            "MC", session_id, instance_id, second_identity, "ROUTINE"
+                        )
+                        evaluation_result = self.routine_adapter.evaluate_cycle(
                             session_id,
                             routine_instance_id=instance_id,
-                            candles=candles,
+                            candles=candle_projection.get("candles", ()),
                             market=market,
                             policy=policy,
-                            evaluation_cycle_id=deterministic_mock_identity(
-                                "MC", session_id, instance_id, second_identity, "ROUTINE"
-                            ),
+                            evaluation_cycle_id=evaluation_cycle_id,
                             evaluated_at=now,
                             new_buy_allowed=new_buy_allowed,
+                            candle_availability=candle_projection,
+                        )
+                        self.lifecycle.record_instance_routine_final_sell(
+                            session_id,
+                            routine_instance_id=instance_id,
+                            as_of=now,
+                            evaluation_cycle_id=evaluation_cycle_id,
+                            result=evaluation_result,
+                        )
+                        self.lifecycle.complete_instance_routine_close_if_ready(
+                            session_id,
+                            routine_instance_id=instance_id,
+                            as_of=now,
+                            lifecycle_cycle_id=deterministic_mock_identity(
+                                "MC", session_id, instance_id, second_identity,
+                                "ROUTINE_CLOSE_COMPLETION",
+                            ),
                         )
                     except Exception as exc:
                         reason = str(exc) or type(exc).__name__
@@ -1069,8 +1429,6 @@ class MockValidationHost:
                         market=market,
                         policy=policy,
                     )
-            refreshed = self.repository.read_session(session_id)
-            self._trigger_due_close(refreshed, now)
             return
         if state == SESSION_CLOSING and policy is not None:
             operation = self._operation(document)
@@ -1104,6 +1462,12 @@ class MockValidationHost:
             errors.extend(read_errors)
             for document in documents:
                 stock_code = document["session"]["stock_code"]
+                if (
+                    document["session"]["validation_session_id"]
+                    in self._restart_recovery_blocked_session_ids
+                ):
+                    errors.append((stock_code, "MOCK_RESTART_RECOVERY_BLOCKED"))
+                    continue
                 try:
                     self._process_stock(document, now)
                     processed += 1
