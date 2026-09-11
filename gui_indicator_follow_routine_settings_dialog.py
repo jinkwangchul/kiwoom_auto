@@ -205,6 +205,16 @@ def _settings_validation_user_reason(reason, *, context="change"):
         return "기본매수 설정이 올바르지 않습니다.\n매수방식과 세부 조건을 확인하세요."
     if "sell signal expression" in lowered or "sell signal combination" in lowered:
         return "매도 신호 조합이 올바르지 않습니다.\n조건과 논리 조합을 확인하세요."
+    referenced_empty_sell_group = re.search(
+        r"sell condition ([abc]) is referenced by expression but has no active conditions",
+        lowered,
+    )
+    if referenced_empty_sell_group:
+        group_name = referenced_empty_sell_group.group(1).upper()
+        return (
+            f"매도조건 {group_name}가 신호 조합에 포함되어 있지만\n"
+            "활성화된 조건이 없습니다."
+        )
     if "sell condition a" in lowered or "condition_a" in lowered:
         return "매도조건 A 설정이 올바르지 않습니다.\n활성 조건과 값을 확인하세요."
     if "sell condition b" in lowered or "condition_b" in lowered:

@@ -1419,7 +1419,8 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertFalse(top["excluded"].isChecked())
             self.assertTrue(top["stock"].isChecked())
 
-            top["review"].click()
+            QTest.mouseDClick(top["review"], Qt.LeftButton)
+            self.app.processEvents()
             self.assertEqual("all", window._main_routine_stock_scope)
             self.assertFalse(top["review"].isChecked())
             open_review.assert_called_once()

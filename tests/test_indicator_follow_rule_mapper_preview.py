@@ -2414,16 +2414,19 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             self.current_rules["sell"]["signals"]["macd_sell"],
         )
 
-    def test_apply_approved_rule_patch_preview_sell_existing_target_is_skipped(self):
+    def test_apply_approved_rule_patch_preview_sell_existing_target_is_updated(self):
         current_rules = deepcopy(self.current_rules)
         current_rules["sell"]["signals"]["ui_condition_c"] = {"enabled": False}
         patch_preview = self._build_patch_preview({"sell.signals.ui_preview_condition_c": "APPROVED"})
 
         result = self.mapper.apply_approved_rule_patch_preview(current_rules, patch_preview)
 
-        self.assertEqual(result["summary"]["applied"], 0)
-        self.assertEqual(result["summary"]["skipped"], 1)
-        self.assertEqual(result["skipped_patches"][0]["reason"], "target path already exists")
+        self.assertEqual(result["summary"]["applied"], 1)
+        self.assertEqual(result["summary"]["skipped"], 0)
+        self.assertTrue(
+            result["applied_rules_preview"]["sell"]["signals"]["ui_condition_c"]["enabled"]
+        )
+        self.assertFalse(result["applied_patches"][0]["added"])
 
     def test_apply_approved_rule_patch_preview_unknown_operation_is_skipped_with_warning(self):
         patch_preview = {

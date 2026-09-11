@@ -5,9 +5,20 @@ import unittest
 from unittest.mock import Mock
 
 from PyQt5 import sip
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QApplication, QPushButton, QWidget
 
-from gui_windows import MainWindow, _MarketDataMonitoringWindow
+from gui_windows import (
+    MainWindow,
+    _MarketDataMonitoringWindow,
+    _tr_capacity_load_projection,
+    TR_CAPACITY_SEGMENT_ACTIVE_COLORS,
+    TR_CAPACITY_SEGMENT_COUNT,
+    TR_CAPACITY_SEGMENT_HEIGHT,
+    TR_CAPACITY_SEGMENT_INACTIVE_COLOR,
+    TR_CAPACITY_SEGMENT_RADIUS,
+    TR_CAPACITY_SEGMENT_SPACING,
+    TR_CAPACITY_SEGMENT_WIDTH,
+)
 from tests.qt_test_support import flush_deferred_deletes
 
 
@@ -48,6 +59,7 @@ class _MonitoringHost:
             last_error_reason="CommRqData failed",
         )
         self.CommRqData = Mock()
+        self.CommKwRqData = Mock()
         self.SetRealReg = Mock()
         self.SetRealRemove = Mock()
 
@@ -62,6 +74,10 @@ class _MainHarness(QWidget):
     def __init__(self, host: _MonitoringHost) -> None:
         super().__init__()
         self.host = host
+        self._main_monitoring_auto_trade_operation_host = host
+        self.kiwoom_api = SimpleNamespace(TR_GOVERNOR_MIN_INTERVAL_MS=1_000)
+        self.btn_market_data_monitoring = QPushButton("모니터링", self)
+        MainWindow._create_main_tr_capacity_indicator(self)
         self.market_data_monitoring_window = None
 
     def main_monitoring_auto_trade_operation_host(self):
@@ -95,6 +111,119 @@ class MarketDataMonitoringWindowTests(unittest.TestCase):
         self.host.CommRqData.assert_not_called()
         self.host.SetRealReg.assert_not_called()
         self.host.SetRealRemove.assert_not_called()
+
+    def test_tr_capacity_load_projection_uses_six_equal_pacing_bins(self) -> None:
+        expected = {
+            0: (0, "비용 없음"),
+            10: (1, "매우양호"),
+            20: (2, "양호"),
+            30: (3, "아주보통"),
+            40: (4, "보통"),
+            50: (5, "부담"),
+            60: (6, "매우부담"),
+            75: (6, "매우부담"),
+        }
+        for recent_dispatches, (expected_level, expected_status) in expected.items():
+            with self.subTest(recent_dispatches=recent_dispatches):
+                metrics = SimpleNamespace(dispatch_count_last_60s=recent_dispatches)
+                projected = _tr_capacity_load_projection(
+                    metrics,
+                    minimum_dispatch_interval_ms=1_000,
+                )
+                self.assertEqual(60, projected["capacity_last_60s"])
+                self.assertEqual(expected_level, projected["level"])
+                self.assertEqual(expected_status, projected["status"])
+                self.assertEqual(
+                    TR_CAPACITY_SEGMENT_ACTIVE_COLORS[:expected_level]
+                    + (TR_CAPACITY_SEGMENT_INACTIVE_COLOR,)
+                    * (TR_CAPACITY_SEGMENT_COUNT - expected_level),
+                    projected["segment_colors"],
+                )
+
+    def test_tr_capacity_indicator_has_equal_graphic_segment_geometry(self) -> None:
+        segments = self.parent._main_tr_capacity_indicator_segments
+
+        self.assertEqual(TR_CAPACITY_SEGMENT_COUNT, len(segments))
+        self.assertEqual(
+            TR_CAPACITY_SEGMENT_SPACING,
+            self.parent._main_tr_capacity_indicator_layout.spacing(),
+        )
+        self.assertEqual(
+            {TR_CAPACITY_SEGMENT_WIDTH},
+            {segment.width() for segment in segments},
+        )
+        self.assertEqual(
+            {TR_CAPACITY_SEGMENT_HEIGHT},
+            {segment.height() for segment in segments},
+        )
+        MainWindow._refresh_main_tr_capacity_indicator(self.parent)
+        for segment in segments:
+            self.assertIn(
+                f"border-radius: {TR_CAPACITY_SEGMENT_RADIUS}px",
+                segment.styleSheet(),
+            )
+
+    def test_refresh_applies_all_seven_graphic_segment_states(self) -> None:
+        for recent_dispatches, expected_level in (
+            (0, 0),
+            (10, 1),
+            (20, 2),
+            (30, 3),
+            (40, 4),
+            (50, 5),
+            (60, 6),
+        ):
+            with self.subTest(level=expected_level):
+                self.host.tr.dispatch_count_last_60s = recent_dispatches
+                projected = MainWindow._refresh_main_tr_capacity_indicator(
+                    self.parent
+                )
+                self.assertEqual(expected_level, projected["level"])
+                for segment, expected_color in zip(
+                    self.parent._main_tr_capacity_indicator_segments,
+                    projected["segment_colors"],
+                ):
+                    self.assertIn(
+                        f"background-color: {expected_color};",
+                        segment.styleSheet(),
+                    )
+
+    def test_main_monitoring_button_indicator_refresh_is_read_only(self) -> None:
+        total_enqueued_before = self.host.tr.total_enqueued
+        projected = MainWindow._refresh_main_tr_capacity_indicator(self.parent)
+
+        self.assertEqual(1, projected["level"])
+        self.assertEqual("매우양호", projected["status"])
+        self.assertEqual("모니터링", self.parent.btn_market_data_monitoring.text())
+        self.assertNotIn(chr(0x25A1), self.parent.btn_market_data_monitoring.text())
+        self.assertNotIn(chr(0x25AE), self.parent.btn_market_data_monitoring.text())
+        tooltip = self.parent.btn_market_data_monitoring.toolTip()
+        self.assertIn("TR 내부 부하: 1/6", tooltip)
+        self.assertIn("상태: 매우양호", tooltip)
+        self.assertIn("최근 60초 Dispatch: 4", tooltip)
+        self.assertIn("Queue: 1", tooltip)
+        self.assertIn("최근/최대 Queue Wait: 25.000 ms / 1250.000 ms", tooltip)
+        self.assertIn(
+            "Kiwoom 공식 잔여쿼터가 아닌 프로그램 내부 처리부하 추정",
+            tooltip,
+        )
+        self.assertEqual(total_enqueued_before, self.host.tr.total_enqueued)
+        self.host.CommRqData.assert_not_called()
+        self.host.CommKwRqData.assert_not_called()
+        self.assertEqual(
+            self.parent.btn_market_data_monitoring.toolTip(),
+            self.parent._main_tr_capacity_indicator.toolTip(),
+        )
+        self.assertEqual(
+            TR_CAPACITY_SEGMENT_ACTIVE_COLORS[0],
+            projected["segment_colors"][0],
+        )
+        self.assertTrue(
+            all(
+                color == TR_CAPACITY_SEGMENT_INACTIVE_COLOR
+                for color in projected["segment_colors"][1:]
+            )
+        )
 
     def test_close_then_reopen_creates_a_live_window(self) -> None:
         first = MainWindow.open_market_data_monitoring_window(self.parent)

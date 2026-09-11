@@ -192,72 +192,46 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             )
             self.assertEqual((), preview_delete_scope(root, [stock]))
 
-    def test_instance_delete_unassigns_review_holding_and_preserves_state(self) -> None:
+    def test_instance_delete_blocks_assigned_stock_without_mutation(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             stock, stock_dir = _stock(root, holding=7, review=True)
-            instance_dir, instance = _instance(root)
-            scope = RoutineInstanceDeletionScope(
-                root, INSTANCE_A, "루틴A", GROUP_ID, "definition_a", instance_dir, (stock,)
-            )
-            state_before = (stock_dir / "state.json").read_bytes()
-            result = delete_routine_instance_completely(scope)
-            self.assertTrue(result.success, result.error)
-            self.assertFalse(instance_dir.exists())
-            config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
-            self.assertEqual("", config["assigned_routine_instance_id"])
-            self.assertEqual(state_before, (stock_dir / "state.json").read_bytes())
-            episodes = CanonicalAssignmentEpisodeRepository(root).list_episodes("005930")
-            self.assertEqual("UNASSIGNED", episodes[-1].ownership_kind)
-            self.assertTrue(any(item.ownership_kind == "ASSIGNED" for item in episodes))
-
-    def test_instance_delete_failure_rolls_back_assignment_and_episode(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            stock, stock_dir = _stock(root)
             instance_dir, _instance_record = _instance(root)
             scope = RoutineInstanceDeletionScope(
                 root, INSTANCE_A, "루틴A", GROUP_ID, "definition_a", instance_dir, (stock,)
             )
             config_before = (stock_dir / "config.json").read_bytes()
-            episode_repository = CanonicalAssignmentEpisodeRepository(root)
-            opened = episode_repository.open_episode(
-                "005930",
-                AssignmentEpisodeTarget.assigned(
-                    instance_id=INSTANCE_A,
-                    group_id=GROUP_ID,
-                    definition_id="definition_a",
-                    instance_name_snapshot="루틴A",
-                    group_name_snapshot="그룹A",
-                ),
-                started_at="2026-08-23T09:00:00+09:00",
-                start_reason="TEST_CURRENT",
-                source="TEST",
-            )
-            self.assertTrue(opened.success)
-            episode_path = episode_repository.document_path("005930")
-            episode_before = episode_path.read_bytes()
-            import routine_instance_deletion_service as instance_deletion
+            state_before = (stock_dir / "state.json").read_bytes()
+            result = delete_routine_instance_completely(scope)
 
-            real_rmtree = instance_deletion.shutil.rmtree
-            calls = 0
-
-            def fail_once(path, *args, **kwargs):
-                nonlocal calls
-                calls += 1
-                if calls == 1:
-                    raise OSError("injected failure")
-                return real_rmtree(path, *args, **kwargs)
-
-            with patch.object(instance_deletion.shutil, "rmtree", side_effect=fail_once):
-                result = delete_routine_instance_completely(scope)
             self.assertFalse(result.success)
+            self.assertEqual(
+                "ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS",
+                result.reason_code,
+            )
+            self.assertEqual(1, result.assigned_stock_count)
             self.assertTrue(instance_dir.exists())
             self.assertEqual(config_before, (stock_dir / "config.json").read_bytes())
-            self.assertEqual(episode_before, episode_path.read_bytes())
-            current = episode_repository.get_open_episode("005930")
-            self.assertIsNotNone(current)
-            self.assertEqual("ASSIGNED", current.ownership_kind)
+            self.assertEqual(state_before, (stock_dir / "state.json").read_bytes())
+
+    def test_instance_delete_recaptures_assignment_sot_before_writer(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock, stock_dir = _stock(root)
+            instance_dir, _instance_record = _instance(root)
+            scope = RoutineInstanceDeletionScope(
+                root, INSTANCE_A, "루틴A", GROUP_ID, "definition_a", instance_dir, ()
+            )
+            config_before = (stock_dir / "config.json").read_bytes()
+            result = delete_routine_instance_completely(scope)
+
+            self.assertFalse(result.success)
+            self.assertEqual(
+                "ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS",
+                result.reason_code,
+            )
+            self.assertTrue(instance_dir.exists())
+            self.assertEqual(config_before, (stock_dir / "config.json").read_bytes())
 
     def test_registration_is_idempotent_and_blocks_other_current_instance(self) -> None:
         with TemporaryProjectRoot(prefix="preinit_registration_") as layout:

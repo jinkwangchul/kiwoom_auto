@@ -177,6 +177,18 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
         fresh_state_getter.assert_called_once_with("005930")
         snapshot_getter.assert_called_once_with()
 
+    def test_tr_governor_metrics_snapshot_uses_official_api_accessor(self) -> None:
+        metrics = object()
+        self.owner.kiwoom_api.tr_governor_metrics_snapshot = Mock(
+            return_value=metrics
+        )
+
+        self.assertIs(metrics, self.host.tr_governor_metrics_snapshot())
+        self.owner.kiwoom_api.tr_governor_metrics_snapshot.assert_called_once_with()
+
+    def test_tr_governor_metrics_snapshot_returns_none_without_provider(self) -> None:
+        self.assertIsNone(self.host.tr_governor_metrics_snapshot())
+
     def test_shadow_first_pends_then_later_canonical_commit_compares(self) -> None:
         scheduled = []
         comparisons = []

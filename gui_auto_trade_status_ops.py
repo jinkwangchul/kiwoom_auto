@@ -133,6 +133,39 @@ class OperationExclusionCommandResult:
     current_running: bool
 
 
+@dataclass(frozen=True)
+class OperationModeChangeResult:
+    success: bool
+    changed: bool
+    result: str
+    reason_code: str
+    operator_message: str
+    stock_code: str
+    stock_name: str
+    routine: str
+    routine_instance_id: str
+    before_mode: str
+    requested_mode: str
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "success": self.success,
+            "changed": self.changed,
+            "result": self.result,
+            "reason": self.operator_message,
+            "reason_code": self.reason_code,
+            "stock_code": self.stock_code,
+            "stock_name": self.stock_name,
+            "routine": self.routine,
+            "routine_instance_id": self.routine_instance_id,
+            "before_mode": self.before_mode,
+            "requested_mode": self.requested_mode,
+        }
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1055,7 +1088,131 @@ def auto_trade_recalculate_all_status_by_operation_policy(
 
 
 
-def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, name: str, operation_mode: str, config_updates: dict[str, object] | None = None) -> bool:
+def _operation_mode_failure_message(reason_code: object) -> str:
+    return {
+        "BLOCKED_TRADING_ACTIVE": "현재 운영 중인 종목은 운영방식을 변경할 수 없습니다.",
+        "BLOCKED_ATS_RUNTIME_ACTIVE": "ATS 거래 진행 중에는 운영방식을 변경할 수 없습니다.",
+        "BLOCKED_RUNTIME_STATE_UNAVAILABLE": "운영상태를 확인할 수 없어 운영방식을 변경할 수 없습니다.",
+        "BLOCKED_ORDER_ACTIVE": "미체결 주문이 있는 종목은 운영방식을 변경할 수 없습니다.",
+        "BLOCKED_CLOSE_OR_LIQUIDATION_ACTIVE": "마감 또는 청산 진행 중에는 운영방식을 변경할 수 없습니다.",
+        "BLOCKED_TIME_POLICY_MISSING": "운영시간 설정을 확인할 수 없어 운영방식을 변경할 수 없습니다.",
+        "BLOCKED_TIME_POLICY_INVALID": "운영시간 설정이 올바르지 않아 운영방식을 변경할 수 없습니다.",
+        "CONFIG_UNAVAILABLE": "운영방식 설정을 읽을 수 없습니다.",
+        "WRITE_FAILED": "운영방식을 저장하지 못했습니다.",
+        "READ_BACK_FAILED": "운영방식 저장 결과를 확인하지 못했습니다.",
+        "ATS_CLEAR_FAILED": "운영방식 변경 후 ATS 설정을 해제하지 못했습니다.",
+    }.get(
+        str(reason_code or "").strip(),
+        "선택한 종목의 운영방식을 변경할 수 없습니다.",
+    )
+
+
+def _operation_mode_change_result(
+    *,
+    success: bool,
+    changed: bool,
+    result: str,
+    reason_code: object,
+    config: dict[str, object],
+    code: object,
+    name: object,
+    before_mode: object,
+    requested_mode: object,
+    operator_message: str = "",
+) -> OperationModeChangeResult:
+    clean_reason = str(reason_code or "").strip()
+    return OperationModeChangeResult(
+        success=bool(success),
+        changed=bool(changed),
+        result=str(result or "").strip().upper(),
+        reason_code=clean_reason,
+        operator_message=(
+            str(operator_message or "").strip()
+            if success
+            else str(operator_message or "").strip()
+            or _operation_mode_failure_message(clean_reason)
+        ),
+        stock_code=normalize_stock_code(code),
+        stock_name=str(name or "").strip(),
+        routine=str(
+            config.get("routine_instance_name")
+            or config.get("assigned_routine")
+            or config.get("routine_name")
+            or config.get("routine")
+            or ""
+        ).strip(),
+        routine_instance_id=str(
+            config.get("assigned_routine_instance_id") or ""
+        ).strip(),
+        before_mode=normalize_operation_mode(before_mode),
+        requested_mode=normalize_operation_mode(requested_mode),
+    )
+
+
+def _record_operation_mode_failure_event(result: OperationModeChangeResult) -> None:
+    append_production_event(
+        "OPERATOR_SETTING_DECISION",
+        severity="NOTICE" if result.result == "BLOCKED" else "ERROR",
+        result=result.result,
+        source="gui_auto_trade_status_ops.auto_trade_update_stock_operation_mode",
+        template_args={},
+        target_type="STOCK",
+        target_id=result.stock_code,
+        target_name=result.stock_name,
+        stock_code=result.stock_code,
+        stock_name=result.stock_name,
+        routine=result.routine,
+        reason_code=result.reason_code,
+        operation="OPERATION_MODE_CHANGE",
+        details={
+            "action": "OPERATION_MODE_CHANGE",
+            "before_mode": result.before_mode,
+            "requested_mode": result.requested_mode,
+            "operator_message": result.operator_message,
+            "routine_instance_id": result.routine_instance_id,
+        },
+    )
+
+
+def _operation_mode_decision_result(reason_code: object) -> str:
+    return (
+        "FAILED"
+        if str(reason_code or "").strip()
+        in {
+            "BLOCKED_RUNTIME_STATE_UNAVAILABLE",
+            "BLOCKED_TIME_POLICY_MISSING",
+            "BLOCKED_TIME_POLICY_INVALID",
+        }
+        else "BLOCKED"
+    )
+
+
+def _operation_mode_current_session_trading_active(
+    window,
+    runtime_state: dict[str, object],
+    stock_code: object,
+) -> bool:
+    persisted_started = auto_trade_setting_trade_started(runtime_state)
+    try:
+        return auto_trade_setting_current_session_trade_started(
+            window,
+            persisted_started,
+            stock_code,
+        )
+    except Exception:
+        # A missing participant owner cannot weaken the established fail-closed
+        # behavior of non-GUI or legacy callers.
+        return persisted_started
+
+
+def auto_trade_update_stock_operation_mode(
+    window,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    operation_mode: str,
+    config_updates: dict[str, object] | None = None,
+) -> OperationModeChangeResult:
     mode = normalize_operation_mode(operation_mode)
     config_path = stock_dir / "config.json"
     config = read_json_dict(config_path)
@@ -1083,6 +1240,11 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         or int(sell_pending_qty) > 0
     )
     runtime_status = str(runtime_state.get("status", "STOPPED")).strip().upper()
+    current_session_trading_active = _operation_mode_current_session_trading_active(
+        window,
+        runtime_state,
+        code,
+    )
     close_or_liquidation_active = (
         bool(runtime_state.get("close_routine_final_sell_ordered", False))
         or (
@@ -1096,9 +1258,10 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         decision_now,
         ats_runtime_active=(
             manual_ats_active_now(config, runtime_state, decision_now)
-            and auto_trade_setting_trade_started(runtime_state)
+            and current_session_trading_active
         ),
         runtime_status=runtime_status,
+        current_session_trading_active=current_session_trading_active,
         pending_order_active=pending_order_active,
         close_or_liquidation_active=close_or_liquidation_active,
         runtime_state_available=bool(runtime_state),
@@ -1113,7 +1276,19 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / "
             f"현재 {decision['current_time']} / 종료 {scheduled_end_time or '-'}",
         )
-        return False
+        blocked_result = _operation_mode_change_result(
+            success=False,
+            changed=False,
+            result=_operation_mode_decision_result(reason),
+            reason_code=reason,
+            config=config,
+            code=code,
+            name=name,
+            before_mode=before_mode,
+            requested_mode=mode,
+        )
+        _record_operation_mode_failure_event(blocked_result)
+        return blocked_result
 
     target_fields: dict[str, object] = {"operation_mode": mode}
     if config_updates:
@@ -1167,7 +1342,20 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}"
             f" / {write_result.reason_code}",
         )
-        return False
+        failed_result = _operation_mode_change_result(
+            success=False,
+            changed=False,
+            result="FAILED",
+            reason_code=write_result.reason_code,
+            config=config,
+            code=code,
+            name=name,
+            before_mode=before_mode,
+            requested_mode=mode,
+            operator_message=_operation_mode_failure_message("WRITE_FAILED"),
+        )
+        _record_operation_mode_failure_event(failed_result)
+        return failed_result
 
     saved_config = read_json_dict(config_path)
     if any(saved_config.get(key) != value for key, value in target_fields.items()):
@@ -1176,7 +1364,19 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             "ERROR",
             f"운영방식 저장 read-back 실패: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
         )
-        return False
+        failed_result = _operation_mode_change_result(
+            success=False,
+            changed=False,
+            result="FAILED",
+            reason_code="READ_BACK_FAILED",
+            config=config,
+            code=code,
+            name=name,
+            before_mode=before_mode,
+            requested_mode=mode,
+        )
+        _record_operation_mode_failure_event(failed_result)
+        return failed_result
 
     if before_mode != mode and manual_ats_selected:
         if not clear_manual_ats_runtime_selection(stock_dir):
@@ -1186,7 +1386,19 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
                 "운영방식 변경 후 ATS 설정 해제 실패: "
                 f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
             )
-            return False
+            failed_result = _operation_mode_change_result(
+                success=False,
+                changed=False,
+                result="FAILED",
+                reason_code="ATS_CLEAR_FAILED",
+                config=config,
+                code=code,
+                name=name,
+                before_mode=before_mode,
+                requested_mode=mode,
+            )
+            _record_operation_mode_failure_event(failed_result)
+            return failed_result
 
     tracked_keys = (
         "operation_mode",
@@ -1222,7 +1434,18 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         )
 
     append_stock_log(stock_dir, "GUI", f"운영방식 변경: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}")
-    return True
+    return _operation_mode_change_result(
+        success=True,
+        changed=bool(changes),
+        result="SUCCESS",
+        reason_code="UPDATED" if changes else "NO_CHANGE",
+        config=saved_config,
+        code=code,
+        name=name,
+        before_mode=before_mode,
+        requested_mode=mode,
+        operator_message="",
+    )
 
 
 
@@ -1242,22 +1465,27 @@ def handle_auto_trade_operation_mode_double_click(
     stock_dir, code, name = target
     config = read_json_dict(Path(stock_dir) / "config.json")
     if not isinstance(config, dict) or not config:
-        QMessageBox.warning(
-            operation_dialog_parent(window),
-            "운영방식 변경",
-            f"{code} {name}의 운영방식 설정을 읽을 수 없습니다.",
+        failed_result = _operation_mode_change_result(
+            success=False,
+            changed=False,
+            result="FAILED",
+            reason_code="CONFIG_UNAVAILABLE",
+            config={},
+            code=code,
+            name=name,
+            before_mode="SCHEDULED",
+            requested_mode="CONTINUOUS",
         )
+        _record_operation_mode_failure_event(failed_result)
+        show_toast(operation_dialog_parent(window), failed_result.operator_message)
         return {
             "requested": 1,
             "succeeded": 0,
             "failed": 1,
             "results": [
                 {
-                    "stock_code": code,
-                    "stock_name": name,
+                    **failed_result.as_dict(),
                     "stock_dir": str(stock_dir),
-                    "success": False,
-                    "reason": "운영방식 설정을 읽을 수 없습니다.",
                 }
             ],
         }
@@ -1300,11 +1528,7 @@ def auto_trade_set_operation_mode_for_targets(
         "results": [],
     }
     if not targets:
-        QMessageBox.warning(
-            dialog_parent,
-            "선택 오류",
-            "운영방식 변경은 종목을 1개 이상 선택해야 합니다.",
-        )
+        show_toast(dialog_parent, "운영방식을 변경할 종목을 선택하세요.")
         return result
 
     mode = normalize_operation_mode(operation_mode)
@@ -1319,21 +1543,29 @@ def auto_trade_set_operation_mode_for_targets(
     target_results = result["results"]
     assert isinstance(target_results, list)
     for stock_dir, code, name in targets:
-        changed = window.update_stock_operation_mode(
+        change_result = window.update_stock_operation_mode(
             stock_dir,
             code,
             name,
             mode,
             config_updates,
         )
-        if not changed:
-            target_results.append(
-                {
+        if not change_result:
+            if isinstance(change_result, OperationModeChangeResult):
+                failure = change_result.as_dict()
+            else:
+                failure = {
                     "stock_code": code,
                     "stock_name": name,
-                    "stock_dir": str(stock_dir),
                     "success": False,
-                    "reason": "운영방식 또는 시간 설정을 변경할 수 없습니다.",
+                    "result": "FAILED",
+                    "reason": "선택한 종목의 운영방식을 변경할 수 없습니다.",
+                    "reason_code": "OPERATION_MODE_CHANGE_FAILED",
+                }
+            target_results.append(
+                {
+                    **failure,
+                    "stock_dir": str(stock_dir),
                 }
             )
             result["failed"] = int(result["failed"]) + 1
@@ -1408,7 +1640,17 @@ def auto_trade_finalize_operation_mode_result(
     ]
     requested = int(result.get("requested", 0) or 0)
     if requested == 1:
-        message = "선택한 종목을 변경할 수 없습니다."
+        message = str(
+            next(
+                (
+                    item.get("reason")
+                    for item in items
+                    if isinstance(item, dict) and not bool(item.get("success"))
+                ),
+                "",
+            )
+            or "선택한 종목의 운영방식을 변경할 수 없습니다."
+        )
     elif succeeded:
         message = (
             f"일부 종목의 운영방식/시간 설정을 변경하지 못했습니다.\n\n"
@@ -1420,11 +1662,7 @@ def auto_trade_finalize_operation_mode_result(
             "선택한 종목의 운영방식/시간 설정을 변경할 수 없습니다.\n\n"
             + "\n".join(failed_lines[:10])
         )
-    QMessageBox.warning(
-        operation_dialog_parent(window),
-        "운영방식 변경",
-        message,
-    )
+    show_toast(operation_dialog_parent(window), message)
 
 
 def auto_trade_apply_schedule_times_to_targets(

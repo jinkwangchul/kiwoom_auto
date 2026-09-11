@@ -33,7 +33,11 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
 )
-from mock_validation_contract import MockValidationError, instance_effective_settings
+from mock_validation_contract import (
+    MockValidationError,
+    instance_effective_settings,
+    payload_hash,
+)
 from mock_validation_host import MockValidationHost
 from mock_validation_reference_snapshot import build_mock_reference_snapshot
 from mock_validation_ui_actions import MockValidationUIActions
@@ -345,7 +349,6 @@ class MockValidationHostUiTest(unittest.TestCase):
         for name in (
             "_mock_routine_instance_edit_target",
             "_mock_start_budget_edit_authorized",
-            "_mock_operation_settings_edit_authorized",
             "_mock_start_budget_current_price",
             "_write_mock_routine_instance_settings",
             "toggle_mock_routine_instance_initial_buy_mode",
@@ -394,7 +397,6 @@ class MockValidationHostUiTest(unittest.TestCase):
             "_main_routine_selected_row_keys",
             "_reload_main_routine_table_preserving_view",
             "_mock_routine_instance_edit_target",
-            "_mock_operation_settings_edit_authorized",
             "_write_mock_routine_instance_settings",
             "toggle_mock_routine_instance_operation_mode",
             "open_mock_routine_instance_schedule_dialog",
@@ -611,6 +613,88 @@ class MockValidationHostUiTest(unittest.TestCase):
         evaluate.reset_mock()
         self.host.process_due_cycles(as_of=NOW.replace(hour=20, minute=0))
         evaluate.assert_not_called()
+        document = self.host.current_session("005930")
+        for instance_id in ("A", "B"):
+            operation = document["mock_operation_lifecycle"]["instance_operations"][
+                instance_id
+            ]
+            self.assertEqual("", operation["close_source"])
+            self.assertEqual("", operation["close_method"])
+            self.assertFalse(operation["close_pending"])
+
+    def test_instance_auto_close_uses_active_snapshot_not_next_effective_settings(self):
+        self.create()
+        self.actions.set_instance_effective_settings(
+            "005930", "A", operation_mode="CONTINUOUS"
+        )
+        self.host.start_instance_operation("005930", "A", as_of=NOW)
+        continuous = self.host.current_session("005930")
+        continuous_session_id = continuous["session"]["validation_session_id"]
+
+        def next_scheduled(document):
+            document["effective_settings_by_instance"]["A"][
+                "operation_mode"
+            ] = "SCHEDULED"
+            return document
+
+        self.host.repository.mutate_session(continuous_session_id, next_scheduled)
+        self.host.process_due_cycles(as_of=NOW.replace(hour=21, minute=15))
+        continuous = self.host.current_session("005930")
+        continuous_operation = continuous["mock_operation_lifecycle"][
+            "instance_operations"
+        ]["A"]
+        self.assertEqual(
+            "CONTINUOUS",
+            continuous_operation["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ]["operation_mode"],
+        )
+        self.assertEqual(
+            "SCHEDULED",
+            continuous["effective_settings_by_instance"]["A"]["operation_mode"],
+        )
+        self.assertEqual("", continuous_operation["close_source"])
+        self.assertEqual("", continuous_operation["close_method"])
+        self.assertFalse(continuous_operation["close_pending"])
+
+        scheduled = self.create("005380")["document"]
+        self.actions.set_instance_effective_settings(
+            "005380",
+            "A",
+            operation_mode="SCHEDULED",
+            operation_schedule={
+                "start_time": "10:30:00",
+                "end_buy_time": "13:30:00",
+            },
+        )
+        self.host.start_instance_operation("005380", "A", as_of=NOW)
+        scheduled_session_id = scheduled["session"]["validation_session_id"]
+
+        def next_continuous(document):
+            document["effective_settings_by_instance"]["A"][
+                "operation_mode"
+            ] = "CONTINUOUS"
+            return document
+
+        self.host.repository.mutate_session(scheduled_session_id, next_continuous)
+        self.host.process_due_cycles(as_of=NOW.replace(hour=13, minute=30))
+        scheduled = self.host.current_session("005380")
+        scheduled_operation = scheduled["mock_operation_lifecycle"][
+            "instance_operations"
+        ]["A"]
+        self.assertEqual(
+            "SCHEDULED",
+            scheduled_operation["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ]["operation_mode"],
+        )
+        self.assertEqual(
+            "CONTINUOUS",
+            scheduled["effective_settings_by_instance"]["A"]["operation_mode"],
+        )
+        self.assertEqual("AUTO", scheduled_operation["close_source"])
+        self.assertEqual("ROUTINE", scheduled_operation["close_method"])
+        self.assertTrue(scheduled_operation["close_pending"])
 
     def test_legacy_manual_ats_projects_all_but_executes_only_policy_enabled_sessions(self):
         created = self.create()["document"]
@@ -1238,21 +1322,65 @@ class MockValidationHostUiTest(unittest.TestCase):
             read_back["effective_settings_by_instance"]["A"],
         )
 
-    def test_mock_operation_settings_require_auth_and_waiting_instance(self):
+    def test_mock_operation_settings_allow_pre_auth_and_require_pre_start_instance(self):
         created = self.create()
         window = self._phase1_mock_table_window()
         window.load_routine_table()
-        initial_revision = created["document"]["revision"]
-
-        window.kiwoom_api = SimpleNamespace(is_connected=lambda: False)
+        frozen_reference = deepcopy(created["document"]["reference_snapshot"])
+        connected = Mock(return_value=False)
+        selected_account = Mock(return_value="")
+        window.kiwoom_api = SimpleNamespace(is_connected=connected)
+        window.selected_account_no = selected_account
+        window._account_authentication_states = {}
+        schedule_dialog = SimpleNamespace(
+            setWindowTitle=Mock(),
+            exec_=Mock(return_value=gui_windows.QDialog.Accepted),
+            start_time=lambda: "10:45:00",
+            end_buy_time=lambda: "14:10:00",
+            deleteLater=Mock(),
+        )
         with (
             patch.object(gui_windows, "show_toast") as toast,
-            patch.object(gui_windows, "ScheduleOperationDialog") as dialog,
+            patch.object(
+                gui_windows,
+                "ScheduleOperationDialog",
+                return_value=schedule_dialog,
+            ),
         ):
             window.toggle_mock_routine_instance_operation_mode(1)
-        dialog.assert_not_called()
-        self.assertEqual(initial_revision, self.host.current_session("005930")["revision"])
-        self.assertIn("서버 인증 완료", toast.call_args.args[1])
+            self.assertEqual(
+                "CONTINUOUS",
+                self.host.current_session("005930")["effective_settings_by_instance"]["A"]["operation_mode"],
+            )
+            window.set_mock_routine_instance_ats_flag(
+                1, "extra1", True, "장전프리"
+            )
+            self.assertEqual(
+                ["extra1"],
+                self.host.current_session("005930")["effective_settings_by_instance"]["A"]["manual_ats"]["selected_sessions"],
+            )
+            window.toggle_mock_routine_instance_operation_mode(1)
+            window.open_mock_routine_instance_schedule_dialog(1)
+        toast.assert_not_called()
+        connected.assert_not_called()
+        selected_account.assert_not_called()
+        pre_start = self.host.current_session("005930")
+        self.assertEqual(
+            "SCHEDULED",
+            pre_start["effective_settings_by_instance"]["A"]["operation_mode"],
+        )
+        self.assertEqual(
+            {"start_time": "10:45:00", "end_buy_time": "14:10:00"},
+            pre_start["effective_settings_by_instance"]["A"]["operation_schedule"],
+        )
+        self.assertEqual(
+            [],
+            pre_start["effective_settings_by_instance"]["A"]["manual_ats"]["selected_sessions"],
+        )
+        self.assertEqual(frozen_reference, pre_start["reference_snapshot"])
+        self.assertIsNone(
+            pre_start.get("mock_operation_lifecycle", {}).get("current")
+        )
 
         window.kiwoom_api = self.api
         self.host.start_instance_operation("005930", "A", as_of=NOW)
@@ -1284,6 +1412,195 @@ class MockValidationHostUiTest(unittest.TestCase):
             )
         )
         self.assertEqual(blocked_revision, self.host.current_session("005930")["revision"])
+
+    def test_validation_stopped_pre_start_settings_are_editable_until_restart(self):
+        created = self.create()
+        session_id = created["document"]["session"]["validation_session_id"]
+        self.actions.set_instance_effective_settings(
+            "005930",
+            "A",
+            operation_mode="CONTINUOUS",
+            manual_ats={"selected_sessions": ["extra2"]},
+        )
+        self.host.start_instance_operation("005930", "A", as_of=NOW)
+        stopped = self.host.stop_instance_validation(
+            "005930", "A", command_id="MC-stop-before-operation-mode-edit-A"
+        )["document"]
+        old_operation = deepcopy(
+            stopped["mock_operation_lifecycle"]["instance_operations"]["A"]
+        )
+        old_reference = deepcopy(stopped["reference_snapshot"])
+        old_stop_event = deepcopy(
+            next(
+                event
+                for event in reversed(self.host.repository.read_events(session_id))
+                if event["event_type"] == "VALIDATION_STOP_COMPLETED"
+                and event["routine_instance_id"] == "A"
+            )
+        )
+        self.assertEqual("WAITING", stopped["session"]["state"])
+        self.assertEqual(
+            "VALIDATION_STOPPED", stopped["instance_execution"]["A"]["state"]
+        )
+        self.assertFalse(stopped["instance_execution"]["A"]["progression_allowed"])
+        self.assertIsNone(stopped["mock_operation_lifecycle"]["current"])
+
+        window = self._phase1_mock_table_window()
+        window.load_routine_table()
+        connected = Mock(return_value=False)
+        selected_account = Mock(return_value="")
+        window.kiwoom_api = SimpleNamespace(is_connected=connected)
+        window.selected_account_no = selected_account
+        window._account_authentication_states = {}
+        with (
+            patch.object(gui_windows, "show_toast") as toast,
+            patch.object(
+                gui_windows,
+                "read_global_schedule",
+                return_value={
+                    "start_time": "09:00:00",
+                    "end_buy_time": "13:30:00",
+                },
+            ),
+        ):
+            window.toggle_mock_routine_instance_operation_mode(1)
+
+        toast.assert_not_called()
+        edited = self.host.current_session("005930")
+        self.assertEqual("WAITING", edited["session"]["state"])
+        self.assertEqual(
+            "VALIDATION_STOPPED", edited["instance_execution"]["A"]["state"]
+        )
+        self.assertFalse(edited["instance_execution"]["A"]["progression_allowed"])
+        self.assertIsNone(edited["mock_operation_lifecycle"]["current"])
+        self.assertEqual(
+            old_operation,
+            edited["mock_operation_lifecycle"]["instance_operations"]["A"],
+        )
+        self.assertEqual(old_reference, edited["reference_snapshot"])
+        self.assertEqual(
+            "SCHEDULED",
+            edited["effective_settings_by_instance"]["A"]["operation_mode"],
+        )
+
+        schedule_dialog = SimpleNamespace(
+            setWindowTitle=Mock(),
+            exec_=Mock(return_value=gui_windows.QDialog.Accepted),
+            start_time=lambda: "10:00:00",
+            end_buy_time=lambda: "13:00:00",
+            deleteLater=Mock(),
+        )
+        with patch.object(
+            gui_windows,
+            "ScheduleOperationDialog",
+            return_value=schedule_dialog,
+        ):
+            window.open_mock_routine_instance_schedule_dialog(1)
+        window.toggle_mock_routine_instance_operation_mode(1)
+        window.set_mock_routine_instance_ats_flag(1, "extra1", True, "장전프리")
+        connected.assert_not_called()
+        selected_account.assert_not_called()
+        self.actions.set_instance_effective_settings(
+            "005930", "A", initial_buy={"mode": "AMOUNT", "value": 5_000}
+        )
+        before_initial_value = self.host.current_session("005930")
+        self.actions.set_instance_initial_buy(
+            "005930",
+            "A",
+            mode="AMOUNT",
+            value=6_000,
+            apply_policy="PRE_OPERATION",
+            expected_validation_session_id=session_id,
+            expected_revision=before_initial_value["revision"],
+            expected_operation_session_id="",
+            requested_at=(NOW + timedelta(milliseconds=500)).isoformat(),
+        )
+        edited = self.host.current_session("005930")
+        self.assertEqual(
+            {
+                "initial_buy": {"mode": "AMOUNT", "value": 6_000},
+                "operation_schedule": {
+                    "start_time": "10:00:00",
+                    "end_buy_time": "13:00:00",
+                },
+                "operation_mode": "CONTINUOUS",
+                "manual_ats": {"selected_sessions": ["extra1"]},
+            },
+            instance_effective_settings(edited, "A"),
+        )
+        self.assertEqual(
+            old_operation,
+            edited["mock_operation_lifecycle"]["instance_operations"]["A"],
+        )
+        self.assertEqual(old_reference, edited["reference_snapshot"])
+        self.assertIsNone(edited["mock_operation_lifecycle"]["current"])
+
+        restarted = self.host.start_instance_operation(
+            "005930", "A", as_of=NOW + timedelta(seconds=1)
+        )
+        self.assertNotEqual(
+            old_operation["operation_session_id"],
+            restarted["operation"]["operation_session_id"],
+        )
+        self.assertEqual(
+            "CONTINUOUS",
+            restarted["operation"]["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ]["operation_mode"],
+        )
+        self.assertEqual(
+            {"selected_sessions": ["extra1"]},
+            restarted["operation"]["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ]["manual_ats"],
+        )
+        self.assertEqual(
+            {"mode": "AMOUNT", "value": 6_000},
+            restarted["operation"]["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ]["initial_buy"],
+        )
+        persisted_stop_event = next(
+            event
+            for event in self.host.repository.read_events(session_id)
+            if event["event_id"] == old_stop_event["event_id"]
+        )
+        self.assertEqual(old_stop_event, persisted_stop_event)
+
+        ended = self.create("005380")["document"]
+        ended_session_id = ended["session"]["validation_session_id"]
+        self.host.session_service.end_stock_session(
+            ended_session_id, command_id="MC-end-before-operation-mode-edit"
+        )
+        with self.assertRaisesRegex(
+            MockValidationError, "MOCK_INSTANCE_SETTINGS_REQUIRE_WAITING"
+        ):
+            self.host.session_service.set_instance_effective_settings(
+                ended_session_id,
+                routine_instance_id="A",
+                operation_mode="CONTINUOUS",
+                command_id="MC-ended-operation-mode-edit",
+            )
+
+        review_stopped = deepcopy(edited)
+        review_stopped["session"]["state"] = "REVIEW_STOPPED"
+        review_stopped["instance_execution"]["A"]["state"] = "REVIEW_STOPPED"
+        with (
+            patch.object(
+                self.host.session_service.repository,
+                "read_session",
+                return_value=review_stopped,
+            ),
+            self.assertRaisesRegex(
+                MockValidationError, "MOCK_INSTANCE_SETTINGS_REQUIRE_WAITING"
+            ),
+        ):
+            self.host.session_service.set_instance_effective_settings(
+                session_id,
+                routine_instance_id="A",
+                operation_mode="SCHEDULED",
+                command_id="MC-review-stopped-operation-mode-edit",
+            )
 
     def test_mock_instance_reset_retains_operation_settings(self):
         created = self.create()
@@ -1527,13 +1844,7 @@ class MockValidationHostUiTest(unittest.TestCase):
         self.assertEqual(frozen_hash, document["reference_snapshot"]["snapshot_hash"])
 
         stale_revision = document["revision"]
-        self.actions.set_instance_effective_settings(
-            "005930",
-            "B",
-            manual_ats={
-                "selected_sessions": ["extra1"],
-            },
-        )
+        self.host.start_instance_operation("005930", "B", as_of=NOW)
         with self.assertRaisesRegex(
             MockValidationError,
             "MOCK_INSTANCE_SETTINGS_REVISION_CONFLICT",
@@ -1916,8 +2227,17 @@ class MockValidationHostUiTest(unittest.TestCase):
         self.assertEqual("매수/매도", projection["display_status"])
         self.assertTrue(projection["status_cell_active"])
         self.assertTrue(projection["method_cell_active"])
-        self.assertFalse(projection["liquidation_cell_active"])
+        self.assertTrue(projection["liquidation_cell_active"])
 
+        active_settings = deepcopy(
+            document["effective_settings_by_instance"]["A"]
+        )
+        active_settings.update(
+            {
+                "operation_mode": "CONTINUOUS",
+                "manual_ats": {"selected_sessions": ["extra1"]},
+            }
+        )
         document["mock_operation_lifecycle"]["current"]["operation_policy_snapshot"] = {
             "regular_market": {
                 "start_time": "09:00:00",
@@ -1930,10 +2250,7 @@ class MockValidationHostUiTest(unittest.TestCase):
                     "end_time": "08:50:00",
                 }
             ],
-            "mock_instance_effective_settings": {
-                "operation_mode": "CONTINUOUS",
-                "manual_ats": {"selected_sessions": ["extra1"]},
-            },
+            "mock_instance_effective_settings": active_settings,
         }
         projection = mock_instance_projection(
             document,
@@ -1960,7 +2277,7 @@ class MockValidationHostUiTest(unittest.TestCase):
         )
         self.assertEqual("감시/대기", projection["display_status"])
         self.assertTrue(projection["status_cell_active"])
-        self.assertTrue(projection["method_cell_active"])
+        self.assertFalse(projection["method_cell_active"])
         self.assertFalse(projection["liquidation_cell_active"])
 
         document["progression_by_instance"]["A"] = {}
@@ -2033,6 +2350,219 @@ class MockValidationHostUiTest(unittest.TestCase):
         self.assertFalse(projection["status_cell_active"])
         self.assertFalse(projection["method_cell_active"])
         self.assertFalse(projection["liquidation_cell_active"])
+
+    def test_manual_current_liquidation_display_uses_effective_close_state_not_frozen_policy(self):
+        document = self.create()["document"]
+        frozen_hash = document["reference_snapshot"]["snapshot_hash"]
+        frozen_liquidation = document["reference_snapshot"]["display_contract"][
+            "liquidation"
+        ]["display_text"]
+        settings = document["effective_settings_by_instance"]["A"]
+        settings["operation_mode"] = "CONTINUOUS"
+        settings["manual_ats"]["selected_sessions"] = []
+        operation = {
+            "state": "RUNNING",
+            "close_source": "",
+            "close_method": "",
+            "operation_policy_snapshot": {
+                "regular_market": {
+                    "start_time": "09:00:00",
+                    "end_time": "15:20:00",
+                },
+                "extra_sessions": [
+                    {
+                        "enabled": True,
+                        "start_time": "08:00:00",
+                        "end_time": "08:50:00",
+                    }
+                ],
+                "mock_instance_effective_settings": deepcopy(settings),
+            },
+        }
+        document["mock_operation_lifecycle"] = {
+            "current": None,
+            "instance_operations": {"A": operation},
+        }
+        document["instance_execution"]["A"].update(
+            {"state": "RUNNING", "progression_allowed": True}
+        )
+
+        manual = mock_instance_projection(document, "A", as_of=NOW)
+        self.assertEqual("매수/매도", manual["display_status"])
+        self.assertEqual(
+            "-", manual["display_contract"]["liquidation"]["display_text"]
+        )
+        self.assertFalse(manual["liquidation_has_policy"])
+        self.assertFalse(manual["liquidation_cell_active"])
+
+        settings["manual_ats"]["selected_sessions"] = ["extra1"]
+        operation["operation_policy_snapshot"][
+            "mock_instance_effective_settings"
+        ] = deepcopy(settings)
+        manual_ats = mock_instance_projection(
+            document,
+            "A",
+            as_of=NOW.replace(hour=8, minute=30),
+        )
+        self.assertEqual("매수/매도", manual_ats["display_status"])
+        self.assertEqual(
+            "-", manual_ats["display_contract"]["liquidation"]["display_text"]
+        )
+        self.assertFalse(manual_ats["liquidation_has_policy"])
+        self.assertFalse(manual_ats["liquidation_cell_active"])
+
+        operation.update(
+            {"state": "CLOSING", "close_source": "EARLY", "close_method": "MARKET"}
+        )
+        document["instance_execution"]["A"]["state"] = "CLOSING"
+        next(
+            item
+            for item in document["positions"]
+            if item["routine_instance_id"] == "A"
+        )["holding_qty"] = 5
+        closing = mock_instance_projection(document, "A", as_of=NOW)
+        self.assertEqual("조기마감", closing["display_status"])
+        self.assertEqual(
+            "5분/시장가",
+            closing["display_contract"]["liquidation"]["display_text"],
+        )
+        self.assertTrue(closing["liquidation_has_policy"])
+        self.assertTrue(closing["liquidation_cell_active"])
+
+        self.assertEqual(frozen_hash, document["reference_snapshot"]["snapshot_hash"])
+        self.assertEqual(
+            frozen_liquidation,
+            document["reference_snapshot"]["display_contract"]["liquidation"][
+                "display_text"
+            ],
+        )
+
+    def test_mock_operation_mode_time_phase_liquidation_matrix(self):
+        document = self.create()["document"]
+        document["session"]["state"] = "RUNNING"
+        document["instance_execution"]["A"].update(
+            {"state": "RUNNING", "progression_allowed": True}
+        )
+        operation = {
+            "routine_instance_id": "A",
+            "state": "RUNNING",
+            "close_source": "",
+            "close_method": "",
+            "operation_policy_snapshot": {
+                "regular_market": {
+                    "start_time": "09:00:00",
+                    "end_time": "15:20:00",
+                },
+                "scheduled_operation": {
+                    "default_start_time": "09:00:00",
+                    "default_end_buy_time": "13:30:00",
+                },
+                "extra_sessions": [
+                    {
+                        "enabled": True,
+                        "start_time": "15:40:00",
+                        "end_time": "19:50:00",
+                    }
+                ],
+            },
+        }
+        document["mock_operation_lifecycle"] = {
+            "current": operation,
+            "instance_operations": {"A": operation},
+        }
+
+        def set_active_settings(mode, *, selected=()):
+            settings = deepcopy(document["effective_settings_by_instance"]["A"])
+            settings["operation_mode"] = mode
+            settings["operation_schedule"] = {
+                "start_time": "10:00:00",
+                "end_buy_time": "13:30:00",
+            }
+            settings["manual_ats"] = {"selected_sessions": list(selected)}
+            operation["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ] = settings
+
+        set_active_settings("CONTINUOUS")
+        for as_of, status, method_active in (
+            (NOW.replace(hour=8, minute=55), "감시/대기", False),
+            (NOW.replace(hour=10, minute=0), "매수/매도", True),
+            (NOW.replace(hour=21, minute=15), "감시/대기", False),
+        ):
+            with self.subTest(mode="CONTINUOUS", as_of=as_of.time()):
+                projected = mock_instance_projection(document, "A", as_of=as_of)
+                self.assertEqual(status, projected["display_status"])
+                self.assertIs(method_active, projected["method_cell_active"])
+                self.assertEqual(
+                    "-", projected["display_contract"]["liquidation"]["display_text"]
+                )
+                self.assertFalse(projected["liquidation_has_policy"])
+                self.assertFalse(projected["liquidation_phase_active"])
+                self.assertFalse(projected["liquidation_cell_active"])
+
+        set_active_settings("CONTINUOUS", selected=("extra1",))
+        for as_of, status, method_active in (
+            (NOW.replace(hour=16, minute=0), "매수/매도", True),
+            (NOW.replace(hour=15, minute=30), "감시/대기", False),
+            (NOW.replace(hour=19, minute=50), "감시/대기", False),
+        ):
+            with self.subTest(mode="CONTINUOUS_ATS", as_of=as_of.time()):
+                projected = mock_instance_projection(document, "A", as_of=as_of)
+                self.assertEqual(status, projected["display_status"])
+                self.assertIs(method_active, projected["method_cell_active"])
+                self.assertEqual(
+                    "-", projected["display_contract"]["liquidation"]["display_text"]
+                )
+                self.assertFalse(projected["liquidation_has_policy"])
+                self.assertFalse(projected["liquidation_phase_active"])
+                self.assertFalse(projected["liquidation_cell_active"])
+
+        set_active_settings("SCHEDULED")
+        for as_of, status, method_active, liquidation_active in (
+            (NOW.replace(hour=8, minute=55), "감시/대기", False, False),
+            (NOW.replace(hour=9, minute=30), "감시/대기", True, True),
+            (NOW.replace(hour=10, minute=0), "매수/매도", True, True),
+            (NOW.replace(hour=13, minute=30), "감시/대기", False, False),
+        ):
+            with self.subTest(mode="SCHEDULED", as_of=as_of.time()):
+                projected = mock_instance_projection(document, "A", as_of=as_of)
+                self.assertEqual(status, projected["display_status"])
+                self.assertIs(method_active, projected["method_cell_active"])
+                self.assertEqual(
+                    "5분/시장가",
+                    projected["display_contract"]["liquidation"]["display_text"],
+                )
+                self.assertTrue(projected["liquidation_has_policy"])
+                self.assertIs(
+                    liquidation_active, projected["liquidation_phase_active"]
+                )
+                self.assertIs(
+                    liquidation_active, projected["liquidation_cell_active"]
+                )
+
+    def test_main_mock_manual_row_displays_no_current_liquidation(self):
+        self.create()
+        self.actions.set_instance_effective_settings(
+            "005930", "A", operation_mode="CONTINUOUS"
+        )
+        self.host.start_instance_operation("005930", "A", as_of=NOW)
+        table = QTableWidget(0, len(main_table_loader.ROUTINE_MONITORING_HEADERS))
+        self.addCleanup(table.close)
+        window = SimpleNamespace(
+            routine_table=table,
+            mock_validation_host=self.host,
+        )
+
+        main_table_loader._load_mock_routine_table(window)
+
+        row = next(
+            row
+            for row in range(table.rowCount())
+            if table.item(row, 0).data(main_table_loader.ROUTINE_INSTANCE_ID_ROLE)
+            == "A"
+        )
+        values = table.item(row, 0).data(main_table_loader.ROUTINE_STOCK_VALUES_ROLE)
+        self.assertEqual("-", values[6])
 
     def test_single_instance_parent_has_identity_and_profit_only_and_mock_fills_drive_trade_counts(self):
         created = self.actions.create_waiting_session(_reference("005930", ("A",)))
@@ -2162,7 +2692,7 @@ class MockValidationHostUiTest(unittest.TestCase):
         )
         b_tokens = row_by_instance["B"].data(main_table_loader.ROUTINE_STOCK_DISPLAY_ROLE)
         self.assertEqual(
-            ("#ffffff", "#ffffff", "#f4f5f7"),
+            ("#ffffff", "#ffffff", "#ffffff"),
             tuple(b_tokens[index]["background"] for index in (4, 5, 6)),
         )
         self.assertEqual(
@@ -3089,6 +3619,366 @@ class MockValidationHostUiTest(unittest.TestCase):
         owner._select_mock_validation_instances.assert_not_called()
         actions.create_waiting_session.assert_not_called()
 
+    def test_mock_blank_registration_uses_official_stock_search_dialog(self):
+        selection_callback = Mock()
+        owner = SimpleNamespace(
+            _begin_mock_validation_for_selected_stock=selection_callback,
+        )
+        official_dialog = object()
+        with patch.object(
+            gui_windows,
+            "open_instance_stock_search_register_dialog",
+            return_value=official_dialog,
+        ) as open_official:
+            result = MainWindow.open_mock_stock_search_register_dialog(owner)
+
+        self.assertIs(official_dialog, result)
+        open_official.assert_called_once_with(
+            owner,
+            {
+                "row_kind": "unassigned",
+                "target_kind": "unassigned",
+                "instance_id": "",
+                "instance_name": "등록대기",
+                "definition_id": "",
+                "definition_name": "등록대기",
+            },
+            owner_attribute="mock_stock_search_register_window",
+            delete_on_close=True,
+            stock_selection_callback=selection_callback,
+        )
+
+    def test_new_mock_stock_zero_routines_does_not_commit_base_stock(self):
+        owner = SimpleNamespace(
+            mock_validation_host=SimpleNamespace(
+                current_session=Mock(return_value=None),
+            ),
+            mock_validation_ui_actions=SimpleNamespace(),
+            _select_mock_validation_instances=Mock(return_value=None),
+            begin_mock_validation=Mock(),
+        )
+        repository = Mock()
+        repository.resolve_stock_dir.return_value = (
+            self.project_root / "stocks" / "006380_카프로"
+        )
+        with (
+            patch.object(gui_windows, "StockRepository", return_value=repository),
+            patch.object(gui_windows, "append_central_base_stock") as append_base,
+        ):
+            self.assertFalse(
+                MainWindow._begin_mock_validation_for_selected_stock(
+                    owner,
+                    "006380",
+                    "카프로",
+                    needs_registration=True,
+                )
+            )
+
+        append_base.assert_not_called()
+        owner.begin_mock_validation.assert_not_called()
+
+    def test_new_mock_stock_commits_after_routine_selection_then_creates_mock(self):
+        selected = [SimpleNamespace(instance_id="A"), SimpleNamespace(instance_id="C")]
+        order = []
+        owner = SimpleNamespace(
+            mock_validation_host=SimpleNamespace(
+                current_session=Mock(return_value=None),
+            ),
+            mock_validation_ui_actions=SimpleNamespace(),
+            _select_mock_validation_instances=Mock(return_value=selected),
+            begin_mock_validation=Mock(
+                side_effect=lambda *_args, **_kwargs: order.append("mock") or True
+            ),
+        )
+        stock_dir = self.project_root / "stocks" / "006380_카프로"
+        repository = Mock()
+        repository.resolve_stock_dir.return_value = stock_dir
+        with (
+            patch.object(gui_windows, "StockRepository", return_value=repository),
+            patch.object(
+                gui_windows,
+                "append_central_base_stock",
+                side_effect=lambda *_args: order.append("base") or True,
+            ) as append_base,
+        ):
+            self.assertTrue(
+                MainWindow._begin_mock_validation_for_selected_stock(
+                    owner,
+                    "006380",
+                    "카프로",
+                    needs_registration=True,
+                )
+            )
+
+        self.assertEqual(["base", "mock"], order)
+        append_base.assert_called_once_with("006380", "카프로")
+        target = owner.begin_mock_validation.call_args.args[0]
+        self.assertEqual(("006380", "카프로", stock_dir), (
+            target.code,
+            target.name,
+            target.stock_dir,
+        ))
+        self.assertEqual(
+            selected,
+            owner.begin_mock_validation.call_args.kwargs["selected_instances"],
+        )
+
+    def test_existing_mock_stock_selection_does_not_reregister_or_change_production_assignment(self):
+        selected = [SimpleNamespace(instance_id="A")]
+        owner = SimpleNamespace(
+            mock_validation_host=SimpleNamespace(
+                current_session=Mock(return_value=None),
+            ),
+            mock_validation_ui_actions=SimpleNamespace(),
+            _select_mock_validation_instances=Mock(return_value=selected),
+            begin_mock_validation=Mock(return_value=True),
+        )
+        repository = Mock()
+        repository.resolve_stock_dir.return_value = (
+            self.project_root / "stocks" / "006380_카프로"
+        )
+        with (
+            patch.object(gui_windows, "StockRepository", return_value=repository),
+            patch.object(gui_windows, "append_central_base_stock") as append_base,
+        ):
+            self.assertTrue(
+                MainWindow._begin_mock_validation_for_selected_stock(
+                    owner,
+                    "006380",
+                    "카프로",
+                    needs_registration=False,
+                )
+            )
+
+        append_base.assert_not_called()
+        owner.begin_mock_validation.assert_called_once()
+
+    def test_existing_routine_dialog_mock_entry_starts_empty_and_returns_multi_identity(self):
+        instances = []
+        for instance_id in ("A", "B", "C"):
+            rules_path = self.project_root / f"{instance_id}.json"
+            rules_path.write_text("{}", encoding="utf-8")
+            instances.append(SimpleNamespace(
+                instance_id=instance_id,
+                definition_id="indicator_follow",
+                display_name=f"지표추종매매{instance_id}",
+                rules_path=rules_path,
+            ))
+        target = SimpleNamespace(code="006380", name="카프로", routine_instance_id="B")
+        owner = QMainWindow()
+        self.addCleanup(owner.close)
+        initially_checked = []
+
+        def select_first_and_third(dialog):
+            checkboxes = dialog.findChildren(gui_windows.QCheckBox)
+            initially_checked.extend(checkbox.isChecked() for checkbox in checkboxes)
+            checkboxes[0].setChecked(True)
+            checkboxes[2].setChecked(True)
+            return QDialog.Accepted
+
+        with (
+            patch.object(gui_windows, "load_persisted_routine_instances", return_value=instances),
+            patch.object(
+                gui_windows,
+                "routine_definition_by_id",
+                return_value=SimpleNamespace(definition_id="indicator_follow"),
+            ),
+            patch.object(gui_windows.QDialog, "exec_", select_first_and_third),
+        ):
+            selected = MainWindow._select_mock_validation_instances(
+                owner,
+                target,
+                initial_checked_routine_ids=(),
+                empty_selection_toast="모의검증할 루틴을 선택하세요.",
+            )
+
+        self.assertEqual([False, False, False], initially_checked)
+        self.assertEqual(["A", "C"], [instance.instance_id for instance in selected])
+
+    def test_existing_routine_dialog_zero_selection_uses_exact_toast_without_modal(self):
+        rules_path = self.project_root / "A.json"
+        rules_path.write_text("{}", encoding="utf-8")
+        instance = SimpleNamespace(
+            instance_id="A",
+            definition_id="indicator_follow",
+            display_name="지표추종매매A",
+            rules_path=rules_path,
+        )
+        target = SimpleNamespace(code="006380", name="카프로", routine_instance_id="A")
+        owner = QMainWindow()
+        self.addCleanup(owner.close)
+        with (
+            patch.object(gui_windows, "load_persisted_routine_instances", return_value=[instance]),
+            patch.object(
+                gui_windows,
+                "routine_definition_by_id",
+                return_value=SimpleNamespace(definition_id="indicator_follow"),
+            ),
+            patch.object(gui_windows.QDialog, "exec_", return_value=QDialog.Accepted),
+            patch.object(gui_windows, "show_toast") as toast,
+            patch.object(gui_windows.QMessageBox, "information") as information,
+        ):
+            selected = MainWindow._select_mock_validation_instances(
+                owner,
+                target,
+                initial_checked_routine_ids=(),
+                empty_selection_toast="모의검증할 루틴을 선택하세요.",
+            )
+
+        self.assertIsNone(selected)
+        toast.assert_called_once_with(owner, "모의검증할 루틴을 선택하세요.")
+        information.assert_not_called()
+
+    def test_existing_production_mock_entry_keeps_assigned_routine_preselection(self):
+        instances = []
+        for instance_id in ("A", "B"):
+            rules_path = self.project_root / f"production-{instance_id}.json"
+            rules_path.write_text("{}", encoding="utf-8")
+            instances.append(SimpleNamespace(
+                instance_id=instance_id,
+                definition_id="indicator_follow",
+                display_name=f"지표추종매매{instance_id}",
+                rules_path=rules_path,
+            ))
+        target = SimpleNamespace(code="006380", name="카프로", routine_instance_id="B")
+        owner = QMainWindow()
+        self.addCleanup(owner.close)
+        observed = []
+
+        def reject(dialog):
+            observed.extend(
+                checkbox.isChecked()
+                for checkbox in dialog.findChildren(gui_windows.QCheckBox)
+            )
+            return QDialog.Rejected
+
+        with (
+            patch.object(gui_windows, "load_persisted_routine_instances", return_value=instances),
+            patch.object(
+                gui_windows,
+                "routine_definition_by_id",
+                return_value=SimpleNamespace(definition_id="indicator_follow"),
+            ),
+            patch.object(gui_windows.QDialog, "exec_", reject),
+        ):
+            self.assertIsNone(MainWindow._select_mock_validation_instances(owner, target))
+
+        self.assertEqual([False, True], observed)
+
+    def test_registered_stock_entry_reuses_begin_with_empty_routine_selection(self):
+        stock_dir = self.project_root / "stocks" / "006380_카프로"
+        stock_dir.mkdir(parents=True)
+        target = SimpleNamespace(
+            stock_dir=stock_dir,
+            code="006380",
+            name="카프로",
+            routine_instance_id="",
+        )
+        owner = SimpleNamespace(begin_mock_validation=Mock(return_value=True))
+        self.assertTrue(MainWindow.begin_registered_stock_mock_validation(owner, target))
+
+        owner.begin_mock_validation.assert_called_once_with(
+            target,
+            initial_checked_routine_ids=(),
+            empty_selection_toast="모의검증할 루틴을 선택하세요.",
+        )
+
+    def test_mock_blank_registration_context_calls_official_opener_only(self):
+        owner = SimpleNamespace(open_mock_stock_search_register_dialog=Mock())
+
+        self.assertTrue(mock_context_menu._begin_mock_stock_registration(owner))
+
+        owner.open_mock_stock_search_register_dialog.assert_called_once_with()
+
+    def test_existing_backend_registers_only_all_selected_routine_identities(self):
+        stock_dir = self.project_root / "stocks" / "006380_카프로"
+        stock_dir.mkdir(parents=True)
+        selected = []
+        for instance_id in ("A", "C"):
+            rules_path = self.project_root / f"selected-{instance_id}.json"
+            rules_path.write_text("{}", encoding="utf-8")
+            selected.append(SimpleNamespace(
+                instance_id=instance_id,
+                definition_id="indicator_follow",
+                display_name=f"지표추종매매{instance_id}",
+                group_id="group-1",
+                rules_path=rules_path,
+            ))
+        target = SimpleNamespace(
+            code="006380",
+            name="카프로",
+            stock_dir=stock_dir,
+            routine_instance_id="",
+        )
+        actions = SimpleNamespace(create_waiting_session=Mock())
+        owner = SimpleNamespace(
+            mock_validation_host=SimpleNamespace(current_session=Mock(return_value=None)),
+            mock_validation_ui_actions=actions,
+            _select_mock_validation_instances=Mock(return_value=selected),
+        )
+        with (
+            patch.object(
+                gui_windows,
+                "default_config",
+                return_value={
+                    "trade_amount_type": "QUANTITY",
+                    "operation_mode": "CONTINUOUS",
+                },
+            ),
+            patch.object(
+                gui_windows,
+                "starting_budget_defaults",
+                return_value={
+                    "quantity": 1,
+                    "amount_multiplier": 1.0,
+                    "limit_recommended_multiplier": 1.0,
+                    "limit_minimum_multiplier": 1.0,
+                },
+            ),
+            patch.object(
+                gui_windows,
+                "read_global_schedule",
+                return_value={"start_time": "09:00:00", "end_buy_time": "13:30:00"},
+            ),
+            patch.object(
+                gui_windows,
+                "main_stock_resolved_initial_buy_display",
+                return_value={
+                    "mode": "QUANTITY",
+                    "badge": "주수",
+                    "value": 1,
+                    "value_text": "1주",
+                },
+            ),
+            patch.object(
+                gui_windows,
+                "auto_trade_setting_liquidation_text",
+                return_value="5분/시장가",
+            ),
+            patch.object(gui_windows, "show_toast"),
+        ):
+            self.assertTrue(MainWindow.begin_mock_validation(
+                owner,
+                target,
+                initial_checked_routine_ids=(),
+                empty_selection_toast="모의검증할 루틴을 선택하세요.",
+            ))
+
+        snapshot = actions.create_waiting_session.call_args.args[0]
+        self.assertEqual(
+            ["A", "C"],
+            [
+                item["routine_instance_id"]
+                for item in snapshot["routine_instances"]
+            ],
+        )
+        self.assertEqual(
+            {"A", "C"},
+            set(actions.create_waiting_session.call_args.kwargs[
+                "effective_settings_by_instance"
+            ]),
+        )
+
     def test_main_registration_freezes_official_display_projections_once(self):
         stock_dir = self.project_root / "stocks" / "005930_삼성전자"
         stock_dir.mkdir(parents=True)
@@ -3237,7 +4127,6 @@ class MockValidationHostUiTest(unittest.TestCase):
         window.load_routine_table = lambda: main_table_loader._load_mock_routine_table(window)
         for name in (
             "_mock_routine_instance_edit_target",
-            "_mock_operation_settings_edit_authorized",
             "_write_mock_routine_instance_settings",
             "open_mock_routine_instance_schedule_dialog",
             "reset_mock_routine_instance_schedule",
@@ -3260,6 +4149,41 @@ class MockValidationHostUiTest(unittest.TestCase):
             for row in range(table.rowCount())
             if table.item(row, 0).data(main_table_loader.ROUTINE_INSTANCE_ID_ROLE)
             == instance_id
+        )
+
+    def test_mock_blank_area_context_exposes_stock_registration_entry(self):
+        self.create()
+        window, _results = self._mock_context_window()
+        window._main_routine_stock_scope = "mock"
+        position = window.routine_table.viewport().rect().bottomRight()
+        self.assertIsNone(window.routine_table.itemAt(position))
+        _Menu.chosen_text = "종목등록"
+        _Menu.chosen_menu_title = None
+        with (
+            patch.object(mock_context_menu, "QMenu", _Menu),
+            patch.object(
+                mock_context_menu,
+                "_begin_mock_stock_registration",
+            ) as register,
+        ):
+            MainWindow.open_routine_context_menu(window, position)
+
+        register.assert_called_once_with(window)
+
+    def test_mock_blank_area_context_exposes_registration_and_all_unregister_only(self):
+        self.create()
+        window, _results = self._mock_context_window()
+        window._main_routine_stock_scope = "mock"
+        position = window.routine_table.viewport().rect().bottomRight()
+        self.assertIsNone(window.routine_table.itemAt(position))
+        _Menu.chosen_text = ""
+        _Menu.chosen_menu_title = None
+        with patch.object(mock_context_menu, "QMenu", _Menu):
+            MainWindow.open_routine_context_menu(window, position)
+
+        self.assertEqual(
+            ["종목등록", "전체해제"],
+            [action.text() for action in _Menu.root.actions],
         )
 
     def test_actual_context_signal_dispatches_parent_and_exact_instance_without_production_adapter(self):
@@ -3315,9 +4239,12 @@ class MockValidationHostUiTest(unittest.TestCase):
         self.assertNotIn("종목리셋", child_root_text)
         self.assertIn("검증종료", child_root_text)
         self.assertIn("간이차트", child_root_text)
+        self.assertIn("등록해제", child_root_text)
+        self.assertNotIn("전체해제", child_root_text)
         self.assertNotIn("운영일지", child_root_text)
         self.assertIn("시간변경", child_root_text)
         self.assertIn("변경리셋", child_root_text)
+        self.assertNotIn("종목등록", child_root_text)
         self.assertEqual(
             ["조기마감", "개별청산"],
             [submenu.title for submenu in _Menu.root.submenus],
@@ -3350,9 +4277,187 @@ class MockValidationHostUiTest(unittest.TestCase):
             "운영제외",
             "제외해제",
             "ATS설정",
-            "종목등록",
         ):
             self.assertNotIn(hidden, child_root_text)
+
+    def test_instance_unregister_removes_exact_identity_and_preserves_siblings(self):
+        created = self.create()
+        session_id = created["document"]["session"]["validation_session_id"]
+
+        result = self.actions.unregister_instance(
+            "005930",
+            "B",
+            expected_validation_session_id=session_id,
+        )
+
+        self.assertTrue(result["ok"])
+        document = self.host.current_session("005930")
+        self.assertIsNotNone(document)
+        self.assertEqual({"A", "C"}, set(document["instance_execution"]))
+        self.assertEqual(
+            {"A", "C"},
+            {
+                item["routine_instance_id"]
+                for item in document["reference_snapshot"]["routine_instances"]
+            },
+        )
+        for key in (
+            "effective_settings_by_instance",
+            "cycle_state_by_instance",
+            "progression_by_instance",
+        ):
+            self.assertEqual({"A", "C"}, set(document[key]))
+        for key in ("positions", "pnl"):
+            self.assertEqual(
+                {"A", "C"},
+                {item["routine_instance_id"] for item in document[key]},
+            )
+        self.assertEqual(
+            ["RETURN_REQUESTED", "RETURN_COMPLETED"],
+            [
+                event["event_type"]
+                for event in self.host.repository.read_events(session_id)
+                if event.get("routine_instance_id") == "B"
+            ],
+        )
+
+    def test_instance_unregister_stale_identity_is_fail_closed(self):
+        created = self.create()
+        before = deepcopy(self.host.current_session("005930"))
+
+        result = self.actions.unregister_instance(
+            "005930",
+            "B",
+            expected_validation_session_id="MV-stale",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("MOCK_CONTEXT_TARGET_STALE", result["reason"])
+        self.assertEqual(before, self.host.current_session("005930"))
+
+    def test_instance_unregister_uses_identity_when_display_names_match(self):
+        reference = _reference(instance_ids=("A", "B"))
+        for item in reference["routine_instances"]:
+            item["routine_instance_name"] = "동일 루틴명"
+        reference.pop("snapshot_hash", None)
+        reference["snapshot_hash"] = payload_hash(reference)
+        created = self.actions.create_waiting_session(reference)
+
+        result = self.actions.unregister_instance(
+            "005930",
+            "B",
+            expected_validation_session_id=created["document"]["session"][
+                "validation_session_id"
+            ],
+        )
+
+        self.assertTrue(result["ok"])
+        document = self.host.current_session("005930")
+        self.assertEqual({"A"}, set(document["instance_execution"]))
+        self.assertEqual(
+            ["동일 루틴명"],
+            [
+                item["routine_instance_name"]
+                for item in document["reference_snapshot"]["routine_instances"]
+            ],
+        )
+
+    def test_last_instance_unregister_uses_stock_boundary_and_keeps_program_stock(self):
+        created = self.actions.create_waiting_session(_reference(instance_ids=("A",)))
+        session_id = created["document"]["session"]["validation_session_id"]
+        stock_dir = self.project_root / "stocks" / "005930_삼성전자"
+        stock_dir.mkdir(parents=True)
+        config_path = stock_dir / "config.json"
+        config_path.write_text('{"routine":""}', encoding="utf-8")
+
+        result = self.actions.unregister_instance(
+            "005930",
+            "A",
+            expected_validation_session_id=session_id,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(self.host.current_session("005930"))
+        self.assertTrue(config_path.is_file())
+        self.assertEqual('{"routine":""}', config_path.read_text(encoding="utf-8"))
+
+    def test_unregister_all_preflights_then_removes_every_mock_registration(self):
+        self.actions.create_waiting_session(_reference("005380", ("A", "B"), stock_name="현대차"))
+        self.actions.create_waiting_session(_reference("032680", ("C",), stock_name="소프트센"))
+        production_paths = []
+        for folder in ("005380_현대차", "032680_소프트센"):
+            path = self.project_root / "stocks" / folder / "config.json"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"routine":"production-kept"}', encoding="utf-8")
+            production_paths.append(path)
+
+        result = self.actions.unregister_all()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual({}, self.host.repository.current_session_ids())
+        self.assertTrue(all(path.is_file() for path in production_paths))
+        self.assertTrue(
+            all(
+                path.read_text(encoding="utf-8") == '{"routine":"production-kept"}'
+                for path in production_paths
+            )
+        )
+
+    def test_unregister_all_ineligible_target_blocks_before_any_mutation(self):
+        first = self.actions.create_waiting_session(_reference("005380", ("A",), stock_name="현대차"))
+        second = self.actions.create_waiting_session(_reference("032680", ("B",), stock_name="소프트센"))
+        self.actions.start_instance("032680", "B")
+        before_ids = self.host.repository.current_session_ids()
+        with patch.object(self.actions, "unregister", wraps=self.actions.unregister) as unregister:
+            result = self.actions.unregister_all()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("PREFLIGHT", result["stage"])
+        self.assertEqual((), result["removed"])
+        unregister.assert_not_called()
+        self.assertEqual(before_ids, self.host.repository.current_session_ids())
+        self.assertEqual(
+            first["document"]["session"]["validation_session_id"],
+            self.host.current_session("005380")["session"]["validation_session_id"],
+        )
+        self.assertEqual(
+            second["document"]["session"]["validation_session_id"],
+            self.host.current_session("032680")["session"]["validation_session_id"],
+        )
+
+    def test_instance_context_unregister_dispatches_exact_fresh_target(self):
+        self.create()
+        window, results = self._mock_context_window()
+        table = window.routine_table
+        row = self._row_for_instance(table, "B")
+        position = table.visualItemRect(table.item(row, 0)).center()
+        _Menu.chosen_text = "등록해제"
+        _Menu.chosen_menu_title = None
+        with patch.object(mock_context_menu, "QMenu", _Menu):
+            table.customContextMenuRequested.emit(position)
+
+        self.assertTrue(results[-1]["ok"])
+        self.assertEqual(
+            {"A", "C"},
+            set(self.host.current_session("005930")["instance_execution"]),
+        )
+        self.assertNotIn("종목등록", [action.text() for action in _Menu.root.actions])
+        self.assertNotIn("전체해제", [action.text() for action in _Menu.root.actions])
+
+    def test_blank_context_all_unregister_dispatch_clears_current_mock_badge(self):
+        self.create("005930")
+        self.create("000660")
+        window, results = self._mock_context_window()
+        window._main_routine_stock_scope = "mock"
+        position = window.routine_table.viewport().rect().bottomRight()
+        _Menu.chosen_text = "전체해제"
+        _Menu.chosen_menu_title = None
+        with patch.object(mock_context_menu, "QMenu", _Menu):
+            MainWindow.open_routine_context_menu(window, position)
+
+        self.assertTrue(results[-1]["ok"])
+        self.assertEqual({}, self.host.repository.current_session_ids())
+        self.assertEqual(0, mock_badge_count(self.host.repository))
 
     def test_mock_multi_selection_context_start_applies_only_existing_instance_guards(self):
         first = self.create("005930")["document"]
@@ -3445,6 +4550,9 @@ class MockValidationHostUiTest(unittest.TestCase):
             "005930", "A", operation_mode="CONTINUOUS"
         )
         window, _results = self._mock_context_window()
+        window.kiwoom_api = SimpleNamespace(is_connected=Mock(return_value=False))
+        window.selected_account_no = Mock(return_value="")
+        window._account_authentication_states = {}
         table = window.routine_table
 
         def operation_display():
@@ -3502,7 +4610,9 @@ class MockValidationHostUiTest(unittest.TestCase):
             ):
                 table.customContextMenuRequested.emit(position)
 
-        choose("장전프리", "ATS설정")
+        with patch.object(gui_windows, "show_toast") as toast:
+            choose("장전프리", "ATS설정")
+        toast.assert_not_called()
         ats_text, ats_style = operation_display()
         self.assertEqual("수동+ATS", ats_text)
         self.assertEqual(expected_operation_style(), ats_style)

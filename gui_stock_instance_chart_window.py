@@ -768,13 +768,10 @@ def project_stock_operation_header_display(
         return _fallback_stock_operation_header_display(owner)
     try:
         from gui_auto_trade_policy import (
-            auto_trade_setting_liquidation_active,
             auto_trade_setting_current_session_trade_started,
-            auto_trade_setting_display_status_for_current_session,
-            auto_trade_setting_liquidation_text,
-            auto_trade_setting_method_text,
+            auto_trade_setting_row_projection,
             auto_trade_setting_trade_started,
-            effective_liquidation_policy_for_config,
+            auto_trade_stock_operation_category,
         )
         from gui_auto_trade_integrity import (
             is_emergency_stopped_state,
@@ -810,46 +807,33 @@ def project_stock_operation_header_display(
             trade_started,
             code,
         )
-        display_status = auto_trade_setting_display_status_for_current_session(
+        review_required = is_review_required_state(state)
+        operation_excluded = is_operation_excluded(config)
+        operation_category = auto_trade_stock_operation_category(
+            session_owner,
+            stock_code=code,
+            persisted_trade_started=trade_started,
+            operation_excluded=operation_excluded,
+            review_required=review_required,
+        )
+        row_projection = auto_trade_setting_row_projection(
             state,
             config,
+            operation_category=operation_category,
             holding_qty=holding_qty,
             buy_pending_qty=buy_pending_qty,
             sell_pending_qty=sell_pending_qty,
             current_session_trade_started=current_session_trade_started,
             persisted_trade_started=trade_started,
         )
-        method_text = auto_trade_setting_method_text(display_status, config, state)
-        liquidation_text = auto_trade_setting_liquidation_text(
-            config,
-            display_status,
-            state,
-            holding_qty=holding_qty,
-        )
-        status_cell_active = (
-            current_session_trade_started
-            and display_status not in ("긴급정지", "검토종목")
-        )
-        method_cell_active = (
-            status_cell_active
-            and display_status not in ("감시/대기", "-", "")
-        )
-        liquidation_has_policy = str(liquidation_text).strip() not in ("", "-")
-        _policy, liquidation_is_individual = effective_liquidation_policy_for_config(
-            config,
-            state,
-        )
-        liquidation_cell_active = (
-            current_session_trade_started
-            and holding_qty > 0
-            and auto_trade_setting_liquidation_active(
-                config,
-                holding_qty,
-                display_status=display_status,
-                state=state,
-            )
-            and liquidation_has_policy
-        )
+        display_status = str(row_projection.get("display_status") or "감시/대기")
+        method_text = str(row_projection.get("method_text") or "루틴")
+        liquidation_text = str(row_projection.get("liquidation_text") or "-")
+        status_cell_active = row_projection.get("status_cell_active") is True
+        method_cell_active = row_projection.get("method_cell_active") is True
+        liquidation_has_policy = row_projection.get("liquidation_has_policy") is True
+        liquidation_cell_active = row_projection.get("liquidation_cell_active") is True
+        liquidation_is_individual = row_projection.get("liquidation_is_individual") is True
 
         status_item = create_auto_trade_setting_status_item(display_status)
         method_item = QTableWidgetItem(method_text)
@@ -864,8 +848,6 @@ def project_stock_operation_header_display(
             liquidation_has_policy,
             liquidation_is_individual,
         )
-        review_required = is_review_required_state(state)
-        operation_excluded = is_operation_excluded(config)
         for item in (status_item, method_item, liquidation_item):
             apply_auto_trade_setting_protection_row_style(
                 item,
@@ -874,6 +856,12 @@ def project_stock_operation_header_display(
             )
 
         default_color = _auto_trade_setting_default_text_color(owner)
+        liquidation_color = _settings_item_text_color(
+            liquidation_item,
+            default_color,
+        )
+        if not liquidation_cell_active and not liquidation_is_individual:
+            liquidation_color = AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR
         current_running = False
         global_emergency_stopped = False
         if session_owner is not None:
@@ -891,10 +879,7 @@ def project_stock_operation_header_display(
             liquidation=liquidation_text,
             status_color=_settings_item_text_color(status_item, default_color),
             method_color=_settings_item_text_color(method_item, default_color),
-            liquidation_color=_settings_item_text_color(
-                liquidation_item,
-                default_color,
-            ),
+            liquidation_color=liquidation_color,
             identity_color=auto_trade_operation_identity_color(
                 operation_excluded=operation_excluded,
                 review_managed=review_required,
@@ -1018,15 +1003,9 @@ def _build_window_title(
     code = str(stock_code or "").strip()
     name = str(stock_name or "").strip()
     identity = " ".join(part for part in (code, name) if part) or "-"
-    return " / ".join(
-        (
-            identity,
-            str(instance_name or "").strip() or "-",
-            str(operation_title or "").strip() or "-",
-            str(bar_title or "").strip() or "-",
-            f"매수 {_nonnegative_count(buy_count)}",
-            f"매도 {_nonnegative_count(sell_count)}",
-        )
+    return (
+        f"{identity} ▷매수 {_nonnegative_count(buy_count)}"
+        f" / 매도 {_nonnegative_count(sell_count)}"
     )
 
 
@@ -1177,6 +1156,7 @@ class StockInstanceCloseChart(QWidget):
         self.live_price_data_quality = ""
         self.fixed_time_range: tuple[datetime, datetime] | None = None
         self.visible_time_ranges: list[tuple[datetime, datetime]] = []
+        self.nxt_available = False
         self.timeframe_minutes: int | None = None
         self.empty_message = "표시할 기준봉 데이터가 없습니다."
 
@@ -1212,6 +1192,7 @@ class StockInstanceCloseChart(QWidget):
         x_range_start: Any = None,
         x_range_end: Any = None,
         visible_time_ranges: Any = None,
+        nxt_available: Any = False,
         timeframe_minutes: Any = None,
         actual_fill_markers: Any = None,
         process_rails: Any = None,
@@ -1294,6 +1275,7 @@ class StockInstanceCloseChart(QWidget):
                 for marker in self.actual_fill_marker_records
                 if visible((marker["_occurred_at"], marker["_filled_price"]))
             ]
+        self.nxt_available = nxt_available is True
         self.actual_buy_fill_series = [
             (marker["_occurred_at"], marker["_filled_price"])
             for marker in self.actual_fill_marker_records
@@ -1423,6 +1405,35 @@ class StockInstanceCloseChart(QWidget):
             path.lineTo(points[1])
             painter.drawPath(path)
 
+    def _live_price_bridge_points(
+        self,
+        plot: QRectF | None = None,
+    ) -> tuple[QPointF, QPointF] | None:
+        if self.live_price_point is None or not self.close_series:
+            return None
+        target = plot or self._plot_rect()
+        live_time, live_price = self.live_price_point
+        endpoint = self.position_for(live_time, live_price, target)
+        visible_plot = target.adjusted(-1, -1, 1, 1)
+        if endpoint is None or not visible_plot.contains(endpoint):
+            return None
+        for bar_time, close in reversed(self.close_series):
+            startpoint = self.position_for(bar_time, close, target)
+            if startpoint is None or not visible_plot.contains(startpoint):
+                continue
+            if endpoint.x() <= startpoint.x():
+                return None
+            return startpoint, endpoint
+        return None
+
+    def _draw_live_price_bridge(self, painter: QPainter, plot: QRectF) -> None:
+        points = self._live_price_bridge_points(plot)
+        if points is None:
+            return
+        painter.setPen(QPen(LINE_COLOR, 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(*points)
+
     def _plot_rect(self) -> QRectF:
         return QRectF(
             92,
@@ -1469,17 +1480,26 @@ class StockInstanceCloseChart(QWidget):
         minimum_time, maximum_time = time_range
         time_span = (maximum_time - minimum_time).total_seconds()
         if self.fixed_time_range is not None:
-            label_times = [minimum_time]
-            next_hour = minimum_time.replace(
-                minute=0,
-                second=0,
-                microsecond=0,
-            ) + timedelta(hours=1)
-            while next_hour < maximum_time:
-                label_times.append(next_hour)
-                next_hour += timedelta(hours=1)
-            if label_times[-1] != maximum_time:
-                label_times.append(maximum_time)
+            if self.nxt_available:
+                label_times = []
+                next_label = minimum_time
+                while next_label < maximum_time:
+                    label_times.append(next_label)
+                    next_label += timedelta(minutes=90)
+            else:
+                label_times = [minimum_time]
+                next_hour = minimum_time.replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                ) + timedelta(hours=1)
+                while next_hour < maximum_time:
+                    label_times.append(next_hour)
+                    next_hour += timedelta(hours=1)
+                if label_times[-1] != maximum_time:
+                    label_times.append(maximum_time)
+                if maximum_time.strftime("%H:%M") == "15:30":
+                    label_times = [item for item in label_times if item != maximum_time]
         elif len(self.close_series) == 1:
             label_times = [self.close_series[0][0]]
         else:
@@ -1749,6 +1769,7 @@ class StockInstanceCloseChart(QWidget):
                 painter.drawEllipse(points[0], 2.5, 2.5)
 
         self._draw_session_gap_bridges(painter, plot)
+        self._draw_live_price_bridge(painter, plot)
 
         self._draw_average_price_projection(painter, plot)
 
@@ -1865,6 +1886,7 @@ class StockInstanceChartWindow(QDialog):
         self._bar_committed_refresh_pending = False
         self._live_price_operation_host = None
         self._live_price_refresh_timer: QTimer | None = None
+        self._operation_header_refresh_timer: QTimer | None = None
         self._operation_command_in_progress = False
         self._stock_operation_adapter = None
         self._stock_operation_executor = None
@@ -1879,9 +1901,6 @@ class StockInstanceChartWindow(QDialog):
                 stock_name=self._title_stock_name,
             )
         )
-        self.setMinimumSize(820, 428)
-        self.resize(self.minimumSize())
-
         self.info_labels: dict[str, QLabel] = {}
         self.operation_info_labels: dict[str, QLabel] = {}
         self.header_badges: dict[str, QLabel] = {}
@@ -1901,15 +1920,34 @@ class StockInstanceChartWindow(QDialog):
             fill_selected.connect(self._on_actual_fill_marker_selected)
         self.process_rail.processSelected.connect(self._on_execution_process_selected)
         self._setup_ui()
-        required_height = max(self.minimumHeight(), self.minimumSizeHint().height())
-        self.setMinimumHeight(required_height)
-        self.resize(self.width(), required_height)
         self.refresh_projection()
+        required_size = self.minimumSizeHint()
+        self.setMinimumSize(required_size)
+        self.resize(required_size)
         self._connect_operation_cycle_refresh()
         self._connect_bar_committed_refresh()
         self._start_live_price_refresh()
+        self._start_operation_header_refresh()
 
     LIVE_PRICE_REFRESH_INTERVAL_MS = 333
+    OPERATION_HEADER_REFRESH_INTERVAL_MS = PNL_REFRESH_INTERVAL_MS
+
+    def _start_operation_header_refresh(self) -> None:
+        if self.trade_date != _today_trade_date():
+            return
+        timer = QTimer(self)
+        timer.setObjectName("stockInstanceChartOperationHeaderRefreshTimer")
+        timer.setInterval(self.OPERATION_HEADER_REFRESH_INTERVAL_MS)
+        timer.timeout.connect(self.refresh_operation_header_projection)
+        self._operation_header_refresh_timer = timer
+        timer.start()
+
+    def refresh_operation_header_projection(self) -> None:
+        """Refresh only the canonical operation header projection."""
+
+        if self.trade_date != _today_trade_date():
+            return
+        self._update_operation_header_info()
 
     def _find_live_price_operation_host(self):
         current = persistent_feature_owner(self)
@@ -2144,6 +2182,10 @@ class StockInstanceChartWindow(QDialog):
             self._disconnect_operation_cycle_refresh()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        header_timer = self._operation_header_refresh_timer
+        if header_timer is not None:
+            header_timer.stop()
+        self._operation_header_refresh_timer = None
         live_timer = self._live_price_refresh_timer
         if live_timer is not None:
             live_timer.stop()
@@ -2208,19 +2250,19 @@ class StockInstanceChartWindow(QDialog):
             QWidget#stockInstanceCloseChart {
                 background: #FFFFFF;
             }
-            QLabel#stockInstanceChartInfoValue,
             QLabel#stockInstanceChartRoutineValue {
                 color: #111827;
-                font-size: 17px;
-                font-weight: 700;
-            }
-            QLabel#stockInstanceChartStockValue,
-            QLabel#stockInstanceChartPnlValue {
-                font-size: 21px;
+                font-size: 13px;
                 font-weight: 700;
             }
             QLabel#stockInstanceChartStockValue {
+                font-size: 14px;
+                font-weight: 700;
                 color: #1D4ED8;
+            }
+            QLabel#stockInstanceChartPnlValue {
+                font-size: 21px;
+                font-weight: 700;
             }
             QLabel#stockInstanceChartSummaryValue {
                 font-size: 20px;
@@ -2228,71 +2270,44 @@ class StockInstanceChartWindow(QDialog):
             }
             QFrame#stockInstanceChartOperationInfo {
                 background: transparent;
-                border: 1px solid __AUTO_TRADE_SETTING_PERFORMANCE_BORDER_COLOR__;
-                border-radius: 3px;
+                border: none;
             }
-            """.replace(
-                "__AUTO_TRADE_SETTING_PERFORMANCE_BORDER_COLOR__",
-                AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
-            )
+            """
         )
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
+        root.setContentsMargins(8, 6, 8, 8)
         root.setSpacing(0)
 
         info_panel = QFrame()
         info_panel.setObjectName("stockInstanceChartInfoPanel")
         info_layout = QHBoxLayout(info_panel)
-        info_layout.setContentsMargins(18, 8, 14, 8)
-        info_layout.setSpacing(8)
+        info_layout.setContentsMargins(6, 4, 6, 4)
+        info_layout.setSpacing(12)
 
         left_block = QWidget()
         left_block.setObjectName("stockInstanceChartHeaderLeftBlock")
         left_layout = QVBoxLayout(left_block)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
+        left_layout.setSpacing(1)
         routine_value = QLabel("-")
         routine_value.setObjectName("stockInstanceChartRoutineValue")
         routine_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         routine_value.setMinimumWidth(0)
-        routine_value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        routine_value.setAlignment(Qt.AlignCenter)
+        routine_value.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        routine_value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         left_layout.addWidget(routine_value)
         self.info_labels["routine"] = routine_value
         stock_value = QLabel("-")
         stock_value.setObjectName("stockInstanceChartStockValue")
         stock_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         stock_value.setMinimumWidth(0)
-        stock_value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        stock_value.setAlignment(Qt.AlignCenter)
+        stock_value.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        stock_value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         left_layout.addWidget(stock_value)
         self.info_labels["stock"] = stock_value
 
         badge_font = _auto_trade_setting_badge_font(persistent_feature_owner(self))
         segment_widths = _stock_operation_header_segment_widths(badge_font)
-        operation_info = QFrame()
-        operation_info.setObjectName("stockInstanceChartOperationInfo")
-        operation_info_layout = QHBoxLayout(operation_info)
-        operation_info_layout.setContentsMargins(8, 4, 8, 4)
-        operation_info_layout.setSpacing(16)
-        for key in ("status", "method", "liquidation"):
-            label = QLabel("-")
-            label.setObjectName("stockInstanceChartOperationInfoValue")
-            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            label.setFont(QFont(badge_font))
-            label.setFixedWidth(segment_widths[key])
-            operation_info_layout.addWidget(label)
-            self.operation_info_labels[key] = label
-        operation_info.setFixedWidth(
-            sum(segment_widths.values())
-            + (operation_info_layout.spacing() * 2)
-            + operation_info_layout.contentsMargins().left()
-            + operation_info_layout.contentsMargins().right()
-            + 2  # 1px frame border on both sides
-        )
-        self.operation_info_panel = operation_info
-        left_layout.addWidget(operation_info, 0, Qt.AlignHCenter)
-
         badge_row = QWidget()
         badge_row.setObjectName("stockInstanceChartHeaderBadges")
         badge_layout = QHBoxLayout(badge_row)
@@ -2309,19 +2324,38 @@ class StockInstanceChartWindow(QDialog):
             badge.setStyleSheet(_chart_header_badge_stylesheet(active=True))
             badge_layout.addWidget(badge, 0, Qt.AlignVCenter)
             self.header_badges[key] = badge
+        badge_layout.addStretch(1)
         self.header_badge_row = badge_row
         self.header_badge_layout = badge_layout
-        left_layout.addWidget(badge_row, 0, Qt.AlignHCenter)
-        left_block.setMinimumWidth(operation_info.width())
-        left_block.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        left_layout.addWidget(badge_row, 0, Qt.AlignLeft)
+        left_block.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.header_left_block = left_block
-        info_layout.addWidget(left_block, 0, Qt.AlignVCenter)
+        info_layout.addWidget(left_block, 0, Qt.AlignTop)
+
+        operation_info = QFrame()
+        operation_info.setObjectName("stockInstanceChartOperationInfo")
+        operation_info_layout = QVBoxLayout(operation_info)
+        operation_info_layout.setContentsMargins(0, 0, 0, 0)
+        operation_info_layout.setSpacing(0)
+        bullet_width = QFontMetrics(badge_font).horizontalAdvance("· ")
+        for key in ("status", "method", "liquidation"):
+            label = QLabel("· -")
+            label.setObjectName("stockInstanceChartOperationInfoValue")
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label.setFont(QFont(badge_font))
+            label.setMinimumWidth(max(segment_widths.values()) + bullet_width)
+            operation_info_layout.addWidget(label)
+            self.operation_info_labels[key] = label
+        operation_info.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.operation_info_panel = operation_info
+        info_layout.addWidget(operation_info, 0, Qt.AlignTop)
+        info_layout.addStretch(1)
 
         right_block = QWidget()
         right_block.setObjectName("stockInstanceChartHeaderRightBlock")
-        right_layout = QHBoxLayout(right_block)
+        right_layout = QVBoxLayout(right_block)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        right_layout.setSpacing(2)
         pnl_value = QLabel("-")
         pnl_value.setObjectName("stockInstanceChartPnlValue")
         pnl_font = QFont(pnl_value.font())
@@ -2331,17 +2365,13 @@ class StockInstanceChartWindow(QDialog):
         pnl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         pnl_value.setMinimumWidth(0)
         pnl_value.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
-        pnl_value.setAlignment(Qt.AlignCenter)
-        pnl_value.setFixedWidth(
-            _stock_instance_chart_pnl_display_width(pnl_font)
-        )
+        pnl_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.info_labels["cumulative_pnl"] = pnl_value
-        right_layout.addStretch(1)
-        right_layout.addWidget(pnl_value, 0, Qt.AlignVCenter)
+        right_layout.addWidget(pnl_value, 0, Qt.AlignRight)
 
         action_block = QWidget()
         action_block.setObjectName("stockInstanceChartHeaderActionBlock")
-        action_layout = QVBoxLayout(action_block)
+        action_layout = QHBoxLayout(action_block)
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(4)
 
@@ -2362,37 +2392,18 @@ class StockInstanceChartWindow(QDialog):
         button_width = max(
             button_metrics.horizontalAdvance(self.early_close_button.text()),
             button_metrics.horizontalAdvance(self.immediate_liquidation_button.text()),
-        ) + 24
+        ) + 18
         for button in (
             self.early_close_button,
             self.immediate_liquidation_button,
         ):
-            button.setFixedSize(button_width, 30)
+            button.setFixedSize(button_width, 24)
             action_layout.addWidget(button)
-        operation_top_margin, operation_bottom_margin = (
-            _operation_info_vertical_margins(self.early_close_button)
-        )
-        operation_info_layout.setContentsMargins(
-            operation_info_layout.contentsMargins().left(),
-            operation_top_margin,
-            operation_info_layout.contentsMargins().right(),
-            operation_bottom_margin,
-        )
-        operation_info.setFixedHeight(
-            QFontMetrics(badge_font).height()
-            + operation_top_margin
-            + operation_bottom_margin
-            + 2  # 1px frame border on both sides
-        )
         self.header_action_block = action_block
-        right_layout.addWidget(
-            action_block,
-            0,
-            Qt.AlignRight | Qt.AlignVCenter,
-        )
-        right_block.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        right_layout.addWidget(action_block, 0, Qt.AlignRight)
+        right_block.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.header_right_block = right_block
-        info_layout.addWidget(right_block, 1, Qt.AlignVCenter)
+        info_layout.addWidget(right_block, 0, Qt.AlignTop | Qt.AlignRight)
         root.addWidget(info_panel)
 
         chart_panel = QFrame()
@@ -2570,6 +2581,12 @@ class StockInstanceChartWindow(QDialog):
             self.stock_code,
             persistent_feature_owner(self),
         )
+        self._apply_operation_header_display(display)
+
+    def _apply_operation_header_display(
+        self,
+        display: StockOperationHeaderDisplay,
+    ) -> None:
         stock_label = self.info_labels.get("stock")
         if stock_label is not None:
             stock_label.setStyleSheet(f"color: {display.identity_color};")
@@ -2582,7 +2599,7 @@ class StockInstanceChartWindow(QDialog):
             label = self.operation_info_labels.get(key)
             if label is None:
                 continue
-            label.setText(str(value or "-").strip() or "-")
+            label.setText(f"· {str(value or '-').strip() or '-'}")
             label.setStyleSheet(f"color: {color};")
         self._update_header_badges(
             status_text=display.status,
@@ -2888,7 +2905,9 @@ class StockInstanceChartWindow(QDialog):
             else "-"
         )
 
-        self.info_labels["routine"].setText(instance_name or "-")
+        self.info_labels["routine"].setText(
+            f"▶ {instance_name}" if instance_name else "-"
+        )
         self.info_labels["stock"].setText(
             " ".join(part for part in (stock_code, stock_name) if part) or "-"
         )
@@ -2925,6 +2944,7 @@ class StockInstanceChartWindow(QDialog):
             x_range_start=x_range_start,
             x_range_end=x_range_end,
             visible_time_ranges=visible_time_ranges,
+            nxt_available=data.get("nxt_available") is True,
             timeframe_minutes=bar_minutes,
             actual_fill_markers=data.get("actual_fill_markers", []),
             process_rails=data.get("execution_process_rails", []),

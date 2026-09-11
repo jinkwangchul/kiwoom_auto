@@ -360,6 +360,46 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual("INSTANCE_UNKNOWN", result.error_code)
 
+    def test_delete_blocks_direct_writer_when_stock_is_assigned(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            created = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Assigned Routine",
+                ),
+                {},
+            )
+            stock_dir = root / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
+            config_path = stock_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "code": "005930",
+                        "name": "삼성전자",
+                        "routines": ["Assigned Routine"],
+                        "assigned_routine_instance_id": str(INSTANCE_ID),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config_before = config_path.read_bytes()
+
+            result = repository.delete_instance(str(INSTANCE_ID))
+
+            self.assertTrue(created.success)
+            self.assertFalse(result.success)
+            self.assertEqual(
+                "ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS",
+                result.error_code,
+            )
+            self.assertEqual(1, result.assigned_stock_count)
+            self.assertTrue((root / "routine_instances" / str(INSTANCE_ID)).is_dir())
+            self.assertEqual(config_before, config_path.read_bytes())
+
     def test_update_buy_limit_toggles_enabled_amount_without_touching_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

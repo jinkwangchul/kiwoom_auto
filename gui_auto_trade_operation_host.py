@@ -438,7 +438,7 @@ class AutoTradeOperationHost(QObject):
         return self._market_data_host.high_resolution_market_data_snapshot()
 
     def tr_governor_metrics_snapshot(self):
-        getter = getattr(self.kiwoom_api, "tr_governor_metrics_snapshot", None)
+        getter = getattr(self._kiwoom_api(), "tr_governor_metrics_snapshot", None)
         return getter() if callable(getter) else None
 
     def prepare_market_data_operation_cycle(self, snapshot, minute_key: str) -> dict[str, object]:

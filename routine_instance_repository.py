@@ -108,6 +108,8 @@ class RoutineInstanceDeleteResult:
     success: bool
     error_code: str = ""
     error: str = ""
+    assigned_stock_count: int = 0
+    mock_registration_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -238,12 +240,15 @@ class RoutineInstanceRepository:
             temp_dir.mkdir()
             self._write_json(temp_dir / "instance.json", metadata)
             self._write_json(temp_dir / "rules.json", deepcopy(rules))
-            self._verify_staged_instance(temp_dir, metadata)
+            self._verify_staged_instance(temp_dir, metadata, rules)
             os.replace(temp_dir, final_dir)
 
             instance = self.get_instance(instance_id)
             if instance is None:
                 raise RuntimeError("저장된 등록 루틴을 다시 읽어 검증하지 못했습니다.")
+            saved_rules = json.loads(Path(instance.rules_path).read_text(encoding="utf-8"))
+            if saved_rules != rules:
+                raise RuntimeError("등록된 적용 설정이 검증된 설정과 일치하지 않습니다.")
             _append_instance_lifecycle_event(
                 "ROUTINE_INSTANCE_CREATED",
                 instance=instance,
@@ -339,6 +344,52 @@ class RoutineInstanceRepository:
                 False,
                 error_code="INSTANCE_UNKNOWN",
                 error="삭제할 등록 루틴을 찾을 수 없습니다.",
+            )
+
+        from routine_instance_deletion_service import (
+            ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS,
+            ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS_MESSAGE,
+            ROUTINE_INSTANCE_DELETE_MOCK_REGISTRATIONS,
+            ROUTINE_INSTANCE_DELETE_MOCK_REGISTRATIONS_MESSAGE,
+            assigned_stocks_for_routine_instance,
+            current_mock_registrations_for_routine_instance,
+        )
+
+        try:
+            assigned_stocks = assigned_stocks_for_routine_instance(
+                self.project_root,
+                instance.instance_id,
+            )
+        except Exception as exc:
+            return RoutineInstanceDeleteResult(
+                False,
+                error_code="ROUTINE_INSTANCE_DELETE_DEPENDENCY_UNAVAILABLE",
+                error=str(exc) or type(exc).__name__,
+            )
+        if assigned_stocks:
+            return RoutineInstanceDeleteResult(
+                False,
+                error_code=ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS,
+                error=ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS_MESSAGE,
+                assigned_stock_count=len(assigned_stocks),
+            )
+        try:
+            mock_registrations = current_mock_registrations_for_routine_instance(
+                self.project_root,
+                instance.instance_id,
+            )
+        except Exception as exc:
+            return RoutineInstanceDeleteResult(
+                False,
+                error_code="ROUTINE_INSTANCE_DELETE_DEPENDENCY_UNAVAILABLE",
+                error=str(exc) or type(exc).__name__,
+            )
+        if mock_registrations:
+            return RoutineInstanceDeleteResult(
+                False,
+                error_code=ROUTINE_INSTANCE_DELETE_MOCK_REGISTRATIONS,
+                error=ROUTINE_INSTANCE_DELETE_MOCK_REGISTRATIONS_MESSAGE,
+                mock_registration_count=len(mock_registrations),
             )
 
         instance_dir = self.instances_root / instance.instance_id
@@ -569,10 +620,16 @@ class RoutineInstanceRepository:
             os.fsync(handle.fileno())
 
     @staticmethod
-    def _verify_staged_instance(instance_dir: Path, expected_metadata: dict[str, Any]) -> None:
+    def _verify_staged_instance(
+        instance_dir: Path,
+        expected_metadata: dict[str, Any],
+        expected_rules: dict[str, Any],
+    ) -> None:
         metadata = json.loads((instance_dir / "instance.json").read_text(encoding="utf-8"))
         rules = json.loads((instance_dir / "rules.json").read_text(encoding="utf-8"))
         if metadata != expected_metadata:
             raise ValueError("instance.json 저장 후 검증이 일치하지 않습니다.")
         if not isinstance(rules, dict):
             raise ValueError("rules.json 저장 후 JSON 객체 검증에 실패했습니다.")
+        if rules != expected_rules:
+            raise ValueError("rules.json 저장 후 검증된 적용 설정과 일치하지 않습니다.")

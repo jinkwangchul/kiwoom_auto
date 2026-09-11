@@ -627,6 +627,82 @@ def instance_effective_settings(
     return default_instance_effective_settings(reference, instance_id)
 
 
+def mock_instance_active_operation(
+    document: dict[str, Any], routine_instance_id: str
+) -> dict[str, Any] | None:
+    """Return the target Instance's current RUNNING/CLOSING operation, if any."""
+
+    instance_id = clean_text(routine_instance_id)
+    lifecycle = document.get("mock_operation_lifecycle")
+    if not isinstance(lifecycle, dict):
+        return None
+    operations = lifecycle.get("instance_operations")
+    operation = operations.get(instance_id) if isinstance(operations, dict) else None
+    if (
+        isinstance(operation, dict)
+        and clean_text(operation.get("state")).upper()
+        in {SESSION_RUNNING, SESSION_CLOSING}
+    ):
+        return operation
+    current = lifecycle.get("current")
+    current_instance_id = (
+        clean_text(current.get("routine_instance_id"))
+        if isinstance(current, dict)
+        else ""
+    )
+    if (
+        isinstance(current, dict)
+        and current_instance_id in {"", instance_id}
+        and clean_text(current.get("state")).upper()
+        in {SESSION_RUNNING, SESSION_CLOSING}
+    ):
+        return current
+    return None
+
+
+def mock_instance_pre_start_editable(
+    document: dict[str, Any], routine_instance_id: str
+) -> bool:
+    """Project whether next-start Mock settings are editable without mutation."""
+
+    instance_id = clean_text(routine_instance_id)
+    execution = document.get("instance_execution")
+    if not isinstance(execution, dict) or not isinstance(execution.get(instance_id), dict):
+        return False
+    lifecycle = document.get("mock_operation_lifecycle")
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    return (
+        clean_text(document.get("session", {}).get("state")).upper()
+        == SESSION_WAITING
+        and clean_text(execution[instance_id].get("state")).upper()
+        in {SESSION_WAITING, INSTANCE_VALIDATION_STOPPED}
+        and not isinstance(lifecycle.get("current"), dict)
+        and mock_instance_active_operation(document, instance_id) is None
+    )
+
+
+def mock_instance_active_effective_settings(
+    document: dict[str, Any], routine_instance_id: str
+) -> dict[str, Any] | None:
+    """Return the immutable settings snapshot only for an active operation."""
+
+    instance_id = clean_text(routine_instance_id)
+    operation = mock_instance_active_operation(document, instance_id)
+    snapshot = (
+        operation.get("operation_policy_snapshot")
+        if isinstance(operation, dict)
+        else None
+    )
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    direct = snapshot.get("mock_instance_effective_settings")
+    if isinstance(direct, dict):
+        return deepcopy(direct)
+    by_instance = snapshot.get("mock_effective_settings_by_instance")
+    if isinstance(by_instance, dict) and isinstance(by_instance.get(instance_id), dict):
+        return deepcopy(by_instance[instance_id])
+    return None
+
+
 def validate_reference_snapshot(snapshot: Any) -> dict[str, Any]:
     if not isinstance(snapshot, dict):
         raise MockValidationError("MOCK_REFERENCE_SNAPSHOT_INVALID")
@@ -1088,6 +1164,9 @@ __all__ = [name for name in globals() if name.startswith(("MOCK_", "SESSION_", "
     "initial_session_document",
     "instance_initial_buy_adjustment",
     "instance_effective_settings",
+    "mock_instance_active_effective_settings",
+    "mock_instance_active_operation",
+    "mock_instance_pre_start_editable",
     "new_mock_identity",
     "normalized_stock_code",
     "now_text",

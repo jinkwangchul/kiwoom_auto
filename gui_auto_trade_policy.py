@@ -1258,19 +1258,16 @@ def auto_trade_setting_liquidation_text(
     단, 유효한 일회성 개별청산 요청이 있으면 해당 Command 값을 우선 표시한다.
     조기마감 상태에서는 청산정책 표시가 가능하다.
     """
-    policy = read_operation_policy()
     status_text = auto_trade_setting_display_status(display_status)
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     early_close_forced = auto_trade_setting_early_close_requested(state)
     individual_policy = individual_liquidation_policy_from_state(state)
     has_individual = bool(individual_policy)
-    manual = policy.get("manual_operation", {}) if isinstance(policy.get("manual_operation"), dict) else {}
     if (
         not has_individual
         and not early_close_forced
-        and status_text != "조기마감"
+        and status_text not in {"조기마감", "자동마감", "청산"}
         and mode == "CONTINUOUS"
-        and not bool(manual.get("use_liquidation_policy", False))
     ):
         return "-"
 

@@ -283,6 +283,87 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         self.assertEqual(result["stage"], "awaiting_cancel_confirmation")
         builder.assert_not_called()
 
+    def test_zero_holding_completes_without_order_candidate_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["holding_qty"] = 0
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            window = Mock()
+            window.queue_pending_order_cancellations_for_stock_automatically.return_value = {
+                "ok": True,
+                "cancel_requested": 0,
+                "cancel_pending": 0,
+            }
+            with (
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(close, "pending_order_side_quantities", return_value=(0, 0)),
+                patch.object(
+                    close,
+                    "read_execution_queue_records",
+                    return_value={"ok": True, "records": ()},
+                ),
+                patch.object(close, "build_close_liquidation_candidate_preview") as builder,
+                patch.object(close, "commit_close_liquidation_candidate_preview") as commit,
+            ):
+                result = close._start_close_liquidation_execution(
+                    window,
+                    stock_dir=stock,
+                    code="005930",
+                    name="Samsung",
+                    method="시장가",
+                    command_id="command-zero",
+                    requested_at="2026-07-27 13:30:00",
+                    routine_instance_id="routine-instance-1",
+                    reason="EARLY_CLOSE",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("completed", result["stage"])
+        self.assertEqual("EARLY_CLOSED", result["runtime_status"])
+        builder.assert_not_called()
+        commit.assert_not_called()
+        window.process_executable_order_for_auto_trade.assert_not_called()
+        window.send_order_for_order_queued_automatically.assert_not_called()
+
+    def test_zero_holding_with_pending_side_quantity_does_not_false_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["holding_qty"] = 0
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            for pending in ((1, 0), (0, 1)):
+                with self.subTest(pending=pending):
+                    window = Mock()
+                    window.queue_pending_order_cancellations_for_stock_automatically.return_value = {
+                        "ok": True,
+                        "cancel_requested": 0,
+                        "cancel_pending": 0,
+                    }
+                    with (
+                        patch.object(close, "_production_recovery_gate", return_value=None),
+                        patch.object(close, "pending_order_side_quantities", return_value=pending),
+                        patch.object(close, "build_close_liquidation_candidate_preview") as builder,
+                    ):
+                        result = close._start_close_liquidation_execution(
+                            window,
+                            stock_dir=stock,
+                            code="005930",
+                            name="Samsung",
+                            method="시장가",
+                            command_id="command-zero-pending",
+                            requested_at="2026-07-27 13:30:00",
+                            routine_instance_id="routine-instance-1",
+                            reason="EARLY_CLOSE",
+                        )
+
+                    self.assertFalse(result["ok"])
+                    self.assertEqual("pending_cancel_evidence", result["stage"])
+                    self.assertEqual("REVIEW_REQUIRED", result["runtime_status"])
+                    builder.assert_not_called()
+
     def test_no_pending_order_enters_existing_executable_pipeline_once(self):
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp))

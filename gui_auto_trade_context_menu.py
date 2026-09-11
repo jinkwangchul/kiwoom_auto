@@ -78,6 +78,84 @@ CONTEXT_MENU_DANGER_TEXT_COLOR = "#DC2626"
 CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR = "#15803D"
 CONTEXT_MENU_DISABLED_TEXT_COLOR = "#AFB2B9"
 _MENU_TEXT_COLOR_PROPERTY = "menuTextColor"
+_QT_MENU_CLASS = QMenu
+
+
+class PersistentContextMenu(QMenu):
+    """Keep one popup instance open while registered leaf actions run."""
+
+    def __init__(self, parent=None, *, persistent_root=None) -> None:
+        super().__init__(parent)
+        self._persistent_root = persistent_root or self
+        if self._persistent_root is self:
+            self._persistent_handlers: dict[int, tuple[Callable[[], None], bool]] = {}
+            self._persistent_context_invalidated = False
+
+    def addMenu(self, title):
+        if isinstance(title, QMenu):
+            return super().addMenu(title)
+        submenu = PersistentContextMenu(
+            self,
+            persistent_root=self._persistent_root,
+        )
+        submenu.setTitle(str(title))
+        super().addMenu(submenu)
+        return submenu
+
+    def register_persistent_action(
+        self,
+        action,
+        handler: Callable[[], None],
+        *,
+        terminal: bool = False,
+    ) -> None:
+        root = self._persistent_root
+        root._persistent_handlers[id(action)] = (handler, bool(terminal))
+        action.setProperty("persistentContextAction", not terminal)
+        action.setProperty("terminalContextAction", bool(terminal))
+
+    def _activate_registered_action(self, action) -> bool:
+        if action is None or not action.isEnabled() or action.isSeparator():
+            return False
+        if action.menu() is not None:
+            return False
+        registered = self._persistent_root._persistent_handlers.get(id(action))
+        if registered is None:
+            return False
+        handler, terminal = registered
+        root = self._persistent_root
+        was_visible = root.isVisible()
+        root._persistent_context_invalidated = False
+        if action.isCheckable():
+            action.toggle()
+        handler()
+        if terminal:
+            root.close()
+        elif not root._persistent_context_invalidated:
+            # A modal dialog temporarily dismisses Qt's popup.  Restore the
+            # same menu instance after the callback, never a rebuilt menu.
+            if was_visible and not root.isVisible():
+                root.show()
+            self.setActiveAction(action)
+        return True
+
+    def invalidate_persistent_context(self) -> None:
+        root = self._persistent_root
+        root._persistent_context_invalidated = True
+        root.close()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._activate_registered_action(self.actionAt(event.pos())):
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            if self._activate_registered_action(self.activeAction()):
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 def _menu_item_text_color(widget: QMenu, option: QStyleOptionMenuItem) -> QColor:
@@ -582,7 +660,13 @@ def _apply_menu_status(
 
 
 def _new_stock_context_menu(parent) -> QMenu:
-    menu = QMenu(parent)
+    # Tests and compatibility callers may replace the module-level QMenu with a
+    # lightweight stand-in.  Keep that legacy construction path intact.
+    menu = (
+        PersistentContextMenu(parent)
+        if QMenu is _QT_MENU_CLASS
+        else QMenu(parent)
+    )
     set_tooltips_visible = getattr(menu, "setToolTipsVisible", None)
     if callable(set_tooltips_visible):
         set_tooltips_visible(True)
@@ -895,6 +979,7 @@ def _add_ats_settings_menu(
         "current_state": current_state,
         "session_actions": tuple(session_actions),
         "toggle_session": toggle_session,
+        "refresh": refresh_session_status,
         "market": action_market,
         "current": action_current,
     }
@@ -935,6 +1020,66 @@ def _dispatch_ats_settings_action(
         )
         liquidate(method, current_state, visible_keys, selected_sessions)
     return True
+
+
+def _append_stock_context_decision(
+    selected_option: str,
+    decision_event_type: str,
+    targets: Iterable[tuple[object, str, str]],
+) -> None:
+    if not selected_option:
+        return
+    target_list = list(targets)
+    codes = [
+        str(code or "").strip()
+        for _path, code, _name in target_list
+        if str(code or "").strip()
+    ]
+    names = [
+        str(name or "").strip()
+        for _path, _code, name in target_list
+        if str(name or "").strip()
+    ]
+    correlation = (
+        {"stock_code": codes[0], "stock_name": names[0] if names else None}
+        if len(codes) == 1
+        else {}
+    )
+    append_production_event(
+        decision_event_type,
+        result="ACCEPTED",
+        source="gui_auto_trade_context_menu.show_monitor_stock_context_menu",
+        target_type="STOCK_SELECTION",
+        target_id=",".join(codes) or None,
+        target_name=",".join(names) or "선택 종목",
+        details={
+            "interaction_type": "SELECTION",
+            "prompt_key": "MONITOR_STOCK_CONTEXT_MENU",
+            "prompt_title": "종목 운영 메뉴",
+            "prompt_summary": "선택 종목에 적용할 context action",
+            "offered_options": [
+                "OPERATION_START",
+                "EMERGENCY_STOP",
+                "EMERGENCY_RELEASE",
+                "OPERATION_EXCLUDE",
+                "OPERATION_EXCLUSION_RELEASE",
+                "EARLY_CLOSE_ROUTINE",
+                "EARLY_CLOSE_MARKET",
+                "EARLY_CLOSE_CURRENT",
+                "EARLY_CLOSE_PROFIT_LOSS",
+                "EARLY_CLOSE_CARRY",
+                "EARLY_CLOSE_CANCEL",
+                "LIQUIDATION_MARKET",
+                "LIQUIDATION_CURRENT",
+                "LIQUIDATION_CARRY",
+                "ATS_LIQUIDATION_MARKET",
+                "ATS_LIQUIDATION_CURRENT",
+            ],
+            "selected_option": selected_option,
+            "target_count": len(target_list),
+        },
+        **correlation,
+    )
 
 
 def show_monitor_stock_context_menu(
@@ -1309,7 +1454,222 @@ def show_monitor_stock_context_menu(
         fallback="대상 종목을 선택하세요.",
     )
 
+    registrar = getattr(menu, "register_persistent_action", None)
+    if callable(registrar):
+        def context_targets_valid() -> bool:
+            for raw_path, raw_code, _name in targets:
+                target_path = Path(raw_path)
+                stock_code = normalize_stock_code(str(raw_code or ""))
+                folder_code = normalize_stock_code(target_path.name.partition("_")[0])
+                if not target_path.exists() or not stock_code or folder_code != stock_code:
+                    return False
+            return True
+
+        def refresh_entry(action, enabled: bool, reason_code: str, fallback: str) -> None:
+            if action is None:
+                return
+            action.setEnabled(bool(enabled))
+            if enabled:
+                for setter_name in ("setToolTip", "setStatusTip"):
+                    setter = getattr(action, setter_name, None)
+                    if callable(setter):
+                        setter("")
+                return
+            _set_disabled_reason(
+                action,
+                enabled=False,
+                reason_code=reason_code,
+                fallback=fallback,
+            )
+
+        def refresh_persistent_state() -> None:
+            if not context_targets_valid():
+                menu.invalidate_persistent_context()
+                return
+            current_excluded = bool(
+                targets
+                and all(
+                    is_operation_excluded(read_json_dict(Path(stock_dir) / "config.json"))
+                    for stock_dir, _code, _name in targets
+                )
+            )
+            refreshed = inspect_stock_context_menu_availability(
+                parent,
+                has_selection=has_selection,
+                callbacks=callbacks,
+                selected_targets=targets,
+                operation_excluded=current_excluded,
+                operation_exclusion_action=exclusion_action,
+                stock_register_enabled=stock_register_enabled,
+                scheduled_excluded_management=scheduled_excluded_management,
+                operation_policy=_context_menu_operation_policy(),
+            )
+            menu._stock_context_availability = refreshed
+            refresh_entry(action_start, refreshed.start_allowed, refreshed.reason_for("start"), "현재 선택한 종목은 운영을 시작할 수 없습니다.")
+            refresh_entry(action_emergency_stop, refreshed.emergency_stop_allowed, refreshed.reason_for("emergency_stop"), "현재 선택한 종목은 운영을 정지할 수 없습니다.")
+            refresh_entry(action_stock_register, refreshed.stock_register_allowed, refreshed.reason_for("stock_register"), "현재 선택한 종목은 등록할 수 없습니다.")
+            refresh_entry(action_unregister, refreshed.unregister_allowed, refreshed.reason_for("unregister"), "현재 선택한 종목은 루틴에서 해제할 수 없습니다.")
+            refresh_entry(action_open_charts, refreshed.chart_allowed, refreshed.reason_for("chart"), "대상 종목을 선택하세요.")
+            refresh_entry(action_time_change, refreshed.time_management_allowed, refreshed.reason_for("time_management"), "대상 종목을 선택하세요.")
+            refresh_entry(action_time_reset, refreshed.time_management_allowed, refreshed.reason_for("time_management"), "대상 종목을 선택하세요.")
+            refresh_entry(
+                early_close["menu"],
+                refreshed.early_close_allowed or refreshed.early_close_cancel_allowed,
+                refreshed.reason_for("early_close") or refreshed.reason_for("early_close_cancel"),
+                "현재 선택한 종목은 조기마감 설정을 변경할 수 없습니다.",
+            )
+            for key in ("routine", "market", "current", "profit_loss", "carry"):
+                refresh_entry(early_close[key], refreshed.early_close_allowed, refreshed.reason_for("early_close"), "현재 선택한 종목은 조기마감할 수 없습니다.")
+            refresh_entry(early_close["cancel"], refreshed.early_close_cancel_allowed, refreshed.reason_for("early_close_cancel"), "현재 선택한 종목은 조기마감을 취소할 수 없습니다.")
+            refresh_entry(
+                individual["menu"],
+                refreshed.individual_liquidation_allowed,
+                refreshed.reason_for("individual_liquidation"),
+                "현재 선택한 종목은 개별청산할 수 없습니다.",
+            )
+            if ats_settings is not None:
+                refresh_entry(
+                    ats_settings["menu"],
+                    refreshed.ats_settings_allowed,
+                    refreshed.reason_for("ats_settings"),
+                    "현재 선택한 종목의 ATS 설정을 변경할 수 없습니다.",
+                )
+                ats_refresh = ats_settings.get("refresh")
+                if callable(ats_refresh):
+                    ats_refresh()
+
+        def persistent_decision(chosen_action) -> tuple[str, str]:
+            event_type = "OPERATOR_OPERATION_DECISION"
+            option = ""
+            if chosen_action == action_start:
+                option = "OPERATION_START"
+            elif chosen_action == action_emergency_stop:
+                option = "EMERGENCY_STOP"
+            elif chosen_action == action_set_exclusion:
+                option, event_type = "OPERATION_EXCLUDE", "OPERATOR_SETTING_DECISION"
+            elif chosen_action == action_clear_exclusion:
+                option, event_type = "OPERATION_EXCLUSION_RELEASE", "OPERATOR_SETTING_DECISION"
+            elif chosen_action == early_close["routine"]:
+                option = "EARLY_CLOSE_ROUTINE"
+            elif chosen_action == early_close["market"]:
+                option = "EARLY_CLOSE_MARKET"
+            elif chosen_action == early_close["current"]:
+                option = "EARLY_CLOSE_CURRENT"
+            elif chosen_action == early_close["profit_loss"]:
+                option = "EARLY_CLOSE_PROFIT_LOSS"
+            elif chosen_action == early_close["carry"]:
+                option = "EARLY_CLOSE_CARRY"
+            elif chosen_action == early_close["cancel"]:
+                option = "EARLY_CLOSE_CANCEL"
+            elif chosen_action == individual["market"]:
+                option = "LIQUIDATION_MARKET"
+            elif chosen_action == individual["current"]:
+                option = "LIQUIDATION_CURRENT"
+            elif chosen_action == individual["carry"]:
+                option = "LIQUIDATION_CARRY"
+            elif ats_settings is not None and chosen_action == ats_settings["market"]:
+                option = "ATS_LIQUIDATION_MARKET"
+            elif ats_settings is not None and chosen_action == ats_settings["current"]:
+                option = "ATS_LIQUIDATION_CURRENT"
+            return option, event_type
+
+        def dispatch_persistent_action(chosen_action) -> None:
+            if not context_targets_valid() or not _menu_entry_enabled(chosen_action):
+                menu.invalidate_persistent_context()
+                return
+            option, event_type = persistent_decision(chosen_action)
+            _append_stock_context_decision(option, event_type, targets)
+            if chosen_action == action_start and callbacks.start is not None:
+                callbacks.start()
+            elif chosen_action == action_emergency_stop and callbacks.emergency_stop is not None:
+                callbacks.emergency_stop()
+            elif chosen_action == action_stock_register and callbacks.stock_register is not None:
+                callbacks.stock_register()
+            elif chosen_action == action_select_all:
+                callbacks.select_all()
+            elif chosen_action == action_clear_selection:
+                callbacks.clear_selection()
+            elif chosen_action == action_set_exclusion and callbacks.set_operation_exclusion is not None:
+                callbacks.set_operation_exclusion()
+            elif chosen_action == action_clear_exclusion and callbacks.clear_operation_exclusion is not None:
+                callbacks.clear_operation_exclusion()
+            elif chosen_action == action_unregister and callbacks.unregister is not None:
+                callbacks.unregister()
+            elif chosen_action == action_open_charts and callbacks.open_charts is not None:
+                callbacks.open_charts()
+            elif chosen_action == action_mock_create and callbacks.mock_create is not None:
+                callbacks.mock_create()
+            elif _dispatch_early_close_action(
+                chosen_action,
+                early_close,
+                apply_method=callbacks.early_close,
+                apply_profit_loss=callbacks.early_close_profit_loss,
+                cancel=callbacks.early_close_cancel,
+            ):
+                pass
+            elif chosen_action == individual["market"]:
+                callbacks.individual_liquidation("시장가", individual["minutes"])
+            elif chosen_action == individual["current"]:
+                callbacks.individual_liquidation("현재가", individual["minutes"])
+            elif chosen_action == individual["carry"]:
+                callbacks.individual_liquidation("이월", individual["minutes"])
+            elif chosen_action == action_time_change and callbacks.time_change is not None:
+                callbacks.time_change()
+            elif chosen_action == action_time_reset and callbacks.time_reset is not None:
+                callbacks.time_reset()
+            elif ats_settings is not None and _dispatch_ats_settings_action(
+                chosen_action,
+                ats_settings,
+                toggle=callbacks.ats_toggle,
+                liquidate=callbacks.ats_liquidation,
+            ):
+                pass
+            else:
+                for minute, time_action in individual["time_actions"]:
+                    if chosen_action == time_action:
+                        callbacks.individual_liquidation(individual["method"], minute)
+                        break
+            refresh_persistent_state()
+
+        persistent_actions = [
+            action_start,
+            action_emergency_stop,
+            action_open_charts,
+            action_time_change,
+            action_time_reset,
+            *[early_close[key] for key in ("routine", "market", "current", "profit_loss", "carry", "cancel")],
+            individual["market"],
+            individual["current"],
+            individual["carry"],
+            *[action for _minute, action in individual["time_actions"]],
+        ]
+        if ats_settings is not None:
+            persistent_actions.extend((ats_settings["market"], ats_settings["current"]))
+        for persistent_action in persistent_actions:
+            if persistent_action is not None:
+                registrar(
+                    persistent_action,
+                    lambda action=persistent_action: dispatch_persistent_action(action),
+                )
+        for terminal_action in (
+            action_select_all,
+            action_clear_selection,
+            action_set_exclusion,
+            action_clear_exclusion,
+            action_stock_register,
+            action_unregister,
+            action_mock_create,
+        ):
+            if terminal_action is not None:
+                registrar(
+                    terminal_action,
+                    lambda action=terminal_action: dispatch_persistent_action(action),
+                    terminal=True,
+                )
+
     chosen = menu.exec_(global_pos)
+    if callable(registrar):
+        return
     if chosen is None:
         return
     allowed_actions = [action_select_all, action_clear_selection]
@@ -1389,45 +1749,7 @@ def show_monitor_stock_context_menu(
     elif ats_settings is not None and chosen == ats_settings["current"]:
         selected_option = "ATS_LIQUIDATION_CURRENT"
 
-    if selected_option:
-        codes = [str(code or "").strip() for _path, code, _name in targets if str(code or "").strip()]
-        names = [str(name or "").strip() for _path, _code, name in targets if str(name or "").strip()]
-        correlation = {"stock_code": codes[0], "stock_name": names[0] if names else None} if len(codes) == 1 else {}
-        append_production_event(
-            decision_event_type,
-            result="ACCEPTED",
-            source="gui_auto_trade_context_menu.show_monitor_stock_context_menu",
-            target_type="STOCK_SELECTION",
-            target_id=",".join(codes) or None,
-            target_name=",".join(names) or "선택 종목",
-            details={
-                "interaction_type": "SELECTION",
-                "prompt_key": "MONITOR_STOCK_CONTEXT_MENU",
-                "prompt_title": "종목 운영 메뉴",
-                "prompt_summary": "선택 종목에 적용할 context action",
-                "offered_options": [
-                    "OPERATION_START",
-                    "EMERGENCY_STOP",
-                    "EMERGENCY_RELEASE",
-                    "OPERATION_EXCLUDE",
-                    "OPERATION_EXCLUSION_RELEASE",
-                    "EARLY_CLOSE_ROUTINE",
-                    "EARLY_CLOSE_MARKET",
-                    "EARLY_CLOSE_CURRENT",
-                    "EARLY_CLOSE_PROFIT_LOSS",
-                    "EARLY_CLOSE_CARRY",
-                    "EARLY_CLOSE_CANCEL",
-                    "LIQUIDATION_MARKET",
-                    "LIQUIDATION_CURRENT",
-                    "LIQUIDATION_CARRY",
-                    "ATS_LIQUIDATION_MARKET",
-                    "ATS_LIQUIDATION_CURRENT",
-                ],
-                "selected_option": selected_option,
-                "target_count": len(targets),
-            },
-            **correlation,
-        )
+    _append_stock_context_decision(selected_option, decision_event_type, targets)
     if action_start is not None and chosen == action_start:
         callbacks.start()
     elif action_emergency_stop is not None and chosen == action_emergency_stop:

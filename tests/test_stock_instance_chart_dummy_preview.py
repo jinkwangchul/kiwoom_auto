@@ -78,7 +78,7 @@ class StockInstanceChartDummyPreviewTests(unittest.TestCase):
         self.assertEqual(3, len(window.chart.buy_series))
         self.assertEqual(2, len(window.chart.sell_series))
         self.assertEqual(
-            "005380 현대차 / 지표추종매매 / 인스턴스 A / 시간운영 / 5분봉 / 매수 3 / 매도 2",
+            "005380 현대차 ▷매수 3 / 매도 2",
             window.windowTitle(),
         )
         self.assertNotIn("status", window.info_labels)

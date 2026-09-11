@@ -32,8 +32,10 @@ from mock_validation_contract import (
     initial_session_document,
     instance_initial_buy_adjustment,
     instance_effective_settings,
+    mock_instance_pre_start_editable,
     new_mock_identity,
     now_text,
+    payload_hash,
     transition_mock_order,
     validate_instance_effective_settings,
     validate_instance_initial_buy_adjustment,
@@ -50,6 +52,56 @@ def mock_instance_error_recovery_reset_allowed(
         and isinstance(operation, dict)
         and clean_text(operation.get("state")) == SESSION_RUNNING
     )
+
+
+def mock_routine_instance_unregister_eligibility(
+    document: dict[str, Any], routine_instance_id: str
+) -> dict[str, Any]:
+    """Read-only eligibility for removing one Mock Routine registration."""
+
+    instance_id = clean_text(routine_instance_id)
+    execution = document.get("instance_execution")
+    if not isinstance(execution, dict) or instance_id not in execution:
+        return {"eligible": False, "reason": "MOCK_CONTEXT_TARGET_STALE"}
+    if document.get("review", {}).get("review_required") is True:
+        return {"eligible": False, "reason": "MOCK_REVIEW_UNRESOLVED"}
+    if any(
+        clean_text(item.get("routine_instance_id")) == instance_id
+        and clean_text(item.get("state"))
+        in {ORDER_CREATED, ORDER_OPEN, ORDER_PARTIAL_FILL, ORDER_CANCEL_PENDING}
+        for item in document.get("orders", ())
+        if isinstance(item, dict)
+    ):
+        return {"eligible": False, "reason": "MOCK_ACTIVE_EXECUTION"}
+    if any(
+        clean_text(item.get("routine_instance_id")) == instance_id
+        and int(item.get("holding_qty", 0) or 0) > 0
+        for item in document.get("positions", ())
+        if isinstance(item, dict)
+    ):
+        return {"eligible": False, "reason": "MOCK_POSITION_REMAINS"}
+    lifecycle = document.get("mock_operation_lifecycle")
+    current = lifecycle.get("current") if isinstance(lifecycle, dict) else None
+    if isinstance(current, dict) and clean_text(current.get("state")) in {
+        SESSION_RUNNING,
+        SESSION_CLOSING,
+    }:
+        return {"eligible": False, "reason": "MOCK_OPERATION_ACTIVE"}
+    operations = (
+        lifecycle.get("instance_operations") if isinstance(lifecycle, dict) else None
+    )
+    operation = operations.get(instance_id) if isinstance(operations, dict) else None
+    if (
+        clean_text(execution[instance_id].get("state"))
+        in {SESSION_RUNNING, SESSION_CLOSING}
+        or (
+            isinstance(operation, dict)
+            and clean_text(operation.get("state"))
+            in {SESSION_RUNNING, SESSION_CLOSING}
+        )
+    ):
+        return {"eligible": False, "reason": "MOCK_INSTANCE_OPERATION_ACTIVE"}
+    return {"eligible": True, "reason": ""}
 
 
 class MockValidationSessionService:
@@ -266,14 +318,11 @@ class MockValidationSessionService:
         manual_ats: dict[str, Any] | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Persist one WAITING Instance setting through the Mock repository only."""
+        """Persist one admitted Instance setting through the Mock repository only."""
 
         before = self.repository.read_session(session_id)
         instance_id = self._require_instance(before, routine_instance_id)
-        execution_state = clean_text(
-            before["instance_execution"][instance_id].get("state")
-        ).upper()
-        if execution_state != SESSION_WAITING:
+        if not mock_instance_pre_start_editable(before, instance_id):
             raise MockValidationError("MOCK_INSTANCE_SETTINGS_REQUIRE_WAITING")
         current = instance_effective_settings(before, instance_id)
         candidate = deepcopy(current)
@@ -362,7 +411,7 @@ class MockValidationSessionService:
             if isinstance(operation, dict)
             else ""
         )
-        if execution_state == SESSION_WAITING:
+        if mock_instance_pre_start_editable(before, instance_id):
             if policy != MOCK_BUDGET_POLICY_PRE_OPERATION:
                 raise MockValidationError("MOCK_INSTANCE_INITIAL_BUY_APPLY_POLICY_INVALID")
             if clean_text(expected_operation_session_id):
@@ -1310,6 +1359,7 @@ class MockValidationSessionService:
         command_id: str,
         reason_code: str = "",
         payload: dict[str, Any] | None = None,
+        routine_instance_id: str = "",
     ) -> dict[str, Any]:
         """Append idempotent Mock-owned evidence for registration removal."""
 
@@ -1328,7 +1378,104 @@ class MockValidationSessionService:
             command_id=clean_text(command_id),
             reason_code=clean_text(reason_code),
             payload=details,
+            routine_instance_id=clean_text(routine_instance_id),
         )
+
+    def unregister_routine_instance(
+        self,
+        session_id: str,
+        *,
+        routine_instance_id: str,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one eligible Instance from an existing Mock stock container."""
+
+        command = clean_text(command_id) or new_mock_identity("MC")
+        before = self.repository.read_session(session_id)
+        instance_id = self._require_instance(before, routine_instance_id)
+        eligibility = mock_routine_instance_unregister_eligibility(before, instance_id)
+        if eligibility.get("eligible") is not True:
+            return {
+                "ok": False,
+                "reason": eligibility.get("reason"),
+                "stage": "ELIGIBILITY",
+            }
+        if len(before["instance_execution"]) <= 1:
+            return {
+                "ok": False,
+                "reason": "MOCK_LAST_ROUTINE_REQUIRES_STOCK_UNREGISTER",
+                "stage": "BOUNDARY",
+            }
+        changed_at = self._now()
+
+        def mutation(document: dict[str, Any]) -> dict[str, Any]:
+            snapshot = document["reference_snapshot"]
+            snapshot["routine_instances"] = [
+                item
+                for item in snapshot["routine_instances"]
+                if clean_text(item.get("routine_instance_id")) != instance_id
+            ]
+            snapshot.pop("snapshot_hash", None)
+            snapshot["snapshot_hash"] = payload_hash(snapshot)
+            document["session"]["reference_snapshot_hash"] = snapshot["snapshot_hash"]
+            for key in (
+                "effective_settings_by_instance",
+                "initial_buy_adjustments_by_instance",
+                "instance_execution",
+                "cycle_state_by_instance",
+                "progression_by_instance",
+            ):
+                value = document.get(key)
+                if isinstance(value, dict):
+                    value.pop(instance_id, None)
+            for key in ("orders", "fills", "positions", "pnl"):
+                document[key] = [
+                    item
+                    for item in document.get(key, ())
+                    if clean_text(item.get("routine_instance_id")) != instance_id
+                ]
+            lifecycle = document.get("mock_operation_lifecycle")
+            if isinstance(lifecycle, dict):
+                operations = lifecycle.get("instance_operations")
+                removed_operation_ids: set[str] = set()
+                if isinstance(operations, dict):
+                    removed = operations.pop(instance_id, None)
+                    if isinstance(removed, dict):
+                        removed_operation_ids.add(
+                            clean_text(removed.get("operation_session_id"))
+                        )
+                history = lifecycle.get("history")
+                if isinstance(history, list):
+                    lifecycle["history"] = [
+                        item
+                        for item in history
+                        if clean_text(item.get("routine_instance_id")) != instance_id
+                    ]
+                commands = lifecycle.get("commands")
+                if isinstance(commands, dict) and removed_operation_ids:
+                    lifecycle["commands"] = {
+                        key: value
+                        for key, value in commands.items()
+                        if clean_text(value.get("entity_id")) not in removed_operation_ids
+                    }
+            document["applied_commands"][command] = {
+                "operation": "UNREGISTER_ROUTINE_INSTANCE",
+                "applied_at": changed_at,
+                "entity_id": instance_id,
+            }
+            return document
+
+        result = self.repository.mutate_session(
+            session_id,
+            mutation,
+            expected_revision=before["revision"],
+        )
+        return {
+            "ok": True,
+            "removed": True,
+            "routine_instance_id": instance_id,
+            **result,
+        }
 
     def end_stock_session(self, session_id: str, *, command_id: str | None = None) -> dict[str, Any]:
         command = clean_text(command_id) or new_mock_identity("MC")

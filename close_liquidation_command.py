@@ -344,8 +344,6 @@ def inspect_close_liquidation_availability(
         )
 
     if normalized_intent == EARLY_CLOSE_REQUEST:
-        if holding_qty <= 0:
-            return _blocked(reason_code="NO_HOLDING", **common)
         if auto_trade_setting_liquidation_phase_active(
             config,
             holding_qty,

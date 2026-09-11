@@ -126,6 +126,52 @@ def _current_operation_identity(document: dict[str, Any], instance_id: str) -> s
     )
 
 
+def _operation_header_display_from_projection(
+    display: dict[str, Any],
+) -> dict[str, Any]:
+    display_contract = display.get("display_contract")
+    display_contract = display_contract if isinstance(display_contract, dict) else {}
+    liquidation = display_contract.get("liquidation")
+    liquidation = liquidation if isinstance(liquidation, dict) else {}
+    return {
+        "status": clean_text(display.get("display_status")) or "감시/대기",
+        "status_active": display.get("status_cell_active") is True,
+        "method": "루틴",
+        "method_active": display.get("method_cell_active") is True,
+        "liquidation": clean_text(liquidation.get("display_text")) or "-",
+        "liquidation_has_policy": display.get("liquidation_has_policy") is True,
+        "liquidation_cell_active": display.get("liquidation_cell_active") is True,
+    }
+
+
+def _fresh_operation_header_display(window: Any, target: Any) -> dict[str, Any] | None:
+    document = _target_document(window, target)
+    if document is None:
+        return None
+    instance_id = clean_text(getattr(target, "routine_instance_id", ""))
+    pnl_rows = document.get("pnl")
+    pnl = next(
+        (
+            row
+            for row in pnl_rows
+            if isinstance(row, dict)
+            and clean_text(row.get("routine_instance_id")) == instance_id
+        ),
+        {},
+    ) if isinstance(pnl_rows, list) else {}
+    host = getattr(window, "mock_validation_host", None)
+    now_getter = getattr(host, "_now", None)
+    if not callable(now_getter):
+        return None
+    display = mock_instance_projection(
+        document,
+        instance_id,
+        current_price=pnl.get("mark_price"),
+        as_of=now_getter(),
+    )
+    return _operation_header_display_from_projection(display)
+
+
 def _signal_markers(
     document: dict[str, Any],
     *,
@@ -236,10 +282,6 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> d
         current_price=pnl.get("mark_price"),
         as_of=now,
     )
-    display_contract = display.get("display_contract")
-    display_contract = display_contract if isinstance(display_contract, dict) else {}
-    liquidation = display_contract.get("liquidation")
-    liquidation = liquidation if isinstance(liquidation, dict) else {}
     operation = _current_operation(document, instance_id)
     manual_ats = settings.get("manual_ats")
     manual_ats = manual_ats if isinstance(manual_ats, dict) else {}
@@ -288,14 +330,7 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> d
         "freshness": deepcopy(candle_supply.get("freshness", {})),
         "source_identity": clean_text(candle_supply.get("source_identity")),
         "current_price": pnl.get("mark_price"),
-        "operation_header_display": {
-            "status": clean_text(display.get("display_status")) or "감시/대기",
-            "status_active": display.get("status_cell_active") is True,
-            "method": "루틴",
-            "method_active": display.get("method_cell_active") is True,
-            "liquidation": clean_text(liquidation.get("display_text")) or "-",
-            "liquidation_has_policy": display.get("liquidation_has_policy") is True,
-        },
+        "operation_header_display": _operation_header_display_from_projection(display),
         "diagnostics": {
             "raw_candle_count": int(
                 candle_supply.get("available_minute_candles", len(candles)) or 0
@@ -352,14 +387,21 @@ class MockInstanceQuickChartWindow(StockInstanceChartWindow):
     def _early_close_is_excluded(self) -> bool:
         return True
 
-    def _update_operation_button_state(self) -> None:
-        labels = getattr(self, "operation_info_labels", {})
-        header = self.last_projection.get("operation_header_display", {})
+    def _update_operation_header_info(self) -> None:
+        header = _fresh_operation_header_display(self._mock_owner, self._mock_target)
+        if header is None:
+            header = self.last_projection.get("operation_header_display", {})
         header = header if isinstance(header, dict) else {}
+        if isinstance(self.last_projection, dict):
+            self.last_projection["operation_header_display"] = deepcopy(header)
+        self._apply_mock_operation_header(header)
+
+    def _apply_mock_operation_header(self, header: dict[str, Any]) -> None:
+        labels = getattr(self, "operation_info_labels", {})
         status = clean_text(header.get("status")) or "감시/대기"
         status_active = header.get("status_active") is True
         method_active = header.get("method_active") is True
-        liquidation_has_policy = header.get("liquidation_has_policy") is True
+        liquidation_cell_active = header.get("liquidation_cell_active") is True
         values = {
             "status": (
                 status,
@@ -374,19 +416,22 @@ class MockInstanceQuickChartWindow(StockInstanceChartWindow):
             "liquidation": (
                 clean_text(header.get("liquidation")) or "-",
                 AUTO_TRADE_SETTING_AMBER_TEXT_COLOR
-                if liquidation_has_policy
+                if liquidation_cell_active
                 else AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR,
             ),
         }
         for key, (value, color) in values.items():
             label = labels.get(key)
             if label is not None:
-                label.setText(value)
+                label.setText(f"· {value}")
                 label.setStyleSheet(f"color: {color};")
         self._update_header_badges(
             status_text=status,
             status_active=status_active,
         )
+
+    def _update_operation_button_state(self) -> None:
+        self._update_operation_header_info()
         for name in ("early_close_button", "immediate_liquidation_button"):
             button = getattr(self, name, None)
             if button is not None:

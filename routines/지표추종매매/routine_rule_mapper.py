@@ -2016,10 +2016,10 @@ def _attach_sell_signal_expression(
     candidates: dict[str, dict[str, Any]],
     expression: Any,
     warnings: list[str],
-) -> None:
+) -> dict[str, Any] | None:
     expression_text = str(expression or "").strip()
-    if not expression_text or not candidates:
-        return
+    if not expression_text:
+        return None
     parsed = parse_condition_expression(
         expression_text,
         allowed_identifiers={"A", "B", "C"},
@@ -2028,7 +2028,9 @@ def _attach_sell_signal_expression(
     if not parsed.get("ok"):
         warnings.append(f"sell signal expression is invalid: {parsed.get('reason')}")
         candidates.clear()
-        return
+        return parsed
+    if not candidates:
+        return parsed
     expression_value = {
         "source": expression_text,
         "normalized": parsed["normalized"],
@@ -2043,6 +2045,7 @@ def _attach_sell_signal_expression(
     for candidate in candidates.values():
         value = _as_dict(candidate.get("value"))
         value["signal_expression"] = deepcopy(expression_value)
+    return parsed
 
 
 def _build_sell_condition_b_price_box_condition(condition_b: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
@@ -2610,34 +2613,93 @@ def build_engine_rules_preview_from_ui_state(
     signal_conditions = _as_dict(sell_ui.get("signal_conditions"))
     sell_add_signal_candidates: dict[str, dict[str, Any]] = {}
     condition_a = _as_dict(signal_conditions.get("condition_a"))
-    sell_condition_a_candidate = _build_sell_condition_a_signal_candidate(condition_a, validation_warnings)
-    if sell_condition_a_candidate:
-        sell_add_signal_candidates[SELL_CONDITION_A_SIGNAL_PREVIEW_PATH] = sell_condition_a_candidate
-        legacy_notices.append("sell condition A is an add_signal_candidate and does not replace existing macd_sell")
-    elif condition_a:
-        validation_warnings.append("sell condition A candidate group was not generated")
-
     condition_b = _as_dict(signal_conditions.get("condition_b"))
-    sell_condition_b_candidate = _build_sell_condition_b_signal_candidate(condition_b, validation_warnings)
-    if sell_condition_b_candidate:
-        sell_add_signal_candidates[SELL_CONDITION_B_SIGNAL_PREVIEW_PATH] = sell_condition_b_candidate
-        legacy_notices.append("sell condition B is an add_signal_candidate and does not replace existing macd_sell")
-    elif condition_b:
-        validation_warnings.append("sell condition B candidate group was not generated")
-
     condition_c = _as_dict(signal_conditions.get("condition_c"))
-    sell_condition_c_candidate = _build_sell_condition_c_signal_candidate(condition_c, validation_warnings)
-    if sell_condition_c_candidate:
-        sell_add_signal_candidates[SELL_CONDITION_C_SIGNAL_PREVIEW_PATH] = sell_condition_c_candidate
-        legacy_notices.append("sell condition C is an add_signal_candidate and does not replace existing macd_sell")
-    else:
-        validation_warnings.append("sell condition C candidate group was not generated")
+    sell_group_records: list[dict[str, Any]] = []
+    for group_name, condition, builder, candidate_path in (
+        ("A", condition_a, _build_sell_condition_a_signal_candidate, SELL_CONDITION_A_SIGNAL_PREVIEW_PATH),
+        ("B", condition_b, _build_sell_condition_b_signal_candidate, SELL_CONDITION_B_SIGNAL_PREVIEW_PATH),
+        ("C", condition_c, _build_sell_condition_c_signal_candidate, SELL_CONDITION_C_SIGNAL_PREVIEW_PATH),
+    ):
+        group_warnings: list[str] = []
+        candidate = builder(condition, group_warnings)
+        check_values = [
+            value for key, value in condition.items() if str(key).endswith("_check")
+        ]
+        has_active_conditions = (
+            any(_truthy_ui(value) for value in check_values)
+            if check_values
+            else candidate is not None
+        )
+        if candidate:
+            sell_add_signal_candidates[candidate_path] = candidate
+            legacy_notices.append(
+                f"sell condition {group_name} is an add_signal_candidate and does not replace existing macd_sell"
+            )
+        sell_group_records.append({
+            "name": group_name,
+            "condition": condition,
+            "candidate": candidate,
+            "candidate_path": candidate_path,
+            "warnings": group_warnings,
+            "has_active_conditions": has_active_conditions,
+        })
 
-    _attach_sell_signal_expression(
+    parsed_sell_expression = _attach_sell_signal_expression(
         sell_add_signal_candidates,
         basic.get("sell_signal_expr_line"),
         validation_warnings,
     )
+    if isinstance(parsed_sell_expression, dict) and parsed_sell_expression.get("ok"):
+        referenced_groups = {
+            str(identifier or "").strip().upper()
+            for identifier in _as_list(parsed_sell_expression.get("identifiers"))
+        }
+        preserved_expression_candidates = False
+        for record in sell_group_records:
+            if record["name"] in referenced_groups or record["candidate"] is not None:
+                continue
+            sell_target = _sell_add_signal_target(record["candidate_path"])
+            target_path = sell_target[0] if sell_target else ""
+            existing_signal = _get_path_value(source_rules, target_path) if target_path else _MISSING
+            if not isinstance(existing_signal, dict):
+                continue
+            candidate = {
+                "path": record["candidate_path"],
+                "candidate_type": "add_signal",
+                "value": deepcopy(existing_signal),
+            }
+            sell_add_signal_candidates[record["candidate_path"]] = candidate
+            record["candidate"] = candidate
+            preserved_expression_candidates = True
+        if preserved_expression_candidates:
+            _attach_sell_signal_expression(
+                sell_add_signal_candidates,
+                basic.get("sell_signal_expr_line"),
+                validation_warnings,
+            )
+        for record in sell_group_records:
+            group_name = record["name"]
+            if group_name not in referenced_groups:
+                continue
+            validation_warnings.extend(record["warnings"])
+            if not record["has_active_conditions"]:
+                validation_warnings.append(
+                    f"sell condition {group_name} is referenced by expression but has no active conditions"
+                )
+            elif record["candidate"] is None and not record["warnings"]:
+                validation_warnings.append(
+                    f"sell condition {group_name} candidate group was not generated"
+                )
+    else:
+        for record in sell_group_records:
+            validation_warnings.extend(record["warnings"])
+            if record["candidate"] is None and (
+                record["condition"] or record["name"] == "C"
+            ):
+                validation_warnings.append(
+                    f"sell condition {record['name']} candidate group was not generated"
+                )
 
     if sell_add_signal_candidates or sell_profit_rate_candidate or sell_method_candidates:
         sell_candidates: dict[str, Any] = {}

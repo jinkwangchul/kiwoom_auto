@@ -1374,6 +1374,7 @@ class _AccountComboPopupInteractionController(QObject):
 
 
 from gui_stock_register_window import StockRegisterWindow
+from gui_stock_data import append_base_stock as append_central_base_stock
 from gui_review_required_window import (
     GlobalReviewRequiredWindow,
     collect_global_review_required_rows,
@@ -1498,6 +1499,8 @@ from gui_auto_trade_context_menu import (
 )
 from gui_auto_trade_integrity import is_operation_excluded
 from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR,
+    auto_trade_setting_status_color,
     draw_limit_metric,
     draw_stock_position_metric,
     draw_stock_position_metric_display,
@@ -1716,9 +1719,14 @@ from production_recovery_state_registry import (
 from startup_runtime_initializer import initialize_pristine_startup_runtime
 from operation_command_service import MODE_EARLY_CLOSE
 from close_liquidation_transition_service import POLICY_MARKET
-from mock_validation_contract import MockValidationError, instance_effective_settings
+from mock_validation_contract import (
+    MockValidationError,
+    instance_effective_settings,
+    mock_instance_pre_start_editable,
+)
 from mock_validation_context_menu import (
     mock_context_target_for_row,
+    show_mock_registration_context_menu,
     show_mock_monitoring_context_menu,
 )
 from mock_validation_host import MockValidationHost
@@ -3413,6 +3421,95 @@ def append_base_stock(code: str, name: str) -> None:
         file.write(f"{prefix}{code},{name}\n")
 
 
+TR_CAPACITY_SEGMENT_COUNT = 6
+TR_CAPACITY_SEGMENT_WIDTH = 6
+TR_CAPACITY_SEGMENT_HEIGHT = 16
+TR_CAPACITY_SEGMENT_SPACING = 2
+TR_CAPACITY_SEGMENT_RADIUS = 2
+TR_CAPACITY_SEGMENT_INACTIVE_COLOR = AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR
+TR_CAPACITY_SEGMENT_ACTIVE_COLORS = (
+    auto_trade_setting_status_color("매수/매도"),
+    auto_trade_setting_status_color("매수/매도"),
+    auto_trade_setting_status_color("조기마감"),
+    auto_trade_setting_status_color("조기마감"),
+    auto_trade_setting_status_color("긴급정지"),
+    auto_trade_setting_status_color("긴급정지"),
+)
+TR_CAPACITY_LEVEL_STATUS = (
+    "비용 없음",
+    "매우양호",
+    "양호",
+    "아주보통",
+    "보통",
+    "부담",
+    "매우부담",
+)
+
+
+def _tr_capacity_load_projection(
+    tr_metrics: object,
+    *,
+    minimum_dispatch_interval_ms: object,
+) -> dict[str, object]:
+    try:
+        interval_ms = max(1, int(minimum_dispatch_interval_ms))
+    except (TypeError, ValueError):
+        interval_ms = KiwoomApi.TR_GOVERNOR_MIN_INTERVAL_MS
+    capacity = max(1, 60_000 // interval_ms)
+    recent_dispatches = max(
+        0,
+        int(getattr(tr_metrics, "dispatch_count_last_60s", 0) or 0),
+    )
+    level = (
+        0
+        if recent_dispatches == 0
+        else min(
+            TR_CAPACITY_SEGMENT_COUNT,
+            (
+                recent_dispatches * TR_CAPACITY_SEGMENT_COUNT
+                + capacity
+                - 1
+            )
+            // capacity,
+        )
+    )
+    segment_colors = tuple(
+        TR_CAPACITY_SEGMENT_ACTIVE_COLORS[index]
+        if index < level
+        else TR_CAPACITY_SEGMENT_INACTIVE_COLOR
+        for index in range(TR_CAPACITY_SEGMENT_COUNT)
+    )
+    status = TR_CAPACITY_LEVEL_STATUS[level]
+    queue_depth = max(0, int(getattr(tr_metrics, "current_queue_depth", 0) or 0))
+    last_wait_ms = float(getattr(tr_metrics, "last_queue_wait_ms", 0.0) or 0.0)
+    max_wait_ms = float(getattr(tr_metrics, "max_queue_wait_ms", 0.0) or 0.0)
+    timeout_count = max(0, int(getattr(tr_metrics, "timeout_count", 0) or 0))
+    stale_count = max(0, int(getattr(tr_metrics, "stale_count", 0) or 0))
+    error_count = max(0, int(getattr(tr_metrics, "error_count", 0) or 0))
+    last_error = str(getattr(tr_metrics, "last_error_reason", "") or "").strip()
+    tooltip_lines = [
+        f"TR 내부 부하: {level}/{TR_CAPACITY_SEGMENT_COUNT}",
+        f"상태: {status}",
+        f"최근 60초 Dispatch: {recent_dispatches}",
+        f"Queue: {queue_depth}",
+        f"최근/최대 Queue Wait: {last_wait_ms:.3f} ms / {max_wait_ms:.3f} ms",
+        f"Timeout/Stale/Error: {timeout_count}/{stale_count}/{error_count}",
+    ]
+    if last_error:
+        tooltip_lines.append(f"최근 Error: {last_error}")
+    tooltip_lines.append(
+        "Kiwoom 공식 잔여쿼터가 아닌 프로그램 내부 처리부하 추정"
+    )
+    return {
+        "level": level,
+        "capacity_last_60s": capacity,
+        "recent_dispatches": recent_dispatches,
+        "status": status,
+        "segment_colors": segment_colors,
+        "tooltip": "\n".join(tooltip_lines),
+    }
+
+
 class _MarketDataMonitoringWindow(QDialog):
     """Read-only process-local Realtime and TR Governor diagnostics."""
 
@@ -4248,8 +4345,9 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
         self.btn_review_manage = QPushButton("검토관리")
-        self.btn_review_required = QPushButton()
+        self.btn_review_required = _DoubleClickActionButton()
         self.btn_market_data_monitoring = QPushButton("모니터링")
+        self._create_main_tr_capacity_indicator()
         self.btn_group_pack_register = QPushButton("그룹등록")
         self.btn_main_visible_early_close = QPushButton("조기마감")
         self.btn_exit = QPushButton("종료")
@@ -4302,6 +4400,8 @@ class MainWindow(QMainWindow):
         self._pnl_refresh_timer.setInterval(PNL_REFRESH_INTERVAL_MS)
         self._pnl_refresh_timer.timeout.connect(lambda: main_refresh_pnl_only(self))
         self._pnl_refresh_timer.timeout.connect(self._process_mock_validation_host_cycle)
+        self._pnl_refresh_timer.timeout.connect(self._refresh_main_tr_capacity_indicator)
+        self._refresh_main_tr_capacity_indicator()
         self._pnl_refresh_timer.start()
         append_owner_event_once(
             self,
@@ -5074,7 +5174,11 @@ class MainWindow(QMainWindow):
             MainWindow._update_main_routine_filter_badges(self)
         MainWindow._style_main_top_action_buttons(self)
         routine_header_layout.addWidget(
-            self.btn_market_data_monitoring,
+            getattr(
+                self,
+                "_main_market_data_monitoring_control",
+                self.btn_market_data_monitoring,
+            ),
             0,
             Qt.AlignRight | Qt.AlignVCenter,
         )
@@ -5183,6 +5287,45 @@ class MainWindow(QMainWindow):
             style += " }"
             button.setMinimumHeight(28)
             button.setStyleSheet(style)
+
+    def _create_main_tr_capacity_indicator(self) -> QWidget:
+        control = QWidget()
+        control.setObjectName("mainMarketDataMonitoringControl")
+        control_layout = QHBoxLayout(control)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.setSpacing(5)
+
+        indicator = QWidget(control)
+        indicator.setObjectName("mainTrCapacityIndicator")
+        indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        indicator.setFocusPolicy(Qt.NoFocus)
+        indicator_layout = QHBoxLayout(indicator)
+        indicator_layout.setContentsMargins(0, 0, 0, 0)
+        indicator_layout.setSpacing(TR_CAPACITY_SEGMENT_SPACING)
+        segments: list[QFrame] = []
+        for index in range(TR_CAPACITY_SEGMENT_COUNT):
+            segment = QFrame(indicator)
+            segment.setObjectName(f"mainTrCapacitySegment{index + 1}")
+            segment.setFixedSize(
+                TR_CAPACITY_SEGMENT_WIDTH,
+                TR_CAPACITY_SEGMENT_HEIGHT,
+            )
+            segment.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            segment.setFocusPolicy(Qt.NoFocus)
+            indicator_layout.addWidget(segment)
+            segments.append(segment)
+        indicator.setFixedSize(
+            TR_CAPACITY_SEGMENT_COUNT * TR_CAPACITY_SEGMENT_WIDTH
+            + (TR_CAPACITY_SEGMENT_COUNT - 1) * TR_CAPACITY_SEGMENT_SPACING,
+            TR_CAPACITY_SEGMENT_HEIGHT,
+        )
+        control_layout.addWidget(indicator, 0, Qt.AlignVCenter)
+        control_layout.addWidget(self.btn_market_data_monitoring, 0, Qt.AlignVCenter)
+        self._main_market_data_monitoring_control = control
+        self._main_tr_capacity_indicator = indicator
+        self._main_tr_capacity_indicator_layout = indicator_layout
+        self._main_tr_capacity_indicator_segments = tuple(segments)
+        return control
 
     def _create_main_routine_summary(self) -> QWidget:
         summary = QWidget()
@@ -6029,8 +6172,20 @@ class MainWindow(QMainWindow):
             # A Mock failure must never escape the shared UI timer callback.
             LOGGER.exception("Mock validation host cycle failed")
 
-    def _select_mock_validation_instances(self, target) -> list[object] | None:
+    def _select_mock_validation_instances(
+        self,
+        target,
+        *,
+        initial_checked_routine_ids: tuple[str, ...] | None = None,
+        empty_selection_toast: str = "",
+    ) -> list[object] | None:
         instances = load_persisted_routine_instances(project_root=PROJECT_ROOT)
+        explicit_initial_ids = initial_checked_routine_ids is not None
+        checked_ids = {
+            str(instance_id or "").strip()
+            for instance_id in (initial_checked_routine_ids or ())
+            if str(instance_id or "").strip()
+        }
         eligible: list[tuple[object, bool]] = []
         unsupported: list[object] = []
         for instance in instances:
@@ -6045,11 +6200,16 @@ class MainWindow(QMainWindow):
                 and Path(getattr(instance, "rules_path", "") or "").is_file()
             )
             if supported:
+                instance_id = str(getattr(instance, "instance_id", "") or "").strip()
                 eligible.append(
                     (
                         instance,
-                        str(getattr(instance, "instance_id", "") or "").strip()
-                        == str(target.routine_instance_id or "").strip(),
+                        (
+                            instance_id in checked_ids
+                            if explicit_initial_ids
+                            else instance_id
+                            == str(target.routine_instance_id or "").strip()
+                        ),
                     )
                 )
             else:
@@ -6092,11 +6252,21 @@ class MainWindow(QMainWindow):
             return None
         selected = [instance for checkbox, instance in checkboxes if checkbox.isChecked()]
         if not selected:
-            QMessageBox.information(self, "모의검증", "루틴을 1개 이상 선택하세요.")
+            if empty_selection_toast:
+                show_toast(self, empty_selection_toast)
+            else:
+                QMessageBox.information(self, "모의검증", "루틴을 1개 이상 선택하세요.")
             return None
         return selected
 
-    def begin_mock_validation(self, target) -> bool:
+    def begin_mock_validation(
+        self,
+        target,
+        *,
+        initial_checked_routine_ids: tuple[str, ...] | None = None,
+        empty_selection_toast: str = "",
+        selected_instances=None,
+    ) -> bool:
         host = getattr(self, "mock_validation_host", None)
         actions = getattr(self, "mock_validation_ui_actions", None)
         if host is None or actions is None:
@@ -6105,7 +6275,16 @@ class MainWindow(QMainWindow):
         if host.current_session(target.code) is not None:
             show_toast(self, "이미 진행 중인 모의검증 종목입니다.")
             return False
-        selected = self._select_mock_validation_instances(target)
+        if selected_instances is not None:
+            selected = list(selected_instances)
+        elif initial_checked_routine_ids is None and not empty_selection_toast:
+            selected = self._select_mock_validation_instances(target)
+        else:
+            selected = self._select_mock_validation_instances(
+                target,
+                initial_checked_routine_ids=initial_checked_routine_ids,
+                empty_selection_toast=empty_selection_toast,
+            )
         if not selected:
             return False
         rules_by_instance_id = {
@@ -6222,8 +6401,65 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "모의검증", f"모의검증 종목을 만들지 못했습니다.\n사유: {exc}")
             return False
-        show_toast(self, "모의검증 대기 종목으로 등록했습니다.")
+        show_toast(self, "모의검증 종목으로 등록 되었습니다.")
         return True
+
+    def begin_registered_stock_mock_validation(self, target) -> bool:
+        return self.begin_mock_validation(
+            target,
+            initial_checked_routine_ids=(),
+            empty_selection_toast="모의검증할 루틴을 선택하세요.",
+        )
+
+    def _begin_mock_validation_for_selected_stock(
+        self,
+        code: str,
+        name: str,
+        *,
+        needs_registration: bool,
+    ) -> bool:
+        stock_dir = StockRepository(PROJECT_ROOT).resolve_stock_dir(code, name)
+        host = getattr(self, "mock_validation_host", None)
+        actions = getattr(self, "mock_validation_ui_actions", None)
+        if host is None or actions is None:
+            QMessageBox.warning(self, "모의검증", "모의검증 실행 기반을 사용할 수 없습니다.")
+            return False
+        if host.current_session(code) is not None:
+            show_toast(self, "이미 진행 중인 모의검증 종목입니다.")
+            return False
+        target = MainMonitoringStockTarget(
+            stock_dir=stock_dir,
+            code=code,
+            name=name,
+            routine_instance_id="",
+        )
+        selected = self._select_mock_validation_instances(
+            target,
+            initial_checked_routine_ids=(),
+            empty_selection_toast="모의검증할 루틴을 선택하세요.",
+        )
+        if not selected:
+            return False
+        if needs_registration and not append_central_base_stock(code, name):
+            QMessageBox.warning(self, "모의검증", "종목을 등록하지 못했습니다.")
+            return False
+        return self.begin_mock_validation(target, selected_instances=selected)
+
+    def open_mock_stock_search_register_dialog(self):
+        return open_instance_stock_search_register_dialog(
+            self,
+            {
+                "row_kind": "unassigned",
+                "target_kind": "unassigned",
+                "instance_id": "",
+                "instance_name": "등록대기",
+                "definition_id": "",
+                "definition_name": "등록대기",
+            },
+            owner_attribute="mock_stock_search_register_window",
+            delete_on_close=True,
+            stock_selection_callback=self._begin_mock_validation_for_selected_stock,
+        )
 
     def mock_validation_context_state(self, stock_code: str) -> dict[str, object]:
         host = getattr(self, "mock_validation_host", None)
@@ -7001,7 +7237,7 @@ class MainWindow(QMainWindow):
         self.btn_review_manage.clicked.connect(
             self.open_current_domain_review_window
         )
-        self.btn_review_required.clicked.connect(self.open_review_required_window)
+        self.btn_review_required.doubleClicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
         self.routine_table.customContextMenuRequested.connect(self.open_routine_context_menu)
         self._routine_tree_interaction_controller = _RoutineTreeInteractionController(self)
@@ -9820,7 +10056,12 @@ class MainWindow(QMainWindow):
         execution_state = str(
             document["instance_execution"][instance_id].get("state") or ""
         ).strip().upper()
-        if execution_state not in allowed_states:
+        pre_start_editable = mock_instance_pre_start_editable(document, instance_id)
+        non_pre_start_states = allowed_states - frozenset({"WAITING"})
+        if (
+            not pre_start_editable
+            and execution_state not in non_pre_start_states
+        ):
             if show_state_error:
                 show_toast(
                     self,
@@ -9859,12 +10100,6 @@ class MainWindow(QMainWindow):
         if main_budget_display_auth_state(self) == SERVER_AUTH_COMPLETE:
             return True
         show_toast(self, "서버 인증 완료 후 모의 시작예산을 변경할 수 있습니다.")
-        return False
-
-    def _mock_operation_settings_edit_authorized(self) -> bool:
-        if main_budget_display_auth_state(self) == SERVER_AUTH_COMPLETE:
-            return True
-        show_toast(self, "서버 인증 완료 후 모의 운영설정을 변경할 수 있습니다.")
         return False
 
     def _mock_start_budget_current_price(self, stock_code: str) -> float | None:
@@ -10009,7 +10244,9 @@ class MainWindow(QMainWindow):
                 expected_validation_session_id=session_id,
                 expected_revision=int(document.get("revision", -1)),
                 expected_operation_session_id=(
-                    MainWindow._mock_instance_operation_identity(
+                    ""
+                    if mock_instance_pre_start_editable(document, instance_id)
+                    else MainWindow._mock_instance_operation_identity(
                         document, instance_id
                     )
                 ),
@@ -10026,8 +10263,6 @@ class MainWindow(QMainWindow):
         show_toast(self, "기본예산을 변경했습니다.")
 
     def toggle_mock_routine_instance_operation_mode(self, row: int) -> None:
-        if not self._mock_operation_settings_edit_authorized():
-            return
         target = self._mock_routine_instance_edit_target(row)
         if target is None:
             return
@@ -10044,8 +10279,6 @@ class MainWindow(QMainWindow):
         self._write_mock_routine_instance_settings(row, **changes)
 
     def open_mock_routine_instance_schedule_dialog(self, row: int) -> None:
-        if not self._mock_operation_settings_edit_authorized():
-            return
         target = self._mock_routine_instance_edit_target(row)
         if target is None:
             return
@@ -10076,8 +10309,6 @@ class MainWindow(QMainWindow):
         )
 
     def reset_mock_routine_instance_schedule(self, row: int) -> None:
-        if not self._mock_operation_settings_edit_authorized():
-            return
         target = self._mock_routine_instance_edit_target(row)
         if target is None:
             return
@@ -10105,8 +10336,6 @@ class MainWindow(QMainWindow):
         enabled: bool,
         _label: str,
     ) -> None:
-        if not self._mock_operation_settings_edit_authorized():
-            return
         target = self._mock_routine_instance_edit_target(row)
         if target is None or target[3]["operation_mode"] != "CONTINUOUS":
             return
@@ -11049,14 +11278,6 @@ class MainWindow(QMainWindow):
         target = _stock_target_for_row(self, row)
         if target is None:
             return False
-        config = read_json_dict(target.stock_dir / "config.json")
-        if not isinstance(config, dict) or not config:
-            QMessageBox.warning(
-                self,
-                "운영방식 변경",
-                f"{target.code} {target.name}의 운영방식 설정을 읽을 수 없습니다.",
-            )
-            return True
 
         adapter = MainMonitoringStockOperationAdapter(
             self,
@@ -12498,6 +12719,8 @@ class MainWindow(QMainWindow):
     def open_routine_context_menu(self, position) -> None:
         item = self.routine_table.itemAt(position)
         if item is None:
+            if MainWindow._current_main_routine_stock_scope(self) == "mock":
+                show_mock_registration_context_menu(self, position)
             return
         first_item = self.routine_table.item(item.row(), 0)
         if first_item is None:
@@ -13038,6 +13261,7 @@ class MainWindow(QMainWindow):
         window = StockRegisterWindow(
             self,
             stock_search_register_opener=open_instance_stock_search_register_dialog,
+            mock_validation_opener=self.begin_registered_stock_mock_validation,
         )
         window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.stock_register_window = window
@@ -13095,6 +13319,41 @@ class MainWindow(QMainWindow):
             host = AutoTradeOperationHost(self)
             self._main_monitoring_auto_trade_operation_host = host
         return host
+
+    def _refresh_main_tr_capacity_indicator(self) -> dict[str, object]:
+        host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
+        metrics_getter = getattr(host, "tr_governor_metrics_snapshot", None)
+        try:
+            metrics = metrics_getter() if callable(metrics_getter) else None
+        except Exception:
+            metrics = None
+        api = getattr(self, "kiwoom_api", None)
+        projection = _tr_capacity_load_projection(
+            metrics,
+            minimum_dispatch_interval_ms=getattr(
+                api,
+                "TR_GOVERNOR_MIN_INTERVAL_MS",
+                KiwoomApi.TR_GOVERNOR_MIN_INTERVAL_MS,
+            ),
+        )
+        button = getattr(self, "btn_market_data_monitoring", None)
+        if button is not None:
+            button.setText("모니터링")
+            button.setToolTip(str(projection["tooltip"]))
+        indicator = getattr(self, "_main_tr_capacity_indicator", None)
+        if indicator is not None:
+            indicator.setToolTip(str(projection["tooltip"]))
+        for segment, color in zip(
+            getattr(self, "_main_tr_capacity_indicator_segments", ()),
+            projection["segment_colors"],
+        ):
+            segment.setToolTip(str(projection["tooltip"]))
+            segment.setStyleSheet(
+                f"background-color: {color};"
+                " border: none;"
+                f" border-radius: {TR_CAPACITY_SEGMENT_RADIUS}px;"
+            )
+        return projection
 
     def open_market_data_monitoring_window(self) -> QDialog:
         window = getattr(self, "market_data_monitoring_window", None)

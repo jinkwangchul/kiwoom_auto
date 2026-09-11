@@ -171,7 +171,66 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
             holding_qty=3,
         )
 
-    def test_single_padded_outline_wraps_fixed_text_columns(self) -> None:
+    def test_header_projection_consumes_scheduled_prestart_row_semantics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_삼성전자"
+            stock_dir.mkdir()
+            config = {"operation_mode": "SCHEDULED"}
+            state = {"status": "RUNNING", "holding_qty": 0}
+            repository = Mock()
+            repository.resolve_stock_dir.return_value = stock_dir
+            row_projection = {
+                "display_status": "감시/대기",
+                "method_text": "루틴",
+                "liquidation_text": "5분/시장가",
+                "status_cell_active": True,
+                "method_cell_active": False,
+                "liquidation_cell_active": False,
+                "liquidation_has_policy": True,
+                "liquidation_is_individual": False,
+            }
+            with patch(
+                "stock_repository.StockRepository",
+                return_value=repository,
+            ), patch(
+                "runtime_io.read_json_dict",
+                side_effect=lambda path: config if Path(path).name == "config.json" else state,
+            ), patch(
+                "gui_order_utils.pending_order_side_quantities",
+                return_value=(0, 0),
+            ), patch(
+                "gui_auto_trade_policy.auto_trade_setting_trade_started",
+                return_value=True,
+            ), patch(
+                "gui_auto_trade_policy.auto_trade_setting_current_session_trade_started",
+                return_value=True,
+            ), patch(
+                "gui_auto_trade_policy.auto_trade_stock_operation_category",
+                return_value="operation",
+            ), patch(
+                "gui_auto_trade_policy.auto_trade_setting_row_projection",
+                return_value=row_projection,
+            ) as projection_helper, patch(
+                "gui_auto_trade_integrity.is_review_required_state",
+                return_value=False,
+            ), patch(
+                "gui_auto_trade_integrity.is_operation_excluded",
+                return_value=False,
+            ):
+                display = chart_window.project_stock_operation_header_display("005930")
+
+        self.assertEqual(("감시/대기", "루틴", "5분/시장가"), display.values)
+        self.assertEqual(
+            AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR.lower(),
+            display.method_color.lower(),
+        )
+        self.assertEqual(
+            AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR.lower(),
+            display.liquidation_color.lower(),
+        )
+        projection_helper.assert_called_once()
+
+    def test_three_bullet_rows_preserve_projection_values_without_outline(self) -> None:
         samples = (
             ("감시/대기", "루틴", "5분/시장가"),
             ("조기마감", "현재가", "100분/현재가"),
@@ -181,69 +240,17 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         self.assertEqual(3, window.operation_info_panel.layout().count())
-        self.assertNotIn(
-            "stockInstanceChartOperationInfoSeparator",
-            window.styleSheet(),
-        )
         self.assertIn("QFrame#stockInstanceChartOperationInfo", window.styleSheet())
-        self.assertIn(
-            f"border: 1px solid {AUTO_TRADE_SETTING_BADGE_BORDER_COLOR}",
-            window.styleSheet(),
-        )
-        self.assertIn("border-radius: 3px", window.styleSheet())
+        self.assertNotIn("border-radius: 3px", window.styleSheet())
         self.assertIn("background: transparent", window.styleSheet())
         margins = window.operation_info_panel.layout().contentsMargins()
-        button_top, button_bottom = chart_window._button_content_vertical_margins(
-            window.early_close_button
-        )
-        expected_top, expected_bottom = chart_window._operation_info_vertical_margins(
-            window.early_close_button
-        )
-        self.assertEqual((8, expected_top, 8, expected_bottom), (
+        self.assertEqual((0, 0, 0, 0), (
             margins.left(),
             margins.top(),
             margins.right(),
             margins.bottom(),
         ))
-        self.assertEqual(
-            window.early_close_button.style().pixelMetric(
-                QStyle.PM_ButtonMargin,
-                None,
-                window.early_close_button,
-            ),
-            button_top + button_bottom,
-        )
-        self.assertEqual(max(1, button_top - 1), margins.top())
-        self.assertEqual(max(1, button_bottom - 1), margins.bottom())
-        self.assertEqual(
-            window.operation_info_labels["status"].fontMetrics().height()
-            + margins.top()
-            + margins.bottom()
-            + 2,
-            window.operation_info_panel.height(),
-        )
-        widths = chart_window._stock_operation_header_segment_widths(
-            window.operation_info_labels["status"].font()
-        )
         baseline_panel_width = window.operation_info_panel.width()
-        self.assertEqual(
-            sum(widths.values())
-            + (window.operation_info_panel.layout().spacing() * 2)
-            + margins.left()
-            + margins.right()
-            + 2,
-            baseline_panel_width,
-        )
-        baseline_columns = {
-            key: (
-                window.operation_info_labels[key].mapTo(
-                    window.operation_info_panel,
-                    window.operation_info_labels[key].rect().topLeft(),
-                ).x(),
-                window.operation_info_labels[key].width(),
-            )
-            for key in ("status", "method", "liquidation")
-        }
         for values in samples:
             with self.subTest(values=values), patch.object(
                 chart_window,
@@ -253,7 +260,7 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
                 window._update_operation_header_info()
                 self.app.processEvents()
                 self.assertEqual(
-                    values,
+                    tuple(f"· {value}" for value in values),
                     tuple(
                         window.operation_info_labels[key].text()
                         for key in ("status", "method", "liquidation")
@@ -263,31 +270,27 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
                 for key in ("status", "method", "liquidation"):
                     label = window.operation_info_labels[key]
                     self.assertTrue(label.alignment() & Qt.AlignLeft)
-                    self.assertEqual(widths[key], label.width())
-                    self.assertEqual(
-                        baseline_columns[key],
-                        (
-                            label.mapTo(
-                                window.operation_info_panel,
-                                label.rect().topLeft(),
-                            ).x(),
-                            label.width(),
-                        ),
-                    )
+                    self.assertGreaterEqual(label.width(), label.sizeHint().width())
+                row_tops = [
+                    window.operation_info_labels[key].mapTo(
+                        window.operation_info_panel,
+                        window.operation_info_labels[key].rect().topLeft(),
+                    ).y()
+                    for key in ("status", "method", "liquidation")
+                ]
+                self.assertLess(row_tops[0], row_tops[1])
+                self.assertLess(row_tops[1], row_tops[2])
         window.close()
 
-    def test_right_actions_stack_at_edge_and_pnl_reserves_maximum_width(self) -> None:
+    def test_compact_header_aligns_identity_operation_pnl_actions_and_badges(self) -> None:
         badge_font = QFont("Malgun Gothic", 8)
         window = self._window(
             ("매수/매도", "루틴", "100분/현재가"),
             badge_font=badge_font,
         )
-        widths = chart_window._stock_operation_header_segment_widths(badge_font)
-        self.assertEqual(
-            widths["liquidation"],
-            window.operation_info_labels["liquidation"].width(),
-        )
-        self.assertEqual(Qt.AlignCenter, window.info_labels["stock"].alignment())
+        self.assertTrue(window.info_labels["routine"].alignment() & Qt.AlignLeft)
+        self.assertTrue(window.info_labels["stock"].alignment() & Qt.AlignLeft)
+        self.assertTrue(window.info_labels["cumulative_pnl"].alignment() & Qt.AlignRight)
         for button in (
             window.early_close_button,
             window.immediate_liquidation_button,
@@ -296,60 +299,40 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
             self.assertEqual(badge_font.pointSize(), button.font().pointSize())
         window.show()
         self.app.processEvents()
-        window.info_labels["stock"].setText(
-            "005930 아주긴종목명이표시되는삼성전자"
-        )
-        self.app.processEvents()
+        routine_label = window.info_labels["routine"]
         stock_label = window.info_labels["stock"]
         operation_panel = window.operation_info_panel
-        left_x = window.header_left_block.mapTo(
+        left_rect = window.header_left_block.geometry()
+        operation_rect = operation_panel.geometry()
+        right_rect = window.header_right_block.geometry()
+        self.assertLessEqual(left_rect.right(), operation_rect.left())
+        self.assertLessEqual(operation_rect.right(), right_rect.left())
+        routine_top = routine_label.mapTo(
             window,
-            window.header_left_block.rect().topLeft(),
-        ).x()
-        right_x = window.header_right_block.mapTo(
-            window,
-            window.header_right_block.rect().topLeft(),
-        ).x()
-        self.assertLessEqual(
-            left_x + window.header_left_block.width(),
-            right_x,
-        )
-        stock_top = stock_label.mapTo(window, stock_label.rect().topLeft()).y()
-        operation_top = operation_panel.mapTo(
-            window,
-            operation_panel.rect().topLeft(),
+            routine_label.rect().topLeft(),
         ).y()
-        self.assertLessEqual(stock_top + stock_label.height(), operation_top)
-        left_center = window.header_left_block.mapTo(
+        stock_top = stock_label.mapTo(
             window,
-            window.header_left_block.rect().center(),
-        ).x()
-        identity_center = stock_label.mapTo(
+            stock_label.rect().topLeft(),
+        ).y()
+        badge_top = window.header_badge_row.mapTo(
             window,
-            stock_label.rect().center(),
-        ).x()
-        operation_center = operation_panel.mapTo(
-            window,
-            operation_panel.rect().center(),
-        ).x()
-        self.assertLessEqual(abs(left_center - identity_center), 1)
-        self.assertLessEqual(abs(left_center - operation_center), 1)
+            window.header_badge_row.rect().topLeft(),
+        ).y()
+        self.assertLess(routine_top, stock_top)
+        self.assertLess(stock_top, badge_top)
 
         pnl_label = window.info_labels["cumulative_pnl"]
-        expected_pnl_width = chart_window._stock_instance_chart_pnl_display_width(
-            pnl_label.font()
-        )
-        self.assertEqual(expected_pnl_width, pnl_label.width())
         self.assertGreaterEqual(
             pnl_label.width(),
-            pnl_label.fontMetrics().horizontalAdvance("-99,999,999(-99.99%)"),
+            pnl_label.fontMetrics().horizontalAdvance(pnl_label.text()),
         )
         early_rect = window.early_close_button.geometry()
         immediate_rect = window.immediate_liquidation_button.geometry()
-        self.assertEqual(early_rect.x(), immediate_rect.x())
+        self.assertEqual(early_rect.y(), immediate_rect.y())
         self.assertEqual(early_rect.width(), immediate_rect.width())
         self.assertEqual(early_rect.height(), immediate_rect.height())
-        self.assertLessEqual(early_rect.bottom(), immediate_rect.top())
+        self.assertLess(early_rect.right(), immediate_rect.left())
         action_right = window.header_action_block.mapTo(
             window.header_right_block,
             window.header_action_block.rect().topRight(),
@@ -359,20 +342,20 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
             window,
             pnl_label.rect().topRight(),
         ).x()
-        action_left = window.header_action_block.mapTo(
+        action_right_global = window.header_action_block.mapTo(
+            window,
+            window.header_action_block.rect().topRight(),
+        ).x()
+        pnl_top = pnl_label.mapTo(
+            window,
+            pnl_label.rect().topLeft(),
+        ).y()
+        action_top = window.header_action_block.mapTo(
             window,
             window.header_action_block.rect().topLeft(),
-        ).x()
-        self.assertLess(pnl_right, action_left)
-        left_vertical_center = window.header_left_block.mapTo(
-            window,
-            window.header_left_block.rect().center(),
         ).y()
-        pnl_vertical_center = pnl_label.mapTo(
-            window,
-            pnl_label.rect().center(),
-        ).y()
-        self.assertLessEqual(abs(left_vertical_center - pnl_vertical_center), 1)
+        self.assertEqual(pnl_right, action_right_global)
+        self.assertLess(pnl_top, action_top)
         window.close()
 
     def test_chart_applies_projected_settings_foreground_colors(self) -> None:
@@ -579,7 +562,7 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
             raise RuntimeError("broken")
 
         window = self._window(("검토종목", "루틴", "-"), provider=broken_provider)
-        self.assertEqual("검토종목", window.operation_info_labels["status"].text())
+        self.assertEqual("· 검토종목", window.operation_info_labels["status"].text())
         with patch.object(
             chart_window,
             "project_current_stock_pnl",
@@ -587,7 +570,7 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
         ):
             window.refresh_pnl_only()
         self.assertEqual(
-            ("검토종목", "루틴", "-"),
+            ("· 검토종목", "· 루틴", "· -"),
             tuple(
                 window.operation_info_labels[key].text()
                 for key in ("status", "method", "liquidation")
@@ -646,7 +629,7 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
             second.info_labels["stock"].styleSheet().lower(),
         )
         self.assertEqual(
-            current["values"],
+            tuple(f"· {value}" for value in current["values"]),
             tuple(
                 second.operation_info_labels[key].text()
                 for key in ("status", "method", "liquidation")

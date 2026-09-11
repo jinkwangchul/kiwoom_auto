@@ -1098,6 +1098,38 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             (stock_dir, "005930", "삼성전자"),
         )
 
+    def test_operation_token_config_failure_is_delegated_to_common_toast_handler(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        item = self.window.routine_table.item(row, 0)
+        stock_dir = Path(str(item.data(ROUTINE_STOCK_PATH_ROLE)))
+        (stock_dir / "config.json").unlink()
+
+        with (
+            patch.object(
+                gui_windows,
+                "handle_auto_trade_operation_mode_double_click",
+                return_value={"requested": 1, "succeeded": 0, "failed": 1, "results": []},
+            ) as common_handler,
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+        ):
+            handled = gui_windows.MainWindow.handle_routine_stock_operation_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        adapter = self.window._main_monitoring_stock_operation_adapter
+        common_handler.assert_called_once_with(
+            adapter,
+            (stock_dir, "005930", "삼성전자"),
+        )
+        warning.assert_not_called()
+
     def test_common_handler_scheduled_mode_uses_single_target_continuous_backend(self) -> None:
         row = self._add_row(
             kind=ROUTINE_ROW_STOCK,

@@ -37,6 +37,12 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         )
         self.clock_patch.start()
         self.addCleanup(self.clock_patch.stop)
+        self.toast_patch = patch.object(status_ops, "show_toast")
+        self.toast = self.toast_patch.start()
+        self.addCleanup(self.toast_patch.stop)
+        self.event_patch = patch.object(status_ops, "append_production_event")
+        self.events = self.event_patch.start()
+        self.addCleanup(self.event_patch.stop)
 
     def _stock(
         self,
@@ -169,10 +175,10 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
 
         window.update_stock_operation_mode.assert_not_called()
-        warning.assert_called_once_with(
+        warning.assert_not_called()
+        self.toast.assert_called_once_with(
             window,
-            "선택 오류",
-            "운영방식 변경은 종목을 1개 이상 선택해야 합니다.",
+            "운영방식을 변경할 종목을 선택하세요.",
         )
 
     def test_ats_outside_session_changes_mode_and_clears_all_selections(self) -> None:
@@ -289,7 +295,8 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         self.assertTrue(all("manual_ats_selection" in state for state in states))
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
-        warning.assert_called_once()
+        warning.assert_not_called()
+        self.toast.assert_called_once()
 
     def test_context_menu_has_no_operation_mode_change_entry(self) -> None:
         source = (
@@ -397,11 +404,88 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         parent.refresh_all.assert_not_called()
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
-        warning.assert_called_once_with(
+        warning.assert_not_called()
+        self.toast.assert_called_once_with(
             window,
-            "운영방식 변경",
-            "선택한 종목을 변경할 수 없습니다.",
+            "선택한 종목의 운영방식을 변경할 수 없습니다.",
         )
+
+    def test_config_unavailable_uses_failed_event_and_toast(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "stocks" / "111111_테스트종목"
+            window = SimpleNamespace(parent=lambda: None)
+            with patch.object(status_ops.QMessageBox, "warning") as warning:
+                result = status_ops.handle_auto_trade_operation_mode_double_click(
+                    window,
+                    (stock_dir, "111111", "테스트종목"),
+                )
+
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("FAILED", result["results"][0]["result"])
+        self.assertEqual("CONFIG_UNAVAILABLE", result["results"][0]["reason_code"])
+        self.events.assert_called_once()
+        self.assertEqual("FAILED", self.events.call_args.kwargs["result"])
+        self.assertEqual("CONFIG_UNAVAILABLE", self.events.call_args.kwargs["reason_code"])
+        self.toast.assert_called_once_with(window, "운영방식 설정을 읽을 수 없습니다.")
+        warning.assert_not_called()
+
+    def test_writer_failure_uses_exact_failed_event_and_toast(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp))
+            window, _parent = self._window(stock_dir)
+            with (
+                patch.object(
+                    status_ops.StockRepository,
+                    "_atomic_write_stock_config",
+                    side_effect=OSError("write failed"),
+                ),
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                result = status_ops.auto_trade_set_selected_operation_mode(
+                    window,
+                    "CONTINUOUS",
+                )
+
+        self.assertEqual("ATOMIC_WRITE_FAILED", result["results"][0]["reason_code"])
+        self.events.assert_called_once()
+        self.assertEqual("FAILED", self.events.call_args.kwargs["result"])
+        self.assertEqual("ATOMIC_WRITE_FAILED", self.events.call_args.kwargs["reason_code"])
+        self.toast.assert_called_once_with(window, "운영방식을 저장하지 못했습니다.")
+        warning.assert_not_called()
+
+    def test_read_back_failure_uses_exact_failed_event_and_toast(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp))
+            window, _parent = self._window(stock_dir)
+            original = {
+                "operation_mode": "SCHEDULED",
+                "start_time": "09:00:00",
+                "end_buy_time": "13:30:00",
+            }
+            with (
+                patch.object(
+                    status_ops,
+                    "read_json_dict",
+                    side_effect=[dict(original), {"status": "STOPPED"}, dict(original)],
+                ),
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                result = status_ops.auto_trade_set_selected_operation_mode(
+                    window,
+                    "CONTINUOUS",
+                )
+
+        self.assertEqual("READ_BACK_FAILED", result["results"][0]["reason_code"])
+        self.events.assert_called_once()
+        self.assertEqual("FAILED", self.events.call_args.kwargs["result"])
+        self.assertEqual("READ_BACK_FAILED", self.events.call_args.kwargs["reason_code"])
+        self.toast.assert_called_once_with(
+            window,
+            "운영방식 저장 결과를 확인하지 못했습니다.",
+        )
+        warning.assert_not_called()
 
     def test_read_back_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -427,8 +511,14 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 )
 
         self.assertFalse(result)
+        self.assertEqual("FAILED", result.result)
+        self.assertEqual("READ_BACK_FAILED", result.reason_code)
         critical.assert_not_called()
         self.assertIn("read-back 실패", append_stock_log.call_args.args[2])
+        self.events.assert_called_once()
+        self.assertEqual("OPERATOR_SETTING_DECISION", self.events.call_args.args[0])
+        self.assertEqual("FAILED", self.events.call_args.kwargs["result"])
+        self.assertEqual("READ_BACK_FAILED", self.events.call_args.kwargs["reason_code"])
 
     def test_operation_mode_write_failure_does_not_clear_ats(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -454,8 +544,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
 
         self.assertFalse(result)
+        self.assertEqual("FAILED", result.result)
+        self.assertEqual("ATOMIC_WRITE_FAILED", result.reason_code)
         self.assertIn("manual_ats_selection", state)
         clear_ats.assert_not_called()
+        self.events.assert_called_once()
+        self.assertEqual("FAILED", self.events.call_args.kwargs["result"])
+        self.assertEqual("ATOMIC_WRITE_FAILED", self.events.call_args.kwargs["reason_code"])
 
     def test_ats_clear_failure_reports_failure_without_mode_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -639,16 +734,116 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                         return_value=datetime(2026, 7, 25, 17, 0, 0),
                     ),
                     patch.object(status_ops, "append_stock_log"),
+                    patch.object(
+                        status_ops,
+                        "_operation_mode_current_session_trading_active",
+                        return_value=runtime_status == "RUNNING",
+                    ),
                     patch.object(status_ops.QMessageBox, "warning") as warning,
                 ):
                     status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
                 saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
                 self.assertEqual("CONTINUOUS", saved["operation_mode"])
-                warning.assert_called_once_with(
+                warning.assert_not_called()
+                self.toast.assert_called_once()
+                self.toast.reset_mock()
+                self.events.reset_mock()
+
+    def test_stale_running_without_current_participant_allows_mode_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(
+                Path(temp),
+                mode="SCHEDULED",
+                config_values={
+                    "routine_instance_name": "지표추종매매A",
+                    "assigned_routine_instance_id": "instance-a",
+                },
+            )
+            state_path = stock_dir / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update(
+                {
+                    "status": "RUNNING",
+                    "trade_enabled": True,
+                    "updated_at": "2026-07-24 12:45:48",
+                }
+            )
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            window, _parent = self._window(stock_dir)
+            window.current_session_operation_participant_stock_codes = lambda: ()
+            window.register_current_session_operation_participants = Mock()
+            window.retire_current_session_operation_participants = Mock()
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                result = status_ops.auto_trade_set_selected_operation_mode(
                     window,
-                    "운영방식 변경",
-                    "선택한 종목을 변경할 수 없습니다.",
+                    "CONTINUOUS",
                 )
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("CONTINUOUS", saved["operation_mode"])
+        self.assertEqual(1, result["succeeded"])
+        self.assertEqual(0, result["failed"])
+        warning.assert_not_called()
+        self.toast.assert_not_called()
+        self.events.assert_called_once()
+        self.assertEqual("TRADING_TIME_CHANGED", self.events.call_args.args[0])
+        self.assertEqual("SUCCESS", self.events.call_args.kwargs["result"])
+
+    def test_current_session_running_preserves_reason_event_and_toast(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(
+                Path(temp),
+                mode="CONTINUOUS",
+                config_values={
+                    "routine_instance_name": "지표추종매매A",
+                    "assigned_routine_instance_id": "instance-a",
+                },
+            )
+            state_path = stock_dir / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({"status": "RUNNING", "trade_enabled": True})
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            window, _parent = self._window(stock_dir)
+            window.current_session_operation_participant_stock_codes = lambda: ("111111",)
+            window.register_current_session_operation_participants = Mock()
+            window.retire_current_session_operation_participants = Mock()
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                aggregate = status_ops.auto_trade_set_selected_operation_mode(
+                    window,
+                    "SCHEDULED",
+                )
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+
+        failure = aggregate["results"][0]
+        self.assertEqual("CONTINUOUS", saved["operation_mode"])
+        self.assertEqual("BLOCKED", failure["result"])
+        self.assertEqual("BLOCKED_TRADING_ACTIVE", failure["reason_code"])
+        self.assertEqual("지표추종매매A", failure["routine"])
+        self.assertEqual("instance-a", failure["routine_instance_id"])
+        self.events.assert_called_once()
+        event = self.events.call_args
+        self.assertEqual("OPERATOR_SETTING_DECISION", event.args[0])
+        self.assertEqual("BLOCKED", event.kwargs["result"])
+        self.assertEqual("BLOCKED_TRADING_ACTIVE", event.kwargs["reason_code"])
+        self.assertEqual("111111", event.kwargs["stock_code"])
+        self.assertEqual("지표추종매매A", event.kwargs["routine"])
+        self.assertEqual("instance-a", event.kwargs["details"]["routine_instance_id"])
+        self.assertEqual(
+            "현재 운영 중인 종목은 운영방식을 변경할 수 없습니다.",
+            event.kwargs["details"]["operator_message"],
+        )
+        self.toast.assert_called_once_with(
+            window,
+            "현재 운영 중인 종목은 운영방식을 변경할 수 없습니다.",
+        )
+        warning.assert_not_called()
 
     def test_active_ats_blocks_only_while_trade_is_started(self) -> None:
         scenarios = (
@@ -673,6 +868,11 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 with (
                     patch.object(status_ops, "current_datetime", return_value=now_dt),
                     patch.object(status_ops, "manual_ats_active_now", return_value=ats_active),
+                    patch.object(
+                        status_ops,
+                        "_operation_mode_current_session_trading_active",
+                        return_value=trade_started,
+                    ),
                     patch.object(status_ops, "append_stock_log"),
                     patch.object(status_ops.QMessageBox, "warning") as warning,
                 ):
@@ -687,14 +887,16 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 )
                 if blocked:
                     self.assertIn("manual_ats_selection", state)
-                    warning.assert_called_once_with(
+                    warning.assert_not_called()
+                    self.toast.assert_called_once_with(
                         window,
-                        "운영방식 변경",
-                        "선택한 종목을 변경할 수 없습니다.",
+                        "ATS 거래 진행 중에는 운영방식을 변경할 수 없습니다.",
                     )
                 else:
                     self.assertNotIn("manual_ats_selection", state)
                     warning.assert_not_called()
+                    self.toast.assert_not_called()
+                self.toast.reset_mock()
                 window.statusBarMessage.assert_not_called()
                 window.showAutoTradePopupMessage.assert_not_called()
 
@@ -801,10 +1003,10 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
 
         self.assertEqual("CONTINUOUS", config["operation_mode"])
-        warning.assert_called_once_with(
+        warning.assert_not_called()
+        self.toast.assert_called_once_with(
             window,
-            "운영방식 변경",
-            "선택한 종목을 변경할 수 없습니다.",
+            "운영시간 설정이 올바르지 않아 운영방식을 변경할 수 없습니다.",
         )
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()

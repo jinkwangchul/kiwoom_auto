@@ -509,6 +509,7 @@ def operation_mode_change_decision(
     global_schedule: dict[str, object] | None = None,
     ats_runtime_active: bool = False,
     runtime_status: object = "STOPPED",
+    current_session_trading_active: bool | None = None,
     pending_order_active: bool = False,
     close_or_liquidation_active: bool = False,
     runtime_state_available: bool = True,
@@ -533,7 +534,10 @@ def operation_mode_change_decision(
             "schedule_source": "",
         }
     status = str(runtime_status or "STOPPED").strip().upper() or "STOPPED"
-    if status in {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}:
+    trading_active = status in {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+    if current_session_trading_active is not None:
+        trading_active = trading_active and bool(current_session_trading_active)
+    if trading_active:
         return {
             "allowed": False,
             "reason": "BLOCKED_TRADING_ACTIVE",

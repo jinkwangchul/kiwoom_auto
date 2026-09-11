@@ -24,6 +24,7 @@ import shutil
 from datetime import date, datetime, timedelta
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QPoint
 from PyQt5.QtGui import QColor, QFont, QPalette
@@ -1315,7 +1316,7 @@ def stock_register_routine_display_name(stock: dict[str, object]) -> str:
     else:
         routine_text_raw = str(routines).strip()
         routine_list = [routine_text_raw] if routine_text_raw else []
-    return routine_list[0] if routine_list else "등록대기"
+    return routine_list[0] if routine_list else "미지정"
 
 
 class StockRegisterWindow(QDialog):
@@ -1323,10 +1324,17 @@ class StockRegisterWindow(QDialog):
     종목관리 창.
     """
 
-    def __init__(self, parent: QWidget | None = None, *, stock_search_register_opener=None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        stock_search_register_opener=None,
+        mock_validation_opener=None,
+    ) -> None:
         super().__init__(None)
         configure_persistent_feature_window(self, parent)
         self._stock_search_register_opener = stock_search_register_opener
+        self._mock_validation_opener = mock_validation_opener
 
         self.setWindowTitle("종목관리")
 
@@ -1391,6 +1399,8 @@ class StockRegisterWindow(QDialog):
         ]
 
         for button in buttons:
+            button.setAutoDefault(False)
+            button.setDefault(False)
             button.setMinimumHeight(34)
             button_layout.addWidget(button)
 
@@ -1816,6 +1826,7 @@ class StockRegisterWindow(QDialog):
         self.btn_stock_history.clicked.connect(self.open_selected_stock_history)
         self.btn_delete_stock.clicked.connect(self.delete_selected_stock)
         self.stock_search_input.textChanged.connect(self.refresh_stock_table)
+        self.stock_search_input.returnPressed.connect(self.refresh_stock_table)
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
         self.stock_table.itemClicked.connect(self.on_stock_table_item_clicked)
         self.stock_table.customContextMenuRequested.connect(self.show_stock_table_context_menu)
@@ -2102,11 +2113,14 @@ class StockRegisterWindow(QDialog):
         else:
             action_assign = menu.addAction("루틴등록")
         action_unassign = menu.addAction("루틴해제")
+        action_mock_validation = menu.addAction("모의검증")
+        mock_validation_target = self.mock_validation_target_for_row(row)
 
         has_selected = selected_count > 0
         action_assign.setEnabled(has_selected)
         action_unassign.setEnabled(has_selected)
         action_delete.setEnabled(selected_count == 1)
+        action_mock_validation.setEnabled(mock_validation_target is not None)
         if not has_selected:
             reason = "대상 종목을 선택하세요."
             for action in (action_assign, action_unassign, action_delete):
@@ -2119,6 +2133,10 @@ class StockRegisterWindow(QDialog):
             reason = "초기화할 종목을 하나만 선택하세요."
             action_delete.setToolTip(reason)
             action_delete.setStatusTip(reason)
+        if mock_validation_target is None:
+            reason = "모의검증할 종목 행을 선택하세요."
+            action_mock_validation.setToolTip(reason)
+            action_mock_validation.setStatusTip(reason)
 
         selected_action = menu.exec_(self.stock_table.viewport().mapToGlobal(position))
         if selected_action is None:
@@ -2131,11 +2149,41 @@ class StockRegisterWindow(QDialog):
             self.unassign_selected_stock_routines()
         elif selected_action == action_delete:
             self.delete_selected_stock()
+        elif selected_action == action_mock_validation and mock_validation_target is not None:
+            self.open_mock_validation_for_row(row)
         elif selected_action == action_select_all:
             self.select_all_visible_stocks()
         elif selected_action == action_clear:
             self.stock_table.clearSelection()
             self.on_stock_selection_changed()
+
+    def mock_validation_target_for_row(self, row: int):
+        if row < 0 or row >= self.stock_table.rowCount():
+            return None
+        code_item = self.stock_table.item(row, 0)
+        name_item = self.stock_table.item(row, 1)
+        if code_item is None or name_item is None:
+            return None
+        code = code_item.text().strip()
+        name = name_item.text().strip()
+        if not code or not name:
+            return None
+        stock_dir = stock_repository_factory().resolve_stock_dir(code, name)
+        if not stock_dir.is_dir():
+            return None
+        return SimpleNamespace(
+            stock_dir=stock_dir,
+            code=code,
+            name=name,
+            routine_instance_id="",
+        )
+
+    def open_mock_validation_for_row(self, row: int) -> bool:
+        target = self.mock_validation_target_for_row(row)
+        opener = getattr(self, "_mock_validation_opener", None)
+        if target is None or not callable(opener):
+            return False
+        return bool(opener(target))
 
     def available_routine_assign_targets(self) -> list[tuple[RoutineInstanceRecord, RoutineDefinitionRecord]]:
         targets: list[tuple[RoutineInstanceRecord, RoutineDefinitionRecord]] = []

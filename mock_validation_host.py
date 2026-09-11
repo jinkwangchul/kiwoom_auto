@@ -37,6 +37,8 @@ from mock_validation_contract import (
     MockValidationError,
     deterministic_mock_identity,
     instance_effective_settings,
+    mock_instance_active_effective_settings,
+    mock_instance_pre_start_editable,
     new_mock_identity,
     normalized_stock_code,
     payload_hash,
@@ -1049,9 +1051,14 @@ class MockValidationHost:
                 not ended
                 and not restart_recovery_blocked
                 and not stock_operation_active
-                and session_state in {SESSION_WAITING, SESSION_RUNNING}
-                and execution.get("state")
-                in {SESSION_WAITING, INSTANCE_VALIDATION_STOPPED}
+                and (
+                    mock_instance_pre_start_editable(document, instance_id)
+                    or (
+                        session_state == SESSION_RUNNING
+                        and execution.get("state")
+                        in {SESSION_WAITING, INSTANCE_VALIDATION_STOPPED}
+                    )
+                )
                 and operation_state not in {"RUNNING", "CLOSING", "ENDED"}
             ),
             "can_early_close": (
@@ -1102,6 +1109,8 @@ class MockValidationHost:
             snapshot = operation.get("operation_policy_snapshot")
             snapshot = snapshot if isinstance(snapshot, dict) else {}
             settings = self._operation_effective_settings(document, instance_id)
+            if str(settings.get("operation_mode") or "").strip().upper() != "SCHEDULED":
+                continue
             phase = self._mock_operation_activation_phase(
                 settings, now, operation_policy=snapshot
             )
@@ -1285,19 +1294,9 @@ class MockValidationHost:
     def _operation_effective_settings(
         self, document: dict[str, Any], instance_id: str
     ) -> dict[str, Any]:
-        operation = instance_operation_state(document, instance_id)
-        snapshot = (
-            operation.get("operation_policy_snapshot")
-            if isinstance(operation, dict)
-            else None
-        )
-        snapshot = snapshot if isinstance(snapshot, dict) else {}
-        direct = snapshot.get("mock_instance_effective_settings")
-        if isinstance(direct, dict):
-            return deepcopy(direct)
-        by_instance = snapshot.get("mock_effective_settings_by_instance")
-        if isinstance(by_instance, dict) and isinstance(by_instance.get(instance_id), dict):
-            return deepcopy(by_instance[instance_id])
+        active = mock_instance_active_effective_settings(document, instance_id)
+        if isinstance(active, dict):
+            return active
         return self._instance_effective_settings(document, instance_id)
 
     def _process_stock(self, document: dict[str, Any], now: datetime) -> None:

@@ -19,6 +19,8 @@ from mock_validation_contract import (
     clean_text,
     instance_initial_buy_adjustment,
     instance_effective_settings,
+    mock_instance_active_effective_settings,
+    mock_instance_active_operation,
     normalized_stock_code,
     payload_hash,
 )
@@ -58,9 +60,9 @@ def _record_by_instance(records: Any) -> dict[str, dict[str, Any]]:
     }
 
 
-def _mock_instance_trade_window_active(
+def _mock_instance_activation_phase(
     operation: dict[str, Any], as_of: datetime
-) -> bool:
+) -> dict[str, Any]:
     snapshot = operation.get("operation_policy_snapshot")
     snapshot = snapshot if isinstance(snapshot, dict) else {}
     settings = snapshot.get("mock_instance_effective_settings")
@@ -104,7 +106,7 @@ def _mock_instance_trade_window_active(
         session_phase=phase,
         operation_policy_reader=lambda: snapshot,
     )
-    return activation.get("actual_trading_session_active") is True
+    return activation
 
 
 def _mock_instance_display_status(
@@ -116,7 +118,7 @@ def _mock_instance_display_status(
     live_orders: tuple[dict[str, Any], ...],
     progression: dict[str, Any],
     as_of: datetime,
-) -> tuple[str, bool, bool, bool]:
+) -> tuple[str, bool, bool, bool, dict[str, Any]]:
     lifecycle = document.get("mock_operation_lifecycle")
     lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
     instance_operations = lifecycle.get("instance_operations")
@@ -132,11 +134,11 @@ def _mock_instance_display_status(
     review_instance_id = clean_text(review.get("source_routine_instance_id"))
     review_required = review.get("review_required") is True and review_instance_id in {"", instance_id}
     if state == INSTANCE_ERROR or operation.get("state") == "REVIEW_STOPPED" or review_required:
-        return "검토종목", False, False, False
+        return "검토종목", False, False, False, {}
 
     operation_state = clean_text(operation.get("state"))
     if state in {"WAITING", "ENDED", "VALIDATION_STOPPED"}:
-        return "감시/대기", False, False, False
+        return "감시/대기", False, False, False, {}
     close_source = clean_text(operation.get("close_source")).upper()
     close_method = clean_text(operation.get("close_method")).upper()
     if close_source and close_method:
@@ -145,25 +147,32 @@ def _mock_instance_display_status(
             "CURRENT_PRICE",
         }
         if close_source in {"NORMAL", "AUTO"}:
-            return "자동마감", True, False, liquidation_active
+            return "자동마감", True, False, liquidation_active, {}
         if close_source == "EARLY":
-            return "조기마감", True, False, liquidation_active
+            return "조기마감", True, False, liquidation_active, {}
         if close_source == "IMMEDIATE":
-            return "청산", True, False, liquidation_active
+            return "청산", True, False, liquidation_active, {}
     if state == "CLOSING" or operation_state == "CLOSING":
-        return "감시/대기", False, False, False
+        return "감시/대기", False, False, False, {}
 
     _ = live_orders, progression
     if state == "RUNNING" and progression_allowed and operation_state == "RUNNING":
+        activation = _mock_instance_activation_phase(operation, as_of)
+        projection_phase = clean_text(activation.get("projection_phase")).upper()
+        controls_active = projection_phase in {
+            "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
+            "ACTIVE_SESSION",
+        }
         return (
             "매수/매도"
-            if _mock_instance_trade_window_active(operation, as_of)
+            if activation.get("actual_trading_session_active") is True
             else "감시/대기",
             True,
-            True,
+            controls_active,
             False,
+            activation,
         )
-    return "감시/대기", False, False, False
+    return "감시/대기", False, False, False, {}
 
 
 def _instance_period(rules: Any) -> Any:
@@ -228,7 +237,11 @@ def mock_instance_projection(
         isinstance(mutable_settings, dict)
         and isinstance(mutable_settings.get(instance_id), dict)
     )
-    projected_settings = instance_effective_settings(document, instance_id)
+    next_start_settings = instance_effective_settings(document, instance_id)
+    active_settings = mock_instance_active_effective_settings(document, instance_id)
+    projected_settings = (
+        active_settings if isinstance(active_settings, dict) else next_start_settings
+    )
     effective_settings = projected_settings if has_mutable_settings else None
     operation_display = (
         _mock_operation_display(projected_settings)
@@ -306,6 +319,7 @@ def mock_instance_projection(
         status_cell_active,
         method_cell_active,
         liquidation_phase_active,
+        activation_phase,
     ) = _mock_instance_display_status(
         document,
         instance_id,
@@ -325,8 +339,41 @@ def mock_instance_projection(
         if isinstance(effective_display_contract.get("liquidation"), dict)
         else {}
     )
+    operation_mode = clean_text(projected_settings.get("operation_mode")).upper()
+    active_operation = mock_instance_active_operation(document, instance_id) or {}
+    close_source = clean_text(active_operation.get("close_source")).upper()
+    close_method = clean_text(active_operation.get("close_method")).upper()
+    legitimate_close = bool(close_source and close_method)
+    if operation_mode == "CONTINUOUS" and not legitimate_close:
+        liquidation = {**liquidation, "display_text": "-"}
+        effective_display_contract["liquidation"] = liquidation
+    elif close_method in {"CARRYOVER", "LONG_HOLD"}:
+        liquidation = {**liquidation, "display_text": "-"}
+        effective_display_contract["liquidation"] = liquidation
     liquidation_has_policy = clean_text(liquidation.get("display_text")) not in {"", "-"}
     holding_qty = int(position.get("holding_qty", 0) or 0)
+    normal_scheduled_liquidation_active = bool(
+        operation_mode == "SCHEDULED"
+        and state == "RUNNING"
+        and execution.get("progression_allowed") is True
+        and clean_text(active_operation.get("state")).upper() == "RUNNING"
+        and clean_text(activation_phase.get("projection_phase")).upper()
+        in {
+            "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
+            "ACTIVE_SESSION",
+        }
+        and activation_phase.get("ats_session_active") is not True
+    )
+    liquidation_phase_active = bool(
+        liquidation_phase_active or normal_scheduled_liquidation_active
+    )
+    liquidation_cell_active = bool(
+        liquidation_has_policy
+        and (
+            normal_scheduled_liquidation_active
+            or (liquidation_phase_active and holding_qty > 0)
+        )
+    )
     return {
         "row_kind": "mock_routine_instance",
         "validation_session_id": document["session"]["validation_session_id"],
@@ -340,9 +387,8 @@ def mock_instance_projection(
         "display_status": display_status,
         "status_cell_active": status_cell_active,
         "method_cell_active": method_cell_active,
-        "liquidation_cell_active": bool(
-            liquidation_phase_active and holding_qty > 0 and liquidation_has_policy
-        ),
+        "liquidation_phase_active": liquidation_phase_active,
+        "liquidation_cell_active": liquidation_cell_active,
         "liquidation_has_policy": liquidation_has_policy,
         "error": is_error,
         "status_led": "red" if is_error else "normal",

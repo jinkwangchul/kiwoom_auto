@@ -193,6 +193,59 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual("동전주B", dialog_type.call_args.kwargs["initial_display_name"])
 
+    def test_snapshot_clone_success_toasts_persistent_root_with_unified_message(self) -> None:
+        persistent_root = SimpleNamespace(
+            refresh_auto_trade_assignment_views=Mock()
+        )
+        owner = SimpleNamespace(parent=lambda: persistent_root)
+        request = RoutineInstanceCreateRequest(
+            definition_id="indicator_follow",
+            display_name="동전주B",
+        )
+        fake_dialog = Mock()
+        fake_dialog.exec_.return_value = QDialog.Accepted
+        fake_dialog.registration_request = request
+        instance = SimpleNamespace(instance_id="instance-id", display_name="동전주B")
+        repository = Mock()
+        repository.create_instance.return_value = SimpleNamespace(
+            success=True,
+            instance=instance,
+            error="",
+        )
+
+        with (
+            patch(
+                "gui_routine_registration_dialog.RoutineRegistrationDialog",
+                return_value=fake_dialog,
+            ),
+            patch(
+                "gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository",
+                return_value=repository,
+            ),
+            patch(
+                "gui_indicator_follow_routine_settings_dialog.show_toast"
+            ) as toast,
+        ):
+            result = register_routine_instance_snapshot(
+                owner,
+                definition_id="indicator_follow",
+                definition_display_name="지표추종매매",
+                source_instance_display_name="동전주A",
+                rules_provider=lambda: {
+                    "success": True,
+                    "rules": {"buy": {}},
+                },
+            )
+
+        self.assertIs(instance, result)
+        repository.create_instance.assert_called_once_with(request, {"buy": {}})
+        toast.assert_called_once_with(
+            persistent_root,
+            "'동전주B' 루틴을 등록했습니다.",
+        )
+        self.assertIsNot(toast.call_args.args[0], owner)
+        persistent_root.refresh_auto_trade_assignment_views.assert_called_once_with()
+
     def test_group_registration_name_uses_normalized_group_family(self) -> None:
         fake_dialog = Mock()
         fake_dialog.exec_.return_value = QDialog.Rejected
@@ -332,15 +385,17 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         with (
             patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=fake_dialog),
             patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository") as repository,
+            patch("gui_indicator_follow_routine_settings_dialog.show_toast") as toast,
         ):
             result = IndicatorFollowRoutineSettingsDialog.open_registration_dialog(fake_self)
 
         self.assertIsNone(result)
         fake_self.build_registration_rules_from_current_ui_state.assert_not_called()
         repository.assert_not_called()
+        toast.assert_not_called()
         fake_self.close.assert_not_called()
 
-    def test_success_refreshes_parent_once_after_repository_success(self) -> None:
+    def test_group_registration_success_toasts_root_then_refreshes_and_closes(self) -> None:
         lifecycle_events = []
         parent = SimpleNamespace(
             refresh_auto_trade_assignment_views=Mock(
@@ -360,6 +415,8 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                 return_value={"success": True, "rules": {"buy": {}}, "error": ""}
             ),
             parent=lambda: parent,
+            group_id=str(Path("groups") / "_대형주"),
+            group_display_name="대형주",
             settings_mode="registration",
             close=Mock(side_effect=lambda: lifecycle_events.append("close")),
         )
@@ -391,9 +448,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         parent.refresh_all.assert_not_called()
         information.assert_not_called()
         toast.assert_called_once_with(
-            fake_self,
+            parent,
             "'대형주 추세형' 루틴을 등록했습니다.",
         )
+        self.assertIsNot(toast.call_args.args[0], fake_self)
         fake_self.close.assert_called_once_with()
         self.assertEqual(["toast", "refresh", "close"], lifecycle_events)
 
@@ -431,28 +489,64 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=fake_dialog),
             patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository", return_value=repository),
             patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.critical"),
+            patch("gui_indicator_follow_routine_settings_dialog.show_toast") as toast,
         ):
             result = IndicatorFollowRoutineSettingsDialog.open_registration_dialog(fake_self)
 
         self.assertIsNone(result)
         parent.refresh_auto_trade_assignment_views.assert_not_called()
         parent.refresh_all.assert_not_called()
+        toast.assert_not_called()
         fake_self.close.assert_not_called()
 
-    def test_registration_rules_use_existing_ui_mapper_without_writing(self) -> None:
-        base_rules = {"indicator_follow_ui_state": {"state": {"basic": {}}}}
-        pending_rules = {
-            **base_rules,
-            "indicator_follow_rule_pending": {"mode": "merge_add_candidate"},
-        }
+    def test_validation_failure_does_not_create_routine_instance(self) -> None:
+        request = RoutineInstanceCreateRequest(
+            definition_id="indicator_follow",
+            display_name="검증 실패 루틴",
+        )
+        fake_self = SimpleNamespace(
+            definition_id="indicator_follow",
+            definition_display_name="지표추종매매",
+            routine_name="지표추종매매",
+            build_registration_rules_from_current_ui_state=Mock(
+                return_value={
+                    "success": False,
+                    "rules": {},
+                    "error": "SELL 설정은 하나만 선택해야 합니다.",
+                }
+            ),
+            parent=lambda: None,
+            settings_mode="registration",
+            close=Mock(),
+        )
+        fake_dialog = Mock()
+        fake_dialog.exec_.return_value = QDialog.Accepted
+        fake_dialog.registration_request = request
+
+        with (
+            patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=fake_dialog),
+            patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository") as repository,
+            patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.critical"),
+            patch("gui_indicator_follow_routine_settings_dialog.show_toast") as toast,
+        ):
+            result = IndicatorFollowRoutineSettingsDialog.open_registration_dialog(fake_self)
+
+        self.assertIsNone(result)
+        repository.assert_not_called()
+        toast.assert_not_called()
+        fake_self.close.assert_not_called()
+
+    def test_registration_rules_use_common_validation_without_writing(self) -> None:
+        base_rules = {"bar": {"bar_minutes": 1}}
+        prospective_rules = {"bar": {"bar_minutes": 5}}
         mapper = Mock()
-        mapper.build_engine_rules_pending_from_ui_state.return_value = {
-            "pending_rules": pending_rules,
-            "validation_warnings": [],
-            "postponed": ["existing postponed mapping"],
+        mapper.validate_settings_candidate.return_value = {
+            "valid": True,
+            "prospective_rules": prospective_rules,
+            "prospective_rules_hash": "rules-hash",
         }
         fake_self = SimpleNamespace(
-            build_rules_with_indicator_follow_ui_state=Mock(return_value=base_rules),
+            rules_data=base_rules,
             collect_indicator_follow_ui_state=Mock(return_value={"basic": {}}),
             _load_indicator_follow_rule_mapper=Mock(return_value=mapper),
         )
@@ -462,8 +556,8 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         )
 
         self.assertTrue(result["success"])
-        self.assertEqual(pending_rules, result["rules"])
-        mapper.build_engine_rules_pending_from_ui_state.assert_called_once_with(
+        self.assertEqual(prospective_rules, result["rules"])
+        mapper.validate_settings_candidate.assert_called_once_with(
             {"basic": {}},
             base_rules,
         )
@@ -519,7 +613,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         after = hashlib.sha256(rules_path.read_bytes()).hexdigest()
         self.assertTrue(result["success"], result.get("error"))
         self.assertIn("indicator_follow_ui_state", result["rules"])
-        self.assertIn("indicator_follow_rule_pending", result["rules"])
+        self.assertEqual(
+            dialog.basic_signal_interval_combo.currentText(),
+            str(result["rules"]["bar"]["bar_minutes"]),
+        )
         self.assertEqual(before, after)
 
     def test_existing_instance_uses_instance_name_in_window_title(self) -> None:
@@ -613,7 +710,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         fake_self = SimpleNamespace(
             instance_id="instance-id",
             group_id="group-id",
-            save_indicator_follow_ui_state_to_rules=Mock(
+            commit_current_settings=Mock(
                 return_value={"success": True}
             ),
             close=Mock(),
@@ -634,15 +731,16 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
 
     def test_edit_failure_keeps_dialog_open_without_refresh(self) -> None:
         fake_self = SimpleNamespace(
-            save_indicator_follow_ui_state_to_rules=Mock(
+            commit_current_settings=Mock(
                 return_value={"success": False, "error": "write failed"}
             ),
             close=Mock(),
         )
 
-        with patch(
-            "gui_indicator_follow_routine_settings_dialog._refresh_routine_assignment_views"
-        ) as refresh:
+        with (
+            patch("gui_indicator_follow_routine_settings_dialog._refresh_routine_assignment_views") as refresh,
+            patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.warning"),
+        ):
             result = IndicatorFollowRoutineSettingsDialog.save_edit_settings_and_close(
                 fake_self
             )

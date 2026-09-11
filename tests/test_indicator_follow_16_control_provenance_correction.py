@@ -89,6 +89,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mapper = _load("correction_mapper", "routine_rule_mapper.py")
+        cls.validator = _load("correction_validator", "routine_rule_commit_validator.py")
         cls.buy_execution = _load("correction_buy_execution", "routine_buy_execution.py")
         cls.routine_engine = _load("correction_routine_engine", "routine_macd_engine.py")
 
@@ -285,8 +286,8 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         preview = self.mapper.build_engine_rules_preview_from_ui_state(state, self._rules())
         candidate = preview["preview_rules"]["buy"]["filters"]["price_compare"]
         below, above = candidate["conditions"]
-        self.assertEqual(below["operator"], "<=")
-        self.assertEqual(above["operator"], ">")
+        self.assertEqual(below["operator"], "<")
+        self.assertEqual(above["operator"], ">=")
         self.assertEqual(below["branch_policy"]["round_budget_value"], 0.62)
         self.assertEqual(above["branch_policy"]["budget_ratio"], 2.63)
 
@@ -336,10 +337,97 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             actionable_order_price=100,
         )
         self.assertEqual(reason, "")
-        self.assertEqual(evidence_equal["branch_id"], "BELOW_OR_EQUAL")
+        self.assertEqual(evidence_equal["branch_id"], "ABOVE")
         self.assertEqual(
-            planned_equal["buy"]["execution"]["repeat"]["round_budget_value"], 0.62
+            planned_equal["buy"]["execution"]["repeat"]["budget_ratio"], 2.63
         )
+
+    def test_price_compare_operator_pairs_preserve_selection_and_block_overlap(self):
+        base_price_compare = {
+            "check": True,
+            "mode_combo": "회차기준",
+            "round_operator_combo": "+",
+            "round_budget_line": "1",
+            "above_mode_combo": "예산기준",
+            "above_budget_ratio_line": "1",
+        }
+        for below_operator, above_operator in (("<=", ">"), ("<", ">"), ("<", ">=")):
+            with self.subTest(pair=(below_operator, above_operator)):
+                state = {
+                    "basic": {"basic_signal_interval_combo": "1"},
+                    "buy_ui": {
+                        "signal_filter": {},
+                        "price_compare": {
+                            **base_price_compare,
+                            "condition_combo": below_operator,
+                            "above_condition_combo": above_operator,
+                        },
+                    },
+                    "sell_ui": {"signal_conditions": {}},
+                }
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state, self._rules()
+                )
+                candidate = preview["preview_rules"]["buy"]["filters"]["price_compare"]
+                self.assertEqual(
+                    [below_operator, above_operator],
+                    [item["operator"] for item in candidate["conditions"]],
+                )
+                validation = self.validator.validate_committed_rules(
+                    preview["preview_rules"], preview["preview_rules"], [], {}
+                )
+                checks = {item["name"]: item["ok"] for item in validation["checks"]}
+                self.assertTrue(checks["buy_price_compare_branch_operators_valid"])
+                execution_rules = self._rules()
+                execution_rules.setdefault("buy", {}).setdefault("filters", {})[
+                    "price_compare"
+                ] = candidate
+                _, evidence, reason = self.buy_execution._buy_price_compare_branch_planning_rules(
+                    rules=execution_rules,
+                    confirmed_round=1,
+                    average_price=90,
+                    actionable_order_price=100,
+                )
+                self.assertEqual("", reason)
+                self.assertEqual("BELOW_OR_EQUAL", evidence["branch_id"])
+
+                if (below_operator, above_operator) == ("<", ">"):
+                    _, evidence, reason = self.buy_execution._buy_price_compare_branch_planning_rules(
+                        rules=execution_rules,
+                        confirmed_round=1,
+                        average_price=100,
+                        actionable_order_price=100,
+                    )
+                    self.assertIsNone(evidence)
+                    self.assertEqual("BUY_PRICE_COMPARE_BRANCH_NOT_DETERMINISTIC", reason)
+
+        overlap_state = deepcopy(state)
+        overlap_state["buy_ui"]["price_compare"].update({
+            "condition_combo": "<=",
+            "above_condition_combo": ">=",
+        })
+        overlap_preview = self.mapper.build_engine_rules_preview_from_ui_state(
+            overlap_state, self._rules()
+        )
+        self.assertNotIn(
+            "price_compare",
+            overlap_preview["preview_rules"]["indicator_follow_rule_preview"]
+            ["candidates"].get("filters", {}),
+        )
+        self.assertIn(
+            "buy price compare branch operators overlap",
+            overlap_preview["validation_warnings"],
+        )
+
+        invalid_rules = deepcopy(preview["preview_rules"])
+        invalid_conditions = invalid_rules["buy"]["filters"]["price_compare"]["conditions"]
+        invalid_conditions[0]["operator"] = "<="
+        invalid_conditions[1]["operator"] = ">="
+        validation = self.validator.validate_committed_rules(
+            invalid_rules, invalid_rules, [], {}
+        )
+        checks = {item["name"]: item["ok"] for item in validation["checks"]}
+        self.assertFalse(checks["buy_price_compare_branch_operators_valid"])
 
         multiply_budget, _, reference, _, issues = _repeat_budget(
             {"detail_mode": "ROUND", "round_operator": "MULTIPLY", "round_budget_value": 1.37},

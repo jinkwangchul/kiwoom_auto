@@ -59,7 +59,7 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
         return stock_dir, "111111", "Test"
 
     @staticmethod
-    def _callbacks(*, trade_allowed: bool):
+    def _callbacks():
         return context_menu.StockContextMenuCallbacks(
             select_all=Mock(),
             clear_selection=Mock(),
@@ -90,7 +90,7 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
                         _main_monitoring_auto_trade_operation_host=operation_host,
                     ),
                     has_selection=True,
-                    callbacks=self._callbacks(trade_allowed=False),
+                    callbacks=self._callbacks(),
                     selected_targets=[target],
                     operation_excluded=False,
                     operation_exclusion_action="set",
@@ -103,7 +103,7 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
                         _main_monitoring_auto_trade_operation_host=operation_host,
                     ),
                     has_selection=True,
-                    callbacks=self._callbacks(trade_allowed=False),
+                    callbacks=self._callbacks(),
                     selected_targets=[target],
                     operation_excluded=False,
                     operation_exclusion_action="set",
@@ -128,7 +128,7 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
     def test_backend_availability_reasons_flow_into_ui_projection(self) -> None:
         with TemporaryDirectory() as temp:
             target = self._target(temp, review=False)
-            callbacks = self._callbacks(trade_allowed=False)
+            callbacks = self._callbacks()
             decision = SimpleNamespace(
                 allowed=False,
                 reason_code="CURRENTLY_RUNNING",
@@ -166,7 +166,7 @@ class ContextMenuAvailabilityNormalizationTests(unittest.TestCase):
             before = state_path.read_bytes()
             runtime_state = {"participant": "unchanged"}
             callbacks = replace(
-                self._callbacks(trade_allowed=True),
+                self._callbacks(),
                 unregister=Mock(),
                 unregister_available=Mock(return_value=False),
             )

@@ -294,6 +294,31 @@ class ConnectedBuyUiTest(unittest.TestCase):
         ]["candidates"].get("execution", {})
         self.assertNotIn("base", legacy_candidates)
 
+    def test_price_compare_operator_combos_enforce_only_overlap_exclusion(self) -> None:
+        top = self.dialog.buy_price_compare_condition_combo
+        bottom = self.dialog.buy_price_compare_above_condition_combo
+
+        self.assertEqual(["<=", "<"], [top.itemText(index) for index in range(top.count())])
+        self.assertEqual([">"], [bottom.itemText(index) for index in range(bottom.count())])
+
+        top.setCurrentText("<")
+        self.assertEqual([">", ">="], [bottom.itemText(index) for index in range(bottom.count())])
+        bottom.setCurrentText(">=")
+        self.assertEqual(["<"], [top.itemText(index) for index in range(top.count())])
+
+        bottom.setCurrentText(">")
+        self.assertEqual(["<=", "<"], [top.itemText(index) for index in range(top.count())])
+        top.setCurrentText("<")
+        state = deepcopy(self._state())
+        self.assertEqual("<", state["buy_ui"]["price_compare"]["condition_combo"])
+        self.assertEqual(">", state["buy_ui"]["price_compare"]["above_condition_combo"])
+
+        top.setCurrentText("<=")
+        applied = self.dialog.apply_indicator_follow_ui_state(state)
+        self.assertFalse(applied["sync_errors"])
+        self.assertEqual("<", top.currentText())
+        self.assertEqual(">", bottom.currentText())
+
     def test_situation_response_direction_uses_common_comparator_rule(self) -> None:
         self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
         for slot in ("setting1", "setting2"):
@@ -321,7 +346,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_situation_response_unfilled_enabled_check.setChecked(True)
         self.assertFalse(self.dialog.buy_situation_response_price_enabled_check.isChecked())
         self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
-        self.assertTrue(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
+        self.assertFalse(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
         self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
         self.dialog.buy_situation_response_setting1_direction_combo.setCurrentText("상하")
         self.dialog.buy_situation_response_setting1_compare_combo.setCurrentText("이탈")
@@ -438,7 +463,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
     def test_situation_response_commit_validator_guards_pair_and_cycle_authority(self) -> None:
         state = self._state()
         state["buy_ui"]["situation"].update({
-            "unfilled_enabled_check": True,
+            "unfilled_enabled_check": False,
             "unfilled_scope_combo": "매회",
             "unfilled_time_line": "10",
             "unfilled_unit_combo": "초",
@@ -506,13 +531,22 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.assertFalse(cycle_checks["buy_cycle_policy_valid"])
 
         combined_rules = deepcopy(valid_rules)
+        combined_rules["buy"]["execution"]["base"]["unfilled_timeout_policy"] = {
+            "policy": "CANCEL_PENDING_ORDER",
+            "enabled": True,
+            "action": "CANCEL",
+            "scope": "EACH",
+            "configured_value": 10,
+            "configured_unit": "SECOND",
+            "anchor": "BROKER_ACCEPTED_AT",
+        }
         combined_result = self.validator.validate_committed_rules(
             deepcopy(combined_rules), combined_rules, [], {}
         )
         combined_checks = {
             item["name"]: item["ok"] for item in combined_result["checks"]
         }
-        self.assertNotIn("buy_situation_response_modes_exclusive", combined_checks)
+        self.assertFalse(combined_checks["buy_situation_response_modes_exclusive"])
         self.assertTrue(combined_checks["buy_unfilled_timeout_policy_valid"])
         self.assertTrue(combined_checks["buy_price_response_slots_valid"])
 
@@ -604,7 +638,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.assertTrue(self._candidate("cycle")["execution_connected"])
         self.dialog.buy_situation_response_unfilled_enabled_check.setChecked(True)
         self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
-        self.assertTrue(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
+        self.assertFalse(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
         self.dialog.buy_situation_response_setting1_action_combo.setCurrentText("일괄취소")
         connected = self._candidate("cycle")
         self.assertTrue(connected["execution_connected"])
@@ -616,11 +650,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
             self._candidate("base")["value"]["buy_price_response_policies"],
             connected["value"]["buy_price_response_policies"],
         )
-        self.assertEqual(
-            self._candidate("base")["value"]["unfilled_timeout_policy"],
-            connected["value"]["unfilled_timeout_policy"],
-        )
-        self.assertTrue(connected["value"]["unfilled_timeout_policy"]["enabled"])
+        self.assertFalse(connected["value"]["unfilled_timeout_policy"]["enabled"])
 
     def test_exit_conditions_are_independent_and_use_or(self) -> None:
         self.dialog.buy_cycle_time_mode_combo.setCurrentText("선택없음")

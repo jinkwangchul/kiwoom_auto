@@ -131,20 +131,19 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                     ),
                 )
 
-    def test_chart_pnl_font_matches_stock_identity_across_refresh_states(self) -> None:
+    def test_chart_pnl_font_is_larger_than_compact_stock_identity_across_refresh_states(self) -> None:
         window = self._window(_projection())
         window.show()
         self.app.processEvents()
         stock_label = window.info_labels["stock"]
         pnl_label = window.info_labels["cumulative_pnl"]
 
-        def assert_matching_font() -> None:
-            self.assertEqual(stock_label.font().pixelSize(), pnl_label.font().pixelSize())
-            self.assertEqual(stock_label.font().weight(), pnl_label.font().weight())
-            self.assertEqual(stock_label.fontMetrics().height(), pnl_label.fontMetrics().height())
+        def assert_compact_identity_and_large_pnl() -> None:
+            self.assertEqual(14, stock_label.font().pixelSize())
+            self.assertEqual(21, pnl_label.font().pixelSize())
+            self.assertGreater(pnl_label.fontMetrics().height(), stock_label.fontMetrics().height())
 
-        self.assertEqual(21, stock_label.font().pixelSize())
-        assert_matching_font()
+        assert_compact_identity_and_large_pnl()
         for result in (
             {"available": False},
             {"available": True, "cumulative_profit": 12_500, "cumulative_rate": 1.25},
@@ -152,12 +151,12 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         ):
             window.apply_pnl_result(result)
             self.app.processEvents()
-            assert_matching_font()
+            assert_compact_identity_and_large_pnl()
         window.close()
 
     def test_window_title_builder_keeps_stock_code_when_name_is_unavailable(self) -> None:
         self.assertEqual(
-            "999999 / - / - / - / 매수 0 / 매도 0",
+            "999999 ▷매수 0 / 매도 0",
             chart_window._build_window_title(stock_code="999999"),
         )
 
@@ -236,7 +235,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             [(bar_time.isoformat(timespec="seconds"), price) for bar_time, price in window.chart.sell_series],
         )
         self.assertEqual(
-            "005930 삼성전자 / 지표추종-A / 수동운영 / 5분봉 / 매수 2 / 매도 2",
+            "005930 삼성전자 ▷매수 2 / 매도 2",
             window.windowTitle(),
         )
         window.close()
@@ -289,7 +288,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             ))
             labels = window.chart._x_axis_label_points(QRectF(70, 34, 600, 300))
             self.assertEqual(
-                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"],
+                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],
                 [bar_time.strftime("%H:%M") for bar_time, _x in labels],
             )
             self.assertEqual([], window.chart.close_series)
@@ -301,31 +300,42 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             (
                 "2026-08-10T09:00:00+09:00",
                 "2026-08-10T15:30:00+09:00",
-                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"],
+                False,
+                ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],
             ),
             (
                 "2026-08-10T08:00:00+09:00",
                 "2026-08-10T20:00:00+09:00",
+                True,
                 [
-                    "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00",
-                    "15:00", "16:00", "17:00", "18:00", "19:00", "20:00",
+                    "08:00", "09:30", "11:00", "12:30", "14:00", "15:30",
+                    "17:00", "18:30",
                 ],
             ),
             (
                 "2026-08-10T09:25:00+09:00",
                 "2026-08-10T15:30:00+09:00",
-                ["09:25", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"],
+                False,
+                ["09:25", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],
             ),
             (
                 "2026-08-10T09:00:00+09:00",
                 "2026-08-10T15:00:00+09:00",
+                False,
                 ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],
             ),
         )
-        for start, end, expected in cases:
+        for start, end, nxt_available, expected in cases:
             with self.subTest(start=start, end=end):
                 chart = StockInstanceCloseChart()
-                chart.set_projection([], [], [], x_range_start=start, x_range_end=end)
+                chart.set_projection(
+                    [],
+                    [],
+                    [],
+                    x_range_start=start,
+                    x_range_end=end,
+                    nxt_available=nxt_available,
+                )
                 labels = chart._x_axis_label_points(QRectF(70, 34, 600, 300))
                 self.assertEqual(
                     expected,
@@ -358,6 +368,35 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual("12:15", chart.buy_series[0][0].strftime("%H:%M"))
         self.assertEqual("12:15", chart.actual_buy_fill_series[0][0].strftime("%H:%M"))
         chart.close()
+
+    def test_hidden_session_endpoint_label_preserves_endpoint_candle_and_coordinate(self) -> None:
+        cases = (
+            (False, "09:00:00", "15:30:00", "15:30"),
+            (True, "08:00:00", "20:00:00", "20:00"),
+        )
+        plot = QRectF(70, 34, 600, 300)
+        for nxt_available, start, end, endpoint in cases:
+            with self.subTest(nxt_available=nxt_available):
+                endpoint_value = 115
+                chart = StockInstanceCloseChart()
+                chart.set_projection(
+                    [{"bar_time": f"2026-08-10T{end}+09:00", "close": endpoint_value}],
+                    [],
+                    [],
+                    x_range_start=f"2026-08-10T{start}+09:00",
+                    x_range_end=f"2026-08-10T{end}+09:00",
+                    nxt_available=nxt_available,
+                )
+                labels = [
+                    bar_time.strftime("%H:%M")
+                    for bar_time, _x in chart._x_axis_label_points(plot)
+                ]
+                self.assertNotIn(endpoint, labels)
+                self.assertEqual(endpoint, chart.close_series[-1][0].strftime("%H:%M"))
+                point = chart.position_for(chart.close_series[-1][0], endpoint_value, plot)
+                self.assertIsNotNone(point)
+                self.assertAlmostEqual(plot.right(), point.x())
+                chart.close()
 
     def test_market_capability_alone_selects_regular_or_nxt_axis(self) -> None:
         cases = (
@@ -457,16 +496,16 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                     ],
                 )
                 self.assertIs(nxt, window.header_badges["nxt"].isEnabled())
-                self.assertEqual("지표추종-A", window.info_labels["routine"].text())
-                self.assertEqual("매수/매도", window.operation_info_labels["status"].text())
-                self.assertEqual("루틴", window.operation_info_labels["method"].text())
-                self.assertEqual("5분/시장가", window.operation_info_labels["liquidation"].text())
+                self.assertEqual("▶ 지표추종-A", window.info_labels["routine"].text())
+                self.assertEqual("· 매수/매도", window.operation_info_labels["status"].text())
+                self.assertEqual("· 루틴", window.operation_info_labels["method"].text())
+                self.assertEqual("· 5분/시장가", window.operation_info_labels["liquidation"].text())
                 start, end = window.chart.fixed_time_range
                 self.assertEqual(expected_start, start.strftime("%H:%M"))
                 self.assertEqual(expected_end, end.strftime("%H:%M"))
                 window.close()
 
-    def test_empty_nxt_chart_keeps_full_hourly_market_axis(self) -> None:
+    def test_empty_nxt_chart_keeps_full_market_axis_with_90_minute_labels(self) -> None:
         window = self._window(_projection(
             candles=[],
             buys=[],
@@ -476,7 +515,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         ))
         labels = window.chart._x_axis_label_points(QRectF(70, 34, 600, 300))
         self.assertEqual(
-            [f"{hour:02d}:00" for hour in range(8, 21)],
+            ["08:00", "09:30", "11:00", "12:30", "14:00", "15:30", "17:00", "18:30"],
             [bar_time.strftime("%H:%M") for bar_time, _x in labels],
         )
         self.assertEqual("표시할 기준봉 데이터가 없습니다.", window.chart.empty_message)
@@ -594,11 +633,11 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             with self.subTest(minutes=minutes):
                 window = self._window(_projection(bar_minutes=minutes))
                 self.assertEqual(
-                    f"005930 삼성전자 / 지표추종-A / 수동운영 / {minutes}분봉 / 매수 1 / 매도 1",
+                    "005930 삼성전자 ▷매수 1 / 매도 1",
                     window.windowTitle(),
                 )
                 self.assertEqual("005930 삼성전자", window.info_labels["stock"].text())
-                self.assertEqual("지표추종-A", window.info_labels["routine"].text())
+                self.assertEqual("▶ 지표추종-A", window.info_labels["routine"].text())
                 self.assertEqual("+154,000(+3.25%)", window.info_labels["cumulative_pnl"].text())
                 self.assertNotIn("operation_mode", window.info_labels)
                 self.assertNotIn("operation_time", window.info_labels)
@@ -607,11 +646,11 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                     set(window.info_labels),
                 )
                 self.assertTrue(
-                    window.info_labels["stock"].alignment() & Qt.AlignHCenter
+                    window.info_labels["stock"].alignment() & Qt.AlignLeft
                 )
                 self.assertTrue(
                     window.info_labels["cumulative_pnl"].alignment()
-                    & Qt.AlignHCenter
+                    & Qt.AlignRight
                 )
                 self.assertTrue(
                     all(
@@ -632,7 +671,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             window = self._window(_projection())
 
         self.assertEqual(
-            "005930 삼성전자 / 지표추종-A / 수동운영 / 5분봉 / 매수 1 / 매도 1",
+            "005930 삼성전자 ▷매수 1 / 매도 1",
             window.windowTitle(),
         )
         self.assertNotIn("오늘", window.windowTitle())
@@ -643,7 +682,8 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertNotIn("sell_first_signal_label", vars(window))
         self.assertNotIn("actual_order_count_label", vars(window))
         self.assertIn("font-size: 21px", window.styleSheet())
-        self.assertIn("font-size: 17px", window.styleSheet())
+        self.assertIn("font-size: 13px", window.styleSheet())
+        self.assertIn("font-size: 14px", window.styleSheet())
         visible_texts = [label.text() for label in window.findChildren(chart_window.QLabel)]
         self.assertNotIn("종목명 / 코드", visible_texts)
         self.assertNotIn("루틴 / 인스턴스", visible_texts)
@@ -687,9 +727,9 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual("005930 삼성전자 / 지표추종-A / 시간운영 / 5분봉 / 매수 1 / 매도 1", scheduled.windowTitle())
-        self.assertEqual("005930 삼성전자 / 지표추종-A / 수동운영 / 5분봉 / 매수 1 / 매도 1", manual.windowTitle())
-        self.assertEqual("005930 삼성전자 / 지표추종-A / 수동+ATS / 5분봉 / 매수 1 / 매도 1", ats.windowTitle())
+        self.assertEqual("005930 삼성전자 ▷매수 1 / 매도 1", scheduled.windowTitle())
+        self.assertEqual(scheduled.windowTitle(), manual.windowTitle())
+        self.assertEqual(scheduled.windowTitle(), ats.windowTitle())
         self.assertIn(
             chart_window.BUY_COLOR.name(),
             scheduled.info_labels["cumulative_pnl"].styleSheet().lower(),
@@ -715,9 +755,9 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual("0(0.00%)", window.info_labels["cumulative_pnl"].text())
         window.show()
         self.app.processEvents()
-        self.assertEqual(
-            window.info_labels["stock"].font().pixelSize(),
+        self.assertGreater(
             window.info_labels["cumulative_pnl"].font().pixelSize(),
+            window.info_labels["stock"].font().pixelSize(),
         )
         self.assertIn(
             chart_window.DIRECTIONAL_NEUTRAL_COLOR,
@@ -736,9 +776,9 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual("0(0.00%)", window.info_labels["cumulative_pnl"].text())
         window.show()
         self.app.processEvents()
-        self.assertEqual(
-            window.info_labels["stock"].font().pixelSize(),
+        self.assertGreater(
             window.info_labels["cumulative_pnl"].font().pixelSize(),
+            window.info_labels["stock"].font().pixelSize(),
         )
         self.assertIn(
             chart_window.DIRECTIONAL_NEUTRAL_COLOR,
@@ -756,8 +796,8 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         summary_panel = window.findChild(chart_window.QFrame, "stockInstanceChartSummaryPanel")
 
         self.assertEqual(0, window.layout().spacing())
-        self.assertEqual(8, info_panel.layout().contentsMargins().top())
-        self.assertEqual(8, info_panel.layout().contentsMargins().bottom())
+        self.assertEqual(4, info_panel.layout().contentsMargins().top())
+        self.assertEqual(4, info_panel.layout().contentsMargins().bottom())
         self.assertEqual(0, chart_panel.layout().contentsMargins().top())
         self.assertEqual(0, chart_panel.layout().contentsMargins().bottom())
         self.assertIsNone(summary_panel)
@@ -770,15 +810,14 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertIn("background: #FFFFFF", window.styleSheet())
         self.assertIn("border: none", window.styleSheet())
         self.assertIn("QFrame#stockInstanceChartOperationInfo", window.styleSheet())
-        self.assertIn("border-radius: 3px", window.styleSheet())
+        self.assertNotIn("border-radius: 3px", window.styleSheet())
         self.assertFalse(
             any(
                 frame.frameShape() == chart_window.QFrame.VLine
                 for frame in window.findChildren(chart_window.QFrame)
             )
         )
-        self.assertEqual(820, window.minimumWidth())
-        self.assertGreaterEqual(window.minimumHeight(), 428)
+        self.assertEqual(window.minimumSizeHint().width(), window.minimumWidth())
         self.assertGreaterEqual(window.minimumHeight(), window.minimumSizeHint().height())
         self.assertEqual(window.minimumSize(), window.size())
         window.close()
@@ -789,7 +828,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         projected["sell_signal_count"] = 3
         window = self._window(projected)
         self.assertEqual(
-            "005930 삼성전자 / 지표추종-A / 수동운영 / 5분봉 / 매수 4 / 매도 3",
+            "005930 삼성전자 ▷매수 4 / 매도 3",
             window.windowTitle(),
         )
         self.assertFalse(hasattr(window, "buy_count_label"))
@@ -968,7 +1007,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual([], window.chart.buy_series)
         self.assertEqual([], window.chart.sell_series)
         self.assertEqual(
-            "005930 삼성전자 / 지표추종-A / 수동운영 / 5분봉 / 매수 0 / 매도 0",
+            "005930 삼성전자 ▷매수 0 / 매도 0",
             window.windowTitle(),
         )
         self.assertEqual("", window.notice_label.text())
@@ -981,7 +1020,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         )
         self.assertEqual("표시할 기준봉 데이터가 없습니다.", no_candles.notice_label.text())
         self.assertEqual("표시할 기준봉 데이터가 없습니다.", no_candles.chart.empty_message)
-        self.assertTrue(no_candles.windowTitle().startswith("005930 삼성전자 /"))
+        self.assertTrue(no_candles.windowTitle().startswith("005930 삼성전자 ▷매수"))
         self.assertNotIn("notice_panel", vars(no_candles))
         no_candles.close()
 
@@ -1077,7 +1116,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual("09:00", error_window.chart.fixed_time_range[0].strftime("%H:%M"))
         self.assertEqual("15:30", error_window.chart.fixed_time_range[1].strftime("%H:%M"))
         self.assertEqual(
-            "005930 삼성전자 / - / - / - / 매수 0 / 매도 0",
+            "005930 삼성전자 ▷매수 0 / 매도 0",
             error_window.windowTitle(),
         )
         error_window.close()
@@ -1128,6 +1167,112 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         )
         chart.close()
 
+    def test_live_price_bridge_tracks_marker_and_latest_confirmed_point(self) -> None:
+        chart = StockInstanceCloseChart()
+        chart.resize(760, 420)
+        confirmed = [
+            {"bar_time": "2026-08-10T09:00:00+09:00", "close": 100},
+            {"bar_time": "2026-08-10T09:01:00+09:00", "close": None},
+            {"bar_time": "2026-08-10T09:02:00+09:00", "close": 102},
+        ]
+        chart.set_projection(
+            confirmed,
+            [],
+            [],
+            x_range_start="2026-08-10T09:00:00+09:00",
+            x_range_end="2026-08-10T15:30:00+09:00",
+        )
+        original_close_series = list(chart.close_series)
+        chart.set_live_price_projection(
+            "2026-08-10T09:03:00+09:00",
+            104,
+        )
+
+        bridge = chart._live_price_bridge_points()
+        self.assertIsNotNone(bridge)
+        self.assertEqual(
+            chart.position_for("2026-08-10T09:02:00+09:00", 102),
+            bridge[0],
+        )
+        self.assertEqual(
+            chart.position_for("2026-08-10T09:03:00+09:00", 104),
+            bridge[1],
+        )
+        self.assertEqual(original_close_series, chart.close_series)
+
+        chart.set_live_price_projection("2026-08-10T09:04:00+09:00", 105)
+        moved = chart._live_price_bridge_points()
+        self.assertEqual(
+            chart.position_for("2026-08-10T09:02:00+09:00", 102),
+            moved[0],
+        )
+        self.assertEqual(
+            chart.position_for("2026-08-10T09:04:00+09:00", 105),
+            moved[1],
+        )
+
+        chart.set_projection(
+            confirmed
+            + [{"bar_time": "2026-08-10T09:03:00+09:00", "close": 103}],
+            [],
+            [],
+            x_range_start="2026-08-10T09:00:00+09:00",
+            x_range_end="2026-08-10T15:30:00+09:00",
+        )
+        after_commit = chart._live_price_bridge_points()
+        self.assertEqual(
+            chart.position_for("2026-08-10T09:03:00+09:00", 103),
+            after_commit[0],
+        )
+        self.assertEqual(
+            chart.position_for("2026-08-10T09:04:00+09:00", 105),
+            after_commit[1],
+        )
+        chart.close()
+
+    def test_live_price_bridge_is_hidden_without_both_valid_endpoints(self) -> None:
+        chart = StockInstanceCloseChart()
+        chart.resize(760, 420)
+        chart.set_projection([], [], [])
+        chart.set_live_price_projection("2026-08-10T09:03:00+09:00", 104)
+        self.assertIsNone(chart._live_price_bridge_points())
+
+        chart.set_projection(
+            [{"bar_time": "2026-08-10T09:02:00+09:00", "close": 102}],
+            [],
+            [],
+            x_range_start="2026-08-10T09:00:00+09:00",
+            x_range_end="2026-08-10T15:30:00+09:00",
+        )
+        chart.clear_live_price_projection()
+        self.assertIsNone(chart._live_price_bridge_points())
+        chart.set_live_price_projection("2026-08-10T09:02:00+09:00", 104)
+        self.assertIsNone(chart._live_price_bridge_points())
+        chart.set_live_price_projection("bad", "bad")
+        self.assertIsNone(chart._live_price_bridge_points())
+        chart.close()
+
+    def test_live_price_bridge_reuses_confirmed_price_line_style(self) -> None:
+        chart = StockInstanceCloseChart()
+        chart.resize(760, 420)
+        chart.set_projection(
+            [{"bar_time": "2026-08-10T09:02:00+09:00", "close": 102}],
+            [],
+            [],
+            x_range_start="2026-08-10T09:00:00+09:00",
+            x_range_end="2026-08-10T15:30:00+09:00",
+        )
+        chart.set_live_price_projection("2026-08-10T09:03:00+09:00", 104)
+        painter = Mock()
+
+        chart._draw_live_price_bridge(painter, chart._plot_rect())
+
+        pen = painter.setPen.call_args.args[0]
+        self.assertEqual(chart_window.LINE_COLOR, pen.color())
+        self.assertEqual(2.0, pen.widthF())
+        painter.drawLine.assert_called_once_with(*chart._live_price_bridge_points())
+        chart.close()
+
     def test_marker_draws_circle_centered_on_canonical_coordinate(self) -> None:
         painter = Mock()
         point = chart_window.QPointF(17.5, 23.25)
@@ -1153,7 +1298,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertEqual(2, loader.call_count)
         loader.assert_called_with("005930", "2026-08-10")
         self.assertEqual(
-            "005930 삼성전자 / 지표추종-A / 수동운영 / 1분봉 / 매수 0 / 매도 0",
+            "005930 삼성전자 ▷매수 0 / 매도 0",
             window.windowTitle(),
         )
         self.assertEqual([], window.chart.buy_series)
@@ -1197,7 +1342,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             [("09:00", 105.0), ("09:05", 110.0)],
             [(bar_time.strftime("%H:%M"), close) for bar_time, close in window.chart.close_series],
         )
-        self.assertIn("새 루틴 / 수동운영 / 5분봉", window.windowTitle())
+        self.assertEqual("005930 삼성전자 ▷매수 0 / 매도 0", window.windowTitle())
         self.assertEqual(
             ("2026-08-10", "instance-2", 5),
             window._last_valid_projection_identity,

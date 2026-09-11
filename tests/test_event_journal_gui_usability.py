@@ -124,6 +124,45 @@ class EventJournalGuiUsabilityTest(unittest.TestCase):
         finally:
             window.close()
 
+    def test_blocked_operation_mode_event_is_visible_in_today_all_filters(self) -> None:
+        self._append(
+            "OPERATOR_SETTING_DECISION",
+            severity="NOTICE",
+            result="BLOCKED",
+            stock_code="000070",
+            stock_name="삼양홀딩스",
+            routine="지표추종매매A",
+            target_type="STOCK",
+            target_id="000070",
+            target_name="삼양홀딩스",
+            reason_code="BLOCKED_TRADING_ACTIVE",
+            operation="OPERATION_MODE_CHANGE",
+            details={
+                "action": "OPERATION_MODE_CHANGE",
+                "routine_instance_id": "instance-a",
+                "before_mode": "CONTINUOUS",
+                "requested_mode": "SCHEDULED",
+                "operator_message": "현재 운영 중인 종목은 운영방식을 변경할 수 없습니다.",
+            },
+        )
+
+        window = self._window()
+        try:
+            window.select_period("오늘")
+            events = window._filtered_events()
+            self.assertEqual(1, len(events))
+            self.assertEqual("OPERATOR_SETTING_DECISION", events[0]["event_type"])
+            self.assertEqual("BLOCKED", events[0]["result"])
+            self.assertEqual("BLOCKED_TRADING_ACTIVE", events[0]["reason_code"])
+            self.assertEqual("000070", events[0]["stock_code"])
+            self.assertEqual("지표추종매매A", events[0]["routine"])
+            self.assertEqual(
+                "현재 운영 중인 종목은 운영방식을 변경할 수 없습니다.",
+                events[0]["details"]["operator_message"],
+            )
+        finally:
+            window.close()
+
     def test_operator_and_changes_are_human_readable_without_raw_json(self) -> None:
         self._append(
             "OPERATOR_ORDER_DECISION",

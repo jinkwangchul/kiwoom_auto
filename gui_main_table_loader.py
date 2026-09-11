@@ -2525,10 +2525,12 @@ def _load_mock_routine_table(window) -> None:
                 current_prices[stock_code] = (
                     getattr(trade, "current_price", None) if trade is not None else None
                 )
+    projection_now = getattr(host, "_now", None)
     trees = (
         current_mock_monitoring_trees(
             repository,
             current_price_by_stock=current_prices,
+            as_of=projection_now() if callable(projection_now) else None,
         )
         if repository is not None
         else ()
@@ -2699,7 +2701,7 @@ def _load_mock_routine_table(window) -> None:
                     else schedule.get("display_text") or ""
                 ),
                 "●",
-                str(child.get("state_label") or "-"),
+                str(child.get("display_status") or "감시/대기"),
                 "루틴",
                 str(liquidation.get("display_text") or ""),
                 ratio_metric_text(metrics[0]),
@@ -2716,8 +2718,29 @@ def _load_mock_routine_table(window) -> None:
                     token = _item_style_snapshot(
                         create_auto_trade_operation_item(official_operation_display)
                     )
-                elif index == 4 and child.get("error") is True:
-                    token["foreground"] = "#DC2626"
+                elif index == 4:
+                    token = _item_style_snapshot(
+                        create_auto_trade_setting_activity_status_item(
+                            value,
+                            bool(child.get("status_cell_active")),
+                        )
+                    )
+                elif index == 5:
+                    item = SortableTableWidgetItem(value)
+                    apply_auto_trade_setting_activity_style(
+                        item,
+                        bool(child.get("method_cell_active")),
+                    )
+                    token = _item_style_snapshot(item)
+                elif index == 6:
+                    item = SortableTableWidgetItem(value)
+                    apply_auto_trade_setting_liquidation_style(
+                        item,
+                        bool(child.get("liquidation_cell_active")),
+                        bool(child.get("liquidation_has_policy")),
+                        False,
+                    )
+                    token = _item_style_snapshot(item)
                 elif index == 9:
                     token["foreground"] = profit_loss_value_color(child.get("net_pnl", 0)).lower()
                 tokens.append(token)

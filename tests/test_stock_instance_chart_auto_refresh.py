@@ -157,7 +157,7 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
             window.refresh_projection()
             self.assertEqual(3, len(window.chart.close_series))
             self.assertEqual(
-                "005930 종목005930 / 루틴-005930 / 시간운영 / 5분봉 / 매수 2 / 매도 1",
+                "005930 종목005930 ▷매수 2 / 매도 1",
                 window.windowTitle(),
             )
             self.assertEqual(3, loader.call_count)
@@ -165,6 +165,61 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
                 all(call.args == ("005930", TODAY) for call in loader.call_args_list)
             )
             window.close()
+        owner.close()
+
+    def test_open_window_header_timer_refreshes_all_operation_fields_from_one_snapshot(self) -> None:
+        owner = ChartOwner()
+        pre = chart_window.StockOperationHeaderDisplay(
+            "감시/대기", "루틴", "5분/시장가",
+            "#9ca3af", "#9ca3af", "#9ca3af", "#2563eb", False,
+        )
+        active = chart_window.StockOperationHeaderDisplay(
+            "매수/매도", "루틴", "5분/시장가",
+            "#16a34a", "#111827", "#5c4300", "#16a34a", True,
+        )
+        final = chart_window.StockOperationHeaderDisplay(
+            "감시/대기", "루틴", "-",
+            "#9ca3af", "#9ca3af", "#9ca3af", "#2563eb", False,
+        )
+        current_display = {"value": pre}
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY), patch.object(
+            chart_window,
+            "project_stock_instance_day",
+            return_value=_projection("005930"),
+        ), patch.object(
+            chart_window,
+            "project_stock_operation_header_display",
+            side_effect=lambda *_args: current_display["value"],
+        ) as header_projection:
+            window = StockInstanceChartWindow("005930", TODAY, owner)
+            timer = window._operation_header_refresh_timer
+            self.assertIsNotNone(timer)
+            self.assertTrue(timer.isActive())
+            self.assertEqual(1_000, timer.interval())
+            self.assertEqual(
+                ("· 감시/대기", "· 루틴", "· 5분/시장가"),
+                tuple(window.operation_info_labels[key].text() for key in ("status", "method", "liquidation")),
+            )
+
+            current_display["value"] = active
+            timer.timeout.emit()
+            self.assertEqual(
+                ("· 매수/매도", "· 루틴", "· 5분/시장가"),
+                tuple(window.operation_info_labels[key].text() for key in ("status", "method", "liquidation")),
+            )
+            self.assertIn("#16a34a", window.operation_info_labels["status"].styleSheet())
+            self.assertIn("#111827", window.operation_info_labels["method"].styleSheet())
+            self.assertIn("#5c4300", window.operation_info_labels["liquidation"].styleSheet())
+
+            current_display["value"] = final
+            timer.timeout.emit()
+            self.assertEqual(
+                ("· 감시/대기", "· 루틴", "· -"),
+                tuple(window.operation_info_labels[key].text() for key in ("status", "method", "liquidation")),
+            )
+            self.assertEqual(4, header_projection.call_count)
+            window.close()
+            self.assertFalse(timer.isActive())
         owner.close()
 
     def test_same_completed_bar_keeps_pnl_until_a_new_bar_is_added(self) -> None:
@@ -197,6 +252,8 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
             window = StockInstanceChartWindow("005930", "2026-08-09", owner)
             self.assertFalse(window._operation_cycle_refresh_connected)
             self.assertFalse(window._bar_committed_refresh_connected)
+            self.assertIsNone(window.chart.live_price_point)
+            self.assertIsNone(window.chart._live_price_bridge_points())
             owner.operation_host.operation_cycle_completed.emit(_completed_result())
             self.assertEqual(1, loader.call_count)
             self.assertNotIn("refresh_button", vars(window))

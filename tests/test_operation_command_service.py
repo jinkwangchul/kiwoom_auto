@@ -1379,7 +1379,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             duration_ms=2500,
         )
 
-    def test_no_holding_early_close_result_uses_toast_not_information_messagebox(self) -> None:
+    def test_no_holding_early_close_uses_canonical_completion_path(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1394,6 +1394,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             ]
             window = self._window(selected)
             self._MessageBox.instances = []
+            self._MessageBox.proceed = True
             service = Mock()
             service.apply_early_close.return_value = OperationCommandResult(
                 RESULT_SUCCESS,
@@ -1416,6 +1417,22 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                     "gui_auto_trade_close.evaluate_production_transition",
                     return_value=Mock(allowed=True),
                 ),
+                patch(
+                    "gui_auto_trade_close._start_close_liquidation_execution",
+                    return_value={
+                        "ok": True,
+                        "stage": "completed",
+                        "runtime_status": "EARLY_CLOSED",
+                    },
+                ) as start_execution,
+                patch(
+                    "gui_auto_trade_close._persist_early_close_execution_result",
+                    return_value=True,
+                ) as persist_execution,
+                patch(
+                    "gui_auto_trade_close.check_global_close_completion_after_durable_update",
+                    return_value={"checked": True, "global_complete": True},
+                ) as completion_check,
                 patch("gui_auto_trade_close.append_changelog"),
                 patch("gui_auto_trade_close.append_stock_log"),
                 patch("gui_auto_trade_close.refresh_auto_trade_views") as refresh_views,
@@ -1423,30 +1440,29 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             ):
                 result = auto_trade_apply_selected_early_close(window, "루틴")
 
-        service.apply_early_close.assert_not_called()
-        refresh_views.assert_not_called()
-        self.assertEqual([], self._MessageBox.instances)
-        show_toast.assert_called_once()
-        toast_args = show_toast.call_args.args
-        self.assertIs(toast_args[0], window)
-        self.assertEqual("조기마감 대상이 없습니다.", toast_args[1])
-        self.assertNotIn("111111", toast_args[1])
-        self.assertNotIn("222222", toast_args[1])
-        self.assertNotIn("\n", toast_args[1])
-        self.assertEqual(2500, show_toast.call_args.kwargs["duration_ms"])
-        self.assertNotIn("position", show_toast.call_args.kwargs)
-        window.statusBarMessage.assert_called_with("조기마감 적용: 0개")
+        service.apply_early_close.assert_called_once()
+        start_execution.assert_called_once()
+        persist_execution.assert_called_once()
+        completion_check.assert_called_once()
+        refresh_views.assert_called_once()
+        self.assertEqual(1, len(self._MessageBox.instances))
+        show_toast.assert_called_once_with(
+            window,
+            "1종목을 조기마감 적용하였습니다.",
+            duration_ms=2500,
+        )
+        window.statusBarMessage.assert_called_with("조기마감 적용: 1개")
         self.assertEqual(
             {
-                "ok": False,
-                "completed_count": 0,
+                "ok": True,
+                "completed_count": 1,
                 "failed_count": 0,
-                "message": "조기마감 대상이 없습니다.",
+                "message": "",
             },
             result,
         )
 
-    def test_confirmation_count_excludes_non_operating_and_no_target_stocks(self) -> None:
+    def test_confirmation_count_includes_zero_holding_operating_stock(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1503,7 +1519,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         service_type.assert_not_called()
         self.assertEqual(1, len(self._MessageBox.instances))
         self.assertEqual(
-            "전체운영 2종목을 조기마감합니다. 진행하시겠습니까?",
+            "전체운영 3종목을 조기마감합니다. 진행하시겠습니까?",
             self._MessageBox.instances[0].text,
         )
 

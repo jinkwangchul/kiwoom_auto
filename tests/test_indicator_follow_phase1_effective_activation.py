@@ -345,15 +345,13 @@ class IndicatorFollowExecutionKillSwitchTest(unittest.TestCase):
                 json.dumps({"trade_enabled": True, "status": "RUNNING"}),
                 encoding="utf-8",
             )
+            config = {
+                "assigned_routine_instance_id": "instance-A",
+                "routine_definition_id": "indicator_follow",
+                "routine_instance_name": "테스트 루틴",
+            }
             (stock_dir / "config.json").write_text(
-                json.dumps(
-                    {
-                        "assigned_routine_instance_id": "instance-A",
-                        "routine_definition_id": "indicator_follow",
-                        "routine_instance_name": "테스트 루틴",
-                    }
-                ),
-                encoding="utf-8",
+                json.dumps(config), encoding="utf-8"
             )
             snapshot = SimpleNamespace(
                 entries=(SimpleNamespace(execution_ready=True, stock_dir=stock_dir),)

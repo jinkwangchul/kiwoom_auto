@@ -234,6 +234,52 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
         )
         self.assertIs(guard["ok"], True)
 
+    def test_continuous_legitimate_close_routes_keep_liquidation_display(self) -> None:
+        requested_at = f"{policy.auto_trade_setting_today_date_text()} 10:00:00"
+        cases = (
+            (
+                "조기마감",
+                {
+                    "early_close_requested_at": requested_at,
+                    "early_close_method": "시장가",
+                },
+            ),
+            (
+                "청산",
+                {
+                    "individual_liquidation_request": {
+                        "status": "REQUESTED",
+                        "requested_at": requested_at,
+                        "minutes_before_regular_close": "5",
+                        "method": "현재가",
+                    }
+                },
+            ),
+            (
+                "자동마감",
+                {
+                    "auto_close_requested_at": requested_at,
+                    "auto_close_method": "시장가",
+                },
+            ),
+        )
+        with patch.object(
+            policy,
+            "read_operation_policy",
+            return_value=deepcopy(self.operation_policy),
+        ):
+            for display_status, state in cases:
+                with self.subTest(display_status=display_status):
+                    self.assertNotEqual(
+                        "-",
+                        policy.auto_trade_setting_liquidation_text(
+                            {"operation_mode": "CONTINUOUS"},
+                            display_status,
+                            state,
+                            holding_qty=3,
+                        ),
+                    )
+
     def test_stale_early_close_metadata_is_read_only_and_does_not_split_views(self) -> None:
         state = {
             "status": "EARLY_CLOSE",
@@ -831,8 +877,8 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
                     status="매수/매도" if phase == "ACTIVE_SESSION" else "감시/대기",
                     method="루틴",
                     method_active=controls_active,
-                    liquidation="5분/시장가",
-                    liquidation_active=controls_active,
+                    liquidation="-",
+                    liquidation_active=False,
                 )
 
     def test_scheduled_environment_boundary_precedes_individual_trade_start(self) -> None:
@@ -895,8 +941,8 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
                     status=status,
                     method=method,
                     method_active=method_active,
-                    liquidation="-" if phase == "ACTIVE_SESSION" else "5분/시장가",
-                    liquidation_active=(method_active and phase != "ACTIVE_SESSION"),
+                    liquidation="-",
+                    liquidation_active=False,
                 )
 
     def test_post_market_gap_and_ats_boundaries_are_symmetric(self) -> None:
@@ -920,14 +966,9 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
                 self.assertEqual(status, row["display_status"])
                 self.assertEqual(method, row["method_text"])
                 self.assertIs(row["method_cell_active"], method_active)
-                self.assertEqual(
-                    (
-                        "-"
-                        if now_dt.hour == 15 and now_dt.minute == 40
-                        else "5분/시장가"
-                    ),
-                    row["liquidation_text"],
-                )
+                self.assertEqual("-", row["liquidation_text"])
+                self.assertFalse(row["liquidation_has_policy"])
+                self.assertFalse(row["liquidation_cell_active"])
 
     def test_multiple_ats_sessions_ignore_legacy_execution_method(self) -> None:
         config = {

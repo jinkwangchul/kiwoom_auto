@@ -97,6 +97,85 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertEqual("3", value.text())
         self.assertEqual("", window.btn_review_required.text())
 
+    def test_main_review_badge_opens_only_on_left_double_click(self) -> None:
+        api = SimpleNamespace(
+            unavailable_reason=lambda: "test double",
+            login_state_changed=None,
+            raw_chejan_received=None,
+        )
+        with (
+            patch.object(gui_windows, "KiwoomApi", return_value=api),
+            patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
+            patch.object(
+                gui_windows.MainWindow,
+                "refresh_startup_recovery_status",
+                return_value={},
+            ),
+            patch.object(gui_windows.MainWindow, "refresh_all"),
+            patch.object(
+                gui_windows.MainWindow,
+                "open_review_required_window",
+            ) as opener,
+        ):
+            window = gui_windows.MainWindow()
+        self.addCleanup(window.close)
+        window.show()
+        self.app.processEvents()
+
+        self.assertIsInstance(
+            window.btn_review_required,
+            gui_windows._DoubleClickActionButton,
+        )
+
+        QTest.mouseClick(window.btn_review_required, Qt.LeftButton)
+        self.app.processEvents()
+        QTest.qWait(QApplication.doubleClickInterval() + 50)
+        self.app.processEvents()
+        opener.assert_not_called()
+
+        QTest.mouseDClick(window.btn_review_required, Qt.LeftButton)
+        self.app.processEvents()
+        QTest.qWait(50)
+        self.app.processEvents()
+        opener.assert_called_once_with()
+
+        opener.reset_mock()
+        QTest.mouseClick(window.btn_review_required, Qt.RightButton)
+        self.app.processEvents()
+        QTest.qWait(50)
+        self.app.processEvents()
+        opener.assert_not_called()
+
+    def test_other_main_summary_badge_keeps_single_click_action(self) -> None:
+        api = SimpleNamespace(
+            unavailable_reason=lambda: "test double",
+            login_state_changed=None,
+            raw_chejan_received=None,
+        )
+        with (
+            patch.object(gui_windows, "KiwoomApi", return_value=api),
+            patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
+            patch.object(
+                gui_windows.MainWindow,
+                "refresh_startup_recovery_status",
+                return_value={},
+            ),
+            patch.object(gui_windows.MainWindow, "refresh_all"),
+        ):
+            window = gui_windows.MainWindow()
+        self.addCleanup(window.close)
+        window.show()
+        self.app.processEvents()
+        action = MagicMock()
+        window._activate_main_routine_summary_badge = action
+
+        QTest.mouseClick(
+            window._main_routine_summary_count_buttons["group"],
+            Qt.LeftButton,
+        )
+        self.app.processEvents()
+        self.assertEqual(1, action.call_count)
+
     def test_monitoring_bottom_button_order_starts_with_global_start(self) -> None:
         window = SimpleNamespace(
             btn_start=QPushButton("▶ 운영시작"),

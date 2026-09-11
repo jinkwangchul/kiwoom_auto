@@ -95,6 +95,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         collector.assert_called_once_with()
         self.assertEqual("검토관리(2)", window.btn_review_view.text())
 
+    def test_review_view_keeps_existing_single_click_entry(self) -> None:
+        with (
+            patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None),
+            patch.object(AutoTradeSettingWindow, "open_review_required_window") as opener,
+        ):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(dispose_qt_widget, window)
+
+        QTest.mouseClick(window.btn_review_view, Qt.LeftButton)
+        self._app.processEvents()
+        opener.assert_called_once_with(False)
+
     def test_open_initialization_builds_tree_and_stock_table_once(self) -> None:
         empty_snapshot = {
             "definitions": (),
@@ -2863,7 +2875,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "삼성전자",
             routine="지표추종매매",
         )
-        ensure_routine.assert_called_once_with("005930", "삼성전자", "지표추종매매")
         sync_monitoring.assert_called_once_with(dialog)
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(
@@ -3338,6 +3349,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         repository = MagicMock()
         with (
             patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch(
+                "routine_instance_deletion_service.collect_routine_instance_deletion_scope",
+                return_value=SimpleNamespace(stocks=()),
+            ),
             patch.object(
                 setting_window.QMessageBox,
                 "question",
@@ -3358,38 +3373,31 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "instance_id": "inst-a",
             "instance_name": "A 인스턴스",
         }
-        scope = SimpleNamespace(instance_id="inst-a")
-        result = SimpleNamespace(
-            success=False,
-            error="",
-            blocked=(SimpleNamespace(message="지정 종목이 남아 있습니다."),),
-            cleared_stock_codes=(),
+        scope = SimpleNamespace(
+            instance_id="inst-a",
+            stocks=(SimpleNamespace(code="005930"),),
         )
         with (
-            patch.object(
-                setting_window.QMessageBox,
-                "question",
-                return_value=setting_window.QMessageBox.Yes,
-            ),
+            patch.object(setting_window.QMessageBox, "question") as question,
             patch.object(setting_window.QMessageBox, "warning") as warning,
+            patch.object(setting_window, "show_toast") as toast,
             patch(
                 "routine_instance_deletion_service.collect_routine_instance_deletion_scope",
                 return_value=scope,
             ),
             patch(
                 "routine_instance_deletion_service.delete_routine_instance_completely",
-                return_value=result,
             ) as delete_instance,
-            patch.object(
-                setting_window,
-                "auto_trade_running_registered_operation_targets",
-                return_value=[],
-            ),
         ):
             window.delete_routine_instance(metadata)
 
-        warning.assert_called_once()
-        delete_instance.assert_called_once_with(scope, running_stock_dirs=[])
+        toast.assert_called_once_with(
+            window,
+            "해당루틴은 삭제 불가합니다.\n등록된 종목을 모두 해제하세요.",
+        )
+        question.assert_not_called()
+        warning.assert_not_called()
+        delete_instance.assert_not_called()
         window.refresh_all.assert_not_called()
 
     def test_routine_instance_delete_checks_config_assignment_fallback(self) -> None:
@@ -3430,7 +3438,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ):
             window.delete_routine_instance(metadata)
 
-        collect_scope.assert_called_once_with(setting_window.PROJECT_ROOT, "inst-a")
+        self.assertEqual(2, collect_scope.call_count)
+        collect_scope.assert_called_with(setting_window.PROJECT_ROOT, "inst-a")
         warning.assert_called_once()
         window.refresh_all.assert_not_called()
 
@@ -6165,6 +6174,44 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ],
         )
 
+    def test_stock_register_search_text_and_return_do_not_open_registration_dialog(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        opener = MagicMock()
+        with patch.object(
+            stock_register_window.StockRegisterWindow,
+            "refresh_stock_table",
+        ) as refresh:
+            window = stock_register_window.StockRegisterWindow(
+                stock_search_register_opener=opener,
+            )
+            self.addCleanup(window.close)
+            window.show()
+            self._app.processEvents()
+            window.stock_search_input.setFocus()
+            window.stock_search_input.setText("푸")
+            self._app.processEvents()
+
+            opener.assert_not_called()
+            QTest.keyClick(window.stock_search_input, Qt.Key_Return)
+            self._app.processEvents()
+            opener.assert_not_called()
+
+            window.stock_search_input.clear()
+            self._app.processEvents()
+            opener.assert_not_called()
+
+        self.assertGreaterEqual(refresh.call_count, 4)
+        for button in (
+            window.btn_search_register,
+            window.btn_manual_register,
+            window.btn_stock_history,
+            window.btn_delete_stock,
+            window.btn_close,
+        ):
+            self.assertFalse(button.autoDefault())
+            self.assertFalse(button.isDefault())
+
     def test_stock_register_reset_button_enabled_only_for_single_selection(self) -> None:
         import gui_stock_register_window as stock_register_window
 
@@ -6442,7 +6489,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ]
 
         self.assertEqual(
-            ["동전주", "지표추종매매B", "구형루틴", "등록대기"],
+            ["동전주", "지표추종매매B", "구형루틴", "미지정"],
             displayed_routines,
         )
         self.assertEqual(["● 운영정지", "● 운영정지", "● 운영정지", "미지정"], displayed_statuses)
@@ -7209,6 +7256,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "---",
                 ("루틴등록", assign_submenu),
                 "루틴해제",
+                "모의검증",
             ],
             FakeMenu.last.entries,
         )
@@ -7230,8 +7278,153 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         assign_submenu.actions[4].setData.assert_called_once_with("inst-a")
         self.assertNotIn("등록대기 선택", FakeMenu.last.entries)
         self.assertNotIn("등록대기 전환", FakeMenu.last.entries)
-        for action in FakeMenu.last.actions[2:]:
+        for action in FakeMenu.last.actions[2:4]:
             action.setEnabled.assert_called_once_with(True)
+
+    def test_stock_register_context_mock_validation_uses_exact_clicked_stock(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        class FakeMenu:
+            def __init__(self, _parent=None):
+                self.actions = []
+
+            def addAction(self, text):
+                action = MagicMock()
+                action.text.return_value = text
+                self.actions.append(action)
+                return action
+
+            def addSeparator(self):
+                pass
+
+            def addMenu(self, text):
+                return self.addAction(text)
+
+            def exec_(self, _position):
+                return next(action for action in self.actions if action.text() == "모의검증")
+
+        with TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "006380_카프로"
+            stock_dir.mkdir()
+            repository = MagicMock()
+            repository.resolve_stock_dir.return_value = stock_dir
+            opener = MagicMock(return_value=True)
+            with (
+                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
+                patch.object(stock_register_window, "QMenu", FakeMenu),
+                patch.object(stock_register_window, "load_persisted_routine_instances", return_value=[]),
+                patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
+            ):
+                window = stock_register_window.StockRegisterWindow(
+                    mock_validation_opener=opener,
+                )
+                self.addCleanup(window.close)
+                window.stock_table.setRowCount(1)
+                window.stock_table.setItem(0, 0, QTableWidgetItem("006380"))
+                window.stock_table.setItem(0, 1, QTableWidgetItem("카프로"))
+                position = window.stock_table.visualItemRect(
+                    window.stock_table.item(0, 0)
+                ).center()
+                window.show_stock_table_context_menu(position)
+
+        opener.assert_called_once()
+        target = opener.call_args.args[0]
+        self.assertEqual(("006380", "카프로", ""), (
+            target.code,
+            target.name,
+            target.routine_instance_id,
+        ))
+        self.assertEqual(stock_dir, target.stock_dir)
+
+    def test_official_unassigned_registration_keeps_production_base_stock_boundary(self) -> None:
+        with patch.object(
+            setting_window,
+            "append_base_stock",
+            return_value=True,
+        ) as append_base:
+            dialog, _parent = self._unassigned_stock_search_dialog()
+            self.assertTrue(
+                dialog._register_stock_to_unassigned(
+                    "006380",
+                    "카프로",
+                    needs_registration=True,
+                )
+            )
+
+        append_base.assert_called_once_with("006380", "카프로")
+
+    def test_mock_stock_selection_callback_runs_before_any_base_stock_registration(self) -> None:
+        callback = MagicMock()
+        with (
+            patch.object(
+                setting_window.InstanceStockSearchRegisterDialog,
+                "search_stocks",
+                lambda _self, *args, **kwargs: None,
+            ),
+            patch.object(setting_window, "append_base_stock") as append_base,
+        ):
+            dialog = setting_window.InstanceStockSearchRegisterDialog(
+                instance_metadata={
+                    "target_kind": "unassigned",
+                    "instance_name": "등록대기",
+                },
+                stock_selection_callback=callback,
+            )
+            self.addCleanup(dialog.close)
+            self._set_instance_stock_search_rows(dialog, [("006380", "카프로")])
+            callback.return_value = False
+            with (
+                patch.object(
+                    setting_window,
+                    "find_library_stock_by_code",
+                    return_value={"code": "006380", "name": "카프로"},
+                ),
+                patch.object(setting_window, "read_base_stocks", return_value=[]),
+            ):
+                self.assertFalse(dialog.register_or_assign_result_row(0))
+
+        callback.assert_called_once_with(
+            "006380",
+            "카프로",
+            needs_registration=True,
+        )
+        append_base.assert_not_called()
+
+    def test_mock_stock_selection_callback_accepts_existing_stock_without_reassignment(self) -> None:
+        callback = MagicMock(return_value=True)
+        dialog, parent = self._unassigned_stock_search_dialog()
+        dialog._stock_selection_callback = callback
+        self._set_instance_stock_search_rows(dialog, [("006380", "카프로")])
+        with (
+            patch.object(
+                setting_window,
+                "find_library_stock_by_code",
+                return_value={"code": "006380", "name": "카프로"},
+            ),
+            patch.object(
+                setting_window,
+                "read_base_stocks",
+                return_value=[{
+                    "code": "006380",
+                    "name": "카프로",
+                    "assigned_routine_instance_id": "production-a",
+                }],
+            ),
+            patch.object(setting_window, "append_base_stock") as append_base,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as assign_production,
+        ):
+            self.assertTrue(dialog.register_or_assign_result_row(0))
+
+        callback.assert_called_once_with(
+            "006380",
+            "카프로",
+            needs_registration=False,
+        )
+        append_base.assert_not_called()
+        assign_production.assert_not_called()
+        parent.refresh_all.assert_called_once_with()
 
     def test_stock_register_context_menu_keeps_existing_handlers(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -7384,7 +7577,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "가능1",
             routine="지표추종매매",
         )
-        ensure_single.assert_called_once_with("111111", "가능1", "지표추종매매")
         toast.assert_called_once_with(window, "루틴등록 1종목 | 등록불가 0종목")
 
     def test_stock_register_routine_assign_partial_result_toast_counts(self) -> None:
@@ -7436,8 +7628,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
         self.assertEqual(2, execute_assignment.call_count)
-        ensure_single.assert_any_call("111111", "가능1", "지표추종매매")
-        ensure_single.assert_any_call("222222", "가능2", "지표추종매매")
         toast.assert_called_once_with(window, "루틴등록 2종목 | 등록불가 2종목")
 
     def test_stock_register_routine_assign_all_blocked_toasts_without_backend(self) -> None:
@@ -7465,7 +7655,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
         execute_assignment.assert_not_called()
-        ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 2종목")
 
@@ -7544,7 +7733,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
         execute_assignment.assert_not_called()
-        ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 1종목")
 
@@ -7573,7 +7761,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
         execute_assignment.assert_not_called()
-        ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 1종목")
 
@@ -7614,7 +7801,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
         execute_assignment.assert_called_once()
-        ensure_single.assert_called_once_with("111111", "가능", "지표추종매매")
         toast.assert_called_once_with(window, "루틴등록 1종목 | 등록불가 1종목")
 
     def test_stock_register_context_menu_without_routines_uses_disabled_plain_assign_action(self) -> None:
@@ -7655,7 +7841,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.show_stock_table_context_menu(QPoint(1, 1))
 
         self.assertEqual(
-            ["전체 선택", "선택 해제", "---", "종목초기화", "---", "루틴등록", "루틴해제"],
+            ["전체 선택", "선택 해제", "---", "종목초기화", "---", "루틴등록", "루틴해제", "모의검증"],
             FakeMenu.last.entries,
         )
         FakeMenu.last.actions[3].setEnabled.assert_called_once_with(True)
@@ -7786,7 +7972,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.unassign_selected_stock_routines()
 
         execute_unassign.assert_not_called()
-        ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(
             window,
@@ -7827,7 +8012,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.unassign_selected_stock_routines()
 
         execute_unassign.assert_not_called()
-        ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(
             window,
@@ -8313,8 +8497,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.unassign_selected_stock_routines()
 
         self.assertEqual(2, execute_unassign.call_count)
-        ensure_single.assert_any_call("111111", "가능1")
-        ensure_single.assert_any_call("222222", "가능2")
         changelog.assert_called_once()
         information.assert_not_called()
         toast.assert_called_once_with(
@@ -13843,7 +14025,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             expected_instance_id="inst-a",
             intent=setting_window.ASSIGNMENT_INTENT_UNASSIGN,
         )
-        ensure_single.assert_called_once_with("005930", "삼성전자")
         question.assert_not_called()
         window.refresh_all.assert_called_once_with()
         toast.assert_called_once_with(window, "등록해제 1건 | 삼성전자")
@@ -14001,7 +14182,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             definition_id="indicator_follow",
             routine_type="지표추종매매",
         )
-        ensure_routine.assert_called_once_with("005930", "삼성전자", "지표추종매매")
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(parent, "등록 1건 | 삼성전자")
 

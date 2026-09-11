@@ -189,7 +189,7 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
             self.assertIsInstance(first, StockInstanceChartWindow)
             self.assertTrue(first.isVisible())
             self.assertEqual(first.minimumSize(), first.size())
-            self.assertTrue(first.windowTitle().startswith("005930 005930 /"))
+            self.assertTrue(first.windowTitle().startswith("005930 005930 ▷매수"))
 
             QTest.mouseDClick(table.viewport(), Qt.LeftButton, pos=code_rect.center())
             self.app.processEvents()
@@ -280,7 +280,7 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
             self.assertIs(chart._main_monitoring_window(), main)
             self.assertTrue(chart.isVisible())
             self.assertEqual(chart.minimumSize(), chart.size())
-            self.assertTrue(chart.windowTitle().startswith("005930 005930 /"))
+            self.assertTrue(chart.windowTitle().startswith("005930 005930 ▷매수"))
             self.assertTrue(timer.isActive())
             self.assertTrue(chart._operation_cycle_refresh_connected)
             with patch.object(
@@ -414,7 +414,9 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
             self.assertEqual(9, len({chart.windowTitle() for chart in charts}))
             self.assertTrue(
                 all(
-                    chart.windowTitle().startswith(f"{chart.stock_code} {chart.stock_code} /")
+                    chart.windowTitle().startswith(
+                        f"{chart.stock_code} {chart.stock_code} ▷매수"
+                    )
                     for chart in charts
                 )
             )
@@ -649,7 +651,7 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
                 activate_window.assert_called_once_with()
                 refresh_projection.assert_called_once_with()
             self.assertIs(first, second)
-            self.assertTrue(first.windowTitle().startswith("005930 종목명-2 /"))
+            self.assertTrue(first.windowTitle().startswith("005930 종목명-2 ▷매수"))
             self.assertIs(timer, chart_window._common_pnl_refresh_timer())
             self.assertFalse(hasattr(first, "_pnl_refresh_timer"))
             self.assertTrue(timer.isActive())

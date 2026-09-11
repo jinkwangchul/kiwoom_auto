@@ -6,7 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from PyQt5.QtWidgets import QDialog, QMenu, QMessageBox
+from PyQt5.QtWidgets import (
+    QDialog,
+    QMenu,
+    QMessageBox,
+)
 
 from gui_auto_trade_context_menu import (
     _add_early_close_menu,
@@ -26,8 +30,11 @@ from gui_main_table_loader import (
     ROUTINE_STOCK_NAME_ROLE,
     ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
 )
-from mock_validation_contract import normalized_stock_code
-from mock_validation_contract import instance_effective_settings
+from mock_validation_contract import (
+    instance_effective_settings,
+    mock_instance_pre_start_editable,
+    normalized_stock_code,
+)
 from mock_validation_operation_lifecycle import (
     instance_operation_state,
     mock_validation_end_eligibility,
@@ -196,6 +203,30 @@ def _run(window: Any, title: str, operation: Callable[[], dict[str, Any]]) -> No
         reporter(title, operation)
     else:
         operation()
+
+
+def _begin_mock_stock_registration(window: Any) -> bool:
+    opener = getattr(window, "open_mock_stock_search_register_dialog", None)
+    if not callable(opener):
+        return False
+    opener()
+    return True
+
+
+def show_mock_registration_context_menu(window: Any, position: Any) -> bool:
+    """Show Mock stock registration without requiring an existing row target."""
+
+    menu = QMenu(window.routine_table)
+    register_action = menu.addAction("종목등록")
+    unregister_all_action = menu.addAction("전체해제")
+    actions = getattr(window, "mock_validation_ui_actions", None)
+    unregister_all_action.setEnabled(actions is not None)
+    chosen = menu.exec_(window.routine_table.viewport().mapToGlobal(position))
+    if chosen is register_action:
+        _begin_mock_stock_registration(window)
+    elif chosen is unregister_all_action and actions is not None:
+        _run(window, "모의 전체해제", actions.unregister_all)
+    return True
 
 
 def _fresh_operation(
@@ -375,7 +406,9 @@ def show_mock_monitoring_context_menu(
         operation_policy=operation_policy,
     )
     settings = instance_effective_settings(document, target.routine_instance_id)
-    settings_editable = str(state.get("state") or "").strip().upper() == "WAITING"
+    settings_editable = mock_instance_pre_start_editable(
+        document, target.routine_instance_id
+    )
     time_change_action = None
     time_reset_action = None
     ats_settings = None
@@ -405,6 +438,13 @@ def show_mock_monitoring_context_menu(
     chart_action.setEnabled(state.get("can_chart") is True)
     reset_action = menu.addAction("검증리셋")
     reset_action.setEnabled(state.get("can_reset") is True)
+    unregister_eligibility = actions.unregister_instance_eligibility(
+        target.stock_code,
+        target.routine_instance_id,
+        expected_validation_session_id=target.validation_session_id,
+    )
+    unregister_action = menu.addAction("등록해제")
+    unregister_action.setEnabled(unregister_eligibility.get("eligible") is True)
 
     chosen = menu.exec_(window.routine_table.viewport().mapToGlobal(position))
     if chosen is start_action and start_action.isEnabled():
@@ -535,6 +575,21 @@ def show_mock_monitoring_context_menu(
                 ),
             ),
         )
+    elif chosen is unregister_action and unregister_action.isEnabled():
+        _run(
+            window,
+            "모의 Routine 등록해제",
+            lambda: _fresh_operation(
+                window,
+                row,
+                target,
+                lambda current: actions.unregister_instance(
+                    current.stock_code,
+                    current.routine_instance_id,
+                    expected_validation_session_id=current.validation_session_id,
+                ),
+            ),
+        )
     return True
 
 
@@ -543,5 +598,6 @@ __all__ = [
     "clear_visible_mock_instance_selection",
     "mock_context_target_for_row",
     "select_all_visible_mock_instances",
+    "show_mock_registration_context_menu",
     "show_mock_monitoring_context_menu",
 ]

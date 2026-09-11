@@ -335,6 +335,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         instance_metadata: dict[str, object] | None = None,
         stock_source: str = STOCK_LIBRARY_EMPTY_SOURCE,
         kiwoom_api: object | None = None,
+        stock_selection_callback=None,
     ) -> None:
         super().__init__(parent)
         configure_persistent_feature_window(self, parent)
@@ -345,6 +346,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             else getattr(owner, "kiwoom_api", None)
         )
         self.instance_metadata = dict(instance_metadata or {})
+        self._stock_selection_callback = stock_selection_callback
         # Search is intentionally local-only. Server Master collection is owned by
         # the login-session sync service and never by dialog open/textChanged.
         self.stock_source = str(stock_source or STOCK_LIBRARY_EMPTY_SOURCE)
@@ -1952,6 +1954,42 @@ class InstanceStockSearchRegisterDialog(QDialog):
         if not selected_rows:
             self._toast("등록할 종목을 선택하세요.")
             return False
+        selection_callback = getattr(self, "_stock_selection_callback", None)
+        if callable(selection_callback):
+            changed = False
+            changed_codes: list[str] = []
+            seen_codes: set[str] = set()
+            for row in selected_rows:
+                result_stock = self._result_stock_at_row(row)
+                if result_stock is None:
+                    continue
+                code, name = result_stock
+                if (
+                    not code
+                    or code in seen_codes
+                    or not self._valid_result_stock(row, code, name)
+                ):
+                    continue
+                seen_codes.add(code)
+                try:
+                    selected = bool(
+                        selection_callback(
+                            code,
+                            name,
+                            needs_registration=self._registered_stock(code) is None,
+                        )
+                    )
+                except Exception:
+                    LOGGER.exception("Stock-selection callback failed")
+                    selected = False
+                if selected:
+                    changed = True
+                    changed_codes.append(code)
+            if changed:
+                self._refresh_parent_views()
+                for code in changed_codes:
+                    self._refresh_classification_for_stock(code)
+            return changed
         target = self._target_instance()
         if target is None:
             self._toast("대상 루틴 정보를 확인하지 못했습니다.")
@@ -2113,6 +2151,24 @@ class InstanceStockSearchRegisterDialog(QDialog):
             self._toast("선택한 종목의 등록 Evidence가 유효하지 않습니다.")
             return False
 
+        selection_callback = getattr(self, "_stock_selection_callback", None)
+        if callable(selection_callback):
+            try:
+                selected = bool(
+                    selection_callback(
+                        code,
+                        name,
+                        needs_registration=self._registered_stock(code) is None,
+                    )
+                )
+            except Exception:
+                LOGGER.exception("Stock-selection callback failed")
+                return False
+            if selected:
+                self._refresh_parent_views()
+                self._refresh_classification_for_stock(code)
+            return selected
+
         stock = self._registered_stock(code)
         assigned_instance_id = (
             str(stock.get("assigned_routine_instance_id", "") or "").strip()
@@ -2184,6 +2240,7 @@ def open_instance_stock_search_register_dialog(
     owner_attribute: str = "instance_stock_search_register_window",
     delete_on_close: bool = False,
     finished_callback=None,
+    stock_selection_callback=None,
 ) -> InstanceStockSearchRegisterDialog:
     """Open one process-wide search dialog per target Instance."""
     target_id = str(metadata.get("instance_id", "") or "").strip()
@@ -2197,6 +2254,7 @@ def open_instance_stock_search_register_dialog(
             if not sip.isdeleted(existing):
                 if existing.parentWidget() is not owner:
                     existing.setParent(owner, existing.windowFlags() | Qt.Window)
+                existing._stock_selection_callback = stock_selection_callback
                 setattr(owner, owner_attribute, existing)
                 owner_refs = getattr(existing, "_registration_dialog_owner_refs", [])
                 owner_ref = (owner, owner_attribute)
@@ -2214,10 +2272,12 @@ def open_instance_stock_search_register_dialog(
             pass
         dialogs.pop(target_key, None)
 
-    dialog = InstanceStockSearchRegisterDialog(
-        owner,
-        instance_metadata=dict(metadata),
-    )
+    dialog_kwargs: dict[str, object] = {
+        "instance_metadata": dict(metadata),
+    }
+    if stock_selection_callback is not None:
+        dialog_kwargs["stock_selection_callback"] = stock_selection_callback
+    dialog = InstanceStockSearchRegisterDialog(owner, **dialog_kwargs)
     if delete_on_close:
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
     dialogs[target_key] = dialog
@@ -4225,6 +4285,23 @@ def delete_routine_instance_with_existing_policy(
     if not instance_id:
         return
 
+    from routine_instance_deletion_service import (
+        ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS,
+        ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS_MESSAGE,
+        collect_routine_instance_deletion_scope,
+        current_mock_registrations_for_routine_instance,
+        delete_routine_instance_completely,
+    )
+
+    try:
+        scope = collect_routine_instance_deletion_scope(PROJECT_ROOT, instance_id)
+    except Exception as exc:
+        QMessageBox.warning(window, "등록삭제", str(exc))
+        return
+    if getattr(scope, "stocks", ()):
+        show_toast(window, ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS_MESSAGE)
+        return
+
     answer = QMessageBox.question(
         window,
         "등록삭제",
@@ -4235,10 +4312,87 @@ def delete_routine_instance_with_existing_policy(
     if answer != QMessageBox.Yes:
         return
 
-    from routine_instance_deletion_service import (
-        collect_routine_instance_deletion_scope,
-        delete_routine_instance_completely,
-    )
+    from mock_validation_operation_lifecycle import mock_validation_end_eligibility
+
+    try:
+        mock_registrations = current_mock_registrations_for_routine_instance(
+            PROJECT_ROOT,
+            instance_id,
+        )
+    except Exception as exc:
+        QMessageBox.warning(window, "등록삭제", str(exc))
+        return
+
+    if mock_registrations:
+        shared = tuple(
+            registration
+            for registration in mock_registrations
+            if set(registration.routine_instance_ids) != {instance_id}
+        )
+        if shared:
+            QMessageBox.warning(
+                window,
+                "등록삭제",
+                "다른 루틴과 함께 등록된 모의검증 종목이 있습니다.\n"
+                "모의검증 등록을 먼저 정리하세요.",
+            )
+            return
+        try:
+            blocked = tuple(
+                registration
+                for registration in mock_registrations
+                if mock_validation_end_eligibility(registration.document).get("eligible")
+                is not True
+            )
+        except Exception as exc:
+            QMessageBox.warning(window, "등록삭제", str(exc))
+            return
+        if blocked:
+            QMessageBox.warning(
+                window,
+                "등록삭제",
+                "현재 등록해제할 수 없는 모의검증 종목이 있습니다.\n"
+                "모의검증 운영을 종료하고 등록상태를 먼저 정리하세요.",
+            )
+            return
+        if getattr(window, "mock_validation_ui_actions", None) is None:
+            QMessageBox.warning(
+                window,
+                "등록삭제",
+                "모의검증 등록상태를 안전하게 정리할 수 없습니다.",
+            )
+            return
+
+    if mock_registrations:
+        show_toast(window, "모의검증에 등록상태도 삭제 합니다.")
+        try:
+            for registration in mock_registrations:
+                result = window.mock_validation_ui_actions.unregister(
+                    registration.stock_code,
+                    expected_validation_session_id=registration.validation_session_id,
+                )
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    reason = result.get("reason") if isinstance(result, dict) else ""
+                    raise RuntimeError(reason or "MOCK_UNREGISTER_FAILED")
+                purge = result.get("purge")
+                if (
+                    not isinstance(purge, dict)
+                    or int(purge.get("events_remaining", -1)) != 0
+                ):
+                    raise RuntimeError("MOCK_UNREGISTER_EVENT_PURGE_UNVERIFIED")
+            remaining = current_mock_registrations_for_routine_instance(
+                PROJECT_ROOT,
+                instance_id,
+            )
+            if remaining:
+                raise RuntimeError("MOCK_ROUTINE_REGISTRATION_REMAINS")
+        except Exception as exc:
+            QMessageBox.warning(
+                window,
+                "등록삭제",
+                f"모의검증 등록상태를 삭제하지 못했습니다.\n{exc}",
+            )
+            return
 
     try:
         scope = collect_routine_instance_deletion_scope(PROJECT_ROOT, instance_id)
@@ -4254,6 +4408,9 @@ def delete_routine_instance_with_existing_policy(
         running_stock_dirs=running_stock_dirs,
     )
     if not result.success:
+        if getattr(result, "reason_code", "") == ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS:
+            show_toast(window, ROUTINE_INSTANCE_DELETE_ASSIGNED_STOCKS_MESSAGE)
+            return
         reason = result.error
         if result.blocked:
             reason = "\n".join(block.message for block in result.blocked)
