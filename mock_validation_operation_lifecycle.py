@@ -1066,9 +1066,6 @@ class MockOperationLifecycleCoordinator:
         if as_of.tzinfo is None:
             raise MockValidationError("MOCK_OPERATION_TIMESTAMP_INVALID")
         close_method = normalize_close_method(method)
-        profit_loss = self._profit_loss_snapshot(
-            close_method, profit_percent, loss_percent
-        )
         command = clean_text(command_id)
         instance_id = clean_text(routine_instance_id)
         before = self.repository.read_session(session_id)
@@ -1087,6 +1084,39 @@ class MockOperationLifecycleCoordinator:
             or operation.get("state") not in allowed_states
         ):
             raise MockValidationError("MOCK_INSTANCE_OPERATION_CLOSE_STATE_INVALID")
+        operation_snapshot = operation.get("operation_policy_snapshot")
+        operation_snapshot = (
+            operation_snapshot if isinstance(operation_snapshot, dict) else {}
+        )
+        snapshot_settings = operation_snapshot.get(
+            "mock_instance_effective_settings"
+        )
+        snapshot_settings = (
+            snapshot_settings if isinstance(snapshot_settings, dict) else {}
+        )
+        operation_mode = clean_text(
+            operation_snapshot.get("operation_mode")
+            or snapshot_settings.get("operation_mode")
+        ).upper()
+        if source == "EARLY" and operation_mode == "CONTINUOUS":
+            individual = operation.get("individual_liquidation_time_snapshot")
+            individual = individual if isinstance(individual, dict) else {}
+            liquidation = operation_snapshot.get("liquidation")
+            liquidation = liquidation if isinstance(liquidation, dict) else {}
+            activated_method = normalize_close_method(
+                individual.get("method")
+                if individual
+                else liquidation.get("method", CLOSE_CARRYOVER)
+            )
+            if activated_method in {
+                CLOSE_MARKET,
+                CLOSE_CURRENT_PRICE,
+                CLOSE_CARRYOVER,
+            }:
+                close_method = activated_method
+        profit_loss = self._profit_loss_snapshot(
+            close_method, profit_percent, loss_percent
+        )
         timestamp = as_of.isoformat(timespec="microseconds")
         if source == "EARLY":
             position = _positions(before)[instance_id]
@@ -2209,6 +2239,16 @@ class MockOperationLifecycleCoordinator:
 
         transition = operation.get("close_transition_pending")
         transition = transition if isinstance(transition, dict) else {}
+        if (
+            clean_text(transition.get("method")).upper() == CLOSE_CARRYOVER
+            and not pending_order_cleanup_boundary
+            and not final_close_boundary
+        ):
+            return {
+                "status": "WAIT",
+                "reason": "MOCK_CARRYOVER_HOLD_UNTIL_CLEANUP",
+                "document": before,
+            }
         if transition and live:
             order = live[0]
             result = self.engine.request_cancel(
@@ -2381,6 +2421,21 @@ class MockOperationLifecycleCoordinator:
             if clean_text(item.get("child_identity")).startswith(close_prefix)
         ]
         other_orders = [item for item in live if item not in close_orders]
+        carryover_snapshot = operation.get("operation_policy_snapshot")
+        carryover_snapshot = (
+            carryover_snapshot if isinstance(carryover_snapshot, dict) else {}
+        )
+        if (
+            operation.get("close_method") == CLOSE_CARRYOVER
+            and carryover_snapshot.get("long_hold_enabled") is not False
+            and not pending_order_cleanup_boundary
+            and not final_close_boundary
+        ):
+            return {
+                "status": "WAIT",
+                "reason": "MOCK_CARRYOVER_HOLD_UNTIL_CLEANUP",
+                "document": before,
+            }
         if (pending_order_cleanup_boundary or final_close_boundary) and close_orders:
             order = close_orders[0]
             result = self.engine.request_cancel(
@@ -2862,6 +2917,7 @@ class MockOperationLifecycleCoordinator:
                     "state": OPERATION_ENDED,
                     "ended_at": timestamp,
                     "outcome": outcome,
+                    "individual_liquidation_time_snapshot": None,
                     **(
                         {"termination_provenance": termination_provenance}
                         if termination_provenance

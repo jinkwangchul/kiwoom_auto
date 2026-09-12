@@ -1442,7 +1442,6 @@ class MockValidationHost:
                 )
                 and (
                     mode == "SCHEDULED"
-                    or bool(individual)
                     or bool(str(operation.get("close_method") or "").strip())
                 )
                 and (
@@ -1723,12 +1722,29 @@ class MockValidationHost:
                 operation = instance_operation_state(current, instance_id)
                 if (
                     not operation
-                    or operation.get("state") != "RUNNING"
+                    or operation.get("state") not in {"RUNNING", "CLOSING"}
                     or not self._instance_pending_order_cancel_boundary_reached(
                         operation,
                         now,
                     )
                 ):
+                    continue
+                snapshot = operation.get("operation_policy_snapshot")
+                snapshot = snapshot if isinstance(snapshot, dict) else {}
+                settings = self._operation_effective_settings(current, instance_id)
+                mode = str(
+                    snapshot.get("operation_mode")
+                    or settings.get("operation_mode")
+                    or ""
+                ).strip().upper()
+                close_source = str(
+                    operation.get("close_source") or ""
+                ).strip().upper()
+                if mode == "CONTINUOUS" and close_source not in {
+                    "EARLY",
+                    "AUTO",
+                    "LIQUIDATION",
+                }:
                     continue
                 has_live_orders = any(
                     isinstance(item, dict)

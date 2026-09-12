@@ -1369,7 +1369,13 @@ def auto_trade_setting_liquidation_text(
     status_text = auto_trade_setting_display_status(display_status)
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     early_close_forced = auto_trade_setting_early_close_requested(state)
-    individual_policy = individual_liquidation_setting_policy_from_state(state)
+    if mode == "CONTINUOUS" and not early_close_forced:
+        return "-"
+    individual_policy = (
+        individual_liquidation_policy_from_state(state)
+        if mode == "CONTINUOUS"
+        else individual_liquidation_setting_policy_from_state(state)
+    )
     has_individual = bool(individual_policy)
     if (
         not has_individual
@@ -1381,7 +1387,7 @@ def auto_trade_setting_liquidation_text(
 
     # 개별청산 정책이 없을 때 마감 이월은 청산 미진입("-")이다.
     # 이후 명시된 종목별 개별청산 정책은 과거 마감 이월보다 우선 표시한다.
-    if not has_individual and early_close_forced:
+    if not has_individual and early_close_forced and mode != "CONTINUOUS":
         method = short_close_method_text(
             close_method_from_state_or_policy(
                 state,
@@ -1776,6 +1782,13 @@ def auto_trade_setting_liquidation_active(
         return False
 
     if holding_qty <= 0:
+        return False
+
+    if (
+        normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+        == "CONTINUOUS"
+        and not auto_trade_setting_early_close_requested(state)
+    ):
         return False
 
     liquidation, is_individual = effective_liquidation_policy_for_config(config, state)

@@ -24,7 +24,7 @@ from close_liquidation_execution_pipeline import (
 
 
 class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
-    def test_regular_end_pending_cleanup_starts_at_frozen_end_minus_thirty_seconds(self):
+    def test_manual_inactive_liquidation_does_not_start_pending_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp))
             state_path = stock / "state.json"
@@ -55,12 +55,8 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                 )
 
         self.assertEqual(0, before["processed"])
-        self.assertEqual(1, at_boundary["processed"])
-        execute.assert_called_once()
-        self.assertEqual(
-            "REGULAR_END_PENDING_CLEANUP",
-            execute.call_args.kwargs["reason"],
-        )
+        self.assertEqual(0, at_boundary["processed"])
+        execute.assert_not_called()
 
     def test_liquidation_carryover_waits_until_regular_end_cleanup_boundary(self):
         with tempfile.TemporaryDirectory() as temp:

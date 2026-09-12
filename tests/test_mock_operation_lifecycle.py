@@ -41,6 +41,7 @@ from mock_validation_operation_lifecycle import (
 )
 from mock_validation_repository import MockValidationRepository
 from mock_validation_session_service import MockValidationSessionService
+from mock_validation_ui_projection import mock_instance_projection
 from mock_validation_virtual_execution import MockExecutionPolicy, MockVirtualExecutionEngine
 from manual_ats_runtime import PROGRAM_SESSION_ID
 from tests.test_mock_indicator_follow_adapter import NOW, SESSION_ID, _buy_rules, _market
@@ -172,7 +173,7 @@ class MockOperationLifecycleTest(unittest.TestCase):
         self.assertEqual(1, len(document["orders"]))
         self.assertEqual(3, document["positions"][1]["holding_qty"])
 
-    def test_early_close_carryover_still_cancels_pending_immediately(self):
+    def test_early_close_carryover_defers_cancel_until_cleanup_boundary(self):
         self.start_instance("B")
         self.position("B", 2)
         resting = _market(now=self.clock["now"], asks=((110, 100),))
@@ -196,20 +197,34 @@ class MockOperationLifecycleTest(unittest.TestCase):
             as_of=self.clock["now"],
             command_id="MC-early-carry",
         )
-        result = self.coordinator.process_instance_operation_cycle(
+        held = self.coordinator.process_instance_operation_cycle(
             SESSION_ID,
             routine_instance_id="B",
-            lifecycle_cycle_id="EARLY-CARRY-CANCEL",
+            lifecycle_cycle_id="EARLY-CARRY-HOLD",
             as_of=self.clock["now"],
             market=resting,
             policy=self.policy,
+        )
+        before_cleanup = self.repository.read_session(SESSION_ID)
+        saved_before_cleanup = next(
+            item for item in before_cleanup["orders"]
+            if item["mock_order_id"] == order["mock_order_id"]
+        )
+        cleanup = self.coordinator.process_instance_regular_end_pending_cleanup(
+            SESSION_ID,
+            routine_instance_id="B",
+            lifecycle_cycle_id="EARLY-CARRY-CLEANUP",
+            as_of=self.clock["now"] + timedelta(seconds=1),
         )
         document = self.repository.read_session(SESSION_ID)
         saved = next(
             item for item in document["orders"]
             if item["mock_order_id"] == order["mock_order_id"]
         )
-        self.assertEqual("CANCEL_REQUEST", result["action"])
+        self.assertEqual("WAIT", held["status"])
+        self.assertEqual("MOCK_CARRYOVER_HOLD_UNTIL_CLEANUP", held["reason"])
+        self.assertNotEqual(ORDER_CANCEL_PENDING, saved_before_cleanup["state"])
+        self.assertEqual("REGULAR_END_CANCEL_REQUEST", cleanup["action"])
         self.assertEqual(ORDER_CANCEL_PENDING, saved["state"])
 
     def setUp(self):
@@ -1120,7 +1135,7 @@ class MockOperationLifecycleTest(unittest.TestCase):
             as_of=self.clock["now"],
             command_id="MC-individual-carry-boundary-B",
         )
-        completed = self.coordinator.process_instance_operation_cycle(
+        held = self.coordinator.process_instance_operation_cycle(
             SESSION_ID,
             routine_instance_id="B",
             lifecycle_cycle_id="INDIVIDUAL-CARRY-B",
@@ -1128,12 +1143,141 @@ class MockOperationLifecycleTest(unittest.TestCase):
             market=_market(now=self.clock["now"]),
             policy=self.policy,
         )
+        completed = self.coordinator.process_instance_operation_cycle(
+            SESSION_ID,
+            routine_instance_id="B",
+            lifecycle_cycle_id="INDIVIDUAL-CARRY-CLEANUP-B",
+            as_of=self.clock["now"] + timedelta(seconds=1),
+            market=_market(now=self.clock["now"] + timedelta(seconds=1)),
+            policy=self.policy,
+            pending_order_cleanup_boundary=True,
+        )
+        self.assertEqual("WAIT", held["status"])
+        self.assertEqual("MOCK_CARRYOVER_HOLD_UNTIL_CLEANUP", held["reason"])
         self.assertEqual(OUTCOME_CARRYOVER_DONE, completed["status"])
         position = next(
             item for item in completed["document"]["positions"]
             if item["routine_instance_id"] == "B"
         )
         self.assertEqual(3, position["holding_qty"])
+        operation = completed["document"]["mock_operation_lifecycle"][
+            "instance_operations"
+        ]["B"]
+        self.assertIsNone(operation["individual_liquidation_time_snapshot"])
+
+    def test_manual_individual_setting_projects_only_after_early_close(self):
+        settings = self.repository.read_session(SESSION_ID)[
+            "effective_settings_by_instance"
+        ]["B"]
+        settings["operation_mode"] = "CONTINUOUS"
+        settings["manual_ats"]["selected_sessions"] = []
+        self.coordinator.start_instance_operation(
+            SESSION_ID,
+            routine_instance_id="B",
+            trading_date=self.clock["now"].date(),
+            as_of=self.clock["now"],
+            operation_policy_snapshot={
+                "operation_mode": "CONTINUOUS",
+                "regular_market": {"start_time": "09:00:00", "end_time": "15:20:00"},
+                "liquidation": {
+                    "minutes_before_regular_close": "5",
+                    "method": "MARKET",
+                },
+                "mock_instance_effective_settings": settings,
+            },
+            command_id="MC-manual-start-B",
+        )
+        self.position("B", 2)
+        requested = self.coordinator.request_instance_individual_liquidation(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_CURRENT_PRICE,
+            minutes_before_regular_close="10",
+            reason="manual fixture",
+            as_of=self.clock["now"],
+            command_id="MC-manual-individual-B",
+        )
+        before = mock_instance_projection(
+            requested["document"], "B", as_of=self.clock["now"]
+        )
+        self.assertEqual(
+            "-", before["display_contract"]["liquidation"]["display_text"]
+        )
+        self.assertFalse(before["liquidation_has_policy"])
+        self.assertEqual([], requested["document"]["orders"])
+
+        early = self.coordinator.request_instance_early_close(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_MARKET,
+            reason="operator",
+            as_of=self.clock["now"],
+            command_id="MC-manual-early-B",
+        )
+        after = mock_instance_projection(
+            early["document"], "B", as_of=self.clock["now"]
+        )
+        early_operation = early["document"]["mock_operation_lifecycle"][
+            "instance_operations"
+        ]["B"]
+        self.assertEqual(CLOSE_CURRENT_PRICE, early_operation["close_method"])
+        self.assertEqual(
+            "10분/현재가",
+            after["display_contract"]["liquidation"]["display_text"],
+        )
+
+    def test_manual_early_close_without_override_uses_global_carryover(self):
+        settings = self.repository.read_session(SESSION_ID)[
+            "effective_settings_by_instance"
+        ]["B"]
+        settings["operation_mode"] = "CONTINUOUS"
+        settings["manual_ats"]["selected_sessions"] = []
+        self.coordinator.start_instance_operation(
+            SESSION_ID,
+            routine_instance_id="B",
+            trading_date=self.clock["now"].date(),
+            as_of=self.clock["now"],
+            operation_policy_snapshot={
+                "operation_mode": "CONTINUOUS",
+                "regular_market": {"start_time": "09:00:00", "end_time": "15:20:00"},
+                "liquidation": {
+                    "minutes_before_regular_close": "5",
+                    "method": "CARRYOVER",
+                },
+                "mock_instance_effective_settings": settings,
+            },
+            command_id="MC-manual-global-start-B",
+        )
+        self.position("B", 2)
+        early = self.coordinator.request_instance_early_close(
+            SESSION_ID,
+            routine_instance_id="B",
+            method=CLOSE_MARKET,
+            reason="operator",
+            as_of=self.clock["now"],
+            command_id="MC-manual-global-early-B",
+        )
+        operation = early["document"]["mock_operation_lifecycle"][
+            "instance_operations"
+        ]["B"]
+        projected = mock_instance_projection(
+            early["document"], "B", as_of=self.clock["now"]
+        )
+        held = self.coordinator.process_instance_operation_cycle(
+            SESSION_ID,
+            routine_instance_id="B",
+            lifecycle_cycle_id="MANUAL-GLOBAL-CARRYOVER-HOLD",
+            as_of=self.clock["now"],
+            market=_market(now=self.clock["now"]),
+            policy=self.policy,
+        )
+
+        self.assertEqual(CLOSE_CARRYOVER, operation["close_method"])
+        self.assertEqual(
+            "이월", projected["display_contract"]["liquidation"]["display_text"]
+        )
+        self.assertEqual("WAIT", held["status"])
+        self.assertEqual([], held["document"]["orders"])
 
     def test_pre_operation_individual_liquidation_reservation_binds_on_start(self):
         reserved = self.coordinator.request_instance_individual_liquidation(

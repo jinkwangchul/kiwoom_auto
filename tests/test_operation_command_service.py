@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import os
@@ -876,6 +877,71 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertEqual("program-session-1", request["program_session_id"])
         self.assertNotIn(INDIVIDUAL_LIQUIDATION_REQUEST_KEY, state)
 
+    def test_regular_individual_and_manual_ats_requests_do_not_contaminate_each_other(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "RUNNING",
+                    "operation_command_mode": MODE_NORMAL,
+                    "operation_sequence": 4,
+                },
+            )
+            service = self._service(root)
+            service.apply_individual_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_INDIVIDUAL_LIQUIDATION,
+                    "auto_trade_setting_context_menu",
+                    command_id="individual-isolation-1",
+                ),
+                IndividualLiquidationOverride("시장가", "10"),
+            )
+            individual_before_ats = deepcopy(
+                self._state(stock)[INDIVIDUAL_LIQUIDATION_REQUEST_KEY]
+            )
+            service.apply_manual_ats_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_MANUAL_ATS_LIQUIDATION,
+                    "ATS_SETTINGS",
+                    command_id="ats-isolation-1",
+                ),
+                ManualAtsLiquidationOverride("CURRENT_PRICE", ("extra1",)),
+            )
+            state_after_ats = self._state(stock)
+            ats_before_individual = deepcopy(
+                state_after_ats[MANUAL_ATS_LIQUIDATION_REQUEST_KEY]
+            )
+            service.apply_individual_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_INDIVIDUAL_LIQUIDATION,
+                    "auto_trade_setting_context_menu",
+                    command_id="individual-isolation-2",
+                ),
+                IndividualLiquidationOverride("현재가", "15"),
+            )
+            state_after_individual = self._state(stock)
+
+        self.assertEqual(
+            individual_before_ats,
+            state_after_ats[INDIVIDUAL_LIQUIDATION_REQUEST_KEY],
+        )
+        self.assertEqual(
+            ats_before_individual,
+            state_after_individual[MANUAL_ATS_LIQUIDATION_REQUEST_KEY],
+        )
+        self.assertEqual(
+            "현재가",
+            state_after_individual[INDIVIDUAL_LIQUIDATION_REQUEST_KEY]["method"],
+        )
+
     def test_manual_ats_liquidation_result_status_is_read_back_verified(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1295,6 +1361,108 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                     close_intent.call_args.kwargs["requested_policy"],
                 )
                 self.assertEqual(canonical, execute.call_args.kwargs["method"])
+
+    def test_manual_early_close_activates_current_individual_override(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            operation_identity = "2026-07-27 09:00:00"
+            selected = [
+                self._write_stock(
+                    Path(temp),
+                    "005930_Samsung",
+                    state={
+                        "status": "RUNNING",
+                        "holding_qty": 5,
+                        "trade_enabled": True,
+                        "trade_started_at": operation_identity,
+                        "operation_policy_snapshot": {
+                            "operation_identity": operation_identity,
+                            "operation_mode": "CONTINUOUS",
+                            "liquidation": {
+                                "method": "시장가",
+                                "minutes_before_regular_close": "5",
+                            },
+                        },
+                        INDIVIDUAL_LIQUIDATION_REQUEST_KEY: {
+                            "status": INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
+                            "reservation_scope": "CURRENT_OPERATION",
+                            "operation_identity": operation_identity,
+                            "method": "현재가",
+                            "minutes_before_regular_close": "10",
+                        },
+                    },
+                )
+            ]
+            window = self._window(selected)
+            self._MessageBox.proceed = True
+            command_result = OperationCommandResult(
+                RESULT_SUCCESS,
+                "manual-early-command",
+                (
+                    StockOperationCommandResult(
+                        "005930",
+                        str(selected[0][0]),
+                        STOCK_APPLIED,
+                        1,
+                    ),
+                ),
+            )
+            with (
+                patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
+                patch(
+                    "gui_auto_trade_close.pending_order_side_quantities",
+                    return_value=(0, 0),
+                ),
+                patch(
+                    "close_liquidation_command.auto_trade_setting_liquidation_phase_active",
+                    return_value=False,
+                ),
+                patch(
+                    "close_liquidation_command._early_close_time_reason",
+                    return_value="",
+                ),
+                patch(
+                    "gui_auto_trade_close._production_recovery_gate",
+                    return_value=None,
+                ),
+                patch(
+                    "gui_auto_trade_close.evaluate_production_transition",
+                    return_value=Mock(allowed=True),
+                ),
+                patch(
+                    "close_liquidation_command.apply_close_intent",
+                    return_value={
+                        "ok": True,
+                        "durable_applied": True,
+                        "blocked": False,
+                        "reason": "",
+                        "command_result": command_result,
+                    },
+                ),
+                patch(
+                    "gui_auto_trade_close._start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "send_order"},
+                ) as execute,
+                patch(
+                    "gui_auto_trade_close._persist_early_close_execution_result",
+                    return_value=True,
+                ),
+                patch(
+                    "gui_auto_trade_close.check_global_close_completion_after_durable_update",
+                    return_value={"ok": True},
+                ),
+                patch("gui_auto_trade_close.append_changelog"),
+                patch("gui_auto_trade_close.append_stock_log"),
+                patch("gui_auto_trade_close.show_toast"),
+            ):
+                result = auto_trade_apply_selected_early_close(
+                    window,
+                    "시장가",
+                )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("현재가", execute.call_args.kwargs["method"])
 
     def test_partial_failure_is_reported_and_direct_writer_is_not_called(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
@@ -2972,7 +3140,16 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             stock = OperationCommandServiceTest._stock(root, "005930_Samsung")
             state_path = stock / "state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["holding_qty"] = 3
+            state.update(
+                {
+                    "holding_qty": 3,
+                    "trade_started_at": "2026-07-27 09:00:00",
+                    "operation_policy_snapshot": {
+                        "operation_identity": "2026-07-27 09:00:00",
+                        "operation_mode": "SCHEDULED",
+                    },
+                }
+            )
             state_path.write_text(json.dumps(state), encoding="utf-8")
             config_path = stock / "config.json"
             before = config_path.read_bytes()

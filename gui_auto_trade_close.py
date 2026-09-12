@@ -780,6 +780,7 @@ def _start_close_liquidation_execution(
     routine_instance_id: str,
     reason: str,
     regular_end_reached: bool = False,
+    pending_cleanup_reached: bool = False,
 ) -> dict[str, object]:
     """Enter existing Cancel/Candidate/Final-Gate pipelines for one stock."""
 
@@ -815,7 +816,17 @@ def _start_close_liquidation_execution(
         and liquidation_execution.get("cancel_confirmed") is True
         and not regular_end_reached
     )
-    if _close_liquidation_cancel_required(method) and not handoff_confirmed:
+    normalized_method = short_close_method_text(method)
+    carryover_cleanup_deferred = bool(
+        normalized_method == "이월"
+        and not regular_end_reached
+        and not pending_cleanup_reached
+    )
+    if (
+        _close_liquidation_cancel_required(method)
+        and not handoff_confirmed
+        and not carryover_cleanup_deferred
+    ):
         cancel_result = (
             window.queue_pending_order_cancellations_for_stock_automatically(
                 code,
@@ -862,10 +873,17 @@ def _start_close_liquidation_execution(
                 "cancel_result": cancel_result,
             }
 
-    normalized_method = short_close_method_text(method)
     direct_method = normalize_direct_liquidation_method(method)
     state = read_json_dict(stock_dir / "state.json")
     holding_qty = safe_int_value(state.get("holding_qty"), 0)
+    if carryover_cleanup_deferred:
+        return {
+            "ok": True,
+            "stage": "carryover_hold",
+            "runtime_status": (
+                "EARLY_CLOSE" if reason == "EARLY_CLOSE" else "LIQUIDATING"
+            ),
+        }
     if normalized_method == "이월":
         return {
             "ok": True,
@@ -1149,13 +1167,16 @@ def auto_trade_continue_pending_close_liquidations(
         boundary_eligible = not close_carryover_completed and bool(
             boundary.get("entered")
         ) and (
-            active_mode == "SCHEDULED" or individual_requested or early_requested
+            active_mode == "SCHEDULED" or early_requested
         )
         cleanup_entered = bool(boundary.get("pending_order_cancel_entered"))
         boundary_ended = bool(boundary.get("ended"))
         boundary_method = short_close_method_text(boundary.get("method")) or "이월"
         regular_end_pending_cleanup = bool(
-            active_operation_evidence and cleanup_entered and has_pending
+            active_operation_evidence
+            and cleanup_entered
+            and has_pending
+            and (active_mode == "SCHEDULED" or early_requested)
         )
         liquidation_carryover_ready = bool(
             boundary_eligible
@@ -1313,6 +1334,7 @@ def auto_trade_continue_pending_close_liquidations(
                 routine_instance_id=routine_instance_id,
                 reason=reason,
                 regular_end_reached=bool(boundary.get("ended")),
+                pending_cleanup_reached=cleanup_entered,
             )
         except Exception as exc:
             LOGGER.exception(
@@ -2361,6 +2383,21 @@ def auto_trade_apply_selected_early_close(
         transition_requested_at = str(
             saved_state.get("early_close_requested_at") or now_text()
         ).strip()
+        execution_method = method_text
+        active_snapshot = active_operation_policy_snapshot(saved_state)
+        active_mode = normalize_operation_mode(
+            active_snapshot.get("operation_mode")
+            or config.get("operation_mode", "SCHEDULED")
+        )
+        if active_mode == "CONTINUOUS":
+            activated_policy, _is_individual = (
+                effective_liquidation_policy_for_config(config, saved_state)
+            )
+            activated_method = short_close_method_text(
+                activated_policy.get("method")
+            )
+            if activated_method in {"시장가", "현재가", "이월"}:
+                execution_method = activated_method
         has_close_progress_qty = bool(
             application_result.availability
             and application_result.availability.holding_qty > 0
@@ -2370,7 +2407,7 @@ def auto_trade_apply_selected_early_close(
             stock_dir=stock_dir,
             code=code,
             name=name,
-            method=method_text,
+            method=execution_method,
             command_id=command_result.command_id,
             requested_at=str(
                 saved_state.get("early_close_requested_at")

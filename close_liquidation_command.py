@@ -198,6 +198,49 @@ def _connection_ready(owner: object | None) -> bool | None:
         return False
 
 
+_ACTIVE_OPERATION_STATUSES = {
+    "RUNNING",
+    "MONITORING",
+    "AUTO_CLOSE",
+    "AUTO_CLOSING",
+    "EARLY_CLOSE",
+    "EARLY_CLOSING",
+    "LIQUIDATING",
+}
+
+
+def _active_operation_identity_reason(
+    state: dict[str, object],
+    *,
+    participant: bool,
+) -> tuple[bool, str]:
+    """Validate identity only when a Production Operation is actually active."""
+
+    status = str(state.get("status") or "").strip().upper()
+    active = bool(participant or status in _ACTIVE_OPERATION_STATUSES)
+    if not active:
+        return False, ""
+    snapshot = active_operation_policy_snapshot(state)
+    started_at = str(state.get("trade_started_at") or "").strip()
+    snapshot_identity = str(snapshot.get("operation_identity") or "").strip()
+    identity = snapshot_identity or started_at
+    if not identity:
+        return True, "ACTIVE_OPERATION_IDENTITY_MISSING"
+    if snapshot_identity and started_at and started_at != snapshot_identity:
+        return True, "OPERATION_IDENTITY_MISMATCH"
+    request = state.get("individual_liquidation_request")
+    request = request if isinstance(request, dict) else {}
+    request_scope = str(request.get("reservation_scope") or "").strip().upper()
+    request_identity = str(request.get("operation_identity") or "").strip()
+    if (
+        str(request.get("status") or "").strip().upper() == "REQUESTED"
+        and request_scope not in {"", "NEXT_OPERATION"}
+        and request_identity != identity
+    ):
+        return True, "OPERATION_IDENTITY_MISMATCH"
+    return True, ""
+
+
 def _early_close_time_reason(
     config: dict[str, object],
     state: dict[str, object],
@@ -418,7 +461,13 @@ def inspect_close_liquidation_availability(
         ):
             return _blocked(reason_code="LIQUIDATION_IN_PROGRESS", **common)
     elif normalized_intent == INDIVIDUAL_LIQUIDATION:
-        if not participant and runtime_operation_started:
+        active_operation, identity_reason = _active_operation_identity_reason(
+            state,
+            participant=participant,
+        )
+        if identity_reason:
+            return _blocked(reason_code=identity_reason, **common)
+        if not participant and active_operation:
             return _blocked(reason_code="NOT_CURRENT_PARTICIPANT", **common)
         normalized_method = short_close_method_text(requested_method)
         if normalized_method not in {"시장가", "현재가", "이월"}:

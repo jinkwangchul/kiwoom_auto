@@ -259,6 +259,64 @@ class IndividualLiquidationTimeContractTests(unittest.TestCase):
                 self.assertFalse((stock.parent.parent / "runtime" / "order_queue.json").exists())
                 start.assert_not_called()
 
+    def test_historical_trade_started_without_active_operation_allows_next_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update(
+                {
+                    "status": "WAIT_BUY",
+                    "holding_qty": 0,
+                    "trade_enabled": True,
+                    "trade_started_at": "2026-08-15 09:00:00",
+                }
+            )
+            state["operation_policy_snapshot"]["operation_identity"] = (
+                "2026-08-15 09:00:00"
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            window = self._window(stock)
+            attach_participant_owner(window, set())
+
+            availability = close.inspect_close_liquidation_availability(
+                window,
+                stock,
+                "005930",
+                intent=close.INDIVIDUAL_LIQUIDATION,
+                requested_method="시장가",
+                requested_minutes="5",
+                now_dt=datetime(*self.NOW_DATE, 13, 0),
+            )
+
+        self.assertTrue(availability.allowed)
+        self.assertFalse(availability.current_session_participant)
+        self.assertEqual(0, availability.holding_qty)
+
+    def test_active_operation_identity_mismatch_remains_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["operation_policy_snapshot"]["operation_identity"] = (
+                "2026-08-16 08:59:59"
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            window = self._window(stock)
+
+            availability = close.inspect_close_liquidation_availability(
+                window,
+                stock,
+                "005930",
+                intent=close.INDIVIDUAL_LIQUIDATION,
+                requested_method="시장가",
+                requested_minutes="5",
+                now_dt=datetime(*self.NOW_DATE, 13, 0),
+            )
+
+        self.assertFalse(availability.allowed)
+        self.assertEqual("OPERATION_IDENTITY_MISMATCH", availability.reason_code)
+
     def test_pre_operation_reservation_binds_once_and_does_not_block_start(self) -> None:
         state = {
             "individual_liquidation_request": {
@@ -936,6 +994,126 @@ class IndividualLiquidationTimeContractTests(unittest.TestCase):
                 )
         self.assertEqual(0, result["processed"])
         start.assert_not_called()
+
+    def test_continuous_individual_setting_is_inactive_until_early_close(self) -> None:
+        config = {"operation_mode": "CONTINUOUS"}
+        state = {
+            "status": "RUNNING",
+            "holding_qty": 3,
+            "trade_started_at": "2026-08-16 09:00:00",
+            "operation_policy_snapshot": {
+                "operation_identity": "2026-08-16 09:00:00",
+                "operation_mode": "CONTINUOUS",
+            },
+            "individual_liquidation_request": {
+                "status": "REQUESTED",
+                "reservation_scope": "CURRENT_OPERATION",
+                "operation_identity": "2026-08-16 09:00:00",
+                "method": "현재가",
+                "minutes_before_regular_close": "10",
+            },
+        }
+        with patch.object(
+            policy, "read_operation_policy", side_effect=self._operation_policy
+        ):
+            self.assertEqual(
+                "-", policy.auto_trade_setting_liquidation_text(config, state=state)
+            )
+            self.assertFalse(
+                policy.auto_trade_setting_liquidation_active(
+                    config,
+                    3,
+                    now_dt=datetime(*self.NOW_DATE, 15, 10),
+                    state=state,
+                )
+            )
+            early_state = {
+                **state,
+                "status": "EARLY_CLOSE",
+                "early_close_requested_at": "2026-08-16 13:00:00",
+                "early_close_method": "시장가",
+            }
+            self.assertEqual(
+                "10분/현재가",
+                policy.auto_trade_setting_liquidation_text(
+                    config, state=early_state
+                ),
+            )
+            no_override = dict(early_state)
+            no_override.pop("individual_liquidation_request")
+            self.assertEqual(
+                "이월",
+                policy.auto_trade_setting_liquidation_text(
+                    config, state=no_override
+                ),
+            )
+            carryover_close = {
+                **no_override,
+                "early_close_method": "이월",
+            }
+            self.assertEqual(
+                "이월",
+                policy.auto_trade_setting_liquidation_text(
+                    config, state=carryover_close
+                ),
+            )
+
+    def test_continuous_individual_setting_does_not_enter_cleanup_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp), method="현재가")
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["operation_policy_snapshot"]["operation_mode"] = "CONTINUOUS"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "pending_order_side_quantities", return_value=(1, 0)),
+                patch.object(close, "_start_close_liquidation_execution") as start,
+            ):
+                result = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(*self.NOW_DATE, 15, 19, 30),
+                )
+
+        self.assertEqual(0, result["processed"])
+        start.assert_not_called()
+
+    def test_carryover_defers_cancel_until_cleanup_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp), method="이월")
+            window = Mock()
+            window.queue_pending_order_cancellations_for_stock_automatically.return_value = {
+                "ok": True,
+                "cancel_requested": 0,
+                "cancel_pending": 0,
+            }
+            kwargs = {
+                "stock_dir": stock,
+                "code": "005930",
+                "name": "Samsung",
+                "method": "이월",
+                "command_id": "carryover-command",
+                "requested_at": "2026-08-16 13:00:00",
+                "routine_instance_id": "routine-instance-1",
+                "reason": "EARLY_CLOSE",
+            }
+            with patch.object(close, "_production_recovery_gate", return_value=None):
+                started = close._start_close_liquidation_execution(
+                    window,
+                    **kwargs,
+                )
+                at_cleanup = close._start_close_liquidation_execution(
+                    window,
+                    pending_cleanup_reached=True,
+                    **kwargs,
+                )
+
+        self.assertEqual("carryover_hold", started["stage"])
+        self.assertEqual("carryover_completed", at_cleanup["stage"])
+        window.queue_pending_order_cancellations_for_stock_automatically.assert_called_once()
 
     def test_completed_close_carryover_does_not_enter_scheduled_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

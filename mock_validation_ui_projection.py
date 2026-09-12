@@ -389,7 +389,10 @@ def mock_instance_projection(
     if operation_mode == "CONTINUOUS" and not legitimate_close:
         liquidation = {**liquidation, "display_text": "-"}
         effective_display_contract["liquidation"] = liquidation
-    elif close_method in {"CARRYOVER", "LONG_HOLD"}:
+    elif (
+        operation_mode != "CONTINUOUS"
+        and close_method in {"CARRYOVER", "LONG_HOLD"}
+    ):
         liquidation = {**liquidation, "display_text": "-"}
         effective_display_contract["liquidation"] = liquidation
     individual_liquidation_text = _active_individual_liquidation_display_text(
@@ -403,7 +406,23 @@ def mock_instance_projection(
             individual_liquidation_text = _individual_liquidation_display_text(
                 pending_reservation
             )
-    if individual_liquidation_text is not None:
+    if (
+        individual_liquidation_text is None
+        and operation_mode == "CONTINUOUS"
+        and legitimate_close
+    ):
+        operation_snapshot = active_operation.get("operation_policy_snapshot")
+        operation_snapshot = (
+            operation_snapshot if isinstance(operation_snapshot, dict) else {}
+        )
+        global_liquidation = operation_snapshot.get("liquidation")
+        if isinstance(global_liquidation, dict):
+            individual_liquidation_text = _individual_liquidation_display_text(
+                global_liquidation
+            )
+    if individual_liquidation_text is not None and (
+        operation_mode != "CONTINUOUS" or legitimate_close
+    ):
         liquidation = {
             **liquidation,
             "display_text": individual_liquidation_text,
