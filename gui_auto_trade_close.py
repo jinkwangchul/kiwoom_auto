@@ -1496,12 +1496,13 @@ class ProfitLossEarlyCloseDialog(QDialog):
     def accept(self) -> None:
         profit_text, loss_text = self.values()
         if not profit_text and not loss_text:
-            QMessageBox.warning(
-                self,
-                "입력 필요",
+            parent = self.parentWidget() or self
+            super().reject()
+            show_toast(
+                parent,
                 "익절 또는 손절 비율 중 최소 1개 값을 입력하세요.",
+                duration_ms=2500,
             )
-            self.profit_edit.setFocus()
             return
 
         for label, value, widget in [

@@ -25,6 +25,7 @@ import gui_auto_trade_setting_window as setting_window
 import gui_operation_environment as operation_environment
 import gui_stock_register_window as stock_register
 import gui_windows
+import mock_validation_context_menu as mock_context_menu
 from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
 from tests.qt_test_support import dispose_qt_widget, ensure_qapplication
 from tests.test_gui_main_stock_context_menu import _FakeMenu
@@ -191,6 +192,108 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         self.assertEqual({"profit_percent": 1.5, "loss_percent": 2.0}, accepted["details"]["input_value"])
         self.assertEqual("CANCELLED", cancelled["result"])
         self.assertNotIn("input_value", cancelled["details"])
+
+    def test_profit_loss_dialog_empty_input_rejects_with_parent_toast(self) -> None:
+        parent = QWidget()
+        dialog = close_ops.ProfitLossEarlyCloseDialog(parent)
+        self.addCleanup(dispose_qt_widget, parent, close=True)
+        self.addCleanup(dispose_qt_widget, dialog, close=True)
+        dialog.show()
+        self.app.processEvents()
+
+        with (
+            patch.object(close_ops.QMessageBox, "warning") as warning,
+            patch.object(close_ops, "show_toast") as toast,
+        ):
+            dialog.accept()
+
+        warning.assert_not_called()
+        toast.assert_called_once_with(
+            parent,
+            "익절 또는 손절 비율 중 최소 1개 값을 입력하세요.",
+            duration_ms=2500,
+        )
+        self.assertEqual(QDialog.Rejected, dialog.result())
+        self.assertFalse(dialog.isVisible())
+
+    def test_profit_loss_dialog_valid_partial_and_complete_inputs_stay_accepted(self) -> None:
+        for profit, loss in (("1.5", ""), ("", "2"), ("1.5", "2")):
+            with self.subTest(profit=profit, loss=loss):
+                dialog = close_ops.ProfitLossEarlyCloseDialog()
+                dialog.profit_edit.setText(profit)
+                dialog.loss_edit.setText(loss)
+                with patch.object(close_ops.QMessageBox, "warning") as warning:
+                    dialog.accept()
+                warning.assert_not_called()
+                self.assertEqual(QDialog.Accepted, dialog.result())
+                dispose_qt_widget(dialog, close=True)
+
+    def test_profit_loss_dialog_non_numeric_and_zero_validation_is_unchanged(self) -> None:
+        for value, message in (
+            ("not-a-number", "익절 비율은 숫자로 입력하세요."),
+            ("0", "익절 비율은 0보다 큰 값으로 입력하세요."),
+        ):
+            with self.subTest(value=value):
+                dialog = close_ops.ProfitLossEarlyCloseDialog()
+                dialog.profit_edit.setText(value)
+                with (
+                    patch.object(close_ops.QMessageBox, "warning") as warning,
+                    patch.object(close_ops, "show_toast") as toast,
+                ):
+                    dialog.accept()
+                warning.assert_called_once_with(dialog, "입력 오류", message)
+                toast.assert_not_called()
+                self.assertNotEqual(QDialog.Accepted, dialog.result())
+                dispose_qt_widget(dialog, close=True)
+
+    def test_profit_loss_empty_rejection_stops_production_and_mock_callers(self) -> None:
+        rejected_dialog = MagicMock()
+        rejected_dialog.exec_.return_value = QDialog.Rejected
+        rejected_dialog.values.return_value = ("", "")
+        production_window = QWidget()
+        mock_window = QWidget()
+        self.addCleanup(dispose_qt_widget, production_window, close=True)
+        self.addCleanup(dispose_qt_widget, mock_window, close=True)
+        actions = MagicMock()
+        target = mock_context_menu.MockContextTarget(
+            "mock_routine_instance",
+            "005930",
+            "Samsung",
+            "MV-empty-profit-loss",
+            "instance-1",
+        )
+
+        with (
+            patch.object(
+                close_ops,
+                "ProfitLossEarlyCloseDialog",
+                return_value=rejected_dialog,
+            ),
+            patch.object(close_ops, "append_production_event") as journal,
+            patch.object(close_ops, "auto_trade_apply_selected_early_close") as production_apply,
+        ):
+            close_ops.auto_trade_apply_selected_early_close_profit_loss(
+                production_window
+            )
+        with (
+            patch.object(
+                mock_context_menu,
+                "ProfitLossEarlyCloseDialog",
+                return_value=rejected_dialog,
+            ),
+            patch.object(mock_context_menu, "_run") as mock_run,
+        ):
+            mock_context_menu._apply_mock_profit_loss_early_close(
+                mock_window,
+                0,
+                target,
+                actions,
+            )
+
+        production_apply.assert_not_called()
+        self.assertEqual("CANCELLED", journal.call_args.kwargs["result"])
+        mock_run.assert_not_called()
+        actions.early_close_instance.assert_not_called()
 
     def test_direct_early_close_records_proceed_and_cancel_before_backend_outcome(self) -> None:
         layout = TemporaryProjectRoot(prefix="operator_decision_close_")
