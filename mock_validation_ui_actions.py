@@ -19,6 +19,9 @@ class MockValidationUIActions:
         self.repository = host.repository
         self.sessions = host.session_service
 
+    def server_authenticated(self) -> bool:
+        return self.host.server_authenticated()
+
     def create_waiting_session(
         self,
         reference_snapshot: dict[str, Any],

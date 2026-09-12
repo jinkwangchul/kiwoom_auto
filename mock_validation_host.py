@@ -214,6 +214,21 @@ class MockValidationHost:
             return {}
         return deepcopy(value) if isinstance(value, dict) else {}
 
+    def server_authenticated(self) -> bool:
+        """Fresh-read the broker login fact without mirroring Production state."""
+
+        checker = getattr(self.api, "is_connected", None)
+        if not callable(checker):
+            return False
+        try:
+            return checker() is True
+        except Exception:
+            return False
+
+    def _require_server_authenticated(self) -> None:
+        if not self.server_authenticated():
+            raise MockValidationError("SERVER_NOT_CONNECTED")
+
     def _latest_applied_rules(
         self,
         routine_instance_id: str,
@@ -925,6 +940,7 @@ class MockValidationHost:
     def request_early_close(
         self, stock_code: Any, *, method: str = CLOSE_MARKET, as_of: datetime | None = None
     ) -> dict[str, Any]:
+        self._require_server_authenticated()
         document = self.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
@@ -951,6 +967,7 @@ class MockValidationHost:
         loss_percent: Any = None,
         as_of: datetime | None = None,
     ) -> dict[str, Any]:
+        self._require_server_authenticated()
         document = self.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")
@@ -1169,6 +1186,7 @@ class MockValidationHost:
         minutes_before_regular_close: Any = "5",
         as_of: datetime | None = None,
     ) -> dict[str, Any]:
+        self._require_server_authenticated()
         document = self.current_session(stock_code)
         if document is None:
             raise MockValidationError("MOCK_CURRENT_SESSION_NOT_FOUND")

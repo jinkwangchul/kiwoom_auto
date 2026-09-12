@@ -251,6 +251,37 @@ def _run(window: Any, title: str, operation: Callable[[], dict[str, Any]]) -> No
         operation()
 
 
+def _declared_server_authentication_checker(actions: Any) -> Callable[[], Any] | None:
+    checker = getattr(type(actions), "server_authenticated", None)
+    if callable(checker):
+        return lambda: checker(actions)
+    values = getattr(actions, "__dict__", None)
+    checker = values.get("server_authenticated") if isinstance(values, dict) else None
+    return checker if callable(checker) else None
+
+
+def _run_mock_close_edit(
+    window: Any,
+    title: str,
+    actions: Any,
+    operation: Callable[[], dict[str, Any]],
+) -> bool:
+    checker = _declared_server_authentication_checker(actions)
+    if checker is not None:
+        try:
+            authenticated = checker() is True
+        except Exception:
+            authenticated = False
+        if not authenticated:
+            def blocked() -> dict[str, Any]:
+                raise MockValidationError("SERVER_NOT_CONNECTED")
+
+            _run(window, title, blocked)
+            return False
+    _run(window, title, operation)
+    return True
+
+
 def _begin_mock_stock_registration(window: Any) -> bool:
     opener = getattr(window, "open_mock_stock_search_register_dialog", None)
     if not callable(opener):
@@ -293,13 +324,23 @@ def _apply_mock_profit_loss_early_close(
     target: MockContextTarget,
     actions: Any,
 ) -> None:
+    checker = _declared_server_authentication_checker(actions)
+    if checker is not None:
+        try:
+            authenticated = checker() is True
+        except Exception:
+            authenticated = False
+        if not authenticated:
+            _run_mock_close_edit(window, "모의 Instance 조기마감", actions, lambda: {})
+            return
     dialog = ProfitLossEarlyCloseDialog(window)
     if dialog.exec_() != QDialog.Accepted:
         return
     profit_percent, loss_percent = dialog.values()
-    _run(
+    _run_mock_close_edit(
         window,
         "모의 Instance 조기마감",
+        actions,
         lambda: _fresh_operation(
             window,
             row,
@@ -341,9 +382,10 @@ def _apply_mock_individual_liquidation(
         captured["result"] = result
         return result
 
-    _run(
+    _run_mock_close_edit(
         window,
         "모의 Instance 개별청산",
+        actions,
         apply,
     )
     return captured.get("result")
@@ -719,9 +761,10 @@ def show_mock_monitoring_context_menu(
     elif _dispatch_early_close_action(
         chosen,
         early_close,
-        apply_method=lambda method: _run(
+        apply_method=lambda method: _run_mock_close_edit(
             window,
             "모의 Instance 조기마감",
+            actions,
             lambda: _fresh_operation(
                 window,
                 row,
