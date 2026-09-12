@@ -28,7 +28,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QEvent, QTimer
+from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -81,6 +81,9 @@ from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
     routine_instance_by_id,
+)
+from routines.지표추종매매.routine_validation_contract import (
+    ValidationSettingsSnapshot,
 )
 
 
@@ -539,6 +542,8 @@ class IndicatorFollowRoutineSettingsDialog(
     - 항목별 활성/비활성 상태와 진입 버튼 중심
     """
 
+    validation_chart_requested = pyqtSignal(object)
+
     def __init__(
         self,
         rules_path=None,
@@ -647,6 +652,7 @@ class IndicatorFollowRoutineSettingsDialog(
 
         button_row = QHBoxLayout()
         self.reload_button = QPushButton("다시 불러오기")
+        self.validation_chart_button = QPushButton("검증차트")
         if self.settings_mode == "edit":
             self.save_button = QPushButton("변경")
         else:
@@ -658,6 +664,9 @@ class IndicatorFollowRoutineSettingsDialog(
         self.save_button.setEnabled(True)
 
         self.reload_button.clicked.connect(self.load_rules)
+        self.validation_chart_button.clicked.connect(
+            self._handle_validation_chart_clicked
+        )
         if self.settings_mode == "edit":
             self.save_button.clicked.connect(self.save_edit_settings_and_close)
         else:
@@ -666,6 +675,7 @@ class IndicatorFollowRoutineSettingsDialog(
 
         button_row.addWidget(self.reload_button)
         button_row.addStretch(1)
+        button_row.addWidget(self.validation_chart_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
         root.addLayout(button_row)
@@ -1250,6 +1260,40 @@ class IndicatorFollowRoutineSettingsDialog(
         mapper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mapper)
         return mapper
+
+    def build_validation_settings_snapshot_from_current_ui_state(self):
+        """Build a non-writing Validation snapshot or fail closed."""
+        rules = getattr(self, "rules", None)
+        if not isinstance(rules, dict):
+            rules = getattr(self, "rules_data", None)
+        if not isinstance(rules, dict):
+            raise ValueError("validation base rules are unavailable")
+
+        ui_state = self.collect_indicator_follow_ui_state()
+        mapper = self._load_indicator_follow_rule_mapper()
+        preview = mapper.build_engine_rules_preview_from_ui_state(
+            ui_state,
+            deepcopy(rules),
+        )
+        if not isinstance(preview, dict):
+            raise ValueError("validation preview result must be a mapping")
+        preview_rules = preview.get("preview_rules")
+        if not isinstance(preview_rules, dict):
+            raise ValueError("validation preview rules must be a mapping")
+        return ValidationSettingsSnapshot(preview_rules)
+
+    def _handle_validation_chart_clicked(self):
+        try:
+            snapshot = self.build_validation_settings_snapshot_from_current_ui_state()
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "검증차트",
+                "현재 편집 설정으로 검증차트 데이터를 만들 수 없습니다.",
+            )
+            return None
+        self.validation_chart_requested.emit(snapshot)
+        return snapshot
 
     def build_engine_rules_preview_from_current_ui_state(self):
         rules = getattr(self, "rules", None)
