@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from manual_ats_runtime import PROGRAM_SESSION_ID
+from ats_session_contract import PROGRAM_SESSION_ID, VALID_SESSION_KEYS
 
 from candle_timeframe_aggregation import candle_session_windows
 from gui_ats_utils import (
@@ -26,8 +26,6 @@ from gui_ats_utils import (
 from close_liquidation_transition_service import (
     regular_end_pending_order_cancel_boundary_seconds,
 )
-from manual_ats_runtime import VALID_SESSION_KEYS
-
 from mock_validation_contract import (
     INSTANCE_ERROR,
     INSTANCE_VALIDATION_STOPPED,

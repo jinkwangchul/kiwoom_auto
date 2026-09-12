@@ -16,7 +16,7 @@ from math import isfinite
 from typing import Any, Callable
 from uuid import uuid4
 
-from manual_ats_runtime import (
+from ats_session_contract import (
     PROGRAM_SESSION_ID,
     VALID_SESSION_KEYS,
     normalized_manual_ats_session_keys,

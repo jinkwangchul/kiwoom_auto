@@ -13,8 +13,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
 )
 
-from gui_auto_trade_context_menu import (
+from gui_operation_ui_primitives import (
     PersistentContextMenu,
+    ProfitLossEarlyCloseDialog,
     _add_early_close_menu,
     _add_individual_liquidation_menu,
     _add_ats_settings_menu,
@@ -22,8 +23,8 @@ from gui_auto_trade_context_menu import (
     _dispatch_ats_settings_action,
     _individual_liquidation_action_applied,
     _refresh_individual_liquidation_menu_state,
+    ats_session_ui_options,
 )
-from gui_auto_trade_close import ProfitLossEarlyCloseDialog
 from gui_auto_trade_run_control import operation_start_result_summary_toast_text
 
 from gui_main_table_loader import (
@@ -615,9 +616,12 @@ def show_mock_monitoring_context_menu(
         time_reset_action.setEnabled(settings_editable)
     elif settings["operation_mode"] == "CONTINUOUS":
         menu.addSeparator()
+        visible_keys, labels = ats_session_ui_options(operation_policy)
         ats_settings = _add_ats_settings_menu(
             menu,
             has_selection=True,
+            visible_keys=visible_keys,
+            labels=labels,
             state_getter=lambda: window.mock_routine_instance_ats_state(row),
             toggle=lambda key, enabled, label: window.set_mock_routine_instance_ats_flag(
                 row, key, enabled, label

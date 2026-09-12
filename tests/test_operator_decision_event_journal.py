@@ -23,6 +23,7 @@ from gui_auto_trade_integrity import inspect_stock_review_state
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 import gui_auto_trade_setting_window as setting_window
 import gui_operation_environment as operation_environment
+import gui_operation_ui_primitives as operation_ui
 import gui_stock_register_window as stock_register
 import gui_windows
 import mock_validation_context_menu as mock_context_menu
@@ -203,7 +204,7 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
 
         with (
             patch.object(close_ops.QMessageBox, "warning") as warning,
-            patch.object(close_ops, "show_toast") as toast,
+            patch.object(operation_ui, "show_toast") as toast,
         ):
             dialog.accept()
 
@@ -238,7 +239,7 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
                 dialog.profit_edit.setText(value)
                 with (
                     patch.object(close_ops.QMessageBox, "warning") as warning,
-                    patch.object(close_ops, "show_toast") as toast,
+                    patch.object(operation_ui, "show_toast") as toast,
                 ):
                     dialog.accept()
                 warning.assert_called_once_with(dialog, "입력 오류", message)

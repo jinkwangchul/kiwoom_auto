@@ -4598,14 +4598,12 @@ class MockValidationHostUiTest(unittest.TestCase):
             with (
                 patch.object(mock_context_menu, "QMenu", _Menu),
                 patch.object(
-                    common_menu,
-                    "manual_ats_visible_session_keys",
-                    return_value=("extra1", "extra2"),
-                ),
-                patch.object(
-                    common_menu,
-                    "manual_ats_session_labels",
-                    return_value={"extra1": "장전프리", "extra2": "장마감NTX"},
+                    mock_context_menu,
+                    "ats_session_ui_options",
+                    return_value=(
+                        ("extra1", "extra2"),
+                        {"extra1": "장전프리", "extra2": "장마감NTX"},
+                    ),
                 ),
             ):
                 table.customContextMenuRequested.emit(position)

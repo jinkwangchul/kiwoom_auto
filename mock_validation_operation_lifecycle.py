@@ -13,7 +13,7 @@ from copy import deepcopy
 from datetime import date, datetime
 from typing import Any, Callable
 
-from manual_ats_runtime import PROGRAM_SESSION_ID
+from ats_session_contract import PROGRAM_SESSION_ID
 
 from mock_validation_contract import (
     INSTANCE_ERROR,

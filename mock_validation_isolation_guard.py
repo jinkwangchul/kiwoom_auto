@@ -45,6 +45,13 @@ FORBIDDEN_IMPORT_ROOTS = {
     "production_recovery_timer_lifecycle",
     "stock_long_hold_policy",
 }
+FORBIDDEN_IMPORT_ROOTS.update(
+    {
+        "gui_auto_trade_close",
+        "gui_auto_trade_context_menu",
+        "manual_ats_runtime",
+    }
+)
 
 FORBIDDEN_CALL_NAMES = {
     "SendOrder",

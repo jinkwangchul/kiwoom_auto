@@ -5,33 +5,26 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 
 from runtime_atomic_writer import STATUS_OK, write_json_atomic
 from runtime_io import read_json_dict
+from ats_session_contract import (
+    DEFAULT_EXECUTION_METHOD,
+    INVALID_ATS_EXECUTION_METHOD,
+    PROGRAM_SESSION_ID,
+    VALID_EXECUTION_METHODS,
+    VALID_SESSION_KEYS,
+    normalize_manual_ats_execution_method,
+    normalized_manual_ats_session_keys,
+)
 
 
 MANUAL_ATS_SELECTION_KEY = "manual_ats_selection"
-VALID_SESSION_KEYS = ("extra1", "extra2", "extra3")
-VALID_EXECUTION_METHODS = ("ROUTINE", "MARKET", "CURRENT_PRICE")
-DEFAULT_EXECUTION_METHOD = "ROUTINE"
-INVALID_ATS_EXECUTION_METHOD = "INVALID_ATS_EXECUTION_METHOD"
-PROGRAM_SESSION_ID = uuid4().hex
 _PRESERVE_EXECUTION_METHOD = object()
 
 
 def _current(now_dt: datetime | None = None) -> datetime:
     return now_dt or datetime.now().astimezone()
-
-
-def normalized_manual_ats_session_keys(values: object) -> tuple[str, ...]:
-    if isinstance(values, dict):
-        selected = {key for key in VALID_SESSION_KEYS if bool(values.get(key, False))}
-    elif isinstance(values, (list, tuple, set)):
-        selected = {str(value or "").strip() for value in values}
-    else:
-        selected = set()
-    return tuple(key for key in VALID_SESSION_KEYS if key in selected)
 
 
 def manual_ats_runtime_selected_keys(
@@ -47,11 +40,6 @@ def manual_ats_runtime_selected_keys(
     if not isinstance(selection, dict):
         return ()
     return normalized_manual_ats_session_keys(selection.get("selected_sessions"))
-
-
-def normalize_manual_ats_execution_method(value: object) -> str | None:
-    normalized = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
-    return normalized if normalized in VALID_EXECUTION_METHODS else None
 
 
 def manual_ats_runtime_execution_method_result(

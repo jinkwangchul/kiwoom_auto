@@ -12,7 +12,7 @@ from gui_ats_utils import (
     auto_trade_operation_activation_phase,
     auto_trade_operation_session_phase,
 )
-from manual_ats_runtime import VALID_SESSION_KEYS
+from ats_session_contract import VALID_SESSION_KEYS
 from mock_validation_contract import (
     INSTANCE_ERROR,
     MockValidationError,

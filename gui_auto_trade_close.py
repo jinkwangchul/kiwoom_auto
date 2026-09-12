@@ -13,15 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
-    QCheckBox,
     QDialog,
-    QDialogButtonBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
     QMessageBox,
-    QVBoxLayout,
-    QWidget,
 )
 from gui_operation_ui_context import (
     actionable_current_price,
@@ -29,6 +22,7 @@ from gui_operation_ui_context import (
     refresh_auto_trade_views,
 )
 from gui_window_policy import persistent_feature_owner
+from gui_operation_ui_primitives import ProfitLossEarlyCloseDialog
 
 from gui_common_utils import safe_int_value
 from gui_config_utils import default_config
@@ -1440,91 +1434,6 @@ def append_changelog(change_type: str, filename: str, message: str) -> None:
     with CHANGELOG_PATH.open("a", encoding="utf-8") as file:
         file.write(block)
 
-
-
-class ProfitLossEarlyCloseDialog(QDialog):
-    """우클릭 조기마감 > 손/익절 입력창.
-
-    환경설정의 입력 방식과 맞춰 한 줄에
-    "익절/손절 + [익절] / - [손절]" 형태로 입력한다.
-    """
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("손/익절 조기마감")
-        self.resize(330, 120)
-
-        layout = QVBoxLayout()
-        guide = QLabel("익절/손절 비율(%)을 입력하세요.")
-        layout.addWidget(guide)
-
-        row_layout = QHBoxLayout()
-        self.enabled_check = QCheckBox("익절/손절")
-        self.enabled_check.setChecked(True)
-        self.enabled_check.setEnabled(False)
-        row_layout.addWidget(self.enabled_check)
-
-        row_layout.addWidget(QLabel("+"))
-        self.profit_edit = QLineEdit()
-        self.profit_edit.setPlaceholderText("입력")
-        self.profit_edit.setMaximumWidth(70)
-        row_layout.addWidget(self.profit_edit)
-
-        row_layout.addWidget(QLabel("/ -"))
-        self.loss_edit = QLineEdit()
-        self.loss_edit.setPlaceholderText("입력")
-        self.loss_edit.setMaximumWidth(70)
-        row_layout.addWidget(self.loss_edit)
-        row_layout.addStretch(1)
-        layout.addLayout(row_layout)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("확인")
-        buttons.button(QDialogButtonBox.Cancel).setText("취소")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        self.setLayout(layout)
-
-    def values(self) -> tuple[str, str]:
-        return self.profit_edit.text().strip(), self.loss_edit.text().strip()
-
-    def _positive_number_from_text(self, value: str) -> float:
-        # 입력창 앞에 + / - 라벨이 있으므로 사용자가 부호를 입력해도 절댓값으로 해석한다.
-        return abs(float(value))
-
-    def accept(self) -> None:
-        profit_text, loss_text = self.values()
-        if not profit_text and not loss_text:
-            parent = self.parentWidget() or self
-            super().reject()
-            show_toast(
-                parent,
-                "익절 또는 손절 비율 중 최소 1개 값을 입력하세요.",
-                duration_ms=2500,
-            )
-            return
-
-        for label, value, widget in [
-            ("익절", profit_text, self.profit_edit),
-            ("손절", loss_text, self.loss_edit),
-        ]:
-            if not value:
-                continue
-            try:
-                number = self._positive_number_from_text(value)
-            except ValueError:
-                QMessageBox.warning(self, "입력 오류", f"{label} 비율은 숫자로 입력하세요.")
-                widget.setFocus()
-                widget.selectAll()
-                return
-            if number <= 0:
-                QMessageBox.warning(self, "입력 오류", f"{label} 비율은 0보다 큰 값으로 입력하세요.")
-                widget.setFocus()
-                widget.selectAll()
-                return
-
-        super().accept()
 
 
 def auto_trade_apply_selected_individual_liquidation_method(
