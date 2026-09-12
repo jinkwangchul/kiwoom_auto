@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from datetime import datetime
 
 import close_liquidation_command as command
 from operation_command_service import OperationCommandService
@@ -48,12 +49,15 @@ class CloseLiquidationCommandTest(unittest.TestCase):
         return stock
 
     @staticmethod
-    def _owner(*, participant: bool = True):
-        return SimpleNamespace(
+    def _owner(*, participant: bool = True, connected: bool | None = None):
+        owner = SimpleNamespace(
             _main_monitoring_auto_trade_operation_host=participant_owner(
                 {CODE} if participant else ()
             )
         )
+        if connected is not None:
+            owner.kiwoom_api = SimpleNamespace(is_connected=lambda: connected)
+        return owner
 
     @staticmethod
     def _recovery_allowed(_code: str, _caller: str):
@@ -99,7 +103,115 @@ class CloseLiquidationCommandTest(unittest.TestCase):
         self.assertTrue(result.allowed)
         self.assertEqual(before, after)
 
-    def test_early_close_zero_holding_is_available_in_current_schema(self) -> None:
+    def test_common_admission_precedence_auth_holding_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp), holding_qty=0)
+            for intent, expected_reason in (
+                (command.EARLY_CLOSE_REQUEST, "NO_HOLDING"),
+                (command.INDIVIDUAL_LIQUIDATION, "NOT_CURRENT_PARTICIPANT"),
+            ):
+                with self.subTest(intent=intent, level="auth"):
+                    result = command.inspect_close_liquidation_availability(
+                        self._owner(participant=False, connected=False),
+                        stock,
+                        CODE,
+                        intent=intent,
+                        requested_method="시장가",
+                        requested_minutes="5",
+                        recovery_inspector=self._recovery_allowed,
+                    )
+                    self.assertEqual("SERVER_NOT_CONNECTED", result.reason_code)
+                with self.subTest(intent=intent, level="holding"):
+                    result = command.inspect_close_liquidation_availability(
+                        self._owner(participant=False, connected=True),
+                        stock,
+                        CODE,
+                        intent=intent,
+                        requested_method="시장가",
+                        requested_minutes="5",
+                        recovery_inspector=self._recovery_allowed,
+                    )
+                    self.assertEqual(expected_reason, result.reason_code)
+
+            state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
+            state["holding_qty"] = 3
+            (stock / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            for intent in (
+                command.EARLY_CLOSE_REQUEST,
+                command.INDIVIDUAL_LIQUIDATION,
+            ):
+                with self.subTest(intent=intent, level="participant"):
+                    result = command.inspect_close_liquidation_availability(
+                        self._owner(participant=False, connected=True),
+                        stock,
+                        CODE,
+                        intent=intent,
+                        requested_method="시장가",
+                        requested_minutes="5",
+                        recovery_inspector=self._recovery_allowed,
+                    )
+                    self.assertEqual("NOT_CURRENT_PARTICIPANT", result.reason_code)
+
+    def test_early_close_uses_active_operation_time_axis_not_ats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp), holding_qty=3)
+            state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
+            state["operation_policy_snapshot"] = {
+                "operation_identity": "OP-1",
+                "operation_mode": "SCHEDULED",
+                "operation_schedule": {
+                    "start_time": "09:00:00",
+                    "end_buy_time": "13:30:00",
+                },
+                "regular_market": {
+                    "start_time": "09:00:00",
+                    "end_time": "15:20:00",
+                },
+                "liquidation": {
+                    "minutes_before_regular_close": "5",
+                    "method": "시장가",
+                },
+            }
+            (stock / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            scheduled_late = command.inspect_close_liquidation_availability(
+                self._owner(connected=True),
+                stock,
+                CODE,
+                intent=command.EARLY_CLOSE_REQUEST,
+                requested_method="시장가",
+                now_dt=datetime(2026, 9, 12, 13, 31),
+                recovery_inspector=self._recovery_allowed,
+            )
+            state["operation_policy_snapshot"]["operation_mode"] = "CONTINUOUS"
+            state["manual_ats_selected_sessions"] = ["NXT_PRE", "NXT_AFTER"]
+            (stock / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            manual_open = command.inspect_close_liquidation_availability(
+                self._owner(connected=True),
+                stock,
+                CODE,
+                intent=command.EARLY_CLOSE_REQUEST,
+                requested_method="시장가",
+                now_dt=datetime(2026, 9, 12, 10, 0),
+                recovery_inspector=self._recovery_allowed,
+            )
+            manual_after_boundary = command.inspect_close_liquidation_availability(
+                self._owner(connected=True),
+                stock,
+                CODE,
+                intent=command.EARLY_CLOSE_REQUEST,
+                requested_method="시장가",
+                now_dt=datetime(2026, 9, 12, 15, 15),
+                recovery_inspector=self._recovery_allowed,
+            )
+
+        self.assertEqual(
+            "SCHEDULED_OPERATION_WINDOW_ENDED",
+            scheduled_late.reason_code,
+        )
+        self.assertTrue(manual_open.allowed)
+        self.assertEqual("LIQUIDATION_IN_PROGRESS", manual_after_boundary.reason_code)
+
+    def test_early_close_zero_holding_is_blocked_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, holding_qty=0)
@@ -124,23 +236,27 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 if path.is_file()
             }
 
-            self.assertTrue(result.allowed)
-            self.assertEqual("", result.reason_code)
+            self.assertFalse(result.allowed)
+            self.assertEqual("NO_HOLDING", result.reason_code)
             self.assertEqual(0, result.holding_qty)
             self.assertEqual(before, after)
 
-    def test_zero_holding_keeps_other_liquidation_intents_blocked(self) -> None:
+    def test_zero_holding_allows_individual_setting_but_blocks_manual_ats_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp), holding_qty=0)
-            individual = command.inspect_close_liquidation_availability(
-                self._owner(),
-                stock,
-                CODE,
-                intent=command.INDIVIDUAL_LIQUIDATION,
-                requested_method="시장가",
-                requested_minutes="5",
-                recovery_inspector=self._recovery_allowed,
-            )
+            individual = {
+                method: command.inspect_close_liquidation_availability(
+                    self._owner(),
+                    stock,
+                    CODE,
+                    intent=command.INDIVIDUAL_LIQUIDATION,
+                    requested_method=method,
+                    requested_minutes="5",
+                    now_dt=datetime(2026, 8, 30, 10, 0),
+                    recovery_inspector=self._recovery_allowed,
+                )
+                for method in ("시장가", "현재가", "이월")
+            }
             state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
             state["manual_ats_selected_sessions"] = ["NXT_PRE"]
             (stock / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -160,10 +276,13 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                     recovery_inspector=self._recovery_allowed,
                 )
 
-        self.assertEqual("NO_HOLDING", individual.reason_code)
+        for method, result in individual.items():
+            with self.subTest(method=method):
+                self.assertTrue(result.allowed)
+                self.assertEqual("", result.reason_code)
         self.assertEqual("NO_HOLDING", manual_ats.reason_code)
 
-    def test_zero_holding_early_close_keeps_existing_safety_guards(self) -> None:
+    def test_zero_holding_precedes_participant_and_safety_guards(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, holding_qty=0)
@@ -207,27 +326,32 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 )
             )
 
-        self.assertEqual("NOT_CURRENT_PARTICIPANT", non_participant.reason_code)
-        self.assertEqual("REVIEW_REQUIRED", review.reason_code)
-        self.assertEqual("EMERGENCY_STOPPED", emergency.reason_code)
-        self.assertEqual("RECOVERY_BLOCKED", recovery.reason_code)
+        self.assertEqual("NO_HOLDING", non_participant.reason_code)
+        self.assertEqual("NO_HOLDING", review.reason_code)
+        self.assertEqual("NO_HOLDING", emergency.reason_code)
+        self.assertEqual("NO_HOLDING", recovery.reason_code)
 
-    def test_individual_liquidation_requires_current_participant_and_holding(self) -> None:
+    def test_individual_liquidation_allows_zero_holding_then_requires_current_participant(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, holding_qty=0)
-            factory = Mock()
-            no_holding = command.execute_individual_liquidation_command(
-                self._owner(),
-                stock,
-                CODE,
-                method="시장가",
-                minutes_before_regular_close="5",
-                source="test",
-                project_root=root,
-                recovery_inspector=self._recovery_allowed,
-                command_service_factory=factory,
-            )
+            with patch("operation_command_service.observe_liquidation_requested"):
+                zero_holding = command.execute_individual_liquidation_command(
+                    self._owner(),
+                    stock,
+                    CODE,
+                    method="시장가",
+                    minutes_before_regular_close="5",
+                    source="test",
+                    now_dt=datetime(2026, 8, 30, 10, 0),
+                    project_root=root,
+                    recovery_inspector=self._recovery_allowed,
+                    transition_guard=lambda **_kwargs: SimpleNamespace(
+                        allowed=True,
+                        reason_code="ALLOWED",
+                    ),
+                    command_service_factory=OperationCommandService,
+                )
             state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
             state["holding_qty"] = 3
             (stock / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -238,14 +362,21 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 method="시장가",
                 minutes_before_regular_close="5",
                 source="test",
+                now_dt=datetime(2026, 8, 30, 10, 0),
                 project_root=root,
                 recovery_inspector=self._recovery_allowed,
-                command_service_factory=factory,
+                command_service_factory=OperationCommandService,
             )
+            saved = json.loads((stock / "state.json").read_text(encoding="utf-8"))
 
-        self.assertEqual("NO_HOLDING", no_holding.reason_code)
+        self.assertTrue(zero_holding.ok)
+        self.assertTrue(zero_holding.changed)
+        self.assertEqual("", zero_holding.reason_code)
+        self.assertEqual(
+            "시장가",
+            saved["individual_liquidation_request"]["method"],
+        )
         self.assertEqual("NOT_CURRENT_PARTICIPANT", stale_raw.reason_code)
-        factory.assert_not_called()
 
     def test_review_and_recovery_block_before_writer(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -291,8 +422,9 @@ class CloseLiquidationCommandTest(unittest.TestCase):
     def test_individual_liquidation_persists_requested_without_config_or_queue_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            stock = self._stock(root)
+            stock = self._stock(root, holding_qty=3)
             config_before = (stock / "config.json").read_bytes()
+            orders_before = (stock / "orders.json").read_bytes()
             with patch("operation_command_service.observe_liquidation_requested"):
                 result = command.execute_individual_liquidation_command(
                     self._owner(),
@@ -301,6 +433,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                     method="현재가",
                     minutes_before_regular_close="7",
                     source="test",
+                    now_dt=datetime(2026, 8, 30, 10, 0),
                     project_root=root,
                     recovery_inspector=self._recovery_allowed,
                     transition_guard=lambda **_kwargs: SimpleNamespace(
@@ -311,6 +444,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 )
             state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
             config_after = (stock / "config.json").read_bytes()
+            orders_after = (stock / "orders.json").read_bytes()
             queue_created = (root / "runtime" / "order_queue.json").exists()
 
         self.assertTrue(result.ok)
@@ -319,6 +453,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
         self.assertEqual("REQUESTED", state["individual_liquidation_request"]["status"])
         self.assertEqual("현재가", state["individual_liquidation_request"]["method"])
         self.assertEqual(config_before, config_after)
+        self.assertEqual(orders_before, orders_after)
         self.assertFalse(queue_created)
 
     def test_cancel_uses_canonical_request_and_ignores_ui_projection(self) -> None:
@@ -574,7 +709,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
         self.assertEqual("NOT_CURRENT_PARTICIPANT", blocked.reason_code)
         close_intent.assert_called_once()
 
-    def test_zero_holding_early_close_command_is_idempotent_without_queue_write(self) -> None:
+    def test_zero_holding_early_close_command_is_blocked_without_queue_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, holding_qty=0)
@@ -626,17 +761,15 @@ class CloseLiquidationCommandTest(unittest.TestCase):
             saved = json.loads((stock / "state.json").read_text(encoding="utf-8"))
             queue_created = (root / "runtime" / "order_queue.json").exists()
 
-        self.assertTrue(first.ok)
-        self.assertTrue(first.changed)
-        self.assertTrue(second.ok)
+        self.assertFalse(first.ok)
+        self.assertFalse(first.changed)
+        self.assertFalse(second.ok)
         self.assertFalse(second.changed)
-        self.assertEqual("zero-holding-command", first.command_id)
-        self.assertEqual("zero-holding-command", second.command_id)
-        self.assertEqual(1, saved["operation_sequence"])
+        self.assertEqual("NO_HOLDING", first.reason_code)
+        self.assertEqual("NO_HOLDING", second.reason_code)
+        self.assertEqual(0, saved["operation_sequence"])
         self.assertFalse(queue_created)
-        operation_state_writer.assert_called_once_with(
-            close_reason="EARLY_CLOSE"
-        )
+        operation_state_writer.assert_not_called()
 
     def test_manual_ats_request_uses_current_session_final_guard(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

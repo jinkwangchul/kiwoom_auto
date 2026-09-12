@@ -19,6 +19,7 @@ from mock_validation_contract import (
     clean_text,
     instance_initial_buy_adjustment,
     instance_effective_settings,
+    instance_individual_liquidation_reservation,
     mock_instance_active_effective_settings,
     mock_instance_active_operation,
     normalized_stock_code,
@@ -208,6 +209,47 @@ def _mock_operation_display(
     )
 
 
+def _active_individual_liquidation_display_text(
+    operation: dict[str, Any],
+) -> str | None:
+    """Project the active Operation's persisted one-shot liquidation setting."""
+
+    snapshot = operation.get("individual_liquidation_time_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    operation_id = clean_text(operation.get("operation_session_id"))
+    if (
+        not operation_id
+        or clean_text(snapshot.get("operation_session_id")) != operation_id
+    ):
+        return None
+    return _individual_liquidation_display_text(snapshot)
+
+
+def _individual_liquidation_display_text(
+    snapshot: dict[str, Any],
+) -> str | None:
+    method = clean_text(snapshot.get("method")).upper().replace(" ", "_")
+    method = {
+        "시장가": "MARKET",
+        "현재가": "CURRENT_PRICE",
+        "이월": "CARRYOVER",
+        "LONG_HOLD": "CARRYOVER",
+    }.get(method, method)
+    if method == "CARRYOVER":
+        return "이월"
+    if method not in {"MARKET", "CURRENT_PRICE"}:
+        return None
+    try:
+        minutes = int(snapshot.get("minutes_before_regular_close"))
+    except (TypeError, ValueError):
+        return None
+    if minutes <= 0:
+        return None
+    suffix = "시장가" if method == "MARKET" else "현재가"
+    return f"{minutes}분/{suffix}"
+
+
 def mock_instance_projection(
     document: dict[str, Any],
     routine_instance_id: str,
@@ -349,6 +391,23 @@ def mock_instance_projection(
         effective_display_contract["liquidation"] = liquidation
     elif close_method in {"CARRYOVER", "LONG_HOLD"}:
         liquidation = {**liquidation, "display_text": "-"}
+        effective_display_contract["liquidation"] = liquidation
+    individual_liquidation_text = _active_individual_liquidation_display_text(
+        active_operation
+    )
+    if individual_liquidation_text is None and not active_operation:
+        pending_reservation = instance_individual_liquidation_reservation(
+            document, instance_id
+        )
+        if pending_reservation is not None:
+            individual_liquidation_text = _individual_liquidation_display_text(
+                pending_reservation
+            )
+    if individual_liquidation_text is not None:
+        liquidation = {
+            **liquidation,
+            "display_text": individual_liquidation_text,
+        }
         effective_display_contract["liquidation"] = liquidation
     liquidation_has_policy = clean_text(liquidation.get("display_text")) not in {"", "-"}
     holding_qty = int(position.get("holding_qty", 0) or 0)

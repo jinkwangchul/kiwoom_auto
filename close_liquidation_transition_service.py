@@ -20,6 +20,8 @@ POLICY_MARKET: Final = "시장가"
 POLICY_CURRENT_PRICE: Final = "현재가"
 POLICY_STOP_LOSS_TAKE_PROFIT: Final = "익절/손절"
 
+DEFAULT_PENDING_ORDER_CANCEL_LEAD_SECONDS: Final = 30
+
 REASON_ALLOWED: Final = "ALLOWED"
 REASON_SAME_POLICY_NOOP: Final = "SAME_POLICY_NOOP"
 REASON_MARKET_DOWNGRADE_NOT_ALLOWED: Final = "MARKET_DOWNGRADE_NOT_ALLOWED"
@@ -111,6 +113,39 @@ class TransitionDecision:
 
 def _clean_text(value: object) -> str:
     return str(value or "").strip()
+
+
+def pending_order_cancel_lead_seconds(
+    operation_policy: dict[str, object] | None = None,
+) -> int:
+    """Return the frozen-policy lead time for regular-end order cleanup."""
+
+    policy = operation_policy if isinstance(operation_policy, dict) else {}
+    liquidation = policy.get("liquidation")
+    liquidation = liquidation if isinstance(liquidation, dict) else {}
+    raw = policy.get(
+        "pending_order_cancel_lead_seconds",
+        liquidation.get(
+            "pending_order_cancel_lead_seconds",
+            DEFAULT_PENDING_ORDER_CANCEL_LEAD_SECONDS,
+        ),
+    )
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_PENDING_ORDER_CANCEL_LEAD_SECONDS
+
+
+def regular_end_pending_order_cancel_boundary_seconds(
+    regular_end_seconds: int,
+    operation_policy: dict[str, object] | None = None,
+) -> int:
+    """Project the common regular-end pending-order cleanup boundary."""
+
+    return max(
+        0,
+        int(regular_end_seconds) - pending_order_cancel_lead_seconds(operation_policy),
+    )
 
 
 def _normalize_domain(value: object) -> str:
@@ -227,23 +262,10 @@ def decide_close_liquidation_transition(
             evidence=snapshot,
         )
 
-    if snapshot.pending_order_cancellation_started and requested in {
-        POLICY_ROUTINE_CLOSE,
-        POLICY_CARRY_OVER,
-    }:
+    if snapshot.pending_order_cancellation_started and requested == POLICY_ROUTINE_CLOSE:
         return _decision(
             allowed=False,
             reason_code=REASON_EXECUTION_PROGRESS_BLOCKED,
-            current_policy=current,
-            requested_policy=requested,
-            policy_domain=domain,
-            evidence=snapshot,
-        )
-
-    if current == POLICY_MARKET:
-        return _decision(
-            allowed=False,
-            reason_code=REASON_MARKET_DOWNGRADE_NOT_ALLOWED,
             current_policy=current,
             requested_policy=requested,
             policy_domain=domain,
@@ -272,16 +294,6 @@ def decide_close_liquidation_transition(
         return _decision(
             allowed=False,
             reason_code=REASON_RETURN_TO_ROUTINE_CLOSE_NOT_ALLOWED,
-            current_policy=current,
-            requested_policy=requested,
-            policy_domain=domain,
-            evidence=snapshot,
-        )
-
-    if requested == POLICY_CARRY_OVER and current != POLICY_ROUTINE_CLOSE:
-        return _decision(
-            allowed=False,
-            reason_code=REASON_RETURN_TO_CARRY_OVER_NOT_ALLOWED,
             current_policy=current,
             requested_policy=requested,
             policy_domain=domain,

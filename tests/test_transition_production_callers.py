@@ -88,6 +88,8 @@ class TransitionProductionCallerTest(unittest.TestCase):
     def _window(selected):
         window = Mock()
         window._persistent_feature_owner_ref = None
+        window.parent.return_value = None
+        window.kiwoom_api.is_connected.return_value = True
         window.selected_stock_infos.return_value = selected
         window.current_selected_routine_name.return_value = "routine"
         attach_participant_owner(
@@ -235,6 +237,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                 patch.object(close, "persistent_feature_owner", return_value=parent),
                 patch.object(close_command, "OperationCommandService", return_value=service),
                 patch.object(close.QMessageBox, "critical"),
+                patch.object(close, "show_toast") as toast,
             ):
                 close.auto_trade_apply_selected_individual_liquidation_method(
                     window,
@@ -249,6 +252,11 @@ class TransitionProductionCallerTest(unittest.TestCase):
             service.apply_individual_liquidation.assert_not_called()
             window.update_stock_status.assert_not_called()
             self.assertEqual(before, state_path.read_bytes())
+            toast.assert_called_once_with(
+                window,
+                "현재 상태에서는 실행할 수 없습니다.",
+                duration_ms=2500,
+            )
 
     def test_individual_unknown_does_not_create_command_or_mutate_state(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -271,6 +279,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     return_value=rejected,
                 ),
                 patch.object(close.QMessageBox, "critical") as critical,
+                patch.object(close, "show_toast") as toast,
             ):
                 close.auto_trade_apply_selected_individual_liquidation_method(
                     window,
@@ -280,7 +289,12 @@ class TransitionProductionCallerTest(unittest.TestCase):
 
             self.assertEqual(state_path.read_bytes(), before)
             service.apply_individual_liquidation.assert_not_called()
-            critical.assert_called_once()
+            critical.assert_not_called()
+            toast.assert_called_once_with(
+                window,
+                "현재 상태에서는 실행할 수 없습니다.",
+                duration_ms=2500,
+            )
 
     def test_auto_close_unknown_keeps_runtime_unchanged(self):
         with tempfile.TemporaryDirectory() as temp:

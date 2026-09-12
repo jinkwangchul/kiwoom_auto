@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from close_liquidation_transition_service import (
+    DEFAULT_PENDING_ORDER_CANCEL_LEAD_SECONDS,
     DOMAIN_CLOSE,
     DOMAIN_LIQUIDATION,
     POLICY_CARRY_OVER,
@@ -29,10 +30,29 @@ from close_liquidation_transition_service import (
     decide_close_liquidation_transition,
     is_routine_close_policy,
     normalize_direct_close_policy_alias,
+    pending_order_cancel_lead_seconds,
+    regular_end_pending_order_cancel_boundary_seconds,
 )
 
 
 class CloseLiquidationTransitionServiceTest(unittest.TestCase):
+    def test_regular_end_pending_cancel_boundary_has_one_default_owner(self):
+        self.assertEqual(30, DEFAULT_PENDING_ORDER_CANCEL_LEAD_SECONDS)
+        self.assertEqual(30, pending_order_cancel_lead_seconds({}))
+        self.assertEqual(
+            15 * 3600 + 19 * 60 + 30,
+            regular_end_pending_order_cancel_boundary_seconds(
+                15 * 3600 + 20 * 60,
+                {},
+            ),
+        )
+        self.assertEqual(
+            45,
+            pending_order_cancel_lead_seconds(
+                {"liquidation": {"pending_order_cancel_lead_seconds": 45}}
+            ),
+        )
+
     def test_direct_close_aliases_use_korean_canonical_values(self) -> None:
         self.assertEqual("시장가", normalize_direct_close_policy_alias("시장가즉시"))
         self.assertEqual("현재가", normalize_direct_close_policy_alias("현재가즉시"))
@@ -134,19 +154,19 @@ class CloseLiquidationTransitionServiceTest(unittest.TestCase):
         self.assert_allowed(POLICY_STOP_LOSS_TAKE_PROFIT, POLICY_CURRENT_PRICE)
         self.assert_allowed(POLICY_STOP_LOSS_TAKE_PROFIT, POLICY_MARKET)
 
-    def test_market_cannot_transition_to_other_close_policy(self) -> None:
+    def test_market_can_transition_to_other_hard_policy_or_carry(self) -> None:
         for requested in (
-            POLICY_ROUTINE_CLOSE,
             POLICY_CARRY_OVER,
             POLICY_CURRENT_PRICE,
             POLICY_STOP_LOSS_TAKE_PROFIT,
         ):
             with self.subTest(requested=requested):
-                self.assert_blocked(
-                    POLICY_MARKET,
-                    requested,
-                    REASON_MARKET_DOWNGRADE_NOT_ALLOWED,
-                )
+                self.assert_allowed(POLICY_MARKET, requested)
+        self.assert_blocked(
+            POLICY_MARKET,
+            POLICY_ROUTINE_CLOSE,
+            REASON_RETURN_TO_ROUTINE_CLOSE_NOT_ALLOWED,
+        )
 
     def test_current_and_profit_loss_cannot_return_to_routine_close(self) -> None:
         for current in (POLICY_CURRENT_PRICE, POLICY_STOP_LOSS_TAKE_PROFIT):
@@ -157,14 +177,10 @@ class CloseLiquidationTransitionServiceTest(unittest.TestCase):
                     REASON_RETURN_TO_ROUTINE_CLOSE_NOT_ALLOWED,
                 )
 
-    def test_current_and_profit_loss_cannot_return_to_carry_over(self) -> None:
+    def test_current_and_profit_loss_can_transition_to_carry_over(self) -> None:
         for current in (POLICY_CURRENT_PRICE, POLICY_STOP_LOSS_TAKE_PROFIT):
             with self.subTest(current=current):
-                self.assert_blocked(
-                    current,
-                    POLICY_CARRY_OVER,
-                    REASON_RETURN_TO_CARRY_OVER_NOT_ALLOWED,
-                )
+                self.assert_allowed(current, POLICY_CARRY_OVER)
 
     def test_close_same_policy_is_allowed_noop(self) -> None:
         for policy in (
@@ -238,7 +254,7 @@ class CloseLiquidationTransitionServiceTest(unittest.TestCase):
                     reason=REASON_SAME_POLICY_NOOP,
                 )
 
-    def test_cancellation_progress_blocks_return_to_routine_or_carry(self) -> None:
+    def test_cancellation_progress_blocks_return_to_routine_but_allows_carry(self) -> None:
         evidence = TransitionEvidence(pending_order_cancellation_started=True)
         self.assert_blocked(
             POLICY_CURRENT_PRICE,
@@ -246,10 +262,9 @@ class CloseLiquidationTransitionServiceTest(unittest.TestCase):
             REASON_EXECUTION_PROGRESS_BLOCKED,
             evidence=evidence,
         )
-        self.assert_blocked(
+        self.assert_allowed(
             POLICY_CURRENT_PRICE,
             POLICY_CARRY_OVER,
-            REASON_EXECUTION_PROGRESS_BLOCKED,
             evidence=evidence,
         )
 

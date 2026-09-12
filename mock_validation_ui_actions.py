@@ -68,6 +68,13 @@ class MockValidationUIActions:
             stock_code, routine_instance_id
         )
 
+    def return_early_close_to_auto_instance(
+        self, stock_code: str, routine_instance_id: str
+    ) -> dict[str, Any]:
+        return self.host.return_instance_early_close_to_auto(
+            stock_code, routine_instance_id
+        )
+
     def immediate_liquidation(
         self,
         stock_code: str,
@@ -80,6 +87,13 @@ class MockValidationUIActions:
         self, stock_code: str, routine_instance_id: str, *, method: str
     ) -> dict[str, Any]:
         return self.host.request_instance_immediate_liquidation(
+            stock_code, routine_instance_id, method=method
+        )
+
+    def manual_ats_liquidation_instance(
+        self, stock_code: str, routine_instance_id: str, *, method: str
+    ) -> dict[str, Any]:
+        return self.host.request_instance_manual_ats_liquidation(
             stock_code, routine_instance_id, method=method
         )
 

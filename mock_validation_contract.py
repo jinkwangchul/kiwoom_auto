@@ -17,6 +17,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from manual_ats_runtime import (
+    PROGRAM_SESSION_ID,
     VALID_SESSION_KEYS,
     normalized_manual_ats_session_keys,
 )
@@ -144,12 +145,14 @@ FOUNDATION_EVENT_TYPES = {
     "NORMAL_CLOSE_REQUESTED",
     "AUTO_CLOSE_REQUESTED",
     "EARLY_CLOSE_REQUESTED",
+    "EARLY_CLOSE_BLOCKED",
     "EARLY_CLOSE_CANCELLED",
     "ROUTINE_CLOSE_FINAL_SELL_ACCEPTED",
     "LIQUIDATION_STARTED",
     "LIQUIDATION_PROGRESS",
     "LIQUIDATION_COMPLETED",
     "IMMEDIATE_LIQUIDATION_REQUESTED",
+    "INDIVIDUAL_LIQUIDATION_BLOCKED",
     "LONG_HOLD_SELECTED",
     "CARRYOVER_CONFIRMED",
     "OPERATION_DONE",
@@ -627,6 +630,92 @@ def instance_effective_settings(
     return default_instance_effective_settings(reference, instance_id)
 
 
+def validate_instance_individual_liquidation_reservation(
+    value: Any,
+) -> dict[str, Any]:
+    """Validate a Mock-owned one-shot reservation for the next Operation."""
+
+    required = {
+        "version",
+        "routine_instance_id",
+        "reservation_scope",
+        "method",
+        "minutes_before_regular_close",
+        "reserved_at",
+        "command_id",
+    }
+    allowed = required | {"program_session_id"}
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or not set(value).issubset(allowed)
+    ):
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    if value.get("version") != 1:
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    instance_id = clean_text(value.get("routine_instance_id"))
+    if not instance_id:
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    if clean_text(value.get("reservation_scope")).upper() != "NEXT_OPERATION":
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    method = clean_text(value.get("method")).upper()
+    if method not in {"MARKET", "CURRENT_PRICE", "CARRYOVER"}:
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    minutes_text = clean_text(value.get("minutes_before_regular_close"))
+    if method == "CARRYOVER":
+        if minutes_text:
+            raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    else:
+        try:
+            minutes = int(minutes_text)
+        except (TypeError, ValueError) as exc:
+            raise MockValidationError(
+                "MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID"
+            ) from exc
+        if minutes <= 0:
+            raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+        minutes_text = str(minutes)
+    reserved_at = clean_text(value.get("reserved_at"))
+    command_id = clean_text(value.get("command_id"))
+    if not reserved_at or not command_id:
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    return {
+        "version": 1,
+        "routine_instance_id": instance_id,
+        "reservation_scope": "NEXT_OPERATION",
+        "method": method,
+        "minutes_before_regular_close": minutes_text,
+        "reserved_at": reserved_at,
+        "command_id": command_id,
+        "program_session_id": clean_text(value.get("program_session_id")),
+    }
+
+
+def instance_individual_liquidation_reservation(
+    document: dict[str, Any],
+    routine_instance_id: str,
+    *,
+    program_session_id: str | None = None,
+) -> dict[str, Any] | None:
+    instance_id = clean_text(routine_instance_id)
+    reservations = document.get("individual_liquidation_reservations_by_instance")
+    raw = reservations.get(instance_id) if isinstance(reservations, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    checked = validate_instance_individual_liquidation_reservation(raw)
+    if checked["routine_instance_id"] != instance_id:
+        raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_INVALID")
+    current_program_session_id = clean_text(
+        program_session_id or PROGRAM_SESSION_ID
+    )
+    if (
+        not current_program_session_id
+        or checked["program_session_id"] != current_program_session_id
+    ):
+        return None
+    return checked
+
+
 def mock_instance_active_operation(
     document: dict[str, Any], routine_instance_id: str
 ) -> dict[str, Any] | None:
@@ -1014,6 +1103,23 @@ def validate_session_document(document: Any) -> dict[str, Any]:
             )
             for instance_id in sorted(instance_ids)
         }
+    reservations = result.get("individual_liquidation_reservations_by_instance")
+    if reservations is not None:
+        if not isinstance(reservations, dict) or not set(reservations).issubset(instance_ids):
+            raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_SET_INVALID")
+        result["individual_liquidation_reservations_by_instance"] = {
+            instance_id: validate_instance_individual_liquidation_reservation(
+                reservations[instance_id]
+            )
+            for instance_id in sorted(reservations)
+        }
+        if any(
+            item["routine_instance_id"] != instance_id
+            for instance_id, item in result[
+                "individual_liquidation_reservations_by_instance"
+            ].items()
+        ):
+            raise MockValidationError("MOCK_INDIVIDUAL_LIQUIDATION_RESERVATION_SET_INVALID")
     adjustments = result.get("initial_buy_adjustments_by_instance", {})
     if not isinstance(adjustments, dict) or not set(adjustments).issubset(instance_ids):
         raise MockValidationError("MOCK_INSTANCE_INITIAL_BUY_ADJUSTMENT_SET_MISMATCH")
@@ -1164,6 +1270,7 @@ __all__ = [name for name in globals() if name.startswith(("MOCK_", "SESSION_", "
     "initial_session_document",
     "instance_initial_buy_adjustment",
     "instance_effective_settings",
+    "instance_individual_liquidation_reservation",
     "mock_instance_active_effective_settings",
     "mock_instance_active_operation",
     "mock_instance_pre_start_editable",
@@ -1176,6 +1283,7 @@ __all__ = [name for name in globals() if name.startswith(("MOCK_", "SESSION_", "
     "validate_mock_order",
     "validate_instance_effective_settings",
     "validate_instance_initial_buy_adjustment",
+    "validate_instance_individual_liquidation_reservation",
     "validate_reference_snapshot",
     "validate_session_document",
 ]

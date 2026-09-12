@@ -156,6 +156,41 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertFalse(state["buy_enabled"])
         self.assertTrue(state["sell_enabled"])
 
+    def test_active_auto_method_change_preserves_auto_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "AUTO_CLOSE",
+                    "trade_enabled": True,
+                    "auto_close_requested_at": "2026-07-19 10:00:00",
+                    "auto_close_source": "TIME_POLICY",
+                    "auto_close_method": "루틴",
+                    "auto_close_policy": {"method": "루틴"},
+                },
+            )
+            result = self._service(root).apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    MODE_EARLY_CLOSE,
+                    "monitoring_window",
+                ),
+                EarlyCloseCompatibility(
+                    method="시장가",
+                    has_close_progress_quantity=True,
+                ),
+            )
+            state = self._state(stock)
+
+        self.assertEqual(RESULT_SUCCESS, result.status)
+        self.assertEqual("AUTO_CLOSE", state["status"])
+        self.assertEqual("TIME_POLICY", state["auto_close_source"])
+        self.assertEqual("시장가", state["auto_close_method"])
+        self.assertFalse(bool(state.get("early_close_requested_at")))
+
     def test_early_close_no_target_cleanup_is_committed_by_command_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -927,10 +962,17 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertEqual(1, request["pending_order_count"])
         self.assertEqual(1, request["cancel_requested_count"])
 
-    def test_runtime_individual_liquidation_override_precedes_environment_policy(
+    def test_identity_less_runtime_override_does_not_precede_operation_policy(
         self,
     ) -> None:
         state = {
+            "operation_policy_snapshot": {
+                "operation_identity": "2026-08-16 09:00:00",
+                "liquidation": {
+                    "method": "시장가",
+                    "minutes_before_regular_close": "5",
+                },
+            },
             INDIVIDUAL_LIQUIDATION_REQUEST_KEY: {
                 "status": INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
                 "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -949,9 +991,9 @@ class OperationCommandServiceTest(unittest.TestCase):
         ):
             policy, is_override = effective_liquidation_policy_for_config({}, state)
 
-        self.assertTrue(is_override)
-        self.assertEqual("현재가", policy["method"])
-        self.assertEqual("15", policy["minutes_before_regular_close"])
+        self.assertFalse(is_override)
+        self.assertEqual("시장가", policy["method"])
+        self.assertEqual("5", policy["minutes_before_regular_close"])
 
     def test_legacy_config_override_is_not_an_execution_policy(self) -> None:
         config = {
@@ -1136,16 +1178,22 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
 
             with (
                 patch("close_liquidation_command.OperationCommandService") as service_type,
+                patch("gui_auto_trade_close.append_production_event") as journal,
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 auto_trade_apply_selected_early_close(window, "루틴")
 
         service_type.assert_not_called()
-        window.selected_stock_infos.assert_not_called()
+        window.selected_stock_infos.assert_called_once_with()
         show_toast.assert_called_once_with(
             window,
             "키움 서버에 로그인되어 있지 않습니다.",
             duration_ms=2500,
+        )
+        self.assertEqual("BLOCKED", journal.call_args.kwargs["result"])
+        self.assertEqual(
+            "SERVER_NOT_CONNECTED",
+            journal.call_args.kwargs["details"]["reason_code"],
         )
         window.statusBarMessage.assert_not_called()
 
@@ -1379,7 +1427,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             duration_ms=2500,
         )
 
-    def test_no_holding_early_close_uses_canonical_completion_path(self) -> None:
+    def test_no_holding_early_close_is_blocked_before_close_mutation(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1435,34 +1483,35 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                 ) as completion_check,
                 patch("gui_auto_trade_close.append_changelog"),
                 patch("gui_auto_trade_close.append_stock_log"),
+                patch("gui_auto_trade_close.append_production_event"),
                 patch("gui_auto_trade_close.refresh_auto_trade_views") as refresh_views,
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 result = auto_trade_apply_selected_early_close(window, "루틴")
 
-        service.apply_early_close.assert_called_once()
-        start_execution.assert_called_once()
-        persist_execution.assert_called_once()
-        completion_check.assert_called_once()
-        refresh_views.assert_called_once()
-        self.assertEqual(1, len(self._MessageBox.instances))
+        service.apply_early_close.assert_not_called()
+        start_execution.assert_not_called()
+        persist_execution.assert_not_called()
+        completion_check.assert_not_called()
+        refresh_views.assert_not_called()
+        self.assertEqual(0, len(self._MessageBox.instances))
         show_toast.assert_called_once_with(
             window,
-            "1종목을 조기마감 적용하였습니다.",
+            "보유수량이 없습니다.",
             duration_ms=2500,
         )
-        window.statusBarMessage.assert_called_with("조기마감 적용: 1개")
+        window.statusBarMessage.assert_called_with("조기마감 적용: 0개")
         self.assertEqual(
             {
-                "ok": True,
-                "completed_count": 1,
-                "failed_count": 0,
-                "message": "",
+                "ok": False,
+                "completed_count": 0,
+                "failed_count": 2,
+                "message": "보유수량이 없습니다.",
             },
             result,
         )
 
-    def test_confirmation_count_includes_zero_holding_operating_stock(self) -> None:
+    def test_confirmation_count_excludes_zero_holding_operating_stock(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1519,7 +1568,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         service_type.assert_not_called()
         self.assertEqual(1, len(self._MessageBox.instances))
         self.assertEqual(
-            "전체운영 3종목을 조기마감합니다. 진행하시겠습니까?",
+            "전체운영 2종목을 조기마감합니다. 진행하시겠습니까?",
             self._MessageBox.instances[0].text,
         )
 
@@ -1547,6 +1596,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
                 patch("close_liquidation_command.OperationCommandService") as service_type,
+                patch("gui_auto_trade_close.append_production_event"),
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 result = auto_trade_apply_selected_early_close(window, "루틴")
@@ -1558,10 +1608,10 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         self.assertEqual([], self._MessageBox.instances)
         show_toast.assert_called_once_with(
             window,
-            "조기마감 대상이 없습니다.",
+            "보유수량이 없습니다.",
             duration_ms=2500,
         )
-        self.assertEqual("조기마감 대상이 없습니다.", result["message"])
+        self.assertEqual("보유수량이 없습니다.", result["message"])
 
 
 class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
@@ -2669,10 +2719,10 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         early_menu = self._FakeMenu.root.submenus[0]
         self.assertEqual("조기마감", early_menu.title)
         self.assertEqual(
-            ["루틴마감", "시장가", "현재가", "손/익절", "이월", "취소"],
+            ["루틴마감", "시장가", "현재가", "손/익절", "이월", "자동마감", "취소"],
             [action.text for action in early_menu.actions if not action.separator],
         )
-        self.assertEqual("<separator>", early_menu.actions[5].text)
+        self.assertEqual("<separator>", early_menu.actions[6].text)
 
     def test_early_close_menu_display_labels_keep_existing_call_values(self) -> None:
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
@@ -2737,7 +2787,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     if not action.separator
                 ]
                 self.assertEqual(
-                    ["루틴마감", "시장가", "현재가", "손/익절", "이월", "취소"],
+                    ["루틴마감", "시장가", "현재가", "손/익절", "이월", "자동마감", "취소"],
                     labels,
                 )
                 self.assertTrue(all(action.icon is not None for action in actions))
@@ -2927,6 +2977,9 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             config_path = stock / "config.json"
             before = config_path.read_bytes()
             window = Mock()
+            window._persistent_feature_owner_ref = None
+            window.parent.return_value = None
+            window.kiwoom_api = SimpleNamespace(is_connected=lambda: True)
             attach_participant_owner(window, {"005930"})
             window.selected_stock_infos.return_value = [
                 (stock, "005930", "Samsung")
@@ -2945,17 +2998,21 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     "_start_close_liquidation_execution",
                     return_value={"ok": True, "stage": "send_order"},
                 ) as start,
+                patch.object(close, "show_toast"),
+                patch.object(close.QMessageBox, "question") as question,
             ):
                 close.auto_trade_apply_selected_individual_liquidation_method(
                     window,
                     "현재가",
                     "7",
+                    now_dt=datetime(2026, 7, 27, 10, 0),
                 )
 
             after = config_path.read_bytes()
             state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
 
         self.assertEqual(before, after)
+        question.assert_not_called()
         request = state[INDIVIDUAL_LIQUIDATION_REQUEST_KEY]
         self.assertEqual("현재가", request["method"])
         self.assertEqual("7", request["minutes_before_regular_close"])
@@ -3059,7 +3116,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         failure = SimpleNamespace(
             ok=False,
             changed=False,
-            reason_code="키움 서버에 로그인되어 있지 않습니다.",
+            reason_code="SERVER_NOT_CONNECTED",
             availability=None,
             operation_result=None,
         )

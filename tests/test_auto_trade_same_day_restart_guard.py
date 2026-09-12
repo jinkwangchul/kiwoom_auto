@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import gui_auto_trade_run_control as run_control
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 import gui_auto_trade_status_ops as status_ops
+from manual_ats_runtime import PROGRAM_SESSION_ID
 
 
 class _Viewport:
@@ -331,6 +332,55 @@ class SameDayRestartGuardTest(unittest.TestCase):
         self.assertNotIn("sell_enabled", saved)
         self.assertEqual(1, window.state_write_count)
         global_write.assert_called_once()
+
+    def test_start_binds_explicit_next_operation_individual_liquidation(self) -> None:
+        (self.stock_dir / "config.json").write_text(
+            json.dumps(self.config, ensure_ascii=False), encoding="utf-8"
+        )
+        pending_state = {
+            **self.state,
+            "individual_liquidation_request": {
+                "status": "REQUESTED",
+                "reservation_scope": "NEXT_OPERATION",
+                "operation_identity": "",
+                "requested_at": "2026-08-09 21:00:00",
+                "program_session_id": PROGRAM_SESSION_ID,
+                "method": "현재가",
+                "minutes_before_regular_close": "10",
+            },
+        }
+        (self.stock_dir / "state.json").write_text(
+            json.dumps(pending_state, ensure_ascii=False), encoding="utf-8"
+        )
+        target = (self.stock_dir, "005930", "삼성전자")
+        window = _PersistingStartWindow(target)
+        window._main_monitoring_auto_trade_operation_host = AutoTradeOperationHost(None)
+
+        with (
+            patch.object(run_control, "current_datetime", return_value=self.NOW),
+            patch.object(run_control, "now_text", return_value="2026-08-10 10:00:00"),
+            patch.object(run_control, "ORDER_QUEUE_PATH", self.queue_path),
+            patch.object(run_control, "read_operation_state", return_value=self.operation_state),
+            patch.object(run_control, "write_global_operation_running_state"),
+            patch.object(run_control, "append_changelog"),
+            patch.object(run_control, "append_production_event"),
+            patch.object(status_ops, "append_stock_log"),
+        ):
+            result = run_control.auto_trade_start_selected_auto_trades(
+                window,
+                request_scope=run_control.START_REQUEST_SINGLE,
+            )
+
+        self.assertTrue(result["ok"])
+        saved = json.loads(
+            (self.stock_dir / "state.json").read_text(encoding="utf-8")
+        )
+        request = saved["individual_liquidation_request"]
+        self.assertEqual("CURRENT_OPERATION", request["reservation_scope"])
+        self.assertEqual(saved["trade_started_at"], request["operation_identity"])
+        self.assertEqual(saved["trade_started_at"], request["bound_at"])
+        self.assertEqual("현재가", request["method"])
+        self.assertEqual("10", request["minutes_before_regular_close"])
 
     def test_normal_ended_blocks_global_button_but_allows_context_restart(self) -> None:
         (self.stock_dir / "config.json").write_text(

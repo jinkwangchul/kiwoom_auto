@@ -24,6 +24,234 @@ from close_liquidation_execution_pipeline import (
 
 
 class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
+    def test_regular_end_pending_cleanup_starts_at_frozen_end_minus_thirty_seconds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["operation_policy_snapshot"]["operation_mode"] = "CONTINUOUS"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "pending_order_side_quantities", return_value=(1, 0)),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "awaiting_cancel_confirmation"},
+                ) as execute,
+            ):
+                before = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 19, 29),
+                )
+                at_boundary = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 19, 30),
+                )
+
+        self.assertEqual(0, before["processed"])
+        self.assertEqual(1, at_boundary["processed"])
+        execute.assert_called_once()
+        self.assertEqual(
+            "REGULAR_END_PENDING_CLEANUP",
+            execute.call_args.kwargs["reason"],
+        )
+
+    def test_liquidation_carryover_waits_until_regular_end_cleanup_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["operation_policy_snapshot"]["liquidation"]["method"] = "이월"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "carryover_completed"},
+                ) as execute,
+                patch.object(close, "_persist_liquidation_execution_result", return_value=True),
+                patch.object(
+                    close,
+                    "check_global_close_completion_after_durable_update",
+                    return_value={"ok": True},
+                ),
+                patch.object(close, "pending_order_side_quantities", return_value=(0, 0)),
+            ):
+                before = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 15, 0),
+                )
+                at_boundary = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 19, 30),
+                )
+
+        self.assertEqual(0, before["processed"])
+        self.assertEqual(1, at_boundary["processed"])
+        execute.assert_called_once()
+        self.assertEqual("LIQUIDATION_BOUNDARY", execute.call_args.kwargs["reason"])
+        self.assertEqual("이월", execute.call_args.kwargs["method"])
+
+    def test_liquidation_carryover_cancels_pending_only_at_cleanup_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["operation_policy_snapshot"]["liquidation"]["method"] = "이월"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "pending_order_side_quantities", return_value=(1, 0)),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "awaiting_cancel_confirmation"},
+                ) as execute,
+            ):
+                before = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 15, 0),
+                )
+                at_boundary = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 19, 30),
+                )
+
+        self.assertEqual(0, before["processed"])
+        self.assertEqual(1, at_boundary["processed"])
+        execute.assert_called_once()
+        self.assertEqual("이월", execute.call_args.kwargs["method"])
+        self.assertEqual(
+            "REGULAR_END_PENDING_CLEANUP",
+            execute.call_args.kwargs["reason"],
+        )
+
+    def test_market_and_current_liquidation_use_same_pending_cleanup_boundary(self):
+        for method in ("시장가", "현재가"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temp:
+                stock = self._stock(Path(temp))
+                state_path = stock / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["operation_policy_snapshot"]["liquidation"]["method"] = method
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                with (
+                    patch(
+                        "gui_auto_trade_runtime.all_registered_stock_dirs",
+                        return_value=[stock],
+                    ),
+                    patch.object(close, "pending_order_side_quantities", return_value=(0, 1)),
+                    patch.object(close, "_production_recovery_gate", return_value=None),
+                    patch.object(
+                        close,
+                        "_start_close_liquidation_execution",
+                        return_value={"ok": True, "stage": "awaiting_cancel_confirmation"},
+                    ) as execute,
+                ):
+                    result = close.auto_trade_continue_pending_close_liquidations(
+                        Mock(),
+                        now_dt=datetime(2026, 9, 12, 15, 19, 30),
+                    )
+                self.assertEqual(1, result["processed"])
+                execute.assert_called_once()
+                self.assertEqual(
+                    "REGULAR_END_PENDING_CLEANUP",
+                    execute.call_args.kwargs["reason"],
+                )
+
+    def test_direct_liquidation_does_not_reissue_after_cleanup_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "pending_order_side_quantities", return_value=(0, 0)),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={
+                        "ok": False,
+                        "stage": "regular_end_residual",
+                        "runtime_status": "REVIEW_REQUIRED",
+                    },
+                ) as execute,
+                patch.object(close, "_persist_liquidation_execution_result", return_value=True),
+                patch.object(
+                    close,
+                    "check_global_close_completion_after_durable_update",
+                    return_value={"ok": True},
+                ),
+            ):
+                quiet = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 19, 30),
+                )
+                ended = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 9, 12, 15, 20, 0),
+                )
+
+        self.assertEqual(0, quiet["processed"])
+        self.assertEqual(1, ended["blocked"])
+        execute.assert_called_once()
+        self.assertTrue(execute.call_args.kwargs["regular_end_reached"])
+
+    def test_close_liquidation_user_messages_follow_admission_levels(self):
+        expected = {
+            "SERVER_NOT_CONNECTED": "키움 서버에 로그인되어 있지 않습니다.",
+            "NO_HOLDING": "보유수량이 없습니다.",
+            "NOT_CURRENT_PARTICIPANT": "현재 운영 대상 종목이 아닙니다.",
+            "SCHEDULED_OPERATION_WINDOW_ENDED": "현재 조기마감 가능한 시간이 아닙니다.",
+            "LIQUIDATION_TIME_WINDOW_ENTERED": "청산설정변경이 불가능합니다.",
+            "RETURN_TO_ROUTINE_CLOSE_NOT_ALLOWED": "현재 마감방식으로 변경할 수 없습니다.",
+            "RECOVERY_BLOCKED": "현재 상태에서는 실행할 수 없습니다.",
+        }
+        for reason, message in expected.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    message,
+                    close._close_liquidation_user_message(reason),
+                )
+
+    def test_block_event_keeps_level_reason_mode_and_time_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            with patch.object(close, "append_production_event") as append:
+                close._append_close_liquidation_block_event(
+                    stock,
+                    "005930",
+                    "Samsung",
+                    requested_action="EARLY_CLOSE_REQUEST",
+                    reason_code="SCHEDULED_OPERATION_WINDOW_ENDED",
+                    source="test",
+                    requested_policy={"method": "시장가"},
+                )
+        details = append.call_args.kwargs["details"]
+        self.assertEqual(4, details["admission_level"])
+        self.assertEqual("SCHEDULED_OPERATION_WINDOW_ENDED", details["reason_code"])
+        self.assertEqual("SCHEDULED", details["operation_mode"])
+        self.assertEqual("시장가", details["requested_method"])
+        self.assertIn("liquidation_start_seconds", details["relevant_time_boundary"])
+
     def test_broker_acceptance_marks_first_routine_close_sell_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             stock_dir = Path(tmp) / "stocks" / "005930_삼성전자"
@@ -100,6 +328,15 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                     "holding_qty": 3,
                     "trade_enabled": True,
                     "trade_started_at": "2026-07-27 09:00:00",
+                    "operation_policy_snapshot": {
+                        "operation_identity": "2026-07-27 09:00:00",
+                        "operation_mode": "SCHEDULED",
+                        "regular_market": {"end_time": "15:20:00"},
+                        "liquidation": {
+                            "method": "시장가",
+                            "minutes_before_regular_close": "5",
+                        },
+                    },
                 }
             ),
             encoding="utf-8",
@@ -1046,12 +1283,21 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             target_state = json.loads(
                 (target / "state.json").read_text(encoding="utf-8")
             )
+            other_state = json.loads(
+                (other / "state.json").read_text(encoding="utf-8")
+            )
+            other_state["operation_policy_snapshot"]["operation_mode"] = "CONTINUOUS"
+            (other / "state.json").write_text(
+                json.dumps(other_state),
+                encoding="utf-8",
+            )
             target_state["individual_liquidation_request"] = {
                 "status": "REQUESTED",
                 "method": "시장가",
                 "minutes_before_regular_close": "5",
                 "command_id": "command-1",
                 "requested_at": "2026-07-27 13:30:00",
+                "operation_identity": "2026-07-27 09:00:00",
             }
             (target / "state.json").write_text(
                 json.dumps(target_state),
@@ -1075,6 +1321,39 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         self.assertEqual(result["processed"], 1)
         start.assert_called_once()
         self.assertEqual(start.call_args.kwargs["code"], "005930")
+
+    def test_zero_holding_at_boundary_does_not_enter_liquidation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["holding_qty"] = 0
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(
+                    close,
+                    "pending_order_side_quantities",
+                    return_value=(0, 0),
+                ),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                ) as start,
+                patch.object(close, "_persist_liquidation_execution_result") as persist,
+            ):
+                result = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 7, 27, 15, 15),
+                )
+
+        self.assertEqual(0, result["processed"])
+        self.assertEqual([], result["results"])
+        start.assert_not_called()
+        persist.assert_not_called()
 
     def test_routine_close_orders_follow_final_sell_marker_at_auto_execution_gate(self):
         window = Mock()

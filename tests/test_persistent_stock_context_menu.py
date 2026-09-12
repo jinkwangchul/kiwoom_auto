@@ -1,7 +1,9 @@
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -16,6 +18,7 @@ from gui_auto_trade_context_menu import (
     PersistentContextMenu,
     StockContextMenuCallbacks,
 )
+from tests.participant_owner_fixture import participant_owner
 
 
 class PersistentStockContextMenuTest(unittest.TestCase):
@@ -248,6 +251,80 @@ class PersistentStockContextMenuTest(unittest.TestCase):
         mock_immediate.assert_called_once_with("현재가", "")
         production_early.assert_not_called()
         production_immediate.assert_not_called()
+
+    def test_policy_blocked_production_close_entries_survive_persistent_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = Path(temp) / "005930_Samsung"
+            stock.mkdir()
+            (stock / "config.json").write_text(
+                json.dumps({"operation_excluded": True}),
+                encoding="utf-8",
+            )
+            (stock / "state.json").write_text(
+                json.dumps({"status": "REVIEW_REQUIRED", "review_required": True}),
+                encoding="utf-8",
+            )
+            early = Mock()
+            individual = Mock()
+            observed = []
+
+            class ScriptedMenu(PersistentContextMenu):
+                def exec_(self, _position):
+                    self.show()
+                    close_menu = next(
+                        action.menu()
+                        for action in self.actions()
+                        if action.menu() is not None and action.text() == "조기마감"
+                    )
+                    individual_menu = next(
+                        action.menu()
+                        for action in self.actions()
+                        if action.menu() is not None and action.text() == "개별청산"
+                    )
+                    close_market = next(
+                        action for action in close_menu.actions() if action.text() == "시장가"
+                    )
+                    individual_market = next(
+                        action for action in individual_menu.actions() if action.text() == "시장가"
+                    )
+                    observed.append(
+                        (close_market.isEnabled(), individual_market.isEnabled())
+                    )
+                    self._activate_registered_action(close_market)
+                    observed.append(
+                        (close_market.isEnabled(), individual_market.isEnabled())
+                    )
+                    self._activate_registered_action(individual_market)
+
+            callbacks = self._callbacks(
+                early_close=early,
+                individual_liquidation=individual,
+            )
+            owner = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(
+                    {"005930"}
+                )
+            )
+            with (
+                patch.object(
+                    context_menu,
+                    "_new_stock_context_menu",
+                    return_value=ScriptedMenu(),
+                ),
+                patch.object(context_menu, "_append_stock_context_decision"),
+            ):
+                context_menu.show_monitor_stock_context_menu(
+                    owner,
+                    QPoint(),
+                    has_selection=True,
+                    callbacks=callbacks,
+                    operation_excluded=True,
+                    selected_targets=[(stock, "005930", "Samsung")],
+                )
+
+        self.assertEqual([(True, True), (True, True)], observed)
+        early.assert_called_once_with("시장가즉시")
+        individual.assert_called_once_with("시장가", "5")
 
 
 if __name__ == "__main__":

@@ -520,8 +520,18 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
             stock_dir.mkdir(parents=True)
             self._write_json(stock_dir / "state.json", {
                 "status": "EARLY_CLOSING",
+                "trade_started_at": "2026-07-30 09:00:00",
                 "early_close_requested_at": "2026-07-30 13:30:00",
                 "operation_command_id": "CMD-1",
+                "operation_policy_snapshot": {
+                    "operation_identity": "2026-07-30 09:00:00",
+                    "operation_mode": "SCHEDULED",
+                    "regular_market": {"end_time": "15:20:00"},
+                    "liquidation": {
+                        "method": "시장가",
+                        "minutes_before_regular_close": "5",
+                    },
+                },
             })
             self._write_json(stock_dir / "config.json", {"assigned_routine_instance_id": "routine-1"})
             window = SimpleNamespace()
@@ -548,8 +558,18 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
             stock_dir.mkdir(parents=True)
             self._write_json(stock_dir / "state.json", {
                 "status": "EARLY_CLOSING",
+                "trade_started_at": "2026-07-30 09:00:00",
                 "early_close_requested_at": "2026-07-30 13:30:00",
                 "operation_command_id": "CMD-1",
+                "operation_policy_snapshot": {
+                    "operation_identity": "2026-07-30 09:00:00",
+                    "operation_mode": "SCHEDULED",
+                    "regular_market": {"end_time": "15:20:00"},
+                    "liquidation": {
+                        "method": "시장가",
+                        "minutes_before_regular_close": "5",
+                    },
+                },
             })
             self._write_json(stock_dir / "config.json", {"assigned_routine_instance_id": "routine-1"})
             with (

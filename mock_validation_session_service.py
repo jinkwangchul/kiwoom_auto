@@ -6,6 +6,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Callable
 
+from manual_ats_runtime import PROGRAM_SESSION_ID
+
 from mock_validation_contract import (
     INSTANCE_ERROR,
     INSTANCE_VALIDATION_STOPPED,
@@ -112,9 +114,86 @@ class MockValidationSessionService:
         repository: MockValidationRepository,
         *,
         now_factory: Callable[[], str] = now_text,
+        program_session_id: str | None = None,
     ) -> None:
         self.repository = repository
         self._now = now_factory
+        self._program_session_id = clean_text(
+            program_session_id or PROGRAM_SESSION_ID
+        )
+
+    def expire_individual_liquidation_reservations_for_application_boundary(
+        self,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        """Remove only pending reservations that cannot outlive this process."""
+
+        boundary_source = clean_text(source)
+        expire_current = boundary_source == "APPLICATION_SHUTDOWN"
+        expired: list[dict[str, str]] = []
+        errors: list[dict[str, str]] = []
+        for stock_code, session_id in sorted(self.repository.current_session_ids().items()):
+            try:
+                before = self.repository.read_session(session_id)
+                reservations = before.get(
+                    "individual_liquidation_reservations_by_instance"
+                )
+                stale_instance_ids = tuple(
+                    sorted(
+                        instance_id
+                        for instance_id, reservation in (
+                            reservations.items()
+                            if isinstance(reservations, dict)
+                            else ()
+                        )
+                        if isinstance(reservation, dict)
+                        and (
+                            expire_current
+                            or clean_text(reservation.get("program_session_id"))
+                            != self._program_session_id
+                        )
+                    )
+                )
+                if not stale_instance_ids:
+                    continue
+
+                def mutation(document: dict[str, Any]) -> dict[str, Any]:
+                    pending = document.get(
+                        "individual_liquidation_reservations_by_instance"
+                    )
+                    if isinstance(pending, dict):
+                        for instance_id in stale_instance_ids:
+                            pending.pop(instance_id, None)
+                    return document
+
+                self.repository.mutate_session(
+                    session_id,
+                    mutation,
+                    expected_revision=before["revision"],
+                )
+                expired.extend(
+                    {
+                        "stock_code": clean_text(stock_code),
+                        "validation_session_id": clean_text(session_id),
+                        "routine_instance_id": clean_text(instance_id),
+                    }
+                    for instance_id in stale_instance_ids
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "stock_code": clean_text(stock_code),
+                        "validation_session_id": clean_text(session_id),
+                        "routine_instance_id": "",
+                        "reason": str(exc) or type(exc).__name__,
+                    }
+                )
+        return {
+            "source": boundary_source,
+            "expired": tuple(expired),
+            "errors": tuple(errors),
+        }
 
     @staticmethod
     def _command(document: dict[str, Any], command_id: str) -> dict[str, Any] | None:
@@ -140,8 +219,13 @@ class MockValidationSessionService:
         """Reuse Validation Stop for active Instances at shutdown/restart."""
 
         boundary_source = clean_text(source)
+        expiration = (
+            self.expire_individual_liquidation_reservations_for_application_boundary(
+                source=boundary_source
+            )
+        )
         stopped: list[dict[str, Any]] = []
-        errors: list[dict[str, str]] = []
+        errors: list[dict[str, str]] = list(expiration["errors"])
         for stock_code, session_id in sorted(self.repository.current_session_ids().items()):
             try:
                 document = self.repository.read_session(session_id)
@@ -220,6 +304,7 @@ class MockValidationSessionService:
                 document = self.repository.read_session(session_id)
         return {
             "source": boundary_source,
+            "expired_reservations": expiration["expired"],
             "stopped": tuple(stopped),
             "errors": tuple(errors),
         }
@@ -1420,6 +1505,7 @@ class MockValidationSessionService:
             document["session"]["reference_snapshot_hash"] = snapshot["snapshot_hash"]
             for key in (
                 "effective_settings_by_instance",
+                "individual_liquidation_reservations_by_instance",
                 "initial_buy_adjustments_by_instance",
                 "instance_execution",
                 "cycle_state_by_instance",

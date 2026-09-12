@@ -80,6 +80,8 @@ class EarlyCloseCompatibility:
 class IndividualLiquidationOverride:
     method: str
     minutes_before_regular_close: str
+    reservation_scope: str = "CURRENT_OPERATION"
+    program_session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -494,6 +496,28 @@ class OperationCommandService:
                             "minutes_before_regular_close": str(
                                 override.minutes_before_regular_close or ""
                             ).strip(),
+                            "reservation_scope": str(
+                                override.reservation_scope or "CURRENT_OPERATION"
+                            ).strip().upper(),
+                            "program_session_id": str(
+                                override.program_session_id or ""
+                            ).strip(),
+                            "operation_identity": (
+                                ""
+                                if str(override.reservation_scope or "").strip().upper()
+                                == "NEXT_OPERATION"
+                                else str(
+                                    (
+                                        state.get("operation_policy_snapshot")
+                                        if isinstance(
+                                            state.get("operation_policy_snapshot"), dict
+                                        )
+                                        else {}
+                                    ).get("operation_identity")
+                                    or state.get("trade_started_at")
+                                    or ""
+                                ).strip()
+                            ),
                         }
                     )
                 if is_manual_ats_liquidation:
@@ -638,6 +662,40 @@ class OperationCommandService:
                 compatibility.method
             ) or "루틴"
             policy = {"method": method, **dict(compatibility.policy or {})}
+            current_method = normalize_direct_close_policy_alias(
+                state.get("early_close_method") or state.get("auto_close_method")
+            )
+            runtime_status = str(state.get("status") or "").strip().upper()
+            active_auto = bool(
+                str(state.get("auto_close_requested_at") or "").strip()
+                and runtime_status in {"AUTO_CLOSE", "AUTO_CLOSING"}
+            )
+            active_early = bool(
+                str(state.get("early_close_requested_at") or "").strip()
+                and runtime_status in {"EARLY_CLOSE", "EARLY_CLOSING"}
+            )
+            close_cause = "AUTO" if active_auto else "EARLY"
+            preserved_source = str(
+                state.get("auto_close_source")
+                if active_auto
+                else state.get("early_close_source")
+                if active_early
+                else source
+            ).strip() or source
+            hard_methods = {"시장가", "현재가", "손/익절"}
+            if (
+                current_method in hard_methods
+                and method != current_method
+                and method != "루틴"
+            ):
+                state["close_transition_pending"] = {
+                    "method": method,
+                    "policy": policy,
+                    "source": preserved_source,
+                    "close_cause": close_cause,
+                    "requested_at": applied_at,
+                }
+                return
             if not compatibility.has_close_progress_quantity:
                 state.update(
                     {
@@ -664,8 +722,7 @@ class OperationCommandService:
                     }
                 )
                 return
-            state.update(
-                {
+            metadata = {
                     "review_required": False,
                     "review_status": "",
                     "review_location": "",
@@ -674,13 +731,9 @@ class OperationCommandService:
                     "trade_enabled": True,
                     "startup_reset_reason": "",
                     "startup_reset_cleared_at": "",
-                    "early_close_requested_at": applied_at,
-                    "early_close_source": source,
-                    "early_close_method": method,
-                    "early_close_policy": policy,
                     "liquidation_policy_forced": method in {"시장가", "현재가"},
                     "liquidation_policy_reason": (
-                        "EARLY_CLOSE"
+                        ("AUTO_CLOSE" if active_auto else "EARLY_CLOSE")
                         if method in {"시장가", "현재가"}
                         else ""
                     ),
@@ -691,8 +744,29 @@ class OperationCommandService:
                     "close_routine_final_sell_ordered_at": "",
                     "close_routine_final_sell_source": "",
                     "close_routine_final_sell_reason": "",
+                    "close_transition_pending": None,
                 }
-            )
+            if active_auto:
+                metadata.update(
+                    {
+                        "auto_close_method": method,
+                        "auto_close_policy": policy,
+                    }
+                )
+            else:
+                metadata.update(
+                    {
+                        "early_close_requested_at": (
+                            state.get("early_close_requested_at")
+                            if active_early
+                            else applied_at
+                        ),
+                        "early_close_source": preserved_source,
+                        "early_close_method": method,
+                        "early_close_policy": policy,
+                    }
+                )
+            state.update(metadata)
             if str(state.get("status", "")).strip().upper() not in {
                 "EMERGENCY_STOPPED",
                 "EMERGENCY_STOP",
@@ -700,20 +774,59 @@ class OperationCommandService:
                 "REVIEW_REQUIRED",
                 "REVIEW",
             }:
-                state["status"] = "EARLY_CLOSE"
+                state["status"] = "AUTO_CLOSE" if active_auto else "EARLY_CLOSE"
             return
 
         if mode == MODE_CARRY_OVER:
-            state.update(
-                {
+            current_method = normalize_direct_close_policy_alias(
+                state.get("early_close_method") or state.get("auto_close_method")
+            )
+            runtime_status = str(state.get("status") or "").strip().upper()
+            active_auto = bool(
+                str(state.get("auto_close_requested_at") or "").strip()
+                and runtime_status in {"AUTO_CLOSE", "AUTO_CLOSING"}
+            )
+            active_early = bool(
+                str(state.get("early_close_requested_at") or "").strip()
+                and runtime_status in {"EARLY_CLOSE", "EARLY_CLOSING"}
+            )
+            close_cause = "AUTO" if active_auto else "EARLY"
+            preserved_source = str(
+                state.get("auto_close_source")
+                if active_auto
+                else state.get("early_close_source")
+                if active_early
+                else source
+            ).strip() or source
+            if current_method in {"시장가", "현재가", "손/익절"}:
+                state["close_transition_pending"] = {
+                    "method": "이월",
+                    "policy": {"method": "이월"},
+                    "source": preserved_source,
+                    "close_cause": close_cause,
+                    "requested_at": applied_at,
+                }
+                return
+            if active_auto:
+                state.update(
+                    {
+                        "auto_close_method": "이월",
+                        "auto_close_policy": {"method": "이월"},
+                        "liquidation_policy_forced": False,
+                        "liquidation_policy_reason": "",
+                    }
+                )
+            else:
+                state.update(
+                    {
                     "early_close_requested_at": applied_at,
-                    "early_close_source": source,
+                    "early_close_source": preserved_source,
                     "early_close_method": "이월",
                     "early_close_policy": {"method": "이월"},
                     "liquidation_policy_forced": False,
                     "liquidation_policy_reason": "",
-                }
-            )
+                    }
+                )
             return
 
         state.update(

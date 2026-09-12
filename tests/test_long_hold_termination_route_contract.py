@@ -207,6 +207,60 @@ class TerminationRouteTruthTableTests(unittest.TestCase):
             )
         )
 
+    def test_failed_liquidation_carryover_is_never_long_hold_exempt(self) -> None:
+        state = {
+            "status": "REVIEW_REQUIRED",
+            "holding_qty": 3,
+            "review_required": True,
+            "review_reason": "청산 후 보유잔량",
+            "liquidation_execution": {
+                "phase": "REVIEW_REQUIRED",
+                "method": "이월",
+                "termination_provenance": (
+                    "LIQUIDATION_EXECUTION_FAILURE_RESIDUAL"
+                ),
+            },
+        }
+        route = classify_termination_route(
+            state,
+            operation_mode="SCHEDULED",
+            final_session_ended=True,
+        )
+        self.assertEqual(ROUTE_CLOSE_INTENT, route["route"])
+        self.assertTrue(route["safety_issue"])
+        self.assertFalse(self._allowed(state, mode="SCHEDULED"))
+
+    def test_successful_liquidation_carryover_requires_long_hold_policy(self) -> None:
+        state = {
+            "status": "LIQUIDATED",
+            "holding_qty": 3,
+            "liquidation_execution": {
+                "phase": "COMPLETED",
+                "method": "이월",
+                "termination_provenance": "LIQUIDATION_CARRYOVER",
+            },
+        }
+        route = classify_termination_route(
+            state,
+            operation_mode="SCHEDULED",
+            final_session_ended=True,
+        )
+        self.assertEqual(ROUTE_CARRYOVER, route["route"])
+        self.assertFalse(route["safety_issue"])
+        self.assertTrue(self._allowed(state, mode="SCHEDULED"))
+        self.assertFalse(
+            long_hold_excludes_holding_review(
+                False,
+                state,
+                holding_qty=3,
+                buy_pending_qty=0,
+                sell_pending_qty=0,
+                safety_issue=False,
+                operation_mode="SCHEDULED",
+                final_session_ended=True,
+            )
+        )
+
 
 class ImmediateReviewAndRetirementTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -350,6 +404,74 @@ class ImmediateReviewAndRetirementTests(unittest.TestCase):
         self.assertEqual((), result["removed"])
         self.assertEqual(("012210",), result["remaining"])
         self.assertTrue(result["evaluations"][0]["review_marked"])
+
+    def test_failed_liquidation_carryover_is_not_retired_as_normal_completion(self) -> None:
+        stock_dir = self._stock(
+            "012210",
+            config={
+                "operation_mode": "SCHEDULED",
+                "start_time": "09:00:00",
+                "end_buy_time": "13:30:00",
+            },
+            state={
+                "status": "REVIEW_REQUIRED",
+                "trade_started_at": f"{TODAY} 09:00:00",
+                "holding_qty": 3,
+                "avg_price": 1000,
+                "review_required": True,
+                "liquidation_execution": {
+                    "phase": "REVIEW_REQUIRED",
+                    "method": "이월",
+                    "termination_provenance": (
+                        "LIQUIDATION_EXECUTION_FAILURE_RESIDUAL"
+                    ),
+                },
+            },
+        )
+        window = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"})
+        )
+        with (
+            patch.object(
+                run_control,
+                "auto_trade_registered_operation_targets",
+                return_value=[(stock_dir, "012210", "Stock")],
+            ),
+            patch.object(
+                run_control,
+                "read_operation_state",
+                return_value={
+                    "operation_date": TODAY,
+                    "operation_status": "RUNNING",
+                    "operation_participant_stock_codes": ["012210"],
+                },
+            ),
+            patch.object(
+                run_control,
+                "read_review_policy",
+                return_value={"long_term_holding_enabled": True},
+            ),
+            patch.object(
+                run_control,
+                "mark_end_of_operation_review_required",
+                return_value={"ok": True, "changed": False},
+            ) as marker,
+        ):
+            result = run_control.auto_trade_retire_time_ended_current_session_participants(
+                window,
+                now_dt=datetime(2026, 8, 26, 13, 31),
+                order_queue_path=self.queue,
+                order_executions_path=self.executions,
+                order_locks_path=self.locks,
+            )
+
+        marker.assert_called_once()
+        self.assertEqual((), result["removed"])
+        self.assertEqual(("012210",), result["remaining"])
+        self.assertIn(
+            "END_OF_OPERATION_SAFETY_REVIEW_REQUIRED",
+            result["evaluations"][0]["blockers"],
+        )
 
     def test_terminal_no_close_pending_order_is_immediate_review(self) -> None:
         stock_dir = self._stock(

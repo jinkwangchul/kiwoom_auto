@@ -163,6 +163,57 @@ class LongTermHoldingReviewPolicyTests(unittest.TestCase):
                 ):
                     self.assertEqual(1, len(review_window.collect_global_review_required_rows()))
 
+    def test_failed_liquidation_carryover_remains_in_review_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = root / "111111_Test"
+            stock_dir.mkdir()
+            (stock_dir / "config.json").write_text(
+                json.dumps({"operation_mode": "SCHEDULED"}), encoding="utf-8"
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    self._state(
+                        liquidation_execution={
+                            "phase": "REVIEW_REQUIRED",
+                            "method": "이월",
+                            "termination_provenance": (
+                                "LIQUIDATION_EXECUTION_FAILURE_RESIDUAL"
+                            ),
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "orders.json").write_text(
+                json.dumps({"orders": []}), encoding="utf-8"
+            )
+
+            class Repo:
+                def list_stocks(self):
+                    return [
+                        SimpleNamespace(
+                            code="111111", name="Test", routine="Routine"
+                        )
+                    ]
+
+                def resolve_stock_dir(self, code, name):
+                    return stock_dir
+
+            with patch.object(
+                review_window, "stock_repository_factory", return_value=Repo()
+            ):
+                for enabled in (True, False):
+                    with self.subTest(enabled=enabled), patch.object(
+                        review_window,
+                        "read_review_policy",
+                        return_value={"long_term_holding_enabled": enabled},
+                    ):
+                        self.assertEqual(
+                            1,
+                            len(review_window.collect_global_review_required_rows()),
+                        )
+
     def test_legacy_stock_config_value_never_controls_global_policy(self) -> None:
         for legacy_value in (True, False):
             with self.subTest(legacy_value=legacy_value), tempfile.TemporaryDirectory() as temp:

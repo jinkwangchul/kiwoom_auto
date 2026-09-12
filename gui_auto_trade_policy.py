@@ -46,6 +46,11 @@ from operation_command_service import (
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
     INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
 )
+from manual_ats_runtime import PROGRAM_SESSION_ID
+from close_liquidation_transition_service import (
+    pending_order_cancel_lead_seconds,
+    regular_end_pending_order_cancel_boundary_seconds,
+)
 
 
 
@@ -1185,7 +1190,18 @@ def individual_liquidation_policy_from_state(
         return {}
     if str(raw.get("status", "")).strip().upper() != INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED:
         return {}
-    requested_at = str(raw.get("requested_at", "") or "").strip()
+    snapshot = active_operation_policy_snapshot(state)
+    current_operation_identity = str(
+        snapshot.get("operation_identity") or state.get("trade_started_at") or ""
+    ).strip()
+    request_operation_identity = str(raw.get("operation_identity") or "").strip()
+    if active_only and (
+        not current_operation_identity
+        or not request_operation_identity
+        or request_operation_identity != current_operation_identity
+    ):
+        return {}
+    requested_at = str(raw.get("bound_at") or raw.get("requested_at", "") or "").strip()
     if active_only:
         if requested_at and not requested_at.startswith(auto_trade_setting_today_date_text()):
             return {}
@@ -1203,9 +1219,83 @@ def individual_liquidation_policy_from_state(
     minutes = max(1, min(100, minutes))
     return {
         "enabled": True,
+        "minutes_before_regular_close": "" if method == "이월" else str(minutes),
+        "method": method,
+    }
+
+
+def pending_individual_liquidation_policy_from_state(
+    state: dict[str, object] | None,
+    *,
+    program_session_id: str | None = None,
+) -> dict[str, object]:
+    """Return only an explicit reservation for the next Production Operation."""
+
+    if not isinstance(state, dict):
+        return {}
+    raw = state.get(INDIVIDUAL_LIQUIDATION_REQUEST_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    if str(raw.get("status") or "").strip().upper() != INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED:
+        return {}
+    if str(raw.get("reservation_scope") or "").strip().upper() != "NEXT_OPERATION":
+        return {}
+    if str(raw.get("operation_identity") or "").strip():
+        return {}
+    current_program_session_id = str(
+        program_session_id or PROGRAM_SESSION_ID
+    ).strip()
+    if (
+        not current_program_session_id
+        or str(raw.get("program_session_id") or "").strip()
+        != current_program_session_id
+    ):
+        return {}
+    method = short_close_method_text(raw.get("method", "이월"))
+    if method not in {"시장가", "현재가", "이월"}:
+        return {}
+    if method == "이월":
+        return {
+            "enabled": True,
+            "minutes_before_regular_close": "",
+            "method": method,
+        }
+    try:
+        minutes = int(str(raw.get("minutes_before_regular_close", "5")).strip() or "5")
+    except (TypeError, ValueError):
+        return {}
+    if not 1 <= minutes <= 100:
+        return {}
+    return {
+        "enabled": True,
         "minutes_before_regular_close": str(minutes),
         "method": method,
     }
+
+
+def individual_liquidation_setting_policy_from_state(
+    state: dict[str, object] | None,
+) -> dict[str, object]:
+    """Project the active one-shot setting or an explicit next-Operation reservation."""
+
+    return (
+        individual_liquidation_policy_from_state(state)
+        or pending_individual_liquidation_policy_from_state(state)
+    )
+
+
+def active_operation_policy_snapshot(
+    state: dict[str, object] | None,
+) -> dict[str, object]:
+    """Return the immutable policy captured for the active Production Operation."""
+    if not isinstance(state, dict):
+        return {}
+    snapshot = state.get("operation_policy_snapshot")
+    if not isinstance(snapshot, dict):
+        return {}
+    if not str(snapshot.get("operation_identity") or "").strip():
+        return {}
+    return snapshot
 
 
 def effective_liquidation_policy_for_config(
@@ -1220,9 +1310,27 @@ def effective_liquidation_policy_for_config(
     """
     individual = individual_liquidation_policy_from_state(state)
     if individual:
+        if short_close_method_text(individual.get("method")) == "이월":
+            base_policy = active_operation_policy_snapshot(state) or read_operation_policy()
+            base_liquidation = (
+                base_policy.get("liquidation", {})
+                if isinstance(base_policy, dict)
+                else {}
+            )
+            base_liquidation = (
+                base_liquidation if isinstance(base_liquidation, dict) else {}
+            )
+            individual = {
+                **individual,
+                "minutes_before_regular_close": str(
+                    base_liquidation.get("minutes_before_regular_close", "5")
+                    or "5"
+                ).strip()
+                or "5",
+            }
         return individual, True
 
-    policy = read_operation_policy()
+    policy = active_operation_policy_snapshot(state) or read_operation_policy()
     liquidation = policy.get("liquidation", {}) if isinstance(policy, dict) else {}
     if not isinstance(liquidation, dict):
         liquidation = {}
@@ -1261,7 +1369,7 @@ def auto_trade_setting_liquidation_text(
     status_text = auto_trade_setting_display_status(display_status)
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     early_close_forced = auto_trade_setting_early_close_requested(state)
-    individual_policy = individual_liquidation_policy_from_state(state)
+    individual_policy = individual_liquidation_setting_policy_from_state(state)
     has_individual = bool(individual_policy)
     if (
         not has_individual
@@ -1300,6 +1408,8 @@ def auto_trade_setting_liquidation_text(
             return "-"
 
     liquidation, _is_individual = effective_liquidation_policy_for_config(config, state)
+    if individual_policy and not individual_liquidation_policy_from_state(state):
+        liquidation = individual_policy
     method = short_close_method_text(liquidation.get("method", "이월"))
     minutes = str(liquidation.get("minutes_before_regular_close", "5")).strip() or "5"
 
@@ -1309,9 +1419,11 @@ def auto_trade_setting_liquidation_text(
     return f"{minutes}분/{method}"
 
 
-def auto_trade_setting_regular_end_seconds() -> int:
+def auto_trade_setting_regular_end_seconds(
+    state: dict[str, object] | None = None,
+) -> int:
     """자동매매설정창 기준 정규장/청산 종료 초 단위."""
-    policy = read_operation_policy()
+    policy = active_operation_policy_snapshot(state) or read_operation_policy()
     regular = policy.get("regular_market", {}) if isinstance(policy.get("regular_market"), dict) else {}
     end_time = normalized_hhmmss_or_empty(regular.get("end_time", "15:20:00")) or "15:20:00"
     return seconds_from_hhmmss(end_time, "15:20:00")
@@ -1349,7 +1461,7 @@ def auto_trade_setting_individual_liquidation_window_entered(
         minute_values.append(candidate_minutes_before_regular_close)
 
     current_seconds = current.hour * 3600 + current.minute * 60 + current.second
-    end_seconds = auto_trade_setting_regular_end_seconds()
+    end_seconds = auto_trade_setting_regular_end_seconds(state)
     for value in minute_values:
         try:
             minutes = int(str(value).strip() or "5")
@@ -1362,11 +1474,51 @@ def auto_trade_setting_individual_liquidation_window_entered(
     return False
 
 
-def auto_trade_setting_is_after_regular_end(now_dt: datetime | None = None) -> bool:
+def auto_trade_setting_is_after_regular_end(
+    now_dt: datetime | None = None,
+    state: dict[str, object] | None = None,
+) -> bool:
     """정규장/청산 종료 이후인지 판단한다."""
     current = now_dt or datetime.now()
     current_seconds = current.hour * 3600 + current.minute * 60 + current.second
-    return current_seconds >= auto_trade_setting_regular_end_seconds()
+    return current_seconds >= auto_trade_setting_regular_end_seconds(state)
+
+
+def auto_trade_setting_effective_liquidation_window(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None,
+    now_dt: datetime | None = None,
+) -> dict[str, object]:
+    """Project the frozen liquidation boundary without mutating Runtime state."""
+    current = now_dt or datetime.now()
+    current_seconds = current.hour * 3600 + current.minute * 60 + current.second
+    end_seconds = auto_trade_setting_regular_end_seconds(state)
+    policy, is_individual = effective_liquidation_policy_for_config(config, state)
+    try:
+        minutes = int(str(policy.get("minutes_before_regular_close", "5")).strip() or "5")
+    except (TypeError, ValueError):
+        minutes = 5
+    minutes = max(1, min(100, minutes))
+    start_seconds = max(0, end_seconds - minutes * 60)
+    snapshot = active_operation_policy_snapshot(state)
+    cleanup_lead_seconds = pending_order_cancel_lead_seconds(snapshot)
+    cleanup_start_seconds = regular_end_pending_order_cancel_boundary_seconds(
+        end_seconds,
+        snapshot,
+    )
+    return {
+        "operation_identity": str(snapshot.get("operation_identity") or "").strip(),
+        "regular_end_seconds": end_seconds,
+        "liquidation_start_seconds": start_seconds,
+        "pending_order_cancel_lead_seconds": cleanup_lead_seconds,
+        "pending_order_cancel_start_seconds": cleanup_start_seconds,
+        "minutes_before_regular_close": str(minutes),
+        "method": short_close_method_text(policy.get("method", "이월")) or "이월",
+        "source": "PER_STOCK" if is_individual else "GLOBAL",
+        "entered": current_seconds >= start_seconds,
+        "pending_order_cancel_entered": current_seconds >= cleanup_start_seconds,
+        "ended": current_seconds >= end_seconds,
+    }
 
 
 def auto_trade_setting_has_unresolved_quantity(
@@ -1666,7 +1818,7 @@ def auto_trade_setting_liquidation_active(
         minutes = 5
     current = now_dt or datetime.now()
     current_seconds = current.hour * 3600 + current.minute * 60 + current.second
-    end_seconds = auto_trade_setting_regular_end_seconds()
+    end_seconds = auto_trade_setting_regular_end_seconds(state)
     start_seconds = max(0, end_seconds - minutes * 60)
     return start_seconds <= current_seconds < end_seconds
 

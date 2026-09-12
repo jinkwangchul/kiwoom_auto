@@ -261,10 +261,17 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
                 window, "시장가즉시", selected=[(stock_dir, "005930", "삼성전자")]
             )
 
-        self.assertEqual(2, liquidation_phase_active.call_count)
+        self.assertEqual(3, liquidation_phase_active.call_count)
         self.assertEqual(3, recovery_gate.call_count)
         self.assertEqual(1, execute_command.call_count)
-        self.assertEqual(["CANCELLED", "ACCEPTED"], [call.kwargs["result"] for call in journal.call_args_list])
+        self.assertEqual(
+            ["CANCELLED", "ACCEPTED", "BLOCKED"],
+            [call.kwargs["result"] for call in journal.call_args_list],
+        )
+        self.assertEqual(
+            "RECOVERY_BLOCKED",
+            journal.call_args_list[-1].kwargs["details"]["reason_code"],
+        )
         self.assertEqual("시장가", journal.call_args_list[1].kwargs["details"]["method"])
         self.assertEqual(
             "테스트 루틴 1종목을 조기마감합니다. 진행하시겠습니까?",

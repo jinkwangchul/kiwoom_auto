@@ -7,12 +7,13 @@ gui_auto_trade_context_menu.py
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from PyQt5.QtCore import QEvent, QObject, Qt
+from PyQt5.QtCore import QEvent, QObject, QPoint, Qt
 from PyQt5.QtGui import (
     QColor,
     QIcon,
@@ -47,6 +48,7 @@ from close_liquidation_command import (
     inspect_close_liquidation_availability,
 )
 from gui_user_reason import user_reason_message
+from gui_auto_trade_policy import individual_liquidation_setting_policy_from_state
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -119,12 +121,29 @@ class PersistentContextMenu(QMenu):
             return False
         if action.menu() is not None:
             return False
+        ancestor: object = self
+        while isinstance(ancestor, PersistentContextMenu):
+            if not ancestor.isEnabled():
+                return False
+            if ancestor is self._persistent_root:
+                break
+            ancestor = ancestor.parentWidget()
         registered = self._persistent_root._persistent_handlers.get(id(action))
         if registered is None:
             return False
         handler, terminal = registered
         root = self._persistent_root
-        was_visible = root.isVisible()
+        visible_path: list[tuple[PersistentContextMenu, QPoint, object]] = []
+        current: object = self
+        while isinstance(current, PersistentContextMenu):
+            if current.isVisible():
+                visible_path.append(
+                    (current, QPoint(current.pos()), current.activeAction())
+                )
+            if current is root:
+                break
+            current = current.parentWidget()
+        visible_path.reverse()
         root._persistent_context_invalidated = False
         if action.isCheckable():
             action.toggle()
@@ -132,10 +151,15 @@ class PersistentContextMenu(QMenu):
         if terminal:
             root.close()
         elif not root._persistent_context_invalidated:
-            # A modal dialog temporarily dismisses Qt's popup.  Restore the
-            # same menu instance after the callback, never a rebuilt menu.
-            if was_visible and not root.isVisible():
-                root.show()
+            # A callback refresh or modal Toast can dismiss the complete popup
+            # chain. Restore the same root/submenu instances and active path;
+            # never rebuild the context menu.
+            for popup, position, active_action in visible_path:
+                if not popup.isVisible():
+                    popup.move(position)
+                    popup.show()
+                if active_action is not None:
+                    popup.setActiveAction(active_action)
             self.setActiveAction(action)
         return True
 
@@ -244,7 +268,8 @@ class StockContextMenuCallbacks:
     early_close: Callable[[str], None]
     early_close_profit_loss: Callable[[], None]
     early_close_cancel: Callable[[], None]
-    individual_liquidation: Callable[[str, str], None]
+    individual_liquidation: Callable[[str, str], object]
+    early_close_return_auto: Callable[[], None] | None = None
     open_charts: Callable[[], None] | None = None
     start: Callable[[], None] | None = None
     emergency_stop: Callable[[], None] | None = None
@@ -366,11 +391,25 @@ def inspect_stock_context_menu_availability(
                 "EXCLUSION_UNAVAILABLE",
             )
 
+    structural_target_available = bool(has_selection)
+    if structural_target_available and targets:
+        structural_target_available = all(
+            Path(stock_dir).exists()
+            and bool(normalize_stock_code(str(code or "")))
+            and normalize_stock_code(Path(stock_dir).name.partition("_")[0])
+            == normalize_stock_code(str(code or ""))
+            for stock_dir, code, _name in targets
+        )
+    if has_selection and not structural_target_available:
+        reasons["early_close"] = "CONTEXT_TARGET_INVALID"
+        reasons["early_close_cancel"] = "CONTEXT_TARGET_INVALID"
+        reasons["individual_liquidation"] = "CONTEXT_TARGET_INVALID"
+
     start_allowed = bool(has_selection)
     emergency_stop_allowed = bool(has_selection)
-    early_close_allowed = bool(has_selection and not operation_excluded)
-    early_close_cancel_allowed = bool(has_selection and not operation_excluded)
-    individual_liquidation_allowed = bool(has_selection)
+    early_close_allowed = structural_target_available
+    early_close_cancel_allowed = False
+    individual_liquidation_allowed = structural_target_available
     time_management_allowed = bool(has_selection)
     ats_settings_allowed = bool(has_selection)
     stock_register_allowed = bool(
@@ -395,27 +434,7 @@ def inspect_stock_context_menu_availability(
         for stock_dir, code, name in targets
         if (Path(stock_dir) / "state.json").is_file()
     ]
-    if has_selection and canonical_targets and len(canonical_targets) == len(targets):
-        policy = (
-            operation_policy
-            if isinstance(operation_policy, dict)
-            else _context_menu_operation_policy()
-        )
-        liquidation = policy.get("liquidation", {})
-        liquidation = liquidation if isinstance(liquidation, dict) else {}
-        liquidation_method = str(liquidation.get("method") or "이월").strip()
-        liquidation_minutes = str(
-            liquidation.get("minutes_before_regular_close") or "5"
-        ).strip()
-        early_decisions = [
-            inspect_close_liquidation_availability(
-                parent,
-                stock_dir,
-                code,
-                intent=EARLY_CLOSE_REQUEST,
-            )
-            for stock_dir, code, _name in canonical_targets
-        ]
+    if structural_target_available and canonical_targets and len(canonical_targets) == len(targets):
         cancel_decisions = [
             inspect_close_liquidation_availability(
                 parent,
@@ -425,37 +444,9 @@ def inspect_stock_context_menu_availability(
             )
             for stock_dir, code, _name in canonical_targets
         ]
-        liquidation_decisions = [
-            inspect_close_liquidation_availability(
-                parent,
-                stock_dir,
-                code,
-                intent=INDIVIDUAL_LIQUIDATION,
-                requested_method=liquidation_method,
-                requested_minutes=liquidation_minutes,
-            )
-            for stock_dir, code, _name in canonical_targets
-        ]
-        early_close_allowed = bool(
-            not operation_excluded
-            and all(decision.allowed for decision in early_decisions)
-        )
         early_close_cancel_allowed = bool(
-            not operation_excluded
-            and all(decision.allowed for decision in cancel_decisions)
+            all(decision.allowed for decision in cancel_decisions)
         )
-        individual_liquidation_allowed = all(
-            decision.allowed for decision in liquidation_decisions
-        )
-        if not early_close_allowed:
-            reasons["early_close"] = next(
-                (
-                    decision.reason_code
-                    for decision in early_decisions
-                    if not decision.allowed
-                ),
-                "EARLY_CLOSE_UNAVAILABLE",
-            )
         if not early_close_cancel_allowed:
             reasons["early_close_cancel"] = next(
                 (
@@ -465,24 +456,12 @@ def inspect_stock_context_menu_availability(
                 ),
                 "EARLY_CLOSE_CANCEL_UNAVAILABLE",
             )
-        if not individual_liquidation_allowed:
-            reasons["individual_liquidation"] = next(
-                (
-                    decision.reason_code
-                    for decision in liquidation_decisions
-                    if not decision.allowed
-                ),
-                "INDIVIDUAL_LIQUIDATION_UNAVAILABLE",
-            )
 
     if review_managed:
         for action_key in (
             "start",
             "emergency_stop",
             "exclusion",
-            "early_close",
-            "early_close_cancel",
-            "individual_liquidation",
             "stock_register",
             "unregister",
             "chart",
@@ -491,22 +470,13 @@ def inspect_stock_context_menu_availability(
         start_allowed = False
         emergency_stop_allowed = False
         exclusion_allowed = False
-        early_close_allowed = False
-        early_close_cancel_allowed = False
-        individual_liquidation_allowed = False
         stock_register_allowed = False
         unregister_allowed = False
         chart_allowed = False
     elif excluded_management:
         reasons["emergency_stop"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
-        reasons["early_close"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
-        reasons["early_close_cancel"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
-        reasons["individual_liquidation"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
         reasons["stock_register"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
         emergency_stop_allowed = False
-        early_close_allowed = False
-        early_close_cancel_allowed = False
-        individual_liquidation_allowed = False
         stock_register_allowed = False
 
     return StockContextMenuAvailability(
@@ -752,9 +722,11 @@ def _add_early_close_menu(
     action_early_current = early_close_menu.addAction("현재가")
     action_early_profit_loss = early_close_menu.addAction("손/익절")
     action_early_carry = early_close_menu.addAction("이월")
+    action_early_auto = early_close_menu.addAction("자동마감")
+    action_early_auto.setEnabled(False)
     early_close_menu.addSeparator()
     action_early_cancel = early_close_menu.addAction("취소")
-    early_close_menu.setEnabled(has_selection and not operation_excluded)
+    early_close_menu.setEnabled(has_selection)
     _apply_menu_status(
         (
             ("루틴마감", action_early_routine),
@@ -762,6 +734,7 @@ def _add_early_close_menu(
             ("현재가", action_early_current),
             ("손/익절", action_early_profit_loss),
             ("이월", action_early_carry),
+            ("자동마감", action_early_auto),
             ("취소", action_early_cancel),
         ),
         _selected_policy_menu_label(
@@ -784,6 +757,7 @@ def _add_early_close_menu(
         action_early_current,
         action_early_profit_loss,
         action_early_carry,
+        action_early_auto,
     ):
         set_menu_action_text_color(
             early_close_menu,
@@ -796,6 +770,7 @@ def _add_early_close_menu(
         "current": action_early_current,
         "profit_loss": action_early_profit_loss,
         "carry": action_early_carry,
+        "auto": action_early_auto,
         "cancel": action_early_cancel,
         "menu": early_close_menu,
     }
@@ -808,6 +783,7 @@ def _dispatch_early_close_action(
     apply_method: Callable[[str], None],
     apply_profit_loss: Callable[[], None],
     cancel: Callable[[], None],
+    return_auto: Callable[[], None] | None = None,
 ) -> bool:
     if chosen == actions["routine"]:
         apply_method("루틴")
@@ -819,6 +795,8 @@ def _dispatch_early_close_action(
         apply_profit_loss()
     elif chosen == actions["carry"]:
         apply_method("이월")
+    elif chosen == actions.get("auto") and actions.get("auto") is not None and callable(return_auto):
+        return_auto()
     elif chosen == actions["cancel"]:
         cancel()
     else:
@@ -837,19 +815,6 @@ def _add_individual_liquidation_menu(
     action_individual_current = individual_liquidation_menu.addAction("현재가")
     action_individual_carry = individual_liquidation_menu.addAction("이월")
     individual_liquidation_menu.setEnabled(has_selection)
-    _apply_menu_status(
-        (
-            ("시장가", action_individual_market),
-            ("현재가", action_individual_current),
-            ("이월", action_individual_carry),
-        ),
-        _selected_policy_menu_label(
-            operation_policy,
-            "liquidation",
-            _INDIVIDUAL_LIQUIDATION_MENU_LABELS,
-        ),
-        "individualLiquidationCurrent",
-    )
     individual_policy = operation_policy.get("liquidation", {})
     if not isinstance(individual_policy, dict):
         individual_policy = {}
@@ -880,18 +845,7 @@ def _add_individual_liquidation_menu(
         )
         for minute in minute_values
     )
-    _apply_menu_status(
-        tuple(
-            (f"{minute}분", action)
-            for minute, action in individual_time_actions
-        ),
-        f"{individual_minutes}분",
-        "individualLiquidationMinutesCurrent",
-    )
-    individual_time_menu.setEnabled(
-        has_selection and individual_method != "이월"
-    )
-    return {
+    result = {
         "menu": individual_liquidation_menu,
         "market": action_individual_market,
         "current": action_individual_current,
@@ -900,6 +854,58 @@ def _add_individual_liquidation_menu(
         "method": individual_method,
         "minutes": individual_minutes,
         "time_menu": individual_time_menu,
+        "has_selection": bool(has_selection),
+    }
+    _refresh_individual_liquidation_menu_state(result)
+    return result
+
+
+def _refresh_individual_liquidation_menu_state(
+    individual: dict[str, object],
+    *,
+    method: str | None = None,
+    minutes: str | None = None,
+) -> None:
+    """Refresh one open individual-liquidation menu without rebuilding it."""
+
+    if method in {"시장가", "현재가", "이월"}:
+        individual["method"] = method
+    if minutes is not None and str(minutes).strip():
+        individual["minutes"] = str(minutes).strip()
+    current_method = str(individual.get("method") or "이월")
+    current_minutes = str(individual.get("minutes") or "5")
+    _apply_menu_status(
+        (
+            ("시장가", individual["market"]),
+            ("현재가", individual["current"]),
+            ("이월", individual["carry"]),
+        ),
+        current_method,
+        "individualLiquidationCurrent",
+    )
+    _apply_menu_status(
+        tuple(
+            (f"{minute}분", action)
+            for minute, action in individual["time_actions"]
+        ),
+        f"{current_minutes}분",
+        "individualLiquidationMinutesCurrent",
+    )
+    individual["time_menu"].setEnabled(
+        bool(individual.get("has_selection")) and current_method != "이월"
+    )
+
+
+def _individual_liquidation_action_applied(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if "ok" in result:
+        return result.get("ok") is True
+    return str(result.get("status") or "").strip().upper() in {
+        "APPLIED",
+        "COMPLETED",
+        "REQUESTED",
+        "UPDATED",
     }
 
 
@@ -1262,6 +1268,66 @@ def show_monitor_stock_context_menu(
         return
     operation_policy = _context_menu_operation_policy()
     targets = list(selected_targets or [])
+    selected_individual_policies = [
+        individual_liquidation_setting_policy_from_state(
+            read_json_dict(Path(stock_dir) / "state.json")
+        )
+        for stock_dir, _code, _name in targets
+    ]
+    if (
+        selected_individual_policies
+        and selected_individual_policies[0]
+        and all(
+            policy == selected_individual_policies[0]
+            for policy in selected_individual_policies[1:]
+        )
+    ):
+        operation_policy = deepcopy(operation_policy)
+        operation_policy["liquidation"] = deepcopy(
+            selected_individual_policies[0]
+        )
+    def active_close_context() -> tuple[set[str], bool, bool]:
+        methods: set[str] = set()
+        operation_modes: set[str] = set()
+        for stock_dir, _code, _name in targets:
+            state = read_json_dict(Path(stock_dir) / "state.json")
+            if not state or str(state.get("status") or "").strip().upper() not in {
+                "AUTO_CLOSE",
+                "AUTO_CLOSING",
+                "EARLY_CLOSE",
+                "EARLY_CLOSING",
+            }:
+                continue
+            if not str(
+                state.get("early_close_requested_at")
+                or state.get("auto_close_requested_at")
+                or ""
+            ).strip():
+                continue
+            methods.add(
+                str(
+                    state.get("early_close_method")
+                    or state.get("auto_close_method")
+                    or ""
+                ).strip()
+            )
+            snapshot = state.get("operation_policy_snapshot")
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            operation_modes.add(
+                str(snapshot.get("operation_mode") or "").strip().upper()
+            )
+        active = bool(methods)
+        return methods, active, bool(active and operation_modes == {"SCHEDULED"})
+
+    active_close_methods, active_close_change, active_auto_return = (
+        active_close_context()
+    )
+    if len(active_close_methods) == 1:
+        operation_policy = deepcopy(operation_policy)
+        early_policy = operation_policy.get("early_close")
+        early_policy = deepcopy(early_policy) if isinstance(early_policy, dict) else {}
+        early_policy["method"] = next(iter(active_close_methods))
+        operation_policy["early_close"] = early_policy
     exclusion_action = str(operation_exclusion_action or "").strip().lower()
     if not exclusion_action:
         exclusion_action = "clear" if operation_excluded else "set"
@@ -1307,13 +1373,24 @@ def show_monitor_stock_context_menu(
         operation_excluded=operation_excluded,
         operation_policy=operation_policy,
     )
+    if active_close_change:
+        early_close["menu"].setTitle("마감변경")
     early_close["menu"].setEnabled(
         availability.early_close_allowed
         or availability.early_close_cancel_allowed
+        or active_close_change
     )
     for key in ("routine", "market", "current", "profit_loss", "carry"):
         early_close[key].setEnabled(availability.early_close_allowed)
     early_close["cancel"].setEnabled(availability.early_close_cancel_allowed)
+    auto_return_action = early_close.get("auto")
+    if auto_return_action is not None:
+        auto_return_action.setEnabled(
+            active_auto_return and callbacks.early_close_return_auto is not None
+        )
+        set_visible = getattr(auto_return_action, "setVisible", None)
+        if callable(set_visible):
+            set_visible(active_auto_return)
 
     individual = _add_individual_liquidation_menu(
         menu,
@@ -1390,7 +1467,7 @@ def show_monitor_stock_context_menu(
     )
     _set_disabled_reason(
         early_close["menu"],
-        enabled=(availability.early_close_allowed or availability.early_close_cancel_allowed),
+        enabled=(availability.early_close_allowed or availability.early_close_cancel_allowed or active_close_change),
         reason_code=(
             availability.reason_for("early_close")
             or availability.reason_for("early_close_cancel")
@@ -1409,6 +1486,12 @@ def show_monitor_stock_context_menu(
         enabled=availability.early_close_cancel_allowed,
         reason_code=availability.reason_for("early_close_cancel"),
         fallback="현재 선택한 종목은 조기마감을 취소할 수 없습니다.",
+    )
+    _set_disabled_reason(
+        auto_return_action,
+        enabled=(active_auto_return and callbacks.early_close_return_auto is not None),
+        reason_code="EARLY_AUTO_RETURN_NOT_APPLICABLE",
+        fallback="현재 마감은 자동마감 일정으로 복귀할 수 없습니다.",
     )
     _set_disabled_reason(
         individual["menu"],
@@ -1505,6 +1588,14 @@ def show_monitor_stock_context_menu(
                 operation_policy=_context_menu_operation_policy(),
             )
             menu._stock_context_availability = refreshed
+            (
+                _refreshed_methods,
+                refreshed_active_close,
+                refreshed_auto_return,
+            ) = active_close_context()
+            early_close["menu"].setTitle(
+                "마감변경" if refreshed_active_close else "조기마감"
+            )
             refresh_entry(action_start, refreshed.start_allowed, refreshed.reason_for("start"), "현재 선택한 종목은 운영을 시작할 수 없습니다.")
             refresh_entry(action_emergency_stop, refreshed.emergency_stop_allowed, refreshed.reason_for("emergency_stop"), "현재 선택한 종목은 운영을 정지할 수 없습니다.")
             refresh_entry(action_stock_register, refreshed.stock_register_allowed, refreshed.reason_for("stock_register"), "현재 선택한 종목은 등록할 수 없습니다.")
@@ -1514,13 +1605,31 @@ def show_monitor_stock_context_menu(
             refresh_entry(action_time_reset, refreshed.time_management_allowed, refreshed.reason_for("time_management"), "대상 종목을 선택하세요.")
             refresh_entry(
                 early_close["menu"],
-                refreshed.early_close_allowed or refreshed.early_close_cancel_allowed,
+                refreshed.early_close_allowed
+                or refreshed.early_close_cancel_allowed
+                or refreshed_active_close,
                 refreshed.reason_for("early_close") or refreshed.reason_for("early_close_cancel"),
                 "현재 선택한 종목은 조기마감 설정을 변경할 수 없습니다.",
             )
             for key in ("routine", "market", "current", "profit_loss", "carry"):
-                refresh_entry(early_close[key], refreshed.early_close_allowed, refreshed.reason_for("early_close"), "현재 선택한 종목은 조기마감할 수 없습니다.")
+                refresh_entry(
+                    early_close[key],
+                    refreshed.early_close_allowed,
+                    refreshed.reason_for("early_close"),
+                    "현재 선택한 종목은 조기마감할 수 없습니다.",
+                )
             refresh_entry(early_close["cancel"], refreshed.early_close_cancel_allowed, refreshed.reason_for("early_close_cancel"), "현재 선택한 종목은 조기마감을 취소할 수 없습니다.")
+            refresh_entry(
+                auto_return_action,
+                refreshed_auto_return
+                and callbacks.early_close_return_auto is not None,
+                "EARLY_AUTO_RETURN_NOT_APPLICABLE",
+                "현재 마감은 자동마감 일정으로 복귀할 수 없습니다.",
+            )
+            if auto_return_action is not None:
+                set_visible = getattr(auto_return_action, "setVisible", None)
+                if callable(set_visible):
+                    set_visible(refreshed_auto_return)
             refresh_entry(
                 individual["menu"],
                 refreshed.individual_liquidation_allowed,
@@ -1559,6 +1668,8 @@ def show_monitor_stock_context_menu(
                 option = "EARLY_CLOSE_PROFIT_LOSS"
             elif chosen_action == early_close["carry"]:
                 option = "EARLY_CLOSE_CARRY"
+            elif chosen_action == auto_return_action and auto_return_action is not None:
+                option = "EARLY_CLOSE_RETURN_AUTO"
             elif chosen_action == early_close["cancel"]:
                 option = "EARLY_CLOSE_CANCEL"
             elif chosen_action == individual["market"]:
@@ -1605,14 +1716,33 @@ def show_monitor_stock_context_menu(
                 apply_method=callbacks.early_close,
                 apply_profit_loss=callbacks.early_close_profit_loss,
                 cancel=callbacks.early_close_cancel,
+                return_auto=callbacks.early_close_return_auto,
             ):
                 pass
             elif chosen_action == individual["market"]:
-                callbacks.individual_liquidation("시장가", individual["minutes"])
+                result = callbacks.individual_liquidation(
+                    "시장가", individual["minutes"]
+                )
+                if _individual_liquidation_action_applied(result):
+                    _refresh_individual_liquidation_menu_state(
+                        individual, method="시장가"
+                    )
             elif chosen_action == individual["current"]:
-                callbacks.individual_liquidation("현재가", individual["minutes"])
+                result = callbacks.individual_liquidation(
+                    "현재가", individual["minutes"]
+                )
+                if _individual_liquidation_action_applied(result):
+                    _refresh_individual_liquidation_menu_state(
+                        individual, method="현재가"
+                    )
             elif chosen_action == individual["carry"]:
-                callbacks.individual_liquidation("이월", individual["minutes"])
+                result = callbacks.individual_liquidation(
+                    "이월", individual["minutes"]
+                )
+                if _individual_liquidation_action_applied(result):
+                    _refresh_individual_liquidation_menu_state(
+                        individual, method="이월"
+                    )
             elif chosen_action == action_time_change and callbacks.time_change is not None:
                 callbacks.time_change()
             elif chosen_action == action_time_reset and callbacks.time_reset is not None:
@@ -1627,7 +1757,13 @@ def show_monitor_stock_context_menu(
             else:
                 for minute, time_action in individual["time_actions"]:
                     if chosen_action == time_action:
-                        callbacks.individual_liquidation(individual["method"], minute)
+                        result = callbacks.individual_liquidation(
+                            individual["method"], minute
+                        )
+                        if _individual_liquidation_action_applied(result):
+                            _refresh_individual_liquidation_menu_state(
+                                individual, minutes=minute
+                            )
                         break
             refresh_persistent_state()
 
@@ -1637,7 +1773,18 @@ def show_monitor_stock_context_menu(
             action_open_charts,
             action_time_change,
             action_time_reset,
-            *[early_close[key] for key in ("routine", "market", "current", "profit_loss", "carry", "cancel")],
+            *[
+                early_close[key]
+                for key in (
+                    "routine",
+                    "market",
+                    "current",
+                    "profit_loss",
+                    "carry",
+                    "auto",
+                    "cancel",
+                )
+            ],
             individual["market"],
             individual["current"],
             individual["carry"],
@@ -1694,6 +1841,8 @@ def show_monitor_stock_context_menu(
                 allow(early_close[key], True)
         if availability.early_close_cancel_allowed:
             allow(early_close["cancel"], True)
+        if active_auto_return and callbacks.early_close_return_auto is not None:
+            allow(auto_return_action, True)
     if (
         availability.individual_liquidation_allowed
         and _menu_entry_enabled(individual["menu"])
@@ -1776,6 +1925,7 @@ def show_monitor_stock_context_menu(
         apply_method=callbacks.early_close,
         apply_profit_loss=callbacks.early_close_profit_loss,
         cancel=callbacks.early_close_cancel,
+        return_auto=callbacks.early_close_return_auto,
     ):
         return
     elif chosen == individual["market"]:
@@ -1872,6 +2022,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ),
         early_close_profit_loss=window_callback("apply_selected_early_close_profit_loss"),
         early_close_cancel=window_callback("cancel_selected_early_close"),
+        early_close_return_auto=window_callback("return_selected_early_close_to_auto"),
         individual_liquidation=window_callback(
             "apply_selected_individual_liquidation_method"
         ),

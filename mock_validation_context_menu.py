@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -13,13 +14,17 @@ from PyQt5.QtWidgets import (
 )
 
 from gui_auto_trade_context_menu import (
+    PersistentContextMenu,
     _add_early_close_menu,
     _add_individual_liquidation_menu,
     _add_ats_settings_menu,
     _dispatch_early_close_action,
     _dispatch_ats_settings_action,
+    _individual_liquidation_action_applied,
+    _refresh_individual_liquidation_menu_state,
 )
 from gui_auto_trade_close import ProfitLossEarlyCloseDialog
+from gui_auto_trade_run_control import operation_start_result_summary_toast_text
 
 from gui_main_table_loader import (
     ROUTINE_INSTANCE_ID_ROLE,
@@ -31,7 +36,10 @@ from gui_main_table_loader import (
     ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
 )
 from mock_validation_contract import (
+    MockValidationError,
     instance_effective_settings,
+    instance_individual_liquidation_reservation,
+    mock_instance_active_operation,
     mock_instance_pre_start_editable,
     normalized_stock_code,
 )
@@ -40,6 +48,9 @@ from mock_validation_operation_lifecycle import (
     mock_validation_end_eligibility,
 )
 from mock_validation_quick_chart import open_mock_instance_quick_chart
+
+
+_QT_MENU_CLASS = QMenu
 
 
 @dataclass(frozen=True)
@@ -174,27 +185,61 @@ def _start_mock_instances(
             skipped.append(
                 {
                     "stock_code": target.stock_code,
+                    "stock_name": target.stock_name,
+                    "display_label": " ".join(
+                        part for part in (target.stock_code, target.stock_name) if part
+                    )
+                    + f" / {target.routine_instance_id}",
                     "routine_instance_id": target.routine_instance_id,
                     "reason": str(
-                        state.get("state")
+                        state.get("start_block_reason")
+                        or state.get("state")
                         or state.get("operation_state")
                         or "BLOCKED"
                     ),
                 }
             )
             continue
-        actions.start_instance(target.stock_code, target.routine_instance_id)
+        try:
+            actions.start_instance(target.stock_code, target.routine_instance_id)
+        except MockValidationError as exc:
+            reason = str(exc) or "BLOCKED"
+            if reason != "FINAL_SESSION_ENDED":
+                raise
+            skipped.append(
+                {
+                    "stock_code": target.stock_code,
+                    "stock_name": target.stock_name,
+                    "display_label": " ".join(
+                        part for part in (target.stock_code, target.stock_name) if part
+                    )
+                    + f" / {target.routine_instance_id}",
+                    "routine_instance_id": target.routine_instance_id,
+                    "operation_mode": str(state.get("operation_mode") or ""),
+                    "reason": reason,
+                }
+            )
+            continue
         started.append(
             {
                 "stock_code": target.stock_code,
+                "stock_name": target.stock_name,
                 "routine_instance_id": target.routine_instance_id,
             }
         )
-    return {
+    result = {
         "status": "COMPLETED" if started else "BLOCKED",
         "started": started,
         "skipped": skipped,
+        "requested_count": len(targets),
+        "started_count": len(started),
+        "blocked_count": len(skipped),
+        "blocked_target_details": tuple(skipped),
     }
+    result["summary_toast_message"] = operation_start_result_summary_toast_text(
+        result
+    )
+    return result
 
 
 def _run(window: Any, title: str, operation: Callable[[], dict[str, Any]]) -> None:
@@ -277,17 +322,11 @@ def _apply_mock_individual_liquidation(
     *,
     method: str,
     minutes: Any,
-) -> None:
-    if QMessageBox.question(
-        window,
-        "모의 Instance 개별청산",
-        f"{target.stock_name}의 선택한 Mock Routine Instance를 {method} 청산하시겠습니까?",
-    ) != QMessageBox.Yes:
-        return
-    _run(
-        window,
-        "모의 Instance 개별청산",
-        lambda: _fresh_operation(
+) -> object:
+    captured: dict[str, object] = {}
+
+    def apply() -> dict[str, Any]:
+        result = _fresh_operation(
             window,
             row,
             target,
@@ -297,8 +336,101 @@ def _apply_mock_individual_liquidation(
                 method=method,
                 minutes_before_regular_close=minutes,
             ),
+        )
+        captured["result"] = result
+        return result
+
+    _run(
+        window,
+        "모의 Instance 개별청산",
+        apply,
+    )
+    return captured.get("result")
+
+
+def _apply_mock_ats_liquidation(
+    window: Any,
+    row: int,
+    target: MockContextTarget,
+    actions: Any,
+    *,
+    method: str,
+) -> None:
+    if QMessageBox.question(
+        window,
+        f"모의검증 ATS {method}매도 확인",
+        (
+            f"{target.stock_name}의 선택한 모의검증을 "
+            f"ATS {method} 방식으로 즉시 청산하시겠습니까?"
+        ),
+    ) != QMessageBox.Yes:
+        return
+    _run(
+        window,
+        f"모의검증 ATS {method}매도",
+        lambda: _fresh_operation(
+            window,
+            row,
+            target,
+            lambda current: actions.manual_ats_liquidation_instance(
+                current.stock_code,
+                current.routine_instance_id,
+                method=method,
+            ),
         ),
     )
+
+
+def _individual_liquidation_menu_policy(
+    window: Any,
+    document: dict[str, Any],
+    routine_instance_id: str,
+) -> dict[str, Any]:
+    """Resolve only current individual-liquidation evidence for the menu."""
+
+    host = window.mock_validation_host
+    active_operation = mock_instance_active_operation(
+        document, routine_instance_id
+    )
+    operation_policy = (
+        active_operation.get("operation_policy_snapshot")
+        if isinstance(active_operation, dict)
+        else None
+    )
+    if not isinstance(operation_policy, dict):
+        provider = getattr(host, "_operation_policy_provider", None)
+        operation_policy = provider() if callable(provider) else {}
+    operation_policy = (
+        deepcopy(operation_policy) if isinstance(operation_policy, dict) else {}
+    )
+
+    individual_snapshot = (
+        active_operation.get("individual_liquidation_time_snapshot")
+        if isinstance(active_operation, dict)
+        else None
+    )
+    if not isinstance(individual_snapshot, dict):
+        individual_snapshot = instance_individual_liquidation_reservation(
+            document,
+            routine_instance_id,
+            program_session_id=getattr(host, "_program_session_id", None),
+        )
+    if not isinstance(individual_snapshot, dict):
+        return operation_policy
+
+    method = str(individual_snapshot.get("method") or "").strip().upper()
+    method = {
+        "MARKET": "시장가",
+        "CURRENT_PRICE": "현재가",
+        "CARRYOVER": "이월",
+    }.get(method, method)
+    operation_policy["liquidation"] = {
+        "method": method,
+        "minutes_before_regular_close": str(
+            individual_snapshot.get("minutes_before_regular_close") or ""
+        ).strip(),
+    }
+    return operation_policy
 
 
 def show_mock_monitoring_context_menu(
@@ -319,7 +451,11 @@ def show_mock_monitoring_context_menu(
     actions = getattr(window, "mock_validation_ui_actions", None)
     if actions is None:
         return False
-    menu = QMenu(window.routine_table)
+    menu = (
+        PersistentContextMenu(window.routine_table)
+        if QMenu is _QT_MENU_CLASS
+        else QMenu(window.routine_table)
+    )
     menu.setToolTipsVisible(True)
 
     if target.row_kind == ROUTINE_ROW_MOCK_STOCK:
@@ -389,21 +525,80 @@ def show_mock_monitoring_context_menu(
         provider = getattr(window.mock_validation_host, "_operation_policy_provider", None)
         operation_policy = provider() if callable(provider) else {}
     operation_policy = operation_policy if isinstance(operation_policy, dict) else {}
+    individual_snapshot = (
+        operation.get("individual_liquidation_time_snapshot")
+        if isinstance(operation, dict)
+        else None
+    )
+    if not isinstance(individual_snapshot, dict):
+        individual_snapshot = instance_individual_liquidation_reservation(
+            document, target.routine_instance_id
+        )
+    if isinstance(individual_snapshot, dict):
+        method = str(individual_snapshot.get("method") or "").strip().upper()
+        method = {
+            "MARKET": "시장가",
+            "CURRENT_PRICE": "현재가",
+            "CARRYOVER": "이월",
+        }.get(method, method)
+        operation_policy = deepcopy(operation_policy)
+        operation_policy["liquidation"] = {
+            "method": method,
+            "minutes_before_regular_close": str(
+                individual_snapshot.get("minutes_before_regular_close") or ""
+            ).strip(),
+        }
+    current_close_method = str(
+        operation.get("close_method") if isinstance(operation, dict) else ""
+    ).strip()
+    if current_close_method:
+        operation_policy = deepcopy(operation_policy)
+        early_policy = operation_policy.get("early_close")
+        early_policy = deepcopy(early_policy) if isinstance(early_policy, dict) else {}
+        early_policy["method"] = current_close_method
+        operation_policy["early_close"] = early_policy
     early_close = _add_early_close_menu(
         menu,
         has_selection=True,
         operation_policy=operation_policy,
     )
-    can_early_close = state.get("can_early_close") is True
     can_early_close_cancel = state.get("can_early_close_cancel") is True
-    early_close["menu"].setEnabled(can_early_close or can_early_close_cancel)
+    active_close_change = bool(
+        isinstance(operation, dict)
+        and str(operation.get("close_source") or "").strip().upper()
+        in {"EARLY", "AUTO"}
+        and str(operation.get("state") or "").strip().upper()
+        in {"RUNNING", "CLOSING"}
+    )
+    snapshot_settings = operation_policy.get("mock_instance_effective_settings")
+    snapshot_settings = (
+        snapshot_settings if isinstance(snapshot_settings, dict) else operation_policy
+    )
+    active_auto_return = bool(
+        active_close_change
+        and str(snapshot_settings.get("operation_mode") or "").strip().upper()
+        == "SCHEDULED"
+    )
+    if active_close_change:
+        early_close["menu"].setTitle("마감변경")
+    early_close["menu"].setEnabled(True)
     for key in ("routine", "market", "current", "profit_loss", "carry"):
-        early_close[key].setEnabled(can_early_close)
+        early_close[key].setEnabled(True)
     early_close["cancel"].setEnabled(can_early_close_cancel)
+    if early_close.get("auto") is not None:
+        early_close["auto"].setEnabled(active_auto_return)
+        set_visible = getattr(early_close["auto"], "setVisible", None)
+        if callable(set_visible):
+            set_visible(active_auto_return)
+    individual_policy = _individual_liquidation_menu_policy(
+        window,
+        document,
+        target.routine_instance_id,
+    )
     individual = _add_individual_liquidation_menu(
         menu,
-        has_selection=state.get("can_immediate") is True,
-        operation_policy=operation_policy,
+        has_selection=True,
+        operation_policy=individual_policy,
     )
     settings = instance_effective_settings(document, target.routine_instance_id)
     settings_editable = mock_instance_pre_start_editable(
@@ -446,7 +641,54 @@ def show_mock_monitoring_context_menu(
     unregister_action = menu.addAction("등록해제")
     unregister_action.setEnabled(unregister_eligibility.get("eligible") is True)
 
+    registrar = getattr(menu, "register_persistent_action", None)
+    if callable(registrar):
+        def apply_individual_setting(method: str, minutes: str) -> None:
+            current = mock_context_target_for_row(window, row)
+            if current != target:
+                menu.invalidate_persistent_context()
+                return
+            result = _apply_mock_individual_liquidation(
+                window,
+                row,
+                target,
+                actions,
+                method=method,
+                minutes=minutes,
+            )
+            if _individual_liquidation_action_applied(result):
+                _refresh_individual_liquidation_menu_state(
+                    individual,
+                    method=method,
+                    minutes=minutes,
+                )
+
+        registrar(
+            individual["market"],
+            lambda: apply_individual_setting("시장가", individual["minutes"]),
+        )
+        registrar(
+            individual["current"],
+            lambda: apply_individual_setting("현재가", individual["minutes"]),
+        )
+        registrar(
+            individual["carry"],
+            lambda: apply_individual_setting("이월", individual["minutes"]),
+        )
+        for minute, time_action in individual["time_actions"]:
+            registrar(
+                time_action,
+                lambda value=minute: apply_individual_setting(
+                    individual["method"], value
+                ),
+            )
+
     chosen = menu.exec_(window.routine_table.viewport().mapToGlobal(position))
+    if callable(registrar) and (
+        chosen in {individual["market"], individual["current"], individual["carry"]}
+        or any(chosen is action for _minute, action in individual["time_actions"])
+    ):
+        return True
     if chosen is start_action and start_action.isEnabled():
         _run(
             window,
@@ -502,6 +744,18 @@ def show_mock_monitoring_context_menu(
                 ),
             ),
         ),
+        return_auto=lambda: _run(
+            window,
+            "모의 Instance 자동마감 복귀",
+            lambda: _fresh_operation(
+                window,
+                row,
+                target,
+                lambda current: actions.return_early_close_to_auto_instance(
+                    current.stock_code, current.routine_instance_id
+                ),
+            ),
+        ),
     ):
         pass
     elif chosen in {individual["market"], individual["current"], individual["carry"]}:
@@ -550,13 +804,12 @@ def show_mock_monitoring_context_menu(
         toggle=lambda key, enabled, label: window.set_mock_routine_instance_ats_flag(
             row, key, enabled, label
         ),
-        liquidate=lambda method, *_args: _apply_mock_individual_liquidation(
+        liquidate=lambda method, *_args: _apply_mock_ats_liquidation(
             window,
             row,
             target,
             actions,
             method=method,
-            minutes=individual["minutes"],
         ),
     ):
         pass

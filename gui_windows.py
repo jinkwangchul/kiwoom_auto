@@ -1512,6 +1512,7 @@ from gui_auto_trade_run_control import (
     auto_trade_registered_operation_targets,
     auto_trade_running_registered_operation_targets,
     auto_trade_update_global_operation_button_state,
+    expire_stale_next_operation_individual_liquidation_reservations,
     execute_operation_start_command,
     show_auto_trade_operation_failure_dialog,
 )
@@ -4353,6 +4354,10 @@ class MainWindow(QMainWindow):
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
         self._mock_validation_ui_enabled = True
+
+        self._individual_liquidation_restart_expiration_result = (
+            expire_stale_next_operation_individual_liquidation_reservations()
+        )
 
         self._setup_ui()
         self._apply_main_control_window_width()

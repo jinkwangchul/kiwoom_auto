@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import gui_auto_trade_status_ops as status_ops
 import operation_policy_gate
@@ -54,6 +54,56 @@ class AutoCloseRuntimePolicySnapshotTest(unittest.TestCase):
             },
         )
 
+    def test_time_trigger_with_zero_holding_does_not_enter_auto_close(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_test"
+            stock_dir.mkdir()
+            state_path = stock_dir / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "trade_started_at": "2026-07-27 09:00:00",
+                        "holding_qty": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "config.json").write_text(
+                json.dumps({"operation_mode": "SCHEDULED"}),
+                encoding="utf-8",
+            )
+
+            class Window:
+                update_stock_status = Mock()
+
+            with (
+                patch.object(
+                    status_ops,
+                    "status_after_operation_mode_change",
+                    return_value="AUTO_CLOSE",
+                ),
+                patch.object(
+                    status_ops,
+                    "read_operation_policy",
+                    return_value={"auto_close": {"method": "시장가"}},
+                ),
+            ):
+                result = status_ops.auto_trade_recalculate_stock_status_by_operation_policy(
+                    Window(),
+                    stock_dir,
+                    "005930",
+                    "test",
+                    "timer",
+                    silent_unchanged=True,
+                )
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(("unchanged", "RUNNING", "RUNNING"), result)
+        self.assertNotIn("auto_close_requested_at", saved)
+        Window.update_stock_status.assert_not_called()
+
     def test_recalculation_writer_captures_and_preserves_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             stock_dir = Path(temp_dir) / "005930_test"
@@ -88,6 +138,8 @@ class AutoCloseRuntimePolicySnapshotTest(unittest.TestCase):
                         "status": "RUNNING",
                         "trade_enabled": True,
                         "trade_started_at": "2026-07-27 09:00:00",
+                        "holding_qty": 3,
+                        "avg_price": 100,
                     }
                 ),
                 encoding="utf-8",

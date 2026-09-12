@@ -25,14 +25,17 @@ from gui_auto_trade_integrity import (
     is_review_required_state,
 )
 from gui_auto_trade_policy import (
+    active_operation_policy_snapshot,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_early_close_requested,
+    auto_trade_setting_effective_liquidation_window,
     auto_trade_setting_has_close_progress_quantity,
     auto_trade_setting_individual_liquidation_window_entered,
     auto_trade_setting_liquidation_phase_active,
     auto_trade_setting_trade_started,
     effective_liquidation_policy_for_config,
     individual_liquidation_policy_from_state,
+    pending_individual_liquidation_policy_from_state,
     short_close_method_text,
 )
 from gui_ats_utils import manual_ats_active_now
@@ -42,7 +45,7 @@ from manual_ats_liquidation_service import (
     ensure_manual_ats_liquidation_request,
     normalize_manual_ats_sell_method,
 )
-from manual_ats_runtime import manual_ats_runtime_selected_keys
+from manual_ats_runtime import PROGRAM_SESSION_ID, manual_ats_runtime_selected_keys
 from operation_command_service import (
     COMMAND_INDIVIDUAL_LIQUIDATION,
     IndividualLiquidationOverride,
@@ -60,7 +63,7 @@ from operation_command_service import (
 from order_candidate_engine import get_real_holding_qty
 from operation_policy_gate import write_global_operation_closing_state
 from runtime_io import read_json_dict
-from state_policy import normalize_operation_mode
+from state_policy import normalize_operation_mode, seconds_from_hhmmss
 from transition_evidence_reader import COMMAND_REQUEST_SCOPE, TransitionEvidenceScope
 from transition_production_guard import evaluate_production_transition
 
@@ -195,6 +198,66 @@ def _connection_ready(owner: object | None) -> bool | None:
         return False
 
 
+def _early_close_time_reason(
+    config: dict[str, object],
+    state: dict[str, object],
+    now_dt: datetime | None,
+) -> str:
+    """Return the active Operation's Early-Close time block reason.
+
+    The active Operation snapshot is authoritative.  Legacy states without an
+    Operation snapshot retain their existing admission behavior; recovery and
+    integrity layers remain responsible for damaged active state.
+    """
+
+    snapshot = active_operation_policy_snapshot(state)
+    if not snapshot:
+        return ""
+    current = now_dt or datetime.now()
+    current_seconds = current.hour * 3600 + current.minute * 60 + current.second
+    boundary = auto_trade_setting_effective_liquidation_window(
+        config,
+        state,
+        now_dt=current,
+    )
+    liquidation_start = safe_int_value(
+        boundary.get("liquidation_start_seconds"),
+        -1,
+    )
+    if liquidation_start < 0 or current_seconds >= liquidation_start:
+        return "LIQUIDATION_IN_PROGRESS"
+
+    mode = normalize_operation_mode(
+        snapshot.get("operation_mode") or config.get("operation_mode", "SCHEDULED")
+    )
+    if mode == "SCHEDULED":
+        schedule = snapshot.get("operation_schedule")
+        schedule = schedule if isinstance(schedule, dict) else {}
+        start_seconds = seconds_from_hhmmss(
+            schedule.get("start_time"),
+            "09:00:00",
+        )
+        end_seconds = seconds_from_hhmmss(
+            schedule.get("end_buy_time"),
+            "15:20:00",
+        )
+        if current_seconds < start_seconds:
+            return "OUTSIDE_REGULAR_MARKET"
+        if current_seconds > end_seconds:
+            return "SCHEDULED_OPERATION_WINDOW_ENDED"
+        return ""
+
+    regular = snapshot.get("regular_market")
+    regular = regular if isinstance(regular, dict) else {}
+    start_seconds = seconds_from_hhmmss(
+        regular.get("start_time"),
+        "09:00:00",
+    )
+    if current_seconds < start_seconds:
+        return "OUTSIDE_REGULAR_MARKET"
+    return ""
+
+
 def inspect_close_liquidation_availability(
     owner: object | None,
     stock_dir: str | Path,
@@ -238,9 +301,10 @@ def inspect_close_liquidation_availability(
     if not isinstance(config, dict):
         config = {}
 
+    runtime_operation_started = auto_trade_setting_trade_started(state)
     participant = auto_trade_setting_current_session_trade_started(
         owner,
-        auto_trade_setting_trade_started(state),
+        runtime_operation_started,
         code,
     )
     review_required = is_review_required_state(state)
@@ -311,39 +375,41 @@ def inspect_close_liquidation_availability(
             command_id=command_id,
         )
 
-    if review_required:
-        return _blocked(reason_code="REVIEW_REQUIRED", **common)
-    if emergency_stopped:
-        return _blocked(reason_code="EMERGENCY_STOPPED", **common)
-    if not participant:
-        return _blocked(reason_code="NOT_CURRENT_PARTICIPANT", **common)
-
-    if normalized_intent == EARLY_CLOSE_REQUEST and _connection_ready(owner) is False:
-        return _blocked(reason_code="SERVER_NOT_CONNECTED", **common)
-
-    recovery_caller_name = (
-        "INDIVIDUAL_LIQUIDATION_REQUEST"
-        if normalized_intent == INDIVIDUAL_LIQUIDATION
-        else normalized_intent
-    )
-    recovery = _recovery_decision(
-        owner,
-        code,
-        recovery_caller_name,
-        recovery_inspector,
-    )
-    if recovery is not None and getattr(recovery, "allowed", False) is not True:
-        recovery_reason = str(
-            getattr(recovery, "reason_code", "") or "RECOVERY_BLOCKED"
-        ).strip()
-        return _blocked(
-            reason_code=recovery_reason,
-            recovery_blocked=True,
-            evidence=tuple(getattr(recovery, "evidence", ()) or ()),
-            **common,
+    if normalized_intent == MANUAL_ATS_LIQUIDATION:
+        if review_required:
+            return _blocked(reason_code="REVIEW_REQUIRED", **common)
+        if emergency_stopped:
+            return _blocked(reason_code="EMERGENCY_STOPPED", **common)
+        if not participant:
+            return _blocked(reason_code="NOT_CURRENT_PARTICIPANT", **common)
+        recovery = _recovery_decision(
+            owner,
+            code,
+            normalized_intent,
+            recovery_inspector,
         )
+        if recovery is not None and getattr(recovery, "allowed", False) is not True:
+            return _blocked(
+                reason_code=str(
+                    getattr(recovery, "reason_code", "") or "RECOVERY_BLOCKED"
+                ).strip(),
+                recovery_blocked=True,
+                evidence=tuple(getattr(recovery, "evidence", ()) or ()),
+                **common,
+            )
+
+    if normalized_intent in {EARLY_CLOSE_REQUEST, INDIVIDUAL_LIQUIDATION}:
+        if _connection_ready(owner) is False:
+            return _blocked(reason_code="SERVER_NOT_CONNECTED", **common)
+        if normalized_intent == EARLY_CLOSE_REQUEST and holding_qty <= 0:
+            return _blocked(reason_code="NO_HOLDING", **common)
+        if normalized_intent == EARLY_CLOSE_REQUEST and not participant:
+            return _blocked(reason_code="NOT_CURRENT_PARTICIPANT", **common)
 
     if normalized_intent == EARLY_CLOSE_REQUEST:
+        time_reason = _early_close_time_reason(config, state, now_dt)
+        if time_reason:
+            return _blocked(reason_code=time_reason, **common)
         if auto_trade_setting_liquidation_phase_active(
             config,
             holding_qty,
@@ -352,16 +418,42 @@ def inspect_close_liquidation_availability(
         ):
             return _blocked(reason_code="LIQUIDATION_IN_PROGRESS", **common)
     elif normalized_intent == INDIVIDUAL_LIQUIDATION:
+        if not participant and runtime_operation_started:
+            return _blocked(reason_code="NOT_CURRENT_PARTICIPANT", **common)
         normalized_method = short_close_method_text(requested_method)
         if normalized_method not in {"시장가", "현재가", "이월"}:
             return _blocked(reason_code="INVALID_LIQUIDATION_METHOD", **common)
-        if holding_qty <= 0:
-            return _blocked(reason_code="NO_HOLDING", **common)
-        current_override = individual_liquidation_policy_from_state(state)
+        window_entered = bool(
+            participant
+            and (
+                auto_trade_setting_effective_liquidation_window(
+                    config, state, now_dt=now_dt
+                ).get("entered")
+                if normalized_method == "이월"
+                else auto_trade_setting_individual_liquidation_window_entered(
+                    state,
+                    now_dt=now_dt,
+                    candidate_minutes_before_regular_close=requested_minutes,
+                )
+            )
+        )
+        if window_entered:
+            return _blocked(
+                reason_code="LIQUIDATION_TIME_WINDOW_ENTERED",
+                **common,
+            )
+        current_override = (
+            individual_liquidation_policy_from_state(state)
+            if participant
+            else pending_individual_liquidation_policy_from_state(state)
+        )
         current_minutes = str(
             current_override.get("minutes_before_regular_close") or ""
         ).strip()
-        clean_minutes = str(requested_minutes or "").strip() or "5"
+        clean_minutes = (
+            "" if normalized_method == "이월"
+            else str(requested_minutes or "").strip() or "5"
+        )
         if (
             current_override
             and short_close_method_text(current_override.get("method"))
@@ -380,6 +472,33 @@ def inspect_close_liquidation_availability(
             return _blocked(reason_code="NO_HOLDING", **common)
         if not normalize_manual_ats_sell_method(requested_method):
             return _blocked(reason_code="INVALID_LIQUIDATION_METHOD", **common)
+
+    if normalized_intent != MANUAL_ATS_LIQUIDATION:
+        recovery_caller_name = (
+            "INDIVIDUAL_LIQUIDATION_REQUEST"
+            if normalized_intent == INDIVIDUAL_LIQUIDATION
+            else normalized_intent
+        )
+        recovery = _recovery_decision(
+            owner,
+            code,
+            recovery_caller_name,
+            recovery_inspector,
+        )
+        if recovery is not None and getattr(recovery, "allowed", False) is not True:
+            recovery_reason = str(
+                getattr(recovery, "reason_code", "") or "RECOVERY_BLOCKED"
+            ).strip()
+            return _blocked(
+                reason_code=recovery_reason,
+                recovery_blocked=True,
+                evidence=tuple(getattr(recovery, "evidence", ()) or ()),
+                **common,
+            )
+        if review_required:
+            return _blocked(reason_code="REVIEW_REQUIRED", **common)
+        if emergency_stopped:
+            return _blocked(reason_code="EMERGENCY_STOPPED", **common)
 
     return CloseLiquidationAvailability(
         True,
@@ -463,7 +582,10 @@ def execute_individual_liquidation_command(
     stock_path = Path(stock_dir)
     code = str(stock_code or "").strip()
     normalized_method = short_close_method_text(method)
-    minutes = str(minutes_before_regular_close or "").strip() or "5"
+    minutes = (
+        "" if normalized_method == "이월"
+        else str(minutes_before_regular_close or "").strip() or "5"
+    )
     availability = inspect_close_liquidation_availability(
         owner,
         stock_path,
@@ -529,10 +651,19 @@ def execute_individual_liquidation_command(
             operation_command_id=current_command_id,
         ),
         liquidation_time_window_entered=(
-            auto_trade_setting_individual_liquidation_window_entered(
-                state,
-                now_dt=now_dt,
-                candidate_minutes_before_regular_close=minutes,
+            availability.current_session_participant
+            and (
+                bool(
+                    auto_trade_setting_effective_liquidation_window(
+                        config, state, now_dt=now_dt
+                    ).get("entered")
+                )
+                if normalized_method == "이월"
+                else auto_trade_setting_individual_liquidation_window_entered(
+                    state,
+                    now_dt=now_dt,
+                    candidate_minutes_before_regular_close=minutes,
+                )
             )
         ),
     )
@@ -563,6 +694,12 @@ def execute_individual_liquidation_command(
         IndividualLiquidationOverride(
             method=normalized_method,
             minutes_before_regular_close=minutes,
+            program_session_id=PROGRAM_SESSION_ID,
+            reservation_scope=(
+                "CURRENT_OPERATION"
+                if availability.current_session_participant
+                else "NEXT_OPERATION"
+            ),
         ),
     )
     stock_result = result.stock_results[0] if result.stock_results else None

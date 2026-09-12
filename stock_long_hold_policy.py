@@ -84,6 +84,12 @@ def final_close_liquidation_method(state: dict[str, Any] | None) -> str:
     if not isinstance(state, dict):
         return ""
 
+    liquidation_execution = state.get("liquidation_execution")
+    if isinstance(liquidation_execution, dict):
+        method = normalized_close_method(liquidation_execution.get("method"))
+        if method:
+            return method
+
     request = state.get("individual_liquidation_request")
     if isinstance(request, dict):
         status = str(request.get("status") or "").strip().upper()
@@ -105,9 +111,12 @@ def has_active_individual_liquidation_request(
     if not isinstance(state, dict):
         return False
     request = state.get("individual_liquidation_request")
-    return isinstance(request, dict) and str(
-        request.get("status") or ""
-    ).strip().upper() == "REQUESTED"
+    return (
+        isinstance(request, dict)
+        and str(request.get("status") or "").strip().upper() == "REQUESTED"
+        and str(request.get("reservation_scope") or "").strip().upper()
+        != "NEXT_OPERATION"
+    )
 
 
 def _text(value: object) -> str:
@@ -189,6 +198,14 @@ def classify_termination_route(
 
     mode = _normalized_operation_mode(operation_mode)
     status = _upper(state.get("status"))
+    liquidation_execution = state.get("liquidation_execution")
+    liquidation_execution = (
+        liquidation_execution if isinstance(liquidation_execution, dict) else {}
+    )
+    liquidation_phase = _upper(liquidation_execution.get("phase"))
+    liquidation_provenance = _upper(
+        liquidation_execution.get("termination_provenance")
+    )
     individual = state.get("individual_liquidation_request")
     individual = individual if isinstance(individual, dict) else {}
     ats_request = state.get("manual_ats_liquidation_request")
@@ -244,7 +261,8 @@ def classify_termination_route(
         "",
     )
     close_entry_evidence = bool(
-        individual
+        liquidation_execution
+        or individual
         or _text(state.get("auto_close_requested_at"))
         or _text(state.get("early_close_requested_at"))
         or _text(state.get("liquidation_method"))
@@ -257,13 +275,15 @@ def classify_termination_route(
     )
     ats_termination_evidence = bool(ats_request)
     actual_execution = bool(
-        ats_status in _ATS_TERMINATION_EXECUTED_STATUSES
+        liquidation_phase in {"ACTIVE", "COMPLETED", "REVIEW_REQUIRED"}
+        or ats_status in _ATS_TERMINATION_EXECUTED_STATUSES
         or queue_evidence["dispatch_evidence"]
         or status in _CLOSE_TERMINAL_STATUSES
         or completion_timestamp
     )
     route_completed = bool(
-        ats_status == "COMPLETED"
+        liquidation_phase in {"COMPLETED", "REVIEW_REQUIRED"}
+        or ats_status == "COMPLETED"
         or queue_evidence["terminal_evidence"]
         or status in _CLOSE_TERMINAL_STATUSES
         or completion_timestamp
@@ -282,12 +302,34 @@ def classify_termination_route(
         }
 
     if close_entry_evidence:
-        route = ROUTE_CARRYOVER if method == "CARRYOVER" else ROUTE_CLOSE_INTENT
+        liquidation_failure = bool(
+            liquidation_execution
+            and (
+                liquidation_phase == "REVIEW_REQUIRED"
+                or "FAILURE" in liquidation_provenance
+                or liquidation_provenance.endswith("_RESIDUAL")
+            )
+        )
+        successful_liquidation_carryover = bool(
+            liquidation_execution
+            and liquidation_phase == "COMPLETED"
+            and liquidation_provenance == "LIQUIDATION_CARRYOVER"
+        )
+        close_stage_carryover = bool(
+            not liquidation_execution and method == "CARRYOVER"
+        )
+        route = (
+            ROUTE_CARRYOVER
+            if successful_liquidation_carryover or close_stage_carryover
+            else ROUTE_CLOSE_INTENT
+        )
         return {
             "route": route,
             "method": method,
             "source": (
-                "INDIVIDUAL_LIQUIDATION_REQUEST"
+                "LIQUIDATION_EXECUTION"
+                if liquidation_execution
+                else "INDIVIDUAL_LIQUIDATION_REQUEST"
                 if individual
                 else "CLOSE_RUNTIME_EVIDENCE"
             ),
@@ -295,7 +337,16 @@ def classify_termination_route(
                 route_completed or (route == ROUTE_CARRYOVER and final_session_ended)
             ),
             "actual_termination_executed": actual_execution,
-            "safety_issue": bool(individual_status and not individual_method),
+            "safety_issue": bool(
+                liquidation_failure
+                or (
+                    liquidation_execution
+                    and method == "CARRYOVER"
+                    and liquidation_phase in {"COMPLETED", "REVIEW_REQUIRED"}
+                    and not successful_liquidation_carryover
+                )
+                or (individual_status and not individual_method)
+            ),
             "request_status": individual_status,
             "queue_evidence": queue_evidence,
         }

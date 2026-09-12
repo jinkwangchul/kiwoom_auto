@@ -1546,6 +1546,182 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
             projected["sell_signal_markers"][0]["signal_bar_time"],
         )
 
+    def test_validation_stopped_pre_start_uses_next_settings_across_main_menu_and_chart(self):
+        self.actions.set_instance_effective_settings(
+            "005930",
+            "A",
+            operation_mode="CONTINUOUS",
+            manual_ats={"selected_sessions": ["extra2"]},
+        )
+        self.host.start_instance_operation("005930", "A", as_of=self.clock["now"])
+        current = self.host.current_session("005930")
+        self.host.session_service.set_instance_position(
+            current["session"]["validation_session_id"],
+            "A",
+            holding_qty=1,
+            available_qty=1,
+            average_price=100,
+            realized_cost_basis=100,
+            command_id="MC-stop-display-position-A",
+        )
+        self.host.request_instance_early_close(
+            "005930", "A", method="ROUTINE", as_of=self.clock["now"]
+        )
+        stopped = self.host.stop_instance_validation(
+            "005930", "A", command_id="MC-stop-before-next-display-A"
+        )["document"]
+        past_operation = deepcopy(
+            stopped["mock_operation_lifecycle"]["instance_operations"]["A"]
+        )
+        frozen_reference = deepcopy(stopped["reference_snapshot"])
+        self.assertEqual("VALIDATION_STOPPED", past_operation["state"])
+        self.assertEqual("VALIDATION_STOP", past_operation["close_source"])
+        self.assertEqual("ROUTINE", past_operation["close_method"])
+        self.assertEqual(
+            ["extra2"],
+            past_operation["operation_policy_snapshot"][
+                "mock_instance_effective_settings"
+            ]["manual_ats"]["selected_sessions"],
+        )
+
+        self.actions.set_instance_effective_settings(
+            "005930",
+            "A",
+            operation_mode="CONTINUOUS",
+            manual_ats={"selected_sessions": []},
+        )
+        owner, table, _controller = self._table_window()
+        row = self._row(table, "A")
+        values = table.item(row, 0).data(
+            main_table_loader.ROUTINE_STOCK_VALUES_ROLE
+        )
+        self.assertEqual("수동", values[2])
+        self.assertEqual("감시/대기", values[4])
+        self.assertEqual("-", values[6])
+
+        target = context_menu.mock_context_target_for_row(owner, row)
+        position = table.visualItemRect(table.item(row, 0)).center()
+
+        class CapturingMenu(QMenu):
+            root = None
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                CapturingMenu.root = self
+
+            def exec_(self, _position):
+                return None
+
+        with patch.object(context_menu, "QMenu", CapturingMenu):
+            self.assertTrue(
+                context_menu.show_mock_monitoring_context_menu(
+                    owner,
+                    position,
+                    expected_row_kind=main_table_loader.ROUTINE_ROW_MOCK_INSTANCE,
+                )
+            )
+        root_actions = CapturingMenu.root.actions()
+        self.assertTrue(
+            next(action for action in root_actions if action.text() == "운영시작").isEnabled()
+        )
+        ats_menu = next(
+            action.menu()
+            for action in root_actions
+            if action.menu() is not None and action.menu().title() == "ATS설정"
+        )
+        self.assertTrue(ats_menu.isEnabled())
+        session_actions = [
+            action
+            for action in ats_menu.actions()
+            if action.property("atsSessionKey")
+        ]
+        self.assertTrue(session_actions)
+        self.assertTrue(all(action.isEnabled() for action in session_actions))
+        self.assertTrue(
+            all(action.property("atsSessionCurrent") is False for action in session_actions)
+        )
+
+        projected = quick_chart._projection(
+            owner, target, "005930", self.clock["now"].date().isoformat()
+        )
+        self.assertEqual("수동", projected["chart_operation_method_label"])
+        self.assertEqual(
+            "-", projected["operation_header_display"]["liquidation"]
+        )
+        self.assertFalse(
+            projected["operation_header_display"]["liquidation_has_policy"]
+        )
+        chart = quick_chart.MockInstanceQuickChartWindow(owner, target)
+        self.addCleanup(chart.close)
+        self.assertEqual("수동", chart.header_badges["operation_method"].text())
+        self.assertEqual("· -", chart.operation_info_labels["liquidation"].text())
+        self.assertIn(
+            AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR.lower(),
+            chart.operation_info_labels["liquidation"].styleSheet().lower(),
+        )
+
+        self.actions.set_instance_effective_settings(
+            "005930",
+            "A",
+            operation_mode="SCHEDULED",
+            operation_schedule={
+                "start_time": "10:00:00",
+                "end_buy_time": "13:00:00",
+            },
+        )
+        main_table_loader._load_mock_routine_table(owner)
+        row = self._row(table, "A")
+        values = table.item(row, 0).data(
+            main_table_loader.ROUTINE_STOCK_VALUES_ROLE
+        )
+        tokens = table.item(row, 0).data(
+            main_table_loader.ROUTINE_STOCK_DISPLAY_ROLE
+        )
+        self.assertEqual("10:00~13:00", values[2])
+        self.assertEqual("감시/대기", values[4])
+        self.assertEqual("5분/시장가", values[6])
+        self.assertEqual("#f4f5f7", tokens[6]["background"])
+        position = table.visualItemRect(table.item(row, 0)).center()
+        with patch.object(context_menu, "QMenu", CapturingMenu):
+            context_menu.show_mock_monitoring_context_menu(
+                owner,
+                position,
+                expected_row_kind=main_table_loader.ROUTINE_ROW_MOCK_INSTANCE,
+            )
+        root_actions = CapturingMenu.root.actions()
+        self.assertTrue(
+            next(action for action in root_actions if action.text() == "시간변경").isEnabled()
+        )
+        self.assertTrue(
+            next(action for action in root_actions if action.text() == "변경리셋").isEnabled()
+        )
+
+        scheduled = quick_chart._projection(
+            owner, target, "005930", self.clock["now"].date().isoformat()
+        )
+        scheduled_header = scheduled["operation_header_display"]
+        self.assertEqual("5분/시장가", scheduled_header["liquidation"])
+        self.assertTrue(scheduled_header["liquidation_has_policy"])
+        self.assertFalse(scheduled_header["liquidation_cell_active"])
+        chart.last_projection = scheduled
+        chart._update_operation_button_state()
+        self.assertEqual(
+            "· 5분/시장가", chart.operation_info_labels["liquidation"].text()
+        )
+        self.assertIn(
+            AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR.lower(),
+            chart.operation_info_labels["liquidation"].styleSheet().lower(),
+        )
+
+        current = self.host.current_session("005930")
+        self.assertEqual(
+            past_operation,
+            current["mock_operation_lifecycle"]["instance_operations"]["A"],
+        )
+        self.assertEqual(frozen_reference, current["reference_snapshot"])
+        self.assertIsNone(current["mock_operation_lifecycle"]["current"])
+        self.assertFalse(current["instance_execution"]["A"]["progression_allowed"])
+
     def test_continuous_ats_after_hours_stays_waiting_in_main_and_quick_chart(self):
         after_hours = NOW.replace(hour=21, minute=15)
         self.clock["now"] = after_hours
@@ -1565,6 +1741,7 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
                 "minutes_before_regular_close": 5,
                 "method": "시장가",
             },
+            "review_policy": {"long_term_holding_enabled": True},
         }
         self.actions.set_instance_effective_settings(
             "005930",
@@ -1572,13 +1749,40 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
             operation_mode="CONTINUOUS",
             manual_ats={"selected_sessions": ["extra1"]},
         )
-        self.host.start_instance_operation("005930", "A", as_of=after_hours)
+        self.host.start_instance_operation(
+            "005930",
+            "A",
+            as_of=NOW.replace(hour=16, minute=0),
+        )
+        current = self.host.current_session("005930")
+        self.host.session_service.set_instance_position(
+            current["session"]["validation_session_id"],
+            "A",
+            holding_qty=2,
+            available_qty=2,
+            average_price=100,
+            realized_cost_basis=200,
+            command_id="MC-ats-normal-termination-position",
+        )
+
+        owner, table, _controller = self._table_window()
+        row = self._row(table, "A")
+        target = context_menu.mock_context_target_for_row(owner, row)
+        projected = quick_chart._projection(
+            owner, target, "005930", after_hours.date().isoformat()
+        )
+        header = projected["operation_header_display"]
+        self.assertEqual("감시/대기", header["status"])
+        self.assertEqual("-", header["liquidation"])
+        self.assertFalse(header["liquidation_has_policy"])
 
         self.host.process_due_cycles(as_of=after_hours)
 
         document = self.host.current_session("005930")
         operation = document["mock_operation_lifecycle"]["instance_operations"]["A"]
-        self.assertEqual("RUNNING", document["instance_execution"]["A"]["state"])
+        self.assertEqual("ENDED", document["instance_execution"]["A"]["state"])
+        self.assertEqual("CARRYOVER_DONE", operation["outcome"])
+        self.assertEqual("ATS_FINAL_NO_TERMINATION", operation["termination_provenance"])
         self.assertEqual("", operation["close_source"])
         self.assertEqual("", operation["close_method"])
         self.assertFalse(operation["close_pending"])
@@ -1590,15 +1794,6 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
         )
         self.assertEqual("감시/대기", values[4])
         self.assertEqual("-", values[6])
-
-        target = context_menu.mock_context_target_for_row(owner, row)
-        projected = quick_chart._projection(
-            owner, target, "005930", after_hours.date().isoformat()
-        )
-        header = projected["operation_header_display"]
-        self.assertEqual("감시/대기", header["status"])
-        self.assertEqual("-", header["liquidation"])
-        self.assertFalse(header["liquidation_has_policy"])
 
     def test_open_mock_chart_header_timer_uses_fresh_document_and_host_time(self):
         self.host._operation_policy_provider = lambda: {
@@ -1667,7 +1862,7 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
             ) as fresh_document:
                 timer.timeout.emit()
 
-            fresh_document.assert_called()
+            fresh_document.assert_not_called()
             full_projection.assert_not_called()
             self.assertEqual(
                 ("· 감시/대기", "· 루틴", "· -"),
@@ -1725,7 +1920,7 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
 
         self.assertEqual(1, len(projected["candles"]))
         self.assertEqual(0, len(projected["buy_signal_markers"]))
-        self.assertEqual(1, len(projected["sell_signal_markers"]))
+        self.assertEqual(0, len(projected["sell_signal_markers"]))
         document = self.host.current_session("005930")
         self.assertEqual("RUNNING", document["instance_execution"]["A"]["state"])
         self.assertFalse(

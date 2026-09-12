@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -62,11 +62,15 @@ class _FakeAction:
         self.text = text
         self.separator = separator
         self.enabled = True
+        self.visible = True
         self.icon = None
         self.properties: dict[str, object] = {}
 
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
+
+    def setVisible(self, visible: bool) -> None:
+        self.visible = bool(visible)
 
     def setText(self, text: str) -> None:
         self.text = text
@@ -115,6 +119,9 @@ class _FakeMenu:
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
 
+    def setTitle(self, title: str) -> None:
+        self.title = str(title)
+
     def exec_(self, _position):
         if _FakeMenu.chosen_text is None:
             return None
@@ -153,6 +160,180 @@ class _Window(QWidget):
 
     def handle_routine_instance_name_double_click(self, _row: int) -> bool:
         return False
+
+
+class PersistentIndividualLiquidationContextMenuTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.parent = QWidget()
+        self.parent.resize(400, 300)
+        self.parent.show()
+
+    def tearDown(self) -> None:
+        self.parent.close()
+
+    def _menu(self):
+        root = common_menu.PersistentContextMenu(self.parent)
+        individual = common_menu._add_individual_liquidation_menu(
+            root,
+            has_selection=True,
+            operation_policy={
+                "liquidation": {
+                    "method": "시장가",
+                    "minutes_before_regular_close": "5",
+                }
+            },
+        )
+        return root, individual
+
+    def _show_path(self, root, individual, *, include_time: bool) -> None:
+        root.move(40, 40)
+        root.show()
+        individual["menu"].move(150, 40)
+        individual["menu"].show()
+        if include_time:
+            individual["time_menu"].move(260, 40)
+            individual["time_menu"].show()
+        self.app.processEvents()
+
+    def test_same_menu_chain_supports_consecutive_time_method_and_carry_updates(self):
+        root, individual = self._menu()
+        calls = []
+
+        def apply(method: str, minutes: str) -> None:
+            calls.append((method, minutes))
+            root.hide()
+            common_menu._refresh_individual_liquidation_menu_state(
+                individual,
+                method=method,
+                minutes=minutes,
+            )
+
+        root.register_persistent_action(
+            individual["current"],
+            lambda: apply("현재가", individual["minutes"]),
+        )
+        root.register_persistent_action(
+            individual["market"],
+            lambda: apply("시장가", individual["minutes"]),
+        )
+        root.register_persistent_action(
+            individual["carry"],
+            lambda: apply("이월", individual["minutes"]),
+        )
+        for minute, action in individual["time_actions"]:
+            root.register_persistent_action(
+                action,
+                lambda value=minute: apply(individual["method"], value),
+            )
+
+        self._show_path(root, individual, include_time=True)
+        ten_action = next(
+            action
+            for minute, action in individual["time_actions"]
+            if minute == "10"
+        )
+        self.assertTrue(
+            individual["time_menu"]._activate_registered_action(ten_action)
+        )
+        self.assertTrue(root.isVisible())
+        self.assertTrue(individual["menu"].isVisible())
+        self.assertTrue(individual["time_menu"].isVisible())
+        self.assertTrue(ten_action.property("individualLiquidationMinutesCurrent"))
+
+        individual["time_menu"].hide()
+        self.assertTrue(
+            individual["menu"]._activate_registered_action(individual["current"])
+        )
+        self.assertTrue(root.isVisible())
+        self.assertTrue(individual["menu"].isVisible())
+        self.assertTrue(
+            individual["current"].property("individualLiquidationCurrent")
+        )
+
+        self.assertTrue(
+            individual["menu"]._activate_registered_action(individual["market"])
+        )
+        self.assertTrue(individual["time_menu"].isEnabled())
+        self.assertTrue(
+            individual["menu"]._activate_registered_action(individual["carry"])
+        )
+        self.assertTrue(root.isVisible())
+        self.assertTrue(individual["menu"].isVisible())
+        self.assertFalse(individual["time_menu"].isEnabled())
+        self.assertTrue(
+            individual["carry"].property("individualLiquidationCurrent")
+        )
+        self.assertFalse(
+            individual["time_menu"]._activate_registered_action(ten_action)
+        )
+
+        self.assertTrue(
+            individual["menu"]._activate_registered_action(individual["market"])
+        )
+        self.assertTrue(individual["time_menu"].isEnabled())
+        self.assertEqual(
+            [
+                ("시장가", "10"),
+                ("현재가", "10"),
+                ("시장가", "10"),
+                ("이월", "10"),
+                ("시장가", "10"),
+            ],
+            calls,
+        )
+
+    def test_policy_block_restores_same_menu_without_changing_selection(self):
+        root, individual = self._menu()
+        root_identity = id(root)
+        submenu_identity = id(individual["menu"])
+
+        def blocked() -> None:
+            root.hide()
+
+        root.register_persistent_action(individual["current"], blocked)
+        self._show_path(root, individual, include_time=False)
+
+        self.assertTrue(
+            individual["menu"]._activate_registered_action(individual["current"])
+        )
+        self.assertEqual(root_identity, id(root))
+        self.assertEqual(submenu_identity, id(individual["menu"]))
+        self.assertTrue(root.isVisible())
+        self.assertTrue(individual["menu"].isVisible())
+        self.assertTrue(
+            individual["market"].property("individualLiquidationCurrent")
+        )
+        self.assertFalse(
+            individual["current"].property("individualLiquidationCurrent")
+        )
+
+    def test_context_invalidation_outside_click_and_escape_close_menu(self):
+        root, individual = self._menu()
+        root.register_persistent_action(
+            individual["market"], root.invalidate_persistent_context
+        )
+        self._show_path(root, individual, include_time=False)
+        self.assertTrue(
+            individual["menu"]._activate_registered_action(individual["market"])
+        )
+        self.assertFalse(root.isVisible())
+
+        root, _individual = self._menu()
+        root.popup(QPoint(80, 80))
+        self.app.processEvents()
+        QTest.mouseClick(root, Qt.LeftButton, pos=QPoint(-10, -10))
+        self.app.processEvents()
+        self.assertFalse(root.isVisible())
+
+        root.popup(QPoint(80, 80))
+        self.app.processEvents()
+        QTest.keyClick(root, Qt.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(root.isVisible())
 
 
 class MainMonitoringStockContextMenuTest(unittest.TestCase):
@@ -1954,9 +2135,14 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         with (
             patch.object(
                 close_ops,
-                "_kiwoom_server_login_block_message",
-                return_value="로그인 필요",
+                "inspect_close_liquidation_availability",
+                return_value=SimpleNamespace(
+                    allowed=False,
+                    reason_code="SERVER_NOT_CONNECTED",
+                    recovery_blocked=False,
+                ),
             ),
+            patch.object(close_ops, "append_production_event") as journal,
             patch.object(close_ops, "show_toast") as toast,
         ):
             close_ops.auto_trade_apply_selected_early_close(
@@ -1967,6 +2153,11 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
 
         self.assertIs(toast.call_args.args[0], self.window)
         self.assertIsInstance(toast.call_args.args[0], QWidget)
+        self.assertEqual("BLOCKED", journal.call_args.kwargs["result"])
+        self.assertEqual(
+            "SERVER_NOT_CONNECTED",
+            journal.call_args.kwargs["details"]["reason_code"],
+        )
 
     def test_main_context_stock_row_keeps_stock_register_action(self) -> None:
         row = self._add_row(
@@ -2086,10 +2277,10 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         )
         early_menu = root.submenus[0]
         self.assertEqual(
-            ["루틴마감", "시장가", "현재가", "손/익절", "이월", "취소"],
+            ["루틴마감", "시장가", "현재가", "손/익절", "이월", "자동마감", "취소"],
             [action.text for action in early_menu.actions if not action.separator],
         )
-        self.assertEqual("<separator>", early_menu.actions[5].text)
+        self.assertEqual("<separator>", early_menu.actions[6].text)
         root_labels = [action.text for action in root.actions]
         for excluded in (
             "등록해제",
@@ -2099,6 +2290,184 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         ):
             self.assertNotIn(excluded, root_labels)
         callbacks.early_close.assert_called_once_with("시장가즉시")
+
+    def test_nonpersistent_policy_blocked_target_dispatches_to_backend_callback(self) -> None:
+        stock = self.root / "005930_삼성전자"
+        stock.mkdir()
+        (stock / "config.json").write_text(
+            json.dumps({"operation_excluded": True}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (stock / "state.json").write_text(
+            json.dumps({"status": "REVIEW_REQUIRED", "review_required": True}),
+            encoding="utf-8",
+        )
+        callbacks = common_menu.StockContextMenuCallbacks(
+            select_all=Mock(),
+            clear_selection=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(),
+        )
+        _FakeMenu.chosen_menu_title = "조기마감"
+        _FakeMenu.chosen_text = "시장가"
+        with (
+            patch.object(common_menu, "QMenu", _FakeMenu),
+            patch.object(common_menu, "_append_stock_context_decision"),
+        ):
+            common_menu.show_monitor_stock_context_menu(
+                self.window.routine_table,
+                QPoint(),
+                has_selection=True,
+                callbacks=callbacks,
+                operation_excluded=True,
+                selected_targets=[(stock, "005930", "삼성전자")],
+            )
+
+        callbacks.early_close.assert_called_once_with("시장가즉시")
+
+    def test_early_close_backend_policy_block_uses_toast_and_detailed_event(self) -> None:
+        stock = self.root / "005930_삼성전자"
+        stock.mkdir()
+        (stock / "config.json").write_text(
+            json.dumps({"assigned_routine_instance_id": "instance-a"}),
+            encoding="utf-8",
+        )
+        (stock / "state.json").write_text(
+            json.dumps(
+                {
+                    "status": "RUNNING",
+                    "holding_qty": 3,
+                    "trade_started_at": "2026-09-12 09:00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (stock / "orders.json").write_text("{\"orders\": []}", encoding="utf-8")
+        before = {
+            path.name: path.read_bytes()
+            for path in stock.iterdir()
+            if path.is_file()
+        }
+        window = Mock()
+        window.current_selected_routine_name.return_value = "Routine A"
+        blocked = SimpleNamespace(
+            allowed=False,
+            reason_code="NOT_CURRENT_PARTICIPANT",
+            recovery_blocked=False,
+        )
+        with (
+            patch.object(close_ops, "_kiwoom_server_login_block_message", return_value=""),
+            patch.object(close_ops, "_early_close_scope_display_name", return_value="선택 종목"),
+            patch.object(close_ops, "inspect_close_liquidation_availability", return_value=blocked),
+            patch.object(close_ops, "show_toast") as toast,
+            patch.object(close_ops, "append_production_event") as journal,
+        ):
+            result = close_ops.auto_trade_apply_selected_early_close(
+                window,
+                "시장가",
+                selected=[(stock, "005930", "삼성전자")],
+                show_confirmation=False,
+            )
+        after = {
+            path.name: path.read_bytes()
+            for path in stock.iterdir()
+            if path.is_file()
+        }
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(before, after)
+        toast.assert_called_once()
+        self.assertNotIn("NOT_CURRENT_PARTICIPANT", toast.call_args.args[1])
+        journal.assert_called_once()
+        event = journal.call_args
+        self.assertEqual("BLOCKED", event.kwargs["result"])
+        self.assertEqual(
+            "NOT_CURRENT_PARTICIPANT",
+            event.kwargs["details"]["reason_code"],
+        )
+
+    def test_active_close_auto_return_uses_frozen_scheduled_operation_mode(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = Path(
+            str(
+                self.window.routine_table.item(row, 0).data(
+                    ROUTINE_STOCK_PATH_ROLE
+                )
+            )
+        )
+        callbacks = common_menu.StockContextMenuCallbacks(
+            select_all=Mock(),
+            clear_selection=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(),
+            early_close_return_auto=Mock(),
+        )
+
+        for operation_mode, expected in (("SCHEDULED", True), ("CONTINUOUS", False)):
+            with self.subTest(operation_mode=operation_mode):
+                (stock_dir / "state.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "EARLY_CLOSE",
+                            "early_close_requested_at": "2026-09-12 10:00:00",
+                            "early_close_method": "시장가즉시",
+                            "operation_policy_snapshot": {
+                                "operation_identity": "OP-1",
+                                "operation_mode": operation_mode,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                _FakeMenu.root = None
+                _FakeMenu.chosen_text = None
+                availability = SimpleNamespace(
+                    start_allowed=False,
+                    emergency_stop_allowed=False,
+                    exclusion_allowed=False,
+                    early_close_allowed=False,
+                    early_close_cancel_allowed=False,
+                    individual_liquidation_allowed=False,
+                    time_management_allowed=False,
+                    ats_settings_allowed=False,
+                    stock_register_allowed=False,
+                    unregister_allowed=False,
+                    chart_allowed=False,
+                    reason_for=lambda _key: "",
+                )
+                with patch.object(common_menu, "QMenu", _FakeMenu), patch.object(
+                    common_menu,
+                    "inspect_stock_context_menu_availability",
+                    return_value=availability,
+                ):
+                    common_menu.show_monitor_stock_context_menu(
+                        self.window.routine_table,
+                        QPoint(),
+                        has_selection=True,
+                        callbacks=callbacks,
+                        selected_targets=((stock_dir, "005930", "삼성전자"),),
+                    )
+
+                early_menu = next(
+                    menu
+                    for menu in _FakeMenu.root.submenus
+                    if menu.title == "마감변경"
+                )
+                auto_action = next(
+                    action for action in early_menu.actions if action.text == "자동마감"
+                )
+                self.assertEqual(expected, auto_action.enabled)
+                self.assertEqual(expected, auto_action.visible)
 
     def test_monitor_profile_switches_operation_exclusion_label_and_callback(self) -> None:
         for excluded, label, callback_name in (
@@ -2387,7 +2756,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.assertEqual(30, len(opened))
         self.assertEqual(30, opener.call_count)
 
-    def test_monitor_excluded_selection_disables_only_early_close_menu(self) -> None:
+    def test_monitor_excluded_selection_keeps_close_entries_structurally_enabled(self) -> None:
         callbacks = common_menu.StockContextMenuCallbacks(
             select_all=Mock(),
             clear_selection=Mock(),
@@ -2401,7 +2770,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         )
         with patch.object(common_menu, "QMenu", _FakeMenu):
             common_menu.show_monitor_stock_context_menu(
-                self.window.routine_table,
+                self.window,
                 QPoint(),
                 has_selection=True,
                 callbacks=callbacks,
@@ -2409,7 +2778,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             )
 
         menus = {menu.title: menu for menu in _FakeMenu.root.submenus}
-        self.assertFalse(menus["조기마감"].enabled)
+        self.assertTrue(menus["조기마감"].enabled)
         self.assertTrue(menus["개별청산"].enabled)
         actions = {
             action.text: action
@@ -2420,7 +2789,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.assertTrue(actions["검토정지"].enabled)
         self.assertTrue(actions["제외해제"].enabled)
 
-    def test_settings_excluded_selection_uses_config_and_disables_early_close(self) -> None:
+    def test_settings_excluded_selection_keeps_close_entries_structurally_enabled(self) -> None:
         stock_dir = self.root / "005930_삼성전자"
         stock_dir.mkdir()
         (stock_dir / "config.json").write_text(
@@ -2442,8 +2811,8 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             common_menu.show_auto_trade_stock_context_menu(window, QPoint())
 
         menus = {menu.title: menu for menu in _FakeMenu.root.submenus}
-        self.assertFalse(menus["조기마감"].enabled)
-        self.assertFalse(menus["개별청산"].enabled)
+        self.assertTrue(menus["조기마감"].enabled)
+        self.assertTrue(menus["개별청산"].enabled)
 
     def test_normal_selection_keeps_early_close_enabled(self) -> None:
         callbacks = common_menu.StockContextMenuCallbacks(
@@ -2693,6 +3062,171 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
 
         individual_menu = _FakeMenu.root.submenus[1]
         self.assertFalse(individual_menu.submenus[0].enabled)
+
+    def test_production_dispatch_keeps_one_individual_menu_for_consecutive_changes(self) -> None:
+        stock_dir = self.root / "005930_삼성전자"
+        stock_dir.mkdir(parents=True)
+        callbacks = common_menu.StockContextMenuCallbacks(
+            select_all=Mock(),
+            clear_selection=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(
+                side_effect=(
+                    {"ok": True},
+                    {"ok": True},
+                    {"ok": True},
+                    {"ok": True},
+                )
+            ),
+        )
+        observed = {}
+
+        class ExercisingPersistentMenu(common_menu.PersistentContextMenu):
+            def exec_(self, _position):
+                individual_menu = next(
+                    action.menu()
+                    for action in self.actions()
+                    if action.text() == "개별청산"
+                )
+                time_menu = next(
+                    action.menu()
+                    for action in individual_menu.actions()
+                    if action.text() == "시간"
+                )
+                actions = {
+                    action.text(): action
+                    for action in individual_menu.actions()
+                    if not action.isSeparator() and action.menu() is None
+                }
+                time_actions = {
+                    action.text(): action
+                    for action in time_menu.actions()
+                }
+                self.show()
+                individual_menu.show()
+                time_menu.show()
+                time_menu._activate_registered_action(time_actions["10분"])
+                individual_menu._activate_registered_action(actions["현재가"])
+                individual_menu._activate_registered_action(actions["이월"])
+                observed["carry_time_enabled"] = time_menu.isEnabled()
+                individual_menu._activate_registered_action(actions["시장가"])
+                observed["market_time_enabled"] = time_menu.isEnabled()
+                observed["market_selected"] = actions["시장가"].property(
+                    "individualLiquidationCurrent"
+                )
+                observed["ten_selected"] = time_actions["10분"].property(
+                    "individualLiquidationMinutesCurrent"
+                )
+                self.close()
+                return None
+
+        with (
+            patch.object(
+                common_menu,
+                "PersistentContextMenu",
+                ExercisingPersistentMenu,
+            ),
+            patch.object(
+                common_menu,
+                "_context_menu_operation_policy",
+                return_value={
+                    "liquidation": {
+                        "method": "시장가",
+                        "minutes_before_regular_close": "5",
+                    }
+                },
+            ),
+        ):
+            common_menu.show_monitor_stock_context_menu(
+                self.window,
+                QPoint(),
+                has_selection=True,
+                callbacks=callbacks,
+                selected_targets=[(stock_dir, "005930", "삼성전자")],
+            )
+
+        self.assertEqual(
+            [
+                call("시장가", "10"),
+                call("현재가", "10"),
+                call("이월", "10"),
+                call("시장가", "10"),
+            ],
+            callbacks.individual_liquidation.call_args_list,
+        )
+        self.assertFalse(observed["carry_time_enabled"])
+        self.assertTrue(observed["market_time_enabled"])
+        self.assertTrue(observed["market_selected"])
+        self.assertTrue(observed["ten_selected"])
+
+    def test_production_policy_block_keeps_individual_selection_unchanged(self) -> None:
+        stock_dir = self.root / "005930_삼성전자"
+        stock_dir.mkdir(parents=True)
+        callbacks = common_menu.StockContextMenuCallbacks(
+            select_all=Mock(),
+            clear_selection=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(return_value={"ok": False}),
+        )
+        observed = {}
+
+        class BlockingPersistentMenu(common_menu.PersistentContextMenu):
+            def exec_(self, _position):
+                individual_menu = next(
+                    action.menu()
+                    for action in self.actions()
+                    if action.text() == "개별청산"
+                )
+                actions = {
+                    action.text(): action
+                    for action in individual_menu.actions()
+                    if not action.isSeparator() and action.menu() is None
+                }
+                self.show()
+                individual_menu.show()
+                individual_menu._activate_registered_action(actions["현재가"])
+                observed["visible"] = self.isVisible() and individual_menu.isVisible()
+                observed["market_selected"] = actions["시장가"].property(
+                    "individualLiquidationCurrent"
+                )
+                observed["current_selected"] = actions["현재가"].property(
+                    "individualLiquidationCurrent"
+                )
+                self.close()
+                return None
+
+        with (
+            patch.object(
+                common_menu,
+                "PersistentContextMenu",
+                BlockingPersistentMenu,
+            ),
+            patch.object(
+                common_menu,
+                "_context_menu_operation_policy",
+                return_value={
+                    "liquidation": {
+                        "method": "시장가",
+                        "minutes_before_regular_close": "5",
+                    }
+                },
+            ),
+        ):
+            common_menu.show_monitor_stock_context_menu(
+                self.window,
+                QPoint(),
+                has_selection=True,
+                callbacks=callbacks,
+                selected_targets=[(stock_dir, "005930", "삼성전자")],
+            )
+
+        self.assertTrue(observed["visible"])
+        self.assertTrue(observed["market_selected"])
+        self.assertFalse(observed["current_selected"])
 
     def test_settings_and_monitor_profiles_share_early_close_definition(
         self,

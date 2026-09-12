@@ -7,6 +7,7 @@ gui_auto_trade_run_control.py
 
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 import logging
 from dataclasses import dataclass
@@ -26,7 +27,10 @@ from event_journal_production import (
     observe_owner_failure_transition,
 )
 from runtime_io import read_json_dict
-from runtime_stock_state_mutation import mutate_runtime_stock_state
+from runtime_stock_state_mutation import (
+    delete_runtime_stock_state_fields,
+    mutate_runtime_stock_state,
+)
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
     is_review_required_state,
@@ -41,8 +45,14 @@ from gui_auto_trade_policy import (
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_trade_started,
     clear_early_close_runtime_metadata_only,
+    pending_individual_liquidation_policy_from_state,
 )
 from gui_auto_trade_runtime import all_registered_stock_dirs, parse_stock_folder_name
+from manual_ats_runtime import PROGRAM_SESSION_ID
+from operation_command_service import (
+    INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
+    INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
+)
 from gui_auto_trade_status_ops import (
     auto_trade_stock_operation_excluded,
     set_auto_trade_stock_operation_excluded,
@@ -71,6 +81,7 @@ from operation_policy_gate import (
     write_global_operation_running_state,
 )
 from state_policy import (
+    effective_schedule_times,
     operation_mode_display,
     auto_trade_status_display,
     normalize_operation_mode,
@@ -625,6 +636,13 @@ def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> 
         request = state.get(key)
         if not isinstance(request, dict):
             continue
+        if (
+            key == "individual_liquidation_request"
+            and str(request.get("reservation_scope") or "").strip().upper()
+            == "NEXT_OPERATION"
+            and not str(request.get("operation_identity") or "").strip()
+        ):
+            continue
         request_status = str(request.get("status") or "REQUESTED").strip().upper()
         if request_status not in _LIQUIDATION_REQUEST_TERMINAL_STATUSES:
             return True
@@ -637,6 +655,83 @@ def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> 
         ):
             return True
     return False
+
+
+def _bind_pending_individual_liquidation_request(
+    state: dict[str, object], operation_identity: str
+) -> dict[str, object] | None:
+    """Bind one explicit next-Operation reservation without accepting legacy blanks."""
+
+    if not pending_individual_liquidation_policy_from_state(state):
+        return None
+    request = state.get("individual_liquidation_request")
+    if not isinstance(request, dict):
+        return None
+    bound = deepcopy(request)
+    bound.update(
+        {
+            "reservation_scope": "CURRENT_OPERATION",
+            "operation_identity": str(operation_identity or "").strip(),
+            "bound_at": str(operation_identity or "").strip(),
+        }
+    )
+    return bound
+
+
+def expire_stale_next_operation_individual_liquidation_reservations(
+    *,
+    program_session_id: str | None = None,
+    stock_dirs: list[Path] | tuple[Path, ...] | None = None,
+) -> dict[str, object]:
+    """Remove only pre-Operation reservations owned by an earlier process."""
+
+    current_program_session_id = str(
+        program_session_id or PROGRAM_SESSION_ID
+    ).strip()
+    expired: list[str] = []
+    errors: list[dict[str, str]] = []
+    targets = list(stock_dirs) if stock_dirs is not None else all_registered_stock_dirs()
+    for stock_dir_value in targets:
+        stock_dir = Path(stock_dir_value)
+        state = read_json_dict(stock_dir / "state.json")
+        request = state.get(INDIVIDUAL_LIQUIDATION_REQUEST_KEY)
+        if not isinstance(request, dict):
+            continue
+        if (
+            str(request.get("status") or "").strip().upper()
+            != INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED
+            or str(request.get("reservation_scope") or "").strip().upper()
+            != "NEXT_OPERATION"
+            or str(request.get("operation_identity") or "").strip()
+        ):
+            continue
+        if (
+            current_program_session_id
+            and str(request.get("program_session_id") or "").strip()
+            == current_program_session_id
+        ):
+            continue
+        result = delete_runtime_stock_state_fields(
+            stock_dir,
+            (INDIVIDUAL_LIQUIDATION_REQUEST_KEY,),
+            expected_fields={
+                INDIVIDUAL_LIQUIDATION_REQUEST_KEY: deepcopy(request),
+            },
+        )
+        if result.ok:
+            expired.append(str(stock_dir.resolve()))
+        else:
+            errors.append(
+                {
+                    "stock_dir": str(stock_dir.resolve()),
+                    "reason": str(result.reason_code or "EXPIRATION_FAILED"),
+                }
+            )
+    return {
+        "program_session_id": current_program_session_id,
+        "expired": tuple(expired),
+        "errors": tuple(errors),
+    }
 
 
 def _active_queue_reason(
@@ -2745,6 +2840,24 @@ def auto_trade_start_selected_auto_trades(
         start_status = status_after_operation_mode_change(operation_mode, config)
         mode_display = operation_mode_display(operation_mode)
         started_at = now_text()
+        operation_policy = read_operation_policy()
+        regular_market = operation_policy.get("regular_market", {})
+        liquidation_policy = operation_policy.get("liquidation", {})
+        operation_policy_snapshot = {
+            "operation_identity": started_at,
+            "captured_at": started_at,
+            "operation_mode": operation_mode,
+            "operation_schedule": {
+                "start_time": effective_schedule_times(config)[0],
+                "end_buy_time": effective_schedule_times(config)[1],
+            },
+            "regular_market": deepcopy(
+                regular_market if isinstance(regular_market, dict) else {}
+            ),
+            "liquidation": deepcopy(
+                liquidation_policy if isinstance(liquidation_policy, dict) else {}
+            ),
+        }
 
         metadata = {
             "review_required": False,
@@ -2763,7 +2876,14 @@ def auto_trade_start_selected_auto_trades(
             "operation_notice_at": "",
             "start_policy_status": start_status,
             "start_policy_checked_at": started_at,
+            "operation_policy_snapshot": operation_policy_snapshot,
+            "liquidation_execution": {},
         }
+        pending_request = _bind_pending_individual_liquidation_request(
+            state, started_at
+        )
+        if pending_request is not None:
+            metadata["individual_liquidation_request"] = pending_request
         cleared_close_state = clear_early_close_runtime_metadata_only(dict(state))
         for key in (
             "early_close_requested_at",
