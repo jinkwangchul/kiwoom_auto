@@ -85,6 +85,9 @@ from routine_instance_registry import (
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
 )
+from indicator_follow_signal_validation_projection import (
+    IndicatorFollowSignalValidationSeed,
+)
 
 
 _SITUATION_RESPONSE_EXCLUSION_MESSAGE = (
@@ -543,6 +546,7 @@ class IndicatorFollowRoutineSettingsDialog(
     """
 
     validation_chart_requested = pyqtSignal(object)
+    signal_validation_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -673,6 +677,7 @@ class IndicatorFollowRoutineSettingsDialog(
         button_row = QHBoxLayout()
         self.reload_button = QPushButton("다시 불러오기")
         self.validation_chart_button = QPushButton("검증차트")
+        self.signal_validation_button = QPushButton("검증차트2")
         if self.settings_mode == "edit":
             self.save_button = QPushButton("변경")
         else:
@@ -687,6 +692,9 @@ class IndicatorFollowRoutineSettingsDialog(
         self.validation_chart_button.clicked.connect(
             self._handle_validation_chart_clicked
         )
+        self.signal_validation_button.clicked.connect(
+            self._handle_signal_validation_clicked
+        )
         if self.settings_mode == "edit":
             self.save_button.clicked.connect(self.save_edit_settings_and_close)
         else:
@@ -696,6 +704,7 @@ class IndicatorFollowRoutineSettingsDialog(
         button_row.addWidget(self.reload_button)
         button_row.addStretch(1)
         button_row.addWidget(self.validation_chart_button)
+        button_row.addWidget(self.signal_validation_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
         root.addLayout(button_row)
@@ -1314,6 +1323,34 @@ class IndicatorFollowRoutineSettingsDialog(
             return None
         self.validation_chart_requested.emit(snapshot)
         return snapshot
+
+    def _handle_signal_validation_clicked(self):
+        try:
+            snapshot = self.build_validation_settings_snapshot_from_current_ui_state()
+            preview_rules = snapshot.to_dict()
+            source_rules = getattr(self, "rules", None)
+            if not isinstance(source_rules, dict):
+                source_rules = getattr(self, "rules_data", {})
+            source_bar = source_rules.get("bar") if isinstance(source_rules, dict) else None
+            preview_bar = preview_rules.get("bar")
+            if isinstance(source_bar, dict) and isinstance(preview_bar, dict):
+                for key in ("buy_delay_bar", "sell_delay_bar"):
+                    if key in source_bar and key not in preview_bar:
+                        preview_bar[key] = deepcopy(source_bar[key])
+            snapshot = ValidationSettingsSnapshot(preview_rules)
+            seed = IndicatorFollowSignalValidationSeed(
+                snapshot,
+                self.collect_indicator_follow_ui_state(),
+            )
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "검증차트2",
+                "현재 편집 설정으로 신호검증 데이터를 만들 수 없습니다.",
+            )
+            return None
+        self.signal_validation_requested.emit(seed)
+        return seed
 
     def build_engine_rules_preview_from_current_ui_state(self):
         rules = getattr(self, "rules", None)

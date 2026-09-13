@@ -567,37 +567,37 @@ class IndicatorFollowControlTabMixin:
         buy_grid.setHorizontalSpacing(8)
         buy_grid.setVerticalSpacing(6)
         self.buy_overview_filter = self._make_buy_filter_overview_controls()
-        self.buy_overview_method = self._make_buy_method_overview_controls(("base", "repeat", "price_compare"))
-        self.buy_overview_method_extra = self._make_buy_method_overview_controls(("situation", "additional"))
-        self.buy_overview_finish = self._make_buy_avg_overview_controls(("cycle", "exit", "close"))
-
-        buy_col1_widget = QWidget()
-        buy_col1_layout = QVBoxLayout(buy_col1_widget)
-        buy_col1_layout.setContentsMargins(0, 0, 0, 0)
-        buy_col1_layout.setSpacing(4)
-        buy_col1_layout.addWidget(self.buy_overview_method)
-        buy_col1_layout.addStretch(1)
-
-        buy_col2_widget = QWidget()
-        buy_col2_layout = QVBoxLayout(buy_col2_widget)
-        buy_col2_layout.setContentsMargins(0, 0, 0, 0)
-        buy_col2_layout.setSpacing(4)
-        buy_col2_layout.addWidget(self.buy_overview_method_extra)
-        buy_col2_layout.addStretch(1)
-
-        buy_col3_widget = QWidget()
-        buy_col3_layout = QVBoxLayout(buy_col3_widget)
-        buy_col3_layout.setContentsMargins(0, 0, 0, 0)
-        buy_col3_layout.setSpacing(4)
-        buy_col3_layout.addWidget(self.buy_overview_finish)
-        buy_col3_layout.addStretch(1)
-
-        # 매수 신호검출조건은 상단 1개 박스로 통합 배치한다.
-        # 매수 설정 하단은 1열/2열/3열 컬럼 위젯으로 직접 묶어 정렬한다.
         buy_grid.addWidget(self.buy_overview_filter, 0, 0, 1, 3)
-        buy_grid.addWidget(buy_col1_widget, 1, 0, Qt.AlignTop)
-        buy_grid.addWidget(buy_col2_widget, 1, 1, Qt.AlignTop)
-        buy_grid.addWidget(buy_col3_widget, 1, 2, Qt.AlignTop)
+        if not getattr(self, "_signal_validation_mode", False):
+            self.buy_overview_method = self._make_buy_method_overview_controls(("base", "repeat", "price_compare"))
+            self.buy_overview_method_extra = self._make_buy_method_overview_controls(("situation", "additional"))
+            self.buy_overview_finish = self._make_buy_avg_overview_controls(("cycle", "exit", "close"))
+
+            buy_col1_widget = QWidget()
+            buy_col1_layout = QVBoxLayout(buy_col1_widget)
+            buy_col1_layout.setContentsMargins(0, 0, 0, 0)
+            buy_col1_layout.setSpacing(4)
+            buy_col1_layout.addWidget(self.buy_overview_method)
+            buy_col1_layout.addStretch(1)
+
+            buy_col2_widget = QWidget()
+            buy_col2_layout = QVBoxLayout(buy_col2_widget)
+            buy_col2_layout.setContentsMargins(0, 0, 0, 0)
+            buy_col2_layout.setSpacing(4)
+            buy_col2_layout.addWidget(self.buy_overview_method_extra)
+            buy_col2_layout.addStretch(1)
+
+            buy_col3_widget = QWidget()
+            buy_col3_layout = QVBoxLayout(buy_col3_widget)
+            buy_col3_layout.setContentsMargins(0, 0, 0, 0)
+            buy_col3_layout.setSpacing(4)
+            buy_col3_layout.addWidget(self.buy_overview_finish)
+            buy_col3_layout.addStretch(1)
+
+            # 매수 설정 하단은 1열/2열/3열 컬럼 위젯으로 직접 묶어 정렬한다.
+            buy_grid.addWidget(buy_col1_widget, 1, 0, Qt.AlignTop)
+            buy_grid.addWidget(buy_col2_widget, 1, 1, Qt.AlignTop)
+            buy_grid.addWidget(buy_col3_widget, 1, 2, Qt.AlignTop)
 
         self.buy_detail_widget = QWidget()
         self.buy_detail_widget.setLayout(buy_grid)
@@ -917,56 +917,57 @@ class IndicatorFollowControlTabMixin:
         clear_button.clicked.connect(lambda: self.sell_signal_expr_line.clear())
         sell_header_row.addWidget(clear_button)
 
-        sell_header_row.addSpacing(300)
+        if not getattr(self, "_signal_validation_mode", False):
+            sell_header_row.addSpacing(300)
 
-        method_select_label = QLabel("● 매도방식지정 :")
-        method_select_label.setStyleSheet("font-size: 9pt; font-weight: normal; padding: 2px 1px;")
-        sell_header_row.addWidget(method_select_label)
+            method_select_label = QLabel("● 매도방식지정 :")
+            method_select_label.setStyleSheet("font-size: 9pt; font-weight: normal; padding: 2px 1px;")
+            sell_header_row.addWidget(method_select_label)
 
-        self.sell_method_select_a_check = QCheckBox("설정 A")
-        self.sell_method_select_b_check = QCheckBox("설정 B")
-        self.sell_method_select_c_check = QCheckBox("설정 C")
-        self.sell_method_select_a_check.setChecked(True)
+            self.sell_method_select_a_check = QCheckBox("설정 A")
+            self.sell_method_select_b_check = QCheckBox("설정 B")
+            self.sell_method_select_c_check = QCheckBox("설정 C")
+            self.sell_method_select_a_check.setChecked(True)
 
-        for check in [
-            self.sell_method_select_a_check,
-            self.sell_method_select_b_check,
-            self.sell_method_select_c_check,
-        ]:
-            check.setFixedHeight(32)
-            check.setStyleSheet("font-size: 9pt; font-weight: normal;")
-            sell_header_row.addWidget(check)
-
-        self._sell_method_select_guard = False
-
-        def _sync_sell_method_select(source_check=None):
-            if self._sell_method_select_guard:
-                return
-            checks = [
+            for check in [
                 self.sell_method_select_a_check,
                 self.sell_method_select_b_check,
                 self.sell_method_select_c_check,
-            ]
-            self._sell_method_select_guard = True
-            try:
-                if source_check is not None and source_check.isChecked():
-                    for check in checks:
-                        if check is not source_check:
-                            check.setChecked(False)
-                elif not any(check.isChecked() for check in checks) and source_check is not None:
-                    source_check.setChecked(True)
-                elif not any(check.isChecked() for check in checks):
-                    self.sell_method_select_a_check.setChecked(True)
-                self._sell_method_selection_load_error = None
-            finally:
-                self._sell_method_select_guard = False
+            ]:
+                check.setFixedHeight(32)
+                check.setStyleSheet("font-size: 9pt; font-weight: normal;")
+                sell_header_row.addWidget(check)
 
-        for check in [
-            self.sell_method_select_a_check,
-            self.sell_method_select_b_check,
-            self.sell_method_select_c_check,
-        ]:
-            check.toggled.connect(lambda _, c=check: _sync_sell_method_select(c))
+            self._sell_method_select_guard = False
+
+            def _sync_sell_method_select(source_check=None):
+                if self._sell_method_select_guard:
+                    return
+                checks = [
+                    self.sell_method_select_a_check,
+                    self.sell_method_select_b_check,
+                    self.sell_method_select_c_check,
+                ]
+                self._sell_method_select_guard = True
+                try:
+                    if source_check is not None and source_check.isChecked():
+                        for check in checks:
+                            if check is not source_check:
+                                check.setChecked(False)
+                    elif not any(check.isChecked() for check in checks) and source_check is not None:
+                        source_check.setChecked(True)
+                    elif not any(check.isChecked() for check in checks):
+                        self.sell_method_select_a_check.setChecked(True)
+                    self._sell_method_selection_load_error = None
+                finally:
+                    self._sell_method_select_guard = False
+
+            for check in [
+                self.sell_method_select_a_check,
+                self.sell_method_select_b_check,
+                self.sell_method_select_c_check,
+            ]:
+                check.toggled.connect(lambda _, c=check: _sync_sell_method_select(c))
 
         sell_header_row.addStretch(1)
 
@@ -1008,12 +1009,12 @@ class IndicatorFollowControlTabMixin:
             "신호검출조건 C",
             False,
         )
-        self.sell_overview_scenario = self._make_sell_scenario_overview_controls()
-
         sell_grid.addWidget(self.sell_signal_condition_1, 0, 0)
         sell_grid.addWidget(self.sell_signal_condition_2, 0, 1)
         sell_grid.addWidget(self.sell_signal_condition_3, 0, 2)
-        sell_grid.addWidget(self.sell_overview_scenario, 1, 0, 1, 3)
+        if not getattr(self, "_signal_validation_mode", False):
+            self.sell_overview_scenario = self._make_sell_scenario_overview_controls()
+            sell_grid.addWidget(self.sell_overview_scenario, 1, 0, 1, 3)
 
         self.sell_detail_widget = QWidget()
         self.sell_detail_widget.setLayout(sell_grid)

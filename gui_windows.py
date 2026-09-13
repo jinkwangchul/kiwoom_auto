@@ -9965,6 +9965,11 @@ class MainWindow(QMainWindow):
         )
 
         bind_indicator_follow_validation_flow(self, dialog)
+        from gui_indicator_follow_signal_validation_flow import (
+            bind_indicator_follow_signal_validation_flow,
+        )
+
+        bind_indicator_follow_signal_validation_flow(self, dialog)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         windows = getattr(self, "_routine_settings_windows", None)
         if not isinstance(windows, set):

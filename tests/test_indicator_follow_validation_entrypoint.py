@@ -69,10 +69,15 @@ class IndicatorFollowValidationEntrypointTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 dialog = self._dialog(mode)
                 self.assertEqual("검증차트", dialog.validation_chart_button.text())
+                self.assertEqual("검증차트2", dialog.signal_validation_button.text())
                 self.assertEqual(save_text, dialog.save_button.text())
                 indices = self._bottom_button_indices(dialog)
                 self.assertEqual(
                     indices[dialog.validation_chart_button] + 1,
+                    indices[dialog.signal_validation_button],
+                )
+                self.assertEqual(
+                    indices[dialog.signal_validation_button] + 1,
                     indices[dialog.save_button],
                 )
 

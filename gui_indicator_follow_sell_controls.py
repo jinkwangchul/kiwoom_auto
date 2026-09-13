@@ -119,42 +119,43 @@ class IndicatorFollowSellControlsMixin:
         self.sell_signal_condition_a_ocr_convert_line = ocr_convert_line
         self.sell_signal_condition_a_ocr_logic_combo = filter_row_entries[-1]["logic"]
 
-        # [주문가/현재가/평단가]에 [주문가/현재가/평단가] 조건
-        gap_direction_combo = make_combo(["상향", "하향", "상하"], "상하", 64)
-        gap_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이내", 66)
+        if not getattr(self, "_signal_validation_mode", False):
+            # [주문가/현재가/평단가]에 [주문가/현재가/평단가] 조건
+            gap_direction_combo = make_combo(["상향", "하향", "상하"], "상하", 64)
+            gap_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이내", 66)
 
-        def sync_gap_compare_combo():
-            direction = gap_direction_combo.currentText()
-            visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
-            for item_text in ["이상", "이하", "이내", "이탈"]:
-                index = gap_compare_combo.findText(item_text)
-                if index >= 0:
-                    gap_compare_combo.view().setRowHidden(index, item_text not in visible_items)
-            if gap_compare_combo.currentText() not in visible_items:
-                gap_compare_combo.setCurrentText("이내" if direction == "상하" else "이하")
+            def sync_gap_compare_combo():
+                direction = gap_direction_combo.currentText()
+                visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
+                for item_text in ["이상", "이하", "이내", "이탈"]:
+                    index = gap_compare_combo.findText(item_text)
+                    if index >= 0:
+                        gap_compare_combo.view().setRowHidden(index, item_text not in visible_items)
+                if gap_compare_combo.currentText() not in visible_items:
+                    gap_compare_combo.setCurrentText("이내" if direction == "상하" else "이하")
 
-        gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
-        sync_gap_compare_combo()
+            gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
+            sync_gap_compare_combo()
 
-        gap_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 78)
-        gap_right_combo = make_combo(["주문가", "현재가", "평단가"], "평단가", 78)
-        gap_value_line = make_line("0.25", 44)
-        gap_check = add_filter_row([
-            gap_left_combo,
-            QLabel("대비"),
-            gap_right_combo,
-            gap_direction_combo,
-            gap_value_line,
-            QLabel("%"),
-            gap_compare_combo,
-        ], "AND", True)
-        self.sell_signal_condition_a_gap_check = gap_check
-        self.sell_signal_condition_a_gap_left_combo = gap_left_combo
-        self.sell_signal_condition_a_gap_right_combo = gap_right_combo
-        self.sell_signal_condition_a_gap_direction_combo = gap_direction_combo
-        self.sell_signal_condition_a_gap_value_line = gap_value_line
-        self.sell_signal_condition_a_gap_compare_combo = gap_compare_combo
-        self.sell_signal_condition_a_gap_logic_combo = filter_row_entries[-1]["logic"]
+            gap_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 78)
+            gap_right_combo = make_combo(["주문가", "현재가", "평단가"], "평단가", 78)
+            gap_value_line = make_line("0.25", 44)
+            gap_check = add_filter_row([
+                gap_left_combo,
+                QLabel("대비"),
+                gap_right_combo,
+                gap_direction_combo,
+                gap_value_line,
+                QLabel("%"),
+                gap_compare_combo,
+            ], "AND", True)
+            self.sell_signal_condition_a_gap_check = gap_check
+            self.sell_signal_condition_a_gap_left_combo = gap_left_combo
+            self.sell_signal_condition_a_gap_right_combo = gap_right_combo
+            self.sell_signal_condition_a_gap_direction_combo = gap_direction_combo
+            self.sell_signal_condition_a_gap_value_line = gap_value_line
+            self.sell_signal_condition_a_gap_compare_combo = gap_compare_combo
+            self.sell_signal_condition_a_gap_logic_combo = filter_row_entries[-1]["logic"]
 
         # RSI
         rsi_period_line = make_line("14", 38)
@@ -255,22 +256,6 @@ class IndicatorFollowSellControlsMixin:
 
             return row_check
 
-        gap_direction_combo = make_combo(["상향", "하향", "상하"], "상하", 64)
-        gap_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이내", 66)
-
-        def sync_gap_compare_combo():
-            direction = gap_direction_combo.currentText()
-            visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
-            for item_text in ["이상", "이하", "이내", "이탈"]:
-                index = gap_compare_combo.findText(item_text)
-                if index >= 0:
-                    gap_compare_combo.view().setRowHidden(index, item_text not in visible_items)
-            if gap_compare_combo.currentText() not in visible_items:
-                gap_compare_combo.setCurrentText("이내" if direction == "상하" else "이하")
-
-        gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
-        sync_gap_compare_combo()
-
         price_box_direction_combo = make_combo(["상향", "하향"], "하향", 64)
         price_box_value_line = make_line("0.1", 44)
         price_box_compare_combo = make_combo(["이상", "이하"], "이상", 66)
@@ -298,31 +283,47 @@ class IndicatorFollowSellControlsMixin:
             bollinger_value_line,
             QLabel("%"),
             bollinger_compare_combo,
-        ], "AND", True)
+        ], "AND", True, not getattr(self, "_signal_validation_mode", False))
         self.sell_signal_condition_b_bollinger_check = bollinger_check
         self.sell_signal_condition_b_bollinger_direction_combo = bollinger_direction_combo
         self.sell_signal_condition_b_bollinger_value_line = bollinger_value_line
         self.sell_signal_condition_b_bollinger_compare_combo = bollinger_compare_combo
         self.sell_signal_condition_b_bollinger_logic_combo = filter_row_entries[-1]["logic"]
 
-        gap_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 78)
-        gap_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 78)
-        gap_value_line = make_line("0.25", 44)
-        gap_check = add_filter_row([
-            gap_left_combo,
-            QLabel("대비"),
-            gap_right_combo,
-            gap_direction_combo,
-            gap_value_line,
-            QLabel("%"),
-            gap_compare_combo,
-        ], "AND", True, False)
-        self.sell_signal_condition_b_gap_check = gap_check
-        self.sell_signal_condition_b_gap_left_combo = gap_left_combo
-        self.sell_signal_condition_b_gap_right_combo = gap_right_combo
-        self.sell_signal_condition_b_gap_direction_combo = gap_direction_combo
-        self.sell_signal_condition_b_gap_value_line = gap_value_line
-        self.sell_signal_condition_b_gap_compare_combo = gap_compare_combo
+        if not getattr(self, "_signal_validation_mode", False):
+            gap_direction_combo = make_combo(["상향", "하향", "상하"], "상하", 64)
+            gap_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이내", 66)
+
+            def sync_gap_compare_combo():
+                direction = gap_direction_combo.currentText()
+                visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
+                for item_text in ["이상", "이하", "이내", "이탈"]:
+                    index = gap_compare_combo.findText(item_text)
+                    if index >= 0:
+                        gap_compare_combo.view().setRowHidden(index, item_text not in visible_items)
+                if gap_compare_combo.currentText() not in visible_items:
+                    gap_compare_combo.setCurrentText("이내" if direction == "상하" else "이하")
+
+            gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
+            sync_gap_compare_combo()
+            gap_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 78)
+            gap_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 78)
+            gap_value_line = make_line("0.25", 44)
+            gap_check = add_filter_row([
+                gap_left_combo,
+                QLabel("대비"),
+                gap_right_combo,
+                gap_direction_combo,
+                gap_value_line,
+                QLabel("%"),
+                gap_compare_combo,
+            ], "AND", True, False)
+            self.sell_signal_condition_b_gap_check = gap_check
+            self.sell_signal_condition_b_gap_left_combo = gap_left_combo
+            self.sell_signal_condition_b_gap_right_combo = gap_right_combo
+            self.sell_signal_condition_b_gap_direction_combo = gap_direction_combo
+            self.sell_signal_condition_b_gap_value_line = gap_value_line
+            self.sell_signal_condition_b_gap_compare_combo = gap_compare_combo
 
         return box
 
@@ -408,41 +409,41 @@ class IndicatorFollowSellControlsMixin:
 
             return row_check
 
-        gap_direction_combo = make_combo(["상향", "하향", "상하"], "상하", 64)
-        gap_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이내", 66)
+        if not getattr(self, "_signal_validation_mode", False):
+            gap_direction_combo = make_combo(["상향", "하향", "상하"], "상하", 64)
+            gap_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이내", 66)
 
-        def sync_gap_compare_combo():
-            direction = gap_direction_combo.currentText()
-            visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
-            for item_text in ["이상", "이하", "이내", "이탈"]:
-                index = gap_compare_combo.findText(item_text)
-                if index >= 0:
-                    gap_compare_combo.view().setRowHidden(index, item_text not in visible_items)
-            if gap_compare_combo.currentText() not in visible_items:
-                gap_compare_combo.setCurrentText("이내" if direction == "상하" else "이하")
+            def sync_gap_compare_combo():
+                direction = gap_direction_combo.currentText()
+                visible_items = ["이내", "이탈"] if direction == "상하" else ["이상", "이하"]
+                for item_text in ["이상", "이하", "이내", "이탈"]:
+                    index = gap_compare_combo.findText(item_text)
+                    if index >= 0:
+                        gap_compare_combo.view().setRowHidden(index, item_text not in visible_items)
+                if gap_compare_combo.currentText() not in visible_items:
+                    gap_compare_combo.setCurrentText("이내" if direction == "상하" else "이하")
 
-        gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
-        sync_gap_compare_combo()
-
-        gap_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 78)
-        gap_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 78)
-        gap_value_line = make_line("0.25", 44)
-        gap_check = add_filter_row([
-            gap_left_combo,
-            QLabel("대비"),
-            gap_right_combo,
-            gap_direction_combo,
-            gap_value_line,
-            QLabel("%"),
-            gap_compare_combo,
-        ], "AND", True)
-        self.sell_signal_condition_c_gap_check = gap_check
-        self.sell_signal_condition_c_gap_left_combo = gap_left_combo
-        self.sell_signal_condition_c_gap_right_combo = gap_right_combo
-        self.sell_signal_condition_c_gap_direction_combo = gap_direction_combo
-        self.sell_signal_condition_c_gap_value_line = gap_value_line
-        self.sell_signal_condition_c_gap_compare_combo = gap_compare_combo
-        self.sell_signal_condition_c_gap_logic_combo = filter_row_entries[-1]["logic"]
+            gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
+            sync_gap_compare_combo()
+            gap_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 78)
+            gap_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 78)
+            gap_value_line = make_line("0.25", 44)
+            gap_check = add_filter_row([
+                gap_left_combo,
+                QLabel("대비"),
+                gap_right_combo,
+                gap_direction_combo,
+                gap_value_line,
+                QLabel("%"),
+                gap_compare_combo,
+            ], "AND", True)
+            self.sell_signal_condition_c_gap_check = gap_check
+            self.sell_signal_condition_c_gap_left_combo = gap_left_combo
+            self.sell_signal_condition_c_gap_right_combo = gap_right_combo
+            self.sell_signal_condition_c_gap_direction_combo = gap_direction_combo
+            self.sell_signal_condition_c_gap_value_line = gap_value_line
+            self.sell_signal_condition_c_gap_compare_combo = gap_compare_combo
+            self.sell_signal_condition_c_gap_logic_combo = filter_row_entries[-1]["logic"]
 
         macd_kind_combo = make_combo(["MACD선", "시그널선"], "MACD선", 120)
         macd_sign_combo = make_combo(["-", "+"], "-", 60)
