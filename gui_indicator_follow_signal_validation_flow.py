@@ -19,7 +19,6 @@ from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_validation_average_price_context,
-    build_signal_validation_snapshot,
 )
 from routines.지표추종매매.routine_validation_contract import (
     ValidationRequest,
@@ -169,21 +168,13 @@ class IndicatorFollowSignalValidationFlow(QObject):
             self.validation_failed.emit("SERVER_NOT_CONNECTED")
             return None
         try:
-            initial_snapshot = build_signal_validation_snapshot(
-                seed.settings_snapshot.to_dict(),
-                ui_state=seed.to_ui_state(),
-            )
-        except Exception as exc:
-            self.validation_failed.emit(f"SIGNAL_PROJECTION_ERROR: {exc}")
-            return None
-        try:
             requester_ref = weakref.ref(requester)
         except TypeError:
             self.validation_failed.emit("INVALID_VALIDATION_REQUESTER")
             return None
         self._pending_entry = (seed, requester_ref)
         try:
-            return self._host.start(initial_snapshot, ui_parent=requester)
+            return self._host.start(seed.settings_snapshot, ui_parent=requester)
         finally:
             if self._pending_entry is not None and self._pending_entry[0] is seed:
                 self._pending_entry = None

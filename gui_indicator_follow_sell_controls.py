@@ -180,7 +180,7 @@ class IndicatorFollowSellControlsMixin:
         gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
         sync_gap_compare_combo()
 
-        gap_left_combo = make_sell_price_combo("주문가", 78, 30)
+        gap_left_combo = make_sell_price_combo("", 78, 30)
         gap_right_combo = make_sell_price_combo("평단가", 78, 30)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
@@ -348,7 +348,7 @@ class IndicatorFollowSellControlsMixin:
 
         gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
         sync_gap_compare_combo()
-        gap_left_combo = make_sell_price_combo("주문가", 78, 32)
+        gap_left_combo = make_sell_price_combo("", 78, 32)
         gap_right_combo = make_sell_price_combo("현재가", 78, 32)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
@@ -466,7 +466,7 @@ class IndicatorFollowSellControlsMixin:
 
         gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
         sync_gap_compare_combo()
-        gap_left_combo = make_sell_price_combo("주문가", 78, 32)
+        gap_left_combo = make_sell_price_combo("", 78, 32)
         gap_right_combo = make_sell_price_combo("현재가", 78, 32)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([

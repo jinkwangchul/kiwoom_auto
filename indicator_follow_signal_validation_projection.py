@@ -58,7 +58,6 @@ class IndicatorFollowSignalValidationSeed:
             raise TypeError("settings_snapshot must be ValidationSettingsSnapshot")
         if not isinstance(ui_state, Mapping):
             raise TypeError("ui_state must be a mapping")
-        require_resolved_sell_price_selections(ui_state)
         signal_ui_state = project_signal_validation_ui_state(ui_state)
         canonical = json.dumps(
             signal_ui_state,
@@ -70,7 +69,6 @@ class IndicatorFollowSignalValidationSeed:
         copied_snapshot = ValidationSettingsSnapshot(
             project_signal_validation_rules(
                 settings_snapshot.to_dict(),
-                ui_state=signal_ui_state,
             )
         )
         object.__setattr__(self, "settings_snapshot", copied_snapshot)

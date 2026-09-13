@@ -147,6 +147,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             resolved_state,
         )
 
+    def _unresolved_seed(self, rules=None, ui_state=None):
+        return IndicatorFollowSignalValidationSeed(
+            ValidationSettingsSnapshot(rules or self.rules),
+            deepcopy(ui_state or self.ui_state),
+        )
+
     def _window(self, ui_state=None):
         with patch.object(dialog_module.QTimer, "singleShot"):
             window = IndicatorFollowSignalValidationWindow(
@@ -496,6 +502,39 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             "IndicatorFollowValidationStockPicker",
             default_flow.host._stock_picker_factory.__name__,
         )
+
+    def test_unresolved_seed_reaches_picker_and_window_entry(self):
+        broker = _FakeBroker(True)
+        host = _FakeHost(self.stock)
+        created = []
+
+        def window_factory(stock, seed, parent=None):
+            window = _FakeWindow(stock, seed, parent)
+            self.widgets.append(window)
+            created.append(window)
+            return window
+
+        flow = IndicatorFollowSignalValidationFlow(
+            broker,
+            host=host,
+            window_factory=window_factory,
+        )
+        carrier = type(
+            "Carrier",
+            (QDialog,),
+            {"signal_validation_requested": pyqtSignal(object)},
+        )()
+        self.widgets.append(carrier)
+        flow.bind_dialog(carrier)
+        seed = self._unresolved_seed()
+        carrier.signal_validation_requested.emit(seed)
+
+        self.assertEqual(1, len(host.started))
+        self.assertIs(host.started[0][0], seed.settings_snapshot)
+        self.assertEqual(1, len(created))
+        self.assertEqual("주문가", created[0].seed.to_ui_state()["sell_ui"][
+            "signal_conditions"
+        ]["condition_a"]["gap_left_combo"])
 
     def test_each_run_uses_its_snapshot_timeframe_and_updates_real_replay_result(self):
         broker = _FakeBroker(True)

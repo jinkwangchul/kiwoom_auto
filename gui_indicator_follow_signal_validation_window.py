@@ -45,6 +45,7 @@ from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationSeed,
     build_validation_average_price_context,
     build_signal_validation_snapshot,
+    require_resolved_sell_price_selections,
 )
 from indicator_follow_signal_validation_presentation import (
     build_signal_validation_filter_rows,
@@ -562,6 +563,7 @@ class IndicatorFollowSignalValidationWindow(
     def _request_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
         try:
             ui_state = self.collect_indicator_follow_ui_state()
+            require_resolved_sell_price_selections(ui_state)
             mapper = self._load_indicator_follow_rule_mapper()
             preview = mapper.build_engine_rules_preview_from_ui_state(
                 ui_state,
@@ -585,6 +587,14 @@ class IndicatorFollowSignalValidationWindow(
                 snapshot,
                 self.historical_candle_count_spin.value(),
             )
+        except ValueError as exc:
+            if "가격 기준 재선택 필요" in str(exc):
+                self.show_validation_error(
+                    "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요."
+                )
+                return None
+            self.show_validation_error("현재 신호설정으로 검증 데이터를 만들 수 없습니다.")
+            return None
         except Exception:
             self.show_validation_error("현재 신호설정으로 검증 데이터를 만들 수 없습니다.")
             return None
@@ -608,6 +618,18 @@ class IndicatorFollowSignalValidationWindow(
             payload = IndicatorFollowSignalValidationApplyPayload(
                 self.collect_indicator_follow_ui_state()
             )
+        except ValueError as exc:
+            if "가격 기준 재선택 필요" in str(exc):
+                self.show_settings_apply_result(
+                    "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요.",
+                    success=False,
+                )
+                return None
+            self.show_settings_apply_result(
+                "현재 신호설정을 반영용 데이터로 만들 수 없습니다.",
+                success=False,
+            )
+            return None
         except Exception:
             self.show_settings_apply_result(
                 "현재 신호설정을 반영용 데이터로 만들 수 없습니다.",

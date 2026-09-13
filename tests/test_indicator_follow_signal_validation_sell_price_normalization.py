@@ -41,6 +41,7 @@ from routines.지표추종매매.routine_validation_replay import (
 )
 from routines.지표추종매매.routine_validation_session import ValidationSession
 from gui_indicator_follow_signal_validation_window import (
+    IndicatorFollowSignalValidationWindow,
     estimated_signal_return_percent,
 )
 from indicator_follow_signal_validation_presentation import filter_rows_for_entry
@@ -142,8 +143,23 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                     "주문가",
                     collected["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"],
                 )
+                signal_payloads = []
+                dialog.signal_validation_requested.connect(signal_payloads.append)
+                dialog.basic_signal_interval_combo.setCurrentText("3")
+                with patch.object(dialog_module.QMessageBox, "warning") as warning:
+                    seed = dialog._handle_signal_validation_clicked()
+                warning.assert_not_called()
+                self.assertIsInstance(seed, IndicatorFollowSignalValidationSeed)
+                self.assertEqual([seed], signal_payloads)
+                self.assertEqual(3, seed.settings_snapshot.to_dict()["bar"]["bar_minutes"])
+                self.assertEqual(
+                    "주문가",
+                    seed.to_ui_state()["sell_ui"]["signal_conditions"][
+                        "condition_a"
+                    ]["gap_left_combo"],
+                )
                 with patch.object(dialog_module.QMessageBox, "warning"):
-                    self.assertIsNone(dialog._handle_signal_validation_clicked())
+                    self.assertIsNone(dialog._handle_validation_chart_clicked())
                 registration_result = dialog.build_registration_rules_from_current_ui_state()
                 self.assertFalse(registration_result["success"])
                 self.assertIn("재선택", " ".join(
@@ -177,12 +193,20 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                     dialog.collect_indicator_follow_ui_state()
                 ))
 
-    def test_unresolved_price_blocks_all_detached_payloads_without_partial_apply(self):
+    def test_unresolved_price_is_entry_only_but_blocks_run_and_apply_payloads(self):
         unresolved = deepcopy(self.rules["indicator_follow_ui_state"]["state"])
-        with self.assertRaisesRegex(ValueError, "재선택"):
-            IndicatorFollowSignalValidationSeed(
-                ValidationSettingsSnapshot(self.rules), unresolved
-            )
+        seed = IndicatorFollowSignalValidationSeed(
+            ValidationSettingsSnapshot(self.rules), unresolved
+        )
+        unresolved["sell_ui"]["signal_conditions"]["condition_a"][
+            "gap_left_combo"
+        ] = "현재가"
+        self.assertEqual(
+            "주문가",
+            seed.to_ui_state()["sell_ui"]["signal_conditions"]["condition_a"][
+                "gap_left_combo"
+            ],
+        )
         with self.assertRaisesRegex(ValueError, "재선택"):
             IndicatorFollowSignalValidationApplyPayload(unresolved)
         with self.assertRaisesRegex(ValueError, "재선택"):
@@ -195,6 +219,87 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         result = dialog.apply_signal_validation_ui_state(changed)
         self.assertTrue(result["skipped"])
         self.assertEqual(before, dialog.collect_indicator_follow_ui_state())
+
+    def test_unresolved_window_defers_initial_run_and_apply_until_reselected(self):
+        unresolved = deepcopy(self.rules["indicator_follow_ui_state"]["state"])
+        seed = IndicatorFollowSignalValidationSeed(
+            ValidationSettingsSnapshot(self.rules), unresolved
+        )
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            window = IndicatorFollowSignalValidationWindow(self.stock, seed)
+        self.widgets.append(window)
+        run_requests = []
+        apply_payloads = []
+        window.validation_run_requested.connect(run_requests.append)
+        window.settings_apply_requested.connect(apply_payloads.append)
+
+        self.assertIsNone(window.request_initial_validation())
+        self.assertEqual([], run_requests)
+        self.assertTrue(window.run_validation_button.isEnabled())
+        self.assertIn("현재가 또는 평단가", window.validation_status_label.text())
+        self.assertIsNone(window._request_settings_apply())
+        self.assertEqual([], apply_payloads)
+
+        window.sell_signal_condition_a_gap_left_combo.setCurrentText("평단가")
+        self.assertIsNone(window._request_validation())
+        self.assertEqual([], run_requests)
+        window.sell_signal_condition_b_gap_left_combo.setCurrentText("현재가")
+        self.assertIsNone(window._request_validation())
+        self.assertEqual([], run_requests)
+        window.sell_signal_condition_c_gap_left_combo.setCurrentText("평단가")
+
+        request = window._request_validation()
+        self.assertIsNotNone(request)
+        self.assertEqual([request], run_requests)
+        payload = window._request_settings_apply()
+        self.assertIsNotNone(payload)
+        self.assertEqual([payload], apply_payloads)
+
+    def test_new_sell_price_left_defaults_are_explicitly_unselected(self):
+        class FreshDialog(IndicatorFollowRoutineSettingsDialog):
+            def load_rules(self):
+                self.rules_data = {}
+                self.rules = {}
+
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            dialog = FreshDialog(
+                rules_path=Path("unused-rules.json"),
+                routine_path=self.routine_dir,
+                routine_name="지표추종매매",
+                definition_id="indicator_follow",
+                settings_mode="registration",
+            )
+        self.widgets.append(dialog)
+        for group_name, right_default in zip("abc", ("평단가", "현재가", "현재가")):
+            left = getattr(dialog, f"sell_signal_condition_{group_name}_gap_left_combo")
+            right = getattr(dialog, f"sell_signal_condition_{group_name}_gap_right_combo")
+            self.assertEqual(-1, left.currentIndex())
+            self.assertEqual("가격 기준 재선택 필요", left.placeholderText())
+            self.assertIn("기존값: -", left.toolTip())
+            self.assertEqual("", left.property(
+                "indicatorFollowUnresolvedSellPriceBasis"
+            ) or "")
+            self.assertEqual(right_default, right.currentText())
+            self.assertNotIn("주문가", [left.itemText(i) for i in range(left.count())])
+
+    def test_v2_entry_only_ignores_reselection_warning_not_other_sell_errors(self):
+        dialog, _path = self._dialog()
+
+        class InvalidSellMapper:
+            @staticmethod
+            def build_engine_rules_preview_from_ui_state(_state, rules):
+                return {
+                    "validation_warnings": ["sell signal malformed"],
+                    "preview_rules": rules,
+                }
+
+        with patch.object(
+            dialog,
+            "_load_indicator_follow_rule_mapper",
+            return_value=InvalidSellMapper(),
+        ):
+            with self.assertRaisesRegex(ValueError, "sell signal malformed"):
+                dialog.build_signal_validation_entry_snapshot_from_current_ui_state()
 
     def test_mapper_materializes_only_current_v2_sell_candidates(self):
         state = self._resolved_state(

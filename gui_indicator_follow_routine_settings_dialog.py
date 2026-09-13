@@ -96,6 +96,7 @@ from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationSeed,
     project_signal_validation_apply_ui_state,
     require_resolved_sell_price_selections,
+    sell_price_selection_issues,
 )
 
 
@@ -1301,8 +1302,11 @@ class IndicatorFollowRoutineSettingsDialog(
         spec.loader.exec_module(mapper)
         return mapper
 
-    def build_validation_settings_snapshot_from_current_ui_state(self):
-        """Build a non-writing Validation snapshot or fail closed."""
+    def _build_validation_settings_snapshot_from_current_ui_state(
+        self,
+        *,
+        allow_unresolved_sell_price=False,
+    ):
         rules = getattr(self, "rules", None)
         if not isinstance(rules, dict):
             rules = getattr(self, "rules_data", None)
@@ -1310,7 +1314,9 @@ class IndicatorFollowRoutineSettingsDialog(
             raise ValueError("validation base rules are unavailable")
 
         ui_state = self.collect_indicator_follow_ui_state()
-        require_resolved_sell_price_selections(ui_state)
+        unresolved_sell_price = sell_price_selection_issues(ui_state)
+        if unresolved_sell_price and not allow_unresolved_sell_price:
+            require_resolved_sell_price_selections(ui_state)
         mapper = self._load_indicator_follow_rule_mapper()
         preview = mapper.build_engine_rules_preview_from_ui_state(
             ui_state,
@@ -1322,6 +1328,11 @@ class IndicatorFollowRoutineSettingsDialog(
             str(item)
             for item in preview.get("validation_warnings", [])
             if str(item).lower().startswith(("sell condition", "sell signal"))
+            and not (
+                allow_unresolved_sell_price
+                and unresolved_sell_price
+                and "가격 기준 재선택 필요" in str(item)
+            )
         ]
         if sell_warnings:
             raise ValueError("; ".join(sell_warnings))
@@ -1329,6 +1340,16 @@ class IndicatorFollowRoutineSettingsDialog(
         if not isinstance(preview_rules, dict):
             raise ValueError("validation preview rules must be a mapping")
         return ValidationSettingsSnapshot(preview_rules)
+
+    def build_validation_settings_snapshot_from_current_ui_state(self):
+        """Build a non-writing, execution-ready Validation snapshot."""
+        return self._build_validation_settings_snapshot_from_current_ui_state()
+
+    def build_signal_validation_entry_snapshot_from_current_ui_state(self):
+        """Build the detached V2 Entry snapshot without relaxing RUN validation."""
+        return self._build_validation_settings_snapshot_from_current_ui_state(
+            allow_unresolved_sell_price=True,
+        )
 
     def _handle_validation_chart_clicked(self):
         try:
@@ -1345,7 +1366,7 @@ class IndicatorFollowRoutineSettingsDialog(
 
     def _handle_signal_validation_clicked(self):
         try:
-            snapshot = self.build_validation_settings_snapshot_from_current_ui_state()
+            snapshot = self.build_signal_validation_entry_snapshot_from_current_ui_state()
             preview_rules = snapshot.to_dict()
             source_rules = getattr(self, "rules", None)
             if not isinstance(source_rules, dict):
