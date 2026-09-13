@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import math
 from typing import Any
 
-from PyQt5.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
@@ -273,19 +273,24 @@ class IndicatorFollowSignalValidationWindow(
 
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
+    stock_selection_requested = pyqtSignal()
 
     def __init__(
         self,
-        stock: ValidationStockRef,
+        stock: ValidationStockRef | None,
         seed: IndicatorFollowSignalValidationSeed,
         parent: QWidget | None = None,
     ) -> None:
-        if not isinstance(stock, ValidationStockRef) or not stock.code or not stock.name:
-            raise TypeError("stock must be a populated ValidationStockRef")
+        if stock is not None and (
+            not isinstance(stock, ValidationStockRef) or not stock.code or not stock.name
+        ):
+            raise TypeError("stock must be None or a populated ValidationStockRef")
         if not isinstance(seed, IndicatorFollowSignalValidationSeed):
             raise TypeError("seed must be IndicatorFollowSignalValidationSeed")
         self._signal_validation_mode = True
-        self._signal_validation_stock = ValidationStockRef(stock.code, stock.name)
+        self._signal_validation_stock = (
+            None if stock is None else ValidationStockRef(stock.code, stock.name)
+        )
         self._signal_validation_seed = IndicatorFollowSignalValidationSeed(
             seed.settings_snapshot,
             seed.to_ui_state(),
@@ -308,8 +313,12 @@ class IndicatorFollowSignalValidationWindow(
         self.setMinimumSize(1200, 700)
 
     @property
-    def stock(self) -> ValidationStockRef:
+    def stock(self) -> ValidationStockRef | None:
         return self._signal_validation_stock
+
+    def _stock_display_text(self) -> str:
+        stock = self.stock
+        return "종목 선택" if stock is None else f"{stock.code} {stock.name}"
 
     @property
     def replay_snapshot(self) -> ValidationReplaySnapshot | None:
@@ -332,7 +341,11 @@ class IndicatorFollowSignalValidationWindow(
         root.addWidget(self.control_tab, 0)
 
         action_row = QHBoxLayout()
-        self.validation_status_label = QLabel("과거 분봉 데이터 조회 중...")
+        self.validation_status_label = QLabel(
+            "검증 종목을 선택하세요."
+            if self.stock is None
+            else "과거 분봉 데이터 조회 중..."
+        )
         self.result_summary_label = QLabel("Candle -  |  BUY -  |  SELL -")
         self.estimated_return_label = QLabel("추정 손익률: -")
         self.estimated_return_label.setStyleSheet("font-weight: bold;")
@@ -357,7 +370,11 @@ class IndicatorFollowSignalValidationWindow(
         self._signal_validation_result_layout = result_layout
 
         self.chart_stack = QStackedWidget()
-        self.loading_label = QLabel("과거 분봉 데이터 조회 중...")
+        self.loading_label = QLabel(
+            "상단 종목명을 더블클릭하여 검증 종목을 선택하세요."
+            if self.stock is None
+            else "과거 분봉 데이터 조회 중..."
+        )
         self.loading_label.setAlignment(Qt.AlignCenter)
         self.loading_label.setStyleSheet("font-size: 12pt; color: #555555;")
         self.chart_scroll_area = QScrollArea()
@@ -424,10 +441,11 @@ class IndicatorFollowSignalValidationWindow(
         header_row.setSpacing(8)
         self.compact_header_arrow = QLabel("▶")
         self.compact_header_arrow.setStyleSheet("font-size: 13pt; font-weight: bold;")
-        self.compact_stock_label = QLabel(
-            f"{self.stock.code} {self.stock.name}"
-        )
+        self.compact_stock_label = QLabel(self._stock_display_text())
         self.compact_stock_label.setStyleSheet("font-size: 13pt; font-weight: bold;")
+        self.compact_stock_label.setToolTip("더블클릭하여 검증 종목 선택")
+        self.compact_stock_label.setCursor(Qt.PointingHandCursor)
+        self.compact_stock_label.installEventFilter(self)
         self.basic_signal_interval_combo = QComboBox()
         self.basic_signal_interval_combo.addItems(
             ["1", "3", "5", "10", "15", "30", "60", "120", "240"]
@@ -483,7 +501,17 @@ class IndicatorFollowSignalValidationWindow(
         self.apply_signal_validation_ui_state(
             self._signal_validation_seed.to_ui_state()
         )
-        self.compact_stock_label.setText(f"{self.stock.code} {self.stock.name}")
+        self.compact_stock_label.setText(self._stock_display_text())
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.compact_stock_label
+            and event.type() == QEvent.MouseButtonDblClick
+            and event.button() == Qt.LeftButton
+        ):
+            self.stock_selection_requested.emit()
+            return True
+        return super().eventFilter(watched, event)
 
     def _show_with_initial_control_section_state(self) -> None:
         self.showNormal()
@@ -561,6 +589,11 @@ class IndicatorFollowSignalValidationWindow(
         self.historical_candle_count_spin.setValue(candle_count)
 
     def _request_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
+        if self.stock is None:
+            self.show_validation_error(
+                "상단 종목명을 더블클릭하여 검증 종목을 선택하세요."
+            )
+            return None
         try:
             ui_state = self.collect_indicator_follow_ui_state()
             require_resolved_sell_price_selections(ui_state)
@@ -607,6 +640,9 @@ class IndicatorFollowSignalValidationWindow(
         self.validation_run_requested.emit(run_request)
         return run_request
 
+    def request_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
+        return self._request_validation()
+
     def request_initial_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
         if self._initial_validation_requested:
             return None
@@ -647,6 +683,36 @@ class IndicatorFollowSignalValidationWindow(
         if self._replay_snapshot is None:
             self.loading_label.setText(str(message or "검증 실패"))
             self.chart_stack.setCurrentWidget(self.loading_label)
+        self.run_validation_button.setEnabled(True)
+
+    def set_validation_stock(self, stock: ValidationStockRef) -> bool:
+        if not isinstance(stock, ValidationStockRef) or not stock.code or not stock.name:
+            raise TypeError("stock must be a populated ValidationStockRef")
+        selected = ValidationStockRef(stock.code, stock.name)
+        if selected == self.stock:
+            return False
+        self._signal_validation_stock = selected
+        self.compact_stock_label.setText(self._stock_display_text())
+        self._clear_validation_result("새 종목 검증 준비 중")
+        return True
+
+    def _clear_validation_result(self, message: str) -> None:
+        self._replay_snapshot = None
+        self._candles = []
+        self._entries = []
+        self._selected_index = None
+        old_canvas = self.chart_scroll_area.takeWidget()
+        if old_canvas is not None:
+            old_canvas.deleteLater()
+        self.canvas = None
+        self.result_summary_label.setText("Candle -  |  BUY -  |  SELL -")
+        self.estimated_return_label.setText("추정 손익률: -")
+        self.selection_summary.setPlainText("선택 Candle 요약\n-")
+        self.filter_result_table.setRowCount(0)
+        self._resize_filter_result_table_to_contents()
+        self.validation_status_label.setText(message)
+        self.loading_label.setText(message)
+        self.chart_stack.setCurrentWidget(self.loading_label)
         self.run_validation_button.setEnabled(True)
 
     def set_replay_snapshot(self, replay_snapshot: ValidationReplaySnapshot) -> None:

@@ -50,6 +50,9 @@ class _Host(QObject):
         super().__init__()
         self.stock = stock
 
+    def preflight_block_reason(self, snapshot):
+        return None
+
     def start(self, snapshot, *, ui_parent=None):
         session = ValidationSession(
             ValidationRequest(
@@ -66,6 +69,7 @@ class _Host(QObject):
 class _AutoWindow(QDialog):
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
+    stock_selection_requested = pyqtSignal()
 
     def __init__(self, stock, seed, parent=None):
         super().__init__(parent)
@@ -86,6 +90,15 @@ class _AutoWindow(QDialog):
 
     def show_validation_error(self, _message):
         pass
+
+    def set_validation_stock(self, stock):
+        if stock == self.stock:
+            return False
+        self.stock = stock
+        return True
+
+    def request_validation(self):
+        return None
 
 
 class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
@@ -253,6 +266,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             host=_Host(self.stock),
             window_factory=factory,
         )
+        flow._last_selected_stock = self.stock
         carrier = type("Carrier", (QDialog,), {"signal_validation_requested": pyqtSignal(object)})()
         self.widgets.append(carrier)
         flow.bind_dialog(carrier)

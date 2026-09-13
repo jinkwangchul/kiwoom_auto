@@ -11,11 +11,12 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
+import gui_indicator_follow_signal_validation_flow as flow_module
 from gui_indicator_follow_signal_validation_flow import (
     DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT,
     IndicatorFollowSignalValidationFlow,
@@ -67,6 +68,17 @@ class _FakeHost(QObject):
         super().__init__()
         self.stock = stock
         self.started = []
+        self.preflighted = []
+        self.pickers = []
+        self.picker_parents = []
+
+    def preflight_block_reason(self, snapshot):
+        self.preflighted.append(snapshot)
+        return None
+
+    def create_stock_picker(self, ui_parent=None):
+        self.picker_parents.append(ui_parent)
+        return self.pickers.pop(0)
 
     def start(self, snapshot, *, ui_parent=None):
         self.started.append((snapshot, ui_parent))
@@ -85,6 +97,7 @@ class _FakeHost(QObject):
 class _FakeWindow(QDialog):
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
+    stock_selection_requested = pyqtSignal()
 
     def __init__(self, stock, seed, parent=None):
         super().__init__(parent)
@@ -95,6 +108,7 @@ class _FakeWindow(QDialog):
         self.initial_requests = 0
         self.apply_results = []
         self.historical_candle_count = None
+        self.validation_requests = 0
 
     def set_historical_candle_count(self, count):
         self.historical_candle_count = count
@@ -108,8 +122,33 @@ class _FakeWindow(QDialog):
     def request_initial_validation(self):
         self.initial_requests += 1
 
+    def request_validation(self):
+        self.validation_requests += 1
+        self.validation_run_requested.emit(
+            IndicatorFollowSignalValidationRunRequest(
+                self.seed.settings_snapshot,
+                self.historical_candle_count,
+            )
+        )
+
+    def set_validation_stock(self, stock):
+        if stock == self.stock:
+            return False
+        self.stock = stock
+        self.snapshots.clear()
+        return True
+
     def show_settings_apply_result(self, message, *, success):
         self.apply_results.append((message, success))
+
+
+class _FakePicker:
+    def __init__(self, result, selected_stock=None):
+        self._result = result
+        self.selected_stock = selected_stock
+
+    def exec_(self):
+        return self._result
 
 
 class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
@@ -459,6 +498,11 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         broker = _FakeBroker(False)
         host = _FakeHost(self.stock)
         created = []
+        downstream_calls = []
+
+        def forbidden_downstream(*_args, **_kwargs):
+            downstream_calls.append(True)
+            raise AssertionError("downstream validation must not start without stock")
 
         def window_factory(stock, seed, parent=None):
             window = _FakeWindow(stock, seed, parent)
@@ -469,6 +513,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         flow = IndicatorFollowSignalValidationFlow(
             broker,
             host=host,
+            historical_provider_factory=forbidden_downstream,
+            replay_factory=forbidden_downstream,
             window_factory=window_factory,
         )
         # Use a real QObject signal carrier to exercise bind_dialog.
@@ -488,8 +534,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         broker.connected = True
         carrier.signal_validation_requested.emit(self._seed())
         self.assertEqual(2, broker.connection_checks)
-        self.assertEqual(1, len(host.started))
+        self.assertEqual([], host.started)
+        self.assertEqual(1, len(host.preflighted))
         self.assertEqual(1, len(created))
+        self.assertIsNone(created[0].stock)
+        self.assertEqual(0, created[0].initial_requests)
+        self.assertEqual([], downstream_calls)
         self.assertIsNone(created[0].parentWidget())
 
         created[0].close()
@@ -503,7 +553,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             default_flow.host._stock_picker_factory.__name__,
         )
 
-    def test_unresolved_seed_reaches_picker_and_window_entry(self):
+    def test_unresolved_seed_reaches_window_without_eager_picker(self):
         broker = _FakeBroker(True)
         host = _FakeHost(self.stock)
         created = []
@@ -529,12 +579,221 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         seed = self._unresolved_seed()
         carrier.signal_validation_requested.emit(seed)
 
-        self.assertEqual(1, len(host.started))
-        self.assertIs(host.started[0][0], seed.settings_snapshot)
+        self.assertEqual([], host.started)
+        self.assertEqual(1, len(host.preflighted))
+        self.assertIs(host.preflighted[0], seed.settings_snapshot)
         self.assertEqual(1, len(created))
         self.assertEqual("주문가", created[0].seed.to_ui_state()["sell_ui"][
             "signal_conditions"
         ]["condition_a"]["gap_left_combo"])
+
+    def test_no_stock_run_is_blocked_and_header_double_click_requests_selection(self):
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            window = IndicatorFollowSignalValidationWindow(None, self._seed())
+        self.widgets.append(window)
+        runs = []
+        selections = []
+        window.validation_run_requested.connect(runs.append)
+        window.stock_selection_requested.connect(lambda: selections.append(True))
+
+        self.assertIsNone(window.stock)
+        self.assertEqual("종목 선택", window.compact_stock_label.text())
+        self.assertIsNone(window.request_validation())
+        self.assertEqual([], runs)
+        self.assertIn("더블클릭", window.validation_status_label.text())
+
+        QTest.mouseClick(window.compact_stock_label, Qt.LeftButton)
+        self.assertEqual([], selections)
+        QTest.mouseDClick(window.compact_stock_label, Qt.LeftButton)
+        self.assertEqual([True], selections)
+
+    def test_picker_accept_cancel_same_stock_and_remembered_reentry(self):
+        host = _FakeHost(self.stock)
+        created = []
+        callbacks = []
+
+        def window_factory(stock, seed, parent=None):
+            window = _FakeWindow(stock, seed, parent)
+            self.widgets.append(window)
+            created.append(window)
+            return window
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=host,
+            window_factory=window_factory,
+        )
+        carrier = type(
+            "Carrier",
+            (QDialog,),
+            {"signal_validation_requested": pyqtSignal(object)},
+        )()
+        self.widgets.append(carrier)
+        flow.bind_dialog(carrier)
+        with patch.object(
+            flow_module.QTimer,
+            "singleShot",
+            side_effect=lambda _ms, callback: callbacks.append(callback),
+        ):
+            carrier.signal_validation_requested.emit(self._seed())
+            first = created[-1]
+            self.assertIsNone(first.stock)
+            self.assertEqual([], host.picker_parents)
+            self.assertEqual([], callbacks)
+
+            host.pickers.append(_FakePicker(QDialog.Accepted, self.stock))
+            first.stock_selection_requested.emit()
+            self.assertEqual(self.stock, first.stock)
+            self.assertEqual(self.stock, flow.last_selected_stock)
+            self.assertEqual(1, first.validation_requests)
+            self.assertIs(first, host.picker_parents[-1])
+
+            generation = flow._request_generation[id(first)]
+            requests = first.validation_requests
+            host.pickers.append(_FakePicker(QDialog.Accepted, self.stock))
+            first.stock_selection_requested.emit()
+            self.assertEqual(generation, flow._request_generation[id(first)])
+            self.assertEqual(requests, first.validation_requests)
+
+            other = ValidationStockRef("000660", "SK하이닉스")
+            host.pickers.append(_FakePicker(QDialog.Rejected, other))
+            first.stock_selection_requested.emit()
+            self.assertEqual(self.stock, first.stock)
+            self.assertEqual(self.stock, flow.last_selected_stock)
+            self.assertEqual(generation, flow._request_generation[id(first)])
+            self.assertEqual(requests, first.validation_requests)
+
+            carrier.signal_validation_requested.emit(self._seed())
+            second = created[-1]
+            self.assertEqual(self.stock, second.stock)
+            self.assertEqual(1, len(callbacks))
+            callbacks.pop()()
+            self.assertEqual(1, second.initial_requests)
+
+            host.pickers.append(_FakePicker(QDialog.Accepted, other))
+            first.stock_selection_requested.emit()
+            self.assertEqual(other, first.stock)
+            self.assertEqual(self.stock, second.stock)
+            self.assertEqual(other, flow.last_selected_stock)
+
+            carrier.signal_validation_requested.emit(self._seed())
+            third = created[-1]
+            self.assertEqual(other, third.stock)
+            self.assertEqual(1, len(callbacks))
+
+    def test_stock_change_clears_result_and_rejects_late_historical_callback(self):
+        host = _FakeHost(self.stock)
+        created = []
+        pending = []
+
+        class Provider:
+            def __init__(_self, session, requester):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                pending.append((_self.session.request.stock, count, callback))
+
+        class Replay:
+            def __init__(_self, session):
+                _self.session = session
+
+            def evaluate(_self, historical):
+                stock = _self.session.request.stock
+                return ValidationReplayResult(True, snapshot=ValidationReplaySnapshot(
+                    stock=stock,
+                    timeframe_minutes=_self.session.request.timeframe_minutes,
+                    settings_hash=_self.session.request.settings_snapshot.rules_hash,
+                    historical_request_id=historical.request_id,
+                    evaluated_start_index=0,
+                    evaluated_end_index=0,
+                    dropped_raw_rows_count=0,
+                    candles=[{
+                        "time": "20260911143000",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100,
+                        "volume": 1,
+                    }],
+                    entries=[],
+                ))
+
+        def result(stock, request_id):
+            return ValidationHistoricalResult(
+                True,
+                snapshot=ValidationHistoricalSnapshot(
+                    stock=stock,
+                    timeframe_minutes=5,
+                    requested_count=100,
+                    request_id=request_id,
+                    rows=[{
+                        "체결시간": "20260911143000",
+                        "시가": "100",
+                        "고가": "101",
+                        "저가": "99",
+                        "현재가": "100",
+                        "거래량": "1",
+                    }],
+                ),
+            )
+
+        def window_factory(stock, seed, parent=None):
+            window = _FakeWindow(stock, seed, parent)
+            self.widgets.append(window)
+            created.append(window)
+            return window
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=host,
+            historical_provider_factory=Provider,
+            replay_factory=Replay,
+            window_factory=window_factory,
+        )
+        carrier = type(
+            "Carrier",
+            (QDialog,),
+            {"signal_validation_requested": pyqtSignal(object)},
+        )()
+        self.widgets.append(carrier)
+        flow.bind_dialog(carrier)
+        carrier.signal_validation_requested.emit(self._seed())
+        window = created[0]
+
+        host.pickers.append(_FakePicker(QDialog.Accepted, self.stock))
+        window.stock_selection_requested.emit()
+        self.assertEqual(self.stock, pending[0][0])
+
+        other = ValidationStockRef("000660", "SK하이닉스")
+        host.pickers.append(_FakePicker(QDialog.Accepted, other))
+        window.stock_selection_requested.emit()
+        self.assertEqual(other, pending[1][0])
+
+        pending[0][2](result(self.stock, "OLD"))
+        self.assertEqual([], window.snapshots)
+        pending[1][2](result(other, "NEW"))
+        self.assertEqual(1, len(window.snapshots))
+        self.assertEqual(other, window.snapshots[0].stock)
+
+    def test_real_window_stock_change_removes_previous_result_immediately(self):
+        window = self._window()
+        window.set_replay_snapshot(
+            self._replay_snapshot([self._entry("BUY", 1, "BUY")])
+        )
+        self.assertIsNotNone(window.replay_snapshot)
+        self.assertIsNotNone(window.canvas)
+        other = ValidationStockRef("000660", "SK하이닉스")
+
+        self.assertTrue(window.set_validation_stock(other))
+        self.assertEqual(other, window.stock)
+        self.assertIsNone(window.replay_snapshot)
+        self.assertIsNone(window.canvas)
+        self.assertEqual([], window._candles)
+        self.assertEqual([], window._entries)
+        self.assertIsNone(window.selected_evaluation_index)
+        self.assertEqual(0, window.filter_result_table.rowCount())
+        self.assertEqual("추정 손익률: -", window.estimated_return_label.text())
+        self.assertIn("준비 중", window.validation_status_label.text())
 
     def test_each_run_uses_its_snapshot_timeframe_and_updates_real_replay_result(self):
         broker = _FakeBroker(True)
@@ -607,6 +866,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             window_factory=window_factory,
         )
+        flow._last_selected_stock = self.stock
         carrier = type("Carrier", (QDialog,), {"signal_validation_requested": pyqtSignal(object)})()
         self.widgets.append(carrier)
         flow.bind_dialog(carrier)

@@ -7,7 +7,7 @@ from collections.abc import Callable
 import weakref
 
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtWidgets import QDialog, QWidget
 
 from gui_toast import show_toast
 from gui_indicator_follow_signal_validation_window import (
@@ -22,7 +22,7 @@ from indicator_follow_signal_validation_projection import (
 )
 from routines.지표추종매매.routine_validation_contract import (
     ValidationRequest,
-    ValidationSettingsSnapshot,
+    ValidationStockRef,
 )
 from routines.지표추종매매.routine_validation_historical import (
     ValidationHistoricalProvider,
@@ -83,16 +83,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
             parent,
             operation_active_reader=operation_active_reader,
         )
+        self._last_selected_stock: ValidationStockRef | None = None
         self._bound_dialog_ids: set[int] = set()
-        self._pending_entry: tuple[
-            IndicatorFollowSignalValidationSeed,
-            weakref.ReferenceType[object],
-        ] | None = None
         self._open_windows: dict[int, object] = {}
         self._request_generation: dict[int, int] = {}
         self._active_providers: dict[tuple[int, int], object] = {}
         self._host.validation_blocked.connect(self._forward_host_failure)
-        self._host.validation_session_ready.connect(self._open_signal_window)
 
     @property
     def host(self) -> IndicatorFollowValidationHost:
@@ -101,6 +97,10 @@ class IndicatorFollowSignalValidationFlow(QObject):
     @property
     def open_windows(self) -> tuple[object, ...]:
         return tuple(self._open_windows.values())
+
+    @property
+    def last_selected_stock(self) -> ValidationStockRef | None:
+        return self._last_selected_stock
 
     def bind_dialog(self, dialog: object) -> bool:
         signal = getattr(dialog, "signal_validation_requested", None)
@@ -172,22 +172,24 @@ class IndicatorFollowSignalValidationFlow(QObject):
         except TypeError:
             self.validation_failed.emit("INVALID_VALIDATION_REQUESTER")
             return None
-        self._pending_entry = (seed, requester_ref)
-        try:
-            return self._host.start(seed.settings_snapshot, ui_parent=requester)
-        finally:
-            if self._pending_entry is not None and self._pending_entry[0] is seed:
-                self._pending_entry = None
-
-    def _open_signal_window(self, session: object) -> None:
-        pending = self._pending_entry
-        if not isinstance(session, ValidationSession) or pending is None:
-            self.validation_failed.emit("INVALID_SIGNAL_VALIDATION_SESSION")
+        preflight = getattr(self._host, "preflight_block_reason", None)
+        if not callable(preflight):
+            self.validation_failed.emit("VALIDATION_PREFLIGHT_UNAVAILABLE")
             return
-        seed, source_ref = pending
+        block_reason = preflight(seed.settings_snapshot)
+        if block_reason is not None:
+            self.validation_failed.emit(str(block_reason or "VALIDATION_BLOCKED"))
+            return None
+        return self._open_signal_window(seed, requester_ref)
+
+    def _open_signal_window(
+        self,
+        seed: IndicatorFollowSignalValidationSeed,
+        source_ref: weakref.ReferenceType[object],
+    ) -> object | None:
         try:
             window = self._window_factory(
-                session.request.stock,
+                self._last_selected_stock,
                 seed,
                 parent=None,
             )
@@ -217,6 +219,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     payload,
                 )
             )
+            stock_signal = getattr(window, "stock_selection_requested", None)
+            if not callable(getattr(stock_signal, "connect", None)):
+                raise TypeError("stock selection request signal is unavailable")
+            stock_signal.connect(
+                lambda ref=window_ref: self._select_stock_for_window(ref())
+            )
             if callable(getattr(window, "setAttribute", None)):
                 window.setAttribute(Qt.WA_DeleteOnClose, True)
             key = id(window)
@@ -228,15 +236,58 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     lambda _obj=None, window_key=key: self._release_window(window_key)
                 )
             window.show()
-            initial_request = getattr(window, "request_initial_validation", None)
-            if not callable(initial_request):
-                raise TypeError("initial signal validation request is unavailable")
-            QTimer.singleShot(
-                0,
-                lambda ref=window_ref: self._request_initial_validation(ref()),
-            )
+            if self._last_selected_stock is not None:
+                initial_request = getattr(window, "request_initial_validation", None)
+                if not callable(initial_request):
+                    raise TypeError("initial signal validation request is unavailable")
+                QTimer.singleShot(
+                    0,
+                    lambda ref=window_ref: self._request_initial_validation(ref()),
+                )
+            return window
         except Exception as exc:
             self.validation_failed.emit(f"SIGNAL_WINDOW_ERROR: {exc}")
+            return None
+
+    def _select_stock_for_window(self, window: object) -> None:
+        window_key = id(window)
+        if window_key not in self._open_windows:
+            return
+        create_picker = getattr(self._host, "create_stock_picker", None)
+        if not callable(create_picker):
+            self._fail_window(window, "STOCK_PICKER_UNAVAILABLE")
+            return
+        try:
+            picker = create_picker(window)
+            if picker.exec_() != QDialog.Accepted:
+                return
+            selected = picker.selected_stock
+        except Exception as exc:
+            self._fail_window(window, f"STOCK_PICKER_ERROR: {exc}")
+            return
+        if (
+            not isinstance(selected, ValidationStockRef)
+            or not selected.code
+            or not selected.name
+        ):
+            self._fail_window(window, "INVALID_SELECTED_STOCK")
+            return
+        if selected == getattr(window, "stock", None):
+            return
+        set_stock = getattr(window, "set_validation_stock", None)
+        request_validation = getattr(window, "request_validation", None)
+        if not callable(set_stock) or not callable(request_validation):
+            self._fail_window(window, "SIGNAL_WINDOW_STOCK_API_UNAVAILABLE")
+            return
+        self._invalidate_window_requests(window_key)
+        if set_stock(selected) is not True:
+            return
+        self._last_selected_stock = ValidationStockRef(selected.code, selected.name)
+        request_validation()
+
+    def _invalidate_window_requests(self, window_key: int) -> None:
+        if window_key in self._request_generation:
+            self._request_generation[window_key] += 1
 
     @staticmethod
     def _request_initial_validation(window: object) -> None:
@@ -299,8 +350,19 @@ class IndicatorFollowSignalValidationFlow(QObject):
             return
         snapshot = run_request.settings_snapshot
         try:
+            stock = getattr(window, "stock", None)
+            if (
+                not isinstance(stock, ValidationStockRef)
+                or not stock.code
+                or not stock.name
+            ):
+                self._fail_window(
+                    window,
+                    "상단 종목명을 더블클릭하여 검증 종목을 선택하세요.",
+                )
+                return
             timeframe = snapshot.to_dict()["bar"]["bar_minutes"]
-            request = ValidationRequest(window.stock, snapshot, timeframe)
+            request = ValidationRequest(stock, snapshot, timeframe)
             session = ValidationSession(
                 request,
                 operation_active_reader=self._operation_active_reader,

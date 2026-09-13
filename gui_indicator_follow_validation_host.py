@@ -58,30 +58,13 @@ class IndicatorFollowValidationHost(QObject):
         *,
         ui_parent: QWidget | None = None,
     ) -> ValidationSession | None:
-        if not isinstance(settings_snapshot, ValidationSettingsSnapshot):
-            self.validation_blocked.emit(REASON_INVALID_SETTINGS_SNAPSHOT)
+        block_reason = self.preflight_block_reason(settings_snapshot)
+        if block_reason is not None:
+            self.validation_blocked.emit(block_reason)
             return None
+        timeframe_minutes = settings_snapshot.to_dict()["bar"]["bar_minutes"]
 
-        try:
-            rules = settings_snapshot.to_dict()
-            timeframe_minutes = rules["bar"]["bar_minutes"]
-        except (KeyError, TypeError, ValueError):
-            self.validation_blocked.emit(REASON_INVALID_TIMEFRAME)
-            return None
-        if (
-            isinstance(timeframe_minutes, bool)
-            or not isinstance(timeframe_minutes, int)
-            or timeframe_minutes <= 0
-        ):
-            self.validation_blocked.emit(REASON_INVALID_TIMEFRAME)
-            return None
-
-        operation_block_reason = self._preflight_operation_block_reason()
-        if operation_block_reason is not None:
-            self.validation_blocked.emit(operation_block_reason)
-            return None
-
-        picker = self._stock_picker_factory(self._picker_parent(ui_parent))
+        picker = self.create_stock_picker(ui_parent)
         if picker.exec_() != QDialog.Accepted:
             return None
         selected_stock = picker.selected_stock
@@ -109,6 +92,28 @@ class IndicatorFollowValidationHost(QObject):
 
         self.validation_session_ready.emit(session)
         return session
+
+    def preflight_block_reason(
+        self,
+        settings_snapshot: object,
+    ) -> str | None:
+        """Read-only settings/operation gate shared by V1 and V2 entry."""
+        if not isinstance(settings_snapshot, ValidationSettingsSnapshot):
+            return REASON_INVALID_SETTINGS_SNAPSHOT
+        try:
+            timeframe_minutes = settings_snapshot.to_dict()["bar"]["bar_minutes"]
+        except (KeyError, TypeError, ValueError):
+            return REASON_INVALID_TIMEFRAME
+        if (
+            isinstance(timeframe_minutes, bool)
+            or not isinstance(timeframe_minutes, int)
+            or timeframe_minutes <= 0
+        ):
+            return REASON_INVALID_TIMEFRAME
+        return self._preflight_operation_block_reason()
+
+    def create_stock_picker(self, ui_parent: object = None) -> object:
+        return self._stock_picker_factory(self._picker_parent(ui_parent))
 
     def _picker_parent(self, ui_parent: object) -> QWidget | None:
         if isinstance(ui_parent, QWidget):

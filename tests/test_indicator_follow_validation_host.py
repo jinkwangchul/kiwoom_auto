@@ -165,6 +165,20 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
         factory.assert_called_once_with(None)
         self.assertEqual(1, picker.exec_calls)
 
+    def test_read_only_preflight_does_not_open_picker_or_emit_session(self) -> None:
+        picker = _FakePicker(QDialog.Accepted)
+        reader = Mock(return_value=False)
+        host, factory, blocked, ready = self._host(reader, picker)
+        snapshot = self._snapshot(5)
+
+        result = host.preflight_block_reason(snapshot)
+
+        self.assertIsNone(result)
+        reader.assert_called_once_with()
+        factory.assert_not_called()
+        self.assertEqual([], blocked)
+        self.assertEqual([], ready)
+
     def test_valid_selection_builds_request_from_current_snapshot(self) -> None:
         selected = ValidationStockRef("005930", "삼성전자")
         picker = _FakePicker(QDialog.Accepted, selected)
