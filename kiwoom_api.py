@@ -2685,6 +2685,51 @@ class KiwoomApi(QObject):
         callback: Opt10080Callback | None = None,
     ) -> dict[str, Any]:
         """Request opt10080 minute candles and save the response on receipt."""
+        return self._request_minute_candles_common(
+            code,
+            name,
+            interval,
+            count,
+            max_count,
+            screen_no,
+            callback,
+            commit_to_production=True,
+        )
+
+    def request_minute_candles_read_only(
+        self,
+        code: str,
+        name: str = "",
+        interval: int = 1,
+        count: int = 300,
+        max_count: int = DEFAULT_CANDLES_MAX_COUNT,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+    ) -> dict[str, Any]:
+        """Request opt10080 minute candles without a Production candle commit."""
+        return self._request_minute_candles_common(
+            code,
+            name,
+            interval,
+            count,
+            max_count,
+            screen_no,
+            callback,
+            commit_to_production=False,
+        )
+
+    def _request_minute_candles_common(
+        self,
+        code: str,
+        name: str,
+        interval: int,
+        count: int,
+        max_count: int,
+        screen_no: str | None,
+        callback: Opt10080Callback | None,
+        *,
+        commit_to_production: bool,
+    ) -> dict[str, Any]:
         clean_code = normalize_stock_code(code)
         if not clean_code:
             return self._finish_callback(
@@ -2753,6 +2798,7 @@ class KiwoomApi(QObject):
             "screen_no": claimed_screen_no,
             "callback": callback,
             "rows": [],
+            "commit_to_production": bool(commit_to_production),
             **request_identity,
         }
 
@@ -3531,40 +3577,56 @@ class KiwoomApi(QObject):
             pending = self._pending_tr.pop(request_name, pending)
             self._release_pending_tr_screen(request_name, pending)
             rows = list(accumulated[:requested_count])
-            commit = commit_minute_candles_for_stock(
-                str(pending.get("code", "")),
-                str(pending.get("name", "")),
-                rows,
-                max_count=int(pending.get("max_count") or DEFAULT_CANDLES_MAX_COUNT),
-                rqname=str(rqname),
-                trcode=str(trcode),
-                connection_epoch=int(pending.get("request_connection_epoch") or 0),
-            )
-            result = {
-                "ok": commit.ok,
-                "type": "minute_candles",
-                "code": pending.get("code", ""),
-                "name": pending.get("name", ""),
-                "rqname": str(rqname),
-                "trcode": str(trcode),
-                "rows_count": len(rows),
-                "saved_count": commit.saved_count,
-                "commit_verified": bool(commit.ok and commit.readback_verified),
-                "changed": commit.changed,
-                "canonical_content_hash": commit.canonical_content_hash,
-                "canonical_path": commit.path,
-                "commit_identity": commit.commit_identity,
-                "bar_key": commit.bar_key,
-                "bar_identity": commit.bar_identity,
-                "bar_time": commit.bar_time,
-                "trade_date": commit.trade_date,
-                "error_kind": commit.error_kind,
-                "error": commit.error,
-                "has_more": str(prev_next).strip() == "2",
-                "warning": "additional pages available" if str(prev_next).strip() == "2" else "",
-            }
-            if commit.ok and commit.readback_verified and commit.changed and commit.notification is not None:
-                self.bar_committed.emit(commit.notification.to_payload())
+            if pending.get("commit_to_production", True) is False:
+                result = {
+                    "ok": True,
+                    "type": "minute_candles",
+                    "request_id": request_name,
+                    "code": pending.get("code", ""),
+                    "name": pending.get("name", ""),
+                    "interval": int(pending.get("interval") or 1),
+                    "rows": rows,
+                    "rows_count": len(rows),
+                    "rqname": str(rqname),
+                    "trcode": str(trcode),
+                    "has_more": str(prev_next).strip() == "2",
+                    "warning": "additional pages available" if str(prev_next).strip() == "2" else "",
+                }
+            else:
+                commit = commit_minute_candles_for_stock(
+                    str(pending.get("code", "")),
+                    str(pending.get("name", "")),
+                    rows,
+                    max_count=int(pending.get("max_count") or DEFAULT_CANDLES_MAX_COUNT),
+                    rqname=str(rqname),
+                    trcode=str(trcode),
+                    connection_epoch=int(pending.get("request_connection_epoch") or 0),
+                )
+                result = {
+                    "ok": commit.ok,
+                    "type": "minute_candles",
+                    "code": pending.get("code", ""),
+                    "name": pending.get("name", ""),
+                    "rqname": str(rqname),
+                    "trcode": str(trcode),
+                    "rows_count": len(rows),
+                    "saved_count": commit.saved_count,
+                    "commit_verified": bool(commit.ok and commit.readback_verified),
+                    "changed": commit.changed,
+                    "canonical_content_hash": commit.canonical_content_hash,
+                    "canonical_path": commit.path,
+                    "commit_identity": commit.commit_identity,
+                    "bar_key": commit.bar_key,
+                    "bar_identity": commit.bar_identity,
+                    "bar_time": commit.bar_time,
+                    "trade_date": commit.trade_date,
+                    "error_kind": commit.error_kind,
+                    "error": commit.error,
+                    "has_more": str(prev_next).strip() == "2",
+                    "warning": "additional pages available" if str(prev_next).strip() == "2" else "",
+                }
+                if commit.ok and commit.readback_verified and commit.changed and commit.notification is not None:
+                    self.bar_committed.emit(commit.notification.to_payload())
         except Exception as exc:
             self._pending_tr.pop(request_name, None)
             self._release_pending_tr_screen(request_name, pending)
