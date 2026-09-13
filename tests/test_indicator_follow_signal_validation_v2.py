@@ -22,9 +22,11 @@ from gui_indicator_follow_signal_validation_flow import (
 )
 from gui_indicator_follow_signal_validation_window import (
     IndicatorFollowSignalValidationWindow,
+    _time_axis_label_records,
     estimated_signal_return_percent,
 )
 from indicator_follow_signal_validation_projection import (
+    IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_signal_validation_snapshot,
     project_signal_validation_rules,
@@ -82,6 +84,7 @@ class _FakeHost(QObject):
 
 class _FakeWindow(QDialog):
     validation_run_requested = pyqtSignal(object)
+    settings_apply_requested = pyqtSignal(object)
 
     def __init__(self, stock, seed, parent=None):
         super().__init__(parent)
@@ -89,12 +92,24 @@ class _FakeWindow(QDialog):
         self.seed = seed
         self.snapshots = []
         self.errors = []
+        self.initial_requests = 0
+        self.apply_results = []
+        self.historical_candle_count = None
+
+    def set_historical_candle_count(self, count):
+        self.historical_candle_count = count
 
     def set_replay_snapshot(self, snapshot):
         self.snapshots.append(snapshot)
 
     def show_validation_error(self, message):
         self.errors.append(message)
+
+    def request_initial_validation(self):
+        self.initial_requests += 1
+
+    def show_settings_apply_result(self, message, *, success):
+        self.apply_results.append((message, success))
 
 
 class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
@@ -284,7 +299,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
     def test_v2_snapshot_runs_through_actual_historical_replay_evaluator(self):
         window = self._window()
-        snapshot = window._request_validation()
+        run_request = window._request_validation()
+        snapshot = run_request.settings_snapshot
         request = ValidationRequest(
             self.stock,
             snapshot,
@@ -317,16 +333,44 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         emitted = []
         window.validation_run_requested.connect(emitted.append)
         window.basic_signal_interval_combo.setCurrentText("15")
+        window.historical_candle_count_spin.setValue(500)
         window.buy_rsi_value_line.setText("33")
-        snapshot = window._request_validation()
-        self.assertIsInstance(snapshot, ValidationSettingsSnapshot)
-        self.assertEqual([snapshot], emitted)
+        run_request = window._request_validation()
+        self.assertIsInstance(run_request, IndicatorFollowSignalValidationRunRequest)
+        self.assertEqual([run_request], emitted)
+        self.assertEqual(500, run_request.candle_count)
+        snapshot = run_request.settings_snapshot
         rules = snapshot.to_dict()
         self.assertEqual(15, rules["bar"]["bar_minutes"])
         self.assertNotIn("execution", rules["buy"])
         self.assertNotIn("price_compare", rules["buy"].get("filters", {}))
         self.assertNotIn("method", rules["sell"])
         self.assertNotIn("profit_rate_sell", rules["sell"]["signals"])
+
+    def test_time_axis_labels_use_only_real_candle_times_and_range_format(self):
+        def candles(times):
+            return [{"time": value, "close": 100} for value in times]
+
+        intraday = _time_axis_label_records(candles([
+            f"2026091310{minute:02d}00" for minute in range(20)
+        ]))
+        self.assertTrue(8 <= len(intraday) <= 12)
+        self.assertEqual("10:00", intraday[0]["label"])
+        self.assertEqual("10:19", intraday[-1]["label"])
+
+        multi_day = _time_axis_label_records(candles([
+            "20260913090000", "20260914090000", "20260915090000"
+        ]))
+        self.assertIn("09/14", {record["label"].split()[0] for record in multi_day})
+
+        long_range = _time_axis_label_records(candles([
+            "20260101090000", "20260501090000", "20270101090000"
+        ]))
+        self.assertTrue(all(len(record["label"].split("/")[0]) == 4 for record in long_range))
+        source_times = {item["time"] for item in candles([
+            "20260101090000", "20260501090000", "20270101090000"
+        ])}
+        self.assertTrue(all(record["time"] in source_times for record in long_range))
 
     def test_estimated_return_uses_all_earlier_buys_and_latest_sell(self):
         snapshot = self._replay_snapshot([
@@ -358,7 +402,16 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             matched_groups=["C"],
             details=["actual-detail"],
             trace={
-                "conditions": [{"condition": "actual-condition"}],
+                "conditions": [{
+                    "path": "sell.signals.ui_condition_c.groups[0].conditions[0]",
+                    "condition_type": "actual-condition",
+                    "operator": "TURN_DOWN",
+                    "left_operand": {"value": 3.0},
+                    "right_operand": {"value": None},
+                    "raw_result": True,
+                    "final_result": True,
+                    "indicator_snapshots": [],
+                }],
                 "groups": [{"group": "C"}],
                 "aggregations": [{"result": True}],
             },
@@ -368,9 +421,15 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(1, window.canvas.marker_count("BUY"))
         self.assertEqual(1, window.canvas.marker_count("SELL"))
         self.assertEqual(2, window.selected_evaluation_index)
-        self.assertIn("actual-reason", window.sell_details.toPlainText())
-        self.assertIn("actual-condition", window.sell_details.toPlainText())
-        self.assertIn("조건 근거봉: 2026-09-11 14:01", window.sell_details.toPlainText())
+        self.assertIn("SELL reason: actual-reason", window.selection_summary.toPlainText())
+        self.assertIn("SELL signal_time: 2026-09-11 14:01", window.selection_summary.toPlainText())
+        table_text = " ".join(
+            window.filter_result_table.item(row, column).text()
+            for row in range(window.filter_result_table.rowCount())
+            for column in range(window.filter_result_table.columnCount())
+            if window.filter_result_table.item(row, column) is not None
+        )
+        self.assertIn("actual-condition", table_text)
         self.assertIn("+50.00%", window.estimated_return_label.text())
 
     def test_auth_is_fresh_and_default_host_is_the_existing_picker_host(self):
@@ -497,17 +556,18 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         flow.bind_dialog(carrier)
         carrier.signal_validation_requested.emit(self._seed())
         window = created[0]
-        for timeframe in (3, 15):
+        self.assertEqual(DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT, window.historical_candle_count)
+        for timeframe, candle_count in ((3, 300), (15, 500)):
             rules = deepcopy(self.rules)
             rules["bar"]["bar_minutes"] = timeframe
             window.validation_run_requested.emit(
-                build_signal_validation_snapshot(rules, ui_state=self.ui_state)
+                IndicatorFollowSignalValidationRunRequest(
+                    build_signal_validation_snapshot(rules, ui_state=self.ui_state),
+                    candle_count,
+                )
             )
         self.assertEqual([3, 15], [session.request.timeframe_minutes for session in sessions])
-        self.assertEqual(
-            [DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT] * 2,
-            requested_counts,
-        )
+        self.assertEqual([300, 500], requested_counts)
         self.assertEqual([3, 15], [snapshot.timeframe_minutes for snapshot in window.snapshots])
 
     def test_source_boundaries_do_not_create_broker_or_mutation_paths(self):

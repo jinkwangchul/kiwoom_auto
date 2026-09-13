@@ -75,6 +75,49 @@ class IndicatorFollowSignalValidationSeed:
         return value
 
 
+@dataclass(frozen=True, slots=True)
+class IndicatorFollowSignalValidationRunRequest:
+    """Immutable V2 run input: signal settings plus requested Candle count."""
+
+    settings_snapshot: ValidationSettingsSnapshot
+    candle_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.settings_snapshot, ValidationSettingsSnapshot):
+            raise TypeError("settings_snapshot must be ValidationSettingsSnapshot")
+        if (
+            isinstance(self.candle_count, bool)
+            or not isinstance(self.candle_count, int)
+            or self.candle_count <= 0
+        ):
+            raise ValueError("candle_count must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class IndicatorFollowSignalValidationApplyPayload:
+    """Immutable signal-only values explicitly requested for source-dialog apply."""
+
+    _ui_state_json: str
+
+    def __init__(self, ui_state: Mapping[str, Any]) -> None:
+        if not isinstance(ui_state, Mapping):
+            raise TypeError("ui_state must be a mapping")
+        canonical = json.dumps(
+            project_signal_validation_apply_ui_state(ui_state),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        object.__setattr__(self, "_ui_state_json", canonical)
+
+    def to_ui_state(self) -> dict[str, Any]:
+        value = json.loads(self._ui_state_json)
+        if not isinstance(value, dict):
+            raise ValueError("canonical apply UI state must decode to an object")
+        return value
+
+
 def _depends_on_execution_price(value: Mapping[str, Any]) -> bool:
     for key, field_value in value.items():
         if str(key).strip().lower() not in _DEPENDENCY_FIELDS:
@@ -111,8 +154,6 @@ def project_signal_validation_ui_state(
     basic = state.get("basic") if isinstance(state.get("basic"), dict) else {}
     safe_basic_names = {
         "basic_signal_interval_combo",
-        "basic_duplicate_signal_combo",
-        "basic_error_policy_combo",
         "buy_signal_expr_line",
         "sell_signal_expr_line",
     }
@@ -159,6 +200,17 @@ def project_signal_validation_ui_state(
     }
 
 
+def project_signal_validation_apply_ui_state(
+    ui_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only V2-visible values that may be applied back to a source dialog."""
+    projected = project_signal_validation_ui_state(ui_state)
+    signal_filter = projected.get("buy_ui", {}).get("signal_filter")
+    if isinstance(signal_filter, dict):
+        signal_filter.pop("buy_composite", None)
+    return projected
+
+
 def project_signal_validation_rules(
     rules: Mapping[str, Any],
     *,
@@ -171,6 +223,7 @@ def project_signal_validation_rules(
 
     for key in ("buy_management", "order_policy", "cancel_policy"):
         projected.pop(key, None)
+    projected.pop("signal_runtime_policy", None)
 
     principle = projected.get("principle")
     if isinstance(principle, dict):

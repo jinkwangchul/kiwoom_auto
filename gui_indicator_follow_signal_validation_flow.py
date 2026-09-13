@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import weakref
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
 from gui_toast import show_toast
@@ -15,6 +15,8 @@ from gui_indicator_follow_signal_validation_window import (
 )
 from gui_indicator_follow_validation_host import IndicatorFollowValidationHost
 from indicator_follow_signal_validation_projection import (
+    IndicatorFollowSignalValidationApplyPayload,
+    IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_signal_validation_snapshot,
 )
@@ -82,7 +84,10 @@ class IndicatorFollowSignalValidationFlow(QObject):
             operation_active_reader=operation_active_reader,
         )
         self._bound_dialog_ids: set[int] = set()
-        self._pending_entry: tuple[IndicatorFollowSignalValidationSeed, object] | None = None
+        self._pending_entry: tuple[
+            IndicatorFollowSignalValidationSeed,
+            weakref.ReferenceType[object],
+        ] | None = None
         self._open_windows: dict[int, object] = {}
         self._request_generation: dict[int, int] = {}
         self._active_providers: dict[tuple[int, int], object] = {}
@@ -170,7 +175,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
         except Exception as exc:
             self.validation_failed.emit(f"SIGNAL_PROJECTION_ERROR: {exc}")
             return None
-        self._pending_entry = (seed, requester)
+        try:
+            requester_ref = weakref.ref(requester)
+        except TypeError:
+            self.validation_failed.emit("INVALID_VALIDATION_REQUESTER")
+            return None
+        self._pending_entry = (seed, requester_ref)
         try:
             return self._host.start(initial_snapshot, ui_parent=requester)
         finally:
@@ -182,13 +192,20 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if not isinstance(session, ValidationSession) or pending is None:
             self.validation_failed.emit("INVALID_SIGNAL_VALIDATION_SESSION")
             return
-        seed, _requester = pending
+        seed, source_ref = pending
         try:
             window = self._window_factory(
                 session.request.stock,
                 seed,
                 parent=None,
             )
+            set_historical_candle_count = getattr(
+                window,
+                "set_historical_candle_count",
+                None,
+            )
+            if callable(set_historical_candle_count):
+                set_historical_candle_count(self._historical_count)
             if not callable(getattr(window, "show", None)):
                 raise TypeError("signal validation window show is unavailable")
             run_signal = getattr(window, "validation_run_requested", None)
@@ -197,6 +214,16 @@ class IndicatorFollowSignalValidationFlow(QObject):
             window_ref = weakref.ref(window)
             run_signal.connect(
                 lambda snapshot, ref=window_ref: self._run_validation(ref(), snapshot)
+            )
+            apply_signal = getattr(window, "settings_apply_requested", None)
+            if not callable(getattr(apply_signal, "connect", None)):
+                raise TypeError("signal validation apply signal is unavailable")
+            apply_signal.connect(
+                lambda payload, ref=window_ref, source=source_ref: self._apply_to_source(
+                    ref(),
+                    source,
+                    payload,
+                )
             )
             if callable(getattr(window, "setAttribute", None)):
                 window.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -209,8 +236,59 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     lambda _obj=None, window_key=key: self._release_window(window_key)
                 )
             window.show()
+            initial_request = getattr(window, "request_initial_validation", None)
+            if not callable(initial_request):
+                raise TypeError("initial signal validation request is unavailable")
+            QTimer.singleShot(
+                0,
+                lambda ref=window_ref: self._request_initial_validation(ref()),
+            )
         except Exception as exc:
             self.validation_failed.emit(f"SIGNAL_WINDOW_ERROR: {exc}")
+
+    @staticmethod
+    def _request_initial_validation(window: object) -> None:
+        request = getattr(window, "request_initial_validation", None)
+        if callable(request):
+            request()
+
+    def _apply_to_source(
+        self,
+        window: object,
+        source_ref: weakref.ReferenceType[object],
+        payload: object,
+    ) -> None:
+        show_result = getattr(window, "show_settings_apply_result", None)
+        if not isinstance(payload, IndicatorFollowSignalValidationApplyPayload):
+            if callable(show_result):
+                show_result("설정 반영 데이터가 올바르지 않습니다.", success=False)
+            return
+        source = source_ref()
+        if not self._valid_requester(source):
+            if callable(show_result):
+                show_result(
+                    "원본 설정창이 닫혀 있어 설정을 반영할 수 없습니다.",
+                    success=False,
+                )
+            return
+        apply_state = getattr(source, "apply_signal_validation_ui_state", None)
+        if not callable(apply_state):
+            if callable(show_result):
+                show_result("원본 설정창에 신호설정을 반영할 수 없습니다.", success=False)
+            return
+        try:
+            result = apply_state(payload.to_ui_state())
+        except Exception:
+            if callable(show_result):
+                show_result("신호설정 반영 중 오류가 발생했습니다.", success=False)
+            return
+        skipped = result.get("skipped", []) if isinstance(result, dict) else ["invalid_result"]
+        if skipped:
+            if callable(show_result):
+                show_result("일부 신호설정을 반영할 수 없습니다.", success=False)
+            return
+        if callable(show_result):
+            show_result("설정 반영 완료", success=True)
 
     def _release_window(self, window_key: int) -> None:
         self._open_windows.pop(window_key, None)
@@ -219,14 +297,15 @@ class IndicatorFollowSignalValidationFlow(QObject):
             if request_key[0] == window_key:
                 self._active_providers.pop(request_key, None)
 
-    def _run_validation(self, window: object, snapshot: object) -> None:
+    def _run_validation(self, window: object, run_request: object) -> None:
         window_key = id(window)
         if window_key not in self._open_windows:
             self.validation_failed.emit("SIGNAL_WINDOW_UNAVAILABLE")
             return
-        if not isinstance(snapshot, ValidationSettingsSnapshot):
-            self._fail_window(window, "INVALID_SETTINGS_SNAPSHOT")
+        if not isinstance(run_request, IndicatorFollowSignalValidationRunRequest):
+            self._fail_window(window, "INVALID_SIGNAL_VALIDATION_RUN_REQUEST")
             return
+        snapshot = run_request.settings_snapshot
         try:
             timeframe = snapshot.to_dict()["bar"]["bar_minutes"]
             request = ValidationRequest(window.stock, snapshot, timeframe)
@@ -265,7 +344,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             self._fail_window(window, "HISTORICAL_PROVIDER_UNAVAILABLE")
             return
         try:
-            request_latest(self._historical_count, completed)
+            request_latest(run_request.candle_count, completed)
         except Exception as exc:
             self._active_providers.pop(request_key, None)
             self._fail_window(window, f"HISTORICAL_REQUEST_ERROR: {exc}")

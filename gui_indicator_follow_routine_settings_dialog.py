@@ -87,6 +87,7 @@ from routines.지표추종매매.routine_validation_contract import (
 )
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationSeed,
+    project_signal_validation_apply_ui_state,
 )
 
 
@@ -3088,6 +3089,42 @@ class IndicatorFollowRoutineSettingsDialog(
                         "error": str(exc),
                     })
         return errors
+
+    def apply_signal_validation_ui_state(self, state):
+        """Apply only V2-visible signal controls in memory; never touch execution settings."""
+        result = {"applied": [], "skipped": []}
+        try:
+            projected = project_signal_validation_apply_ui_state(state)
+        except (TypeError, ValueError) as exc:
+            result["skipped"].append({
+                "name": "state",
+                "reason": "invalid_signal_validation_state",
+                "error": str(exc),
+            })
+            return result
+
+        self._apply_named_ui_values(projected.get("basic", {}), result=result)
+
+        buy_ui = projected.get("buy_ui", {})
+        signal_filter = (
+            buy_ui.get("signal_filter", {}) if isinstance(buy_ui, dict) else {}
+        )
+        self._apply_named_ui_values(signal_filter, result=result)
+
+        sell_ui = projected.get("sell_ui", {})
+        signal_conditions = (
+            sell_ui.get("signal_conditions", {})
+            if isinstance(sell_ui, dict)
+            else {}
+        )
+        if isinstance(signal_conditions, dict):
+            for group_name in ("condition_a", "condition_b", "condition_c"):
+                self._apply_prefixed_ui_values(
+                    signal_conditions.get(group_name, {}),
+                    f"sell_signal_{group_name}_",
+                    result=result,
+                )
+        return result
 
     def apply_indicator_follow_ui_state(self, state):
         """Apply a collected UI state in memory only; this never writes rules.json."""
