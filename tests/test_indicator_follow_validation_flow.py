@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -55,10 +55,16 @@ class _FakeHost(QObject):
 
 
 class _FakeBroker:
-    def __init__(self) -> None:
+    def __init__(self, *, connected: object = True) -> None:
+        self.connected = connected
+        self.connection_checks = 0
         self.calls = []
         self.callback = None
         self.request_minute_candles = Mock()
+
+    def is_connected(self):
+        self.connection_checks += 1
+        return self.connected
 
     def request_minute_candles_read_only(
         self,
@@ -212,6 +218,82 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
         dialog.validation_chart_requested.emit(self.settings)
 
         self.assertEqual([self.settings], host.started)
+        self.assertEqual(1, self.broker.connection_checks)
+
+    def test_disconnected_entry_blocks_host_and_all_downstream_work(self) -> None:
+        broker = _FakeBroker(connected=False)
+        host = _FakeHost()
+        provider_factory = Mock()
+        replay_factory = Mock()
+        chart_factory = Mock()
+        flow = IndicatorFollowValidationFlow(
+            broker,
+            host=host,
+            historical_provider_factory=provider_factory,
+            replay_factory=replay_factory,
+            chart_factory=chart_factory,
+        )
+        failures = []
+        flow.validation_failed.connect(failures.append)
+        dialog = _FakeDialog()
+        flow.bind_dialog(dialog)
+
+        dialog.validation_chart_requested.emit(self.settings)
+
+        self.assertEqual(1, broker.connection_checks)
+        self.assertEqual([], host.started)
+        self.assertEqual([], broker.calls)
+        self.assertEqual(["SERVER_NOT_CONNECTED"], failures)
+        provider_factory.assert_not_called()
+        replay_factory.assert_not_called()
+        chart_factory.assert_not_called()
+
+    def test_authenticated_retry_fresh_reads_same_flow_instance(self) -> None:
+        broker = _FakeBroker(connected=False)
+        host = _FakeHost()
+        flow = IndicatorFollowValidationFlow(broker, host=host)
+        failures = []
+        flow.validation_failed.connect(failures.append)
+        dialog = _FakeDialog()
+        flow.bind_dialog(dialog)
+
+        dialog.validation_chart_requested.emit(self.settings)
+        broker.connected = True
+        dialog.validation_chart_requested.emit(self.settings)
+
+        self.assertEqual(2, broker.connection_checks)
+        self.assertEqual(["SERVER_NOT_CONNECTED"], failures)
+        self.assertEqual([self.settings], host.started)
+
+    def test_authentication_check_fails_closed_for_invalid_brokers(self) -> None:
+        class MissingChecker:
+            pass
+
+        class RaisingChecker:
+            def is_connected(self):
+                raise RuntimeError("fixture failure")
+
+        cases = (
+            ("none", None),
+            ("missing", MissingChecker()),
+            ("non_callable", SimpleNamespace(is_connected=True)),
+            ("raises", RaisingChecker()),
+            ("false", _FakeBroker(connected=False)),
+            ("truthy_non_bool", _FakeBroker(connected=1)),
+        )
+        for label, broker in cases:
+            with self.subTest(case=label):
+                host = _FakeHost()
+                flow = IndicatorFollowValidationFlow(broker, host=host)
+                failures = []
+                flow.validation_failed.connect(failures.append)
+                dialog = _FakeDialog()
+                flow.bind_dialog(dialog)
+
+                dialog.validation_chart_requested.emit(self.settings)
+
+                self.assertEqual([], host.started)
+                self.assertEqual(["SERVER_NOT_CONNECTED"], failures)
 
     def test_host_block_forwards_failure_without_broker_or_chart(self) -> None:
         host = _FakeHost(block_reason="OPERATION_ACTIVE")
@@ -391,6 +473,32 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
 
         self.assertEqual([self.settings, self.settings], host.started)
 
+    def test_registration_and_edit_share_auth_guard_and_retry_path(self) -> None:
+        broker = _FakeBroker(connected=False)
+        host = _FakeHost()
+        flow = IndicatorFollowValidationFlow(broker, host=host)
+        failures = []
+        flow.validation_failed.connect(failures.append)
+        registration = _FakeDialog("registration")
+        edit = _FakeDialog("edit")
+        flow.bind_dialog(registration)
+        flow.bind_dialog(edit)
+
+        registration.validation_chart_requested.emit(self.settings)
+        edit.validation_chart_requested.emit(self.settings)
+        self.assertEqual([], host.started)
+        self.assertEqual(
+            ["SERVER_NOT_CONNECTED", "SERVER_NOT_CONNECTED"],
+            failures,
+        )
+
+        broker.connected = True
+        registration.validation_chart_requested.emit(self.settings)
+        edit.validation_chart_requested.emit(self.settings)
+
+        self.assertEqual(4, broker.connection_checks)
+        self.assertEqual([self.settings, self.settings], host.started)
+
     def test_owner_binding_reuses_one_flow_and_existing_broker(self) -> None:
         owner = SimpleNamespace(kiwoom_api=self.broker)
         registration = _FakeDialog("registration")
@@ -423,6 +531,23 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
 
         status.assert_called_once_with("검증차트: OPERATION_ACTIVE")
 
+    def test_server_not_connected_failure_uses_toast_only(self) -> None:
+        status = Mock()
+        owner = SimpleNamespace(kiwoom_api=self.broker, statusBarMessage=status)
+        flow = bind_indicator_follow_validation_flow(owner, _FakeDialog())
+
+        with patch(
+            "gui_indicator_follow_validation_flow.show_toast"
+        ) as show_toast:
+            flow.validation_failed.emit("SERVER_NOT_CONNECTED")
+
+        show_toast.assert_called_once_with(
+            owner,
+            "키움 서버에 로그인되어 있지 않습니다.",
+            duration_ms=2500,
+        )
+        status.assert_not_called()
+
     def test_caller_sources_bind_both_actual_dialog_creation_paths(self) -> None:
         root = Path(__file__).resolve().parents[1]
         auto_source = (root / "gui_auto_trade_setting_window.py").read_text(
@@ -446,6 +571,7 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
         self.assertNotIn("KiwoomApi", called_names)
+        self.assertNotIn("KiwoomApi", source)
         self.assertNotIn("request_minute_candles", source)
         forbidden_imports = (
             "gui_market_data_host",

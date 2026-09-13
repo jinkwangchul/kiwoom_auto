@@ -8,6 +8,7 @@ from collections.abc import Callable
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
+from gui_toast import show_toast
 from gui_indicator_follow_validation_chart_window import (
     IndicatorFollowValidationChartWindow,
 )
@@ -101,7 +102,7 @@ class IndicatorFollowValidationFlow(QObject):
         dialog_id = id(dialog)
         if dialog_id in self._bound_dialog_ids:
             return True
-        connect(self._host.start)
+        connect(self._start_validation_request)
         self._bound_dialog_ids.add(dialog_id)
         destroyed = getattr(dialog, "destroyed", None)
         destroyed_connect = getattr(destroyed, "connect", None)
@@ -110,6 +111,21 @@ class IndicatorFollowValidationFlow(QObject):
                 lambda _obj=None, key=dialog_id: self._bound_dialog_ids.discard(key)
             )
         return True
+
+    def _server_authenticated(self) -> bool:
+        checker = getattr(self._broker, "is_connected", None)
+        if not callable(checker):
+            return False
+        try:
+            return checker() is True
+        except Exception:
+            return False
+
+    def _start_validation_request(self, snapshot: object) -> object | None:
+        if not self._server_authenticated():
+            self.validation_failed.emit("SERVER_NOT_CONNECTED")
+            return None
+        return self._host.start(snapshot)
 
     def _forward_host_failure(self, reason: str) -> None:
         self.validation_failed.emit(str(reason or "VALIDATION_BLOCKED"))
@@ -208,6 +224,13 @@ class IndicatorFollowValidationFlow(QObject):
 
 
 def _present_validation_failure(owner: object, message: str) -> None:
+    if message == "SERVER_NOT_CONNECTED":
+        show_toast(
+            owner,
+            "키움 서버에 로그인되어 있지 않습니다.",
+            duration_ms=2500,
+        )
+        return
     text = f"검증차트: {str(message or '실패')}"
     status_message = getattr(owner, "statusBarMessage", None)
     if callable(status_message):
