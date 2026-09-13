@@ -18,6 +18,7 @@ from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
+    build_validation_average_price_context,
     build_signal_validation_snapshot,
 )
 from routines.지표추종매매.routine_validation_contract import (
@@ -364,10 +365,17 @@ class IndicatorFollowSignalValidationFlow(QObject):
             return
         try:
             replay = self._replay_factory(session)
+            evaluate_with_context = getattr(replay, "evaluate_with_context", None)
             evaluate = getattr(replay, "evaluate", None)
-            if not callable(evaluate):
+            if callable(evaluate_with_context):
+                replay_result = evaluate_with_context(
+                    result.snapshot,
+                    context_provider=build_validation_average_price_context,
+                )
+            elif callable(evaluate):
+                replay_result = evaluate(result.snapshot)
+            else:
                 raise TypeError("replay evaluator is unavailable")
-            replay_result = evaluate(result.snapshot)
         except Exception as exc:
             self._fail_window(window, f"REPLAY_ERROR: {exc}")
             return

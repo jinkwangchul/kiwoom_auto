@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from engines.condition_engine import (
@@ -1345,9 +1346,23 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
         ("average_price", "avg_price", "position_average_price", "mock_average_price"),
         (("position", "average_price"), ("position", "avg_price"), ("holding", "average_price"), ("holding", "avg_price")),
     )
+    average_price_series = (
+        context.get("average_price_series") if isinstance(context, dict) else None
+    )
     if order_price is not None:
         series_map["ORDER_PRICE"] = [order_price] * length
-    if average_price is not None:
+    if isinstance(average_price_series, list) and len(average_price_series) == length:
+        normalized_average_series: list[float | None] = []
+        for item in average_price_series:
+            if item is None:
+                normalized_average_series.append(None)
+                continue
+            value = _safe_float(item)
+            normalized_average_series.append(
+                value if value is not None and value > 0 else None
+            )
+        series_map["AVG_PRICE"] = normalized_average_series
+    elif average_price is not None:
         series_map["AVG_PRICE"] = [average_price] * length
 
 
@@ -1508,6 +1523,8 @@ def evaluate_indicator_follow_routine(
     active_ui_signal_names = [name for name in active_sell_names if name in ui_signal_names]
     aggregation_sell_names = list(active_sell_names)
     ui_expression_passed: bool | None = None
+    ui_expression_contract: dict[str, Any] | None = None
+    ui_expression_values: dict[str, bool] = {}
     if active_ui_signal_names:
         expression_contracts = [
             condition_sell_signals[name].get("signal_expression")
@@ -1517,6 +1534,7 @@ def evaluate_indicator_follow_routine(
         expression_contracts = [value for value in expression_contracts if isinstance(value, dict)]
         if expression_contracts:
             canonical_expression = expression_contracts[0]
+            ui_expression_contract = canonical_expression
             if any(value != canonical_expression for value in expression_contracts[1:]):
                 ui_expression_passed = False
             else:
@@ -1532,6 +1550,7 @@ def evaluate_indicator_follow_routine(
                             break
                         expression_values[identifier] = bool(condition_sell_passed[signal_name])
                     if expression_values:
+                        ui_expression_values = dict(expression_values)
                         evaluated = evaluate_condition_expression(
                             canonical_expression.get("ast"),
                             expression_values,
@@ -1584,6 +1603,9 @@ def evaluate_indicator_follow_routine(
         "logic": sell_logic,
         "active_group_paths": active_sell_group_paths,
         "matched_group_paths": matched_sell_group_paths,
+        "ui_signal_expression": deepcopy(ui_expression_contract),
+        "ui_expression_values": deepcopy(ui_expression_values),
+        "ui_expression_result": ui_expression_passed,
         "result": sell_passed,
     })
 

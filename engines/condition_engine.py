@@ -380,6 +380,8 @@ def evaluate_condition(
             "observe_condition",
             {
                 "path": condition_path,
+                "expression_id": str(condition.get("expression_id") or ""),
+                "description": str(condition.get("description") or ""),
                 "condition_type": str(condition.get("type") or condition.get("target") or "DISABLED"),
                 "operator": str(condition.get("operator") or "DISABLED"),
                 "negated": bool(condition.get("not", False)),
@@ -519,6 +521,8 @@ def evaluate_condition(
             "observe_condition",
             {
                 "path": condition_path,
+                "expression_id": str(condition.get("expression_id") or ""),
+                "description": str(condition.get("description") or ""),
                 "condition_type": str(condition.get("type") or target_key),
                 "operator": operator or "UNSUPPORTED",
                 "negated": use_not,
@@ -541,6 +545,8 @@ def evaluate_condition(
         "observe_condition",
         {
             "path": condition_path,
+            "expression_id": str(condition.get("expression_id") or ""),
+            "description": str(condition.get("description") or ""),
             "condition_type": str(condition.get("type") or target_key),
             "operator": operator,
             "negated": use_not,
@@ -635,6 +641,8 @@ def evaluate_group(
         "enabled": True,
         "logic": logic,
         "condition_paths": condition_paths,
+        "condition_expression": deepcopy(expression_ast),
+        "expression_values": deepcopy(expression_values),
         "result": passed,
     })
     return GroupResult(passed, group_name, details)

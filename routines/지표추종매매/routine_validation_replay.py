@@ -317,6 +317,7 @@ class ValidationHistoricalReplay:
         *,
         start_index: int = 0,
         end_index: int | None = None,
+        context_provider: Callable[..., dict[str, Any]] | None = None,
     ) -> ValidationReplayResult:
         availability = self.session.readiness()
         if not availability.allowed:
@@ -365,6 +366,18 @@ class ValidationHistoricalReplay:
                         "decision_trace_observer": observer,
                         "_indicator_follow_evaluate_side": side,
                     }
+                    if context_provider is not None:
+                        supplied = context_provider(
+                            evaluation_index,
+                            side,
+                            _fresh_json(prefix_json),
+                            [_copy_entry(entry) for entry in entries],
+                        )
+                        if not isinstance(supplied, dict):
+                            raise TypeError("context_provider must return a mapping")
+                        supplied.pop("decision_trace_observer", None)
+                        supplied.pop("_indicator_follow_evaluate_side", None)
+                        context.update(_fresh_json(_canonical_json(supplied)))
                     signal = self._evaluator(
                         _fresh_json(prefix_json),
                         _fresh_json(rules_json),
@@ -377,7 +390,7 @@ class ValidationHistoricalReplay:
                             candles[evaluation_index]["time"],
                             _fresh_json(prefix_json),
                             signal,
-                            observer.snapshot(),
+                            self._trace_with_context(observer.snapshot(), context),
                         )
                     )
         except Exception as exc:
@@ -411,6 +424,34 @@ class ValidationHistoricalReplay:
                 error=str(exc),
             )
         return ValidationReplayResult(True, snapshot=snapshot)
+
+    def evaluate_with_context(
+        self,
+        historical_snapshot: ValidationHistoricalSnapshot,
+        *,
+        context_provider: Callable[..., dict[str, Any]],
+        start_index: int = 0,
+        end_index: int | None = None,
+    ) -> ValidationReplayResult:
+        if not callable(context_provider):
+            raise TypeError("context_provider must be callable")
+        return self.evaluate(
+            historical_snapshot,
+            start_index=start_index,
+            end_index=end_index,
+            context_provider=context_provider,
+        )
+
+    @staticmethod
+    def _trace_with_context(
+        trace: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        copied = _fresh_json(_canonical_json(trace))
+        evidence = context.get("validation_trace_context")
+        if isinstance(evidence, dict):
+            copied["evaluation_context"] = _fresh_json(_canonical_json(evidence))
+        return copied
 
     @staticmethod
     def _valid_range(start_index: Any, end_index: Any, candle_count: int) -> bool:

@@ -1060,6 +1060,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "operator": ">=",
             "value": 70.0,
             "description": "UI preview: sell condition A RSI threshold condition",
+            "expression_id": "RSI_0",
         }])
 
     def test_sell_condition_a_preserves_ocr_then_rsi_order(self):
@@ -1090,7 +1091,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
         state["sell_ui"]["signal_conditions"]["condition_a"] = {
             "gap_check": True,
-            "gap_left_combo": "주문가",
+            "gap_left_combo": "평단가",
             "gap_right_combo": "현재가",
             "gap_direction_combo": "상하",
             "gap_value_line": "0.25",
@@ -1102,6 +1103,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         condition = candidates["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
         self.assertEqual(condition["operator"], "PERCENT_GAP")
+        self.assertEqual("CLOSE", condition["target"])
+        self.assertEqual("AVG_PRICE", condition["compare_target"])
         self.assertIn("sell.signals.ui_preview_condition_a", result["mapped_paths"])
 
     def test_sell_condition_a_empty_config_does_not_create_candidate(self):
@@ -1310,7 +1313,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
         state["sell_ui"]["signal_conditions"]["condition_b"] = {
             "gap_check": True,
-            "gap_left_combo": "주문가",
+            "gap_left_combo": "평단가",
             "gap_right_combo": "현재가",
             "gap_direction_combo": "상하",
             "gap_value_line": "0.25",
@@ -1656,7 +1659,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         condition_c.clear()
         condition_c.update({
             "gap_check": True,
-            "gap_left_combo": "주문가",
+            "gap_left_combo": "평단가",
             "gap_right_combo": "현재가",
             "gap_direction_combo": "상하",
             "gap_value_line": "0.25",

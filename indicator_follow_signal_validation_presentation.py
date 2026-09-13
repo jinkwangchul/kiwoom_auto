@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import shlex
 from typing import Any, Mapping
 
@@ -135,49 +136,45 @@ def _sell_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
     a = _state(groups, "condition_a")
     b = _state(groups, "condition_b")
     c = _state(groups, "condition_c")
-    a_parts = [
-        _enabled_text(
-            a.get("ocr_check"),
+    def gap(group: Mapping[str, Any]) -> str:
+        return (
+            f"{_field(group, 'gap_left_combo')} 대비 "
+            f"{_field(group, 'gap_right_combo')} "
+            f"{_field(group, 'gap_direction_combo')} "
+            f"{_field(group, 'gap_value_line')}% "
+            f"{_field(group, 'gap_compare_combo')}"
+        )
+    return {
+        "A·OCR": (
             f"OCR {_field(a, 'ocr_sign_combo', '')}{_field(a, 'ocr_value_line')} "
-            f"{_field(a, 'ocr_compare_combo')} + {_field(a, 'ocr_direction_combo')}전환",
+            f"{_field(a, 'ocr_compare_combo')} + {_field(a, 'ocr_direction_combo')}전환"
         ),
-        _enabled_text(
-            a.get("rsi_check"),
+        "A·가격비교": gap(a),
+        "A·RSI": (
             f"RSI({_field(a, 'rsi_period_line')}) {_field(a, 'rsi_value_line')} "
-            f"{_field(a, 'rsi_compare_combo')}",
+            f"{_field(a, 'rsi_compare_combo')}"
         ),
-    ]
-    b_parts = [
-        _enabled_text(
-            b.get("price_box_check"),
+        "B·가격박스": (
             f"가격박스 {_field(b, 'price_box_direction_combo')} "
-            f"{_field(b, 'price_box_value_line')}% {_field(b, 'price_box_compare_combo')}",
+            f"{_field(b, 'price_box_value_line')}% {_field(b, 'price_box_compare_combo')}"
         ),
-        _enabled_text(
-            b.get("bollinger_check"),
+        "B·볼린저밴드": (
             f"볼린저밴드 {_field(b, 'bollinger_direction_combo')} "
-            f"{_field(b, 'bollinger_value_line')}% {_field(b, 'bollinger_compare_combo')}",
+            f"{_field(b, 'bollinger_value_line')}% {_field(b, 'bollinger_compare_combo')}"
         ),
-    ]
-    c_parts = [
-        _enabled_text(
-            c.get("macd_check"),
+        "B·가격비교": gap(b),
+        "C·가격비교": gap(c),
+        "C·MACD": (
             f"{_field(c, 'macd_kind_combo')} {_field(c, 'macd_sign_combo', '')}"
-            f"{_field(c, 'macd_value_line')} {_field(c, 'macd_compare_combo')}",
+            f"{_field(c, 'macd_value_line')} {_field(c, 'macd_compare_combo')}"
         ),
-        _enabled_text(
-            c.get("array_check"),
-            f"배열 {_field(c, 'array_first_period_combo')}"
+        "C·이평배열": (
+            f"{_field(c, 'array_first_period_combo')}"
             f"{_field(c, 'array_first_compare_combo')}"
             f"{_field(c, 'array_second_period_combo')}"
             f"{_field(c, 'array_second_compare_combo')}"
-            f"{_field(c, 'array_third_period_combo')}",
+            f"{_field(c, 'array_third_period_combo')}"
         ),
-    ]
-    return {
-        "A": " / ".join(a_parts),
-        "B": " / ".join(b_parts),
-        "C": " / ".join(c_parts),
     }
 
 
@@ -224,15 +221,23 @@ def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str
     return values
 
 
-def _sell_letter(payload: Mapping[str, Any]) -> str | None:
-    source = " ".join(
-        str(payload.get(name) or "").lower()
-        for name in ("path", "group_name")
-    )
-    for letter in "ABC":
-        if f"condition_{letter.lower()}" in source:
-            return letter
-    return None
+_SELL_CONDITION_PATH = re.compile(
+    r"sell\.signals\.ui_condition_([abc])\.groups\[0\]\.conditions\[\d+\]$"
+)
+_SELL_GROUP_PATH = re.compile(
+    r"sell\.signals\.ui_condition_([abc])\.groups\[0\]$"
+)
+_SELL_ROW_IDS = {
+    "A·OCR": ("A", ("OCR_0", "OCR_1")),
+    "A·가격비교": ("A", ("GAP_0",)),
+    "A·RSI": ("A", ("RSI_0",)),
+    "B·가격박스": ("B", ("PRICE_BOX_0",)),
+    "B·볼린저밴드": ("B", ("BOLLINGER_0",)),
+    "B·가격비교": ("B", ("GAP_0",)),
+    "C·가격비교": ("C", ("GAP_0",)),
+    "C·MACD": ("C", ("MACD_0",)),
+    "C·이평배열": ("C", ("ARRAY_0", "ARRAY_1")),
+}
 
 
 def _condition_actual(payload: Mapping[str, Any]) -> str:
@@ -244,31 +249,120 @@ def _condition_actual(payload: Mapping[str, Any]) -> str:
     return f"{left} {operator}" if right == "-" else f"{left} {operator} {right}"
 
 
-def _sell_trace_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str]]:
+def _sell_filter_enabled(
+    ui_state: Mapping[str, Any],
+    condition_name: str,
+) -> bool:
+    letter, label = condition_name.split("·", 1)
+    condition = _state(
+        ui_state,
+        "sell_ui",
+        "signal_conditions",
+        f"condition_{letter.lower()}",
+    )
+    key = {
+        "OCR": "ocr_check",
+        "가격비교": "gap_check",
+        "RSI": "rsi_check",
+        "가격박스": "price_box_check",
+        "볼린저밴드": "bollinger_check",
+        "MACD": "macd_check",
+        "이평배열": "array_check",
+    }[label]
+    return condition.get(key) is not False
+
+
+def _trace_status(payloads: list[Mapping[str, Any]]) -> str:
+    if not payloads:
+        return "미평가"
+    for payload in payloads:
+        operands = [payload.get("left_operand"), payload.get("right_operand")]
+        if any(
+            isinstance(operand, Mapping)
+            and operand.get("value") is None
+            and str(operand.get("kind") or "").lower() != "none"
+            for operand in operands
+        ):
+            return "데이터부족"
+    results = [payload.get("final_result") for payload in payloads]
+    if any(value is False for value in results):
+        return "실패"
+    if results and all(value is True for value in results):
+        return "통과"
+    return "미평가"
+
+
+def _price_actual(
+    payload: Mapping[str, Any],
+    group: Mapping[str, Any],
+) -> str:
+    basis_label = _field(group, "gap_left_combo")
+    comparison_label = _field(group, "gap_right_combo")
+    basis_value = _operand_value(payload.get("right_operand"))
+    comparison_value = _operand_value(payload.get("left_operand"))
+    percent_text = "-"
+    try:
+        basis = float(basis_value.replace(",", ""))
+        comparison = float(comparison_value.replace(",", ""))
+        if basis > 0:
+            percent_text = f"{(comparison - basis) / basis * 100.0:+.4f}%"
+    except (AttributeError, TypeError, ValueError):
+        pass
+    average_note = " / 검증용 추정평단" if basis_label == "평단가" or comparison_label == "평단가" else ""
+    return (
+        f"기준 {basis_label} {basis_value} / 비교 {comparison_label} "
+        f"{comparison_value} / 변동률 {percent_text}{average_note}"
+    )
+
+
+def _sell_trace_values(
+    entry: ValidationReplayEntry,
+    ui_state: Mapping[str, Any],
+) -> dict[str, tuple[str, str]]:
     trace = entry.trace if isinstance(entry.trace, dict) else {}
-    actuals: dict[str, list[str]] = {letter: [] for letter in "ABC"}
-    condition_results: dict[str, list[Any]] = {letter: [] for letter in "ABC"}
+    payloads_by_id: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
     for payload in trace.get("conditions", []):
         if not isinstance(payload, Mapping):
             continue
-        letter = _sell_letter(payload)
-        if letter is None:
+        match = _SELL_CONDITION_PATH.fullmatch(str(payload.get("path") or ""))
+        expression_id = str(payload.get("expression_id") or "").strip().upper()
+        if match is None or not expression_id:
             continue
-        actuals[letter].append(_condition_actual(payload))
-        condition_results[letter].append(payload.get("final_result"))
-    group_results: dict[str, Any] = {}
-    for payload in trace.get("groups", []):
-        if not isinstance(payload, Mapping):
-            continue
-        letter = _sell_letter(payload)
-        if letter is not None:
-            group_results[letter] = payload.get("result")
+        payloads_by_id.setdefault((match.group(1).upper(), expression_id), []).append(payload)
+
     values: dict[str, tuple[str, str]] = {}
-    for letter in "ABC":
-        result = group_results.get(letter)
-        if result is None and condition_results[letter]:
-            result = all(value is True for value in condition_results[letter])
-        values[letter] = (" / ".join(actuals[letter]) or "-", _result(result))
+    groups = _state(ui_state, "sell_ui", "signal_conditions")
+    for condition_name, (letter, expression_ids) in _SELL_ROW_IDS.items():
+        if not _sell_filter_enabled(ui_state, condition_name):
+            values[condition_name] = ("-", "미사용")
+            continue
+        payloads = [
+            payload
+            for expression_id in expression_ids
+            for payload in payloads_by_id.get((letter, expression_id), [])
+        ]
+        if len(payloads) != len(expression_ids):
+            values[condition_name] = (
+                "-" if not payloads else " / ".join(_condition_actual(item) for item in payloads),
+                "미평가" if not payloads else "근거연결오류",
+            )
+            continue
+        if condition_name.endswith("가격비교"):
+            group = _state(groups, f"condition_{letter.lower()}")
+            actual = _price_actual(payloads[0], group)
+        elif condition_name == "A·OCR":
+            actual = " / ".join(
+                f"{'전환' if item.get('operator') in {'TURN_UP', 'TURN_DOWN'} else '임계값'}: {_condition_actual(item)}"
+                for item in payloads
+            )
+        elif condition_name == "C·이평배열":
+            actual = " / ".join(
+                f"비교 {index + 1}: {_condition_actual(item)}"
+                for index, item in enumerate(payloads)
+            )
+        else:
+            actual = " / ".join(_condition_actual(item) for item in payloads)
+        values[condition_name] = (actual or "-", _trace_status(payloads))
     return values
 
 
@@ -308,31 +402,88 @@ def filter_rows_for_entry(
     entry: ValidationReplayEntry,
     ui_state: Mapping[str, Any],
 ) -> tuple[SignalValidationFilterRow, ...]:
-    """Collapse evaluator observations into one operator row per A/B/C/D condition."""
+    """Present immutable evaluator evidence without re-evaluating a signal."""
     if not isinstance(entry, ValidationReplayEntry):
         raise TypeError("entry must be ValidationReplayEntry")
     if not isinstance(ui_state, Mapping):
         raise TypeError("ui_state must be a mapping")
     side = entry.evaluation_side
     settings = _buy_settings(ui_state) if side == "BUY" else _sell_settings(ui_state)
-    values = _buy_detail_values(entry) if side == "BUY" else _sell_trace_values(entry)
+    values = (
+        _buy_detail_values(entry)
+        if side == "BUY"
+        else _sell_trace_values(entry, ui_state)
+    )
     rows: list[SignalValidationFilterRow] = []
-    failed: list[str] = []
-    for letter in settings:
-        actual, result = values.get(letter, ("-", "-"))
-        if not _condition_enabled(ui_state, side, letter):
+    for condition_name in settings:
+        actual, result = values.get(condition_name, ("-", "미평가"))
+        if side == "BUY" and not _condition_enabled(ui_state, side, condition_name):
             result = "미사용"
-        rows.append(SignalValidationFilterRow(side, letter, settings[letter], actual, result))
-        if result == "실패":
-            failed.append(letter)
-    rows.append(SignalValidationFilterRow(
-        side,
-        "적용 조합식",
-        _expression(ui_state, side),
-        "",
-        "",
-        "summary",
-    ))
+        rows.append(SignalValidationFilterRow(
+            side,
+            condition_name,
+            settings[condition_name],
+            actual,
+            result,
+        ))
+
+    if side == "SELL":
+        trace = entry.trace if isinstance(entry.trace, dict) else {}
+        group_results: dict[str, Any] = {}
+        for payload in trace.get("groups", []):
+            if not isinstance(payload, Mapping):
+                continue
+            match = _SELL_GROUP_PATH.fullmatch(str(payload.get("path") or ""))
+            if match is not None:
+                group_results[match.group(1).upper()] = payload.get("result")
+        for letter in "ABC":
+            group_value = group_results.get(letter)
+            rows.append(SignalValidationFilterRow(
+                side,
+                f"그룹 {letter}",
+                "개별 필터 논리식",
+                "-",
+                "미평가" if group_value is None else _result(group_value),
+                "summary",
+            ))
+
+        aggregation = next(
+            (
+                item.get("payload")
+                for item in reversed(trace.get("aggregations", []))
+                if isinstance(item, Mapping)
+                and str(item.get("side") or "").upper() == "SELL"
+                and isinstance(item.get("payload"), Mapping)
+            ),
+            {},
+        )
+        expression_values = aggregation.get("ui_expression_values", {})
+        actual_expression = (
+            " / ".join(
+                f"{name}={'통과' if value is True else '실패'}"
+                for name, value in sorted(expression_values.items())
+            )
+            if isinstance(expression_values, Mapping)
+            else ""
+        )
+        expression_result = aggregation.get("ui_expression_result")
+        rows.append(SignalValidationFilterRow(
+            side,
+            "적용 조합식",
+            _expression(ui_state, side),
+            actual_expression or "-",
+            "미평가" if expression_result is None else _result(expression_result),
+            "summary",
+        ))
+    else:
+        rows.append(SignalValidationFilterRow(
+            side,
+            "적용 조합식",
+            _expression(ui_state, side),
+            "",
+            "",
+            "summary",
+        ))
     occurred = entry.signal == side
     rows.append(SignalValidationFilterRow(
         side,
@@ -342,15 +493,6 @@ def filter_rows_for_entry(
         "발생" if occurred else "미발생",
         "summary",
     ))
-    if failed:
-        rows.append(SignalValidationFilterRow(
-            side,
-            "실패 조건",
-            ", ".join(failed),
-            "",
-            "",
-            "summary",
-        ))
     return tuple(rows)
 
 

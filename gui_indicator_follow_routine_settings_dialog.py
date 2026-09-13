@@ -66,7 +66,14 @@ class _TabHostStub:
 from gui_indicator_follow_common_widgets import IndicatorFollowCommonWidgetsMixin
 from gui_indicator_follow_control_tab import IndicatorFollowControlTabMixin
 from gui_indicator_follow_buy_controls import IndicatorFollowBuyControlsMixin
-from gui_indicator_follow_sell_controls import IndicatorFollowSellControlsMixin
+from gui_indicator_follow_sell_controls import (
+    IndicatorFollowSellControlsMixin,
+    SELL_PRICE_COMBO_VALUES,
+    SELL_PRICE_COMBO_WIDGET_NAMES,
+    SELL_PRICE_UNRESOLVED_PROPERTY,
+    clear_sell_price_combo_unresolved,
+    mark_sell_price_combo_unresolved,
+)
 from gui_routine_registry import get_routine_records, normalize_routine_name
 from gui_toast import show_toast
 from gui_window_policy import (
@@ -88,6 +95,7 @@ from routines.지표추종매매.routine_validation_contract import (
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationSeed,
     project_signal_validation_apply_ui_state,
+    require_resolved_sell_price_selections,
 )
 
 
@@ -133,6 +141,8 @@ def _validation_fallback_message(context):
 def _settings_validation_user_reason(reason, *, context="change"):
     text = str(reason or "")
     lowered = text.lower()
+    if "가격 기준 재선택 필요" in text:
+        return "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요."
     if (
         "buy situation response modes are mutually exclusive" in lowered
         or "buy unfilled and price-comparison situation responses are mutually exclusive" in lowered
@@ -1300,6 +1310,7 @@ class IndicatorFollowRoutineSettingsDialog(
             raise ValueError("validation base rules are unavailable")
 
         ui_state = self.collect_indicator_follow_ui_state()
+        require_resolved_sell_price_selections(ui_state)
         mapper = self._load_indicator_follow_rule_mapper()
         preview = mapper.build_engine_rules_preview_from_ui_state(
             ui_state,
@@ -1307,6 +1318,13 @@ class IndicatorFollowRoutineSettingsDialog(
         )
         if not isinstance(preview, dict):
             raise ValueError("validation preview result must be a mapping")
+        sell_warnings = [
+            str(item)
+            for item in preview.get("validation_warnings", [])
+            if str(item).lower().startswith(("sell condition", "sell signal"))
+        ]
+        if sell_warnings:
+            raise ValueError("; ".join(sell_warnings))
         preview_rules = preview.get("preview_rules")
         if not isinstance(preview_rules, dict):
             raise ValueError("validation preview rules must be a mapping")
@@ -2800,6 +2818,10 @@ class IndicatorFollowRoutineSettingsDialog(
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
         if isinstance(widget, QComboBox):
+            if name in SELL_PRICE_COMBO_WIDGET_NAMES:
+                unresolved = widget.property(SELL_PRICE_UNRESOLVED_PROPERTY)
+                if unresolved:
+                    return str(unresolved)
             return widget.currentText()
         if isinstance(widget, QLineEdit):
             return widget.text()
@@ -2852,6 +2874,12 @@ class IndicatorFollowRoutineSettingsDialog(
             widget.setChecked(bool(value))
             return None
         if isinstance(widget, QComboBox):
+            if name in SELL_PRICE_COMBO_WIDGET_NAMES:
+                text = str(value or "").strip()
+                if text not in SELL_PRICE_COMBO_VALUES:
+                    mark_sell_price_combo_unresolved(widget, text)
+                    return None
+                clear_sell_price_combo_unresolved(widget)
             index = widget.findText(str(value))
             if index < 0:
                 return {

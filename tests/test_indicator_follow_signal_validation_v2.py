@@ -137,9 +137,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.app.processEvents()
 
     def _seed(self, rules=None, ui_state=None):
+        resolved_state = deepcopy(ui_state or self.ui_state)
+        for group_name in ("condition_a", "condition_b", "condition_c"):
+            group = resolved_state["sell_ui"]["signal_conditions"][group_name]
+            group["gap_left_combo"] = "평단가"
+            group["gap_right_combo"] = "현재가"
         return IndicatorFollowSignalValidationSeed(
             ValidationSettingsSnapshot(rules or self.rules),
-            ui_state or self.ui_state,
+            resolved_state,
         )
 
     def _window(self, ui_state=None):
@@ -213,6 +218,15 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 dialog.validation_chart_requested.connect(old_payloads.append)
                 dialog.signal_validation_requested.connect(new_payloads.append)
                 dialog.buy_signal_expr_line.setText("A or D")
+                for group_name in "abc":
+                    getattr(
+                        dialog,
+                        f"sell_signal_condition_{group_name}_gap_left_combo",
+                    ).setCurrentText("평단가")
+                    getattr(
+                        dialog,
+                        f"sell_signal_condition_{group_name}_gap_right_combo",
+                    ).setCurrentText("현재가")
                 dialog.signal_validation_button.click()
                 self.assertEqual("검증차트", dialog.validation_chart_button.text())
                 self.assertEqual("검증차트2", dialog.signal_validation_button.text())
@@ -269,8 +283,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertNotIn("price_compare", projected["buy"]["filters"])
         self.assertNotIn("method", projected["sell"])
         self.assertNotIn("profit_rate_sell", projected["sell"]["signals"])
-        conditions = projected["sell"]["signals"]["macd_sell"]["groups"][0]["conditions"]
-        self.assertEqual([{"target": "MACD"}], conditions)
+        self.assertEqual({}, projected["sell"]["signals"])
         self.assertNotIn("buy_management", projected)
         self.assertNotIn("order_policy", projected)
 
@@ -287,11 +300,13 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             "buy_overview_finish",
             "sell_method_select_a_check",
             "sell_overview_scenario",
-            "sell_signal_condition_a_gap_check",
-            "sell_signal_condition_b_gap_check",
-            "sell_signal_condition_c_gap_check",
         ):
             self.assertFalse(hasattr(window, name), name)
+        for group_name in "abc":
+            self.assertTrue(hasattr(window, f"sell_signal_condition_{group_name}_gap_check"))
+            for side in ("left", "right"):
+                combo = getattr(window, f"sell_signal_condition_{group_name}_gap_{side}_combo")
+                self.assertEqual(["현재가", "평단가"], [combo.itemText(i) for i in range(combo.count())])
         original_state = ui_state["basic"]["buy_signal_expr_line"]
         window.buy_signal_expr_line.setText("B and C")
         self.assertEqual(original_state, ui_state["basic"]["buy_signal_expr_line"])
@@ -560,12 +575,13 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window = created[0]
         self.assertEqual(100, DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT)
         self.assertEqual(DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT, window.historical_candle_count)
+        resolved_ui_state = self._seed().to_ui_state()
         for timeframe, candle_count in ((3, 300), (15, 500)):
             rules = deepcopy(self.rules)
             rules["bar"]["bar_minutes"] = timeframe
             window.validation_run_requested.emit(
                 IndicatorFollowSignalValidationRunRequest(
-                    build_signal_validation_snapshot(rules, ui_state=self.ui_state),
+                    build_signal_validation_snapshot(rules, ui_state=resolved_ui_state),
                     candle_count,
                 )
             )

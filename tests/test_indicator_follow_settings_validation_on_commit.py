@@ -39,7 +39,7 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
         cls.source_rules_path = cls.routine_dir / "rules.json"
 
     def _dialog(self, rules_path: Path, *, instance_id: str = ""):
-        return IndicatorFollowRoutineSettingsDialog(
+        dialog = IndicatorFollowRoutineSettingsDialog(
             rules_path=rules_path,
             routine_path=self.routine_dir,
             routine_name="검증 루틴",
@@ -47,6 +47,16 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             instance_id=instance_id,
             settings_mode="edit" if instance_id else "registration",
         )
+        for group_name in "abc":
+            getattr(
+                dialog,
+                f"sell_signal_condition_{group_name}_gap_left_combo",
+            ).setCurrentText("평단가")
+            getattr(
+                dialog,
+                f"sell_signal_condition_{group_name}_gap_right_combo",
+            ).setCurrentText("현재가")
+        return dialog
 
     def test_validation_button_is_absent_and_registration_snapshot_is_applied(self) -> None:
         before = hashlib.sha256(self.source_rules_path.read_bytes()).hexdigest()

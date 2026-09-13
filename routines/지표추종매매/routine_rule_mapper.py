@@ -1749,7 +1749,10 @@ def _build_sell_gap_condition(source: dict[str, Any], warnings: list[str], label
     direction = {"상향": "UP", "하향": "DOWN", "상하": "BOTH", "UP": "UP", "DOWN": "DOWN", "BOTH": "BOTH"}.get(str(source.get("gap_direction_combo") or "").strip())
     compare_mode = {"이상": "GTE", "이하": "LTE", "이내": "WITHIN", "이탈": "OUTSIDE", "GTE": "GTE", "LTE": "LTE", "WITHIN": "WITHIN", "OUTSIDE": "OUTSIDE"}.get(str(source.get("gap_compare_combo") or "").strip())
     value = _safe_float(source.get("gap_value_line"))
-    if left is None or right is None or direction is None or compare_mode is None or value is None or value < 0:
+    if left not in {"CLOSE", "AVG_PRICE"} or right not in {"CLOSE", "AVG_PRICE"}:
+        warnings.append(f"{label} GAP 가격 기준 재선택 필요")
+        return None
+    if direction is None or compare_mode is None or value is None or value < 0:
         warnings.append(f"{label} GAP policy is invalid")
         return None
     if direction == "BOTH" and compare_mode not in {"WITHIN", "OUTSIDE"}:
@@ -1761,9 +1764,11 @@ def _build_sell_gap_condition(source: dict[str, Any], warnings: list[str], label
     return {
         "enabled": True,
         "not": False,
-        "target": left,
+        # UI 계약은 왼쪽이 기준가격, 오른쪽이 비교대상이다. PERCENT_GAP의
+        # compare_target이 분모이므로 엔진 피연산자는 이 경계에서 교환한다.
+        "target": right,
         "operator": "PERCENT_GAP",
-        "compare_target": right,
+        "compare_target": left,
         "direction": direction,
         "compare_mode": compare_mode,
         "value": value,
@@ -1792,8 +1797,6 @@ def _sell_group_from_rows(
     if not active:
         return None
     if len(active) == 1:
-        for condition in conditions:
-            condition.pop("expression_id", None)
         return {"enabled": True, "name": name, "conditions_logic": "AND", "conditions": conditions}
     expression = _fold_expression_ids(active[0][0])
     for index in range(1, len(active)):
@@ -2615,6 +2618,18 @@ def build_engine_rules_preview_from_ui_state(
     condition_a = _as_dict(signal_conditions.get("condition_a"))
     condition_b = _as_dict(signal_conditions.get("condition_b"))
     condition_c = _as_dict(signal_conditions.get("condition_c"))
+    for group_name, condition in (
+        ("A", condition_a),
+        ("B", condition_b),
+        ("C", condition_c),
+    ):
+        for field_name in ("gap_left_combo", "gap_right_combo"):
+            if field_name not in condition:
+                continue
+            if _series_target(condition.get(field_name)) not in {"CLOSE", "AVG_PRICE"}:
+                validation_warnings.append(
+                    f"sell condition {group_name} GAP 가격 기준 재선택 필요: {field_name}"
+                )
     sell_group_records: list[dict[str, Any]] = []
     for group_name, condition, builder, candidate_path in (
         ("A", condition_a, _build_sell_condition_a_signal_candidate, SELL_CONDITION_A_SIGNAL_PREVIEW_PATH),

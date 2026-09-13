@@ -113,9 +113,14 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.app.processEvents()
 
     def _seed(self, ui_state=None):
+        resolved_state = deepcopy(ui_state or self.ui_state)
+        for group_name in ("condition_a", "condition_b", "condition_c"):
+            group = resolved_state["sell_ui"]["signal_conditions"][group_name]
+            group["gap_left_combo"] = "평단가"
+            group["gap_right_combo"] = "현재가"
         return IndicatorFollowSignalValidationSeed(
             ValidationSettingsSnapshot(self.rules),
-            ui_state or self.ui_state,
+            resolved_state,
         )
 
     def _window(self, ui_state=None):
@@ -312,7 +317,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertEqual(["통과", "실패", "통과", "실패"], [row.result for row in buy_conditions])
         self.assertIn("상승전환", buy_conditions[0].actual)
         self.assertEqual("-", buy_conditions[3].actual)
-        self.assertIn("실패 조건", [row.condition for row in buy_rows])
+        self.assertNotIn("실패 조건", [row.condition for row in buy_rows])
 
         sell_state = deepcopy(self.ui_state)
         sell_state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
@@ -324,6 +329,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 "conditions": [
                     {
                         "path": "sell.signals.ui_condition_a.groups[0].conditions[0]",
+                        "expression_id": "OCR_0",
                         "condition_type": "OSC",
                         "operator": "TURN_DOWN",
                         "left_operand": {"value": 3},
@@ -332,6 +338,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                     },
                     {
                         "path": "sell.signals.ui_condition_b.groups[0].conditions[0]",
+                        "expression_id": "PRICE_BOX_0",
                         "condition_type": "MA",
                         "operator": "CROSS_UP",
                         "left_operand": {"value": 101},
@@ -340,6 +347,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                     },
                     {
                         "path": "sell.signals.ui_condition_c.groups[0].conditions[0]",
+                        "expression_id": "MACD_0",
                         "condition_type": "MACD",
                         "operator": "CROSS_DOWN",
                         "left_operand": {"value": -1},
@@ -357,11 +365,17 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         )
         sell_rows = filter_rows_for_entry(sell_entry, sell_state)
         sell_conditions = [row for row in sell_rows if row.row_kind == "condition"]
-        self.assertEqual(list("ABC"), [row.condition for row in sell_conditions])
+        self.assertEqual(
+            [
+                "A·OCR", "A·가격비교", "A·RSI",
+                "B·가격박스", "B·볼린저밴드", "B·가격비교",
+                "C·가격비교", "C·MACD", "C·이평배열",
+            ],
+            [row.condition for row in sell_conditions],
+        )
         self.assertIn("하락전환", sell_conditions[0].actual)
-        self.assertIn("상향돌파", sell_conditions[1].actual)
-        self.assertIn("하향돌파", sell_conditions[2].actual)
-        self.assertEqual("미사용", sell_conditions[2].result)
+        self.assertIn("상향돌파", sell_conditions[3].actual)
+        self.assertEqual("미사용", sell_conditions[7].result)
         visible_text = " ".join(cell for row in buy_rows + sell_rows for cell in row.to_cells())
         self.assertNotIn("buy.groups", visible_text)
         self.assertNotIn("sell.signals", visible_text)
@@ -456,7 +470,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.app.processEvents()
         table = window.filter_result_table
         self.assertEqual(Qt.ScrollBarAlwaysOff, table.verticalScrollBarPolicy())
-        self.assertEqual(13, table.rowCount())
+        self.assertEqual(20, table.rowCount())
         expected_height = (
             table.horizontalHeader().height()
             + sum(table.rowHeight(row) for row in range(table.rowCount()))
@@ -517,6 +531,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.buy_signal_expr_line.setText("A or D")
                 window.buy_rsi_value_line.setText("39")
                 window.sell_signal_condition_a_rsi_value_line.setText("57")
+                window.sell_signal_condition_a_gap_left_combo.setCurrentText("현재가")
+                window.sell_signal_condition_a_gap_right_combo.setCurrentText("평단가")
+                window.sell_signal_condition_a_gap_direction_combo.setCurrentText("하향")
+                window.sell_signal_condition_a_gap_value_line.setText("0.75")
+                window.sell_signal_condition_a_gap_compare_combo.setCurrentText("이상")
                 payload = IndicatorFollowSignalValidationApplyPayload(
                     window.collect_indicator_follow_ui_state()
                 )
@@ -530,6 +549,12 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual("A or D", after["basic"]["buy_signal_expr_line"])
                 self.assertEqual("39", after["buy_ui"]["signal_filter"]["buy_rsi_value_line"])
                 self.assertEqual("57", after["sell_ui"]["signal_conditions"]["condition_a"]["rsi_value_line"])
+                sell_a = after["sell_ui"]["signal_conditions"]["condition_a"]
+                self.assertEqual("현재가", sell_a["gap_left_combo"])
+                self.assertEqual("평단가", sell_a["gap_right_combo"])
+                self.assertEqual("하향", sell_a["gap_direction_combo"])
+                self.assertEqual("0.75", sell_a["gap_value_line"])
+                self.assertEqual("이상", sell_a["gap_compare_combo"])
                 self.assertEqual(before["buy_ui"] | {"signal_filter": after["buy_ui"]["signal_filter"]}, after["buy_ui"])
                 self.assertEqual(before["sell_ui"] | {"signal_conditions": after["sell_ui"]["signal_conditions"]}, after["sell_ui"])
                 self.assertEqual(
@@ -572,7 +597,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             with patch.object(flow_module.QTimer, "singleShot"):
                 source.signal_validation_requested.emit(self._seed())
             window = created[0]
-            state = deepcopy(self.ui_state)
+            state = self._seed().to_ui_state()
             state["basic"]["buy_signal_expr_line"] = "B or C"
             payload = IndicatorFollowSignalValidationApplyPayload(state)
             window.settings_apply_requested.emit(payload)
@@ -594,7 +619,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             "duplicate_priority": "TRAILING",
             "error_policy": "STOP_AND_REVIEW",
         }
-        projected = project_signal_validation_rules(rules, ui_state=self.ui_state)
+        projected = project_signal_validation_rules(
+            rules,
+            ui_state=self._seed().to_ui_state(),
+        )
         self.assertNotIn("signal_runtime_policy", projected)
         basic = projected["indicator_follow_ui_state"]["state"]["basic"]
         self.assertNotIn("basic_duplicate_signal_combo", basic)

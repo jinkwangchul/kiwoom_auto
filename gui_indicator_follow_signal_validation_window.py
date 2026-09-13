@@ -43,6 +43,7 @@ from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
+    build_validation_average_price_context,
     build_signal_validation_snapshot,
 )
 from indicator_follow_signal_validation_presentation import (
@@ -86,22 +87,24 @@ def estimated_signal_return_percent(
     sell_close = _valid_close(candles[latest_sell.evaluation_index].get("close"))
     if sell_close is None:
         return None
-    buy_closes = []
-    for entry in entries:
-        if (
-            entry.signal != "BUY"
-            or isinstance(entry.evaluation_index, bool)
-            or not isinstance(entry.evaluation_index, int)
-            or not 0 <= entry.evaluation_index < latest_sell.evaluation_index
-        ):
-            continue
-        close = _valid_close(candles[entry.evaluation_index].get("close"))
-        if close is not None:
-            buy_closes.append(close)
-    if not buy_closes:
-        return None
-    average_buy = sum(buy_closes) / len(buy_closes)
-    if average_buy == 0:
+    trace = latest_sell.trace
+    evaluation_context = (
+        trace.get("evaluation_context") if isinstance(trace, dict) else None
+    )
+    average_buy = _valid_close(
+        evaluation_context.get("estimated_average_price")
+        if isinstance(evaluation_context, dict)
+        else None
+    )
+    if average_buy is None:
+        context = build_validation_average_price_context(
+            latest_sell.evaluation_index,
+            "SELL",
+            candles,
+            entries,
+        )
+        average_buy = _valid_close(context.get("average_price"))
+    if average_buy is None:
         return None
     value = (sell_close - average_buy) / average_buy * 100.0
     return value if math.isfinite(value) else None
@@ -564,6 +567,13 @@ class IndicatorFollowSignalValidationWindow(
                 ui_state,
                 self._signal_validation_seed.settings_snapshot.to_dict(),
             )
+            sell_warnings = [
+                str(item)
+                for item in preview.get("validation_warnings", [])
+                if str(item).lower().startswith(("sell condition", "sell signal"))
+            ]
+            if sell_warnings:
+                raise ValueError("; ".join(sell_warnings))
             preview_rules = preview.get("preview_rules")
             if not isinstance(preview_rules, dict):
                 raise ValueError("signal validation preview rules are unavailable")

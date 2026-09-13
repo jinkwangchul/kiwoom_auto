@@ -29,6 +29,13 @@ _DEPENDENCY_FIELDS = {
     "source",
     "price_basis",
 }
+_SELL_PRICE_VALUES = {"현재가", "평단가"}
+_SELL_PREVIEW_TARGETS = {
+    "sell.signals.ui_preview_condition_a": "ui_condition_a",
+    "sell.signals.ui_preview_condition_b": "ui_condition_b",
+    "sell.signals.ui_preview_condition_c": "ui_condition_c",
+}
+_SELL_VALIDATION_SIGNAL_NAMES = frozenset(_SELL_PREVIEW_TARGETS.values())
 
 
 def _json_copy(value: Any) -> Any:
@@ -51,6 +58,7 @@ class IndicatorFollowSignalValidationSeed:
             raise TypeError("settings_snapshot must be ValidationSettingsSnapshot")
         if not isinstance(ui_state, Mapping):
             raise TypeError("ui_state must be a mapping")
+        require_resolved_sell_price_selections(ui_state)
         signal_ui_state = project_signal_validation_ui_state(ui_state)
         canonical = json.dumps(
             signal_ui_state,
@@ -102,6 +110,7 @@ class IndicatorFollowSignalValidationApplyPayload:
     def __init__(self, ui_state: Mapping[str, Any]) -> None:
         if not isinstance(ui_state, Mapping):
             raise TypeError("ui_state must be a mapping")
+        require_resolved_sell_price_selections(ui_state)
         canonical = json.dumps(
             project_signal_validation_apply_ui_state(ui_state),
             ensure_ascii=False,
@@ -144,6 +153,111 @@ def _strip_dependent_conditions(value: Any) -> Any:
     return deepcopy(value)
 
 
+def sell_price_selection_issues(
+    ui_state: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return unresolved SELL A/B/C price operands without normalizing them."""
+    if not isinstance(ui_state, Mapping):
+        raise TypeError("ui_state must be a mapping")
+    sell_ui = ui_state.get("sell_ui")
+    signal_conditions = (
+        sell_ui.get("signal_conditions") if isinstance(sell_ui, Mapping) else None
+    )
+    if not isinstance(signal_conditions, Mapping):
+        return ()
+    issues: list[str] = []
+    for group_name in ("condition_a", "condition_b", "condition_c"):
+        group = signal_conditions.get(group_name)
+        if not isinstance(group, Mapping):
+            continue
+        for field_name in ("gap_left_combo", "gap_right_combo"):
+            if field_name not in group:
+                continue
+            value = str(group.get(field_name) or "").strip()
+            if value not in _SELL_PRICE_VALUES:
+                issues.append(
+                    f"sell_ui.signal_conditions.{group_name}.{field_name}"
+                )
+    return tuple(issues)
+
+
+def require_resolved_sell_price_selections(ui_state: Mapping[str, Any]) -> None:
+    issues = sell_price_selection_issues(ui_state)
+    if issues:
+        raise ValueError(
+            "가격 기준 재선택 필요: " + ", ".join(issues)
+        )
+
+
+def build_validation_average_price_context(
+    evaluation_index: int,
+    side: str,
+    candles: list[dict[str, Any]],
+    prior_entries: list[Any],
+) -> dict[str, Any]:
+    """Build a replay-local average from BUY signals after the previous SELL."""
+    if (
+        isinstance(evaluation_index, bool)
+        or not isinstance(evaluation_index, int)
+        or not 0 <= evaluation_index < len(candles)
+    ):
+        raise ValueError("evaluation_index is outside candles")
+    signals_by_index: dict[int, set[str]] = {}
+    for entry in prior_entries:
+        index = getattr(entry, "evaluation_index", None)
+        signal = str(getattr(entry, "signal", "") or "").upper()
+        if (
+            isinstance(index, int)
+            and not isinstance(index, bool)
+            and 0 <= index < evaluation_index
+            and signal in {"BUY", "SELL"}
+        ):
+            signals_by_index.setdefault(index, set()).add(signal)
+
+    running_closes: list[float] = []
+    running_indexes: list[int] = []
+    average_series: list[float | None] = []
+    contributor_series: list[list[int]] = []
+    for index in range(evaluation_index + 1):
+        average = (
+            sum(running_closes) / len(running_closes)
+            if running_closes
+            else None
+        )
+        average_series.append(average)
+        contributor_series.append(list(running_indexes))
+        signals = signals_by_index.get(index, set())
+        if "SELL" in signals:
+            running_closes.clear()
+            running_indexes.clear()
+            continue
+        if "BUY" not in signals:
+            continue
+        raw_close = candles[index].get("close")
+        if raw_close is None or isinstance(raw_close, bool):
+            continue
+        try:
+            close = float(raw_close)
+        except (TypeError, ValueError):
+            continue
+        if close > 0:
+            running_closes.append(close)
+            running_indexes.append(index)
+
+    current_average = average_series[evaluation_index]
+    return {
+        "average_price_series": average_series,
+        "average_price": current_average,
+        "validation_trace_context": {
+            "side": str(side or "").upper(),
+            "evaluation_index": evaluation_index,
+            "estimated_average_price": current_average,
+            "contributing_buy_indexes": contributor_series[evaluation_index],
+            "average_source": "VALIDATION_BUY_EVALUATION_CLOSE_SEGMENT",
+        },
+    }
+
+
 def project_signal_validation_ui_state(
     ui_state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -173,11 +287,7 @@ def project_signal_validation_ui_state(
             group = signal_conditions.get(group_name)
             if not isinstance(group, dict):
                 continue
-            safe_conditions[group_name] = {
-                key: deepcopy(item)
-                for key, item in group.items()
-                if "_gap_" not in str(key).lower()
-            }
+            safe_conditions[group_name] = deepcopy(dict(group))
     safe_signal_filter = (
         deepcopy(signal_filter) if isinstance(signal_filter, dict) else {}
     )
@@ -204,6 +314,7 @@ def project_signal_validation_apply_ui_state(
     ui_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return only V2-visible values that may be applied back to a source dialog."""
+    require_resolved_sell_price_selections(ui_state)
     projected = project_signal_validation_ui_state(ui_state)
     signal_filter = projected.get("buy_ui", {}).get("signal_filter")
     if isinstance(signal_filter, dict):
@@ -219,7 +330,10 @@ def project_signal_validation_rules(
     """Return detached candle-only evaluator rules without execution context."""
     if not isinstance(rules, Mapping):
         raise TypeError("rules must be a mapping")
-    projected = _strip_dependent_conditions(_json_copy(rules))
+    if ui_state is not None:
+        require_resolved_sell_price_selections(ui_state)
+    source_rules = _json_copy(rules)
+    projected = _strip_dependent_conditions(source_rules)
 
     for key in ("buy_management", "order_policy", "cancel_policy"):
         projected.pop(key, None)
@@ -252,9 +366,7 @@ def project_signal_validation_rules(
         filters = sell.get("filters")
         if isinstance(filters, dict):
             filters.pop("price_compare", None)
-        signals = sell.get("signals")
-        if isinstance(signals, dict):
-            signals.pop("profit_rate_sell", None)
+        sell["signals"] = _materialize_validation_sell_signals(source_rules)
 
     if ui_state is None:
         root = projected.get("indicator_follow_ui_state")
@@ -267,7 +379,72 @@ def project_signal_validation_rules(
             source_state if isinstance(source_state, Mapping) else {}
         ),
     }
+    projected.pop("indicator_follow_rule_preview", None)
     return projected
+
+
+def _materialize_validation_sell_signals(
+    source_rules: Mapping[str, Any],
+) -> dict[str, Any]:
+    preview_root = source_rules.get("indicator_follow_rule_preview")
+    candidates = (
+        preview_root.get("candidates") if isinstance(preview_root, Mapping) else None
+    )
+    sell_candidates = (
+        candidates.get("sell") if isinstance(candidates, Mapping) else None
+    )
+    add_candidates = (
+        sell_candidates.get("add_signal_candidates")
+        if isinstance(sell_candidates, Mapping)
+        else None
+    )
+    materialized: dict[str, Any] = {}
+    if isinstance(add_candidates, Mapping):
+        for preview_path, signal_name in _SELL_PREVIEW_TARGETS.items():
+            candidate = add_candidates.get(preview_path)
+            value = candidate.get("value") if isinstance(candidate, Mapping) else None
+            if isinstance(value, Mapping) and value.get("preview_candidate") is True:
+                materialized_value = _json_copy(value)
+                materialized_value.pop("preview_candidate", None)
+                materialized[signal_name] = materialized_value
+
+        expression_contract = next(
+            (
+                signal.get("signal_expression")
+                for signal in materialized.values()
+                if isinstance(signal, Mapping)
+                and isinstance(signal.get("signal_expression"), Mapping)
+            ),
+            None,
+        )
+        if isinstance(expression_contract, Mapping):
+            identifier_map = expression_contract.get("identifier_map")
+            identifiers = expression_contract.get("identifiers")
+            if isinstance(identifier_map, Mapping) and isinstance(identifiers, list):
+                missing = [
+                    str(identifier)
+                    for identifier in identifiers
+                    if str(identifier_map.get(str(identifier).upper()) or "")
+                    not in materialized
+                ]
+                if missing:
+                    raise ValueError(
+                        "SELL validation candidate is missing: " + ", ".join(missing)
+                    )
+        return materialized
+
+    if isinstance(preview_root, Mapping):
+        return {}
+
+    sell = source_rules.get("sell")
+    signals = sell.get("signals") if isinstance(sell, Mapping) else None
+    if not isinstance(signals, Mapping):
+        return {}
+    return {
+        name: _json_copy(value)
+        for name, value in signals.items()
+        if name in _SELL_VALIDATION_SIGNAL_NAMES and isinstance(value, Mapping)
+    }
 
 
 def build_signal_validation_snapshot(
