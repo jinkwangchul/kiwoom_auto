@@ -19,7 +19,7 @@ import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_flow as flow_module
 from gui_indicator_follow_signal_validation_flow import IndicatorFollowSignalValidationFlow
 from gui_indicator_follow_signal_validation_window import IndicatorFollowSignalValidationWindow
-from indicator_follow_signal_validation_presentation import filter_rows_for_entry
+from indicator_follow_signal_validation_presentation import filter_rows_for_entry, _trace_status
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationSeed,
@@ -266,6 +266,73 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertTrue(created[0].run_was_connected)
         self.assertTrue(created[0].apply_was_connected)
 
+    def test_sell_operand_source_distinguishes_unary_and_missing_data(self):
+        for operator, left, right, passed, expected in (
+            ("TURN_UP", 88, None, True, "통과"),
+            ("TURN_DOWN", 88, None, False, "실패"),
+            ("TURN_UP", None, None, False, "데이터부족"),
+            ("PERCENT_GAP", 10030, 10000, True, "통과"),
+            ("PERCENT_GAP", 10020, 10000, False, "실패"),
+            ("PERCENT_GAP", 10020, None, False, "데이터부족"),
+        ):
+            with self.subTest(operator=operator, left=left, right=right):
+                payload = {
+                    "operator": operator,
+                    "left_operand": {"source": "indicator", "value": left},
+                    "right_operand": {
+                        "source": "none" if operator.startswith("TURN_") else "indicator",
+                        "value": right,
+                    },
+                    "final_result": passed,
+                }
+                self.assertEqual(expected, _trace_status([payload]))
+
+    def test_sell_ocr_transition_and_threshold_keep_observed_result(self):
+        for passed in (True, False):
+            with self.subTest(passed=passed):
+                conditions = [
+                    {
+                        "path": f"sell.signals.ui_condition_a.groups[0].conditions[{index}]",
+                        "expression_id": f"OCR_{index}",
+                        "operator": operator,
+                        "left_operand": {"source": "indicator", "value": 88},
+                        "right_operand": {"source": source, "value": value},
+                        "final_result": passed if index == 0 else True,
+                    }
+                    for index, (operator, source, value) in enumerate((
+                        ("TURN_DOWN", "none", None), ("<=", "literal", 91),
+                    ))
+                ]
+                entry = self._entry("SELL", 0, trace={"conditions": conditions})
+                rows = filter_rows_for_entry(entry, self.ui_state)
+                row = next(row for row in rows if row.condition == "A·OCR")
+                self.assertEqual("통과" if passed else "실패", row.result)
+                self.assertIn("전환", row.actual)
+                self.assertIn("임계값", row.actual)
+
+    def test_buy_detail_status_and_partial_values_preserve_evidence(self):
+        for reason, enabled, passed, expected in (
+            (None, "True", "False", "미평가"),
+            ("disabled", "True", "True", "미사용"),
+            ("matched", "False", "True", "미사용"),
+            ("insufficient_data", "True", "False", "데이터부족"),
+            ("matched", "True", "True", "통과"),
+            ("not_matched", "True", "False", "실패"),
+        ):
+            with self.subTest(reason=reason, enabled=enabled):
+                details = [] if reason is None else [
+                    f"filter_type={kind} enabled={enabled} passed={passed} reason={reason} "
+                    "current_value=70000 ma_value=None"
+                    for kind in ("OCR", "BOLLINGER", "MOVING_AVERAGE", "RSI")
+                ]
+                entry = self._entry("BUY", 0, details=details)
+                rows = filter_rows_for_entry(entry, self.ui_state)
+                filters = [row for row in rows if row.row_kind == "condition"]
+                self.assertEqual([expected] * 4, [row.result for row in filters])
+                if reason == "insufficient_data":
+                    self.assertEqual("현재가 70000 / 이평 -", filters[2].actual)
+                self.assertEqual("미발생", rows[-1].result)
+
     def test_trace_adapter_uses_observed_values_without_inventing_missing_values(self):
         buy_entry = self._entry(
             "BUY",
@@ -314,7 +381,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         buy_rows = filter_rows_for_entry(buy_entry, self.ui_state)
         buy_conditions = [row for row in buy_rows if row.row_kind == "condition"]
         self.assertEqual(list("ABCD"), [row.condition for row in buy_conditions])
-        self.assertEqual(["통과", "실패", "통과", "실패"], [row.result for row in buy_conditions])
+        self.assertEqual(["통과", "실패", "통과", "데이터부족"], [row.result for row in buy_conditions])
         self.assertIn("상승전환", buy_conditions[0].actual)
         self.assertEqual("-", buy_conditions[3].actual)
         self.assertNotIn("실패 조건", [row.condition for row in buy_rows])

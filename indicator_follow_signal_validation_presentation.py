@@ -194,7 +194,7 @@ def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str
     for letter, filter_type in mapping.items():
         fields = by_type.get(filter_type)
         if fields is None:
-            values[letter] = ("-", "-")
+            values[letter] = ("-", "미평가")
             continue
         enabled = fields.get("enabled", True)
         if filter_type == "OCR":
@@ -217,7 +217,14 @@ def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str
             )
         else:
             actual = _text(fields.get("evaluated_value"))
-        values[letter] = (actual, _result(fields.get("passed"), enabled=enabled))
+        reason = str(fields.get("reason") or "").strip().lower()
+        if str(enabled).strip().lower() == "false" or reason == "disabled":
+            result = "미사용"
+        elif reason == "insufficient_data":
+            result = "데이터부족"
+        else:
+            result = _result(fields.get("passed"), enabled=enabled)
+        values[letter] = (actual, result)
     return values
 
 
@@ -280,7 +287,7 @@ def _trace_status(payloads: list[Mapping[str, Any]]) -> str:
         if any(
             isinstance(operand, Mapping)
             and operand.get("value") is None
-            and str(operand.get("kind") or "").lower() != "none"
+            and str(operand.get("source") or "").lower() != "none"
             for operand in operands
         ):
             return "데이터부족"
