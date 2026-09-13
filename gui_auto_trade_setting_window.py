@@ -119,10 +119,6 @@ from gui_styles import (
     registered_stock_status_table_stylesheet,
 )
 from gui_toast import show_toast
-from gui_stock_name_tooltip import (
-    TOOLTIP_POINT_SIZE,
-    install_persistent_stock_name_tooltips,
-)
 from gui_common_utils import safe_int_value, sanitize_path_part
 from gui_user_reason import user_reason_message, user_reason_messages
 from gui_stock_data import (
@@ -134,6 +130,7 @@ from gui_stock_data import (
 )
 from gui_stock_library_browser import (
     AFTER_MARKET_COLUMN as STOCK_BROWSER_AFTER_MARKET_COLUMN,
+    ClippedTextItemDelegate,
     CHANGE_RATE_COLUMN as STOCK_BROWSER_CHANGE_RATE_COLUMN,
     CODE_COLUMN as STOCK_BROWSER_CODE_COLUMN,
     CURRENT_PRICE_COLUMN as STOCK_BROWSER_CURRENT_PRICE_COLUMN,
@@ -149,12 +146,29 @@ from gui_stock_library_browser import (
     REGISTRATION_STATUS_COLUMN as STOCK_BROWSER_REGISTRATION_STATUS_COLUMN,
     STOCK_BROWSER_HEADERS,
     STOCK_BROWSER_DIALOG_HEIGHT,
+    STOCK_BROWSER_BADGE_INACTIVE_COLOR,
+    STOCK_BROWSER_MARKET_TEXT_COLORS,
+    STOCK_BROWSER_RANKING_BADGE_HORIZONTAL_PADDING,
+    STOCK_BROWSER_RANKING_HIGHLIGHT_BACKGROUND_COLOR,
+    STOCK_BROWSER_ROW_NUMBER_HORIZONTAL_PADDING,
+    STOCK_BROWSER_SEARCH_DISPLAY_CHARACTERS,
+    STOCK_BROWSER_STATUS_SINGLE_VALUES,
+    STOCK_BROWSER_STOCK_NAME_DISPLAY_CHARACTERS,
+    STOCK_BROWSER_TABLE_SEPARATOR_COLOR,
+    SelectedTextReadableDelegate,
+    StockBrowserNumericItem,
     STOCK_STATUS_COLUMN as STOCK_BROWSER_STATUS_COLUMN,
     TRADING_VALUE_COLUMN as STOCK_BROWSER_TRADING_VALUE_COLUMN,
     VOLUME_COLUMN as STOCK_BROWSER_VOLUME_COLUMN,
+    apply_stock_browser_general_badge_style,
+    apply_stock_browser_ranking_badge_styles,
+    apply_stock_browser_ranking_highlight,
     filter_stock_library_records,
     configure_stock_browser_search_geometry,
+    configure_stock_browser_search_presentation,
     configure_stock_browser_table_geometry,
+    configure_stock_browser_table_presentation,
+    create_stock_browser_item,
     format_snapshot_decimal,
     format_snapshot_integer,
     format_snapshot_market_cap,
@@ -168,6 +182,10 @@ from gui_stock_library_browser import (
     normalize_stock_browser_row_number_width,
     snapshot_number,
     stock_browser_display_values,
+    stock_browser_cell_available_width,
+    stock_browser_name_alignment,
+    stock_browser_name_tooltip,
+    stock_browser_status_display_text,
     stock_browser_table_required_width,
     stock_status_full_text,
 )
@@ -273,21 +291,6 @@ class _AutoTradeRoutineInstanceNameEdit(QLineEdit):
         super().focusOutEvent(event)
 
 
-def _snapshot_number(value: object) -> int | float | None:
-    return snapshot_number(value)
-
-
-class _NumericSnapshotTableWidgetItem(QTableWidgetItem):
-    def __lt__(self, other: QTableWidgetItem) -> bool:
-        left = _snapshot_number(self.data(Qt.UserRole))
-        right = _snapshot_number(other.data(Qt.UserRole))
-        if left is None:
-            return right is None and self.text() < other.text()
-        if right is None:
-            return True
-        return left < right
-
-
 class InstanceStockSearchRegisterDialog(QDialog):
     """Instance-scoped stock search and one-stock registration window."""
 
@@ -308,37 +311,20 @@ class InstanceStockSearchRegisterDialog(QDialog):
     MARKET_CAP_COLUMN = STOCK_BROWSER_MARKET_CAP_COLUMN
     STOCK_STATUS_COLUMN = STOCK_BROWSER_STATUS_COLUMN
     NUMERIC_SNAPSHOT_COLUMNS = STOCK_BROWSER_NUMERIC_COLUMNS
-    MARKET_TEXT_COLORS = {
-        "KOSPI": "#1E3A5F",
-        "코스닥": "#6B3E2E",
-    }
+    MARKET_TEXT_COLORS = STOCK_BROWSER_MARKET_TEXT_COLORS
     BASE_DIALOG_WIDTH = 520
-    STOCK_NAME_DISPLAY_CHARACTERS = 14
-    SEARCH_DISPLAY_CHARACTERS = 12
-    ROW_NUMBER_HORIZONTAL_PADDING = 1
-    TABLE_SEPARATOR_COLOR = "#EBEBEB"
-    RANKING_BADGE_HORIZONTAL_PADDING = 3
-    REGISTRATION_BADGE_INACTIVE_COLOR = "#4B5563"
-    RANKING_HIGHLIGHT_BACKGROUND_COLOR = "#EFF6FF"
+    STOCK_NAME_DISPLAY_CHARACTERS = STOCK_BROWSER_STOCK_NAME_DISPLAY_CHARACTERS
+    SEARCH_DISPLAY_CHARACTERS = STOCK_BROWSER_SEARCH_DISPLAY_CHARACTERS
+    ROW_NUMBER_HORIZONTAL_PADDING = STOCK_BROWSER_ROW_NUMBER_HORIZONTAL_PADDING
+    TABLE_SEPARATOR_COLOR = STOCK_BROWSER_TABLE_SEPARATOR_COLOR
+    RANKING_BADGE_HORIZONTAL_PADDING = STOCK_BROWSER_RANKING_BADGE_HORIZONTAL_PADDING
+    REGISTRATION_BADGE_INACTIVE_COLOR = STOCK_BROWSER_BADGE_INACTIVE_COLOR
+    RANKING_HIGHLIGHT_BACKGROUND_COLOR = (
+        STOCK_BROWSER_RANKING_HIGHLIGHT_BACKGROUND_COLOR
+    )
     RANKING_BADGES = STOCK_BROWSER_RANKING_BADGES
     RANKING_HIGHLIGHT_COLUMNS = STOCK_BROWSER_RANKING_HIGHLIGHT_COLUMNS
-    STOCK_STATUS_SINGLE_VALUES = (
-        "정상",
-        "관리",
-        "관리종목",
-        "거래정지",
-        "증거금100%",
-        "감리종목",
-        "투자유의종목",
-        "담보대출",
-        "액면분할",
-        "신용가능",
-        "투자주의",
-        "투자경고",
-        "투자위험",
-        "투자주의환기",
-        "투자주의환기종목",
-    )
+    STOCK_STATUS_SINGLE_VALUES = STOCK_BROWSER_STATUS_SINGLE_VALUES
     closed = pyqtSignal()
 
     def __init__(
@@ -367,7 +353,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self.resize(self.BASE_DIALOG_WIDTH, STOCK_BROWSER_DIALOG_HEIGHT)
 
         self.search_input = QLineEdit(self)
-        self.search_input.setObjectName("instanceStockSearchInput")
         self.btn_search = QPushButton("검색", self)
         self.btn_search.setObjectName("instanceStockSearchButton")
         self.btn_search.setAutoDefault(False)
@@ -381,20 +366,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self.ranking_separator_label = QLabel("|", self)
         self.ranking_separator_label.setObjectName("instanceStockRankingSeparatorLabel")
         self.ranking_title_label = QLabel("TOP100 :", self)
-        self.ranking_title_label.setObjectName("instanceStockRankingTitleLabel")
-        self.ranking_title_label.setStyleSheet(
-            "QLabel#instanceStockRankingTitleLabel {"
-            " color: #111827;"
-            " font-weight: 700;"
-            "}"
-        )
-        self.ranking_title_label.setSizePolicy(
-            QSizePolicy.Fixed,
-            QSizePolicy.Preferred,
-        )
-        self.ranking_title_label.setFixedWidth(
-            self.ranking_title_label.sizeHint().width()
-        )
         self.ranking_buttons: dict[str, QPushButton] = {}
         for source, text in self.RANKING_BADGES:
             button = QPushButton(text, self)
@@ -403,7 +374,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
             button.setDefault(False)
             self.ranking_buttons[source] = button
         self.result_table = QTableWidget(self)
-        self.result_table.setObjectName("instanceStockSearchResultTable")
         self.btn_register = QPushButton("등록", self)
         self.btn_register.setObjectName("instanceStockRegisterButton")
         self.btn_register.setAutoDefault(False)
@@ -491,6 +461,10 @@ class InstanceStockSearchRegisterDialog(QDialog):
             self.ranking_title_label,
             self.ranking_buttons.values(),
         )
+        configure_stock_browser_search_presentation(
+            self.search_input,
+            self.ranking_title_label,
+        )
         search_layout = QHBoxLayout()
         search_label = QLabel("검색어", self)
         search_layout.addWidget(search_label)
@@ -507,44 +481,13 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 search_layout.addSpacing(4)
             button = self.ranking_buttons[source]
             search_layout.addWidget(button, 0, Qt.AlignBottom)
-        self.search_input.setStyleSheet(
-            "QLineEdit#instanceStockSearchInput {"
-            "border: none;"
-            "padding: 3px 4px;"
-            "background: #FFFFFF;"
-            "}"
-            "QLineEdit#instanceStockSearchInput:focus {"
-            "border: none;"
-            "}"
-        )
-
         configure_stock_browser_table_geometry(self.result_table)
-        header = self.result_table.horizontalHeader()
-        header.setObjectName("instanceStockSearchHorizontalHeader")
-        vertical_header = self.result_table.verticalHeader()
-        vertical_header.setObjectName("instanceStockSearchVerticalHeader")
-        item_margin = self.result_table.style().pixelMetric(
-            QStyle.PM_FocusFrameHMargin,
-            None,
-            self.result_table,
-        ) + 1
-        for column in range(self.result_table.columnCount()):
-            header_item = self.result_table.horizontalHeaderItem(column)
-            if header_item is not None:
-                header_item.setBackground(QBrush(QColor("#FFFFFF")))
-        self._stock_name_clip_delegate = ClippedTextItemDelegate(
-            self.result_table,
-            selected_text_color=QColor("#111827"),
-        )
-        self.result_table.setItemDelegateForColumn(1, self._stock_name_clip_delegate)
-        self._market_text_delegate = SelectedTextReadableDelegate(self.result_table)
-        self.result_table.setItemDelegateForColumn(
-            self.MARKET_COLUMN,
+        (
+            self._stock_name_clip_delegate,
             self._market_text_delegate,
-        )
-        self._stock_name_tooltip_filter = install_persistent_stock_name_tooltips(
+            self._stock_name_tooltip_filter,
+        ) = configure_stock_browser_table_presentation(
             self.result_table,
-            {self.NAME_COLUMN},
         )
         self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -552,79 +495,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self.result_table.setSortingEnabled(False)
         self.result_table.horizontalHeader().setSortIndicatorShown(False)
         self.result_table.setAlternatingRowColors(False)
-        grid_line_color = self.TABLE_SEPARATOR_COLOR
-        self.result_table.setStyleSheet(
-            f"""
-            QTableWidget#instanceStockSearchResultTable {{
-                gridline-color: {grid_line_color};
-                border: 1px solid {grid_line_color};
-                background: #FFFFFF;
-            }}
-            QTableWidget#instanceStockSearchResultTable::viewport {{
-                border: none;
-            }}
-            QTableWidget::item {{
-                padding-left: {item_margin}px;
-                padding-right: {item_margin}px;
-            }}
-            QHeaderView#instanceStockSearchHorizontalHeader::section {{
-                padding-left: {item_margin}px;
-                padding-right: {item_margin}px;
-                background: #FFFFFF;
-                border: none;
-                border-right: 1px solid {grid_line_color};
-                border-bottom: 1px solid {grid_line_color};
-            }}
-            QHeaderView#instanceStockSearchHorizontalHeader {{
-                background: #FFFFFF;
-                border: none;
-            }}
-            QHeaderView#instanceStockSearchVerticalHeader::section {{
-                padding-left: {self.ROW_NUMBER_HORIZONTAL_PADDING}px;
-                padding-right: {self.ROW_NUMBER_HORIZONTAL_PADDING}px;
-                background: #FFFFFF;
-                border: none;
-                border-right: 1px solid {grid_line_color};
-                border-bottom: 1px solid {grid_line_color};
-            }}
-            QHeaderView#instanceStockSearchVerticalHeader {{
-                background: #FFFFFF;
-                border: none;
-            }}
-            QTableCornerButton::section {{
-                border: none;
-                border-right: 1px solid {grid_line_color};
-                border-bottom: 1px solid {grid_line_color};
-            }}
-            """
-            + """
-            QTableWidget::item:selected {
-                background: #dbeafe;
-                color: #111827;
-            }
-            QTableWidget::item:selected:active {
-                background: #dbeafe;
-                color: #111827;
-            }
-            QTableWidget::item:selected:!active {
-                background: #dbeafe;
-                color: #111827;
-            }
-            """
-            + f"QToolTip {{ font-size: {TOOLTIP_POINT_SIZE}pt; }}"
-        )
-        header.setStyleSheet(
-            f"QHeaderView::section {{"
-            f"background: #FFFFFF;"
-            f"border: none;"
-            f"border-right: 1px solid {grid_line_color};"
-            f"border-bottom: 1px solid {grid_line_color};"
-            f"}}"
-        )
-        self.result_table.verticalScrollBar().setStyleSheet(
-            "QScrollBar:vertical { border: none; margin: 0px; padding: 0px; }"
-        )
-
         main_layout.addLayout(search_layout)
         main_layout.addWidget(self.result_table)
         button_layout = QHBoxLayout()
@@ -638,47 +508,15 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self._update_register_button_enabled()
 
     def _update_ranking_badge_styles(self) -> None:
-        active_source = str(
-            getattr(self, "_active_ranking_source", "") or ""
-        ).strip().upper()
-        for source, button in self.ranking_buttons.items():
-            color = (
-                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                if source == active_source
-                else self.REGISTRATION_BADGE_INACTIVE_COLOR
-            )
-            button.setStyleSheet(
-                auto_trade_setting_badge_stylesheet(
-                    "QPushButton",
-                    text_color=color,
-                    border_color=color,
-                )
-                + (
-                    "QPushButton, QPushButton:hover {"
-                    f" padding-left: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
-                    f" padding-right: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
-                    "}"
-                )
-            )
+        apply_stock_browser_ranking_badge_styles(
+            self.ranking_buttons,
+            active_source=getattr(self, "_active_ranking_source", ""),
+        )
 
     def _update_general_stock_badge_style(self) -> None:
-        color = (
-            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-            if self.general_stock_button.isChecked()
-            else self.REGISTRATION_BADGE_INACTIVE_COLOR
-        )
-        self.general_stock_button.setStyleSheet(
-            auto_trade_setting_badge_stylesheet(
-                "QPushButton",
-                text_color=color,
-                border_color=color,
-            )
-            + (
-                "QPushButton, QPushButton:hover {"
-                f" padding-left: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
-                f" padding-right: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
-                "}"
-            )
+        apply_stock_browser_general_badge_style(
+            self.general_stock_button,
+            active=self.general_stock_button.isChecked(),
         )
 
     def _on_general_stock_visibility_toggled(self, _checked: bool) -> None:
@@ -705,30 +543,10 @@ class InstanceStockSearchRegisterDialog(QDialog):
         return instrument_classification_display_text(value)
 
     def _update_ranking_column_highlight(self) -> None:
-        active_source = str(
-            getattr(self, "_active_ranking_source", "") or ""
-        ).strip().upper()
-        active_column = self.RANKING_HIGHLIGHT_COLUMNS.get(active_source, -1)
-        highlight_color = QColor(AUTO_TRADE_SETTING_AMBER_TEXT_COLOR)
-        highlight_background = QColor(self.RANKING_HIGHLIGHT_BACKGROUND_COLOR)
-        ranking_columns = set(self.RANKING_HIGHLIGHT_COLUMNS.values())
-        for column in ranking_columns:
-            foreground = (
-                QBrush(highlight_color) if column == active_column else QBrush()
-            )
-            header_background = QBrush(QColor("#FFFFFF"))
-            cell_background = (
-                QBrush(highlight_background) if column == active_column else QBrush()
-            )
-            header_item = self.result_table.horizontalHeaderItem(column)
-            if header_item is not None:
-                header_item.setForeground(foreground)
-                header_item.setBackground(header_background)
-            for row in range(self.result_table.rowCount()):
-                item = self.result_table.item(row, column)
-                if item is not None:
-                    item.setForeground(foreground)
-                    item.setBackground(cell_background)
+        apply_stock_browser_ranking_highlight(
+            self.result_table,
+            getattr(self, "_active_ranking_source", ""),
+        )
 
     def _text_column_width(self, *samples: str) -> int:
         style = self.result_table.style()
@@ -838,7 +656,10 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self._search_stock_codes = set()
         for row, stock in enumerate(stocks):
             full_status_text = self._stock_status_full_text(stock.get("status"))
-            status_display_text = self._elided_stock_status_text(full_status_text)
+            status_display_text = stock_browser_status_display_text(
+                self.result_table,
+                full_status_text,
+            )
             instrument_classification = (
                 str(stock.get("classification", "") or "-").strip() or "-"
             )
@@ -851,19 +672,13 @@ class InstanceStockSearchRegisterDialog(QDialog):
             )
             values = values[:-1] + (status_display_text,)
             for col, value in enumerate(values):
-                item = (
-                    _NumericSnapshotTableWidgetItem(str(value))
-                    if col in self.NUMERIC_SNAPSHOT_COLUMNS
-                    else QTableWidgetItem(str(value))
+                item = create_stock_browser_item(
+                    self.result_table,
+                    col,
+                    value,
+                    full_status_text=full_status_text,
                 )
-                item.setTextAlignment(
-                    self._stock_name_alignment(value)
-                    if col == self.NAME_COLUMN
-                    else Qt.AlignCenter
-                )
-                if col == self.NAME_COLUMN:
-                    item.setToolTip(self._stock_name_tooltip(value))
-                elif (
+                if (
                     col == self.REGISTRATION_STATUS_COLUMN
                     and str(value or "").strip() == "검토관리"
                 ):
@@ -871,13 +686,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
                         "등록된 종목의 로컬 운영 데이터에 무결성 검토가 필요합니다. "
                         "검토관리에서 상세 사유를 확인하세요."
                     )
-                elif col == self.MARKET_COLUMN:
-                    color = self.MARKET_TEXT_COLORS.get(str(value or ""))
-                    if color:
-                        item.setForeground(QBrush(QColor(color)))
-                elif col == self.STOCK_STATUS_COLUMN:
-                    if full_status_text != "-":
-                        item.setToolTip(full_status_text)
                 item.setData(
                     Qt.UserRole,
                     (
@@ -1074,7 +882,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         for column, (sort_value, display_text) in values.items():
             item = self.result_table.item(row, column)
             if item is None:
-                item = _NumericSnapshotTableWidgetItem()
+                item = StockBrowserNumericItem()
                 self.result_table.setItem(row, column, item)
             item.setText(display_text)
             item.setData(Qt.UserRole, sort_value)
@@ -1082,7 +890,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     @staticmethod
     def _snapshot_number(value: object) -> int | float | None:
-        return _snapshot_number(value)
+        return snapshot_number(value)
 
     @classmethod
     def _format_snapshot_integer(cls, value: object) -> str:
@@ -1120,70 +928,23 @@ class InstanceStockSearchRegisterDialog(QDialog):
         return stock_status_full_text(value)
 
     def _stock_status_text_available_width(self) -> int:
-        item_margin = self.result_table.style().pixelMetric(
-            QStyle.PM_FocusFrameHMargin,
-            None,
+        return stock_browser_cell_available_width(
             self.result_table,
-        ) + 1
-        section_border_width = self.result_table.style().pixelMetric(
-            QStyle.PM_DefaultFrameWidth,
-            None,
-            self.result_table,
-        ) if self.result_table.showGrid() else 0
-        return max(
-            0,
-            self.result_table.columnWidth(self.STOCK_STATUS_COLUMN)
-            - (item_margin * 2)
-            - section_border_width,
+            self.STOCK_STATUS_COLUMN,
         )
 
     def _elided_stock_status_text(self, full_text: str) -> str:
-        text = str(full_text or "-")
-        metrics = self.result_table.fontMetrics()
-        available_width = self._stock_status_text_available_width()
-        if metrics.horizontalAdvance(text) <= available_width:
-            return text
-        suffix = "..."
-        prefix = text
-        while prefix and metrics.horizontalAdvance(prefix + suffix) > available_width:
-            prefix = prefix[:-1]
-        return prefix + suffix
+        return stock_browser_status_display_text(self.result_table, full_text)
 
     @staticmethod
     def _market_display_text(market: object) -> str:
         return market_display_text(market)
 
     def _stock_name_tooltip(self, stock_name: object) -> str:
-        text = str(stock_name or "")
-        style = self.result_table.style()
-        item_margin = style.pixelMetric(
-            QStyle.PM_FocusFrameHMargin,
-            None,
-            self.result_table,
-        ) + 1
-        section_border_width = style.pixelMetric(
-            QStyle.PM_DefaultFrameWidth,
-            None,
-            self.result_table,
-        ) if self.result_table.showGrid() else 0
-        available_width = max(
-            0,
-            self.result_table.columnWidth(self.NAME_COLUMN)
-            - (item_margin * 2)
-            - section_border_width,
-        )
-        return (
-            text
-            if self.result_table.fontMetrics().horizontalAdvance(text) > available_width
-            else ""
-        )
+        return stock_browser_name_tooltip(self.result_table, stock_name)
 
     def _stock_name_alignment(self, stock_name: object) -> Qt.Alignment:
-        return (
-            Qt.AlignLeft | Qt.AlignVCenter
-            if self._stock_name_tooltip(stock_name)
-            else Qt.AlignCenter
-        )
+        return stock_browser_name_alignment(self.result_table, stock_name)
 
     def on_result_header_clicked(self, column: int) -> None:
         if column == self._result_sort_column:
@@ -2883,66 +2644,6 @@ class StockPositionMetricDelegate(QStyledItemDelegate):
         left_margin = spare_width // 2
         right_margin = spare_width - left_margin
         return left_margin, right_margin
-
-
-class SelectedTextReadableDelegate(QStyledItemDelegate):
-    """옅은 선택 배경에서도 셀의 상태별 foreground를 유지한다."""
-
-    def paint(self, painter, option, index) -> None:
-        if option.state & QStyle.State_Selected:
-            readable_option = QStyleOptionViewItem(option)
-            self.initStyleOption(readable_option, index)
-            foreground = index.data(Qt.ForegroundRole)
-            if isinstance(foreground, QBrush):
-                readable_option.palette.setBrush(QPalette.HighlightedText, foreground)
-            style = option.widget.style() if option.widget is not None else QApplication.style()
-            style.drawControl(
-                QStyle.CE_ItemViewItem,
-                readable_option,
-                painter,
-                option.widget,
-            )
-            return
-        super().paint(painter, option, index)
-
-
-class ClippedTextItemDelegate(QStyledItemDelegate):
-    """Clip overflowing text at the cell edge without drawing an ellipsis."""
-
-    def __init__(
-        self,
-        parent: QObject | None = None,
-        *,
-        selected_text_color: QColor | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.selected_text_color = selected_text_color
-
-    def paint(self, painter, option, index) -> None:
-        clipped_option = QStyleOptionViewItem(option)
-        self.initStyleOption(clipped_option, index)
-        style = option.widget.style() if option.widget is not None else QApplication.style()
-        text = clipped_option.text
-        text_rect = style.subElementRect(
-            QStyle.SE_ItemViewItemText,
-            clipped_option,
-            option.widget,
-        )
-        clipped_option.text = ""
-        style.drawControl(QStyle.CE_ItemViewItem, clipped_option, painter, option.widget)
-        painter.save()
-        painter.setClipRect(text_rect, Qt.IntersectClip)
-        painter.setFont(option.font)
-        if option.state & QStyle.State_Selected and self.selected_text_color is not None:
-            painter.setPen(self.selected_text_color)
-        else:
-            painter.setPen(
-                clipped_option.palette.highlightedText().color()
-                if option.state & QStyle.State_Selected
-                else clipped_option.palette.text().color()
-            )
-        painter.drawText(text_rect, int(clipped_option.displayAlignment), text)
-        painter.restore()
 
 
 class AutoTradeNotificationPopup(QFrame):

@@ -7,7 +7,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -43,31 +42,27 @@ from gui_stock_library_browser import (
     REGISTRATION_STATUS_COLUMN,
     STOCK_BROWSER_HEADERS,
     STOCK_BROWSER_DIALOG_HEIGHT,
+    StockBrowserNumericItem,
     STOCK_STATUS_COLUMN,
     TRADING_VALUE_COLUMN,
     VOLUME_COLUMN,
+    apply_stock_browser_general_badge_style,
+    apply_stock_browser_ranking_badge_styles,
+    apply_stock_browser_ranking_highlight,
     configure_stock_browser_search_geometry,
+    configure_stock_browser_search_presentation,
     configure_stock_browser_table_geometry,
+    configure_stock_browser_table_presentation,
+    create_stock_browser_item,
     filter_stock_library_records,
     market_snapshot_display_values,
     normalize_stock_browser_dialog_width,
     normalize_browser_code,
-    snapshot_number,
     stock_browser_display_values,
+    stock_browser_status_display_text,
     stock_status_full_text,
 )
 from routines.지표추종매매.routine_validation_contract import ValidationStockRef
-
-
-class _NumericStockBrowserItem(QTableWidgetItem):
-    def __lt__(self, other: QTableWidgetItem) -> bool:
-        left = snapshot_number(self.data(Qt.UserRole))
-        right = snapshot_number(other.data(Qt.UserRole))
-        if left is None:
-            return right is None and self.text() < other.text()
-        if right is None:
-            return True
-        return left < right
 
 
 class IndicatorFollowValidationStockPicker(QDialog):
@@ -92,10 +87,6 @@ class IndicatorFollowValidationStockPicker(QDialog):
     RANKING_HIGHLIGHT_COLUMNS = RANKING_HIGHLIGHT_COLUMNS
 
     IDENTITY_ROLE = Qt.UserRole + 1
-    RANKING_ACTIVE_COLOR = "#2563EB"
-    RANKING_INACTIVE_COLOR = "#4B5563"
-    RANKING_HIGHLIGHT_COLOR = "#EFF6FF"
-
     def __init__(
         self,
         parent=None,
@@ -124,18 +115,22 @@ class IndicatorFollowValidationStockPicker(QDialog):
         )
 
         self.search_input = QLineEdit(self)
-        self.search_input.setPlaceholderText("종목코드 / 종목명 / 시장 / 초성 검색")
         self.btn_search = QPushButton("검색", self)
         self.btn_search.setAutoDefault(False)
         self.btn_search.setDefault(False)
         self.general_stock_button = QPushButton("일반종목", self)
+        self.general_stock_button.setObjectName("instanceStockGeneralVisibilityButton")
         self.general_stock_button.setCheckable(True)
         self.general_stock_button.setChecked(False)
         self.ranking_separator_label = QLabel("|", self)
+        self.ranking_separator_label.setObjectName("instanceStockRankingSeparatorLabel")
         self.ranking_title_label = QLabel("TOP100 :", self)
         self.ranking_buttons: dict[str, QPushButton] = {}
         for source, text in self.RANKING_BADGES:
             button = QPushButton(text, self)
+            button.setObjectName(
+                f"instanceStockRanking{source.title().replace('_', '')}"
+            )
             button.setAutoDefault(False)
             button.setDefault(False)
             self.ranking_buttons[source] = button
@@ -147,9 +142,14 @@ class IndicatorFollowValidationStockPicker(QDialog):
         self.result_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.result_table.setSortingEnabled(False)
-        header = self.result_table.horizontalHeader()
+        (
+            self._stock_name_clip_delegate,
+            self._market_text_delegate,
+            self._stock_name_tooltip_filter,
+        ) = configure_stock_browser_table_presentation(self.result_table)
 
         self.status_label = QLabel(self)
+        self.status_label.hide()
         self.select_button = QPushButton("선택", self)
         self.cancel_button = QPushButton("취소", self)
         self.select_button.setEnabled(False)
@@ -181,14 +181,11 @@ class IndicatorFollowValidationStockPicker(QDialog):
         root.setSpacing(5)
         root.addLayout(search_row)
         root.addWidget(self.result_table)
-        root.addWidget(self.status_label)
         root.addLayout(button_row)
 
         self.search_input.returnPressed.connect(self.search_stocks)
         self.btn_search.clicked.connect(self.search_stocks)
-        self.general_stock_button.toggled.connect(
-            lambda _checked: self._apply_general_stock_visibility()
-        )
+        self.general_stock_button.toggled.connect(self._on_general_stock_toggled)
         for source, button in self.ranking_buttons.items():
             button.clicked.connect(
                 lambda _checked=False, value=source: self.request_stock_ranking(value)
@@ -209,6 +206,11 @@ class IndicatorFollowValidationStockPicker(QDialog):
             self.ranking_title_label,
             self.ranking_buttons.values(),
         )
+        configure_stock_browser_search_presentation(
+            self.search_input,
+            self.ranking_title_label,
+        )
+        self._update_badge_styles()
         button_row.setContentsMargins(0, 1, 0, 0)
         normalize_stock_browser_dialog_width(self, self.result_table)
 
@@ -228,6 +230,11 @@ class IndicatorFollowValidationStockPicker(QDialog):
         self._selection = None
         super().reject()
 
+    def _set_feedback(self, message: object) -> None:
+        text = str(message or "")
+        self.status_label.setText(text)
+        self.result_table.setToolTip(text)
+
     def _load_snapshot(self, snapshot: object) -> None:
         valid = (
             isinstance(snapshot, StockLibraryLoadSnapshot)
@@ -238,7 +245,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
         if not valid:
             self._snapshot_valid = False
             self._records = ()
-            self.status_label.setText("종목 라이브러리를 사용할 수 없습니다.")
+            self._set_feedback("종목 라이브러리를 사용할 수 없습니다.")
             self._render_records(())
             return
 
@@ -250,7 +257,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
             if not code or not name:
                 self._snapshot_valid = False
                 self._records = ()
-                self.status_label.setText("종목 라이브러리를 사용할 수 없습니다.")
+                self._set_feedback("종목 라이브러리를 사용할 수 없습니다.")
                 self._render_records(())
                 return
             record["code"] = code
@@ -259,7 +266,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
 
         self._snapshot_valid = True
         self._records = tuple(records)
-        self.status_label.setText("")
+        self._set_feedback("")
         self._render_records(())
 
     def _apply_filter(self, query: object = "") -> None:
@@ -271,6 +278,10 @@ class IndicatorFollowValidationStockPicker(QDialog):
             self._records,
             query,
             include_all_when_empty=False,
+        )
+        keyword = str(query or "").strip()
+        self._set_feedback(
+            "검색 결과가 없습니다." if keyword and not records else ""
         )
         self._render_records(tuple(records), source="SEARCH")
 
@@ -294,7 +305,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
             None,
         )
         if not callable(request):
-            self.status_label.setText("TOP100 정보를 사용할 수 없습니다.")
+            self._set_feedback("TOP100 정보를 사용할 수 없습니다.")
             return
         try:
             request(
@@ -304,7 +315,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
                 ),
             )
         except Exception:
-            self.status_label.setText("TOP100 정보를 사용할 수 없습니다.")
+            self._set_feedback("TOP100 정보를 사용할 수 없습니다.")
 
     def _on_stock_ranking_result(
         self,
@@ -317,7 +328,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
         payload = dict(result) if isinstance(result, dict) else {}
         rows = payload.get("rows")
         if payload.get("ok") is not True or not isinstance(rows, list):
-            self.status_label.setText("TOP100 정보를 사용할 수 없습니다.")
+            self._set_feedback("TOP100 정보를 사용할 수 없습니다.")
             return
 
         library_by_code = {
@@ -342,7 +353,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
             if len(records) >= 100:
                 break
 
-        self.status_label.setText("")
+        self._set_feedback("")
         self._active_ranking_source = expected_source
         self._render_records(tuple(records), source=expected_source)
         self._request_market_snapshot(generation)
@@ -394,22 +405,22 @@ class IndicatorFollowValidationStockPicker(QDialog):
         self._visible_stock_codes = set()
         for row, record in enumerate(records):
             status = stock_status_full_text(record.get("status"))
+            status_display = stock_browser_status_display_text(
+                self.result_table,
+                status,
+            )
             values = stock_browser_display_values(
                 record,
                 registration_status=record.get("registration_status", "-"),
             )
+            values = values[:-1] + (status_display,)
             for column, value in enumerate(values):
-                item = (
-                    _NumericStockBrowserItem(str(value))
-                    if column in self.NUMERIC_SNAPSHOT_COLUMNS
-                    else QTableWidgetItem(str(value))
+                item = create_stock_browser_item(
+                    self.result_table,
+                    column,
+                    value,
+                    full_status_text=status,
                 )
-                item.setTextAlignment(
-                    Qt.AlignLeft | Qt.AlignVCenter
-                    if column == self.NAME_COLUMN
-                    else Qt.AlignCenter
-                )
-                item.setData(Qt.UserRole, value)
                 if column == self.CODE_COLUMN:
                     item.setData(
                         self.IDENTITY_ROLE,
@@ -418,8 +429,6 @@ class IndicatorFollowValidationStockPicker(QDialog):
                             str(record.get("name", "") or "").strip(),
                         ),
                     )
-                if column == self.STOCK_STATUS_COLUMN and status != "-":
-                    item.setToolTip(status)
                 self.result_table.setItem(row, column, item)
             code = normalize_browser_code(record.get("code"))
             if code:
@@ -440,7 +449,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
         for column, (sort_value, text) in market_snapshot_display_values(snapshot).items():
             item = self.result_table.item(row, column)
             if item is None:
-                item = _NumericStockBrowserItem()
+                item = StockBrowserNumericItem()
                 self.result_table.setItem(row, column, item)
             item.setText(text)
             item.setData(Qt.UserRole, sort_value)
@@ -456,26 +465,26 @@ class IndicatorFollowValidationStockPicker(QDialog):
                 self.result_table.clearSelection()
         self._update_select_button_state()
 
+    def _on_general_stock_toggled(self, _checked: bool) -> None:
+        self._update_badge_styles()
+        self._apply_general_stock_visibility()
+
+    def _update_badge_styles(self) -> None:
+        apply_stock_browser_general_badge_style(
+            self.general_stock_button,
+            active=self.general_stock_button.isChecked(),
+        )
+        apply_stock_browser_ranking_badge_styles(
+            self.ranking_buttons,
+            active_source=self._active_ranking_source,
+        )
+
     def _update_ranking_styles(self) -> None:
-        for source, button in self.ranking_buttons.items():
-            color = (
-                self.RANKING_ACTIVE_COLOR
-                if source == self._active_ranking_source
-                else self.RANKING_INACTIVE_COLOR
-            )
-            button.setStyleSheet(
-                f"QPushButton {{ color: {color}; border: 1px solid {color}; }}"
-            )
-        target_column = self.RANKING_HIGHLIGHT_COLUMNS.get(self._active_ranking_source)
-        for column in set(self.RANKING_HIGHLIGHT_COLUMNS.values()):
-            for row in range(self.result_table.rowCount()):
-                item = self.result_table.item(row, column)
-                if item is not None:
-                    item.setBackground(
-                        QBrush(QColor(self.RANKING_HIGHLIGHT_COLOR))
-                        if column == target_column
-                        else QBrush()
-                    )
+        self._update_badge_styles()
+        apply_stock_browser_ranking_highlight(
+            self.result_table,
+            self._active_ranking_source,
+        )
 
     def on_result_header_clicked(self, column: int) -> None:
         if column == self._result_sort_column:

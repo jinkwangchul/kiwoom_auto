@@ -7,7 +7,26 @@ import re
 from collections.abc import Iterable, Mapping
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QHeaderView, QStyle
+from PyQt5.QtGui import QBrush, QColor, QPalette
+from PyQt5.QtWidgets import (
+    QApplication,
+    QHeaderView,
+    QSizePolicy,
+    QStyle,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
+    QTableWidgetItem,
+)
+
+from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_AMBER_TEXT_COLOR,
+    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+    auto_trade_setting_badge_stylesheet,
+)
+from gui_stock_name_tooltip import (
+    TOOLTIP_POINT_SIZE,
+    install_persistent_stock_name_tooltips,
+)
 
 
 STOCK_BROWSER_HEADERS = (
@@ -91,6 +110,330 @@ STOCK_BROWSER_STATUS_SINGLE_VALUES = (
     "투자주의환기",
     "투자주의환기종목",
 )
+STOCK_BROWSER_TABLE_SEPARATOR_COLOR = "#EBEBEB"
+STOCK_BROWSER_BADGE_INACTIVE_COLOR = "#4B5563"
+STOCK_BROWSER_RANKING_HIGHLIGHT_BACKGROUND_COLOR = "#EFF6FF"
+STOCK_BROWSER_SELECTED_TEXT_COLOR = "#111827"
+STOCK_BROWSER_MARKET_TEXT_COLORS = {
+    "KOSPI": "#1E3A5F",
+    "코스닥": "#6B3E2E",
+}
+
+
+class StockBrowserNumericItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = snapshot_number(self.data(Qt.UserRole))
+        right = snapshot_number(other.data(Qt.UserRole))
+        if left is None:
+            return right is None and self.text() < other.text()
+        if right is None:
+            return True
+        return left < right
+
+
+class SelectedTextReadableDelegate(QStyledItemDelegate):
+    """Keep a cell's foreground readable on the selected-row background."""
+
+    def paint(self, painter, option, index) -> None:
+        if option.state & QStyle.State_Selected:
+            readable_option = QStyleOptionViewItem(option)
+            self.initStyleOption(readable_option, index)
+            foreground = index.data(Qt.ForegroundRole)
+            if isinstance(foreground, QBrush):
+                readable_option.palette.setBrush(QPalette.HighlightedText, foreground)
+            style = option.widget.style() if option.widget is not None else QApplication.style()
+            style.drawControl(
+                QStyle.CE_ItemViewItem,
+                readable_option,
+                painter,
+                option.widget,
+            )
+            return
+        super().paint(painter, option, index)
+
+
+class ClippedTextItemDelegate(QStyledItemDelegate):
+    """Clip overflowing text at the cell edge without drawing an ellipsis."""
+
+    def __init__(self, parent=None, *, selected_text_color: QColor | None = None) -> None:
+        super().__init__(parent)
+        self.selected_text_color = selected_text_color
+
+    def paint(self, painter, option, index) -> None:
+        clipped_option = QStyleOptionViewItem(option)
+        self.initStyleOption(clipped_option, index)
+        style = option.widget.style() if option.widget is not None else QApplication.style()
+        text = clipped_option.text
+        text_rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText,
+            clipped_option,
+            option.widget,
+        )
+        clipped_option.text = ""
+        style.drawControl(QStyle.CE_ItemViewItem, clipped_option, painter, option.widget)
+        painter.save()
+        painter.setClipRect(text_rect, Qt.IntersectClip)
+        painter.setFont(option.font)
+        if option.state & QStyle.State_Selected and self.selected_text_color is not None:
+            painter.setPen(self.selected_text_color)
+        else:
+            painter.setPen(
+                clipped_option.palette.highlightedText().color()
+                if option.state & QStyle.State_Selected
+                else clipped_option.palette.text().color()
+            )
+        painter.drawText(text_rect, int(clipped_option.displayAlignment), text)
+        painter.restore()
+
+
+def stock_browser_badge_stylesheet(*, active: bool) -> str:
+    color = (
+        AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+        if active
+        else STOCK_BROWSER_BADGE_INACTIVE_COLOR
+    )
+    return auto_trade_setting_badge_stylesheet(
+        "QPushButton",
+        text_color=color,
+        border_color=color,
+    ) + (
+        "QPushButton, QPushButton:hover {"
+        f" padding-left: {STOCK_BROWSER_RANKING_BADGE_HORIZONTAL_PADDING}px;"
+        f" padding-right: {STOCK_BROWSER_RANKING_BADGE_HORIZONTAL_PADDING}px;"
+        "}"
+    )
+
+
+def apply_stock_browser_general_badge_style(button, *, active: bool) -> None:
+    button.setStyleSheet(stock_browser_badge_stylesheet(active=active))
+
+
+def apply_stock_browser_ranking_badge_styles(
+    ranking_buttons,
+    *,
+    active_source: object,
+) -> None:
+    clean_source = str(active_source or "").strip().upper()
+    for source, button in ranking_buttons.items():
+        button.setStyleSheet(
+            stock_browser_badge_stylesheet(active=source == clean_source)
+        )
+
+
+def configure_stock_browser_search_presentation(
+    search_input,
+    ranking_title_label,
+) -> None:
+    search_input.setObjectName("instanceStockSearchInput")
+    search_input.setPlaceholderText("")
+    search_input.setStyleSheet(
+        "QLineEdit#instanceStockSearchInput {"
+        "border: none;"
+        "padding: 3px 4px;"
+        "background: #FFFFFF;"
+        "}"
+        "QLineEdit#instanceStockSearchInput:focus {"
+        "border: none;"
+        "}"
+    )
+    ranking_title_label.setObjectName("instanceStockRankingTitleLabel")
+    ranking_title_label.setStyleSheet(
+        "QLabel#instanceStockRankingTitleLabel {"
+        " color: #111827;"
+        " font-weight: 700;"
+        "}"
+    )
+    ranking_title_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+
+
+def configure_stock_browser_table_presentation(table):
+    table.setObjectName("instanceStockSearchResultTable")
+    header = table.horizontalHeader()
+    header.setObjectName("instanceStockSearchHorizontalHeader")
+    header.setSortIndicatorShown(False)
+    vertical_header = table.verticalHeader()
+    vertical_header.setObjectName("instanceStockSearchVerticalHeader")
+    for column in range(table.columnCount()):
+        header_item = table.horizontalHeaderItem(column)
+        if header_item is not None:
+            header_item.setBackground(QBrush(QColor("#FFFFFF")))
+
+    name_delegate = ClippedTextItemDelegate(
+        table,
+        selected_text_color=QColor(STOCK_BROWSER_SELECTED_TEXT_COLOR),
+    )
+    market_delegate = SelectedTextReadableDelegate(table)
+    table.setItemDelegateForColumn(NAME_COLUMN, name_delegate)
+    table.setItemDelegateForColumn(MARKET_COLUMN, market_delegate)
+    tooltip_filter = install_persistent_stock_name_tooltips(table, {NAME_COLUMN})
+
+    item_margin = table.style().pixelMetric(QStyle.PM_FocusFrameHMargin, None, table) + 1
+    grid_color = STOCK_BROWSER_TABLE_SEPARATOR_COLOR
+    table.setShowGrid(True)
+    table.setGridStyle(Qt.SolidLine)
+    table.setAlternatingRowColors(False)
+    table.setStyleSheet(
+        f"""
+            QTableWidget#instanceStockSearchResultTable {{
+                gridline-color: {grid_color};
+                border: 1px solid {grid_color};
+                background: #FFFFFF;
+            }}
+            QTableWidget#instanceStockSearchResultTable::viewport {{
+                border: none;
+            }}
+            QTableWidget::item {{
+                padding-left: {item_margin}px;
+                padding-right: {item_margin}px;
+            }}
+            QHeaderView#instanceStockSearchHorizontalHeader::section {{
+                padding-left: {item_margin}px;
+                padding-right: {item_margin}px;
+                background: #FFFFFF;
+                border: none;
+                border-right: 1px solid {grid_color};
+                border-bottom: 1px solid {grid_color};
+            }}
+            QHeaderView#instanceStockSearchHorizontalHeader {{
+                background: #FFFFFF;
+                border: none;
+            }}
+            QHeaderView#instanceStockSearchVerticalHeader::section {{
+                padding-left: {STOCK_BROWSER_ROW_NUMBER_HORIZONTAL_PADDING}px;
+                padding-right: {STOCK_BROWSER_ROW_NUMBER_HORIZONTAL_PADDING}px;
+                background: #FFFFFF;
+                border: none;
+                border-right: 1px solid {grid_color};
+                border-bottom: 1px solid {grid_color};
+            }}
+            QHeaderView#instanceStockSearchVerticalHeader {{
+                background: #FFFFFF;
+                border: none;
+            }}
+            QTableCornerButton::section {{
+                border: none;
+                border-right: 1px solid {grid_color};
+                border-bottom: 1px solid {grid_color};
+            }}
+            """
+        + """
+            QTableWidget::item:selected {
+                background: #dbeafe;
+                color: #111827;
+            }
+            QTableWidget::item:selected:active {
+                background: #dbeafe;
+                color: #111827;
+            }
+            QTableWidget::item:selected:!active {
+                background: #dbeafe;
+                color: #111827;
+            }
+            """
+        + f"QToolTip {{ font-size: {TOOLTIP_POINT_SIZE}pt; }}"
+    )
+    header.setStyleSheet(
+        f"QHeaderView::section {{"
+        f"background: #FFFFFF;"
+        f"border: none;"
+        f"border-right: 1px solid {grid_color};"
+        f"border-bottom: 1px solid {grid_color};"
+        f"}}"
+    )
+    table.verticalScrollBar().setStyleSheet(
+        "QScrollBar:vertical { border: none; margin: 0px; padding: 0px; }"
+    )
+    return name_delegate, market_delegate, tooltip_filter
+
+
+def apply_stock_browser_ranking_highlight(table, active_source: object) -> None:
+    clean_source = str(active_source or "").strip().upper()
+    active_column = RANKING_HIGHLIGHT_COLUMNS.get(clean_source, -1)
+    foreground_color = QColor(AUTO_TRADE_SETTING_AMBER_TEXT_COLOR)
+    background_color = QColor(STOCK_BROWSER_RANKING_HIGHLIGHT_BACKGROUND_COLOR)
+    for column in set(RANKING_HIGHLIGHT_COLUMNS.values()):
+        foreground = QBrush(foreground_color) if column == active_column else QBrush()
+        cell_background = QBrush(background_color) if column == active_column else QBrush()
+        header_item = table.horizontalHeaderItem(column)
+        if header_item is not None:
+            header_item.setForeground(foreground)
+            header_item.setBackground(QBrush(QColor("#FFFFFF")))
+        for row in range(table.rowCount()):
+            item = table.item(row, column)
+            if item is not None:
+                item.setForeground(foreground)
+                item.setBackground(cell_background)
+
+
+def stock_browser_cell_available_width(table, column: int) -> int:
+    item_margin = table.style().pixelMetric(QStyle.PM_FocusFrameHMargin, None, table) + 1
+    section_border_width = (
+        table.style().pixelMetric(QStyle.PM_DefaultFrameWidth, None, table)
+        if table.showGrid()
+        else 0
+    )
+    return max(0, table.columnWidth(column) - (item_margin * 2) - section_border_width)
+
+
+def stock_browser_status_display_text(table, full_text: object) -> str:
+    text = str(full_text or "-")
+    available_width = stock_browser_cell_available_width(table, STOCK_STATUS_COLUMN)
+    if table.fontMetrics().horizontalAdvance(text) <= available_width:
+        return text
+    suffix = "..."
+    prefix = text
+    while prefix and table.fontMetrics().horizontalAdvance(prefix + suffix) > available_width:
+        prefix = prefix[:-1]
+    return prefix + suffix
+
+
+def stock_browser_name_tooltip(table, stock_name: object) -> str:
+    text = str(stock_name or "")
+    return (
+        text
+        if table.fontMetrics().horizontalAdvance(text)
+        > stock_browser_cell_available_width(table, NAME_COLUMN)
+        else ""
+    )
+
+
+def stock_browser_name_alignment(table, stock_name: object):
+    return (
+        Qt.AlignLeft | Qt.AlignVCenter
+        if stock_browser_name_tooltip(table, stock_name)
+        else Qt.AlignCenter
+    )
+
+
+def create_stock_browser_item(
+    table,
+    column: int,
+    value: object,
+    *,
+    full_status_text: object = "-",
+) -> QTableWidgetItem:
+    item = (
+        StockBrowserNumericItem(str(value))
+        if column in NUMERIC_SNAPSHOT_COLUMNS
+        else QTableWidgetItem(str(value))
+    )
+    item.setTextAlignment(
+        stock_browser_name_alignment(table, value)
+        if column == NAME_COLUMN
+        else Qt.AlignCenter
+    )
+    item.setData(Qt.UserRole, value)
+    if column == NAME_COLUMN:
+        item.setToolTip(stock_browser_name_tooltip(table, value))
+    elif column == MARKET_COLUMN:
+        color = STOCK_BROWSER_MARKET_TEXT_COLORS.get(str(value or ""))
+        if color:
+            item.setForeground(QBrush(QColor(color)))
+    elif column == STOCK_STATUS_COLUMN:
+        full_text = str(full_status_text or "-")
+        if full_text != "-":
+            item.setToolTip(full_text)
+    return item
 
 
 def _text_column_width(table, *samples: str) -> int:
