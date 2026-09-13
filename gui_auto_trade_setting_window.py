@@ -132,6 +132,39 @@ from gui_stock_data import (
     load_stock_library_snapshot,
     stock_runtime_dir_for_routine,
 )
+from gui_stock_library_browser import (
+    AFTER_MARKET_COLUMN as STOCK_BROWSER_AFTER_MARKET_COLUMN,
+    CHANGE_RATE_COLUMN as STOCK_BROWSER_CHANGE_RATE_COLUMN,
+    CODE_COLUMN as STOCK_BROWSER_CODE_COLUMN,
+    CURRENT_PRICE_COLUMN as STOCK_BROWSER_CURRENT_PRICE_COLUMN,
+    EXECUTION_STRENGTH_COLUMN as STOCK_BROWSER_EXECUTION_STRENGTH_COLUMN,
+    INSTRUMENT_CLASSIFICATION_COLUMN as STOCK_BROWSER_CLASSIFICATION_COLUMN,
+    MARKET_CAP_COLUMN as STOCK_BROWSER_MARKET_CAP_COLUMN,
+    MARKET_COLUMN as STOCK_BROWSER_MARKET_COLUMN,
+    NAME_COLUMN as STOCK_BROWSER_NAME_COLUMN,
+    NUMERIC_SNAPSHOT_COLUMNS as STOCK_BROWSER_NUMERIC_COLUMNS,
+    PREVIOUS_DAY_VOLUME_RATE_COLUMN as STOCK_BROWSER_PREVIOUS_DAY_VOLUME_RATE_COLUMN,
+    RANKING_BADGES as STOCK_BROWSER_RANKING_BADGES,
+    RANKING_HIGHLIGHT_COLUMNS as STOCK_BROWSER_RANKING_HIGHLIGHT_COLUMNS,
+    REGISTRATION_STATUS_COLUMN as STOCK_BROWSER_REGISTRATION_STATUS_COLUMN,
+    STOCK_BROWSER_HEADERS,
+    STOCK_STATUS_COLUMN as STOCK_BROWSER_STATUS_COLUMN,
+    TRADING_VALUE_COLUMN as STOCK_BROWSER_TRADING_VALUE_COLUMN,
+    VOLUME_COLUMN as STOCK_BROWSER_VOLUME_COLUMN,
+    filter_stock_library_records,
+    format_snapshot_decimal,
+    format_snapshot_integer,
+    format_snapshot_market_cap,
+    format_snapshot_percent,
+    format_snapshot_trading_value,
+    format_snapshot_volume,
+    instrument_classification_display_text,
+    market_display_text,
+    market_snapshot_display_values,
+    snapshot_number,
+    stock_browser_display_values,
+    stock_status_full_text,
+)
 from gui_stock_instance_chart_window import open_stock_instance_chart
 from gui_order_utils import (
     directional_value_color,
@@ -235,13 +268,7 @@ class _AutoTradeRoutineInstanceNameEdit(QLineEdit):
 
 
 def _snapshot_number(value: object) -> int | float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return int(number) if number.is_integer() else number
+    return snapshot_number(value)
 
 
 class _NumericSnapshotTableWidgetItem(QTableWidgetItem):
@@ -259,32 +286,22 @@ class InstanceStockSearchRegisterDialog(QDialog):
     """Instance-scoped stock search and one-stock registration window."""
 
     RESULT_EVIDENCE_ROLE = Qt.UserRole + 1
-    CODE_COLUMN = 0
-    NAME_COLUMN = 1
-    MARKET_COLUMN = 2
-    REGISTRATION_STATUS_COLUMN = 3
+    CODE_COLUMN = STOCK_BROWSER_CODE_COLUMN
+    NAME_COLUMN = STOCK_BROWSER_NAME_COLUMN
+    MARKET_COLUMN = STOCK_BROWSER_MARKET_COLUMN
+    REGISTRATION_STATUS_COLUMN = STOCK_BROWSER_REGISTRATION_STATUS_COLUMN
     CATEGORY_COLUMN = REGISTRATION_STATUS_COLUMN
-    INSTRUMENT_CLASSIFICATION_COLUMN = 4
-    AFTER_MARKET_COLUMN = 5
-    CURRENT_PRICE_COLUMN = 6
-    CHANGE_RATE_COLUMN = 7
-    EXECUTION_STRENGTH_COLUMN = 8
-    PREVIOUS_DAY_VOLUME_RATE_COLUMN = 9
-    TRADING_VALUE_COLUMN = 10
-    VOLUME_COLUMN = 11
-    MARKET_CAP_COLUMN = 12
-    STOCK_STATUS_COLUMN = 13
-    NUMERIC_SNAPSHOT_COLUMNS = frozenset(
-        {
-            CURRENT_PRICE_COLUMN,
-            CHANGE_RATE_COLUMN,
-            EXECUTION_STRENGTH_COLUMN,
-            PREVIOUS_DAY_VOLUME_RATE_COLUMN,
-            TRADING_VALUE_COLUMN,
-            VOLUME_COLUMN,
-            MARKET_CAP_COLUMN,
-        }
-    )
+    INSTRUMENT_CLASSIFICATION_COLUMN = STOCK_BROWSER_CLASSIFICATION_COLUMN
+    AFTER_MARKET_COLUMN = STOCK_BROWSER_AFTER_MARKET_COLUMN
+    CURRENT_PRICE_COLUMN = STOCK_BROWSER_CURRENT_PRICE_COLUMN
+    CHANGE_RATE_COLUMN = STOCK_BROWSER_CHANGE_RATE_COLUMN
+    EXECUTION_STRENGTH_COLUMN = STOCK_BROWSER_EXECUTION_STRENGTH_COLUMN
+    PREVIOUS_DAY_VOLUME_RATE_COLUMN = STOCK_BROWSER_PREVIOUS_DAY_VOLUME_RATE_COLUMN
+    TRADING_VALUE_COLUMN = STOCK_BROWSER_TRADING_VALUE_COLUMN
+    VOLUME_COLUMN = STOCK_BROWSER_VOLUME_COLUMN
+    MARKET_CAP_COLUMN = STOCK_BROWSER_MARKET_CAP_COLUMN
+    STOCK_STATUS_COLUMN = STOCK_BROWSER_STATUS_COLUMN
+    NUMERIC_SNAPSHOT_COLUMNS = STOCK_BROWSER_NUMERIC_COLUMNS
     MARKET_TEXT_COLORS = {
         "KOSPI": "#1E3A5F",
         "코스닥": "#6B3E2E",
@@ -297,18 +314,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
     RANKING_BADGE_HORIZONTAL_PADDING = 3
     REGISTRATION_BADGE_INACTIVE_COLOR = "#4B5563"
     RANKING_HIGHLIGHT_BACKGROUND_COLOR = "#EFF6FF"
-    RANKING_BADGES = (
-        ("VOLUME_TOP", "거래량"),
-        ("VALUE_TOP", "거래대금"),
-        ("RISE_TOP", "급상승"),
-        ("FALL_TOP", "급하락"),
-    )
-    RANKING_HIGHLIGHT_COLUMNS = {
-        "VOLUME_TOP": VOLUME_COLUMN,
-        "VALUE_TOP": TRADING_VALUE_COLUMN,
-        "RISE_TOP": CHANGE_RATE_COLUMN,
-        "FALL_TOP": CHANGE_RATE_COLUMN,
-    }
+    RANKING_BADGES = STOCK_BROWSER_RANKING_BADGES
+    RANKING_HIGHLIGHT_COLUMNS = STOCK_BROWSER_RANKING_HIGHLIGHT_COLUMNS
     STOCK_STATUS_SINGLE_VALUES = (
         "정상",
         "관리",
@@ -529,25 +536,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
             "}"
         )
 
-        self.result_table.setColumnCount(14)
-        self.result_table.setHorizontalHeaderLabels(
-            [
-                "종목코드",
-                "종목명",
-                "시장",
-                "등록상태",
-                "분류",
-                "비고",
-                "현재주가",
-                "등락률",
-                "체결강도",
-                "전일대비",
-                "거래대금",
-                "거래량",
-                "시총",
-                "상태",
-            ]
-        )
+        self.result_table.setColumnCount(len(STOCK_BROWSER_HEADERS))
+        self.result_table.setHorizontalHeaderLabels(STOCK_BROWSER_HEADERS)
         header = self.result_table.horizontalHeader()
         header.setObjectName("instanceStockSearchHorizontalHeader")
         header.setSectionResizeMode(QHeaderView.Fixed)
@@ -811,8 +801,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     @staticmethod
     def _instrument_classification_display_text(value: object) -> str:
-        classification = str(value or "-").strip() or "-"
-        return "일반" if classification == "일반종목" else classification
+        return instrument_classification_display_text(value)
 
     def _update_ranking_column_highlight(self) -> None:
         active_source = str(
@@ -958,45 +947,12 @@ class InstanceStockSearchRegisterDialog(QDialog):
         library_snapshot = load_stock_library_snapshot()
         self.stock_source = library_snapshot.source
         library = [dict(item) for item in library_snapshot.records]
-        keyword_text = self.search_input.text().strip().lower()
-        keywords = [
-            part.strip()
-            for part in re.split(r"[,，、]+", keyword_text)
-            if part.strip()
-        ]
-        if not keywords:
+        keyword_text = self.search_input.text().strip()
+        if not keyword_text:
             self.result_table.setRowCount(0)
             self._update_register_button_enabled()
             return
-
-        matches: list[dict[str, object]] = []
-        seen_codes: set[str] = set()
-        def stock_matches(stock: dict[str, object], keyword: str) -> bool:
-            searchable_values = [
-                str(stock.get("code", "") or "").strip().lower(),
-                str(stock.get("name", "") or "").strip().lower(),
-                str(stock.get("chosung", "") or "").strip().lower(),
-            ]
-            return any(keyword in value for value in searchable_values)
-
-        for keyword in keywords:
-            for stock in library:
-                code = str(stock.get("code", "") or "").strip()
-                name = str(stock.get("name", "") or "").strip()
-                if not code or not name or code in seen_codes:
-                    continue
-                if stock_matches(stock, keyword):
-                    matches.append(
-                        {
-                            "code": code,
-                            "name": name,
-                            "market": str(stock.get("market", "") or "").strip(),
-                            "nxt_available": stock.get("nxt_available"),
-                            "status": stock.get("status"),
-                            "classification": stock.get("classification"),
-                        }
-                    )
-                    seen_codes.add(code)
+        matches = filter_stock_library_records(library, keyword_text)
 
         self._populate_result_table(matches, source="SEARCH")
         self._request_market_snapshot(search_generation)
@@ -1018,27 +974,14 @@ class InstanceStockSearchRegisterDialog(QDialog):
             instrument_classification = (
                 str(stock.get("classification", "") or "-").strip() or "-"
             )
-            values = (
-                stock.get("code", ""),
-                stock.get("name", ""),
-                self._market_display_text(stock.get("market", "")),
-                self._classification_text(
+            values = stock_browser_display_values(
+                stock,
+                registration_status=self._classification_text(
                     str(stock.get("code", "") or ""),
                     str(stock.get("name", "") or ""),
                 ),
-                self._instrument_classification_display_text(
-                    instrument_classification
-                ),
-                "NXT" if stock.get("nxt_available") is True else "",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                status_display_text,
             )
+            values = values[:-1] + (status_display_text,)
             for col, value in enumerate(values):
                 item = (
                     _NumericSnapshotTableWidgetItem(str(value))
@@ -1259,42 +1202,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         row: int,
         snapshot: dict[str, object],
     ) -> None:
-        values = {
-            self.CURRENT_PRICE_COLUMN: (
-                snapshot.get("current_price"),
-                self._format_snapshot_integer(snapshot.get("current_price")),
-            ),
-            self.CHANGE_RATE_COLUMN: (
-                snapshot.get("change_rate"),
-                self._format_snapshot_percent(snapshot.get("change_rate")),
-            ),
-            self.EXECUTION_STRENGTH_COLUMN: (
-                snapshot.get("execution_strength"),
-                self._format_snapshot_decimal(snapshot.get("execution_strength")),
-            ),
-            self.PREVIOUS_DAY_VOLUME_RATE_COLUMN: (
-                snapshot.get("previous_day_volume_rate"),
-                self._format_snapshot_percent(
-                    snapshot.get("previous_day_volume_rate")
-                ),
-            ),
-            self.TRADING_VALUE_COLUMN: (
-                snapshot.get("cumulative_trading_value"),
-                self._format_snapshot_trading_value(
-                    snapshot.get("cumulative_trading_value")
-                ),
-            ),
-            self.VOLUME_COLUMN: (
-                snapshot.get("cumulative_volume"),
-                self._format_snapshot_volume(snapshot.get("cumulative_volume")),
-            ),
-            self.MARKET_CAP_COLUMN: (
-                snapshot.get("market_capitalization"),
-                self._format_snapshot_market_cap(
-                    snapshot.get("market_capitalization")
-                ),
-            ),
-        }
+        values = market_snapshot_display_values(snapshot)
         for column, (sort_value, display_text) in values.items():
             item = self.result_table.item(row, column)
             if item is None:
@@ -1310,8 +1218,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     @classmethod
     def _format_snapshot_integer(cls, value: object) -> str:
-        number = cls._snapshot_number(value)
-        return "-" if number is None else f"{int(number):,}"
+        return format_snapshot_integer(value)
 
     @staticmethod
     def _compact_one_decimal(value: int | float) -> str:
@@ -1320,52 +1227,29 @@ class InstanceStockSearchRegisterDialog(QDialog):
     @classmethod
     def _format_snapshot_volume(cls, value: object) -> str:
         """Format OPTKWFID FID 13, whose raw unit is one share."""
-        number = cls._snapshot_number(value)
-        if number is None:
-            return "-"
-        if number >= 100_000_000:
-            return f"{cls._compact_one_decimal(number / 100_000_000)}억주"
-        return f"{int(number):,}주"
+        return format_snapshot_volume(value)
 
     @classmethod
     def _format_snapshot_trading_value(cls, value: object) -> str:
         """Format OPTKWFID FID 14, whose raw unit is one million won."""
-        number = cls._snapshot_number(value)
-        if number is None:
-            return "-"
-        if number >= 100:
-            return f"{int(number // 100):,}억"
-        manwon = number * 100
-        return f"{int(manwon):,}만원"
+        return format_snapshot_trading_value(value)
 
     @classmethod
     def _format_snapshot_market_cap(cls, value: object) -> str:
         """Format OPTKWFID FID 311, whose raw unit is one hundred million won."""
-        number = cls._snapshot_number(value)
-        if number is None:
-            return "-"
-        if number >= 1:
-            return f"{int(number):,}억"
-        return f"{int(number * 10_000):,}만원"
+        return format_snapshot_market_cap(value)
 
     @classmethod
     def _format_snapshot_decimal(cls, value: object) -> str:
-        number = cls._snapshot_number(value)
-        return "-" if number is None else f"{float(number):.2f}"
+        return format_snapshot_decimal(value)
 
     @classmethod
     def _format_snapshot_percent(cls, value: object) -> str:
-        number = cls._snapshot_number(value)
-        return "-" if number is None else format_signed_percent(number)
+        return format_snapshot_percent(value)
 
     @staticmethod
     def _stock_status_full_text(value: object) -> str:
-        if isinstance(value, (list, tuple, set, frozenset)):
-            parts = [str(item or "").strip() for item in value]
-            text = " | ".join(part for part in parts if part)
-        else:
-            text = str(value or "").strip()
-        return text if text else "-"
+        return stock_status_full_text(value)
 
     def _stock_status_text_available_width(self) -> int:
         item_margin = self.result_table.style().pixelMetric(
@@ -1399,10 +1283,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     @staticmethod
     def _market_display_text(market: object) -> str:
-        return {
-            "KOSPI": "KOSPI",
-            "KOSDAQ": "코스닥",
-        }.get(str(market or "").strip().upper(), "")
+        return market_display_text(market)
 
     def _stock_name_tooltip(self, stock_name: object) -> str:
         text = str(stock_name or "")

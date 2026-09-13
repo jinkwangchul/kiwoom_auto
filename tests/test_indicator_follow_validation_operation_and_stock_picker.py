@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication, QDialog
+from PyQt5.QtWidgets import QApplication, QAbstractItemView, QDialog
 
 from gui_indicator_follow_validation_stock_picker import (
     IndicatorFollowValidationStockPicker,
@@ -24,6 +24,7 @@ from gui_stock_data import (
     STOCK_LIBRARY_RUNTIME_SOURCE,
     StockLibraryLoadSnapshot,
 )
+from gui_stock_library_browser import STOCK_BROWSER_HEADERS
 from routines.지표추종매매.routine_validation_contract import ValidationStockRef
 from routines.지표추종매매.routine_validation_operation_reader import (
     ValidationOperationStateReadError,
@@ -147,9 +148,30 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dialogs: list[IndicatorFollowValidationStockPicker] = []
         self.records = (
-            {"code": "005930", "name": "삼성전자"},
-            {"code": "000660", "name": "SK하이닉스"},
-            {"code": "035420", "name": "NAVER"},
+            {
+                "code": "005930",
+                "name": "삼성전자",
+                "market": "KOSPI",
+                "classification": "일반종목",
+                "chosung": "ㅅㅅㅈㅈ",
+                "nxt_available": True,
+                "status": "정상",
+            },
+            {
+                "code": "000660",
+                "name": "SK하이닉스",
+                "market": "KOSPI",
+                "classification": "ETF",
+                "chosung": "ㅎㅇㄴㅅ",
+                "status": "투자주의",
+            },
+            {
+                "code": "035420",
+                "name": "NAVER",
+                "market": "KOSDAQ",
+                "classification": "일반종목",
+                "chosung": "ㄴㅇㅂ",
+            },
         )
 
     def tearDown(self) -> None:
@@ -157,7 +179,7 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
             dialog.close()
             dialog.deleteLater()
 
-    def _dialog(self, snapshot=None):
+    def _dialog(self, snapshot=None, market_snapshot_api=None):
         if snapshot is None:
             snapshot = StockLibraryLoadSnapshot(
                 STOCK_LIBRARY_READY,
@@ -165,7 +187,10 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
                 self.records,
             )
         loader = Mock(return_value=snapshot)
-        dialog = IndicatorFollowValidationStockPicker(snapshot_loader=loader)
+        dialog = IndicatorFollowValidationStockPicker(
+            snapshot_loader=loader,
+            market_snapshot_api=market_snapshot_api,
+        )
         self.dialogs.append(dialog)
         loader.assert_called_once_with(None)
         return dialog
@@ -186,6 +211,33 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
         dialog.search_input.setText("삼성")
         self.assertEqual(["005930"], self._visible_codes(dialog))
 
+        dialog.search_input.setText("코스닥")
+        self.assertEqual(["035420"], self._visible_codes(dialog))
+        dialog.search_input.setText("ㅎㅇㄴㅅ")
+        self.assertEqual(["000660"], self._visible_codes(dialog))
+
+    def test_operator_browser_contract_matches_registration_columns_and_filters(self) -> None:
+        dialog = self._dialog()
+        self.assertEqual(
+            list(STOCK_BROWSER_HEADERS),
+            [
+                dialog.result_table.horizontalHeaderItem(column).text()
+                for column in range(dialog.result_table.columnCount())
+            ],
+        )
+        self.assertEqual(
+            QAbstractItemView.SingleSelection,
+            dialog.result_table.selectionMode(),
+        )
+        self.assertEqual("일반종목", dialog.general_stock_button.text())
+        self.assertEqual("TOP100 :", dialog.ranking_title_label.text())
+        self.assertEqual(
+            ["거래량", "거래대금", "급상승", "급하락"],
+            [button.text() for button in dialog.ranking_buttons.values()],
+        )
+        self.assertEqual("선택", dialog.select_button.text())
+        self.assertEqual("취소", dialog.cancel_button.text())
+
     def test_one_selection_returns_validation_stock_ref(self) -> None:
         dialog = self._dialog()
         dialog.stock_table.selectRow(1)
@@ -204,6 +256,30 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
 
         self.assertEqual(QDialog.Rejected, dialog.result())
         self.assertIsNone(dialog.selected_stock)
+
+    def test_double_click_returns_validation_stock_ref(self) -> None:
+        dialog = self._dialog()
+        item = dialog.stock_table.item(2, dialog.NAME_COLUMN)
+        dialog._accept_double_clicked(item)
+        self.assertEqual(QDialog.Accepted, dialog.result())
+        self.assertEqual(
+            ValidationStockRef("035420", "NAVER"),
+            dialog.selected_stock,
+        )
+
+    def test_general_filter_and_local_sort_preserve_single_selection(self) -> None:
+        dialog = self._dialog()
+        dialog.general_stock_button.setChecked(True)
+        self.assertFalse(dialog.result_table.isRowHidden(dialog._find_row("005930")))
+        self.assertTrue(dialog.result_table.isRowHidden(dialog._find_row("000660")))
+        self.assertFalse(dialog.result_table.isRowHidden(dialog._find_row("035420")))
+
+        dialog.general_stock_button.setChecked(False)
+        dialog.on_result_header_clicked(dialog.CODE_COLUMN)
+        self.assertEqual(
+            ["000660", "005930", "035420"],
+            self._visible_codes(dialog),
+        )
 
     def test_invalid_snapshot_blocks_selection(self) -> None:
         snapshot = StockLibraryLoadSnapshot(
@@ -228,27 +304,125 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
             dialog.select_button.click()
         self.assertEqual(ValidationStockRef("035420", "NAVER"), dialog.selected_stock)
 
-    def test_picker_has_no_mutation_network_or_execution_imports(self) -> None:
-        source_path = (
-            Path(__file__).resolve().parents[1]
-            / "gui_indicator_follow_validation_stock_picker.py"
+    def test_search_and_ranking_use_only_injected_read_only_snapshot_surfaces(self) -> None:
+        class SnapshotApi:
+            def __init__(self):
+                self.market_requests = []
+                self.ranking_requests = []
+
+            def request_initial_market_snapshot(self, codes, *, callback=None):
+                self.market_requests.append((tuple(codes), callback))
+                return {"ok": True}
+
+            def request_stock_ranking_snapshot(self, source, *, callback=None):
+                self.ranking_requests.append((source, callback))
+                return {"ok": True}
+
+        api = SnapshotApi()
+        dialog = self._dialog(market_snapshot_api=api)
+        dialog.search_input.setText("삼성")
+        dialog.search_stocks()
+        self.assertEqual(("005930",), api.market_requests[0][0])
+        api.market_requests[0][1](
+            {
+                "ok": True,
+                "rows": [
+                    {
+                        "stock_code": "005930",
+                        "current_price": 75000,
+                        "change_rate": 1.25,
+                        "execution_strength": 117.2,
+                        "previous_day_volume_rate": 12.43,
+                        "cumulative_trading_value": 287735,
+                        "cumulative_volume": 1523650,
+                        "market_capitalization": 4321000,
+                    }
+                ],
+            }
         )
-        source = source_path.read_text(encoding="utf-8-sig")
+        row = dialog._find_row("005930")
+        self.assertEqual(
+            ["75,000", "+1.25%", "117.20", "+12.43%", "2,877억", "1,523,650주", "4,321,000억"],
+            [
+                dialog.result_table.item(row, column).text()
+                for column in (
+                    dialog.CURRENT_PRICE_COLUMN,
+                    dialog.CHANGE_RATE_COLUMN,
+                    dialog.EXECUTION_STRENGTH_COLUMN,
+                    dialog.PREVIOUS_DAY_VOLUME_RATE_COLUMN,
+                    dialog.TRADING_VALUE_COLUMN,
+                    dialog.VOLUME_COLUMN,
+                    dialog.MARKET_CAP_COLUMN,
+                )
+            ],
+        )
+
+        dialog.request_stock_ranking("VOLUME_TOP")
+        self.assertEqual("VOLUME_TOP", api.ranking_requests[0][0])
+        api.ranking_requests[0][1](
+            {
+                "ok": True,
+                "rows": [
+                    {
+                        "stock_code": "000660",
+                        "stock_name": "SK하이닉스",
+                        "cumulative_volume": 999999,
+                    }
+                ],
+            }
+        )
+        self.assertEqual(["000660"], self._visible_codes(dialog))
+        self.assertEqual(2, len(api.market_requests))
+
+    def test_picker_has_no_mutation_network_or_execution_imports(self) -> None:
         forbidden = (
             "append_base_stock",
             "register_stock",
             "refresh_main",
-            "kiwoom_api",
             "market_data",
             "order_queue",
             "sendorder",
             "chejan",
             "mock_validation",
         )
-        lowered = source.lower()
-        for fragment in forbidden:
-            with self.subTest(fragment=fragment):
-                self.assertNotIn(fragment, lowered)
+        source_root = Path(__file__).resolve().parents[1]
+        for filename in (
+            "gui_indicator_follow_validation_stock_picker.py",
+            "gui_stock_library_browser.py",
+        ):
+            source = (source_root / filename).read_text(encoding="utf-8-sig")
+            lowered = source.lower()
+            for fragment in forbidden:
+                with self.subTest(filename=filename, fragment=fragment):
+                    self.assertNotIn(fragment, lowered)
+
+            tree = ast.parse(source)
+            imported_modules = {
+                node.module
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.module
+            }
+            imported_modules.update(
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            )
+            self.assertNotIn("kiwoom_api", imported_modules)
+            self.assertFalse(any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "KiwoomApi"
+                for node in ast.walk(tree)
+            ))
+
+    def test_registration_dialog_uses_same_read_only_browser_contract(self) -> None:
+        source_path = Path(__file__).resolve().parents[1] / "gui_auto_trade_setting_window.py"
+        source = source_path.read_text(encoding="utf-8-sig")
+        self.assertIn("from gui_stock_library_browser import", source)
+        self.assertIn("filter_stock_library_records", source)
+        self.assertIn("stock_browser_display_values", source)
+        self.assertIn("STOCK_BROWSER_HEADERS", source)
 
 
 if __name__ == "__main__":
