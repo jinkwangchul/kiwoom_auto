@@ -9960,6 +9960,11 @@ class MainWindow(QMainWindow):
             instance_id=instance.instance_id if instance is not None else "",
             settings_mode="edit" if instance is not None else "registration",
         )
+        from gui_indicator_follow_validation_flow import (
+            bind_indicator_follow_validation_flow,
+        )
+
+        bind_indicator_follow_validation_flow(self, dialog)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         windows = getattr(self, "_routine_settings_windows", None)
         if not isinstance(windows, set):

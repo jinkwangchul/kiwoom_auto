@@ -4592,6 +4592,11 @@ def open_routine_settings_dialog_for_owner(
         group_display_name=registration_display_name if registration else "",
         settings_mode="registration" if registration else "edit",
     )
+    from gui_indicator_follow_validation_flow import (
+        bind_indicator_follow_validation_flow,
+    )
+
+    bind_indicator_follow_validation_flow(owner, dialog)
     dialog.setAttribute(Qt.WA_DeleteOnClose, True)
     windows = getattr(owner, "_routine_settings_windows", None)
     if not isinstance(windows, set):
