@@ -429,7 +429,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             for column in range(window.filter_result_table.columnCount())
             if window.filter_result_table.item(row, column) is not None
         )
-        self.assertIn("actual-condition", table_text)
+        self.assertIn("하락전환", table_text)
+        self.assertNotIn("actual-condition", table_text)
+        self.assertNotIn("sell.signals", table_text)
         self.assertIn("+50.00%", window.estimated_return_label.text())
 
     def test_auth_is_fresh_and_default_host_is_the_existing_picker_host(self):
@@ -556,6 +558,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         flow.bind_dialog(carrier)
         carrier.signal_validation_requested.emit(self._seed())
         window = created[0]
+        self.assertEqual(100, DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT)
         self.assertEqual(DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT, window.historical_candle_count)
         for timeframe, candle_count in ((3, 300), (15, 500)):
             rules = deepcopy(self.rules)

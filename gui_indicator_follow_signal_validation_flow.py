@@ -38,7 +38,7 @@ from routines.지표추종매매.routine_validation_replay import (
 from routines.지표추종매매.routine_validation_session import ValidationSession
 
 
-DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 300
+DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 100
 _OWNER_FLOW_ATTRIBUTE = "_indicator_follow_signal_validation_flow"
 
 

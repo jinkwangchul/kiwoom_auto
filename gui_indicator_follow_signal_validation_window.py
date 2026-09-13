@@ -11,6 +11,7 @@ from typing import Any
 from PyQt5.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QAbstractItemView,
     QApplication,
     QComboBox,
@@ -285,6 +286,7 @@ class IndicatorFollowSignalValidationWindow(
             seed.settings_snapshot,
             seed.to_ui_state(),
         )
+        self._result_ui_state = seed.to_ui_state()
         self._replay_snapshot: ValidationReplaySnapshot | None = None
         self._candles: list[dict[str, Any]] = []
         self._entries: list[ValidationReplayEntry] = []
@@ -342,11 +344,13 @@ class IndicatorFollowSignalValidationWindow(
         action_row.addWidget(self.run_validation_button)
         action_row.addWidget(self.apply_settings_button)
         action_row.addWidget(self.close_button)
+        self._signal_validation_action_layout = action_row
         root.addLayout(action_row)
 
         self.result_widget = QWidget()
         result_layout = QVBoxLayout(self.result_widget)
         result_layout.setContentsMargins(0, 0, 0, 0)
+        self._signal_validation_result_layout = result_layout
 
         self.chart_stack = QStackedWidget()
         self.loading_label = QLabel("과거 분봉 데이터 조회 중...")
@@ -371,21 +375,22 @@ class IndicatorFollowSignalValidationWindow(
         self.result_splitter.setMinimumHeight(280)
         result_layout.addWidget(self.result_splitter, 1)
 
-        self.filter_result_table = QTableWidget(0, 7)
+        self.filter_result_table = QTableWidget(0, 5)
         self.filter_result_table.setHorizontalHeaderLabels(
-            ["구분", "필터/조건", "실제값", "비교값", "연산", "결과", "사유"]
+            ["구분", "조건", "설정내용", "실제값", "판정"]
         )
         self.filter_result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.filter_result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.filter_result_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.filter_result_table.verticalHeader().setVisible(False)
+        self.filter_result_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.filter_result_table.setWordWrap(True)
         header = self.filter_result_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        for column in range(2, 7):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        self.filter_result_table.setMinimumHeight(145)
-        self.filter_result_table.setMaximumHeight(190)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         result_layout.addWidget(self.filter_result_table)
         self.result_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         root.addWidget(self.result_widget, 1)
@@ -429,7 +434,8 @@ class IndicatorFollowSignalValidationWindow(
         self.basic_signal_interval_combo.setLayoutDirection(Qt.RightToLeft)
         self.historical_candle_count_spin = QSpinBox()
         self.historical_candle_count_spin.setRange(1, 2_147_483_647)
-        self.historical_candle_count_spin.setValue(300)
+        self.historical_candle_count_spin.setValue(100)
+        self.historical_candle_count_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.historical_candle_count_spin.setFixedWidth(80)
         self.historical_candle_count_spin.setFixedHeight(30)
         header_row.addWidget(self.compact_header_arrow)
@@ -484,20 +490,59 @@ class IndicatorFollowSignalValidationWindow(
         QTimer.singleShot(0, self._fit_signal_validation_window)
 
     def _fit_signal_validation_window(self) -> None:
-        self.control_page.adjustSize()
-        control_height = max(0, self.control_page.sizeHint().height())
-        desired_height = max(700, control_height + 500)
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+            contents_hint = layout.sizeHint()
+        else:
+            contents_hint = self.sizeHint()
+        desired_height = max(
+            700,
+            contents_hint.height(),
+            self._required_signal_validation_window_height(),
+        )
+        desired_width = max(1200, self.width(), contents_hint.width())
         screen = self.screen()
         if screen is None:
             application = QApplication.instance()
             screen = application.primaryScreen() if application is not None else None
         if screen is not None:
             available = screen.availableGeometry()
-            desired_height = min(desired_height, available.height())
-            desired_width = min(max(1200, self.width()), available.width())
-        else:
-            desired_width = max(1200, self.width())
+            frame_extra_width = max(0, self.frameGeometry().width() - self.width())
+            frame_extra_height = max(0, self.frameGeometry().height() - self.height())
+            desired_width = min(desired_width, max(1, available.width() - frame_extra_width))
+            desired_height = min(desired_height, max(1, available.height() - frame_extra_height))
         self.resize(int(desired_width), int(desired_height))
+        self._center_on_initial_screen()
+
+    def _required_signal_validation_window_height(self) -> int:
+        root_layout = self.layout()
+        if root_layout is None:
+            return self.sizeHint().height()
+        root_layout.activate()
+        self._signal_validation_result_layout.activate()
+        root_margins = root_layout.contentsMargins()
+        result_margins = self._signal_validation_result_layout.contentsMargins()
+        control_height = max(
+            self.control_tab.sizeHint().height(),
+            self.control_page.sizeHint().height(),
+        )
+        action_height = self._signal_validation_action_layout.sizeHint().height()
+        result_height = (
+            self.result_splitter.minimumHeight()
+            + self.filter_result_table.height()
+            + result_margins.top()
+            + result_margins.bottom()
+            + self._signal_validation_result_layout.spacing()
+        )
+        return (
+            root_margins.top()
+            + root_margins.bottom()
+            + control_height
+            + action_height
+            + result_height
+            + root_layout.spacing() * max(0, root_layout.count() - 1)
+        )
 
     def changeEvent(self, event) -> None:
         QDialog.changeEvent(self, event)
@@ -533,6 +578,7 @@ class IndicatorFollowSignalValidationWindow(
         except Exception:
             self.show_validation_error("현재 신호설정으로 검증 데이터를 만들 수 없습니다.")
             return None
+        self._result_ui_state = deepcopy(ui_state)
         self.validation_status_label.setText("Historical Candle 요청 중")
         self.loading_label.setText("과거 분봉 데이터 조회 중...")
         if self._replay_snapshot is None:
@@ -622,6 +668,7 @@ class IndicatorFollowSignalValidationWindow(
                 f"평가시각: {_display_time(self._candles[index].get('time'))}"
             )
             self.filter_result_table.setRowCount(0)
+            self._resize_filter_result_table_to_contents()
             return True
         buy_entry = self._entry_at(index, "BUY")
         sell_entry = self._entry_at(index, "SELL")
@@ -685,10 +732,37 @@ class IndicatorFollowSignalValidationWindow(
         buy_entry: ValidationReplayEntry | None,
         sell_entry: ValidationReplayEntry | None,
     ) -> None:
-        rows = build_signal_validation_filter_rows(buy_entry, sell_entry)
+        rows = build_signal_validation_filter_rows(
+            buy_entry,
+            sell_entry,
+            self._result_ui_state,
+        )
         self.filter_result_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for column_index, value in enumerate(row.to_cells()):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if row.row_kind in {"section", "summary"}:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
                 self.filter_result_table.setItem(row_index, column_index, item)
+        self._resize_filter_result_table_to_contents()
+
+    def _resize_filter_result_table_to_contents(self) -> int:
+        table = self.filter_result_table
+        table.resizeRowsToContents()
+        margins = table.contentsMargins()
+        required_height = (
+            table.horizontalHeader().height()
+            + sum(table.rowHeight(row) for row in range(table.rowCount()))
+            + table.frameWidth() * 2
+            + margins.top()
+            + margins.bottom()
+            + 2
+        )
+        table.setFixedHeight(required_height)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.updateGeometry()
+        QTimer.singleShot(0, self._fit_signal_validation_window)
+        return required_height

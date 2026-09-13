@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QAbstractSpinBox, QDialog, QScrollArea
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_flow as flow_module
@@ -171,7 +171,14 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window = self._window()
         self.assertEqual("005930 삼성전자", window.compact_stock_label.text())
         self.assertEqual("5", window.basic_signal_interval_combo.currentText())
-        self.assertEqual(300, window.historical_candle_count_spin.value())
+        self.assertEqual(100, window.historical_candle_count_spin.value())
+        self.assertEqual(
+            QAbstractSpinBox.NoButtons,
+            window.historical_candle_count_spin.buttonSymbols(),
+        )
+        window.historical_candle_count_spin.lineEdit().setText("500")
+        window.historical_candle_count_spin.interpretText()
+        self.assertEqual(500, window.historical_candle_count_spin.value())
         all_labels = " ".join(
             label.text() for label in window.control_tab.findChildren(dialog_module.QLabel)
         )
@@ -255,9 +262,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertTrue(created[0].apply_was_connected)
 
     def test_trace_adapter_uses_observed_values_without_inventing_missing_values(self):
-        entry = self._entry(
+        buy_entry = self._entry(
             "BUY",
             0,
+            signal="BUY",
             trace={
                 "conditions": [
                     {
@@ -292,28 +300,81 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 }],
             },
             details=[
-                "filter_type=RSI enabled=True period=14 operator=<= threshold=45 evaluated_value=None passed=False reason=insufficient_data evaluation_index=0"
+                "filter_type=OCR enabled=True logic=AND passed=True reason=matched evaluation_index=0 condition_details=PASS_OSC_TURN_UP",
+                "filter_type=BOLLINGER enabled=True operator=<= value=0.1 close_price=88 bollinger_value=90 passed=False reason=not_matched evaluation_index=0",
+                "filter_type=MOVING_AVERAGE enabled=True operator=CROSS_UP current_value=101 ma_value=100 passed=True reason=matched evaluation_index=0",
+                "filter_type=RSI enabled=True period=14 operator=<= threshold=45 evaluated_value=None passed=False reason=insufficient_data evaluation_index=0",
             ],
         )
-        rows = filter_rows_for_entry(entry)
-        rsi_condition = rows[0]
-        self.assertEqual(("51.2", "45", "<=", "FAIL"), (
-            rsi_condition.actual,
-            rsi_condition.comparison,
-            rsi_condition.operation,
-            rsi_condition.result,
-        ))
-        self.assertEqual("-", rsi_condition.reason)
-        self.assertEqual("condition disabled", rows[1].reason)
-        detail = next(row for row in rows if row.label == "RSI" and row.reason == "insufficient_data")
-        self.assertEqual("-", detail.actual)
-        self.assertEqual("45", detail.comparison)
-        self.assertEqual("FAIL", detail.result)
+        buy_rows = filter_rows_for_entry(buy_entry, self.ui_state)
+        buy_conditions = [row for row in buy_rows if row.row_kind == "condition"]
+        self.assertEqual(list("ABCD"), [row.condition for row in buy_conditions])
+        self.assertEqual(["통과", "실패", "통과", "실패"], [row.result for row in buy_conditions])
+        self.assertIn("상승전환", buy_conditions[0].actual)
+        self.assertEqual("-", buy_conditions[3].actual)
+        self.assertIn("실패 조건", [row.condition for row in buy_rows])
+
+        sell_state = deepcopy(self.ui_state)
+        sell_state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        sell_state["sell_ui"]["signal_conditions"]["condition_c"]["array_check"] = False
+        sell_entry = self._entry(
+            "SELL",
+            0,
+            trace={
+                "conditions": [
+                    {
+                        "path": "sell.signals.ui_condition_a.groups[0].conditions[0]",
+                        "condition_type": "OSC",
+                        "operator": "TURN_DOWN",
+                        "left_operand": {"value": 3},
+                        "right_operand": {"value": None},
+                        "final_result": True,
+                    },
+                    {
+                        "path": "sell.signals.ui_condition_b.groups[0].conditions[0]",
+                        "condition_type": "MA",
+                        "operator": "CROSS_UP",
+                        "left_operand": {"value": 101},
+                        "right_operand": {"value": 100},
+                        "final_result": False,
+                    },
+                    {
+                        "path": "sell.signals.ui_condition_c.groups[0].conditions[0]",
+                        "condition_type": "MACD",
+                        "operator": "CROSS_DOWN",
+                        "left_operand": {"value": -1},
+                        "right_operand": {"value": 0},
+                        "final_result": True,
+                    },
+                ],
+                "groups": [
+                    {"path": "sell.signals.ui_condition_a.groups[0]", "result": True},
+                    {"path": "sell.signals.ui_condition_b.groups[0]", "result": False},
+                    {"path": "sell.signals.ui_condition_c.groups[0]", "result": True},
+                ],
+                "aggregations": [{"side": "SELL", "payload": {"result": False}}],
+            },
+        )
+        sell_rows = filter_rows_for_entry(sell_entry, sell_state)
+        sell_conditions = [row for row in sell_rows if row.row_kind == "condition"]
+        self.assertEqual(list("ABC"), [row.condition for row in sell_conditions])
+        self.assertIn("하락전환", sell_conditions[0].actual)
+        self.assertIn("상향돌파", sell_conditions[1].actual)
+        self.assertIn("하향돌파", sell_conditions[2].actual)
+        self.assertEqual("미사용", sell_conditions[2].result)
+        visible_text = " ".join(cell for row in buy_rows + sell_rows for cell in row.to_cells())
+        self.assertNotIn("buy.groups", visible_text)
+        self.assertNotIn("sell.signals", visible_text)
+        self.assertNotIn("TURN_", visible_text)
+        self.assertNotIn("CROSS_", visible_text)
 
     def test_candle_selection_updates_summary_and_filter_table_for_same_index(self):
         first = self._entry(
             "BUY",
             0,
+            details=[
+                "filter_type=RSI enabled=True period=14 operator=<= threshold=45 evaluated_value=51.2 passed=False reason=not_matched evaluation_index=0"
+            ],
             trace={"conditions": [{
                 "path": "buy.groups[0].conditions[0]",
                 "condition_type": "FIRST",
@@ -329,7 +390,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             signal="SELL",
             reason="second-reason",
             trace={"conditions": [{
-                "path": "sell.groups[0].conditions[0]",
+                "path": "sell.signals.ui_condition_c.groups[0].conditions[0]",
                 "condition_type": "SECOND",
                 "operator": "TURN_DOWN",
                 "left_operand": {"value": 3},
@@ -339,12 +400,87 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         )
         window = self._window()
         window.set_replay_snapshot(self._snapshot([first, second]))
-        self.assertIn("SECOND", self._table_text(window))
+        self.assertIn("하락전환", self._table_text(window))
         self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
         window.select_evaluation_index(0)
-        self.assertIn("FIRST", self._table_text(window))
-        self.assertNotIn("SECOND", self._table_text(window))
+        self.assertIn("51.2", self._table_text(window))
+        self.assertNotIn("하락전환", self._table_text(window))
         self.assertIn("종가: 101", window.selection_summary.toPlainText())
+
+    def test_operator_table_grows_to_all_rows_without_vertical_scroll(self):
+        buy = self._entry(
+            "BUY",
+            1,
+            details=[
+                "filter_type=OCR enabled=True passed=True reason=matched evaluation_index=1 condition_details=PASS_OSC_TURN_UP",
+                "filter_type=BOLLINGER enabled=True close_price=101 bollinger_value=102 passed=False reason=not_matched evaluation_index=1",
+                "filter_type=MOVING_AVERAGE enabled=True current_value=101 ma_value=100 passed=True reason=matched evaluation_index=1",
+                "filter_type=RSI enabled=True evaluated_value=52 passed=False reason=not_matched evaluation_index=1",
+            ],
+        )
+        sell = self._entry(
+            "SELL",
+            1,
+            trace={
+                "conditions": [
+                    {
+                        "path": f"sell.signals.ui_condition_{letter.lower()}.groups[0].conditions[0]",
+                        "operator": "TURN_DOWN",
+                        "left_operand": {"value": index},
+                        "right_operand": {"value": None},
+                        "final_result": letter != "B",
+                    }
+                    for index, letter in enumerate("ABC", 1)
+                ],
+                "groups": [
+                    {
+                        "path": f"sell.signals.ui_condition_{letter.lower()}.groups[0]",
+                        "result": letter != "B",
+                    }
+                    for letter in "ABC"
+                ],
+                "aggregations": [],
+            },
+        )
+        window = self._window()
+        window.show()
+        window._populate_filter_result_table(buy, None)
+        buy_only_height = window.filter_result_table.height()
+        buy_only_window_hint = window._required_signal_validation_window_height()
+        window._populate_filter_result_table(buy, sell)
+        full_height = window.filter_result_table.height()
+        full_window_hint = window._required_signal_validation_window_height()
+        self.assertGreater(full_height, buy_only_height)
+        self.assertGreater(full_window_hint, buy_only_window_hint)
+        window.set_replay_snapshot(self._snapshot([buy, sell]))
+        self.app.processEvents()
+        table = window.filter_result_table
+        self.assertEqual(Qt.ScrollBarAlwaysOff, table.verticalScrollBarPolicy())
+        self.assertEqual(13, table.rowCount())
+        expected_height = (
+            table.horizontalHeader().height()
+            + sum(table.rowHeight(row) for row in range(table.rowCount()))
+            + table.frameWidth() * 2
+            + table.contentsMargins().top()
+            + table.contentsMargins().bottom()
+            + 2
+        )
+        self.assertEqual(expected_height, table.height())
+        self.assertGreater(table.height(), 190)
+        last_rect = table.visualRect(table.model().index(table.rowCount() - 1, 0))
+        self.assertLessEqual(last_rect.bottom(), table.viewport().height())
+        self.assertGreaterEqual(window.result_splitter.height(), window.result_splitter.minimumHeight())
+
+    def test_initial_and_changed_candle_counts_drive_requests_but_not_apply(self):
+        window = self._window()
+        initial = window.request_initial_validation()
+        self.assertEqual(100, initial.candle_count)
+        window.historical_candle_count_spin.setValue(500)
+        changed = window._request_validation()
+        self.assertEqual(500, changed.candle_count)
+        payload = window._request_settings_apply()
+        self.assertNotIn("candle_count", json.dumps(payload.to_ui_state()))
+        self.assertNotIn("500", json.dumps(payload.to_ui_state()))
 
     @staticmethod
     def _table_text(window):
