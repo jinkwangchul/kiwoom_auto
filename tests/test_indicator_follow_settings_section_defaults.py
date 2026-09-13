@@ -49,6 +49,15 @@ class IndicatorFollowSettingsSectionDefaultsTest(unittest.TestCase):
         self.assertEqual("buy", dialog._control_section_mode)
         self.assertGreaterEqual(dialog.height(), 720)
         self.assertLessEqual(dialog.height(), 1180)
+        screen = dialog.screen()
+        self.assertIsNotNone(screen)
+        self.assertLessEqual(
+            (
+                dialog.frameGeometry().center()
+                - screen.availableGeometry().center()
+            ).manhattanLength(),
+            4,
+        )
         self.assertTrue(dialog.basic_box.isVisible())
         self.assertTrue(dialog.basic_header_widget.isVisible())
         self.assertTrue(dialog.buy_detail_expanded)

@@ -601,6 +601,22 @@ class IndicatorFollowRoutineSettingsDialog(
     def _show_with_initial_control_section_state(self):
         self.showNormal()
         self._apply_control_section_mode("buy", force=True)
+        QTimer.singleShot(0, self._center_on_initial_screen)
+
+    def _center_on_initial_screen(self):
+        owner = persistent_feature_owner(self)
+        screen = owner.screen() if owner is not None else None
+        if screen is None:
+            screen = self.screen()
+        if screen is None:
+            application = QApplication.instance()
+            screen = application.primaryScreen() if application is not None else None
+        if screen is None:
+            return
+
+        frame_geometry = self.frameGeometry()
+        frame_geometry.moveCenter(screen.availableGeometry().center())
+        self.move(frame_geometry.topLeft())
 
     def _default_rules_path(self):
         for record in get_routine_records():
