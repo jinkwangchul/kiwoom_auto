@@ -184,6 +184,28 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
         self.assertEqual(2, reader.call_count)
         factory.assert_called_once_with(None)
 
+    def test_explicit_ui_parent_is_used_without_changing_host_lifetime_parent(
+        self,
+    ) -> None:
+        owner = QDialog()
+        requester = QDialog()
+        self.addCleanup(owner.close)
+        self.addCleanup(requester.close)
+        selected = ValidationStockRef("005930", "삼성전자")
+        picker = _FakePicker(QDialog.Accepted, selected)
+        factory = Mock(return_value=picker)
+        host = IndicatorFollowValidationHost(
+            owner,
+            operation_active_reader=Mock(side_effect=(False, False)),
+            stock_picker_factory=factory,
+        )
+
+        result = host.start(self._snapshot(), ui_parent=requester)
+
+        self.assertIsInstance(result, ValidationSession)
+        self.assertIs(owner, host.parent())
+        factory.assert_called_once_with(requester)
+
     def test_fresh_operation_recheck_blocks_after_picker(self) -> None:
         picker = _FakePicker(
             QDialog.Accepted,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import weakref
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import QWidget
@@ -38,7 +39,6 @@ class IndicatorFollowValidationFlow(QObject):
         broker: object,
         parent: QObject | None = None,
         *,
-        chart_parent: QWidget | None = None,
         host: IndicatorFollowValidationHost | None = None,
         historical_count: int = DEFAULT_VALIDATION_HISTORICAL_COUNT,
         historical_provider_factory: Callable[..., object] = (
@@ -65,7 +65,6 @@ class IndicatorFollowValidationFlow(QObject):
                 raise TypeError(f"{name} must be callable")
 
         self._broker = broker
-        self._chart_parent = chart_parent
         self._historical_count = historical_count
         self._historical_provider_factory = historical_provider_factory
         self._replay_factory = replay_factory
@@ -73,7 +72,7 @@ class IndicatorFollowValidationFlow(QObject):
         self._host = (
             host
             if host is not None
-            else IndicatorFollowValidationHost(chart_parent)
+            else IndicatorFollowValidationHost(parent)
         )
         self._bound_dialog_ids: set[int] = set()
         self._active_providers: dict[int, object] = {}
@@ -102,7 +101,18 @@ class IndicatorFollowValidationFlow(QObject):
         dialog_id = id(dialog)
         if dialog_id in self._bound_dialog_ids:
             return True
-        connect(self._start_validation_request)
+        try:
+            dialog_ref = weakref.ref(dialog)
+        except TypeError:
+            return False
+
+        def start_request(
+            snapshot: object,
+            requester_ref: weakref.ReferenceType[object] = dialog_ref,
+        ) -> object | None:
+            return self._start_validation_request(snapshot, requester_ref())
+
+        connect(start_request)
         self._bound_dialog_ids.add(dialog_id)
         destroyed = getattr(dialog, "destroyed", None)
         destroyed_connect = getattr(destroyed, "connect", None)
@@ -121,11 +131,36 @@ class IndicatorFollowValidationFlow(QObject):
         except Exception:
             return False
 
-    def _start_validation_request(self, snapshot: object) -> object | None:
+    @staticmethod
+    def _valid_ui_requester(requester_dialog: object) -> bool:
+        if not isinstance(requester_dialog, QWidget):
+            return False
+        try:
+            requester_dialog.window()
+        except RuntimeError:
+            return False
+        return True
+
+    def _start_validation_request(
+        self,
+        snapshot: object,
+        requester_dialog: object,
+    ) -> object | None:
+        if not self._valid_ui_requester(requester_dialog):
+            self.validation_failed.emit("INVALID_VALIDATION_REQUESTER")
+            return None
         if not self._server_authenticated():
+            try:
+                show_toast(
+                    requester_dialog,
+                    "키움 서버에 로그인되어 있지 않습니다.",
+                    duration_ms=2500,
+                )
+            except RuntimeError:
+                pass
             self.validation_failed.emit("SERVER_NOT_CONNECTED")
             return None
-        return self._host.start(snapshot)
+        return self._host.start(snapshot, ui_parent=requester_dialog)
 
     def _forward_host_failure(self, reason: str) -> None:
         self.validation_failed.emit(str(reason or "VALIDATION_BLOCKED"))
@@ -193,7 +228,7 @@ class IndicatorFollowValidationFlow(QObject):
         try:
             chart = self._chart_factory(
                 replay_result.snapshot,
-                parent=self._chart_parent,
+                parent=None,
             )
             show = getattr(chart, "show", None)
             if not callable(show):
@@ -225,11 +260,6 @@ class IndicatorFollowValidationFlow(QObject):
 
 def _present_validation_failure(owner: object, message: str) -> None:
     if message == "SERVER_NOT_CONNECTED":
-        show_toast(
-            owner,
-            "키움 서버에 로그인되어 있지 않습니다.",
-            duration_ms=2500,
-        )
         return
     text = f"검증차트: {str(message or '실패')}"
     status_message = getattr(owner, "statusBarMessage", None)
@@ -260,11 +290,9 @@ def bind_indicator_follow_validation_flow(
     flow = getattr(owner, _OWNER_FLOW_ATTRIBUTE, None)
     if not isinstance(flow, IndicatorFollowValidationFlow):
         qobject_parent = owner if isinstance(owner, QObject) else None
-        chart_parent = owner if isinstance(owner, QWidget) else None
         flow = IndicatorFollowValidationFlow(
             getattr(owner, "kiwoom_api", None),
             parent=qobject_parent,
-            chart_parent=chart_parent,
         )
         flow.validation_failed.connect(
             lambda message, target=owner: _present_validation_failure(target, message)

@@ -31,7 +31,7 @@ from routines.지표추종매매.routine_validation_replay import (
 from routines.지표추종매매.routine_validation_session import ValidationSession
 
 
-class _FakeDialog(QObject):
+class _FakeDialog(QDialog):
     validation_chart_requested = pyqtSignal(object)
 
     def __init__(self, settings_mode: str = "registration") -> None:
@@ -47,9 +47,11 @@ class _FakeHost(QObject):
         super().__init__()
         self.block_reason = block_reason
         self.started = []
+        self.ui_parents = []
 
-    def start(self, snapshot) -> None:
+    def start(self, snapshot, *, ui_parent=None) -> None:
         self.started.append(snapshot)
+        self.ui_parents.append(ui_parent)
         if self.block_reason:
             self.validation_blocked.emit(self.block_reason)
 
@@ -218,6 +220,7 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
         dialog.validation_chart_requested.emit(self.settings)
 
         self.assertEqual([self.settings], host.started)
+        self.assertEqual([dialog], host.ui_parents)
         self.assertEqual(1, self.broker.connection_checks)
 
     def test_disconnected_entry_blocks_host_and_all_downstream_work(self) -> None:
@@ -264,6 +267,7 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
         self.assertEqual(2, broker.connection_checks)
         self.assertEqual(["SERVER_NOT_CONNECTED"], failures)
         self.assertEqual([self.settings], host.started)
+        self.assertEqual([dialog], host.ui_parents)
 
     def test_authentication_check_fails_closed_for_invalid_brokers(self) -> None:
         class MissingChecker:
@@ -400,6 +404,7 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
 
         self.assertEqual(1, len(created))
         self.assertEqual(1, created[0].show_calls)
+        self.assertIsNone(created[0].parentWidget())
         self.assertFalse(created[0].isModal())
         self.assertEqual((created[0],), flow.open_charts)
         self.addCleanup(created[0].close)
@@ -472,6 +477,7 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
         edit.validation_chart_requested.emit(self.settings)
 
         self.assertEqual([self.settings, self.settings], host.started)
+        self.assertEqual([registration, edit], host.ui_parents)
 
     def test_registration_and_edit_share_auth_guard_and_retry_path(self) -> None:
         broker = _FakeBroker(connected=False)
@@ -498,6 +504,7 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
 
         self.assertEqual(4, broker.connection_checks)
         self.assertEqual([self.settings, self.settings], host.started)
+        self.assertEqual([registration, edit], host.ui_parents)
 
     def test_owner_binding_reuses_one_flow_and_existing_broker(self) -> None:
         owner = SimpleNamespace(kiwoom_api=self.broker)
@@ -511,16 +518,17 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
         self.assertIs(self.broker, first._broker)
         self.assertIs(first, owner._indicator_follow_validation_flow)
 
-    def test_widget_owner_parents_host_stock_picker_and_chart(self) -> None:
+    def test_widget_owner_is_only_flow_and_host_lifetime_parent(self) -> None:
         owner = QDialog()
         owner.kiwoom_api = self.broker
         dialog = _FakeDialog()
         self.addCleanup(owner.close)
+        self.addCleanup(dialog.close)
 
         flow = bind_indicator_follow_validation_flow(owner, dialog)
 
+        self.assertIs(owner, flow.parent())
         self.assertIs(owner, flow.host.parent())
-        self.assertIs(owner, flow._chart_parent)
 
     def test_owner_failure_uses_existing_status_seam_only(self) -> None:
         status = Mock()
@@ -531,22 +539,78 @@ class IndicatorFollowValidationFlowTest(unittest.TestCase):
 
         status.assert_called_once_with("검증차트: OPERATION_ACTIVE")
 
-    def test_server_not_connected_failure_uses_toast_only(self) -> None:
+    def test_server_not_connected_toast_targets_requester_only(self) -> None:
         status = Mock()
-        owner = SimpleNamespace(kiwoom_api=self.broker, statusBarMessage=status)
-        flow = bind_indicator_follow_validation_flow(owner, _FakeDialog())
+        owner = QDialog()
+        owner.kiwoom_api = _FakeBroker(connected=False)
+        owner.statusBarMessage = status
+        owner.show = Mock()
+        owner.raise_ = Mock()
+        owner.activateWindow = Mock()
+        dialog = _FakeDialog()
+        self.addCleanup(owner.close)
+        self.addCleanup(dialog.close)
+        flow = bind_indicator_follow_validation_flow(owner, dialog)
+        start = Mock(wraps=flow.host.start)
+        flow.host.start = start
+        failures = []
+        flow.validation_failed.connect(failures.append)
 
         with patch(
             "gui_indicator_follow_validation_flow.show_toast"
         ) as show_toast:
-            flow.validation_failed.emit("SERVER_NOT_CONNECTED")
+            dialog.validation_chart_requested.emit(self.settings)
 
         show_toast.assert_called_once_with(
-            owner,
+            dialog,
             "키움 서버에 로그인되어 있지 않습니다.",
             duration_ms=2500,
         )
+        self.assertEqual(["SERVER_NOT_CONNECTED"], failures)
+        start.assert_not_called()
         status.assert_not_called()
+        owner.show.assert_not_called()
+        owner.raise_.assert_not_called()
+        owner.activateWindow.assert_not_called()
+
+    def test_requester_close_does_not_destroy_independent_chart(self) -> None:
+        requester = _FakeDialog()
+        host = _FakeHost()
+        replay = Mock()
+        replay.evaluate.return_value = ValidationReplayResult(
+            True,
+            snapshot=self._replay_snapshot(),
+        )
+        created = []
+
+        def chart_factory(snapshot, parent=None):
+            chart = _FakeChart(snapshot, parent)
+            created.append(chart)
+            return chart
+
+        flow = IndicatorFollowValidationFlow(
+            self.broker,
+            host=host,
+            replay_factory=Mock(return_value=replay),
+            chart_factory=chart_factory,
+        )
+        flow.bind_dialog(requester)
+        host.validation_session_ready.emit(self.session)
+        self.broker.complete(self._historical_response())
+        chart = created[0]
+
+        requester.close()
+        QTest.qWait(0)
+        self.app.processEvents()
+
+        self.assertIsNone(chart.parentWidget())
+        self.assertTrue(chart.isVisible())
+        self.assertEqual((chart,), flow.open_charts)
+
+        chart.close()
+        QTest.qWait(0)
+        self.app.processEvents()
+        self.assertEqual((), flow.open_charts)
 
     def test_caller_sources_bind_both_actual_dialog_creation_paths(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtWidgets import QDialog
+from PyQt5.QtWidgets import QDialog, QWidget
 
 from gui_indicator_follow_validation_stock_picker import (
     IndicatorFollowValidationStockPicker,
@@ -55,6 +55,8 @@ class IndicatorFollowValidationHost(QObject):
     def start(
         self,
         settings_snapshot: ValidationSettingsSnapshot,
+        *,
+        ui_parent: QWidget | None = None,
     ) -> ValidationSession | None:
         if not isinstance(settings_snapshot, ValidationSettingsSnapshot):
             self.validation_blocked.emit(REASON_INVALID_SETTINGS_SNAPSHOT)
@@ -79,7 +81,7 @@ class IndicatorFollowValidationHost(QObject):
             self.validation_blocked.emit(operation_block_reason)
             return None
 
-        picker = self._stock_picker_factory(self.parent())
+        picker = self._stock_picker_factory(self._picker_parent(ui_parent))
         if picker.exec_() != QDialog.Accepted:
             return None
         selected_stock = picker.selected_stock
@@ -107,6 +109,23 @@ class IndicatorFollowValidationHost(QObject):
 
         self.validation_session_ready.emit(session)
         return session
+
+    def _picker_parent(self, ui_parent: object) -> QWidget | None:
+        if isinstance(ui_parent, QWidget):
+            try:
+                ui_parent.window()
+            except RuntimeError:
+                pass
+            else:
+                return ui_parent
+        lifetime_parent = self.parent()
+        if isinstance(lifetime_parent, QWidget):
+            try:
+                lifetime_parent.window()
+            except RuntimeError:
+                return None
+            return lifetime_parent
+        return None
 
     def _preflight_operation_block_reason(self) -> str | None:
         reader = self._operation_active_reader
