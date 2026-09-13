@@ -148,10 +148,13 @@ from gui_stock_library_browser import (
     RANKING_HIGHLIGHT_COLUMNS as STOCK_BROWSER_RANKING_HIGHLIGHT_COLUMNS,
     REGISTRATION_STATUS_COLUMN as STOCK_BROWSER_REGISTRATION_STATUS_COLUMN,
     STOCK_BROWSER_HEADERS,
+    STOCK_BROWSER_DIALOG_HEIGHT,
     STOCK_STATUS_COLUMN as STOCK_BROWSER_STATUS_COLUMN,
     TRADING_VALUE_COLUMN as STOCK_BROWSER_TRADING_VALUE_COLUMN,
     VOLUME_COLUMN as STOCK_BROWSER_VOLUME_COLUMN,
     filter_stock_library_records,
+    configure_stock_browser_search_geometry,
+    configure_stock_browser_table_geometry,
     format_snapshot_decimal,
     format_snapshot_integer,
     format_snapshot_market_cap,
@@ -161,8 +164,11 @@ from gui_stock_library_browser import (
     instrument_classification_display_text,
     market_display_text,
     market_snapshot_display_values,
+    normalize_stock_browser_dialog_width,
+    normalize_stock_browser_row_number_width,
     snapshot_number,
     stock_browser_display_values,
+    stock_browser_table_required_width,
     stock_status_full_text,
 )
 from gui_stock_instance_chart_window import open_stock_instance_chart
@@ -358,7 +364,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         # the login-session sync service and never by dialog open/textChanged.
         self.stock_source = str(stock_source or STOCK_LIBRARY_EMPTY_SOURCE)
         self.setWindowTitle(self._window_title())
-        self.resize(self.BASE_DIALOG_WIDTH, 420)
+        self.resize(self.BASE_DIALOG_WIDTH, STOCK_BROWSER_DIALOG_HEIGHT)
 
         self.search_input = QLineEdit(self)
         self.search_input.setObjectName("instanceStockSearchInput")
@@ -479,12 +485,11 @@ class InstanceStockSearchRegisterDialog(QDialog):
         main_layout.setSpacing(5)
         self._update_ranking_badge_styles()
         self._update_general_stock_badge_style()
-        ranking_width = (
-            next(iter(self.ranking_buttons.values()))
-            .fontMetrics()
-            .horizontalAdvance("거래대금")
-            + (self.RANKING_BADGE_HORIZONTAL_PADDING * 2)
-            + 2
+        configure_stock_browser_search_geometry(
+            self.search_input,
+            self.general_stock_button,
+            self.ranking_title_label,
+            self.ranking_buttons.values(),
         )
         search_layout = QHBoxLayout()
         search_label = QLabel("검색어", self)
@@ -492,14 +497,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(self.btn_search)
         search_layout.addStretch(1)
-        general_width = (
-            self.general_stock_button.fontMetrics().horizontalAdvance("일반종목")
-            + (self.RANKING_BADGE_HORIZONTAL_PADDING * 2)
-            + 2
-        )
-        self.general_stock_button.setFixedWidth(general_width)
-        self.general_stock_button.setFixedHeight(AUTO_TRADE_SETTING_BADGE_HEIGHT)
-        self.general_stock_button.setCursor(Qt.PointingHandCursor)
         search_layout.addWidget(self.general_stock_button, 0, Qt.AlignBottom)
         search_layout.addSpacing(6)
         search_layout.addWidget(self.ranking_separator_label, 0, Qt.AlignBottom)
@@ -509,22 +506,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             if index:
                 search_layout.addSpacing(4)
             button = self.ranking_buttons[source]
-            button.setFixedWidth(ranking_width)
-            button.setFixedHeight(AUTO_TRADE_SETTING_BADGE_HEIGHT)
-            button.setCursor(Qt.PointingHandCursor)
             search_layout.addWidget(button, 0, Qt.AlignBottom)
-        search_margin = self.search_input.style().pixelMetric(
-            QStyle.PM_FocusFrameHMargin,
-            None,
-            self.search_input,
-        ) + 1
-        self.search_input.setFixedWidth(
-            self.search_input.fontMetrics().horizontalAdvance(
-                "한" * self.SEARCH_DISPLAY_CHARACTERS
-            )
-            + (search_margin * 2)
-        )
-        self.search_input.setMinimumHeight(self.search_input.sizeHint().height() + 6)
         self.search_input.setStyleSheet(
             "QLineEdit#instanceStockSearchInput {"
             "border: none;"
@@ -536,96 +518,17 @@ class InstanceStockSearchRegisterDialog(QDialog):
             "}"
         )
 
-        self.result_table.setColumnCount(len(STOCK_BROWSER_HEADERS))
-        self.result_table.setHorizontalHeaderLabels(STOCK_BROWSER_HEADERS)
+        configure_stock_browser_table_geometry(self.result_table)
         header = self.result_table.horizontalHeader()
         header.setObjectName("instanceStockSearchHorizontalHeader")
-        header.setSectionResizeMode(QHeaderView.Fixed)
-        header.setStretchLastSection(False)
-        header.setSectionsMovable(False)
-        header.setDefaultAlignment(Qt.AlignCenter)
         vertical_header = self.result_table.verticalHeader()
         vertical_header.setObjectName("instanceStockSearchVerticalHeader")
-        vertical_header.setSectionResizeMode(QHeaderView.Fixed)
-        vertical_header.setSectionsMovable(False)
-        vertical_header.setDefaultAlignment(Qt.AlignCenter)
         item_margin = self.result_table.style().pixelMetric(
             QStyle.PM_FocusFrameHMargin,
             None,
             self.result_table,
         ) + 1
-        section_border_width = self.result_table.style().pixelMetric(
-            QStyle.PM_DefaultFrameWidth,
-            None,
-            self.result_table,
-        ) if self.result_table.showGrid() else 0
-        name_column_width = (
-            self.result_table.fontMetrics().horizontalAdvance(
-                "한" * self.STOCK_NAME_DISPLAY_CHARACTERS
-            )
-            + (item_margin * 2)
-            + section_border_width
-        )
-        code_column_width = self._symmetric_text_column_width("0000000000")
-        code_text_width = self.result_table.fontMetrics().horizontalAdvance("000000")
-        code_horizontal_margin = max(
-            item_margin,
-            (code_column_width - section_border_width - code_text_width) // 2,
-        )
-        market_column_width = self._text_column_width_with_margin(
-            code_horizontal_margin,
-            "시장",
-            "KOSPI",
-            "코스닥",
-        )
-        category_column_width = self._text_column_width_with_margin(
-            code_horizontal_margin,
-            "등록상태",
-            "등록대기",
-            "검토관리",
-        )
-        instrument_classification_width = self._text_column_width_with_margin(
-            code_horizontal_margin,
-            "분류",
-            "일반종목",
-            "SPAC",
-            "REIT",
-        )
-        remarks_column_width = self._text_column_width_with_margin(
-            code_horizontal_margin,
-            "비고",
-            "NXT",
-        )
-        self.result_table.setColumnWidth(self.CODE_COLUMN, code_column_width)
-        self.result_table.setColumnWidth(self.NAME_COLUMN, name_column_width)
-        self.result_table.setColumnWidth(self.MARKET_COLUMN, market_column_width)
-        self.result_table.setColumnWidth(self.CATEGORY_COLUMN, category_column_width)
-        self.result_table.setColumnWidth(
-            self.INSTRUMENT_CLASSIFICATION_COLUMN,
-            instrument_classification_width,
-        )
-        self.result_table.setColumnWidth(self.AFTER_MARKET_COLUMN, remarks_column_width)
-        numeric_column_samples = {
-            self.CURRENT_PRICE_COLUMN: ("현재주가", "999,999,999"),
-            self.CHANGE_RATE_COLUMN: ("등락률", "+999.99%"),
-            self.EXECUTION_STRENGTH_COLUMN: ("체결강도", "999.99"),
-            self.PREVIOUS_DAY_VOLUME_RATE_COLUMN: ("전일대비", "+999.99%"),
-            self.TRADING_VALUE_COLUMN: ("거래대금", "99,999,999억", "9,999만원"),
-            self.VOLUME_COLUMN: ("거래량", "99,999,999주", "999.9억주"),
-            self.MARKET_CAP_COLUMN: ("시총", "99,999,999억"),
-        }
-        for column, samples in numeric_column_samples.items():
-            self.result_table.setColumnWidth(
-                column,
-                self._text_column_width(*samples),
-            )
-        self.result_table.setColumnWidth(
-            self.STOCK_STATUS_COLUMN,
-            self._text_column_width("상태", *self.STOCK_STATUS_SINGLE_VALUES)
-            + section_border_width,
-        )
         for column in range(self.result_table.columnCount()):
-            header.setSectionResizeMode(column, QHeaderView.Fixed)
             header_item = self.result_table.horizontalHeaderItem(column)
             if header_item is not None:
                 header_item.setBackground(QBrush(QColor("#FFFFFF")))
@@ -649,8 +552,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         self.result_table.setSortingEnabled(False)
         self.result_table.horizontalHeader().setSortIndicatorShown(False)
         self.result_table.setAlternatingRowColors(False)
-        self.result_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.result_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         grid_line_color = self.TABLE_SEPARATOR_COLOR
         self.result_table.setStyleSheet(
             f"""
@@ -885,47 +786,14 @@ class InstanceStockSearchRegisterDialog(QDialog):
         return text_width + (max(0, horizontal_margin) * 2) + section_border_width
 
     def _normalize_row_number_header_width(self) -> None:
-        text_width = self.result_table.verticalHeader().fontMetrics().horizontalAdvance("999")
-        section_border_width = self.result_table.style().pixelMetric(
-            QStyle.PM_DefaultFrameWidth,
-            None,
-            self.result_table.verticalHeader(),
-        )
-        fixed_width = (
-            text_width
-            + (self.ROW_NUMBER_HORIZONTAL_PADDING * 2)
-            + section_border_width
-        )
+        fixed_width = normalize_stock_browser_row_number_width(self.result_table)
         self._fixed_row_number_header_width = fixed_width
-        self.result_table.verticalHeader().setFixedWidth(fixed_width)
 
     def _result_table_required_width(self) -> int:
-        section_width = sum(
-            self.result_table.horizontalHeader().sectionSize(column)
-            for column in range(self.result_table.columnCount())
-        )
-        vertical_header = self.result_table.verticalHeader()
-        vertical_header_width = vertical_header.width()
-        return (
-            section_width
-            + vertical_header_width
-            + self.result_table.verticalScrollBar().sizeHint().width()
-            + (self.result_table.frameWidth() * 2)
-        )
+        return stock_browser_table_required_width(self.result_table)
 
     def _normalize_dialog_width_to_result_table(self) -> None:
-        fixed_width = getattr(self, "_fixed_result_dialog_width", None)
-        if isinstance(fixed_width, int) and fixed_width > 0:
-            self.setFixedWidth(fixed_width)
-            return
-        margins = self.layout().contentsMargins()
-        required_width = (
-            self._result_table_required_width()
-            + margins.left()
-            + margins.right()
-        )
-        self._fixed_result_dialog_width = required_width
-        self.setFixedWidth(required_width)
+        normalize_stock_browser_dialog_width(self, self.result_table)
 
     def _update_register_button_enabled(self) -> None:
         has_selection = bool(self.result_table.selectionModel().selectedRows())

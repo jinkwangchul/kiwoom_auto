@@ -12,7 +12,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication, QAbstractItemView, QDialog
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication, QAbstractItemView, QDialog, QHeaderView
 
 from gui_indicator_follow_validation_stock_picker import (
     IndicatorFollowValidationStockPicker,
@@ -24,7 +25,10 @@ from gui_stock_data import (
     STOCK_LIBRARY_RUNTIME_SOURCE,
     StockLibraryLoadSnapshot,
 )
-from gui_stock_library_browser import STOCK_BROWSER_HEADERS
+from gui_stock_library_browser import (
+    STOCK_BROWSER_HEADERS,
+    stock_browser_table_required_width,
+)
 from routines.지표추종매매.routine_validation_contract import ValidationStockRef
 from routines.지표추종매매.routine_validation_operation_reader import (
     ValidationOperationStateReadError,
@@ -202,19 +206,46 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
             for row in range(dialog.stock_table.rowCount())
         ]
 
-    def test_valid_snapshot_loads_and_filters_by_code_and_name(self) -> None:
+    @staticmethod
+    def _search(dialog, keyword: str) -> None:
+        dialog.search_input.setText(keyword)
+        dialog.btn_search.click()
+
+    def test_valid_snapshot_starts_empty_and_text_change_does_not_search(self) -> None:
         dialog = self._dialog()
-        self.assertEqual(["005930", "000660", "035420"], self._visible_codes(dialog))
+        self.assertEqual(0, dialog.result_table.rowCount())
+        self.assertFalse(dialog.select_button.isEnabled())
 
-        dialog.search_input.setText("0006")
-        self.assertEqual(["000660"], self._visible_codes(dialog))
         dialog.search_input.setText("삼성")
-        self.assertEqual(["005930"], self._visible_codes(dialog))
+        self.assertEqual(0, dialog.result_table.rowCount())
+        self.assertFalse(dialog.select_button.isEnabled())
 
-        dialog.search_input.setText("코스닥")
-        self.assertEqual(["035420"], self._visible_codes(dialog))
-        dialog.search_input.setText("ㅎㅇㄴㅅ")
+    def test_search_button_filters_by_code_name_market_and_chosung(self) -> None:
+        dialog = self._dialog()
+        self._search(dialog, "0006")
         self.assertEqual(["000660"], self._visible_codes(dialog))
+        self._search(dialog, "삼성")
+        self.assertEqual(["005930"], self._visible_codes(dialog))
+        self._search(dialog, "코스닥")
+        self.assertEqual(["035420"], self._visible_codes(dialog))
+        self._search(dialog, "ㅎㅇㄴㅅ")
+        self.assertEqual(["000660"], self._visible_codes(dialog))
+
+    def test_enter_runs_explicit_search(self) -> None:
+        dialog = self._dialog()
+        dialog.search_input.setText("NAVER")
+        self.assertEqual(0, dialog.result_table.rowCount())
+        dialog.search_input.returnPressed.emit()
+        self.assertEqual(["035420"], self._visible_codes(dialog))
+
+    def test_empty_explicit_search_clears_existing_result(self) -> None:
+        dialog = self._dialog()
+        self._search(dialog, "삼성")
+        dialog.result_table.selectRow(0)
+        self.assertTrue(dialog.select_button.isEnabled())
+        self._search(dialog, "")
+        self.assertEqual(0, dialog.result_table.rowCount())
+        self.assertFalse(dialog.select_button.isEnabled())
 
     def test_operator_browser_contract_matches_registration_columns_and_filters(self) -> None:
         dialog = self._dialog()
@@ -240,7 +271,8 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
 
     def test_one_selection_returns_validation_stock_ref(self) -> None:
         dialog = self._dialog()
-        dialog.stock_table.selectRow(1)
+        self._search(dialog, "000660")
+        dialog.stock_table.selectRow(0)
         dialog.select_button.click()
 
         self.assertEqual(QDialog.Accepted, dialog.result())
@@ -251,6 +283,7 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
 
     def test_cancel_returns_no_selection(self) -> None:
         dialog = self._dialog()
+        self._search(dialog, "삼성")
         dialog.stock_table.selectRow(0)
         dialog.cancel_button.click()
 
@@ -259,7 +292,8 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
 
     def test_double_click_returns_validation_stock_ref(self) -> None:
         dialog = self._dialog()
-        item = dialog.stock_table.item(2, dialog.NAME_COLUMN)
+        self._search(dialog, "NAVER")
+        item = dialog.stock_table.item(0, dialog.NAME_COLUMN)
         dialog._accept_double_clicked(item)
         self.assertEqual(QDialog.Accepted, dialog.result())
         self.assertEqual(
@@ -269,6 +303,7 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
 
     def test_general_filter_and_local_sort_preserve_single_selection(self) -> None:
         dialog = self._dialog()
+        self._search(dialog, "005930,000660,035420")
         dialog.general_stock_button.setChecked(True)
         self.assertFalse(dialog.result_table.isRowHidden(dialog._find_row("005930")))
         self.assertTrue(dialog.result_table.isRowHidden(dialog._find_row("000660")))
@@ -299,7 +334,7 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
         dialog = self._dialog()
         with patch.object(Path, "write_text", side_effect=AssertionError("write")), \
              patch.object(Path, "write_bytes", side_effect=AssertionError("write")):
-            dialog.search_input.setText("NAVER")
+            self._search(dialog, "NAVER")
             dialog.stock_table.selectRow(0)
             dialog.select_button.click()
         self.assertEqual(ValidationStockRef("035420", "NAVER"), dialog.selected_stock)
@@ -320,8 +355,12 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
 
         api = SnapshotApi()
         dialog = self._dialog(market_snapshot_api=api)
+        self.assertEqual([], api.market_requests)
+        self.assertEqual([], api.ranking_requests)
         dialog.search_input.setText("삼성")
-        dialog.search_stocks()
+        self.assertEqual(0, dialog.result_table.rowCount())
+        self.assertEqual([], api.market_requests)
+        dialog.btn_search.click()
         self.assertEqual(("005930",), api.market_requests[0][0])
         api.market_requests[0][1](
             {
@@ -357,7 +396,7 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
             ],
         )
 
-        dialog.request_stock_ranking("VOLUME_TOP")
+        dialog.ranking_buttons["VOLUME_TOP"].click()
         self.assertEqual("VOLUME_TOP", api.ranking_requests[0][0])
         api.ranking_requests[0][1](
             {
@@ -373,6 +412,72 @@ class IndicatorFollowValidationStockPickerTest(unittest.TestCase):
         )
         self.assertEqual(["000660"], self._visible_codes(dialog))
         self.assertEqual(2, len(api.market_requests))
+
+        market_request_count = len(api.market_requests)
+        ranking_request_count = len(api.ranking_requests)
+        dialog.general_stock_button.setChecked(True)
+        dialog.general_stock_button.setChecked(False)
+        self.assertEqual(market_request_count, len(api.market_requests))
+        self.assertEqual(ranking_request_count, len(api.ranking_requests))
+
+    def test_empty_search_never_requests_market_snapshot(self) -> None:
+        api = Mock()
+        dialog = self._dialog(market_snapshot_api=api)
+        dialog.btn_search.click()
+        api.request_initial_market_snapshot.assert_not_called()
+        api.request_stock_ranking_snapshot.assert_not_called()
+
+    def test_geometry_matches_production_registration_dialog(self) -> None:
+        import gui_auto_trade_setting_window as setting_window
+
+        snapshot = StockLibraryLoadSnapshot(
+            STOCK_LIBRARY_READY,
+            STOCK_LIBRARY_RUNTIME_SOURCE,
+            self.records,
+        )
+        with patch.object(
+            setting_window,
+            "load_stock_library_snapshot",
+            return_value=snapshot,
+        ):
+            production = setting_window.InstanceStockSearchRegisterDialog(
+                instance_metadata={"instance_name": "지표추종매매"},
+                kiwoom_api=None,
+            )
+        self.addCleanup(production.close)
+        dialog = self._dialog(snapshot)
+
+        self.assertEqual(420, production.height())
+        self.assertEqual(production.height(), dialog.height())
+        production_header = production.result_table.horizontalHeader()
+        validation_header = dialog.result_table.horizontalHeader()
+        self.assertFalse(production_header.stretchLastSection())
+        self.assertFalse(validation_header.stretchLastSection())
+        for column in range(len(STOCK_BROWSER_HEADERS)):
+            with self.subTest(column=column):
+                self.assertEqual(QHeaderView.Fixed, production_header.sectionResizeMode(column))
+                self.assertEqual(QHeaderView.Fixed, validation_header.sectionResizeMode(column))
+                self.assertEqual(
+                    production_header.sectionSize(column),
+                    validation_header.sectionSize(column),
+                )
+        self.assertEqual(
+            Qt.ScrollBarAlwaysOff,
+            dialog.result_table.horizontalScrollBarPolicy(),
+        )
+        self.assertEqual(
+            Qt.ScrollBarAlwaysOn,
+            dialog.result_table.verticalScrollBarPolicy(),
+        )
+        self.assertEqual(
+            production.result_table.verticalHeader().width(),
+            dialog.result_table.verticalHeader().width(),
+        )
+        self.assertEqual(
+            production._result_table_required_width(),
+            stock_browser_table_required_width(dialog.result_table),
+        )
+        self.assertEqual(production.width(), dialog.width())
 
     def test_picker_has_no_mutation_network_or_execution_imports(self) -> None:
         forbidden = (

@@ -12,7 +12,6 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -43,11 +42,15 @@ from gui_stock_library_browser import (
     RANKING_HIGHLIGHT_COLUMNS,
     REGISTRATION_STATUS_COLUMN,
     STOCK_BROWSER_HEADERS,
+    STOCK_BROWSER_DIALOG_HEIGHT,
     STOCK_STATUS_COLUMN,
     TRADING_VALUE_COLUMN,
     VOLUME_COLUMN,
+    configure_stock_browser_search_geometry,
+    configure_stock_browser_table_geometry,
     filter_stock_library_records,
     market_snapshot_display_values,
+    normalize_stock_browser_dialog_width,
     normalize_browser_code,
     snapshot_number,
     stock_browser_display_values,
@@ -103,7 +106,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("검증 종목 선택")
-        self.resize(1180, 520)
+        self.resize(520, STOCK_BROWSER_DIALOG_HEIGHT)
 
         self._selection: ValidationStockRef | None = None
         self._records: tuple[dict[str, object], ...] = ()
@@ -139,16 +142,12 @@ class IndicatorFollowValidationStockPicker(QDialog):
 
         self.result_table = QTableWidget(0, len(STOCK_BROWSER_HEADERS), self)
         self.stock_table = self.result_table
-        self.result_table.setHorizontalHeaderLabels(STOCK_BROWSER_HEADERS)
+        configure_stock_browser_table_geometry(self.result_table)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.result_table.setSortingEnabled(False)
         header = self.result_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(True)
-        header.setSectionsMovable(False)
-        self.result_table.verticalHeader().setDefaultSectionSize(24)
 
         self.status_label = QLabel(self)
         self.select_button = QPushButton("선택", self)
@@ -163,13 +162,15 @@ class IndicatorFollowValidationStockPicker(QDialog):
         search_row.addWidget(self.search_input)
         search_row.addWidget(self.btn_search)
         search_row.addStretch(1)
-        search_row.addWidget(self.general_stock_button)
+        search_row.addWidget(self.general_stock_button, 0, Qt.AlignBottom)
         search_row.addSpacing(6)
-        search_row.addWidget(self.ranking_separator_label)
+        search_row.addWidget(self.ranking_separator_label, 0, Qt.AlignBottom)
         search_row.addSpacing(6)
-        search_row.addWidget(self.ranking_title_label)
-        for source, _text in self.RANKING_BADGES:
-            search_row.addWidget(self.ranking_buttons[source])
+        search_row.addWidget(self.ranking_title_label, 0, Qt.AlignBottom)
+        for index, (source, _text) in enumerate(self.RANKING_BADGES):
+            if index:
+                search_row.addSpacing(4)
+            search_row.addWidget(self.ranking_buttons[source], 0, Qt.AlignBottom)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
@@ -177,12 +178,12 @@ class IndicatorFollowValidationStockPicker(QDialog):
         button_row.addWidget(self.cancel_button)
 
         root = QVBoxLayout(self)
+        root.setSpacing(5)
         root.addLayout(search_row)
         root.addWidget(self.result_table)
         root.addWidget(self.status_label)
         root.addLayout(button_row)
 
-        self.search_input.textChanged.connect(self._apply_filter)
         self.search_input.returnPressed.connect(self.search_stocks)
         self.btn_search.clicked.connect(self.search_stocks)
         self.general_stock_button.toggled.connect(
@@ -201,6 +202,15 @@ class IndicatorFollowValidationStockPicker(QDialog):
         )
         self.select_button.clicked.connect(self._accept_selection)
         self.cancel_button.clicked.connect(self.reject)
+
+        configure_stock_browser_search_geometry(
+            self.search_input,
+            self.general_stock_button,
+            self.ranking_title_label,
+            self.ranking_buttons.values(),
+        )
+        button_row.setContentsMargins(0, 1, 0, 0)
+        normalize_stock_browser_dialog_width(self, self.result_table)
 
         loader = snapshot_loader or load_stock_library_snapshot
         root_path = None if project_root is None else Path(project_root)
@@ -250,7 +260,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
         self._snapshot_valid = True
         self._records = tuple(records)
         self.status_label.setText("")
-        self._render_records(self._records)
+        self._render_records(())
 
     def _apply_filter(self, query: object = "") -> None:
         if not self._snapshot_valid:
@@ -260,7 +270,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
         records = filter_stock_library_records(
             self._records,
             query,
-            include_all_when_empty=True,
+            include_all_when_empty=False,
         )
         self._render_records(tuple(records), source="SEARCH")
 
