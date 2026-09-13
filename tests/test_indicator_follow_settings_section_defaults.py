@@ -7,6 +7,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 from gui_indicator_follow_routine_settings_dialog import (
@@ -39,10 +40,15 @@ class IndicatorFollowSettingsSectionDefaultsTest(unittest.TestCase):
 
         dialog = IndicatorFollowRoutineSettingsDialog(**kwargs)
         self.app.processEvents()
+        self.app.processEvents()
         return dialog
 
     def _assert_initial_section_state(self, dialog) -> None:
+        self.assertFalse(dialog.isMaximized())
+        self.assertFalse(bool(dialog.windowState() & Qt.WindowMaximized))
         self.assertEqual("buy", dialog._control_section_mode)
+        self.assertGreaterEqual(dialog.height(), 720)
+        self.assertLessEqual(dialog.height(), 1180)
         self.assertTrue(dialog.basic_box.isVisible())
         self.assertTrue(dialog.basic_header_widget.isVisible())
         self.assertTrue(dialog.buy_detail_expanded)

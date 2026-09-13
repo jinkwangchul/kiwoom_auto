@@ -599,7 +599,7 @@ class IndicatorFollowRoutineSettingsDialog(
         QTimer.singleShot(0, self._show_with_initial_control_section_state)
 
     def _show_with_initial_control_section_state(self):
-        self.showMaximized()
+        self.showNormal()
         self._apply_control_section_mode("buy", force=True)
 
     def _default_rules_path(self):
