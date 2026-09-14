@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QRect, Qt, pyqtSignal
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication,
@@ -276,6 +276,72 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window._toggle_control_section_mode("buy")
         self.assertTrue(window.buy_detail_expanded)
         self.assertTrue(window.sell_detail_expanded)
+
+    def test_collapsed_section_geometry_and_initial_natural_width_are_normalized(self):
+        window = self._window()
+        window._available_signal_validation_geometry = lambda: QRect(0, 0, 2400, 1400)
+        window.show()
+        self.app.processEvents()
+        window._apply_control_section_mode("summary", force=True)
+        window._initial_natural_fit_pending = True
+        window.layout().activate()
+        expected_width = window._natural_signal_validation_window_width(
+            window.layout().sizeHint()
+        )
+        window._fit_signal_validation_window()
+        self.app.processEvents()
+
+        sections = (window.basic_box, window.buy_box, window.sell_box)
+        headers = (
+            window.basic_header_widget,
+            window.buy_header_widget,
+            window.sell_header_widget,
+        )
+        collapsed_height = window._v2_collapsed_section_height
+        self.assertEqual([collapsed_height] * 3, [box.height() for box in sections])
+        self.assertEqual(
+            [window._V2_SECTION_HEADER_HEIGHT] * 3,
+            [header.height() for header in headers],
+        )
+        lefts = [box.geometry().left() for box in sections]
+        rights = [box.geometry().right() for box in sections]
+        self.assertLessEqual(max(lefts) - min(lefts), 1)
+        self.assertLessEqual(max(rights) - min(rights), 1)
+        self.assertEqual(expected_width, window.width())
+        self.assertLess(window.width(), 1600)
+
+        window._toggle_recent_stock_row()
+        self.app.processEvents()
+        self.assertGreater(window.basic_box.height(), collapsed_height)
+        self.assertEqual(
+            [window._V2_SECTION_HEADER_HEIGHT] * 3,
+            [header.height() for header in headers],
+        )
+        window._toggle_recent_stock_row()
+        self.app.processEvents()
+        self.assertEqual([collapsed_height] * 3, [box.height() for box in sections])
+
+        for mode, expanded_box in (
+            ("buy", window.buy_box),
+            ("sell", window.sell_box),
+        ):
+            window._apply_control_section_mode(mode, force=True)
+            self.app.processEvents()
+            self.assertGreater(expanded_box.height(), collapsed_height)
+            self.assertEqual(
+                [window._V2_SECTION_HEADER_HEIGHT] * 3,
+                [header.height() for header in headers],
+            )
+            window._apply_control_section_mode("summary", force=True)
+            self.app.processEvents()
+            self.assertEqual([collapsed_height] * 3, [box.height() for box in sections])
+
+        user_width = window.width() + 180
+        window.resize(user_width, window.height())
+        window._toggle_control_section_mode("buy")
+        window._fit_signal_validation_window()
+        self.app.processEvents()
+        self.assertEqual(user_width, window.width())
 
     def test_recent_row_toggles_inline_as_exactly_one_line(self):
         window = self._window()

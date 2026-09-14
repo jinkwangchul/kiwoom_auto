@@ -529,6 +529,9 @@ class IndicatorFollowSignalValidationWindow(
 ):
     """Top-level working copy for repeated signal-only historical replay."""
 
+    _V2_SECTION_HEADER_HEIGHT = 44
+    _V2_SECTION_VERTICAL_MARGIN = 6
+
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
@@ -561,6 +564,7 @@ class IndicatorFollowSignalValidationWindow(
         self._entries: list[ValidationReplayEntry] = []
         self._selected_index: int | None = None
         self._initial_validation_requested = False
+        self._initial_natural_fit_pending = True
         super().__init__(
             rules_path=__file__,
             routine_name="지표추종매매 신호검증 V2",
@@ -569,8 +573,8 @@ class IndicatorFollowSignalValidationWindow(
             parent=parent,
         )
         self.setModal(False)
-        self.resize(1600, 900)
-        self.setMinimumSize(1200, 700)
+        self.setMinimumSize(0, 700)
+        self.resize(max(1, self.sizeHint().width()), 900)
 
     @property
     def stock(self) -> ValidationStockRef | None:
@@ -696,9 +700,12 @@ class IndicatorFollowSignalValidationWindow(
         basic_layout.setContentsMargins(10, 3, 10, 3)
         basic_layout.setSpacing(2)
         header_widget = QWidget()
+        self.basic_header_widget = header_widget
+        self.basic_header_widget.setFixedHeight(self._V2_SECTION_HEADER_HEIGHT)
         header_row = QHBoxLayout(header_widget)
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(8)
+        header_row.setAlignment(Qt.AlignVCenter)
         self.basic_toggle_button = QPushButton("▶ 기본설정")
         self.basic_toggle_button.setFlat(True)
         self.basic_toggle_button.setCursor(Qt.PointingHandCursor)
@@ -783,6 +790,7 @@ class IndicatorFollowSignalValidationWindow(
 
         buy_title = self._build_control_buy_section(page_layout)
         sell_title = self._build_control_sell_section(page_layout)
+        self._normalize_v2_section_geometry()
         self._control_section_mode = "summary"
         self._control_header_click_modes = {
             buy_title: "buy",
@@ -794,6 +802,38 @@ class IndicatorFollowSignalValidationWindow(
         self._apply_control_section_mode("summary", force=True)
         outer.addWidget(self.control_page)
         self.control_tab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
+    def _normalize_v2_section_geometry(self) -> None:
+        collapsed_height = (
+            self._V2_SECTION_HEADER_HEIGHT
+            + self._V2_SECTION_VERTICAL_MARGIN * 2
+        )
+        sections = (
+            (self.basic_box, self.basic_header_widget),
+            (self.buy_box, self.buy_header_widget),
+            (self.sell_box, self.sell_header_widget),
+        )
+        for box, header_widget in sections:
+            section_layout = box.layout()
+            section_layout.setContentsMargins(
+                10,
+                self._V2_SECTION_VERTICAL_MARGIN,
+                10,
+                self._V2_SECTION_VERTICAL_MARGIN,
+            )
+            section_layout.setSpacing(2)
+            header_widget.setFixedHeight(self._V2_SECTION_HEADER_HEIGHT)
+            box.setMinimumHeight(collapsed_height)
+            box.setMaximumHeight(collapsed_height)
+            box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        for box in (self.buy_box, self.sell_box):
+            box.setStyleSheet(
+                box.styleSheet()
+                + f"\nQGroupBox#{box.objectName()} {{ margin-top: 0px; }}"
+            )
+        self._v2_collapsed_section_height = collapsed_height
+        self._buy_collapsed_height = collapsed_height
+        self._sell_collapsed_height = collapsed_height
 
     @staticmethod
     def _detail_view() -> QPlainTextEdit:
@@ -830,19 +870,40 @@ class IndicatorFollowSignalValidationWindow(
             contents_hint.height(),
             self._required_signal_validation_window_height(),
         )
-        desired_width = max(1200, self.width(), contents_hint.width())
-        screen = self.screen()
-        if screen is None:
-            application = QApplication.instance()
-            screen = application.primaryScreen() if application is not None else None
-        if screen is not None:
-            available = screen.availableGeometry()
+        initial_fit = bool(getattr(self, "_initial_natural_fit_pending", False))
+        natural_width = self._natural_signal_validation_window_width(contents_hint)
+        desired_width = natural_width if initial_fit else max(self.width(), natural_width)
+        available = self._available_signal_validation_geometry()
+        if available is not None:
             frame_extra_width = max(0, self.frameGeometry().width() - self.width())
             frame_extra_height = max(0, self.frameGeometry().height() - self.height())
             desired_width = min(desired_width, max(1, available.width() - frame_extra_width))
             desired_height = min(desired_height, max(1, available.height() - frame_extra_height))
         self.resize(int(desired_width), int(desired_height))
+        self._initial_natural_fit_pending = False
         self._center_on_initial_screen()
+
+    def _natural_signal_validation_window_width(self, contents_hint: QSize) -> int:
+        root_layout = self.layout()
+        if root_layout is None:
+            return max(1, contents_hint.width())
+        root_margins = root_layout.contentsMargins()
+        horizontal_chrome = root_margins.left() + root_margins.right()
+        return max(
+            1,
+            contents_hint.width(),
+            self.control_tab.sizeHint().width() + horizontal_chrome,
+            self.result_widget.minimumSizeHint().width() + horizontal_chrome,
+            self._signal_validation_action_layout.sizeHint().width()
+            + horizontal_chrome,
+        )
+
+    def _available_signal_validation_geometry(self):
+        screen = self.screen()
+        if screen is None:
+            application = QApplication.instance()
+            screen = application.primaryScreen() if application is not None else None
+        return screen.availableGeometry() if screen is not None else None
 
     def _required_signal_validation_window_height(self) -> int:
         root_layout = self.layout()
@@ -1007,6 +1068,7 @@ class IndicatorFollowSignalValidationWindow(
         )
         self.recent_stock_panel.setVisible(self._recent_stock_row_expanded)
         self._sync_basic_header_height()
+        self._sync_control_page_size()
         self._sync_recent_stock_row_width()
         QTimer.singleShot(0, self._fit_signal_validation_window)
 
