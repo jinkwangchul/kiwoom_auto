@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+import hashlib
+import json
 import math
 from typing import Any
 
@@ -14,12 +16,14 @@ from PyQt5.QtWidgets import (
     QAbstractSpinBox,
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -39,6 +43,8 @@ from gui_indicator_follow_routine_settings_dialog import (
 )
 from gui_indicator_follow_validation_chart_window import (
     IndicatorFollowValidationChartCanvas,
+    _TEXT,
+    _finite_number,
 )
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
@@ -46,6 +52,7 @@ from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationSeed,
     build_validation_average_price_context,
     build_signal_validation_snapshot,
+    project_signal_validation_ui_state,
     require_resolved_sell_price_selections,
 )
 from indicator_follow_signal_validation_presentation import (
@@ -304,8 +311,12 @@ class IndicatorFollowSignalValidationChartCanvas(
 ):
     """V2 canvas overlaying sparse labels derived only from Candle timestamps."""
 
+    _PRICE_AXIS_PADDING = 10
+
     def __init__(self, candles, markers, parent=None) -> None:
         super().__init__(candles, markers, parent)
+        self._LEFT = self._required_price_axis_gutter()
+        self.setMinimumWidth(self._content_width())
         self._time_axis_records = _time_axis_label_records(self._candles)
         self.setMinimumHeight(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -316,12 +327,87 @@ class IndicatorFollowSignalValidationChartCanvas(
     def time_axis_records(self) -> list[dict[str, Any]]:
         return deepcopy(self._time_axis_records)
 
+    @property
+    def plot_left(self) -> int:
+        return int(self._LEFT)
+
+    @staticmethod
+    def _price_tick_text(value: float) -> str:
+        if float(value).is_integer():
+            return f"{int(value):,}"
+        return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+    def _price_range(self) -> tuple[float, float] | None:
+        prices = []
+        for candle in self._candles:
+            for field in ("open", "high", "low", "close"):
+                number = _finite_number(candle.get(field))
+                if number is not None:
+                    prices.append(number)
+        if not prices:
+            return None
+        minimum = min(prices)
+        maximum = max(prices)
+        if maximum == minimum:
+            padding = max(abs(maximum) * 0.01, 1.0)
+            minimum -= padding
+            maximum += padding
+        return minimum, maximum
+
+    def _price_tick_values(self) -> list[float]:
+        price_range = self._price_range()
+        if price_range is None:
+            return []
+        minimum, maximum = price_range
+        return [
+            maximum - (maximum - minimum) * step / 4
+            for step in range(5)
+        ]
+
+    def _required_price_axis_gutter(self) -> int:
+        labels = [self._price_tick_text(value) for value in self._price_tick_values()]
+        if not labels:
+            return type(self)._LEFT
+        metrics = QFontMetrics(self.font())
+        label_width = max(metrics.horizontalAdvance(label) for label in labels)
+        return max(type(self)._LEFT, label_width + self._PRICE_AXIS_PADDING)
+
+    def price_axis_records(self) -> list[dict[str, Any]]:
+        plot_top = self._TOP
+        plot_bottom = max(plot_top + 1, self.height() - self._BOTTOM)
+        records = []
+        for step, price in enumerate(self._price_tick_values()):
+            y = int(plot_top + (plot_bottom - plot_top) * step / 4)
+            records.append({
+                "step": step,
+                "price": price,
+                "label": self._price_tick_text(price),
+                "y": y,
+            })
+        return records
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if not self._time_axis_records:
+        price_records = self.price_axis_records()
+        if not price_records and not self._time_axis_records:
             return
         painter = QPainter(self)
-        painter.setPen(QColor("#d1d5db"))
+        painter.setPen(_TEXT)
+        price_metrics = QFontMetrics(painter.font())
+        label_right = self.plot_left - self._PRICE_AXIS_PADDING // 2
+        for record in price_records:
+            painter.drawText(
+                QRectF(
+                    0,
+                    record["y"] - price_metrics.height() / 2,
+                    label_right,
+                    price_metrics.height(),
+                ),
+                Qt.AlignRight | Qt.AlignVCenter,
+                record["label"],
+            )
+        if not self._time_axis_records:
+            return
         font = painter.font()
         font.setPointSize(max(7, font.pointSize() - 1))
         painter.setFont(font)
@@ -565,6 +651,9 @@ class IndicatorFollowSignalValidationWindow(
         self._selected_index: int | None = None
         self._initial_validation_requested = False
         self._initial_natural_fit_pending = True
+        self._primary_validation_action_state = "validate"
+        self._pending_validation_ui_fingerprint: str | None = None
+        self._validated_ui_fingerprint: str | None = None
         super().__init__(
             rules_path=__file__,
             routine_name="지표추종매매 신호검증 V2",
@@ -575,6 +664,8 @@ class IndicatorFollowSignalValidationWindow(
         self.setModal(False)
         self.setMinimumSize(0, 700)
         self.resize(max(1, self.sizeHint().width()), 900)
+        self._connect_signal_ui_change_tracking()
+        self._set_primary_validation_action_state("validate")
 
     @property
     def stock(self) -> ValidationStockRef | None:
@@ -607,19 +698,20 @@ class IndicatorFollowSignalValidationWindow(
             else "과거 분봉 데이터 조회 중..."
         )
         self.result_summary_label = QLabel("Candle -  |  BUY -  |  SELL -")
-        self.estimated_return_label = QLabel("추정 손익률: -")
+        self.estimated_return_label = QLabel("|  추정 손익률 -")
         self.estimated_return_label.setStyleSheet("font-weight: bold;")
-        self.run_validation_button = QPushButton("검증 실행")
-        self.apply_settings_button = QPushButton("설정 반영")
+        self.primary_validation_action_button = QPushButton("검증 실행")
+        self.run_validation_button = self.primary_validation_action_button
         self.close_button = QPushButton("닫기")
-        self.run_validation_button.clicked.connect(self._request_validation)
-        self.apply_settings_button.clicked.connect(self._request_settings_apply)
+        self.primary_validation_action_button.clicked.connect(
+            self._handle_primary_validation_action
+        )
         self.close_button.clicked.connect(self.close)
         action_row.addWidget(self.validation_status_label)
-        action_row.addWidget(self.result_summary_label, 1)
+        action_row.addWidget(self.result_summary_label)
         action_row.addWidget(self.estimated_return_label)
-        action_row.addWidget(self.run_validation_button)
-        action_row.addWidget(self.apply_settings_button)
+        action_row.addStretch(1)
+        action_row.addWidget(self.primary_validation_action_button)
         action_row.addWidget(self.close_button)
         self._signal_validation_action_layout = action_row
         root.addLayout(action_row)
@@ -1015,6 +1107,61 @@ class IndicatorFollowSignalValidationWindow(
             raise ValueError("candle_count must be a positive integer")
         self.historical_candle_count_spin.setValue(candle_count)
 
+    @staticmethod
+    def _signal_ui_fingerprint(ui_state: object) -> str:
+        projected = project_signal_validation_ui_state(ui_state)
+        canonical = json.dumps(
+            projected,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _current_signal_ui_fingerprint(self) -> str:
+        return self._signal_ui_fingerprint(
+            self.collect_indicator_follow_ui_state()
+        )
+
+    def _connect_signal_ui_change_tracking(self) -> None:
+        for line_edit in self.findChildren(QLineEdit):
+            line_edit.textChanged.connect(self._on_signal_validation_ui_changed)
+        for combo in self.findChildren(QComboBox):
+            combo.currentTextChanged.connect(self._on_signal_validation_ui_changed)
+        for checkbox in self.findChildren(QCheckBox):
+            checkbox.toggled.connect(self._on_signal_validation_ui_changed)
+
+    def _on_signal_validation_ui_changed(self, *_args) -> None:
+        self._pending_validation_ui_fingerprint = None
+        self._validated_ui_fingerprint = None
+        self._set_primary_validation_action_state("validate")
+
+    def _set_primary_validation_action_state(
+        self,
+        state: str,
+        *,
+        enabled: bool | None = None,
+    ) -> None:
+        if state not in {"validate", "apply", "applied"}:
+            raise ValueError("unknown primary validation action state")
+        self._primary_validation_action_state = state
+        self.primary_validation_action_button.setText({
+            "validate": "검증 실행",
+            "apply": "설정 반영",
+            "applied": "반영 완료",
+        }[state])
+        if enabled is None:
+            enabled = state != "applied"
+        self.primary_validation_action_button.setEnabled(bool(enabled))
+
+    def _handle_primary_validation_action(self):
+        if self._primary_validation_action_state == "apply":
+            return self._request_settings_apply()
+        if self._primary_validation_action_state == "validate":
+            return self._request_validation()
+        return None
+
     def _request_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
         if self.stock is None:
             self.show_validation_error(
@@ -1047,6 +1194,7 @@ class IndicatorFollowSignalValidationWindow(
                 snapshot,
                 self.historical_candle_count_spin.value(),
             )
+            pending_fingerprint = self._signal_ui_fingerprint(ui_state)
         except ValueError as exc:
             if "가격 기준 재선택 필요" in str(exc):
                 self.show_validation_error(
@@ -1059,11 +1207,13 @@ class IndicatorFollowSignalValidationWindow(
             self.show_validation_error("현재 신호설정으로 검증 데이터를 만들 수 없습니다.")
             return None
         self._result_ui_state = deepcopy(ui_state)
+        self._pending_validation_ui_fingerprint = pending_fingerprint
+        self._validated_ui_fingerprint = None
         self.validation_status_label.setText("Historical Candle 요청 중")
         self.loading_label.setText("과거 분봉 데이터 조회 중...")
         if self._replay_snapshot is None:
             self.chart_stack.setCurrentWidget(self.loading_label)
-        self.run_validation_button.setEnabled(False)
+        self._set_primary_validation_action_state("validate", enabled=False)
         self.validation_run_requested.emit(run_request)
         return run_request
 
@@ -1077,11 +1227,20 @@ class IndicatorFollowSignalValidationWindow(
         return self._request_validation()
 
     def _request_settings_apply(self) -> IndicatorFollowSignalValidationApplyPayload | None:
+        if (
+            self._primary_validation_action_state != "apply"
+            or self._validated_ui_fingerprint is None
+        ):
+            return None
         try:
-            payload = IndicatorFollowSignalValidationApplyPayload(
-                self.collect_indicator_follow_ui_state()
-            )
+            ui_state = self.collect_indicator_follow_ui_state()
+            current_fingerprint = self._signal_ui_fingerprint(ui_state)
+            if current_fingerprint != self._validated_ui_fingerprint:
+                self._on_signal_validation_ui_changed()
+                return None
+            payload = IndicatorFollowSignalValidationApplyPayload(ui_state)
         except ValueError as exc:
+            self._on_signal_validation_ui_changed()
             if "가격 기준 재선택 필요" in str(exc):
                 self.show_settings_apply_result(
                     "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요.",
@@ -1094,6 +1253,7 @@ class IndicatorFollowSignalValidationWindow(
             )
             return None
         except Exception:
+            self._on_signal_validation_ui_changed()
             self.show_settings_apply_result(
                 "현재 신호설정을 반영용 데이터로 만들 수 없습니다.",
                 success=False,
@@ -1104,13 +1264,29 @@ class IndicatorFollowSignalValidationWindow(
 
     def show_settings_apply_result(self, message: str, *, success: bool) -> None:
         self.validation_status_label.setText(str(message or "설정 반영 실패"))
+        if success:
+            self._set_primary_validation_action_state("applied")
+            return
+        try:
+            fingerprint_matches = (
+                self._validated_ui_fingerprint is not None
+                and self._current_signal_ui_fingerprint()
+                == self._validated_ui_fingerprint
+            )
+        except Exception:
+            fingerprint_matches = False
+        self._set_primary_validation_action_state(
+            "apply" if fingerprint_matches else "validate"
+        )
 
     def show_validation_error(self, message: str) -> None:
         self.validation_status_label.setText(str(message or "검증 실패"))
         if self._replay_snapshot is None:
             self.loading_label.setText(str(message or "검증 실패"))
             self.chart_stack.setCurrentWidget(self.loading_label)
-        self.run_validation_button.setEnabled(True)
+        self._pending_validation_ui_fingerprint = None
+        self._validated_ui_fingerprint = None
+        self._set_primary_validation_action_state("validate")
 
     def set_validation_stock(self, stock: ValidationStockRef) -> bool:
         if not isinstance(stock, ValidationStockRef) or not stock.code or not stock.name:
@@ -1214,14 +1390,16 @@ class IndicatorFollowSignalValidationWindow(
             old_canvas.deleteLater()
         self.canvas = None
         self.result_summary_label.setText("Candle -  |  BUY -  |  SELL -")
-        self.estimated_return_label.setText("추정 손익률: -")
+        self.estimated_return_label.setText("|  추정 손익률 -")
         self.selection_summary.setPlainText("선택 Candle 요약\n-")
         self.filter_result_table.setRowCount(0)
         self._resize_filter_result_table_to_contents()
         self.validation_status_label.setText(message)
         self.loading_label.setText(message)
         self.chart_stack.setCurrentWidget(self.loading_label)
-        self.run_validation_button.setEnabled(True)
+        self._pending_validation_ui_fingerprint = None
+        self._validated_ui_fingerprint = None
+        self._set_primary_validation_action_state("validate")
 
     def set_replay_snapshot(self, replay_snapshot: ValidationReplaySnapshot) -> None:
         if not isinstance(replay_snapshot, ValidationReplaySnapshot):
@@ -1249,12 +1427,26 @@ class IndicatorFollowSignalValidationWindow(
         )
         estimated = estimated_signal_return_percent(replay_snapshot)
         self.estimated_return_label.setText(
-            "추정 손익률: -"
+            "|  추정 손익률 -"
             if estimated is None
-            else f"추정 손익률: {estimated:+.2f}%"
+            else f"|  추정 손익률 {estimated:+.2f}%"
         )
         self.validation_status_label.setText("검증 완료")
-        self.run_validation_button.setEnabled(True)
+        pending_fingerprint = self._pending_validation_ui_fingerprint
+        self._pending_validation_ui_fingerprint = None
+        try:
+            current_fingerprint = self._current_signal_ui_fingerprint()
+        except Exception:
+            current_fingerprint = None
+        if (
+            pending_fingerprint is not None
+            and current_fingerprint == pending_fingerprint
+        ):
+            self._validated_ui_fingerprint = pending_fingerprint
+            self._set_primary_validation_action_state("apply")
+        else:
+            self._validated_ui_fingerprint = None
+            self._set_primary_validation_action_state("validate")
         self.select_evaluation_index(replay_snapshot.evaluated_end_index)
 
     def select_evaluation_index(self, index: int) -> bool:

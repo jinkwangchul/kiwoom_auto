@@ -979,6 +979,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window.historical_candle_count_spin.setValue(500)
         changed = window._request_validation()
         self.assertEqual(500, changed.candle_count)
+        window.set_replay_snapshot(self._snapshot([]))
         payload = window._request_settings_apply()
         self.assertNotIn("candle_count", json.dumps(payload.to_ui_state()))
         self.assertNotIn("500", json.dumps(payload.to_ui_state()))

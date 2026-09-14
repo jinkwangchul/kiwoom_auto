@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog
 
@@ -22,6 +23,7 @@ from gui_indicator_follow_signal_validation_flow import (
     IndicatorFollowSignalValidationFlow,
 )
 from gui_indicator_follow_signal_validation_window import (
+    IndicatorFollowSignalValidationChartCanvas,
     IndicatorFollowSignalValidationWindow,
     _time_axis_label_records,
     estimated_signal_return_percent,
@@ -483,6 +485,148 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             "20260101090000", "20260501090000", "20270101090000"
         ])}
         self.assertTrue(all(record["time"] in source_times for record in long_range))
+
+    def test_chart_price_axis_uses_five_scaled_ticks_and_dynamic_plot_left(self):
+        candles = [
+            {
+                "time": f"2026091114{index:02d}00",
+                "open": price,
+                "high": price + 500,
+                "low": price - 500,
+                "close": price,
+                "volume": 1,
+            }
+            for index, price in enumerate((249_500, 250_000, 249_750))
+        ]
+        canvas = IndicatorFollowSignalValidationChartCanvas(candles, [])
+        self.widgets.append(canvas)
+        canvas.resize(canvas.sizeHint().width(), 440)
+        records = canvas.price_axis_records()
+
+        self.assertEqual(5, len(records))
+        self.assertEqual(250_500.0, records[0]["price"])
+        self.assertEqual(249_000.0, records[-1]["price"])
+        self.assertEqual(249_750.0, records[2]["price"])
+        self.assertEqual("250,500", records[0]["label"])
+        self.assertEqual("249,000", records[-1]["label"])
+        self.assertEqual(
+            [
+                int(
+                    canvas._TOP
+                    + (canvas.height() - canvas._BOTTOM - canvas._TOP) * step / 4
+                )
+                for step in range(5)
+            ],
+            [record["y"] for record in records],
+        )
+        metrics = QFontMetrics(canvas.font())
+        self.assertGreaterEqual(
+            canvas.plot_left,
+            max(metrics.horizontalAdvance(record["label"]) for record in records)
+            + canvas._PRICE_AXIS_PADDING,
+        )
+        for index in range(len(candles)):
+            self.assertEqual(
+                index,
+                canvas._nearest_candle_index(canvas._x_for_index(index)),
+            )
+        canvas.set_selected_index(1)
+        canvas.render(QPixmap(canvas.size()))
+        self.assertEqual(1, canvas.selected_index)
+
+        expensive = IndicatorFollowSignalValidationChartCanvas(
+            [
+                {
+                    "time": "20260911140000",
+                    "open": 1_490_000,
+                    "high": 1_500_000,
+                    "low": 1_490_000,
+                    "close": 1_500_000,
+                    "volume": 1,
+                }
+            ],
+            [],
+        )
+        self.widgets.append(expensive)
+        self.assertGreater(expensive.plot_left, 48)
+        self.assertEqual("1,500,000", expensive.price_axis_records()[0]["label"])
+
+    def test_primary_action_requires_matching_validation_before_apply(self):
+        window = self._window()
+        runs = []
+        applies = []
+        window.validation_run_requested.connect(runs.append)
+        window.settings_apply_requested.connect(applies.append)
+
+        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+        self.assertIs(window.run_validation_button, window.primary_validation_action_button)
+        self.assertFalse(hasattr(window, "apply_settings_button"))
+        window.primary_validation_action_button.click()
+        self.assertEqual(1, len(runs))
+        self.assertEqual([], applies)
+        window.set_replay_snapshot(
+            self._replay_snapshot([
+                self._entry("BUY", 0, "BUY"),
+                self._entry("SELL", 2, "SELL"),
+            ])
+        )
+        self.assertEqual("설정 반영", window.primary_validation_action_button.text())
+        self.assertEqual([], applies)
+
+        original_expression = window.buy_signal_expr_line.text()
+        blocker = QSignalBlocker(window.buy_signal_expr_line)
+        window.buy_signal_expr_line.setText("A or D")
+        del blocker
+        self.assertIsNone(window._request_settings_apply())
+        self.assertEqual([], applies)
+        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+
+        window.buy_signal_expr_line.setText(original_expression)
+        window._request_validation()
+        window.set_replay_snapshot(self._replay_snapshot([]))
+        window.primary_validation_action_button.click()
+        self.assertEqual(1, len(applies))
+        window.show_settings_apply_result("설정 반영 완료", success=True)
+        self.assertEqual("반영 완료", window.primary_validation_action_button.text())
+        window.buy_rsi_value_line.setText("44")
+        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+
+        window._request_validation()
+        window.show_validation_error("검증 실패")
+        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+        window._request_validation()
+        window.set_replay_snapshot(self._replay_snapshot([]))
+        self.assertEqual("설정 반영", window.primary_validation_action_button.text())
+        window.set_validation_stock(ValidationStockRef("000660", "SK하이닉스"))
+        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+
+    def test_result_summary_keeps_estimate_in_left_cluster(self):
+        window = self._window()
+        window._request_validation()
+        window.set_replay_snapshot(
+            self._replay_snapshot([
+                self._entry("BUY", 0, "BUY"),
+                self._entry("SELL", 2, "SELL"),
+            ])
+        )
+        summary = " ".join(
+            " ".join((
+                window.validation_status_label.text(),
+                window.result_summary_label.text(),
+                window.estimated_return_label.text(),
+            )).split()
+        )
+        self.assertEqual(
+            "검증 완료 005930 삼성전자 | 5분봉 | Candle 3 | BUY 1 | SELL 1 | 추정 손익률 +50.00%",
+            summary,
+        )
+        layout = window._signal_validation_action_layout
+        self.assertEqual(0, layout.indexOf(window.validation_status_label))
+        self.assertEqual(1, layout.indexOf(window.result_summary_label))
+        self.assertEqual(2, layout.indexOf(window.estimated_return_label))
+        self.assertIsNotNone(layout.itemAt(3).spacerItem())
+        self.assertEqual(4, layout.indexOf(window.primary_validation_action_button))
+        self.assertEqual(5, layout.indexOf(window.close_button))
 
     def test_estimated_return_uses_all_earlier_buys_and_latest_sell(self):
         snapshot = self._replay_snapshot([
@@ -978,7 +1122,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual([], window._entries)
         self.assertIsNone(window.selected_evaluation_index)
         self.assertEqual(0, window.filter_result_table.rowCount())
-        self.assertEqual("추정 손익률: -", window.estimated_return_label.text())
+        self.assertEqual("|  추정 손익률 -", window.estimated_return_label.text())
         self.assertIn("준비 중", window.validation_status_label.text())
 
     def test_each_run_uses_its_snapshot_timeframe_and_updates_real_replay_result(self):
