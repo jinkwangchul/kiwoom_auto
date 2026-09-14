@@ -706,16 +706,17 @@ class IndicatorFollowSignalValidationWindow(
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(8)
         header_row.setAlignment(Qt.AlignVCenter)
-        self.basic_toggle_button = QPushButton("▶ 기본설정")
-        self.basic_toggle_button.setFlat(True)
+        self.basic_toggle_button = QLabel("▶ 기본설정")
         self.basic_toggle_button.setCursor(Qt.PointingHandCursor)
         self.basic_toggle_button.setFixedHeight(30)
+        self.basic_toggle_button.setMinimumWidth(132)
+        self.basic_toggle_button.setAlignment(Qt.AlignCenter)
         self.basic_toggle_button.setStyleSheet(
-            "QPushButton { font-size: 13pt; font-weight: bold; color: #2E6B3A;"
-            " padding: 0 5px; border: 1px solid #000000; border-radius: 2px;"
-            " background: transparent; }"
+            "font-size: 13pt; font-weight: bold; color: #2E6B3A;"
+            " padding: 0px 5px; border: 1px solid #000000; border-radius: 2px;"
+            " background: transparent;"
         )
-        self.basic_toggle_button.clicked.connect(self._toggle_recent_stock_row)
+        self.basic_toggle_button.installEventFilter(self)
         self.compact_stock_display = IndicatorFollowSignalValidationStockDisplay()
         self.compact_header_arrow = self.basic_toggle_button
         self.compact_stock_label = self.compact_stock_display.stock_label
@@ -741,7 +742,7 @@ class IndicatorFollowSignalValidationWindow(
         self.stock_selection_button.setCursor(Qt.PointingHandCursor)
         self.stock_selection_button.setStyleSheet(
             "QPushButton#signalValidationStockSelectionButton {"
-            "font-size: 9pt; padding: 0 3px; text-align: center;"
+            "font-size: 9pt; padding: 0px; text-align: center;"
             "border: 1px solid #7A8794; border-radius: 3px;"
             "background: #F4F6F8; color: #1F2933;"
             "}"
@@ -851,39 +852,46 @@ class IndicatorFollowSignalValidationWindow(
 
     def _normalize_v2_header_internal_geometry(self) -> None:
         separator_style = (
-            "font-size: 13pt; font-weight: bold; color: #000000; padding: 0px;"
+            "font-size: 13pt; font-weight: bold; color: #000000; padding: 0px 1px;"
         )
         header_contracts = (
-            (
-                "basic",
-                self.basic_header_widget,
-                self.basic_toggle_button,
-                "QPushButton",
-                "#2E6B3A",
-            ),
-            ("buy", self.buy_header_widget, self.buy_title, "QLabel", "#1565C0"),
-            ("sell", self.sell_header_widget, self.sell_title, "QLabel", "#C62828"),
+            ("basic", self.basic_header_widget, self.basic_toggle_button, "기본설정"),
+            ("buy", self.buy_header_widget, self.buy_title, "매수설정"),
+            ("sell", self.sell_header_widget, self.sell_title, "매도설정"),
         )
-        for name, header_widget, title_widget, selector, color in header_contracts:
+        common_title_width = 132
+        for _name, _header_widget, title_widget, title_text in header_contracts:
+            original_text = title_widget.text()
+            for arrow in ("▶", "▼"):
+                title_widget.setText(f"{arrow} {title_text}")
+                common_title_width = max(
+                    common_title_width,
+                    title_widget.sizeHint().width(),
+                )
+            title_widget.setText(original_text)
+        for name, header_widget, title_widget, _title_text in header_contracts:
             header_layout = header_widget.layout()
             header_layout.setAlignment(Qt.AlignVCenter)
-            title_widget.setFixedSize(132, 30)
-            title_widget.setStyleSheet(
-                f"{selector} {{"
-                "font-family: 'Malgun Gothic'; font-size: 12pt; font-weight: bold;"
-                f"color: {color}; padding: 0px; text-align: center;"
-                "border: 1px solid #000000; border-radius: 2px;"
-                "background: transparent;"
-                "}"
-            )
-            if isinstance(title_widget, QLabel):
-                title_widget.setAlignment(Qt.AlignCenter)
+            title_widget.setFixedWidth(common_title_width)
+            title_widget.setFixedHeight(30)
+            title_widget.setAlignment(Qt.AlignCenter)
             separator = header_layout.itemAt(1).widget()
             separator.setText("|")
             separator.setFixedSize(12, 30)
             separator.setAlignment(Qt.AlignCenter)
             separator.setStyleSheet(separator_style)
             setattr(self, f"{name}_header_separator", separator)
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is getattr(self, "basic_toggle_button", None)
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.LeftButton
+        ):
+            self._toggle_recent_stock_row()
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
 
     @staticmethod
     def _detail_view() -> QPlainTextEdit:
@@ -903,7 +911,6 @@ class IndicatorFollowSignalValidationWindow(
     def _show_with_initial_control_section_state(self) -> None:
         self.showNormal()
         self._apply_control_section_mode("summary", force=True)
-        QTimer.singleShot(0, self._center_on_initial_screen)
 
     def _defer_fit_dialog_height_to_control_mode(self, mode=None) -> None:
         QTimer.singleShot(0, self._fit_signal_validation_window)
@@ -931,7 +938,8 @@ class IndicatorFollowSignalValidationWindow(
             desired_height = min(desired_height, max(1, available.height() - frame_extra_height))
         self.resize(int(desired_width), int(desired_height))
         self._initial_natural_fit_pending = False
-        self._center_on_initial_screen()
+        if initial_fit:
+            self._center_on_initial_screen()
 
     def _natural_signal_validation_window_width(self, contents_hint: QSize) -> int:
         root_layout = self.layout()
@@ -1142,18 +1150,30 @@ class IndicatorFollowSignalValidationWindow(
             self.basic_box,
             self.basic_toggle_button.rect().center(),
         ).x()
-        button_left_x = self.stock_selection_button.mapTo(
+        margins = panel_layout.contentsMargins()
+        required_button_width = max(
+            self.stock_selection_button.sizeHint().width(),
+            self.stock_selection_button.minimumSizeHint().width(),
+        )
+        self.stock_selection_button.setFixedWidth(required_button_width)
+        panel_left_x = self.recent_stock_panel.mapTo(
             self.basic_box,
             QPoint(0, 0),
         ).x()
-        selection_width = header_center_x - button_left_x + 1
-        if selection_width <= 0:
-            return
-        if self.stock_selection_button.width() != selection_width:
-            self.stock_selection_button.setFixedWidth(selection_width)
+        button_left_margin = max(
+            0,
+            header_center_x - required_button_width + 1 - panel_left_x,
+        )
+        if margins.left() != button_left_margin:
+            panel_layout.setContentsMargins(
+                button_left_margin,
+                margins.top(),
+                margins.right(),
+                margins.bottom(),
+            )
             panel_layout.invalidate()
             panel_layout.activate()
-        margins = panel_layout.contentsMargins()
+            margins = panel_layout.contentsMargins()
         available_width = max(
             0,
             self.recent_stock_panel.contentsRect().width()

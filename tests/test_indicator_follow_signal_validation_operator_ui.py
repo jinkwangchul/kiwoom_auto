@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, QRect, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QPoint, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -251,10 +251,17 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         for forbidden_text in ("중복신호처리", "오류발생"):
             self.assertNotIn(forbidden_text, all_labels)
         self.assertEqual(
-            1,
+            0,
             sum(
                 button.text().endswith("기본설정")
                 for button in window.findChildren(dialog_module.QPushButton)
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                label.text().endswith("기본설정")
+                for label in window.findChildren(QLabel)
             ),
         )
         self.assertEqual([], window.control_tab.findChildren(QScrollArea))
@@ -344,6 +351,34 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(user_width, window.width())
 
+    def test_initial_center_runs_once_and_section_toggles_preserve_window_position(self):
+        window = self._window()
+        window._available_signal_validation_geometry = lambda: QRect(0, 0, 2400, 1400)
+        center_calls = []
+        window._center_on_initial_screen = lambda: center_calls.append(window.pos())
+        window._initial_natural_fit_pending = True
+        window._fit_signal_validation_window()
+        window._fit_signal_validation_window()
+        self.assertEqual(1, len(center_calls))
+
+        window.show()
+        self.app.processEvents()
+        window.move(QPoint(173, 211))
+        self.app.processEvents()
+
+        for toggle in (
+            window._toggle_recent_stock_row,
+            window._toggle_recent_stock_row,
+            lambda: window._toggle_control_section_mode("buy"),
+            lambda: window._toggle_control_section_mode("buy"),
+            lambda: window._toggle_control_section_mode("sell"),
+            lambda: window._toggle_control_section_mode("sell"),
+        ):
+            before_position = window.pos()
+            toggle()
+            self.app.processEvents()
+            self.assertEqual(before_position, window.pos())
+
     def test_header_internal_alignment_separators_and_stock_button_are_normalized(self):
         window = self._window()
         window.show()
@@ -364,9 +399,18 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             window.buy_header_separator,
             window.sell_header_separator,
         )
+        self.assertIsInstance(window.basic_toggle_button, QLabel)
+        self.assertNotIsInstance(window.basic_toggle_button, dialog_module.QPushButton)
+        self.assertEqual([132] * 3, [item.minimumWidth() for item in titles])
+        self.assertEqual([30] * 3, [item.height() for item in titles])
+        self.assertEqual(1, len({item.width() for item in titles}))
         self.assertEqual(
-            [(132, 30)] * 3,
-            [(item.width(), item.height()) for item in titles],
+            [
+                "font-size: 13pt; font-weight: bold; color: #2E6B3A; padding: 0px 5px; border: 1px solid #000000; border-radius: 2px; background: transparent;",
+                "font-size: 13pt; font-weight: bold; color: #1565C0; padding: 0px 5px; border: 1px solid #000000; border-radius: 2px; background: transparent;",
+                "font-size: 13pt; font-weight: bold; color: #C62828; padding: 0px 5px; border: 1px solid #000000; border-radius: 2px; background: transparent;",
+            ],
+            [item.styleSheet() for item in titles],
         )
         self.assertEqual(
             ["▶ 기본설정", "▶ 매수설정", "▶ 매도설정"],
@@ -441,11 +485,23 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             ["▼ 기본설정", "▼ 매수설정", "▼ 매도설정"],
             [item.text() for item in titles],
         )
+        self.assertEqual(1, len({item.width() for item in titles}))
         for title in titles:
             self.assertLessEqual(
                 QFontMetrics(title.font()).horizontalAdvance(title.text()),
                 title.contentsRect().width(),
             )
+        self.assertEqual("종목선택", window.stock_selection_button.text())
+        self.assertGreaterEqual(
+            window.stock_selection_button.width(),
+            window.stock_selection_button.sizeHint().width(),
+        )
+        self.assertLessEqual(
+            QFontMetrics(window.stock_selection_button.font()).horizontalAdvance(
+                window.stock_selection_button.text()
+            ),
+            window.stock_selection_button.contentsRect().width(),
+        )
         select_right_x = window.stock_selection_button.mapTo(
             window.basic_box,
             window.stock_selection_button.rect().topRight(),
