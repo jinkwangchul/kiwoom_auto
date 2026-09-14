@@ -841,11 +841,18 @@ class IndicatorFollowSignalValidationWindow(
             box.setMinimumHeight(collapsed_height)
             box.setMaximumHeight(collapsed_height)
             box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        for box in (self.buy_box, self.sell_box):
+        for box, inherited_margin in (
+            (self.buy_box, "4px"),
+            (self.sell_box, "8px"),
+        ):
             box.setStyleSheet(
-                box.styleSheet()
-                + f"\nQGroupBox#{box.objectName()} {{ margin-top: 0px; }}"
+                box.styleSheet().replace(
+                    f"margin-top: {inherited_margin};",
+                    "margin-top: 0px;",
+                )
             )
+        for box, _header_widget in sections:
+            box.setContentsMargins(1, 1, 1, 1)
         self._v2_collapsed_section_height = collapsed_height
         self._buy_collapsed_height = collapsed_height
         self._sell_collapsed_height = collapsed_height

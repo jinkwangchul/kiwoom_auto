@@ -459,7 +459,21 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ]
         self.assertLessEqual(max(following_start_xs) - min(following_start_xs), 1)
         header_center_ys = [header.rect().center().y() for header in headers]
-        for header in headers:
+        boxes = (window.basic_box, window.buy_box, window.sell_box)
+        self.assertEqual(
+            [(1, 1, 1, 1)] * 3,
+            [
+                (
+                    box.contentsMargins().left(),
+                    box.contentsMargins().top(),
+                    box.contentsMargins().right(),
+                    box.contentsMargins().bottom(),
+                )
+                for box in boxes
+            ],
+        )
+        box_header_center_deltas = []
+        for box, header in zip(boxes, headers):
             expected_center_y = header.rect().center().y()
             header_widgets = [
                 header.layout().itemAt(index).widget()
@@ -469,6 +483,21 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             for widget in header_widgets:
                 actual_center_y = widget.mapTo(header, widget.rect().center()).y()
                 self.assertLessEqual(abs(actual_center_y - expected_center_y), 1)
+            mapped_header_center_y = header.mapTo(
+                box,
+                header.rect().center(),
+            ).y()
+            box_header_center_deltas.append(
+                mapped_header_center_y - box.rect().center().y()
+            )
+        self.assertLessEqual(
+            max(box_header_center_deltas) - min(box_header_center_deltas),
+            1,
+        )
+        self.assertTrue(
+            all(abs(delta) <= 1 for delta in box_header_center_deltas),
+            box_header_center_deltas,
+        )
         compact_stock_center_y = window.compact_stock_label.mapTo(
             window.basic_header_widget,
             window.compact_stock_label.rect().center(),
