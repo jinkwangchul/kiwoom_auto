@@ -1442,10 +1442,21 @@ def _evaluate_profit_rate_sell(
     return passed, "profit_rate_sell", [("PASS " if passed else "FAIL ") + detail]
 
 
+def build_indicator_follow_base_series(
+    candles: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+) -> dict[str, list[float | None]]:
+    """Build context-independent indicator series for one candle prefix."""
+    cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
+    return build_indicator_series(candles, cfg)
+
+
 def evaluate_indicator_follow_routine(
     candles: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
+    *,
+    _base_series_map: dict[str, list[float | None]] | None = None,
 ) -> RoutineSignal:
     """MACD 루틴을 평가한다.
 
@@ -1468,7 +1479,15 @@ def evaluate_indicator_follow_routine(
     if len(candles) < 3:
         return RoutineSignal(None, "봉데이터 부족", [], [], -1, 0)
 
-    series_map = build_indicator_series(candles, cfg)
+    if _base_series_map is None:
+        series_map = build_indicator_follow_base_series(candles, cfg)
+    else:
+        if not isinstance(_base_series_map, dict) or any(
+            not isinstance(key, str) or not isinstance(values, list)
+            for key, values in _base_series_map.items()
+        ):
+            raise TypeError("_base_series_map must be an indicator series mapping")
+        series_map = dict(_base_series_map)
     _enrich_price_compare_series(series_map, context)
 
     buy_cfg = _section(cfg, "buy")

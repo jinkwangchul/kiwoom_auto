@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
 from engines.signal_result import RoutineSignal
+from routines.지표추종매매 import routine_macd_engine
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
 )
@@ -545,6 +548,211 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             )
 
         self.assertEqual(canonical(reference.snapshot), canonical(optimized.snapshot))
+
+    def test_same_prefix_base_series_reuse_is_byte_equivalent_to_reference(self) -> None:
+        rules = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "routines"
+                / "지표추종매매"
+                / "rules.json"
+            ).read_text(encoding="utf-8")
+        )
+        settings = ValidationSettingsSnapshot(rules)
+        request = ValidationRequest(self.stock, settings, 5)
+
+        def session():
+            return ValidationSession(
+                request,
+                operation_active_reader=Mock(return_value=False),
+            )
+
+        start = datetime(2026, 9, 13, 9, 0)
+        closes = tuple(100 + ((index % 17) - 8) * 0.75 for index in range(80))
+        historical = ValidationHistoricalSnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            requested_count=len(closes),
+            request_id="SAME-PREFIX-RICH-RULES",
+            rows=[
+                {
+                    "체결시간": (start + timedelta(minutes=5 * index)).strftime(
+                        "%Y%m%d%H%M%S"
+                    ),
+                    "시가": str(close - 0.2),
+                    "고가": str(close + 0.8),
+                    "저가": str(close - 0.9),
+                    "현재가": str(close),
+                    "거래량": str(1000 + index),
+                }
+                for index, close in reversed(list(enumerate(closes)))
+            ],
+        )
+        optimized = ValidationHistoricalReplay(session()).evaluate_with_context(
+            historical,
+            context_provider=build_validation_average_price_context,
+        )
+
+        def reference_evaluator(candles, config, context):
+            return routine_macd_engine.evaluate_indicator_follow_routine(
+                candles,
+                config,
+                context,
+            )
+
+        reference = ValidationHistoricalReplay(
+            session(),
+            evaluator=reference_evaluator,
+        ).evaluate_with_context(
+            historical,
+            context_provider=build_validation_average_price_context,
+        )
+
+        self.assertTrue(optimized.ok, optimized)
+        self.assertTrue(reference.ok, reference)
+        self.assertEqual(
+            json.dumps(reference.snapshot.to_candles(), sort_keys=True),
+            json.dumps(optimized.snapshot.to_candles(), sort_keys=True),
+        )
+        self.assertEqual(
+            json.dumps(
+                [entry.to_dict() for entry in reference.snapshot.to_entries()],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            json.dumps(
+                [entry.to_dict() for entry in optimized.snapshot.to_entries()],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        for field in (
+            "stock",
+            "timeframe_minutes",
+            "settings_hash",
+            "historical_request_id",
+            "candle_count",
+            "evaluated_start_index",
+            "evaluated_end_index",
+            "dropped_raw_rows_count",
+        ):
+            self.assertEqual(
+                getattr(reference.snapshot, field),
+                getattr(optimized.snapshot, field),
+            )
+
+    def test_default_replay_builds_base_series_once_per_eligible_prefix(self) -> None:
+        historical = self._historical(closes=tuple(range(10, 20)))
+        original = routine_macd_engine.build_indicator_series
+        calls = []
+
+        def counting_builder(candles, config):
+            calls.append(len(candles))
+            return original(candles, config)
+
+        with unittest.mock.patch.object(
+            routine_macd_engine,
+            "build_indicator_series",
+            side_effect=counting_builder,
+        ):
+            optimized = ValidationHistoricalReplay(self._session()).evaluate(historical)
+
+        self.assertTrue(optimized.ok, optimized)
+        self.assertEqual(list(range(3, 11)), calls)
+
+    def test_shared_base_series_is_not_mutated_by_side_context_enrichment(self) -> None:
+        candles = project_validation_candles(self._historical())[0]
+        base_series = routine_macd_engine.build_indicator_follow_base_series(
+            candles,
+            self.rules,
+        )
+        original = deepcopy(base_series)
+
+        for side, average_price in (("SELL", 11.0), ("BUY", 12.0)):
+            routine_macd_engine.evaluate_indicator_follow_routine(
+                deepcopy(candles),
+                deepcopy(self.rules),
+                {
+                    "_indicator_follow_evaluate_side": side,
+                    "average_price": average_price,
+                },
+                _base_series_map=base_series,
+            )
+            self.assertEqual(original, base_series)
+            self.assertNotIn("AVG_PRICE", base_series)
+            self.assertNotIn("ORDER_PRICE", base_series)
+
+    def test_future_candles_do_not_change_index_99_series_signal_or_trace(self) -> None:
+        prefix = tuple(100 + ((index % 23) - 11) * 0.8 for index in range(100))
+
+        def historical(closes):
+            start = datetime(2026, 9, 13, 9, 0)
+            rows = [
+                {
+                    "체결시간": (start + timedelta(minutes=index)).strftime(
+                        "%Y%m%d%H%M%S"
+                    ),
+                    "현재가": str(close),
+                    "거래량": str(100 + index),
+                }
+                for index, close in reversed(list(enumerate(closes)))
+            ]
+            return self._historical(rows=rows)
+
+        historical_a = historical(prefix)
+        historical_b = historical(
+            prefix + (10000.0, 1.0, 20000.0, 2.0, 30000.0)
+        )
+
+        candles_a = project_validation_candles(historical_a)[0]
+        candles_b = project_validation_candles(historical_b)[0]
+        series_a = routine_macd_engine.build_indicator_follow_base_series(
+            candles_a[:100],
+            self.rules,
+        )
+        series_b = routine_macd_engine.build_indicator_follow_base_series(
+            candles_b[:100],
+            self.rules,
+        )
+        for key in (
+            "MACD",
+            "OSC",
+            "RSI",
+            "MA5",
+            "MA20",
+            "MA60",
+            "BOLLINGER_LOWER",
+            "BOLLINGER_MIDDLE",
+            "BOLLINGER_UPPER",
+            "PRICE_BOX_LOWER",
+            "PRICE_BOX_MIDDLE",
+            "PRICE_BOX_UPPER",
+        ):
+            self.assertEqual(series_a[key], series_b[key], key)
+
+        result_a = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            historical_a,
+            end_index=99,
+            context_provider=build_validation_average_price_context,
+        )
+        result_b = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            historical_b,
+            end_index=99,
+            context_provider=build_validation_average_price_context,
+        )
+        self.assertTrue(result_a.ok, result_a)
+        self.assertTrue(result_b.ok, result_b)
+        entries_a = [
+            entry.to_dict()
+            for entry in result_a.snapshot.to_entries()
+            if entry.evaluation_index == 99
+        ]
+        entries_b = [
+            entry.to_dict()
+            for entry in result_b.snapshot.to_entries()
+            if entry.evaluation_index == 99
+        ]
+        self.assertEqual(entries_a, entries_b)
 
     def test_snapshot_metadata_preserves_validation_identity(self) -> None:
         result = ValidationHistoricalReplay(self._session()).evaluate(

@@ -11,7 +11,10 @@ from typing import Any, Callable
 
 from engines.signal_result import RoutineSignal
 
-from .routine_macd_engine import evaluate_indicator_follow_routine
+from .routine_macd_engine import (
+    build_indicator_follow_base_series,
+    evaluate_indicator_follow_routine,
+)
 from .routine_validation_contract import ValidationStockRef
 from .routine_validation_historical import ValidationHistoricalSnapshot
 from .routine_validation_session import ValidationSession
@@ -357,9 +360,18 @@ class ValidationHistoricalReplay:
 
         rules_json = _canonical_json(request.settings_snapshot.to_dict())
         entries: list[ValidationReplayEntry] = []
+        reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
         try:
             for evaluation_index in range(start_index, final_index + 1):
                 prefix_json = _canonical_json(candles[: evaluation_index + 1])
+                base_series_map = (
+                    build_indicator_follow_base_series(
+                        _fresh_json(prefix_json),
+                        _fresh_json(rules_json),
+                    )
+                    if reuse_default_base_series and evaluation_index >= 2
+                    else None
+                )
                 for side in ("SELL", "BUY"):
                     observer = ValidationTraceObserver()
                     context = {
@@ -378,11 +390,19 @@ class ValidationHistoricalReplay:
                         supplied.pop("decision_trace_observer", None)
                         supplied.pop("_indicator_follow_evaluate_side", None)
                         context.update(_fresh_json(_canonical_json(supplied)))
-                    signal = self._evaluator(
-                        _fresh_json(prefix_json),
-                        _fresh_json(rules_json),
-                        context,
-                    )
+                    if base_series_map is None:
+                        signal = self._evaluator(
+                            _fresh_json(prefix_json),
+                            _fresh_json(rules_json),
+                            context,
+                        )
+                    else:
+                        signal = evaluate_indicator_follow_routine(
+                            _fresh_json(prefix_json),
+                            _fresh_json(rules_json),
+                            context,
+                            _base_series_map=base_series_map,
+                        )
                     entries.append(
                         self._entry_from_signal(
                             side,
