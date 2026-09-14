@@ -156,6 +156,108 @@ def _main_static_cache(definitions, instances, stocks) -> dict[str, object]:
     }
 
 
+_DELETE_TEST_INSTANCE_ID = "11111111-1111-4111-8111-111111111111"
+_DELETE_TEST_OTHER_INSTANCE_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def _write_delete_test_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _create_main_routine_delete_fixture(
+    root: Path,
+    *,
+    assigned_stock: bool = False,
+    include_other_routine: bool = False,
+) -> tuple[Path, Path | None]:
+    package_dir = root / "routines" / "delete_test"
+    _write_delete_test_json(
+        package_dir / "routine.json",
+        {
+            "name": "삭제검증루틴",
+            "definition_id": "delete_test",
+            "enabled": True,
+        },
+    )
+    (package_dir / "routine.py").write_text(
+        "def evaluate(*args, **kwargs):\n    return None\n",
+        encoding="utf-8",
+    )
+
+    instance_dir = root / "routine_instances" / _DELETE_TEST_INSTANCE_ID
+    _write_delete_test_json(
+        instance_dir / "instance.json",
+        {
+            "schema_version": "1.0",
+            "instance_id": _DELETE_TEST_INSTANCE_ID,
+            "definition_id": "delete_test",
+            "display_name": "삭제대상루틴",
+            "enabled": True,
+            "buy_limit_enabled": False,
+            "buy_limit_amount": None,
+            "rules_file": "rules.json",
+        },
+    )
+    _write_delete_test_json(instance_dir / "rules.json", {"marker": "target"})
+
+    other_instance_dir: Path | None = None
+    if include_other_routine:
+        other_package_dir = root / "routines" / "other_test"
+        _write_delete_test_json(
+            other_package_dir / "routine.json",
+            {
+                "name": "독립루틴",
+                "definition_id": "other_test",
+                "enabled": True,
+            },
+        )
+        (other_package_dir / "routine.py").write_text(
+            "def evaluate(*args, **kwargs):\n    return None\n",
+            encoding="utf-8",
+        )
+        other_instance_dir = root / "routine_instances" / _DELETE_TEST_OTHER_INSTANCE_ID
+        _write_delete_test_json(
+            other_instance_dir / "instance.json",
+            {
+                "schema_version": "1.0",
+                "instance_id": _DELETE_TEST_OTHER_INSTANCE_ID,
+                "definition_id": "other_test",
+                "display_name": "독립루틴인스턴스",
+                "enabled": True,
+                "buy_limit_enabled": False,
+                "buy_limit_amount": None,
+                "rules_file": "rules.json",
+            },
+        )
+        _write_delete_test_json(other_instance_dir / "rules.json", {"marker": "other"})
+
+    if assigned_stock:
+        _write_delete_test_json(
+            root / "stocks" / "005930_삼성전자" / "config.json",
+            {
+                "code": "005930",
+                "name": "삼성전자",
+                "assigned_routine_instance_id": _DELETE_TEST_INSTANCE_ID,
+            },
+        )
+    return instance_dir, other_instance_dir
+
+
+def _file_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _main_routine_delete_window() -> gui_windows.MainWindow:
+    window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+    QMainWindow.__init__(window)
+    return window
+
+
 @unittest.skipIf(
     getattr(QApplication, "__name__", "") == "_QtImportStub",
     "requires real PyQt widgets; the legacy GUI test module installed global stubs",
@@ -1233,23 +1335,107 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         window.refresh_all.assert_not_called()
 
     def test_main_routine_delete_no_confirmation_does_not_delete(self) -> None:
-        window = SimpleNamespace(refresh_all=MagicMock())
-        with (
-            patch(
-                "routine_instance_deletion_service.delete_routine_instance_completely"
-            ) as delete_service,
-            patch.object(
-                setting_window.QMessageBox,
-                "question",
-                return_value=setting_window.QMessageBox.No,
-            ),
-        ):
-            gui_windows.MainWindow.delete_routine_instance_from_main_table(
-                window, "instance-a", "오전루틴"
-            )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            instance_dir, _other_instance_dir = _create_main_routine_delete_fixture(root)
+            _write_delete_test_json(root / "runtime" / "order_queue.json", {"orders": [1]})
+            _write_delete_test_json(root / "runtime" / "positions.json", {"positions": [1]})
+            before = _file_snapshot(root)
+            window = _main_routine_delete_window()
+            window.refresh_all = MagicMock()
+            with (
+                patch.object(setting_window, "PROJECT_ROOT", root),
+                patch(
+                    "routine_instance_deletion_service.delete_routine_instance_completely",
+                ) as delete_service,
+                patch.object(
+                    setting_window.QMessageBox,
+                    "question",
+                    return_value=setting_window.QMessageBox.No,
+                ),
+            ):
+                gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                    window,
+                    _DELETE_TEST_INSTANCE_ID,
+                    "삭제대상루틴",
+                )
 
-        delete_service.assert_not_called()
-        window.refresh_all.assert_not_called()
+            self.assertTrue(instance_dir.is_dir())
+            self.assertEqual(before, _file_snapshot(root))
+            delete_service.assert_not_called()
+            window.refresh_all.assert_not_called()
+            window.deleteLater()
+
+    def test_main_routine_delete_success_runs_real_service_and_preserves_other_routine(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            instance_dir, other_instance_dir = _create_main_routine_delete_fixture(
+                root,
+                include_other_routine=True,
+            )
+            self.assertIsNotNone(other_instance_dir)
+            other_before = _file_snapshot(other_instance_dir)
+            window = _main_routine_delete_window()
+            with (
+                patch.object(setting_window, "PROJECT_ROOT", root),
+                patch.object(
+                    setting_window.QMessageBox,
+                    "question",
+                    return_value=setting_window.QMessageBox.Yes,
+                ),
+                patch.object(
+                    setting_window,
+                    "auto_trade_running_registered_operation_targets",
+                    return_value=[],
+                ),
+                patch.object(setting_window, "append_production_event") as append_event,
+                patch.object(setting_window, "refresh_auto_trade_views") as refresh_views,
+            ):
+                gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                    window,
+                    _DELETE_TEST_INSTANCE_ID,
+                    "삭제대상루틴",
+                )
+
+            self.assertFalse(instance_dir.exists())
+            self.assertTrue(other_instance_dir.is_dir())
+            self.assertEqual(other_before, _file_snapshot(other_instance_dir))
+            self.assertTrue((root / "routines" / "delete_test").is_dir())
+            self.assertTrue((root / "routines" / "other_test").is_dir())
+            append_event.assert_called_once()
+            refresh_views.assert_called_once_with(window)
+            window.deleteLater()
+
+    def test_main_routine_delete_assigned_stock_is_protected_by_real_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            instance_dir, _other_instance_dir = _create_main_routine_delete_fixture(
+                root,
+                assigned_stock=True,
+            )
+            before = _file_snapshot(root)
+            window = _main_routine_delete_window()
+            with (
+                patch.object(setting_window, "PROJECT_ROOT", root),
+                patch.object(setting_window, "show_toast") as toast,
+                patch.object(setting_window.QMessageBox, "question") as question,
+            ):
+                gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                    window,
+                    _DELETE_TEST_INSTANCE_ID,
+                    "삭제대상루틴",
+                )
+
+            self.assertTrue(instance_dir.is_dir())
+            self.assertEqual(before, _file_snapshot(root))
+            toast.assert_called_once_with(
+                window,
+                "해당루틴은 삭제 불가합니다.\n등록된 종목을 모두 해제하세요.",
+            )
+            question.assert_not_called()
+            window.deleteLater()
 
     def test_main_routine_delete_success_uses_repository_and_refreshes(self) -> None:
         window = SimpleNamespace(refresh_all=MagicMock())
