@@ -296,7 +296,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             entries=entries,
         )
 
-    def test_entry_button_is_separate_and_preserves_existing_button(self):
+    def test_v2_entry_button_remains_after_legacy_entry_retirement(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
@@ -313,9 +313,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 with patch.object(dialog_module.QTimer, "singleShot"):
                     dialog = dialog_module.IndicatorFollowRoutineSettingsDialog(**kwargs)
                 self.widgets.append(dialog)
-                old_payloads = []
                 new_payloads = []
-                dialog.validation_chart_requested.connect(old_payloads.append)
                 dialog.signal_validation_requested.connect(new_payloads.append)
                 dialog.buy_signal_expr_line.setText("A or D")
                 for group_name in "abc":
@@ -328,9 +326,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                         f"sell_signal_condition_{group_name}_gap_right_combo",
                     ).setCurrentText("현재가")
                 dialog.signal_validation_button.click()
-                self.assertEqual("검증차트", dialog.validation_chart_button.text())
+                self.assertFalse(hasattr(dialog, "validation_chart_button"))
+                self.assertFalse(hasattr(dialog, "validation_chart_requested"))
                 self.assertEqual("검증차트2", dialog.signal_validation_button.text())
-                self.assertEqual([], old_payloads)
                 self.assertEqual(1, len(new_payloads))
                 self.assertIsInstance(new_payloads[0], IndicatorFollowSignalValidationSeed)
                 self.assertEqual(
@@ -340,6 +338,35 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 signal_bar = new_payloads[0].settings_snapshot.to_dict()["bar"]
                 self.assertEqual(self.rules["bar"]["buy_delay_bar"], signal_bar["buy_delay_bar"])
                 self.assertEqual(self.rules["bar"]["sell_delay_bar"], signal_bar["sell_delay_bar"])
+
+    def test_routine_settings_shell_owns_optional_v2_flow_binding(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(self.rules, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            owner = QDialog()
+            owner.kiwoom_api = object()
+            self.widgets.append(owner)
+            with (
+                patch.object(dialog_module.QTimer, "singleShot"),
+                patch.object(
+                    flow_module,
+                    "bind_indicator_follow_signal_validation_flow",
+                    return_value=object(),
+                ) as bind,
+            ):
+                dialog = dialog_module.IndicatorFollowRoutineSettingsDialog(
+                    rules_path=rules_path,
+                    routine_path=self.routine_dir,
+                    routine_name="지표추종매매",
+                    parent=owner,
+                    definition_id="indicator_follow",
+                    settings_mode="registration",
+                )
+            self.widgets.append(dialog)
+        bind.assert_called_once_with(owner, dialog)
 
     def test_seed_and_signal_only_projection_are_detached_and_strict(self):
         source = {
@@ -1268,8 +1295,22 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertNotIn(forbidden, source)
         for caller_name in ("gui_windows.py", "gui_auto_trade_setting_window.py"):
             caller = (self.project_root / caller_name).read_text(encoding="utf-8")
-            self.assertIn("bind_indicator_follow_validation_flow", caller)
-            self.assertIn("bind_indicator_follow_signal_validation_flow", caller)
+            self.assertNotIn("bind_indicator_follow_validation_flow", caller)
+            self.assertNotIn("bind_indicator_follow_signal_validation_flow", caller)
+        settings_source = (
+            self.project_root / "gui_indicator_follow_routine_settings_dialog.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("_bind_optional_signal_validation", settings_source)
+        chart_source = (
+            self.project_root / "gui_indicator_follow_signal_validation_window.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("gui_indicator_follow_validation_chart_window", chart_source)
+        self.assertFalse(
+            (self.project_root / "gui_indicator_follow_validation_flow.py").exists()
+        )
+        self.assertFalse(
+            (self.project_root / "gui_indicator_follow_validation_chart_window.py").exists()
+        )
 
 
 if __name__ == "__main__":

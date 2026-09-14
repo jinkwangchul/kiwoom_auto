@@ -77,11 +77,12 @@ class IndicatorFollowSettingsSectionDefaultsTest(unittest.TestCase):
                     self.assertEqual(save_text, dialog.save_button.text())
                     self.assertGreater(dialog.reload_button.receivers(dialog.reload_button.clicked), 0)
                     self.assertGreater(
-                        dialog.validation_chart_button.receivers(
-                            dialog.validation_chart_button.clicked
+                        dialog.signal_validation_button.receivers(
+                            dialog.signal_validation_button.clicked
                         ),
                         0,
                     )
+                    self.assertFalse(hasattr(dialog, "validation_chart_button"))
                     self.assertGreater(dialog.save_button.receivers(dialog.save_button.clicked), 0)
                     self.assertGreater(dialog.close_button.receivers(dialog.close_button.clicked), 0)
                 finally:

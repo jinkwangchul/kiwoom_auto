@@ -73,6 +73,8 @@ from gui_indicator_follow_sell_controls import (
     SELL_PRICE_UNRESOLVED_PROPERTY,
     clear_sell_price_combo_unresolved,
     mark_sell_price_combo_unresolved,
+    require_resolved_sell_price_selections,
+    sell_price_selection_issues,
 )
 from gui_routine_registry import get_routine_records, normalize_routine_name
 from gui_toast import show_toast
@@ -89,17 +91,6 @@ from routine_instance_registry import (
     load_routine_definitions,
     routine_instance_by_id,
 )
-from routines.지표추종매매.routine_validation_contract import (
-    ValidationSettingsSnapshot,
-)
-from indicator_follow_signal_validation_projection import (
-    IndicatorFollowSignalValidationSeed,
-    project_signal_validation_apply_ui_state,
-    require_resolved_sell_price_selections,
-    sell_price_selection_issues,
-)
-
-
 _SITUATION_RESPONSE_EXCLUSION_MESSAGE = (
     "미체결과 가격비교는 동시에 사용할 수 없습니다.\n"
     "둘 중 하나만 선택하세요."
@@ -557,7 +548,6 @@ class IndicatorFollowRoutineSettingsDialog(
     - 항목별 활성/비활성 상태와 진입 버튼 중심
     """
 
-    validation_chart_requested = pyqtSignal(object)
     signal_validation_requested = pyqtSignal(object)
 
     def __init__(
@@ -612,7 +602,33 @@ class IndicatorFollowRoutineSettingsDialog(
 
         self._build_ui()
         self.load_rules()
+        self._bind_optional_signal_validation()
         QTimer.singleShot(0, self._show_with_initial_control_section_state)
+
+    def _bind_optional_signal_validation(self):
+        if getattr(self, "_signal_validation_mode", False):
+            return None
+        owner = persistent_feature_owner(self)
+        if owner is None:
+            return None
+        try:
+            from gui_indicator_follow_signal_validation_flow import (
+                bind_indicator_follow_signal_validation_flow,
+            )
+        except ModuleNotFoundError as exc:
+            optional_modules = {
+                "gui_indicator_follow_signal_validation_flow",
+                "gui_indicator_follow_signal_validation_window",
+                "indicator_follow_signal_validation_projection",
+                "indicator_follow_signal_validation_presentation",
+                "indicator_follow_signal_validation_recent_stocks",
+            }
+            if exc.name not in optional_modules:
+                raise
+            self.signal_validation_button.setEnabled(False)
+            self.signal_validation_button.setToolTip("검증차트2를 사용할 수 없습니다.")
+            return None
+        return bind_indicator_follow_signal_validation_flow(owner, self)
 
     def _show_with_initial_control_section_state(self):
         self.showNormal()
@@ -688,7 +704,6 @@ class IndicatorFollowRoutineSettingsDialog(
 
         button_row = QHBoxLayout()
         self.reload_button = QPushButton("다시 불러오기")
-        self.validation_chart_button = QPushButton("검증차트")
         self.signal_validation_button = QPushButton("검증차트2")
         if self.settings_mode == "edit":
             self.save_button = QPushButton("변경")
@@ -701,9 +716,6 @@ class IndicatorFollowRoutineSettingsDialog(
         self.save_button.setEnabled(True)
 
         self.reload_button.clicked.connect(self.load_rules)
-        self.validation_chart_button.clicked.connect(
-            self._handle_validation_chart_clicked
-        )
         self.signal_validation_button.clicked.connect(
             self._handle_signal_validation_clicked
         )
@@ -715,7 +727,6 @@ class IndicatorFollowRoutineSettingsDialog(
 
         button_row.addWidget(self.reload_button)
         button_row.addStretch(1)
-        button_row.addWidget(self.validation_chart_button)
         button_row.addWidget(self.signal_validation_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
@@ -1307,6 +1318,10 @@ class IndicatorFollowRoutineSettingsDialog(
         *,
         allow_unresolved_sell_price=False,
     ):
+        from routines.지표추종매매.routine_validation_contract import (
+            ValidationSettingsSnapshot,
+        )
+
         rules = getattr(self, "rules", None)
         if not isinstance(rules, dict):
             rules = getattr(self, "rules_data", None)
@@ -1341,31 +1356,21 @@ class IndicatorFollowRoutineSettingsDialog(
             raise ValueError("validation preview rules must be a mapping")
         return ValidationSettingsSnapshot(preview_rules)
 
-    def build_validation_settings_snapshot_from_current_ui_state(self):
-        """Build a non-writing, execution-ready Validation snapshot."""
-        return self._build_validation_settings_snapshot_from_current_ui_state()
-
     def build_signal_validation_entry_snapshot_from_current_ui_state(self):
         """Build the detached V2 Entry snapshot without relaxing RUN validation."""
         return self._build_validation_settings_snapshot_from_current_ui_state(
             allow_unresolved_sell_price=True,
         )
 
-    def _handle_validation_chart_clicked(self):
-        try:
-            snapshot = self.build_validation_settings_snapshot_from_current_ui_state()
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "검증차트",
-                "현재 편집 설정으로 검증차트 데이터를 만들 수 없습니다.",
-            )
-            return None
-        self.validation_chart_requested.emit(snapshot)
-        return snapshot
-
     def _handle_signal_validation_clicked(self):
         try:
+            from indicator_follow_signal_validation_projection import (
+                IndicatorFollowSignalValidationSeed,
+            )
+            from routines.지표추종매매.routine_validation_contract import (
+                ValidationSettingsSnapshot,
+            )
+
             snapshot = self.build_signal_validation_entry_snapshot_from_current_ui_state()
             preview_rules = snapshot.to_dict()
             source_rules = getattr(self, "rules", None)
@@ -3143,6 +3148,10 @@ class IndicatorFollowRoutineSettingsDialog(
         """Apply only V2-visible signal controls in memory; never touch execution settings."""
         result = {"applied": [], "skipped": []}
         try:
+            from indicator_follow_signal_validation_projection import (
+                project_signal_validation_apply_ui_state,
+            )
+
             projected = project_signal_validation_apply_ui_state(state)
         except (TypeError, ValueError) as exc:
             result["skipped"].append({

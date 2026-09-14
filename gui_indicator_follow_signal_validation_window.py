@@ -42,20 +42,6 @@ from PyQt5.QtWidgets import (
 from gui_indicator_follow_routine_settings_dialog import (
     IndicatorFollowRoutineSettingsDialog,
 )
-from gui_indicator_follow_validation_chart_window import (
-    IndicatorFollowValidationChartCanvas,
-    _BACKGROUND,
-    _BUY,
-    _DOWN,
-    _FLAT,
-    _GRID,
-    _SELECTION,
-    _SELECTION_LINE,
-    _SELL,
-    _TEXT,
-    _UP,
-    _finite_number,
-)
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRunRequest,
@@ -76,6 +62,99 @@ from routines.지표추종매매.routine_validation_replay import (
     ValidationReplayEntry,
     ValidationReplaySnapshot,
 )
+
+
+_BACKGROUND = QColor("#111827")
+_GRID = QColor("#374151")
+_TEXT = QColor("#d1d5db")
+_UP = QColor("#ef4444")
+_DOWN = QColor("#3b82f6")
+_FLAT = QColor("#9ca3af")
+_BUY = QColor("#22c55e")
+_SELL = QColor("#f59e0b")
+_SELECTION = QColor(250, 204, 21, 45)
+_SELECTION_LINE = QColor("#fde047")
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
+    """V2-owned read-only candle projection and selection boundary."""
+
+    bar_selected = pyqtSignal(int)
+
+    _LEFT = 48
+    _RIGHT = 24
+    _TOP = 42
+    _BOTTOM = 48
+    _BAR_SLOT = 12
+    _MIN_WIDTH = 640
+
+    def __init__(self, candles, markers, parent=None) -> None:
+        super().__init__(parent)
+        self._candles = deepcopy(candles)
+        self._markers = deepcopy(markers)
+        self._selected_index: int | None = None
+        self.setMinimumWidth(self._content_width())
+
+    @property
+    def candle_count(self) -> int:
+        return len(self._candles)
+
+    @property
+    def selected_index(self) -> int | None:
+        return self._selected_index
+
+    def to_candles(self) -> list[dict[str, Any]]:
+        return deepcopy(self._candles)
+
+    def marker_records(self) -> list[dict[str, Any]]:
+        return deepcopy(self._markers)
+
+    def marker_count(self, side: str | None = None) -> int:
+        normalized = str(side or "").strip().upper()
+        if not normalized:
+            return len(self._markers)
+        return sum(marker.get("side") == normalized for marker in self._markers)
+
+    def set_selected_index(self, index: int | None) -> None:
+        if index is not None and (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(self._candles)
+        ):
+            return
+        self._selected_index = index
+        self.update()
+
+    def _content_width(self) -> int:
+        return max(
+            self._MIN_WIDTH,
+            self._LEFT + self._RIGHT + len(self._candles) * self._BAR_SLOT,
+        )
+
+    def _x_for_index(self, index: int) -> float:
+        return self._LEFT + (index + 0.5) * self._BAR_SLOT
+
+    def _nearest_candle_index(self, x: float) -> int | None:
+        if not self._candles:
+            return None
+        raw_index = round((x - self._LEFT - self._BAR_SLOT / 2) / self._BAR_SLOT)
+        return min(max(raw_index, 0), len(self._candles) - 1)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            index = self._nearest_candle_index(event.pos().x())
+            if index is not None:
+                self.set_selected_index(index)
+                self.bar_selected.emit(index)
+                return
+        super().mousePressEvent(event)
 
 
 def _display_time(value: Any) -> str:
@@ -444,7 +523,7 @@ def _validation_price_text(value: float) -> str:
 
 
 class IndicatorFollowSignalValidationChartCanvas(
-    IndicatorFollowValidationChartCanvas
+    _IndicatorFollowSignalValidationChartCanvasBase
 ):
     """V2 scroll canvas containing Candle, marker, grid, and real time labels."""
 

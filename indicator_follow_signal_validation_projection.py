@@ -11,6 +11,10 @@ from typing import Any, Mapping
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
 )
+from gui_indicator_follow_sell_controls import (
+    require_resolved_sell_price_selections,
+    sell_price_selection_issues,
+)
 
 
 _FORBIDDEN_PRICE_TARGETS = {
@@ -29,7 +33,6 @@ _DEPENDENCY_FIELDS = {
     "source",
     "price_basis",
 }
-_SELL_PRICE_VALUES = {"현재가", "평단가"}
 _SELL_PREVIEW_TARGETS = {
     "sell.signals.ui_preview_condition_a": "ui_condition_a",
     "sell.signals.ui_preview_condition_b": "ui_condition_b",
@@ -149,42 +152,6 @@ def _strip_dependent_conditions(value: Any) -> Any:
             for key, item in value.items()
         }
     return deepcopy(value)
-
-
-def sell_price_selection_issues(
-    ui_state: Mapping[str, Any],
-) -> tuple[str, ...]:
-    """Return unresolved SELL A/B/C price operands without normalizing them."""
-    if not isinstance(ui_state, Mapping):
-        raise TypeError("ui_state must be a mapping")
-    sell_ui = ui_state.get("sell_ui")
-    signal_conditions = (
-        sell_ui.get("signal_conditions") if isinstance(sell_ui, Mapping) else None
-    )
-    if not isinstance(signal_conditions, Mapping):
-        return ()
-    issues: list[str] = []
-    for group_name in ("condition_a", "condition_b", "condition_c"):
-        group = signal_conditions.get(group_name)
-        if not isinstance(group, Mapping):
-            continue
-        for field_name in ("gap_left_combo", "gap_right_combo"):
-            if field_name not in group:
-                continue
-            value = str(group.get(field_name) or "").strip()
-            if value not in _SELL_PRICE_VALUES:
-                issues.append(
-                    f"sell_ui.signal_conditions.{group_name}.{field_name}"
-                )
-    return tuple(issues)
-
-
-def require_resolved_sell_price_selections(ui_state: Mapping[str, Any]) -> None:
-    issues = sell_price_selection_issues(ui_state)
-    if issues:
-        raise ValueError(
-            "가격 기준 재선택 필요: " + ", ".join(issues)
-        )
 
 
 def build_validation_average_price_context(

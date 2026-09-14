@@ -158,8 +158,6 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                         "condition_a"
                     ]["gap_left_combo"],
                 )
-                with patch.object(dialog_module.QMessageBox, "warning"):
-                    self.assertIsNone(dialog._handle_validation_chart_clicked())
                 registration_result = dialog.build_registration_rules_from_current_ui_state()
                 self.assertFalse(registration_result["success"])
                 self.assertIn("재선택", " ".join(
