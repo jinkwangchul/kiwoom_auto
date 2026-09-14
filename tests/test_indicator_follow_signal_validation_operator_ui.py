@@ -26,9 +26,18 @@ from PyQt5.QtWidgets import (
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_flow as flow_module
+import gui_indicator_follow_signal_validation_window as validation_window_module
 from gui_indicator_follow_signal_validation_flow import IndicatorFollowSignalValidationFlow
-from gui_indicator_follow_signal_validation_window import IndicatorFollowSignalValidationWindow
-from indicator_follow_signal_validation_presentation import filter_rows_for_entry, _trace_status
+from gui_indicator_follow_signal_validation_window import (
+    IndicatorFollowSignalEvidenceLabel,
+    IndicatorFollowSignalValidationWindow,
+)
+from indicator_follow_signal_validation_presentation import (
+    _trace_status,
+    filter_rows_for_entry,
+    signal_evidence_lines_for_entry,
+    signal_evidence_tooltip,
+)
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationSeed,
@@ -869,7 +878,264 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertNotIn("TURN_", visible_text)
         self.assertNotIn("CROSS_", visible_text)
 
-    def test_candle_selection_updates_summary_and_filter_table_for_same_index(self):
+    def test_signal_evidence_keeps_all_surviving_or_paths_and_hides_not_obstacle(self):
+        identifier = lambda name: {"type": "identifier", "name": name}
+        binary = lambda operator, left, right: {
+            "type": "binary",
+            "operator": operator,
+            "left": left,
+            "right": right,
+        }
+        top_ast = binary(
+            "NOT",
+            binary("OR", binary("OR", identifier("A"), identifier("A")), identifier("B")),
+            identifier("C"),
+        )
+        a_ast = binary("AND", identifier("OCR_0"), identifier("GAP_0"))
+        b_ast = binary("OR", identifier("MACD_0"), identifier("RSI_0"))
+        signal_expression = {
+            "ast": top_ast,
+            "identifier_map": {
+                "A": "ui_condition_a",
+                "B": "ui_condition_b",
+                "C": "ui_condition_c",
+            },
+        }
+        rules = {
+            "buy": {
+                "filters": {
+                    "composite": {
+                        "expression": {
+                            "ast": binary(
+                                "NOT",
+                                binary("OR", identifier("A"), identifier("C")),
+                                identifier("D"),
+                            ),
+                        },
+                    },
+                    "ocr": {
+                        "conditions": [{"target": "OSC", "operator": "TURN_UP"}],
+                    },
+                    "moving_average": {
+                        "conditions": [{"target": "CLOSE", "operator": "CROSS_UP", "compare_target": "MA60"}],
+                    },
+                    "rsi": {
+                        "conditions": [{"target": "RSI", "operator": "<="}],
+                    },
+                },
+            },
+            "sell": {
+                "signals": {
+                    "ui_condition_a": {
+                        "signal_expression": signal_expression,
+                        "groups": [{
+                            "condition_expression": a_ast,
+                            "conditions": [
+                                {"expression_id": "OCR_0", "target": "OSC", "operator": "TURN_DOWN"},
+                                {"expression_id": "GAP_0", "target": "CLOSE", "operator": "PERCENT_GAP", "compare_target": "AVG_PRICE"},
+                            ],
+                        }],
+                    },
+                    "ui_condition_b": {
+                        "signal_expression": signal_expression,
+                        "groups": [{
+                            "condition_expression": b_ast,
+                            "conditions": [
+                                {"expression_id": "MACD_0", "target": "MACD", "operator": "<="},
+                                {"expression_id": "RSI_0", "target": "RSI", "operator": "<="},
+                            ],
+                        }],
+                    },
+                    "ui_condition_c": {
+                        "signal_expression": signal_expression,
+                        "groups": [{
+                            "conditions": [
+                                {"expression_id": "GAP_0", "target": "CLOSE", "operator": "PERCENT_GAP", "compare_target": "AVG_PRICE"},
+                            ],
+                        }],
+                    },
+                },
+            },
+        }
+        paths = {
+            "A": "sell.signals.ui_condition_a.groups[0]",
+            "B": "sell.signals.ui_condition_b.groups[0]",
+            "C": "sell.signals.ui_condition_c.groups[0]",
+        }
+
+        def condition(path, expression_id, condition_type, operator, value, right, result, snapshots=()):
+            return {
+                "path": f"{path}.conditions[0]",
+                "expression_id": expression_id,
+                "condition_type": condition_type,
+                "operator": operator,
+                "left_operand": {"key": condition_type, "index": 0, "value": value},
+                "right_operand": right,
+                "raw_result": result,
+                "final_result": result,
+                "indicator_snapshots": list(snapshots),
+            }
+
+        a_ocr = condition(
+            paths["A"], "OCR_0", "OSC", "TURN_DOWN", -709.65,
+            {"key": "none", "index": None, "value": None}, True,
+            ({"indicator": "OSC", "index": 0, "current": -709.65, "previous": -700, "previous2": -720},),
+        )
+        a_gap = condition(
+            paths["A"], "GAP_0", "CLOSE", "PERCENT_GAP", 252500,
+            {"key": "AVG_PRICE", "index": 0, "value": 250000}, True,
+        )
+        a_gap["path"] = f"{paths['A']}.conditions[1]"
+        b_macd = condition(
+            paths["B"], "MACD_0", "MACD", "<=", -709.65,
+            {"key": "value", "index": None, "value": 0}, True,
+        )
+        b_rsi = condition(
+            paths["B"], "RSI_0", "RSI", "<=", 42,
+            {"key": "value", "index": None, "value": 45}, True,
+        )
+        b_rsi["path"] = f"{paths['B']}.conditions[1]"
+        c_obstacle = condition(
+            paths["C"], "GAP_0", "CLOSE", "PERCENT_GAP", 240000,
+            {"key": "AVG_PRICE", "index": 0, "value": 250000}, False,
+        )
+        trace = {
+            "conditions": [a_ocr, a_gap, b_macd, b_rsi, c_obstacle],
+            "groups": [
+                {
+                    "path": paths["A"],
+                    "condition_paths": [a_ocr["path"], a_gap["path"]],
+                    "condition_expression": a_ast,
+                    "expression_values": {"OCR_0": True, "GAP_0": True},
+                    "result": True,
+                },
+                {
+                    "path": paths["B"],
+                    "condition_paths": [b_macd["path"], b_rsi["path"]],
+                    "condition_expression": b_ast,
+                    "expression_values": {"MACD_0": True, "RSI_0": True},
+                    "result": True,
+                },
+                {
+                    "path": paths["C"],
+                    "condition_paths": [c_obstacle["path"]],
+                    "logic": "AND",
+                    "result": False,
+                },
+            ],
+            "aggregations": [{
+                "side": "SELL",
+                "payload": {
+                    "matched_group_paths": [paths["A"], paths["B"]],
+                    "ui_signal_expression": signal_expression,
+                    "ui_expression_values": {"A": True, "B": True, "C": False},
+                    "ui_expression_result": True,
+                    "result": True,
+                },
+            }],
+        }
+        entry = ValidationReplayEntry(
+            evaluation_side="SELL",
+            evaluation_index=1,
+            evaluation_time="20260913100100",
+            signal="SELL",
+            reason="fixture",
+            signal_index=0,
+            signal_time="20260913100000",
+            delay_bar=1,
+            matched_groups=["A", "B"],
+            details=[],
+            trace=trace,
+        )
+        original_trace = entry.trace
+        lines = signal_evidence_lines_for_entry(entry, rules)
+        tooltip = signal_evidence_tooltip(entry, rules)
+
+        self.assertEqual(4, len(lines))
+        self.assertEqual(1, sum(line.startswith("▪ OCR ") for line in lines))
+        self.assertTrue(any(line.startswith("▪ 가격비교 ") for line in lines))
+        self.assertTrue(any(line.startswith("▪ MACD ") for line in lines))
+        self.assertTrue(any(line.startswith("▪ RSI ") for line in lines))
+        self.assertIn("추정평단 250,000 / 종가 252,500 / +1.00%", tooltip)
+        self.assertIn("현재 -709.65 / 이전 -700 / 이전2 -720", tooltip)
+        self.assertIn("▪ MACD -709.65", tooltip)
+        self.assertNotIn("240,000", tooltip)
+        self.assertNotIn("통과", tooltip)
+        self.assertNotIn("하락전환", tooltip)
+        self.assertNotIn("이하", tooltip)
+        self.assertNotIn("sell.signals", tooltip)
+        self.assertNotIn("A·", tooltip)
+        self.assertEqual("SELL · 09/13 10:01", tooltip.splitlines()[0])
+        self.assertTrue(all(line.startswith("▪ ") for line in tooltip.splitlines()[1:]))
+        self.assertEqual(original_trace, entry.trace)
+
+        buy_entry = ValidationReplayEntry(
+            evaluation_side="BUY",
+            evaluation_index=1,
+            evaluation_time="20260913100100",
+            signal="BUY",
+            reason="fixture",
+            signal_index=0,
+            signal_time="20260913100000",
+            delay_bar=1,
+            matched_groups=["A", "C"],
+            details=[
+                "filter_type=OCR enabled=True passed=True reason=matched evaluation_index=1 condition_details=PASS_OSC_TURN_UP",
+                "filter_type=MOVING_AVERAGE enabled=True current_value=252500 ma_value=251000 passed=True reason=matched evaluation_index=1",
+                "filter_type=RSI enabled=True evaluated_value=52 passed=False reason=not_matched evaluation_index=1",
+            ],
+            trace={"conditions": [], "groups": [], "aggregations": []},
+        )
+        buy_lines = signal_evidence_lines_for_entry(buy_entry, rules)
+        buy_tooltip = signal_evidence_tooltip(buy_entry, rules)
+        self.assertEqual(2, len(buy_lines))
+        self.assertTrue(any(line.startswith("▪ OCR ") for line in buy_lines))
+        self.assertTrue(any(line.startswith("▪ 이동평균 ") for line in buy_lines))
+        self.assertNotIn("RSI", buy_tooltip)
+        self.assertEqual("BUY · 09/13 10:01", buy_tooltip.splitlines()[0])
+
+        settings_snapshot = ValidationSettingsSnapshot(rules)
+        window = self._window()
+        window._pending_result_settings_snapshot = settings_snapshot
+        replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=settings_snapshot.rules_hash,
+            historical_request_id="REQ-EVIDENCE",
+            evaluated_start_index=0,
+            evaluated_end_index=1,
+            dropped_raw_rows_count=0,
+            candles=[
+                {"time": "20260913100000", "open": 249000, "high": 251000, "low": 248000, "close": 250000, "volume": 1000},
+                {"time": "20260913100100", "open": 251000, "high": 253000, "low": 250000, "close": 252500, "volume": 1200},
+            ],
+            entries=[buy_entry, entry],
+        )
+        window.set_replay_snapshot(replay)
+        marker_tooltips = {
+            marker["side"]: marker["tooltip"]
+            for marker in window.canvas.marker_records()
+        }
+        self.assertEqual({"BUY": buy_tooltip, "SELL": tooltip}, marker_tooltips)
+        labels = window.signal_list_table.cellWidget(0, 1).findChildren(
+            IndicatorFollowSignalEvidenceLabel
+        )
+        self.assertEqual(["BUY", "SELL"], [label.text() for label in labels])
+        self.assertEqual(
+            {"BUY": buy_tooltip, "SELL": tooltip},
+            {label.text(): label.toolTip() for label in labels},
+        )
+        with patch.object(
+            validation_window_module,
+            "signal_evidence_tooltip",
+            side_effect=AssertionError("Hover must not rebuild evidence"),
+        ):
+            self.assertEqual(tooltip, window.canvas.marker_tooltip_at(
+                window.canvas._x_for_index(1),
+                window.canvas._TOP - 12,
+            ))
+
+    def test_signal_list_row_selects_matching_candle_without_filter_table(self):
         first = self._entry(
             "BUY",
             0,
@@ -901,75 +1167,83 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         )
         window = self._window()
         window.set_replay_snapshot(self._snapshot([first, second]))
-        self.assertIn("하락전환", self._table_text(window))
+        self.assertFalse(hasattr(window, "filter_result_table"))
+        self.assertEqual(1, window.signal_list_table.rowCount())
+        self.assertEqual("09/13 10:01", window.signal_list_table.item(0, 0).text())
         self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
         window.select_evaluation_index(0)
-        self.assertIn("51.2", self._table_text(window))
-        self.assertNotIn("하락전환", self._table_text(window))
+        self.assertEqual(0, window.selected_evaluation_index)
+        window._signal_list_row_clicked(0, 0)
+        self.assertEqual(1, window.selected_evaluation_index)
+        self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
+        window.select_evaluation_index(0)
         self.assertIn("종가: 101", window.selection_summary.toPlainText())
 
-    def test_operator_table_grows_to_all_rows_without_vertical_scroll(self):
-        buy = self._entry(
-            "BUY",
-            1,
-            details=[
-                "filter_type=OCR enabled=True passed=True reason=matched evaluation_index=1 condition_details=PASS_OSC_TURN_UP",
-                "filter_type=BOLLINGER enabled=True close_price=101 bollinger_value=102 passed=False reason=not_matched evaluation_index=1",
-                "filter_type=MOVING_AVERAGE enabled=True current_value=101 ma_value=100 passed=True reason=matched evaluation_index=1",
-                "filter_type=RSI enabled=True evaluated_value=52 passed=False reason=not_matched evaluation_index=1",
-            ],
-        )
-        sell = self._entry(
-            "SELL",
-            1,
-            trace={
-                "conditions": [
-                    {
-                        "path": f"sell.signals.ui_condition_{letter.lower()}.groups[0].conditions[0]",
-                        "operator": "TURN_DOWN",
-                        "left_operand": {"value": index},
-                        "right_operand": {"value": None},
-                        "final_result": letter != "B",
-                    }
-                    for index, letter in enumerate("ABC", 1)
-                ],
-                "groups": [
-                    {
-                        "path": f"sell.signals.ui_condition_{letter.lower()}.groups[0]",
-                        "result": letter != "B",
-                    }
-                    for letter in "ABC"
-                ],
-                "aggregations": [],
-            },
-        )
+    def test_signal_list_is_bounded_and_same_bar_sides_are_independent(self):
         window = self._window()
         window.show()
-        window._populate_filter_result_table(buy, None)
-        buy_only_height = window.filter_result_table.height()
-        buy_only_window_hint = window._required_signal_validation_window_height()
-        window._populate_filter_result_table(buy, sell)
-        full_height = window.filter_result_table.height()
-        full_window_hint = window._required_signal_validation_window_height()
-        self.assertGreater(full_height, buy_only_height)
-        self.assertGreater(full_window_hint, buy_only_window_hint)
-        window.set_replay_snapshot(self._snapshot([buy, sell]))
+        candle_count = 30
+        candles = [
+            {
+                "time": f"20260913{9 + index // 60:02d}{index % 60:02d}00",
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 1000,
+            }
+            for index in range(candle_count)
+        ]
+        entries = [
+            ValidationReplayEntry(
+                evaluation_side="BUY",
+                evaluation_index=index,
+                evaluation_time=candles[index]["time"],
+                signal="BUY",
+                reason="fixture",
+                signal_index=index,
+                signal_time=candles[index]["time"],
+                delay_bar=0,
+                matched_groups=["A"],
+                details=[],
+                trace={"conditions": [], "groups": [], "aggregations": []},
+            )
+            for index in range(candle_count)
+        ]
+        entries.append(ValidationReplayEntry(
+            evaluation_side="SELL",
+            evaluation_index=0,
+            evaluation_time=candles[0]["time"],
+            signal="SELL",
+            reason="fixture",
+            signal_index=0,
+            signal_time=candles[0]["time"],
+            delay_bar=0,
+            matched_groups=["A"],
+            details=[],
+            trace={"conditions": [], "groups": [], "aggregations": []},
+        ))
+        window.set_replay_snapshot(ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash="hash",
+            historical_request_id="REQ-LIST",
+            evaluated_start_index=0,
+            evaluated_end_index=candle_count - 1,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=entries,
+        ))
         self.app.processEvents()
-        table = window.filter_result_table
-        self.assertEqual(Qt.ScrollBarAlwaysOff, table.verticalScrollBarPolicy())
-        self.assertEqual(20, table.rowCount())
-        expected_height = (
-            table.horizontalHeader().height()
-            + sum(table.rowHeight(row) for row in range(table.rowCount()))
-            + table.frameWidth() * 2
-            + table.contentsMargins().top()
-            + table.contentsMargins().bottom()
-            + 2
+        table = window.signal_list_table
+        self.assertEqual(Qt.ScrollBarAsNeeded, table.verticalScrollBarPolicy())
+        self.assertEqual(candle_count, table.rowCount())
+        self.assertLessEqual(table.height(), window._SIGNAL_LIST_MAX_HEIGHT)
+        first_labels = table.cellWidget(0, 1).findChildren(
+            IndicatorFollowSignalEvidenceLabel
         )
-        self.assertEqual(expected_height, table.height())
-        self.assertGreater(table.height(), 190)
-        last_rect = table.visualRect(table.model().index(table.rowCount() - 1, 0))
-        self.assertLessEqual(last_rect.bottom(), table.viewport().height())
+        self.assertEqual(["BUY", "SELL"], [label.text() for label in first_labels])
+        self.assertIsNot(first_labels[0], first_labels[1])
         self.assertGreaterEqual(window.result_splitter.height(), window.result_splitter.minimumHeight())
 
     def test_initial_and_changed_candle_counts_drive_requests_but_not_apply(self):
@@ -983,15 +1257,6 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         payload = window._request_settings_apply()
         self.assertNotIn("candle_count", json.dumps(payload.to_ui_state()))
         self.assertNotIn("500", json.dumps(payload.to_ui_state()))
-
-    @staticmethod
-    def _table_text(window):
-        return " ".join(
-            window.filter_result_table.item(row, column).text()
-            for row in range(window.filter_result_table.rowCount())
-            for column in range(window.filter_result_table.columnCount())
-            if window.filter_result_table.item(row, column) is not None
-        )
 
     def test_apply_payload_changes_only_source_signal_whitelist_in_registration_and_edit(self):
         for mode in ("registration", "edit"):

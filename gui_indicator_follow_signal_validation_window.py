@@ -56,7 +56,7 @@ from indicator_follow_signal_validation_projection import (
     require_resolved_sell_price_selections,
 )
 from indicator_follow_signal_validation_presentation import (
-    build_signal_validation_filter_rows,
+    signal_evidence_tooltip,
 )
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
@@ -202,6 +202,7 @@ def _valid_close(value: Any) -> float | None:
 def _marker_records(
     candles: list[dict[str, Any]],
     entries: list[ValidationReplayEntry],
+    tooltips: dict[tuple[int, str], str] | None = None,
 ) -> list[dict[str, Any]]:
     markers = []
     for entry in entries:
@@ -218,6 +219,7 @@ def _marker_records(
             "side": entry.signal,
             "evaluation_index": index,
             "evaluation_time": entry.evaluation_time,
+            "tooltip": str((tooltips or {}).get((index, entry.signal), "")),
         })
     return markers
 
@@ -318,6 +320,8 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._LEFT = self._required_price_axis_gutter()
         self.setMinimumWidth(self._content_width())
         self._time_axis_records = _time_axis_label_records(self._candles)
+        self._active_marker_tooltip = ""
+        self.setMouseTracking(True)
         self.setMinimumHeight(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -386,6 +390,42 @@ class IndicatorFollowSignalValidationChartCanvas(
             })
         return records
 
+    def marker_tooltip_at(self, x: float, y: float) -> str:
+        plot_top = self._TOP
+        plot_bottom = max(plot_top + 1, self.height() - self._BOTTOM)
+        for marker in reversed(self._markers):
+            index = marker.get("evaluation_index")
+            side = marker.get("side")
+            if isinstance(index, bool) or not isinstance(index, int):
+                continue
+            if not 0 <= index < len(self._candles):
+                continue
+            marker_y = plot_bottom + 12 if side == "BUY" else plot_top - 12
+            if abs(x - self._x_for_index(index)) <= 7 and abs(y - marker_y) <= 11:
+                return str(marker.get("tooltip") or "")
+        return ""
+
+    def mouseMoveEvent(self, event) -> None:
+        tooltip = self.marker_tooltip_at(event.pos().x(), event.pos().y())
+        if tooltip:
+            self._active_marker_tooltip = tooltip
+            QToolTip.showText(event.globalPos(), tooltip, self)
+        elif self._active_marker_tooltip:
+            self.clear_marker_tooltip()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.clear_marker_tooltip()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self.clear_marker_tooltip()
+        super().hideEvent(event)
+
+    def clear_marker_tooltip(self) -> None:
+        self._active_marker_tooltip = ""
+        QToolTip.hideText()
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         price_records = self.price_axis_records()
@@ -419,6 +459,37 @@ class IndicatorFollowSignalValidationChartCanvas(
                 Qt.AlignHCenter | Qt.AlignTop,
                 record["label"],
             )
+
+
+class IndicatorFollowSignalEvidenceLabel(QLabel):
+    """Hover-only signal evidence with an explicit row-activation boundary."""
+
+    activated = pyqtSignal(int)
+
+    def __init__(
+        self,
+        side: str,
+        evaluation_index: int,
+        tooltip: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(side, parent)
+        self.evaluation_index = evaluation_index
+        self.setObjectName(f"signalEvidence{side.title()}")
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(str(tooltip or ""))
+        color = "#16803a" if side == "BUY" else "#b45309"
+        self.setStyleSheet(
+            f"QLabel {{ color: {color}; font-weight: bold; padding: 1px 4px; }}"
+        )
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.activated.emit(self.evaluation_index)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class IndicatorFollowSignalValidationStockDisplay(QWidget):
@@ -617,6 +688,8 @@ class IndicatorFollowSignalValidationWindow(
 
     _V2_SECTION_HEADER_HEIGHT = 44
     _V2_SECTION_VERTICAL_MARGIN = 6
+    _SIGNAL_LIST_MIN_HEIGHT = 84
+    _SIGNAL_LIST_MAX_HEIGHT = 180
 
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
@@ -654,6 +727,9 @@ class IndicatorFollowSignalValidationWindow(
         self._primary_validation_action_state = "validate"
         self._pending_validation_ui_fingerprint: str | None = None
         self._validated_ui_fingerprint: str | None = None
+        self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
+        self._result_settings_snapshot: ValidationSettingsSnapshot | None = None
+        self._signal_tooltips: dict[tuple[int, str], str] = {}
         super().__init__(
             rules_path=__file__,
             routine_name="지표추종매매 신호검증 V2",
@@ -748,23 +824,26 @@ class IndicatorFollowSignalValidationWindow(
         self.result_splitter.setMinimumHeight(280)
         result_layout.addWidget(self.result_splitter, 1)
 
-        self.filter_result_table = QTableWidget(0, 5)
-        self.filter_result_table.setHorizontalHeaderLabels(
-            ["구분", "조건", "설정내용", "실제값", "판정"]
-        )
-        self.filter_result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.filter_result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.filter_result_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.filter_result_table.verticalHeader().setVisible(False)
-        self.filter_result_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.filter_result_table.setWordWrap(True)
-        header = self.filter_result_table.horizontalHeader()
+        self.signal_empty_label = QLabel("발생 신호 없음")
+        self.signal_empty_label.setAlignment(Qt.AlignCenter)
+        self.signal_empty_label.setFixedHeight(32)
+        self.signal_list_table = QTableWidget(0, 3)
+        self.signal_list_table.setObjectName("signalValidationSignalList")
+        self.signal_list_table.setHorizontalHeaderLabels(["시각", "신호", "종가"])
+        self.signal_list_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.signal_list_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.signal_list_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.signal_list_table.verticalHeader().setVisible(False)
+        self.signal_list_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.signal_list_table.setWordWrap(False)
+        self.signal_list_table.cellClicked.connect(self._signal_list_row_clicked)
+        header = self.signal_list_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        result_layout.addWidget(self.filter_result_table)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.signal_list_table.hide()
+        result_layout.addWidget(self.signal_empty_label)
+        result_layout.addWidget(self.signal_list_table)
         self.result_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         root.addWidget(self.result_widget, 1)
 
@@ -1079,9 +1158,14 @@ class IndicatorFollowSignalValidationWindow(
             self.control_page.sizeHint().height(),
         )
         action_height = self._signal_validation_action_layout.sizeHint().height()
+        signal_list_height = (
+            self.signal_list_table.height()
+            if not self.signal_list_table.isHidden()
+            else self.signal_empty_label.height()
+        )
         result_height = (
             self.result_splitter.minimumHeight()
-            + self.filter_result_table.height()
+            + signal_list_height
             + result_margins.top()
             + result_margins.bottom()
             + self._signal_validation_result_layout.spacing()
@@ -1207,6 +1291,7 @@ class IndicatorFollowSignalValidationWindow(
             self.show_validation_error("현재 신호설정으로 검증 데이터를 만들 수 없습니다.")
             return None
         self._result_ui_state = deepcopy(ui_state)
+        self._pending_result_settings_snapshot = snapshot
         self._pending_validation_ui_fingerprint = pending_fingerprint
         self._validated_ui_fingerprint = None
         self.validation_status_label.setText("Historical Candle 요청 중")
@@ -1285,6 +1370,7 @@ class IndicatorFollowSignalValidationWindow(
             self.loading_label.setText(str(message or "검증 실패"))
             self.chart_stack.setCurrentWidget(self.loading_label)
         self._pending_validation_ui_fingerprint = None
+        self._pending_result_settings_snapshot = None
         self._validated_ui_fingerprint = None
         self._set_primary_validation_action_state("validate")
 
@@ -1381,10 +1467,14 @@ class IndicatorFollowSignalValidationWindow(
             QTimer.singleShot(0, self._sync_recent_stock_row_width)
 
     def _clear_validation_result(self, message: str) -> None:
+        QToolTip.hideText()
         self._replay_snapshot = None
         self._candles = []
         self._entries = []
         self._selected_index = None
+        self._signal_tooltips = {}
+        self._pending_result_settings_snapshot = None
+        self._result_settings_snapshot = None
         old_canvas = self.chart_scroll_area.takeWidget()
         if old_canvas is not None:
             old_canvas.deleteLater()
@@ -1392,8 +1482,7 @@ class IndicatorFollowSignalValidationWindow(
         self.result_summary_label.setText("Candle -  |  BUY -  |  SELL -")
         self.estimated_return_label.setText("|  추정 손익률 -")
         self.selection_summary.setPlainText("선택 Candle 요약\n-")
-        self.filter_result_table.setRowCount(0)
-        self._resize_filter_result_table_to_contents()
+        self._populate_signal_list([])
         self.validation_status_label.setText(message)
         self.loading_label.setText(message)
         self.chart_stack.setCurrentWidget(self.loading_label)
@@ -1409,7 +1498,26 @@ class IndicatorFollowSignalValidationWindow(
         self._replay_snapshot = replay_snapshot
         self._candles = replay_snapshot.to_candles()
         self._entries = replay_snapshot.to_entries()
-        markers = _marker_records(self._candles, self._entries)
+        settings_snapshot = self._pending_result_settings_snapshot
+        self._pending_result_settings_snapshot = None
+        if (
+            isinstance(settings_snapshot, ValidationSettingsSnapshot)
+            and settings_snapshot.rules_hash == replay_snapshot.settings_hash
+        ):
+            self._result_settings_snapshot = settings_snapshot
+        elif (
+            self._signal_validation_seed.settings_snapshot.rules_hash
+            == replay_snapshot.settings_hash
+        ):
+            self._result_settings_snapshot = self._signal_validation_seed.settings_snapshot
+        else:
+            self._result_settings_snapshot = None
+        self._signal_tooltips = self._build_signal_tooltips()
+        markers = _marker_records(
+            self._candles,
+            self._entries,
+            self._signal_tooltips,
+        )
         old_canvas = self.chart_scroll_area.takeWidget()
         if old_canvas is not None:
             old_canvas.deleteLater()
@@ -1417,6 +1525,7 @@ class IndicatorFollowSignalValidationWindow(
         self.canvas.bar_selected.connect(self.select_evaluation_index)
         self.chart_scroll_area.setWidget(self.canvas)
         self.chart_stack.setCurrentWidget(self.chart_scroll_area)
+        self._populate_signal_list(markers)
 
         buy_count = sum(marker["side"] == "BUY" for marker in markers)
         sell_count = sum(marker["side"] == "SELL" for marker in markers)
@@ -1460,20 +1569,18 @@ class IndicatorFollowSignalValidationWindow(
             return False
         self._selected_index = index
         self.canvas.set_selected_index(index)
+        self._ensure_candle_visible(index)
         if not snapshot.evaluated_start_index <= index <= snapshot.evaluated_end_index:
             self.selection_summary.setPlainText(
                 "선택 Candle 요약\nReplay 평가 범위 밖\n"
                 f"평가시각: {_display_time(self._candles[index].get('time'))}"
             )
-            self.filter_result_table.setRowCount(0)
-            self._resize_filter_result_table_to_contents()
             return True
         buy_entry = self._entry_at(index, "BUY")
         sell_entry = self._entry_at(index, "SELL")
         self.selection_summary.setPlainText(
             self._selection_summary_text(index, buy_entry, sell_entry)
         )
-        self._populate_filter_result_table(buy_entry, sell_entry)
         return True
 
     def _entry_at(self, index: int, side: str) -> ValidationReplayEntry | None:
@@ -1525,42 +1632,124 @@ class IndicatorFollowSignalValidationWindow(
         lines.extend(self._entry_summary_lines("SELL", sell_entry))
         return "\n".join(lines)
 
-    def _populate_filter_result_table(
-        self,
-        buy_entry: ValidationReplayEntry | None,
-        sell_entry: ValidationReplayEntry | None,
-    ) -> None:
-        rows = build_signal_validation_filter_rows(
-            buy_entry,
-            sell_entry,
-            self._result_ui_state,
-        )
-        self.filter_result_table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            for column_index, value in enumerate(row.to_cells()):
-                item = QTableWidgetItem(value)
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                if row.row_kind in {"section", "summary"}:
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-                self.filter_result_table.setItem(row_index, column_index, item)
-        self._resize_filter_result_table_to_contents()
+    def _build_signal_tooltips(self) -> dict[tuple[int, str], str]:
+        snapshot = self._result_settings_snapshot
+        if not isinstance(snapshot, ValidationSettingsSnapshot):
+            return {}
+        rules = snapshot.to_dict()
+        tooltips: dict[tuple[int, str], str] = {}
+        for entry in self._entries:
+            if entry.signal != entry.evaluation_side:
+                continue
+            try:
+                tooltip = signal_evidence_tooltip(entry, rules)
+            except (TypeError, ValueError, OverflowError):
+                tooltip = ""
+            if tooltip:
+                tooltips[(entry.evaluation_index, entry.evaluation_side)] = tooltip
+        return tooltips
 
-    def _resize_filter_result_table_to_contents(self) -> int:
-        table = self.filter_result_table
-        table.resizeRowsToContents()
-        margins = table.contentsMargins()
-        required_height = (
-            table.horizontalHeader().height()
-            + sum(table.rowHeight(row) for row in range(table.rowCount()))
-            + table.frameWidth() * 2
-            + margins.top()
-            + margins.bottom()
-            + 2
-        )
-        table.setFixedHeight(required_height)
-        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        table.updateGeometry()
+    @staticmethod
+    def _signal_list_time(value: Any) -> str:
+        text = str(value or "").strip()
+        if len(text) == 14 and text.isdigit():
+            return f"{text[4:6]}/{text[6:8]} {text[8:10]}:{text[10:12]}"
+        return text or "-"
+
+    def _populate_signal_list(self, markers: list[dict[str, Any]]) -> None:
+        QToolTip.hideText()
+        table = self.signal_list_table
+        table.clearContents()
+        by_index: dict[int, list[dict[str, Any]]] = {}
+        for marker in markers:
+            index = marker.get("evaluation_index")
+            if isinstance(index, int) and not isinstance(index, bool):
+                by_index.setdefault(index, []).append(marker)
+        table.setRowCount(len(by_index))
+        for row, index in enumerate(sorted(by_index)):
+            candle = self._candles[index]
+            time_item = QTableWidgetItem(
+                self._signal_list_time(candle.get("time"))
+            )
+            close_value = _finite_number(candle.get("close"))
+            close_item = QTableWidgetItem(
+                "-" if close_value is None else self.canvas._price_tick_text(close_value)
+            )
+            for item in (time_item, close_item):
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setData(Qt.UserRole, index)
+            table.setItem(row, 0, time_item)
+            table.setItem(row, 2, close_item)
+
+            signal_widget = QWidget()
+            signal_layout = QHBoxLayout(signal_widget)
+            signal_layout.setContentsMargins(2, 0, 2, 0)
+            signal_layout.setSpacing(4)
+            for marker in sorted(
+                by_index[index],
+                key=lambda value: 0 if value.get("side") == "BUY" else 1,
+            ):
+                side = str(marker.get("side") or "")
+                label = IndicatorFollowSignalEvidenceLabel(
+                    side,
+                    index,
+                    str(marker.get("tooltip") or ""),
+                    signal_widget,
+                )
+                label.activated.connect(self._select_signal_list_index)
+                signal_layout.addWidget(label)
+            signal_layout.addStretch(1)
+            table.setCellWidget(row, 1, signal_widget)
+
+        has_signals = bool(by_index)
+        self.signal_empty_label.setVisible(not has_signals)
+        table.setVisible(has_signals)
+        if has_signals:
+            table.resizeRowsToContents()
+            margins = table.contentsMargins()
+            required_height = (
+                table.horizontalHeader().height()
+                + sum(table.rowHeight(row) for row in range(table.rowCount()))
+                + table.frameWidth() * 2
+                + margins.top()
+                + margins.bottom()
+                + 2
+            )
+            table.setFixedHeight(min(
+                self._SIGNAL_LIST_MAX_HEIGHT,
+                max(self._SIGNAL_LIST_MIN_HEIGHT, required_height),
+            ))
         QTimer.singleShot(0, self._fit_signal_validation_window)
-        return required_height
+
+    def _signal_list_row_clicked(self, row: int, _column: int) -> None:
+        item = self.signal_list_table.item(row, 0)
+        if item is None:
+            return
+        index = item.data(Qt.UserRole)
+        if isinstance(index, int) and not isinstance(index, bool):
+            self._select_signal_list_index(index)
+
+    def _select_signal_list_index(self, index: int) -> None:
+        if self.select_evaluation_index(index):
+            for row in range(self.signal_list_table.rowCount()):
+                item = self.signal_list_table.item(row, 0)
+                if item is not None and item.data(Qt.UserRole) == index:
+                    self.signal_list_table.selectRow(row)
+                    break
+
+    def _ensure_candle_visible(self, index: int) -> None:
+        if self.canvas is None:
+            return
+        self.chart_scroll_area.ensureVisible(
+            int(self.canvas._x_for_index(index)),
+            max(0, self.canvas.height() // 2),
+            48,
+            0,
+        )
+
+    def hideEvent(self, event) -> None:
+        QToolTip.hideText()
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.clear_marker_tooltip()
+        super().hideEvent(event)

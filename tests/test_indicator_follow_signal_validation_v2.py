@@ -679,15 +679,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(2, window.selected_evaluation_index)
         self.assertIn("SELL reason: actual-reason", window.selection_summary.toPlainText())
         self.assertIn("SELL signal_time: 2026-09-11 14:01", window.selection_summary.toPlainText())
-        table_text = " ".join(
-            window.filter_result_table.item(row, column).text()
-            for row in range(window.filter_result_table.rowCount())
-            for column in range(window.filter_result_table.columnCount())
-            if window.filter_result_table.item(row, column) is not None
+        self.assertFalse(hasattr(window, "filter_result_table"))
+        self.assertEqual(2, window.signal_list_table.rowCount())
+        self.assertEqual(
+            ["09/11 14:00", "09/11 14:02"],
+            [window.signal_list_table.item(row, 0).text() for row in range(2)],
         )
-        self.assertIn("하락전환", table_text)
-        self.assertNotIn("actual-condition", table_text)
-        self.assertNotIn("sell.signals", table_text)
         self.assertIn("+50.00%", window.estimated_return_label.text())
 
     def test_auth_is_fresh_and_default_host_is_the_existing_picker_host(self):
@@ -1121,7 +1118,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual([], window._candles)
         self.assertEqual([], window._entries)
         self.assertIsNone(window.selected_evaluation_index)
-        self.assertEqual(0, window.filter_result_table.rowCount())
+        self.assertEqual(0, window.signal_list_table.rowCount())
+        self.assertTrue(window.signal_list_table.isHidden())
+        self.assertFalse(window.signal_empty_label.isHidden())
         self.assertEqual("|  추정 손익률 -", window.estimated_return_label.text())
         self.assertIn("준비 중", window.validation_status_label.text())
 

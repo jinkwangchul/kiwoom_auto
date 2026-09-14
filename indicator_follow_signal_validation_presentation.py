@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import math
 import re
 import shlex
 from typing import Any, Mapping
@@ -403,6 +405,469 @@ def _expression(ui_state: Mapping[str, Any], side: str) -> str:
         basic,
         "buy_signal_expr_line" if side == "BUY" else "sell_signal_expr_line",
     )
+
+
+_BUY_EVIDENCE_FILTERS = {
+    "A": ("ocr", "OCR"),
+    "B": ("bollinger", "볼린저밴드"),
+    "C": ("moving_average", "이동평균"),
+    "D": ("rsi", "RSI"),
+}
+_SELL_EVIDENCE_FILTERS = {
+    "OCR": "OCR",
+    "GAP": "가격비교",
+    "RSI": "RSI",
+    "PRICE_BOX": "가격박스",
+    "BOLLINGER": "볼린저밴드",
+    "MACD": "MACD",
+    "ARRAY": "이평배열",
+}
+_OPERAND_LABELS = {
+    "AVG_PRICE": "추정평단",
+    "CLOSE": "종가",
+    "OSC": "OCR",
+    "MACD": "MACD",
+    "SIGNAL": "Signal",
+    "RSI": "RSI",
+}
+
+
+def _number_text(value: Any) -> str:
+    if isinstance(value, bool) or value in (None, ""):
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(number):
+        return "-"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.4f}".rstrip("0").rstrip(".")
+
+
+def _operand_label(operand: Any) -> str:
+    if not isinstance(operand, Mapping):
+        return "값"
+    key = str(operand.get("key") or "").strip().upper()
+    if key.startswith("MA") and key[2:].isdigit():
+        return f"{key[2:]}이평"
+    return _OPERAND_LABELS.get(key, key or "값")
+
+
+def _operand_actual(operand: Any) -> str:
+    return _number_text(operand.get("value")) if isinstance(operand, Mapping) else "-"
+
+
+def _condition_actual_evidence(payload: Mapping[str, Any]) -> str:
+    left_operand = payload.get("left_operand")
+    right_operand = payload.get("right_operand")
+    left_label = _operand_label(left_operand)
+    right_label = _operand_label(right_operand)
+    left_value = _operand_actual(left_operand)
+    right_value = _operand_actual(right_operand)
+    operator = str(payload.get("operator") or "").strip().upper()
+    snapshots = [
+        value for value in payload.get("indicator_snapshots", [])
+        if isinstance(value, Mapping)
+    ]
+
+    if operator == "PERCENT_GAP":
+        percent_text = "-"
+        try:
+            basis = float(str(right_value).replace(",", ""))
+            comparison = float(str(left_value).replace(",", ""))
+            if basis > 0:
+                percent_text = f"{(comparison - basis) / basis * 100.0:+.2f}%"
+        except (TypeError, ValueError):
+            pass
+        return (
+            f"{right_label} {right_value} / {left_label} {left_value} / {percent_text}"
+        )
+
+    if operator in {"TURN_UP", "TURN_DOWN"} and snapshots:
+        snapshot = snapshots[0]
+        return " / ".join((
+            f"현재 {_number_text(snapshot.get('current'))}",
+            f"이전 {_number_text(snapshot.get('previous'))}",
+            f"이전2 {_number_text(snapshot.get('previous2'))}",
+        ))
+
+    if operator in {"CROSS_UP", "CROSS_DOWN"} and len(snapshots) >= 2:
+        left_snapshot, right_snapshot = snapshots[:2]
+        return " / ".join((
+            f"{left_label} 현재 {_number_text(left_snapshot.get('current'))}",
+            f"이전 {_number_text(left_snapshot.get('previous'))}",
+            f"{right_label} 현재 {_number_text(right_snapshot.get('current'))}",
+            f"이전 {_number_text(right_snapshot.get('previous'))}",
+        ))
+
+    if operator in {"TREND_UP", "TREND_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN"} and snapshots:
+        snapshot = snapshots[0]
+        return " / ".join((
+            f"현재 {_number_text(snapshot.get('current'))}",
+            f"이전 {_number_text(snapshot.get('previous'))}",
+        ))
+
+    right_source = str(
+        right_operand.get("source") if isinstance(right_operand, Mapping) else ""
+    ).strip().lower()
+    right_key = str(
+        right_operand.get("key") if isinstance(right_operand, Mapping) else ""
+    ).strip().lower()
+    if right_source == "indicator" and right_value != "-":
+        return f"{left_label} {left_value} / {right_label} {right_value}"
+    if right_source == "literal" or right_key in {"value", "none", ""}:
+        return left_value
+    return left_value if right_value == "-" else f"{left_value} / {right_value}"
+
+
+def _expression_survivors(
+    expression_ast: Any,
+    values: Mapping[str, Any],
+) -> tuple[bool, tuple[str, ...]]:
+    """Project recorded booleans through the canonical AST without re-evaluation."""
+    normalized_values = {
+        str(name or "").strip().upper(): value is True
+        for name, value in values.items()
+    }
+
+    def visit(node: Any) -> tuple[bool, list[str]]:
+        if not isinstance(node, Mapping):
+            return False, []
+        node_type = str(node.get("type") or "").strip().lower()
+        if node_type == "identifier":
+            name = str(node.get("name") or "").strip().upper()
+            passed = normalized_values.get(name, False)
+            return passed, [name] if passed else []
+        if node_type != "binary":
+            return False, []
+        left_passed, left_survivors = visit(node.get("left"))
+        right_passed, right_survivors = visit(node.get("right"))
+        operator = str(node.get("operator") or "").strip().upper()
+        if operator == "AND":
+            passed = left_passed and right_passed
+            return passed, left_survivors + right_survivors if passed else []
+        if operator == "OR":
+            passed = left_passed or right_passed
+            survivors = []
+            if left_passed:
+                survivors.extend(left_survivors)
+            if right_passed:
+                survivors.extend(right_survivors)
+            return passed, survivors
+        if operator == "NOT":
+            passed = left_passed and not right_passed
+            return passed, left_survivors if passed else []
+        return False, []
+
+    passed, survivors = visit(expression_ast)
+    return passed, tuple(survivors)
+
+
+def _canonical_condition_key(condition: Any) -> str:
+    if not isinstance(condition, Mapping):
+        return ""
+    detached = {
+        key: value
+        for key, value in condition.items()
+        if key not in {"description", "expression_id"}
+    }
+    return json.dumps(
+        detached,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _trace_payloads(entry: ValidationReplayEntry) -> list[Mapping[str, Any]]:
+    trace = entry.trace if isinstance(entry.trace, dict) else {}
+    return [
+        payload for payload in trace.get("conditions", [])
+        if isinstance(payload, Mapping)
+    ]
+
+
+def _trace_groups(entry: ValidationReplayEntry) -> list[Mapping[str, Any]]:
+    trace = entry.trace if isinstance(entry.trace, dict) else {}
+    return [
+        payload for payload in trace.get("groups", [])
+        if isinstance(payload, Mapping)
+    ]
+
+
+def _side_aggregation(entry: ValidationReplayEntry) -> Mapping[str, Any]:
+    trace = entry.trace if isinstance(entry.trace, dict) else {}
+    return next(
+        (
+            item.get("payload")
+            for item in reversed(trace.get("aggregations", []))
+            if isinstance(item, Mapping)
+            and str(item.get("side") or "").strip().upper() == entry.evaluation_side
+            and isinstance(item.get("payload"), Mapping)
+        ),
+        {},
+    )
+
+
+def _rule_at_path(rules: Mapping[str, Any], path: str) -> Mapping[str, Any]:
+    value: Any = rules
+    for name, index_text in re.findall(r"([^.\[]+)(?:\[(\d+)\])?", str(path or "")):
+        if not isinstance(value, Mapping):
+            return {}
+        value = value.get(name)
+        if index_text:
+            if not isinstance(value, list):
+                return {}
+            index = int(index_text)
+            if not 0 <= index < len(value):
+                return {}
+            value = value[index]
+    return value if isinstance(value, Mapping) else {}
+
+
+def _payload_evidence_key(payload: Mapping[str, Any]) -> str:
+    detached = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"path", "description", "expression_id", "raw_result", "final_result"}
+    }
+    return json.dumps(
+        detached,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _filter_name_from_payload(payload: Mapping[str, Any]) -> str:
+    condition_type = str(payload.get("condition_type") or "").strip().upper()
+    key = str(
+        payload.get("left_operand", {}).get("key")
+        if isinstance(payload.get("left_operand"), Mapping)
+        else ""
+    ).strip().upper()
+    token = condition_type or key
+    if token in {"OSC", "OCR"}:
+        return "OCR"
+    if token == "MA" or token.startswith("MA"):
+        return "이동평균"
+    if token.startswith("BB_") or "BOLLINGER" in token:
+        return "볼린저밴드"
+    if "PRICE_BOX" in token:
+        return "가격박스"
+    if token == "PERCENT_GAP":
+        return "가격비교"
+    return _OPERAND_LABELS.get(token, token or "조건")
+
+
+def _selected_group_payloads(
+    group_payload: Mapping[str, Any],
+    condition_payloads: list[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    if group_payload.get("result") is not True:
+        return []
+    by_path = {
+        str(payload.get("path") or ""): payload
+        for payload in condition_payloads
+    }
+    paths = [str(value or "") for value in group_payload.get("condition_paths", [])]
+    candidates = [by_path[path] for path in paths if path in by_path]
+    expression_ast = group_payload.get("condition_expression")
+    expression_values = group_payload.get("expression_values")
+    if isinstance(expression_ast, Mapping) and isinstance(expression_values, Mapping):
+        passed, survivors = _expression_survivors(expression_ast, expression_values)
+        if not passed:
+            return []
+        surviving_ids = set(survivors)
+        return [
+            payload for payload in candidates
+            if str(payload.get("expression_id") or "").strip().upper() in surviving_ids
+            and payload.get("negated") is not True
+        ]
+    logic = str(group_payload.get("logic") or "AND").strip().upper()
+    if logic == "OR":
+        return [
+            payload for payload in candidates
+            if payload.get("final_result") is True and payload.get("negated") is not True
+        ]
+    return [
+        payload for payload in candidates
+        if payload.get("final_result") is True and payload.get("negated") is not True
+    ]
+
+
+def _buy_evidence_records(
+    entry: ValidationReplayEntry,
+    rules: Mapping[str, Any],
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    records: list[tuple[str, str, tuple[str, ...]]] = []
+    filters = _state(rules, "buy", "filters")
+    composite = _state(filters, "composite")
+    expression = composite.get("expression")
+    values = _buy_detail_values(entry)
+    boolean_values = {
+        letter: values.get(letter, ("-", "미평가"))[1] == "통과"
+        for letter in _BUY_EVIDENCE_FILTERS
+    }
+    if isinstance(expression, Mapping):
+        passed, survivors = _expression_survivors(expression.get("ast"), boolean_values)
+        if passed:
+            for letter in survivors:
+                if letter not in _BUY_EVIDENCE_FILTERS:
+                    continue
+                filter_key, label = _BUY_EVIDENCE_FILTERS[letter]
+                actual, result = values.get(letter, ("-", "미평가"))
+                if result != "통과" or actual == "-":
+                    continue
+                config = _state(filters, filter_key)
+                condition_keys = tuple(
+                    key for condition in config.get("conditions", [])
+                    if (key := _canonical_condition_key(condition))
+                ) or (f"buy-filter:{filter_key}",)
+                records.append((label, actual, condition_keys))
+
+    condition_payloads = _trace_payloads(entry)
+    group_payloads = _trace_groups(entry)
+    aggregation = _side_aggregation(entry)
+    matched_paths = {
+        str(path or "") for path in aggregation.get("matched_group_paths", [])
+    }
+    for group_payload in group_payloads:
+        path = str(group_payload.get("path") or "")
+        if not path.startswith("buy.groups[") or path not in matched_paths:
+            continue
+        for payload in _selected_group_payloads(group_payload, condition_payloads):
+            rule = _rule_at_path(rules, str(payload.get("path") or ""))
+            key = _canonical_condition_key(rule) or _payload_evidence_key(payload)
+            records.append((
+                _filter_name_from_payload(payload),
+                _condition_actual_evidence(payload),
+                (key,),
+            ))
+    return records
+
+
+def _sell_evidence_records(
+    entry: ValidationReplayEntry,
+    rules: Mapping[str, Any],
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    aggregation = _side_aggregation(entry)
+    expression = aggregation.get("ui_signal_expression")
+    expression_values = aggregation.get("ui_expression_values")
+    if not isinstance(expression, Mapping) or not isinstance(expression_values, Mapping):
+        return []
+    passed, survivors = _expression_survivors(expression.get("ast"), expression_values)
+    if not passed:
+        return []
+    identifier_map = expression.get("identifier_map")
+    if not isinstance(identifier_map, Mapping):
+        return []
+
+    condition_payloads = _trace_payloads(entry)
+    group_payloads = _trace_groups(entry)
+    groups_by_path = {
+        str(group.get("path") or ""): group for group in group_payloads
+    }
+    matched_paths = {
+        str(path or "") for path in aggregation.get("matched_group_paths", [])
+    }
+    signals = _state(rules, "sell", "signals")
+    records: list[tuple[str, str, tuple[str, ...]]] = []
+    for identifier in survivors:
+        signal_name = str(identifier_map.get(identifier) or "").strip()
+        signal = _state(signals, signal_name)
+        groups = signal.get("groups") if isinstance(signal.get("groups"), list) else []
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, Mapping):
+                continue
+            group_path = f"sell.signals.{signal_name}.groups[{group_index}]"
+            if group_path not in matched_paths:
+                continue
+            group_payload = groups_by_path.get(group_path)
+            if not isinstance(group_payload, Mapping):
+                continue
+            selected = _selected_group_payloads(group_payload, condition_payloads)
+            selected_by_prefix: dict[str, list[Mapping[str, Any]]] = {}
+            for payload in selected:
+                expression_id = str(payload.get("expression_id") or "").strip().upper()
+                prefix = expression_id.rsplit("_", 1)[0]
+                selected_by_prefix.setdefault(prefix, []).append(payload)
+            rule_conditions = {
+                str(condition.get("expression_id") or "").strip().upper(): condition
+                for condition in group.get("conditions", [])
+                if isinstance(condition, Mapping)
+            }
+            for prefix, payloads in selected_by_prefix.items():
+                label = _SELL_EVIDENCE_FILTERS.get(prefix, prefix or "조건")
+                if prefix == "GAP":
+                    actual = _condition_actual_evidence(payloads[0])
+                elif prefix == "OCR":
+                    actual = " / ".join(_condition_actual_evidence(item) for item in payloads)
+                elif prefix == "ARRAY":
+                    actual = " / ".join(
+                        _condition_actual_evidence(item) for item in payloads
+                    )
+                else:
+                    actual = " / ".join(_condition_actual_evidence(item) for item in payloads)
+                condition_keys = tuple(
+                    _canonical_condition_key(rule_conditions.get(
+                        str(payload.get("expression_id") or "").strip().upper(),
+                        {},
+                    )) or _payload_evidence_key(payload)
+                    for payload in payloads
+                )
+                records.append((label, actual, condition_keys))
+    return records
+
+
+def signal_evidence_lines_for_entry(
+    entry: ValidationReplayEntry,
+    settings_rules: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return only operator-visible evidence for one already-produced signal."""
+    if not isinstance(entry, ValidationReplayEntry):
+        raise TypeError("entry must be ValidationReplayEntry")
+    if not isinstance(settings_rules, Mapping):
+        raise TypeError("settings_rules must be a mapping")
+    if entry.signal != entry.evaluation_side:
+        return ()
+    records = (
+        _buy_evidence_records(entry, settings_rules)
+        if entry.evaluation_side == "BUY"
+        else _sell_evidence_records(entry, settings_rules)
+    )
+    accepted: list[tuple[str, str, tuple[str, ...]]] = []
+    seen_evidence: set[tuple[str, str, frozenset[str], str]] = set()
+    for label, actual, condition_keys in records:
+        key_set = frozenset(value for value in condition_keys if value)
+        evidence_key = (label, actual, key_set, entry.signal_time)
+        if evidence_key in seen_evidence:
+            continue
+        seen_evidence.add(evidence_key)
+        accepted.append((label, actual, condition_keys))
+    return tuple(f"▪ {label} {actual}" for label, actual, _keys in accepted)
+
+
+def signal_evidence_tooltip(
+    entry: ValidationReplayEntry,
+    settings_rules: Mapping[str, Any],
+) -> str:
+    if entry.signal != entry.evaluation_side:
+        return ""
+    text = str(entry.evaluation_time or "").strip()
+    time_text = (
+        f"{text[4:6]}/{text[6:8]} {text[8:10]}:{text[10:12]}"
+        if len(text) == 14 and text.isdigit()
+        else text or "-"
+    )
+    return "\n".join((
+        f"{entry.evaluation_side} · {time_text}",
+        *signal_evidence_lines_for_entry(entry, settings_rules),
+    ))
 
 
 def filter_rows_for_entry(
