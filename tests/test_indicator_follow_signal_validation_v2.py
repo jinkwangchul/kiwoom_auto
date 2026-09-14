@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtCore import QObject, QSignalBlocker, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QDialog
+from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_flow as flow_module
@@ -24,6 +24,7 @@ from gui_indicator_follow_signal_validation_flow import (
 )
 from gui_indicator_follow_signal_validation_window import (
     IndicatorFollowSignalValidationChartCanvas,
+    IndicatorFollowSignalValidationFixedPriceAxis,
     IndicatorFollowSignalValidationWindow,
     _time_axis_label_records,
     estimated_signal_return_percent,
@@ -486,7 +487,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         ])}
         self.assertTrue(all(record["time"] in source_times for record in long_range))
 
-    def test_chart_price_axis_uses_five_scaled_ticks_and_dynamic_plot_left(self):
+    def test_chart_price_axis_is_fixed_and_uses_five_scaled_ticks(self):
         candles = [
             {
                 "time": f"2026091114{index:02d}00",
@@ -499,9 +500,20 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             for index, price in enumerate((249_500, 250_000, 249_750))
         ]
         canvas = IndicatorFollowSignalValidationChartCanvas(candles, [])
-        self.widgets.append(canvas)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(canvas)
+        axis = IndicatorFollowSignalValidationFixedPriceAxis(scroll_area)
+        axis.set_canvas(canvas)
+        self.widgets.extend([scroll_area, axis])
+        scroll_area.resize(640, 440)
+        axis.resize(axis.width(), 440)
+        scroll_area.show()
+        axis.show()
+        self.app.processEvents()
         canvas.resize(canvas.sizeHint().width(), 440)
-        records = canvas.price_axis_records()
+        records = axis.price_axis_records()
+        grid_records = canvas.grid_line_records()
 
         self.assertEqual(5, len(records))
         self.assertEqual(250_500.0, records[0]["price"])
@@ -509,22 +521,18 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(249_750.0, records[2]["price"])
         self.assertEqual("250,500", records[0]["label"])
         self.assertEqual("249,000", records[-1]["label"])
+        viewport_top = scroll_area.viewport().geometry().top()
         self.assertEqual(
-            [
-                int(
-                    canvas._TOP
-                    + (canvas.height() - canvas._BOTTOM - canvas._TOP) * step / 4
-                )
-                for step in range(5)
-            ],
+            [viewport_top + record["y"] for record in grid_records],
             [record["y"] for record in records],
         )
-        metrics = QFontMetrics(canvas.font())
+        metrics = QFontMetrics(axis.font())
         self.assertGreaterEqual(
-            canvas.plot_left,
+            axis.width(),
             max(metrics.horizontalAdvance(record["label"]) for record in records)
-            + canvas._PRICE_AXIS_PADDING,
+            + axis._HORIZONTAL_PADDING * 2,
         )
+        self.assertEqual(12, canvas.plot_left)
         for index in range(len(candles)):
             self.assertEqual(
                 index,
@@ -547,9 +555,13 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             ],
             [],
         )
-        self.widgets.append(expensive)
-        self.assertGreater(expensive.plot_left, 48)
-        self.assertEqual("1,500,000", expensive.price_axis_records()[0]["label"])
+        expensive_scroll = QScrollArea()
+        expensive_scroll.setWidget(expensive)
+        expensive_axis = IndicatorFollowSignalValidationFixedPriceAxis(expensive_scroll)
+        expensive_axis.set_canvas(expensive)
+        self.widgets.extend([expensive, expensive_scroll, expensive_axis])
+        self.assertEqual("1,500,000", expensive_axis.price_axis_records()[0]["label"])
+        self.assertGreater(expensive_axis.width(), axis.width())
 
     def test_primary_action_requires_matching_validation_before_apply(self):
         window = self._window()
@@ -680,10 +692,17 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertIn("SELL reason: actual-reason", window.selection_summary.toPlainText())
         self.assertIn("SELL signal_time: 2026-09-11 14:01", window.selection_summary.toPlainText())
         self.assertFalse(hasattr(window, "filter_result_table"))
-        self.assertEqual(2, window.signal_list_table.rowCount())
+        self.assertEqual(1, window.completed_cycle_table.rowCount())
         self.assertEqual(
-            ["09/11 14:00", "09/11 14:02"],
-            [window.signal_list_table.item(row, 0).text() for row in range(2)],
+            ["회차", "매수구간", "매수횟수", "추정평단", "매도시각", "매도가", "추정수익률"],
+            [
+                window.completed_cycle_table.horizontalHeaderItem(column).text()
+                for column in range(window.completed_cycle_table.columnCount())
+            ],
+        )
+        self.assertEqual(
+            ["1", "09/11 14:00", "1", "100", "09/11 14:02", "150", "+50.00%"],
+            [window.completed_cycle_table.item(0, column).text() for column in range(7)],
         )
         self.assertIn("+50.00%", window.estimated_return_label.text())
 
@@ -1118,9 +1137,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual([], window._candles)
         self.assertEqual([], window._entries)
         self.assertIsNone(window.selected_evaluation_index)
-        self.assertEqual(0, window.signal_list_table.rowCount())
-        self.assertTrue(window.signal_list_table.isHidden())
-        self.assertFalse(window.signal_empty_label.isHidden())
+        self.assertEqual(0, window.completed_cycle_table.rowCount())
+        self.assertTrue(window.completed_cycle_table.isHidden())
+        self.assertFalse(window.completed_cycle_empty_label.isHidden())
         self.assertEqual("|  추정 손익률 -", window.estimated_return_label.text())
         self.assertIn("준비 중", window.validation_status_label.text())
 

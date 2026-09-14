@@ -29,7 +29,6 @@ import gui_indicator_follow_signal_validation_flow as flow_module
 import gui_indicator_follow_signal_validation_window as validation_window_module
 from gui_indicator_follow_signal_validation_flow import IndicatorFollowSignalValidationFlow
 from gui_indicator_follow_signal_validation_window import (
-    IndicatorFollowSignalEvidenceLabel,
     IndicatorFollowSignalValidationWindow,
 )
 from indicator_follow_signal_validation_presentation import (
@@ -1117,14 +1116,9 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             for marker in window.canvas.marker_records()
         }
         self.assertEqual({"BUY": buy_tooltip, "SELL": tooltip}, marker_tooltips)
-        labels = window.signal_list_table.cellWidget(0, 1).findChildren(
-            IndicatorFollowSignalEvidenceLabel
-        )
-        self.assertEqual(["BUY", "SELL"], [label.text() for label in labels])
-        self.assertEqual(
-            {"BUY": buy_tooltip, "SELL": tooltip},
-            {label.text(): label.toolTip() for label in labels},
-        )
+        self.assertFalse(hasattr(window, "signal_list_table"))
+        self.assertEqual(0, window.completed_cycle_table.rowCount())
+        self.assertFalse(window.completed_cycle_empty_label.isHidden())
         with patch.object(
             validation_window_module,
             "signal_evidence_tooltip",
@@ -1135,10 +1129,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.canvas._TOP - 12,
             ))
 
-    def test_signal_list_row_selects_matching_candle_without_filter_table(self):
+    def test_completed_cycle_row_selects_matching_sell_candle(self):
         first = self._entry(
             "BUY",
             0,
+            signal="BUY",
             details=[
                 "filter_type=RSI enabled=True period=14 operator=<= threshold=45 evaluated_value=51.2 passed=False reason=not_matched evaluation_index=0"
             ],
@@ -1168,21 +1163,22 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window = self._window()
         window.set_replay_snapshot(self._snapshot([first, second]))
         self.assertFalse(hasattr(window, "filter_result_table"))
-        self.assertEqual(1, window.signal_list_table.rowCount())
-        self.assertEqual("09/13 10:01", window.signal_list_table.item(0, 0).text())
+        self.assertFalse(hasattr(window, "signal_list_table"))
+        self.assertEqual(1, window.completed_cycle_table.rowCount())
+        self.assertEqual("09/13 10:01", window.completed_cycle_table.item(0, 4).text())
         self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
         window.select_evaluation_index(0)
         self.assertEqual(0, window.selected_evaluation_index)
-        window._signal_list_row_clicked(0, 0)
+        window._completed_cycle_row_clicked(0, 0)
         self.assertEqual(1, window.selected_evaluation_index)
         self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
         window.select_evaluation_index(0)
         self.assertIn("종가: 101", window.selection_summary.toPlainText())
 
-    def test_signal_list_is_bounded_and_same_bar_sides_are_independent(self):
+    def test_completed_cycle_table_is_bounded_and_markers_remain_independent(self):
         window = self._window()
         window.show()
-        candle_count = 30
+        candle_count = 100
         candles = [
             {
                 "time": f"20260913{9 + index // 60:02d}{index % 60:02d}00",
@@ -1196,10 +1192,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ]
         entries = [
             ValidationReplayEntry(
-                evaluation_side="BUY",
+                evaluation_side="BUY" if index % 2 == 0 else "SELL",
                 evaluation_index=index,
                 evaluation_time=candles[index]["time"],
-                signal="BUY",
+                signal="BUY" if index % 2 == 0 else "SELL",
                 reason="fixture",
                 signal_index=index,
                 signal_time=candles[index]["time"],
@@ -1210,19 +1206,6 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             )
             for index in range(candle_count)
         ]
-        entries.append(ValidationReplayEntry(
-            evaluation_side="SELL",
-            evaluation_index=0,
-            evaluation_time=candles[0]["time"],
-            signal="SELL",
-            reason="fixture",
-            signal_index=0,
-            signal_time=candles[0]["time"],
-            delay_bar=0,
-            matched_groups=["A"],
-            details=[],
-            trace={"conditions": [], "groups": [], "aggregations": []},
-        ))
         window.set_replay_snapshot(ValidationReplaySnapshot(
             stock=self.stock,
             timeframe_minutes=5,
@@ -1235,15 +1218,28 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             entries=entries,
         ))
         self.app.processEvents()
-        table = window.signal_list_table
+        table = window.completed_cycle_table
         self.assertEqual(Qt.ScrollBarAsNeeded, table.verticalScrollBarPolicy())
-        self.assertEqual(candle_count, table.rowCount())
-        self.assertLessEqual(table.height(), window._SIGNAL_LIST_MAX_HEIGHT)
-        first_labels = table.cellWidget(0, 1).findChildren(
-            IndicatorFollowSignalEvidenceLabel
+        self.assertEqual(candle_count // 2, table.rowCount())
+        self.assertLessEqual(table.height(), window._CYCLE_TABLE_MAX_HEIGHT)
+        self.assertEqual(
+            candle_count // 2,
+            sum(marker["side"] == "BUY" for marker in window.canvas.marker_records()),
         )
-        self.assertEqual(["BUY", "SELL"], [label.text() for label in first_labels])
-        self.assertIsNot(first_labels[0], first_labels[1])
+        self.assertEqual(
+            candle_count // 2,
+            sum(marker["side"] == "SELL" for marker in window.canvas.marker_records()),
+        )
+        window.select_evaluation_index(0)
+        self.app.processEvents()
+        scroll_value_before = window.chart_scroll_area.horizontalScrollBar().value()
+        window._completed_cycle_row_clicked(table.rowCount() - 1, 0)
+        self.app.processEvents()
+        self.assertEqual(candle_count - 1, window.selected_evaluation_index)
+        self.assertGreater(
+            window.chart_scroll_area.horizontalScrollBar().value(),
+            scroll_value_before,
+        )
         self.assertGreaterEqual(window.result_splitter.height(), window.result_splitter.minimumHeight())
 
     def test_initial_and_changed_candle_counts_drive_requests_but_not_apply(self):

@@ -15,7 +15,6 @@ from PyQt5.QtWidgets import QApplication
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 from engines.condition_engine import parse_condition_expression
 from gui_indicator_follow_signal_validation_window import (
-    IndicatorFollowSignalEvidenceLabel,
     IndicatorFollowSignalValidationWindow,
 )
 from indicator_follow_signal_validation_projection import (
@@ -352,16 +351,15 @@ class SellEmptyExpressionV2IntegrationTest(unittest.TestCase):
             self.assertGreater(sum(marker["side"] == "BUY" for marker in markers), 0)
             self.assertEqual(0, sum(marker["side"] == "SELL" for marker in markers))
             self.assertIn("SELL 0", window.result_summary_label.text())
-            signal_labels = [
-                label
-                for row in range(window.signal_list_table.rowCount())
-                for label in window.signal_list_table.cellWidget(row, 1).findChildren(
-                    IndicatorFollowSignalEvidenceLabel
-                )
-            ]
-            self.assertTrue(signal_labels)
-            self.assertTrue(all(label.text() == "BUY" for label in signal_labels))
-            self.assertTrue(any(label.toolTip().startswith("BUY ·") for label in signal_labels))
+            self.assertFalse(hasattr(window, "signal_list_table"))
+            self.assertEqual(0, window.completed_cycle_table.rowCount())
+            self.assertTrue(window.completed_cycle_table.isHidden())
+            self.assertFalse(window.completed_cycle_empty_label.isHidden())
+            self.assertTrue(any(
+                tooltip.startswith("BUY ·")
+                for (_index, side), tooltip in window._signal_tooltips.items()
+                if side == "BUY"
+            ))
             self.assertFalse(any(
                 side == "SELL" for _index, side in window._signal_tooltips
             ))
