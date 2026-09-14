@@ -471,7 +471,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         self.assertEqual(120.0, sell_two.trace["evaluation_context"]["estimated_average_price"])
         self.assertEqual([4], sell_two.trace["evaluation_context"]["contributing_buy_indexes"])
 
-    def test_estimated_return_uses_latest_sell_segment_only(self):
+    def test_estimated_return_aggregates_completed_sell_segments(self):
         candles = [
             {"time": f"2026091409{index:02d}00", "close": close}
             for index, close in enumerate((100.0, 110.0, 120.0, 130.0, 140.0))
@@ -496,7 +496,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
             entries=entries,
         )
         self.assertAlmostEqual(
-            (140.0 - 130.0) / 130.0 * 100.0,
+            (30.0 + 10.0) / (210.0 + 130.0) * 100.0,
             estimated_signal_return_percent(replay),
         )
 

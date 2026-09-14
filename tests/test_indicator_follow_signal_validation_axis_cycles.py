@@ -11,8 +11,10 @@ from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtWidgets import QApplication, QHBoxLayout, QScrollArea, QWidget
 
 from gui_indicator_follow_signal_validation_window import (
+    IndicatorFollowValidationCompletedCycle,
     IndicatorFollowSignalValidationChartCanvas,
     IndicatorFollowSignalValidationFixedPriceAxis,
+    aggregate_completed_cycle_return_percent,
     completed_validation_cycles,
 )
 from indicator_follow_signal_validation_projection import (
@@ -56,6 +58,46 @@ def _candles(closes, times=None):
 
 
 class CompletedValidationCycleTest(unittest.TestCase):
+    @staticmethod
+    def _cycle(number, average, buy_count, estimated_return):
+        return IndicatorFollowValidationCompletedCycle(
+            cycle_number=number,
+            buy_indexes=tuple(range(buy_count)),
+            buy_start_index=0,
+            buy_end_index=buy_count - 1,
+            buy_count=buy_count,
+            average_buy_price=average,
+            sell_index=buy_count,
+            sell_price=average * (1.0 + estimated_return / 100.0),
+            estimated_return_percent=estimated_return,
+        )
+
+    def test_aggregate_return_uses_completed_cycle_cost_weighting(self):
+        cycle = self._cycle
+        cases = (
+            ((), None),
+            ((cycle(1, 100.0, 1, 10.0),), 10.0),
+            ((cycle(1, 100.0, 1, 10.0), cycle(2, 200.0, 1, -5.0)), 0.0),
+            ((cycle(1, 100.0, 2, 10.0), cycle(2, 200.0, 1, -5.0)), 2.5),
+            ((cycle(1, 110.0, 2, 40.0 / 220.0 * 100.0),), 40.0 / 220.0 * 100.0),
+            (
+                (
+                    cycle(1, 100.0, 1, 10.0),
+                    cycle(2, 200.0, 2, -5.0),
+                    cycle(3, 50.0, 3, 20.0),
+                ),
+                20.0 / 650.0 * 100.0,
+            ),
+            ((cycle(1, 100.0, 10, 10.0), cycle(2, 100.0, 1, -50.0)), 50.0 / 1100.0 * 100.0),
+        )
+        for cycles, expected in cases:
+            with self.subTest(cycles=len(cycles), expected=expected):
+                actual = aggregate_completed_cycle_return_percent(cycles)
+                if expected is None:
+                    self.assertIsNone(actual)
+                else:
+                    self.assertAlmostEqual(expected, actual)
+
     def test_buy_sell_and_multiple_buys_form_completed_cycles(self):
         candles = _candles([100.0, 110.0, 120.0])
         entries = [
@@ -85,6 +127,26 @@ class CompletedValidationCycleTest(unittest.TestCase):
         self.assertEqual(1, len(cycles))
         self.assertEqual((1,), cycles[0].buy_indexes)
         self.assertEqual(2, cycles[0].sell_index)
+        self.assertAlmostEqual(10.0, aggregate_completed_cycle_return_percent(cycles))
+
+    def test_trailing_sell_does_not_change_aggregate_return(self):
+        candles = _candles([100.0, 110.0, 105.0])
+        completed_entries = [
+            _entry("BUY", 0, candles[0]["time"]),
+            _entry("SELL", 1, candles[1]["time"]),
+        ]
+        trailing_entries = completed_entries + [
+            _entry("SELL", 2, candles[2]["time"]),
+        ]
+
+        completed = completed_validation_cycles(candles, completed_entries)
+        trailing = completed_validation_cycles(candles, trailing_entries)
+
+        self.assertEqual(completed, trailing)
+        self.assertAlmostEqual(
+            aggregate_completed_cycle_return_percent(completed),
+            aggregate_completed_cycle_return_percent(trailing),
+        )
 
     def test_cycle_crosses_dates_and_numbering_uses_completed_order(self):
         times = [

@@ -88,14 +88,14 @@ def _display_time(value: Any) -> str:
 def estimated_signal_return_percent(
     replay_snapshot: ValidationReplaySnapshot,
 ) -> float | None:
-    """Return the last completed BUY-to-SELL cycle estimate."""
+    """Return the aggregate estimate across completed BUY-to-SELL cycles."""
     if not isinstance(replay_snapshot, ValidationReplaySnapshot):
         raise TypeError("replay_snapshot must be ValidationReplaySnapshot")
     cycles = completed_validation_cycles(
         replay_snapshot.to_candles(),
         replay_snapshot.to_entries(),
     )
-    return cycles[-1].estimated_return_percent if cycles else None
+    return aggregate_completed_cycle_return_percent(cycles)
 
 
 def _stock_metadata_tooltip(
@@ -214,6 +214,30 @@ class IndicatorFollowValidationCompletedCycle:
     sell_index: int
     sell_price: float
     estimated_return_percent: float
+
+
+def aggregate_completed_cycle_return_percent(
+    cycles: list[IndicatorFollowValidationCompletedCycle]
+    | tuple[IndicatorFollowValidationCompletedCycle, ...],
+) -> float | None:
+    """Aggregate completed Cycle returns using each Cycle's estimated cost."""
+    if not cycles:
+        return None
+    total_cost = sum(
+        cycle.average_buy_price * cycle.buy_count
+        for cycle in cycles
+    )
+    if not math.isfinite(total_cost) or total_cost <= 0:
+        return None
+    total_profit = sum(
+        cycle.average_buy_price
+        * cycle.buy_count
+        * cycle.estimated_return_percent
+        / 100.0
+        for cycle in cycles
+    )
+    aggregate = total_profit / total_cost * 100.0
+    return aggregate if math.isfinite(aggregate) else None
 
 
 def completed_validation_cycles(
@@ -1784,10 +1808,8 @@ class IndicatorFollowSignalValidationWindow(
             f"{replay_snapshot.timeframe_minutes}분봉  |  "
             f"Candle {len(self._candles)}  |  BUY {buy_count}  |  SELL {sell_count}"
         )
-        estimated = (
-            self._completed_cycles[-1].estimated_return_percent
-            if self._completed_cycles
-            else None
+        estimated = aggregate_completed_cycle_return_percent(
+            self._completed_cycles
         )
         self.estimated_return_label.setText(
             "|  추정 손익률 -"
