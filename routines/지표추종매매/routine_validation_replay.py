@@ -10,6 +10,9 @@ import math
 from typing import Any, Callable
 
 from engines.signal_result import RoutineSignal
+from indicator_follow_signal_validation_projection import (
+    build_validation_average_price_context,
+)
 
 from .routine_macd_engine import (
     build_indicator_follow_base_series,
@@ -358,16 +361,28 @@ class ValidationHistoricalReplay:
                 reason=REASON_INVALID_EVALUATION_RANGE,
             )
 
-        rules_json = _canonical_json(request.settings_snapshot.to_dict())
+        rules = request.settings_snapshot.to_dict()
         entries: list[ValidationReplayEntry] = []
         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
+        use_read_only_fast_path = reuse_default_base_series and (
+            context_provider is None
+            or context_provider is build_validation_average_price_context
+        )
+        rules_json = None if use_read_only_fast_path else _canonical_json(rules)
         try:
             for evaluation_index in range(start_index, final_index + 1):
-                prefix_json = _canonical_json(candles[: evaluation_index + 1])
+                prefix = candles[: evaluation_index + 1]
+                prefix_json = (
+                    None if use_read_only_fast_path else _canonical_json(prefix)
+                )
                 base_series_map = (
                     build_indicator_follow_base_series(
-                        _fresh_json(prefix_json),
-                        _fresh_json(rules_json),
+                        prefix
+                        if use_read_only_fast_path
+                        else _fresh_json(prefix_json),
+                        rules
+                        if use_read_only_fast_path
+                        else _fresh_json(rules_json),
                     )
                     if reuse_default_base_series and evaluation_index >= 2
                     else None
@@ -382,24 +397,38 @@ class ValidationHistoricalReplay:
                         supplied = context_provider(
                             evaluation_index,
                             side,
-                            _fresh_json(prefix_json),
+                            prefix
+                            if use_read_only_fast_path
+                            else _fresh_json(prefix_json),
                             list(entries),
                         )
                         if not isinstance(supplied, dict):
                             raise TypeError("context_provider must return a mapping")
                         supplied.pop("decision_trace_observer", None)
                         supplied.pop("_indicator_follow_evaluate_side", None)
-                        context.update(_fresh_json(_canonical_json(supplied)))
+                        context.update(
+                            supplied
+                            if use_read_only_fast_path
+                            else _fresh_json(_canonical_json(supplied))
+                        )
                     if base_series_map is None:
                         signal = self._evaluator(
-                            _fresh_json(prefix_json),
-                            _fresh_json(rules_json),
+                            prefix
+                            if use_read_only_fast_path
+                            else _fresh_json(prefix_json),
+                            rules
+                            if use_read_only_fast_path
+                            else _fresh_json(rules_json),
                             context,
                         )
                     else:
                         signal = evaluate_indicator_follow_routine(
-                            _fresh_json(prefix_json),
-                            _fresh_json(rules_json),
+                            prefix
+                            if use_read_only_fast_path
+                            else _fresh_json(prefix_json),
+                            rules
+                            if use_read_only_fast_path
+                            else _fresh_json(rules_json),
                             context,
                             _base_series_map=base_series_map,
                         )
@@ -408,9 +437,15 @@ class ValidationHistoricalReplay:
                             side,
                             evaluation_index,
                             candles[evaluation_index]["time"],
-                            _fresh_json(prefix_json),
+                            prefix
+                            if use_read_only_fast_path
+                            else _fresh_json(prefix_json),
                             signal,
-                            self._trace_with_context(observer.snapshot(), context),
+                            self._trace_with_context(
+                                observer.snapshot(),
+                                context,
+                                assume_detached=use_read_only_fast_path,
+                            ),
                         )
                     )
         except Exception as exc:
@@ -466,11 +501,21 @@ class ValidationHistoricalReplay:
     def _trace_with_context(
         trace: dict[str, Any],
         context: dict[str, Any],
+        *,
+        assume_detached: bool = False,
     ) -> dict[str, Any]:
-        copied = _fresh_json(_canonical_json(trace))
+        copied = (
+            dict(trace)
+            if assume_detached
+            else _fresh_json(_canonical_json(trace))
+        )
         evidence = context.get("validation_trace_context")
         if isinstance(evidence, dict):
-            copied["evaluation_context"] = _fresh_json(_canonical_json(evidence))
+            copied["evaluation_context"] = (
+                evidence
+                if assume_detached
+                else _fresh_json(_canonical_json(evidence))
+            )
         return copied
 
     @staticmethod

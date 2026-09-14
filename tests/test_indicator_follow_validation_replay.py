@@ -37,6 +37,7 @@ from routines.지표추종매매.routine_validation_session import (
     REASON_OPERATION_ACTIVE,
     ValidationSession,
 )
+from routines.지표추종매매.routine_validation_trace import ValidationTraceObserver
 
 
 class ValidationHistoricalReplayTest(unittest.TestCase):
@@ -681,6 +682,181 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             self.assertEqual(original, base_series)
             self.assertNotIn("AVG_PRICE", base_series)
             self.assertNotIn("ORDER_PRICE", base_series)
+
+    def test_default_evaluator_and_average_context_provider_are_read_only(self) -> None:
+        candles = project_validation_candles(self._historical())[0]
+        rules = deepcopy(self.rules)
+        prior_entries = [
+            ValidationReplayEntry(
+                evaluation_side="BUY",
+                evaluation_index=1,
+                evaluation_time=candles[1]["time"],
+                signal="BUY",
+                reason="fixture",
+                signal_index=1,
+                signal_time=candles[1]["time"],
+                delay_bar=0,
+                matched_groups=["fixture"],
+                details=["fixture"],
+                trace={"conditions": [{"nested": [1]}]},
+            )
+        ]
+        candles_before = deepcopy(candles)
+        rules_before = deepcopy(rules)
+        entries_before = [entry.to_dict() for entry in prior_entries]
+
+        sell_context = build_validation_average_price_context(
+            len(candles) - 1,
+            "SELL",
+            candles,
+            prior_entries,
+        )
+        sell_context_before = deepcopy(sell_context)
+        base_series = routine_macd_engine.build_indicator_follow_base_series(
+            candles,
+            rules,
+        )
+        for side, supplied_context in (
+            ("SELL", sell_context),
+            (
+                "BUY",
+                build_validation_average_price_context(
+                    len(candles) - 1,
+                    "BUY",
+                    candles,
+                    prior_entries,
+                ),
+            ),
+        ):
+            observer = ValidationTraceObserver()
+            routine_macd_engine.evaluate_indicator_follow_routine(
+                candles,
+                rules,
+                {
+                    **supplied_context,
+                    "decision_trace_observer": observer,
+                    "_indicator_follow_evaluate_side": side,
+                },
+                _base_series_map=base_series,
+            )
+            observer.snapshot()
+        buy_context = build_validation_average_price_context(
+            len(candles) - 1,
+            "BUY",
+            candles,
+            prior_entries,
+        )
+
+        self.assertEqual(candles_before, candles)
+        self.assertEqual(rules_before, rules)
+        self.assertEqual(entries_before, [entry.to_dict() for entry in prior_entries])
+        self.assertEqual(sell_context_before, sell_context)
+        self.assertIsNot(sell_context, buy_context)
+        self.assertIsNot(
+            sell_context["average_price_series"],
+            buy_context["average_price_series"],
+        )
+        sell_context["average_price_series"][0] = -1
+        self.assertNotEqual(
+            sell_context["average_price_series"],
+            buy_context["average_price_series"],
+        )
+
+    def test_entry_creation_does_not_mutate_prefix_signal_or_trace(self) -> None:
+        prefix = project_validation_candles(self._historical())[0]
+        signal = RoutineSignal(
+            "BUY",
+            "fixture",
+            ["fixture_group"],
+            ["fixture_detail"],
+            1,
+            0,
+        )
+        trace = {"conditions": [{"nested": [1]}]}
+        prefix_before = deepcopy(prefix)
+        matched_before = deepcopy(signal.matched_groups)
+        details_before = deepcopy(signal.details)
+        trace_before = deepcopy(trace)
+
+        entry = ValidationHistoricalReplay._entry_from_signal(
+            "BUY",
+            2,
+            prefix[2]["time"],
+            prefix,
+            signal,
+            trace,
+        )
+
+        self.assertEqual(prefix_before, prefix)
+        self.assertEqual(matched_before, signal.matched_groups)
+        self.assertEqual(details_before, signal.details)
+        self.assertEqual(trace_before, trace)
+        self.assertEqual(trace_before, entry.trace)
+
+    def test_custom_evaluator_nested_mutation_remains_isolated(self) -> None:
+        observed = []
+
+        def evaluator(candles, config, _context):
+            observed.append(
+                (
+                    candles[0]["time"],
+                    config["buy"]["groups"][0]["conditions"][0]["value"],
+                )
+            )
+            candles[0]["time"] = "19990101000000"
+            config["buy"]["groups"][0]["conditions"][0]["value"] = -1
+            return self._none_signal()
+
+        before = self.settings.to_dict()
+        result = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=evaluator,
+        ).evaluate(self._historical(closes=(10, 11, 12)), start_index=2)
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual(2, len(observed))
+        self.assertEqual(observed[0], observed[1])
+        self.assertEqual(before, self.settings.to_dict())
+        self.assertEqual("20260913090000", result.snapshot.to_candles()[0]["time"])
+
+    def test_custom_context_provider_prefix_mutation_remains_isolated(self) -> None:
+        evaluator_inputs = []
+
+        def evaluator(candles, _config, _context):
+            evaluator_inputs.append(candles[0]["time"])
+            return self._none_signal()
+
+        def context_provider(_index, _side, candles, _prior_entries):
+            candles[0]["time"] = "19990101000000"
+            return {"nested": {"value": 1}}
+
+        result = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=evaluator,
+        ).evaluate_with_context(
+            self._historical(closes=(10, 11, 12)),
+            start_index=2,
+            context_provider=context_provider,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual(["20260913090000", "20260913090000"], evaluator_inputs)
+        self.assertEqual("20260913090000", result.snapshot.to_candles()[0]["time"])
+
+    def test_unhashable_custom_context_provider_keeps_existing_contract(self) -> None:
+        class UnhashableContextProvider:
+            __hash__ = None
+
+            def __call__(self, _index, _side, _candles, _prior_entries):
+                return {}
+
+        result = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            self._historical(closes=(10, 11, 12)),
+            start_index=2,
+            context_provider=UnhashableContextProvider(),
+        )
+
+        self.assertTrue(result.ok, result)
 
     def test_future_candles_do_not_change_index_99_series_signal_or_trace(self) -> None:
         prefix = tuple(100 + ((index % 23) - 11) * 0.8 for index in range(100))
