@@ -88,45 +88,14 @@ def _display_time(value: Any) -> str:
 def estimated_signal_return_percent(
     replay_snapshot: ValidationReplaySnapshot,
 ) -> float | None:
-    """Estimate latest SELL return from earlier BUY evaluation-bar closes."""
+    """Return the last completed BUY-to-SELL cycle estimate."""
     if not isinstance(replay_snapshot, ValidationReplaySnapshot):
         raise TypeError("replay_snapshot must be ValidationReplaySnapshot")
-    candles = replay_snapshot.to_candles()
-    entries = replay_snapshot.to_entries()
-    sell_entries = [
-        entry for entry in entries
-        if entry.signal == "SELL"
-        and isinstance(entry.evaluation_index, int)
-        and not isinstance(entry.evaluation_index, bool)
-        and 0 <= entry.evaluation_index < len(candles)
-    ]
-    if not sell_entries:
-        return None
-    latest_sell = max(sell_entries, key=lambda entry: entry.evaluation_index)
-    sell_close = _valid_close(candles[latest_sell.evaluation_index].get("close"))
-    if sell_close is None:
-        return None
-    trace = latest_sell.trace
-    evaluation_context = (
-        trace.get("evaluation_context") if isinstance(trace, dict) else None
+    cycles = completed_validation_cycles(
+        replay_snapshot.to_candles(),
+        replay_snapshot.to_entries(),
     )
-    average_buy = _valid_close(
-        evaluation_context.get("estimated_average_price")
-        if isinstance(evaluation_context, dict)
-        else None
-    )
-    if average_buy is None:
-        context = build_validation_average_price_context(
-            latest_sell.evaluation_index,
-            "SELL",
-            candles,
-            entries,
-        )
-        average_buy = _valid_close(context.get("average_price"))
-    if average_buy is None:
-        return None
-    value = (sell_close - average_buy) / average_buy * 100.0
-    return value if math.isfinite(value) else None
+    return cycles[-1].estimated_return_percent if cycles else None
 
 
 def _stock_metadata_tooltip(
@@ -910,8 +879,9 @@ class IndicatorFollowSignalValidationWindow(
 
     _V2_SECTION_HEADER_HEIGHT = 44
     _V2_SECTION_VERTICAL_MARGIN = 6
-    _CYCLE_TABLE_MIN_HEIGHT = 62
-    _CYCLE_TABLE_MAX_HEIGHT = 180
+    _INITIAL_AVAILABLE_GEOMETRY_RATIO = 0.85
+    _CYCLE_TABLE_VISIBLE_ROWS = 5
+    _CYCLE_TABLE_COLUMN_RATIOS = (0.06, 0.22, 0.09, 0.15, 0.20, 0.13, 0.15)
 
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
@@ -947,6 +917,9 @@ class IndicatorFollowSignalValidationWindow(
         self._selected_index: int | None = None
         self._initial_validation_requested = False
         self._initial_natural_fit_pending = True
+        self._programmatic_resize_in_progress = False
+        self._initial_geometry_committed = False
+        self._user_geometry_owned = False
         self._primary_validation_action_state = "validate"
         self._pending_validation_ui_fingerprint: str | None = None
         self._validated_ui_fingerprint: str | None = None
@@ -1056,9 +1029,6 @@ class IndicatorFollowSignalValidationWindow(
         self.result_splitter.setMinimumHeight(280)
         result_layout.addWidget(self.result_splitter, 1)
 
-        self.completed_cycle_empty_label = QLabel("완료 매매사이클 없음")
-        self.completed_cycle_empty_label.setAlignment(Qt.AlignCenter)
-        self.completed_cycle_empty_label.setFixedHeight(32)
         self.completed_cycle_table = QTableWidget(0, 7)
         self.completed_cycle_table.setObjectName("signalValidationCompletedCycleTable")
         self.completed_cycle_table.setHorizontalHeaderLabels([
@@ -1074,19 +1044,23 @@ class IndicatorFollowSignalValidationWindow(
         self.completed_cycle_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.completed_cycle_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.completed_cycle_table.verticalHeader().setVisible(False)
-        self.completed_cycle_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.completed_cycle_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.completed_cycle_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.completed_cycle_table.setWordWrap(False)
         self.completed_cycle_table.cellClicked.connect(
             self._completed_cycle_row_clicked
         )
         cycle_header = self.completed_cycle_table.horizontalHeader()
         for column in range(self.completed_cycle_table.columnCount()):
-            cycle_header.setSectionResizeMode(
-                column,
-                QHeaderView.Stretch if column == 1 else QHeaderView.ResizeToContents,
-            )
-        self.completed_cycle_table.hide()
-        result_layout.addWidget(self.completed_cycle_empty_label)
+            cycle_header.setSectionResizeMode(column, QHeaderView.Fixed)
+        self.completed_cycle_empty_label = QLabel(
+            "완료 매매사이클 없음",
+            self.completed_cycle_table.viewport(),
+        )
+        self.completed_cycle_empty_label.setAlignment(Qt.AlignCenter)
+        self.completed_cycle_empty_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.completed_cycle_table.viewport().installEventFilter(self)
+        self._sync_completed_cycle_table_geometry()
         result_layout.addWidget(self.completed_cycle_table)
         self.result_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         root.addWidget(self.result_widget, 1)
@@ -1309,6 +1283,12 @@ class IndicatorFollowSignalValidationWindow(
             setattr(self, f"{name}_header_separator", separator)
 
     def eventFilter(self, watched, event):
+        cycle_table = getattr(self, "completed_cycle_table", None)
+        if cycle_table is not None and watched is cycle_table.viewport():
+            if event.type() == QEvent.Resize:
+                self._sync_completed_cycle_empty_label_geometry()
+                self._resize_completed_cycle_columns()
+            return super().eventFilter(watched, event)
         if (
             watched is getattr(self, "basic_toggle_button", None)
             and event.type() == QEvent.MouseButtonPress
@@ -1342,6 +1322,9 @@ class IndicatorFollowSignalValidationWindow(
         QTimer.singleShot(0, self._fit_signal_validation_window)
 
     def _fit_signal_validation_window(self) -> None:
+        initial_fit = bool(getattr(self, "_initial_natural_fit_pending", False))
+        if not initial_fit or self._user_geometry_owned:
+            return
         layout = self.layout()
         if layout is not None:
             layout.activate()
@@ -1353,19 +1336,32 @@ class IndicatorFollowSignalValidationWindow(
             contents_hint.height(),
             self._required_signal_validation_window_height(),
         )
-        initial_fit = bool(getattr(self, "_initial_natural_fit_pending", False))
         natural_width = self._natural_signal_validation_window_width(contents_hint)
-        desired_width = natural_width if initial_fit else max(self.width(), natural_width)
+        desired_width = natural_width
         available = self._available_signal_validation_geometry()
         if available is not None:
             frame_extra_width = max(0, self.frameGeometry().width() - self.width())
             frame_extra_height = max(0, self.frameGeometry().height() - self.height())
+            desired_width = max(
+                desired_width,
+                round(available.width() * self._INITIAL_AVAILABLE_GEOMETRY_RATIO)
+                - frame_extra_width,
+            )
+            desired_height = max(
+                desired_height,
+                round(available.height() * self._INITIAL_AVAILABLE_GEOMETRY_RATIO)
+                - frame_extra_height,
+            )
             desired_width = min(desired_width, max(1, available.width() - frame_extra_width))
             desired_height = min(desired_height, max(1, available.height() - frame_extra_height))
-        self.resize(int(desired_width), int(desired_height))
+        self._programmatic_resize_in_progress = True
+        try:
+            self.resize(int(desired_width), int(desired_height))
+        finally:
+            self._programmatic_resize_in_progress = False
         self._initial_natural_fit_pending = False
-        if initial_fit:
-            self._center_on_initial_screen()
+        self._initial_geometry_committed = True
+        self._center_on_initial_screen()
 
     def _natural_signal_validation_window_width(self, contents_hint: QSize) -> int:
         root_layout = self.layout()
@@ -1402,11 +1398,7 @@ class IndicatorFollowSignalValidationWindow(
             self.control_page.sizeHint().height(),
         )
         action_height = self._signal_validation_action_layout.sizeHint().height()
-        cycle_summary_height = (
-            self.completed_cycle_table.height()
-            if not self.completed_cycle_table.isHidden()
-            else self.completed_cycle_empty_label.height()
-        )
+        cycle_summary_height = self.completed_cycle_table.height()
         result_height = (
             self.result_splitter.minimumHeight()
             + cycle_summary_height
@@ -1704,11 +1696,22 @@ class IndicatorFollowSignalValidationWindow(
     def showEvent(self, event) -> None:
         super().showEvent(event)
         QTimer.singleShot(0, self._sync_recent_stock_row_width)
+        QTimer.singleShot(0, self._sync_completed_cycle_table_geometry)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._record_signal_validation_resize_ownership(event)
         if self.isVisible():
             QTimer.singleShot(0, self._sync_recent_stock_row_width)
+            QTimer.singleShot(0, self._resize_completed_cycle_columns)
+
+    def _record_signal_validation_resize_ownership(self, event) -> None:
+        if (
+            self._initial_geometry_committed
+            and not self._programmatic_resize_in_progress
+            and event.spontaneous()
+        ):
+            self._user_geometry_owned = True
 
     def _clear_validation_result(self, message: str) -> None:
         QToolTip.hideText()
@@ -1781,7 +1784,11 @@ class IndicatorFollowSignalValidationWindow(
             f"{replay_snapshot.timeframe_minutes}분봉  |  "
             f"Candle {len(self._candles)}  |  BUY {buy_count}  |  SELL {sell_count}"
         )
-        estimated = estimated_signal_return_percent(replay_snapshot)
+        estimated = (
+            self._completed_cycles[-1].estimated_return_percent
+            if self._completed_cycles
+            else None
+        )
         self.estimated_return_label.setText(
             "|  추정 손익률 -"
             if estimated is None
@@ -1954,25 +1961,82 @@ class IndicatorFollowSignalValidationWindow(
                 item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(row, column, item)
 
-        has_cycles = bool(self._completed_cycles)
-        self.completed_cycle_empty_label.setVisible(not has_cycles)
-        table.setVisible(has_cycles)
-        if has_cycles:
-            table.resizeRowsToContents()
-            margins = table.contentsMargins()
-            required_height = (
-                table.horizontalHeader().height()
-                + sum(table.rowHeight(row) for row in range(table.rowCount()))
-                + table.frameWidth() * 2
-                + margins.top()
-                + margins.bottom()
-                + 2
-            )
-            table.setFixedHeight(min(
-                self._CYCLE_TABLE_MAX_HEIGHT,
-                max(self._CYCLE_TABLE_MIN_HEIGHT, required_height),
-            ))
+        self.completed_cycle_empty_label.setVisible(not self._completed_cycles)
+        self.completed_cycle_empty_label.raise_()
+        self._sync_completed_cycle_table_geometry()
         QTimer.singleShot(0, self._fit_signal_validation_window)
+
+    def _completed_cycle_row_height(self) -> int:
+        table = self.completed_cycle_table
+        return max(
+            table.verticalHeader().defaultSectionSize(),
+            QFontMetrics(table.font()).height() + 8,
+        )
+
+    def _sync_completed_cycle_table_geometry(self) -> None:
+        table = self.completed_cycle_table
+        table.ensurePolished()
+        row_height = self._completed_cycle_row_height()
+        table.verticalHeader().setDefaultSectionSize(row_height)
+        header_height = max(
+            table.horizontalHeader().height(),
+            table.horizontalHeader().sizeHint().height(),
+        )
+        fixed_height = (
+            header_height
+            + row_height * self._CYCLE_TABLE_VISIBLE_ROWS
+            + table.frameWidth() * 2
+        )
+        table.setFixedHeight(fixed_height)
+        self._sync_completed_cycle_empty_label_geometry()
+        self._resize_completed_cycle_columns()
+
+    def _sync_completed_cycle_empty_label_geometry(self) -> None:
+        label = getattr(self, "completed_cycle_empty_label", None)
+        table = getattr(self, "completed_cycle_table", None)
+        if label is not None and table is not None:
+            label.setGeometry(table.viewport().rect())
+
+    def _completed_cycle_column_minimum_widths(self) -> list[int]:
+        table = self.completed_cycle_table
+        metrics = QFontMetrics(table.horizontalHeader().font())
+        return [
+            metrics.horizontalAdvance(table.horizontalHeaderItem(column).text()) + 16
+            for column in range(table.columnCount())
+        ]
+
+    def _resize_completed_cycle_columns(self) -> None:
+        table = getattr(self, "completed_cycle_table", None)
+        if table is None:
+            return
+        available_width = table.viewport().width()
+        if available_width <= 0:
+            return
+        ratios = self._CYCLE_TABLE_COLUMN_RATIOS
+        widths = [int(available_width * ratio) for ratio in ratios[:-1]]
+        widths.append(available_width - sum(widths))
+        minimums = self._completed_cycle_column_minimum_widths()
+        for column, minimum in enumerate(minimums):
+            deficit = max(0, minimum - widths[column])
+            if not deficit:
+                continue
+            for donor in sorted(
+                range(len(widths)),
+                key=lambda index: widths[index] - minimums[index],
+                reverse=True,
+            ):
+                if donor == column:
+                    continue
+                available = max(0, widths[donor] - minimums[donor])
+                transfer = min(deficit, available)
+                widths[donor] -= transfer
+                widths[column] += transfer
+                deficit -= transfer
+                if not deficit:
+                    break
+        header = table.horizontalHeader()
+        for column, width in enumerate(widths):
+            header.resizeSection(column, width)
 
     def _completed_cycle_row_clicked(self, row: int, _column: int) -> None:
         item = self.completed_cycle_table.item(row, 0)

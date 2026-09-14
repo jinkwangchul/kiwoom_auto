@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, QPoint, QRect, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -293,17 +293,14 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertTrue(window.buy_detail_expanded)
         self.assertTrue(window.sell_detail_expanded)
 
-    def test_collapsed_section_geometry_and_initial_natural_width_are_normalized(self):
+    def test_collapsed_section_geometry_and_initial_available_ratio_are_normalized(self):
         window = self._window()
         window._available_signal_validation_geometry = lambda: QRect(0, 0, 2400, 1400)
         window.show()
         self.app.processEvents()
         window._apply_control_section_mode("summary", force=True)
         window._initial_natural_fit_pending = True
-        window.layout().activate()
-        expected_width = window._natural_signal_validation_window_width(
-            window.layout().sizeHint()
-        )
+        window._initial_geometry_committed = False
         window._fit_signal_validation_window()
         self.app.processEvents()
 
@@ -323,8 +320,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         rights = [box.geometry().right() for box in sections]
         self.assertLessEqual(max(lefts) - min(lefts), 1)
         self.assertLessEqual(max(rights) - min(rights), 1)
-        self.assertEqual(expected_width, window.width())
-        self.assertLess(window.width(), 1600)
+        self.assertLessEqual(abs(window.frameGeometry().width() - 2040), 2)
+        self.assertLessEqual(abs(window.frameGeometry().height() - 1190), 2)
+        self.assertTrue(window._initial_geometry_committed)
+        self.assertFalse(window._user_geometry_owned)
 
         window._toggle_recent_stock_row()
         self.app.processEvents()
@@ -353,11 +352,15 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             self.assertEqual([collapsed_height] * 3, [box.height() for box in sections])
 
         user_width = window.width() + 180
+        user_position = QPoint(137, 193)
         window.resize(user_width, window.height())
+        window.move(user_position)
+        window._user_geometry_owned = True
         window._toggle_control_section_mode("buy")
         window._fit_signal_validation_window()
         self.app.processEvents()
         self.assertEqual(user_width, window.width())
+        self.assertEqual(user_position, window.pos())
 
     def test_initial_center_runs_once_and_section_toggles_preserve_window_position(self):
         window = self._window()
@@ -386,6 +389,28 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             toggle()
             self.app.processEvents()
             self.assertEqual(before_position, window.pos())
+
+    def test_resize_ownership_ignores_programmatic_and_records_native_user_resize(self):
+        window = self._window()
+
+        class ResizeObservation:
+            def __init__(self, spontaneous):
+                self._spontaneous = spontaneous
+
+            def spontaneous(self):
+                return self._spontaneous
+
+        window._initial_geometry_committed = True
+        window._programmatic_resize_in_progress = True
+        window._record_signal_validation_resize_ownership(ResizeObservation(True))
+        self.assertFalse(window._user_geometry_owned)
+
+        window._programmatic_resize_in_progress = False
+        window._record_signal_validation_resize_ownership(ResizeObservation(False))
+        self.assertFalse(window._user_geometry_owned)
+
+        window._record_signal_validation_resize_ownership(ResizeObservation(True))
+        self.assertTrue(window._user_geometry_owned)
 
     def test_header_internal_alignment_separators_and_stock_button_are_normalized(self):
         window = self._window()
@@ -1175,7 +1200,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window.select_evaluation_index(0)
         self.assertIn("종가: 101", window.selection_summary.toPlainText())
 
-    def test_completed_cycle_table_is_bounded_and_markers_remain_independent(self):
+    def test_completed_cycle_table_keeps_five_rows_and_markers_remain_independent(self):
         window = self._window()
         window.show()
         candle_count = 100
@@ -1219,9 +1244,17 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ))
         self.app.processEvents()
         table = window.completed_cycle_table
-        self.assertEqual(Qt.ScrollBarAsNeeded, table.verticalScrollBarPolicy())
+        self.assertEqual(Qt.ScrollBarAlwaysOn, table.verticalScrollBarPolicy())
         self.assertEqual(candle_count // 2, table.rowCount())
-        self.assertLessEqual(table.height(), window._CYCLE_TABLE_MAX_HEIGHT)
+        expected_height = (
+            table.horizontalHeader().height()
+            + table.verticalHeader().defaultSectionSize()
+            * window._CYCLE_TABLE_VISIBLE_ROWS
+            + table.frameWidth() * 2
+        )
+        self.assertEqual(expected_height, table.height())
+        self.assertTrue(table.verticalScrollBar().isVisible())
+        self.assertGreater(table.verticalScrollBar().maximum(), 0)
         self.assertEqual(
             candle_count // 2,
             sum(marker["side"] == "BUY" for marker in window.canvas.marker_records()),
@@ -1241,6 +1274,130 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             scroll_value_before,
         )
         self.assertGreaterEqual(window.result_splitter.height(), window.result_splitter.minimumHeight())
+
+    def test_cycle_table_height_scroll_and_column_ratios_are_row_count_independent(self):
+        window = self._window()
+        window._available_signal_validation_geometry = lambda: QRect(0, 0, 1920, 1080)
+        window.show()
+        self.app.processEvents()
+        table = window.completed_cycle_table
+        fixed_height = table.height()
+        ratios = window._CYCLE_TABLE_COLUMN_RATIOS
+
+        def load_cycle_count(cycle_count):
+            candles = []
+            entries = []
+            for index in range(cycle_count * 2):
+                time = f"20260914{9 + index // 60:02d}{index % 60:02d}00"
+                candles.append({
+                    "time": time,
+                    "open": 100 + index,
+                    "high": 102 + index,
+                    "low": 99 + index,
+                    "close": 100 + index,
+                    "volume": 1000,
+                })
+                side = "BUY" if index % 2 == 0 else "SELL"
+                entries.append(ValidationReplayEntry(
+                    evaluation_side=side,
+                    evaluation_index=index,
+                    evaluation_time=time,
+                    signal=side,
+                    reason="fixture",
+                    signal_index=index,
+                    signal_time=time,
+                    delay_bar=0,
+                    matched_groups=["A"],
+                    details=[],
+                    trace={"conditions": [], "groups": [], "aggregations": []},
+                ))
+            window._candles = candles
+            window._entries = entries
+            window._populate_completed_cycles()
+            self.app.processEvents()
+
+        for count in (0, 1, 5, 6, 20):
+            with self.subTest(count=count):
+                load_cycle_count(count)
+                self.assertEqual(count, table.rowCount())
+                self.assertEqual(fixed_height, table.height())
+                self.assertEqual(
+                    table.verticalHeader().defaultSectionSize()
+                    * window._CYCLE_TABLE_VISIBLE_ROWS,
+                    table.viewport().height(),
+                )
+                self.assertEqual(Qt.ScrollBarAlwaysOn, table.verticalScrollBarPolicy())
+                self.assertEqual(0 if count <= 5 else count - 5, table.verticalScrollBar().maximum())
+                self.assertEqual(not count, not window.completed_cycle_empty_label.isHidden())
+
+        window._resize_completed_cycle_columns()
+        viewport_width = table.viewport().width()
+        widths = [table.columnWidth(column) for column in range(7)]
+        self.assertEqual(viewport_width, sum(widths))
+        for actual, expected_ratio in zip(widths, ratios):
+            self.assertLessEqual(abs(actual / viewport_width - expected_ratio), 0.02)
+
+        before_height = table.height()
+        window.resize(window.width() + 180, window.height() + 90)
+        self.app.processEvents()
+        window._resize_completed_cycle_columns()
+        resized_viewport_width = table.viewport().width()
+        resized_widths = [table.columnWidth(column) for column in range(7)]
+        self.assertEqual(before_height, table.height())
+        self.assertEqual(resized_viewport_width, sum(resized_widths))
+        for actual, expected_ratio in zip(resized_widths, ratios):
+            self.assertLessEqual(
+                abs(actual / resized_viewport_width - expected_ratio),
+                0.02,
+            )
+
+        window.resize(round(1366 * 0.85), window.height())
+        self.app.processEvents()
+        window._resize_completed_cycle_columns()
+        compact_widths = [table.columnWidth(column) for column in range(7)]
+        self.assertTrue(all(
+            actual >= minimum
+            for actual, minimum in zip(
+                compact_widths,
+                window._completed_cycle_column_minimum_widths(),
+            )
+        ))
+        self.assertEqual(0, table.horizontalScrollBar().maximum())
+
+    def test_user_owned_geometry_survives_result_apply_and_all_section_toggles(self):
+        window = self._window()
+        window._available_signal_validation_geometry = lambda: QRect(0, 0, 2400, 1400)
+        window.show()
+        window._initial_natural_fit_pending = True
+        window._initial_geometry_committed = False
+        window._fit_signal_validation_window()
+        self.app.processEvents()
+
+        user_size = window.size() + QSize(120, 70)
+        user_position = QPoint(151, 179)
+        window.resize(user_size)
+        window.move(user_position)
+        window._user_geometry_owned = True
+        expected_geometry = window.geometry()
+
+        window._request_validation()
+        window.set_replay_snapshot(self._snapshot([
+            self._entry("BUY", 0, signal="BUY"),
+            self._entry("SELL", 1, signal="SELL"),
+        ]))
+        window._request_settings_apply()
+        window.show_settings_apply_result("설정 반영 완료", success=True)
+        for toggle in (
+            window._toggle_recent_stock_row,
+            window._toggle_recent_stock_row,
+            lambda: window._toggle_control_section_mode("buy"),
+            lambda: window._toggle_control_section_mode("buy"),
+            lambda: window._toggle_control_section_mode("sell"),
+            lambda: window._toggle_control_section_mode("sell"),
+        ):
+            toggle()
+            self.app.processEvents()
+            self.assertEqual(expected_geometry, window.geometry())
 
     def test_initial_and_changed_candle_counts_drive_requests_but_not_apply(self):
         window = self._window()

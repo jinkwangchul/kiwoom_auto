@@ -640,7 +640,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(4, layout.indexOf(window.primary_validation_action_button))
         self.assertEqual(5, layout.indexOf(window.close_button))
 
-    def test_estimated_return_uses_all_earlier_buys_and_latest_sell(self):
+    def test_estimated_return_uses_last_completed_cycle_and_ignores_trailing_sell(self):
         snapshot = self._replay_snapshot([
             self._entry("BUY", 0, "BUY"),
             self._entry("BUY", 1, "BUY"),
@@ -654,6 +654,17 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self._entry("SELL", 2, "SELL"),
         ], closes=(0.0, 120.0, 150.0))
         self.assertIsNone(estimated_signal_return_percent(invalid))
+        trailing_sell = self._replay_snapshot([
+            self._entry("BUY", 0, "BUY"),
+            self._entry("SELL", 1, "SELL"),
+            self._entry("SELL", 2, "SELL"),
+        ], closes=(100.0, 110.0, 105.0))
+        self.assertAlmostEqual(10.0, estimated_signal_return_percent(trailing_sell))
+
+        window = self._window()
+        window.set_replay_snapshot(trailing_sell)
+        self.assertEqual(1, len(window.completed_cycles))
+        self.assertEqual("|  추정 손익률 +10.00%", window.estimated_return_label.text())
 
     def test_result_chart_markers_selection_trace_and_estimate_are_real(self):
         window = self._window()
@@ -1138,7 +1149,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual([], window._entries)
         self.assertIsNone(window.selected_evaluation_index)
         self.assertEqual(0, window.completed_cycle_table.rowCount())
-        self.assertTrue(window.completed_cycle_table.isHidden())
+        self.assertFalse(window.completed_cycle_table.isHidden())
         self.assertFalse(window.completed_cycle_empty_label.isHidden())
         self.assertEqual("|  추정 손익률 -", window.estimated_return_label.text())
         self.assertIn("준비 중", window.validation_status_label.text())

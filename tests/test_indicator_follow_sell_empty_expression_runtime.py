@@ -353,7 +353,7 @@ class SellEmptyExpressionV2IntegrationTest(unittest.TestCase):
             self.assertIn("SELL 0", window.result_summary_label.text())
             self.assertFalse(hasattr(window, "signal_list_table"))
             self.assertEqual(0, window.completed_cycle_table.rowCount())
-            self.assertTrue(window.completed_cycle_table.isHidden())
+            self.assertFalse(window.completed_cycle_table.isHidden())
             self.assertFalse(window.completed_cycle_empty_label.isHidden())
             self.assertTrue(any(
                 tooltip.startswith("BUY ·")
