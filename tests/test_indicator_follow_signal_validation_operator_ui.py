@@ -13,7 +13,15 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
-from PyQt5.QtWidgets import QApplication, QAbstractSpinBox, QDialog, QScrollArea
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import (
+    QApplication,
+    QAbstractSpinBox,
+    QComboBox,
+    QDialog,
+    QLabel,
+    QScrollArea,
+)
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_flow as flow_module
@@ -211,6 +219,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
     def test_compact_header_and_independent_sections_have_no_settings_scrollbar(self):
         window = self._window()
         self.assertEqual("005930 삼성전자", window.compact_stock_label.text())
+        self.assertIsInstance(window.compact_stock_label, QLabel)
+        self.assertNotIsInstance(window.compact_stock_label, QComboBox)
+        self.assertFalse(hasattr(window, "compact_stock_selector"))
+        self.assertEqual("▶", window.compact_header_arrow.text())
+        self.assertEqual([], window.compact_stock_display.findChildren(QComboBox))
         self.assertEqual("5", window.basic_signal_interval_combo.currentText())
         self.assertEqual(100, window.historical_candle_count_spin.value())
         self.assertEqual(
@@ -246,6 +259,40 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window._toggle_control_section_mode("buy")
         self.assertFalse(window.buy_detail_expanded)
         self.assertTrue(window.sell_detail_expanded)
+
+    def test_recent_popup_is_floating_and_never_changes_window_geometry(self):
+        window = self._window()
+        window.set_recent_stocks((
+            ValidationStockRef("005930", "삼성전자"),
+            ValidationStockRef("000660", "SK하이닉스"),
+        ))
+        window.show()
+        self.app.processEvents()
+        before_size = window.size()
+        before_header_height = window.basic_box.height()
+        before_buy_position = window.buy_box.pos()
+        before_sell_position = window.sell_box.pos()
+
+        QTest.mouseClick(window.compact_header_arrow, Qt.LeftButton)
+        self.app.processEvents()
+        popup = window.compact_stock_display.recent_popup
+        self.assertTrue(popup.isVisible())
+        self.assertTrue(popup.windowFlags() & Qt.Popup)
+        self.assertEqual(before_size, window.size())
+        self.assertEqual(before_header_height, window.basic_box.height())
+        self.assertEqual(before_buy_position, window.buy_box.pos())
+        self.assertEqual(before_sell_position, window.sell_box.pos())
+
+        QTest.mouseClick(window.validation_status_label, Qt.LeftButton)
+        self.app.processEvents()
+        self.assertFalse(popup.isVisible())
+
+        QTest.mouseClick(window.compact_header_arrow, Qt.LeftButton)
+        self.app.processEvents()
+        self.assertTrue(popup.isVisible())
+        window.close()
+        self.app.processEvents()
+        self.assertFalse(popup.isVisible())
 
     def test_existing_registration_basic_controls_remain_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:

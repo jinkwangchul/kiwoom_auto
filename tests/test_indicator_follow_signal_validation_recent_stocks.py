@@ -12,13 +12,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QEvent, QSettings, Qt
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QComboBox
 
 from gui_indicator_follow_signal_validation_flow import (
     IndicatorFollowSignalValidationFlow,
 )
 from gui_indicator_follow_signal_validation_window import (
-    IndicatorFollowSignalValidationStockSelector,
+    IndicatorFollowSignalValidationStockDisplay,
 )
 from gui_stock_data import (
     STOCK_LIBRARY_READY,
@@ -48,15 +48,6 @@ class _FakeSettings:
 
     def sync(self):
         self.sync_calls += 1
-
-
-class _Selector(IndicatorFollowSignalValidationStockSelector):
-    def __init__(self):
-        super().__init__()
-        self.popup_count = 0
-
-    def showPopup(self):
-        self.popup_count += 1
 
 
 class _ConnectedBroker:
@@ -103,7 +94,7 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         self.app.processEvents()
 
     def _selector(self):
-        selector = _Selector()
+        selector = IndicatorFollowSignalValidationStockDisplay()
         selector.resize(320, 30)
         selector.show()
         self.widgets.append(selector)
@@ -201,55 +192,55 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         payload = json.loads(settings.stored_value)
         self.assertEqual(["000001", "000002"], [item["code"] for item in payload])
 
-    def test_single_double_and_right_click_contract(self):
+    def test_arrow_popup_and_plain_stock_label_click_contract(self):
         selector = self._selector()
+        selector.set_recent_stocks((
+            ValidationStockRef("005930", "삼성전자"),
+            ValidationStockRef("000660", "SK하이닉스"),
+        ))
         selections = []
         selector.full_stock_selection_requested.connect(lambda: selections.append(True))
 
-        QTest.mouseClick(selector, Qt.LeftButton)
-        self.assertEqual(0, selector.popup_count)
-        self.assertTrue(selector._single_click_timer.isActive())
-        QTest.qWait(QApplication.doubleClickInterval() + 20)
-        self.assertEqual(1, selector.popup_count)
-
-        selector = self._selector()
-        selections = []
-        selector.full_stock_selection_requested.connect(lambda: selections.append(True))
-        QTest.mouseDClick(selector, Qt.LeftButton)
-        QTest.qWait(QApplication.doubleClickInterval() + 20)
+        QTest.mouseClick(selector.stock_label, Qt.LeftButton)
+        self.assertEqual([], selections)
+        self.assertFalse(selector.recent_popup.isVisible())
+        QTest.mouseDClick(selector.stock_label, Qt.LeftButton)
         self.assertEqual([True], selections)
-        self.assertEqual(0, selector.popup_count)
-        self.assertFalse(selector._single_click_timer.isActive())
 
-        selector = self._selector()
-        selections = []
-        selector.full_stock_selection_requested.connect(lambda: selections.append(True))
-        QTest.mouseClick(selector, Qt.LeftButton)
-        QTest.mouseDClick(selector, Qt.LeftButton)
-        QTest.qWait(QApplication.doubleClickInterval() + 20)
+        QTest.mouseClick(selector.stock_label, Qt.RightButton)
         self.assertEqual([True], selections)
-        self.assertEqual(0, selector.popup_count)
-        self.assertFalse(selector._single_click_timer.isActive())
+        self.assertFalse(selector.recent_popup.isVisible())
 
-        QTest.mouseClick(selector, Qt.RightButton)
-        QTest.qWait(QApplication.doubleClickInterval() + 20)
-        self.assertEqual([True], selections)
-        self.assertEqual(0, selector.popup_count)
+        QTest.mouseClick(selector.arrow_button, Qt.LeftButton)
+        self.app.processEvents()
+        self.assertTrue(selector.recent_popup.isVisible())
+        self.assertTrue(selector.recent_popup.windowFlags() & Qt.Popup)
+        QTest.mouseClick(selector.arrow_button, Qt.LeftButton)
+        self.app.processEvents()
+        self.assertFalse(selector.recent_popup.isVisible())
 
     def test_recent_popup_emits_only_explicit_activated_selection(self):
         selector = self._selector()
-        a = ValidationStockRef("005930", "삼성전자")
-        b = ValidationStockRef("000660", "SK하이닉스")
+        stocks = tuple(
+            ValidationStockRef(f"{index:06d}", f"종목{index}")
+            for index in range(1, 18)
+        )
         selected = []
         selector.recent_stock_activated.connect(selected.append)
-        selector.set_recent_stocks((a, b))
-        selector.set_current_stock(a)
+        selector.set_recent_stocks(stocks)
+        selector.set_current_stock(stocks[0])
         self.assertEqual([], selected)
-        selector.activated[int].emit(1)
-        self.assertEqual([b], selected)
-        self.assertFalse(selector.isEditable())
-        self.assertIn("width: 0", selector.styleSheet())
-        self.assertEqual(2, selector.count())
+        self.assertEqual(15, len(selector.recent_stocks))
+        self.assertEqual(15, selector.recent_popup.stock_list.count())
+        self.assertFalse(isinstance(selector.stock_label, QComboBox))
+        self.assertEqual("000001 종목1", selector.stock_label.text())
+
+        QTest.mouseClick(selector.arrow_button, Qt.LeftButton)
+        self.app.processEvents()
+        item = selector.recent_popup.stock_list.item(1)
+        selector.recent_popup.stock_list.itemClicked.emit(item)
+        self.assertEqual([stocks[1]], selected)
+        self.assertFalse(selector.recent_popup.isVisible())
 
     def test_tooltip_uses_only_loaded_static_metadata_and_hides_on_boundaries(self):
         selector = self._selector()
@@ -290,9 +281,9 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
                 "증거금", "신용가능", "담보대출",
             ):
                 self.assertNotIn(excluded, tooltip)
-            selector.enterEvent(QEvent(QEvent.Enter))
+            QApplication.sendEvent(selector.stock_label, QEvent(QEvent.Enter))
             show_tooltip.assert_called_once()
-            selector.leaveEvent(QEvent(QEvent.Leave))
+            QApplication.sendEvent(selector.stock_label, QEvent(QEvent.Leave))
             self.assertTrue(hide_tooltip.called)
 
             hide_tooltip.reset_mock()
@@ -315,7 +306,7 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
 
             show_tooltip.reset_mock()
             selector.set_current_stock(None)
-            selector.enterEvent(QEvent(QEvent.Enter))
+            QApplication.sendEvent(selector.stock_label, QEvent(QEvent.Enter))
             show_tooltip.assert_not_called()
             self.assertEqual("", selector.tooltip_text)
 
