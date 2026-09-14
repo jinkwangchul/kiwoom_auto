@@ -437,8 +437,8 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
         self.stock_label.setMinimumWidth(232)
         self.stock_label.setFixedHeight(30)
         self.stock_label.setStyleSheet(
-            "font-size: 13pt; font-weight: bold; padding: 0 4px;"
-            "QToolTip { font-size: 12pt; }"
+            "QLabel { font-size: 13pt; font-weight: bold; padding: 0 4px; }"
+            "QToolTip { font-size: 12pt; font-weight: normal; }"
         )
         self.stock_label.setCursor(Qt.PointingHandCursor)
         self.stock_label.installEventFilter(self)

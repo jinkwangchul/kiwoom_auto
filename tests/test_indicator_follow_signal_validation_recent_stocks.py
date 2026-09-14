@@ -244,6 +244,15 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
 
     def test_tooltip_uses_only_loaded_static_metadata_and_hides_on_boundaries(self):
         selector = self._selector()
+        self.assertTrue(selector.stock_label.font().bold())
+        self.assertIn(
+            "QLabel { font-size: 13pt; font-weight: bold; padding: 0 4px; }",
+            selector.stock_label.styleSheet(),
+        )
+        self.assertIn(
+            "QToolTip { font-size: 12pt; font-weight: normal; }",
+            selector.stock_label.styleSheet(),
+        )
         stock = ValidationStockRef("005930", "삼성전자")
         metadata = {
             "market": "KOSPI",
