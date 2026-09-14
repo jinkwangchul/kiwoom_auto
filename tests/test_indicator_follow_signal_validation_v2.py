@@ -60,6 +60,21 @@ class _FakeBroker:
         return self.connected
 
 
+class _SnapshotBroker(_FakeBroker):
+    def __init__(self, connected=True):
+        super().__init__(connected)
+        self.market_snapshot_requests = []
+
+    def request_initial_market_snapshot(self, stock_codes, *, callback=None):
+        self.market_snapshot_requests.append((tuple(stock_codes), callback))
+        return {
+            "ok": True,
+            "status": "ENQUEUED",
+            "target_stock_codes": list(stock_codes),
+            "batch_count": 1,
+        }
+
+
 class _FakeHost(QObject):
     validation_session_ready = pyqtSignal(object)
     validation_blocked = pyqtSignal(str)
@@ -746,6 +761,110 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             third = created[-1]
             self.assertEqual(other, third.stock)
             self.assertEqual(1, len(callbacks))
+
+    def test_selected_stock_snapshot_merges_static_metadata_and_rejects_stale_result(self):
+        first = self.stock
+        second = ValidationStockRef("000660", "SK하이닉스")
+        broker = _SnapshotBroker(True)
+        created = []
+
+        class Provider:
+            def __init__(_self, session, requester):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                return None
+
+        def window_factory(stock, seed, parent=None):
+            window = _FakeWindow(stock, seed, parent)
+            self.widgets.append(window)
+            created.append(window)
+            return window
+
+        store = _MemoryRecentStockStore(
+            (first,),
+            metadata={
+                first.code: {
+                    "market": "KOSPI",
+                    "status": "정상",
+                    "nxt_available": True,
+                },
+                second.code: {
+                    "market": "KOSPI",
+                    "status": "정상",
+                    "nxt_available": False,
+                },
+            },
+        )
+        flow = IndicatorFollowSignalValidationFlow(
+            broker,
+            host=_FakeHost(first),
+            historical_provider_factory=Provider,
+            window_factory=window_factory,
+            recent_stock_store=store,
+        )
+        carrier = type(
+            "Carrier",
+            (QDialog,),
+            {"signal_validation_requested": pyqtSignal(object)},
+        )()
+        self.widgets.append(carrier)
+        flow.bind_dialog(carrier)
+        with patch.object(flow_module.QTimer, "singleShot"):
+            carrier.signal_validation_requested.emit(self._seed())
+        window = created[0]
+
+        self.assertEqual([((first.code,), broker.market_snapshot_requests[0][1])], broker.market_snapshot_requests)
+        first_callback = broker.market_snapshot_requests[0][1]
+        first_callback({
+            "ok": True,
+            "rows": [{
+                "stock_code": first.code,
+                "current_price": 249500,
+                "open_price": 249000,
+                "high_price": 250500,
+                "low_price": 248500,
+                "change_rate": -3.85,
+                "execution_strength": 83.9,
+                "previous_day_volume_rate": -38.26,
+                "cumulative_trading_value": 123456,
+                "cumulative_volume": 7890,
+                "market_capitalization": 456789,
+            }],
+        })
+        merged = window.stock_metadata_projections[-1]
+        self.assertEqual("KOSPI", merged["market"])
+        self.assertEqual("정상", merged["status"])
+        self.assertIs(True, merged["nxt_available"])
+        self.assertEqual(249500, merged["current_price"])
+        self.assertEqual(249000, merged["open_price"])
+        self.assertEqual(250500, merged["high_price"])
+        self.assertEqual(248500, merged["low_price"])
+        self.assertEqual(-3.85, merged["change_rate"])
+        self.assertEqual(83.9, merged["execution_strength"])
+        self.assertEqual(-38.26, merged["previous_day_volume_rate"])
+        self.assertEqual(123456, merged["cumulative_trading_value"])
+        self.assertEqual(7890, merged["cumulative_volume"])
+        self.assertEqual(456789, merged["market_capitalization"])
+
+        window.recent_stock_selected.emit(second)
+        self.assertEqual((second.code,), broker.market_snapshot_requests[-1][0])
+        projections_after_selection = len(window.stock_metadata_projections)
+        first_callback({
+            "ok": True,
+            "rows": [{"stock_code": first.code, "current_price": 999999}],
+        })
+        self.assertEqual(projections_after_selection, len(window.stock_metadata_projections))
+
+        second_callback = broker.market_snapshot_requests[-1][1]
+        second_callback({
+            "ok": True,
+            "rows": [{"stock_code": "A000660", "current_price": 123000}],
+        })
+        second_metadata = window.stock_metadata_projections[-1]
+        self.assertEqual("KOSPI", second_metadata["market"])
+        self.assertIs(False, second_metadata["nxt_available"])
+        self.assertEqual(123000, second_metadata["current_price"])
 
     def test_stock_change_clears_result_and_rejects_late_historical_callback(self):
         host = _FakeHost(self.stock)

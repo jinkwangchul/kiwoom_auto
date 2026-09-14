@@ -39,10 +39,23 @@ from routines.지표추종매매.routine_validation_replay import (
     ValidationReplayResult,
 )
 from routines.지표추종매매.routine_validation_session import ValidationSession
+from stock_code_contract import normalize_broker_stock_code
 
 
 DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 100
 _OWNER_FLOW_ATTRIBUTE = "_indicator_follow_signal_validation_flow"
+_MARKET_SNAPSHOT_FIELDS = (
+    "current_price",
+    "open_price",
+    "high_price",
+    "low_price",
+    "change_rate",
+    "execution_strength",
+    "previous_day_volume_rate",
+    "cumulative_trading_value",
+    "cumulative_volume",
+    "market_capitalization",
+)
 
 
 class IndicatorFollowSignalValidationFlow(QObject):
@@ -97,6 +110,8 @@ class IndicatorFollowSignalValidationFlow(QObject):
         self._bound_dialog_ids: set[int] = set()
         self._open_windows: dict[int, object] = {}
         self._request_generation: dict[int, int] = {}
+        self._market_snapshot_generation: dict[int, int] = {}
+        self._market_snapshot_metadata: dict[int, tuple[str, dict[str, object]]] = {}
         self._active_providers: dict[tuple[int, int], object] = {}
         self._host.validation_blocked.connect(self._forward_host_failure)
 
@@ -283,6 +298,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             key = id(window)
             self._open_windows[key] = window
             self._request_generation[key] = 0
+            self._market_snapshot_generation[key] = 0
             destroyed = getattr(window, "destroyed", None)
             if callable(getattr(destroyed, "connect", None)):
                 destroyed.connect(
@@ -290,6 +306,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 )
             window.show()
             if self._last_selected_stock is not None:
+                self._request_market_snapshot_for_window(window)
                 initial_request = getattr(window, "request_initial_validation", None)
                 if not callable(initial_request):
                     raise TypeError("initial signal validation request is unavailable")
@@ -351,6 +368,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         self._last_selected_stock = ValidationStockRef(selected.code, selected.name)
         self._remember_stock(selected)
         self._refresh_open_window_stock_projections()
+        self._request_market_snapshot_for_window(window)
         request_validation()
 
     def _remember_stock(self, stock: ValidationStockRef) -> bool:
@@ -374,7 +392,73 @@ class IndicatorFollowSignalValidationFlow(QObject):
             set_recent(self._read_recent_stocks())
         set_metadata = getattr(window, "set_stock_metadata", None)
         if callable(set_metadata):
-            set_metadata(self._metadata_for(getattr(window, "stock", None)))
+            stock = getattr(window, "stock", None)
+            metadata = self._metadata_for(stock) or {}
+            snapshot_projection = self._market_snapshot_metadata.get(id(window))
+            if (
+                isinstance(stock, ValidationStockRef)
+                and snapshot_projection is not None
+                and snapshot_projection[0] == stock.code
+            ):
+                metadata.update(snapshot_projection[1])
+            set_metadata(metadata or None)
+
+    def _request_market_snapshot_for_window(self, window: object) -> None:
+        window_key = id(window)
+        stock = getattr(window, "stock", None)
+        if (
+            window_key not in self._open_windows
+            or not isinstance(stock, ValidationStockRef)
+            or not stock.code
+        ):
+            return
+        request = getattr(self._broker, "request_initial_market_snapshot", None)
+        if not callable(request):
+            return
+        generation = self._market_snapshot_generation.get(window_key, 0) + 1
+        self._market_snapshot_generation[window_key] = generation
+        expected_code = stock.code
+        window_ref = weakref.ref(window)
+
+        def completed(result: object) -> None:
+            target = window_ref()
+            if (
+                target is None
+                or self._market_snapshot_generation.get(window_key) != generation
+            ):
+                return
+            current_stock = getattr(target, "stock", None)
+            if (
+                not isinstance(current_stock, ValidationStockRef)
+                or current_stock.code != expected_code
+            ):
+                return
+            payload = dict(result) if isinstance(result, dict) else {}
+            rows = payload.get("rows")
+            if payload.get("ok") is not True or not isinstance(rows, list):
+                return
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_code = normalize_broker_stock_code(row.get("stock_code"))
+                if row_code != expected_code:
+                    continue
+                projection = {
+                    field: row.get(field)
+                    for field in _MARKET_SNAPSHOT_FIELDS
+                    if field in row
+                }
+                self._market_snapshot_metadata[window_key] = (
+                    expected_code,
+                    projection,
+                )
+                self._sync_window_stock_projection(target)
+                return
+
+        try:
+            request((expected_code,), callback=completed)
+        except Exception:
+            return
 
     def _refresh_open_window_stock_projections(self) -> None:
         for window in tuple(self._open_windows.values()):
@@ -400,6 +484,9 @@ class IndicatorFollowSignalValidationFlow(QObject):
     def _invalidate_window_requests(self, window_key: int) -> None:
         if window_key in self._request_generation:
             self._request_generation[window_key] += 1
+        if window_key in self._market_snapshot_generation:
+            self._market_snapshot_generation[window_key] += 1
+        self._market_snapshot_metadata.pop(window_key, None)
 
     @staticmethod
     def _request_initial_validation(window: object) -> None:
@@ -448,6 +535,8 @@ class IndicatorFollowSignalValidationFlow(QObject):
     def _release_window(self, window_key: int) -> None:
         self._open_windows.pop(window_key, None)
         self._request_generation.pop(window_key, None)
+        self._market_snapshot_generation.pop(window_key, None)
+        self._market_snapshot_metadata.pop(window_key, None)
         for request_key in list(self._active_providers):
             if request_key[0] == window_key:
                 self._active_providers.pop(request_key, None)

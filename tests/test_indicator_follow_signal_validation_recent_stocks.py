@@ -367,14 +367,17 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             self.assertEqual("", selector.tooltip_text)
 
     def test_source_boundaries_exclude_main_runtime_broker_and_mock_resolvers(self):
-        sources = "\n".join(
-            (self.project_root / path).read_text(encoding="utf-8")
-            for path in (
-                "gui_indicator_follow_signal_validation_window.py",
-                "gui_indicator_follow_signal_validation_flow.py",
-                "indicator_follow_signal_validation_recent_stocks.py",
-            )
-        )
+        window_source = (
+            self.project_root / "gui_indicator_follow_signal_validation_window.py"
+        ).read_text(encoding="utf-8")
+        flow_source = (
+            self.project_root / "gui_indicator_follow_signal_validation_flow.py"
+        ).read_text(encoding="utf-8")
+        sources = "\n".join((
+            window_source,
+            flow_source,
+            (self.project_root / "indicator_follow_signal_validation_recent_stocks.py").read_text(encoding="utf-8"),
+        ))
         for forbidden in (
             "MAX_RECENT_STOCKS",
             "IndicatorFollowSignalValidationRecentStockPopup",
@@ -383,13 +386,14 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             "gui_main_table_loader",
             "main_monitoring_auto_trade_operation_host",
             "_main_stock_live_tooltip",
-            "request_initial_market_snapshot",
             "request_stock_ranking_snapshot",
             "SetRealReg",
             "gui_market_data_host",
             "mock_validation",
         ):
             self.assertNotIn(forbidden, sources)
+        self.assertNotIn("request_initial_market_snapshot", window_source)
+        self.assertIn("request_initial_market_snapshot", flow_source)
 
 
 if __name__ == "__main__":

@@ -872,6 +872,10 @@ class IndicatorFollowSignalValidationWindow(
         for name, header_widget, title_widget, _title_text in header_contracts:
             header_layout = header_widget.layout()
             header_layout.setAlignment(Qt.AlignVCenter)
+            for index in range(header_layout.count()):
+                widget = header_layout.itemAt(index).widget()
+                if widget is not None:
+                    header_layout.setAlignment(widget, Qt.AlignVCenter)
             title_widget.setFixedWidth(common_title_width)
             title_widget.setFixedHeight(30)
             title_widget.setAlignment(Qt.AlignCenter)

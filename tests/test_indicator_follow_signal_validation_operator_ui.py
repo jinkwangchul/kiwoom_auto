@@ -459,16 +459,24 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ]
         self.assertLessEqual(max(following_start_xs) - min(following_start_xs), 1)
         header_center_ys = [header.rect().center().y() for header in headers]
-        for header, title, separator, following in zip(
-            headers,
-            titles,
-            separators,
-            following_widgets,
-        ):
+        for header in headers:
             expected_center_y = header.rect().center().y()
-            for widget in (title, separator, following):
+            header_widgets = [
+                header.layout().itemAt(index).widget()
+                for index in range(header.layout().count())
+                if header.layout().itemAt(index).widget() is not None
+            ]
+            for widget in header_widgets:
                 actual_center_y = widget.mapTo(header, widget.rect().center()).y()
                 self.assertLessEqual(abs(actual_center_y - expected_center_y), 1)
+        compact_stock_center_y = window.compact_stock_label.mapTo(
+            window.basic_header_widget,
+            window.compact_stock_label.rect().center(),
+        ).y()
+        self.assertLessEqual(
+            abs(compact_stock_center_y - window.basic_header_widget.rect().center().y()),
+            1,
+        )
         self.assertLessEqual(max(header_center_ys) - min(header_center_ys), 1)
 
         button_style = window.stock_selection_button.styleSheet()
