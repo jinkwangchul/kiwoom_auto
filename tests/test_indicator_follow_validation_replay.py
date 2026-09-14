@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import ast
 from dataclasses import FrozenInstanceError
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
 from engines.signal_result import RoutineSignal
+from indicator_follow_signal_validation_projection import (
+    build_validation_average_price_context,
+)
 from routines.지표추종매매.routine_validation_contract import (
     ValidationRequest,
     ValidationSettingsSnapshot,
@@ -23,6 +27,7 @@ from routines.지표추종매매.routine_validation_replay import (
     REASON_INVALID_ROUTINE_SIGNAL,
     REASON_NO_VALID_CANDLES,
     ValidationHistoricalReplay,
+    ValidationReplayEntry,
     project_validation_candles,
 )
 from routines.지표추종매매.routine_validation_session import (
@@ -418,6 +423,128 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         self.assertEqual(expected_entries, [entry.to_dict() for entry in snapshot.to_entries()])
         with self.assertRaises(FrozenInstanceError):
             snapshot.candle_count = 0
+
+    def test_context_prior_entries_container_and_nested_values_are_detached(self) -> None:
+        observed = {
+            "container_mutated": False,
+            "entry_frozen": False,
+            "nested_values_mutated": False,
+        }
+
+        def evaluator(candles, config, context):
+            side = context["_indicator_follow_evaluate_side"]
+            observer = context["decision_trace_observer"]
+            observer.observe_condition({"nested": {"value": len(candles)}})
+            return RoutineSignal(
+                side,
+                "fixture",
+                ["fixture_group"],
+                ["fixture_detail"],
+                len(candles) - 1,
+                0,
+            )
+
+        def mutating_context_provider(_index, _side, _candles, prior_entries):
+            if prior_entries:
+                entry = prior_entries[0]
+                with self.assertRaises(FrozenInstanceError):
+                    entry.reason = "mutated"
+                observed["entry_frozen"] = True
+
+                matched_groups = entry.matched_groups
+                details = entry.details
+                trace = entry.trace
+                matched_groups.append("mutated")
+                details.append("mutated")
+                trace["conditions"][0]["nested"]["value"] = -1
+                observed["nested_values_mutated"] = True
+
+            prior_entries.append("foreign")
+            prior_entries.clear()
+            observed["container_mutated"] = True
+            return {}
+
+        result = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=evaluator,
+        ).evaluate_with_context(
+            self._historical(closes=(10, 11, 12)),
+            context_provider=mutating_context_provider,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual(
+            {
+                "container_mutated": True,
+                "entry_frozen": True,
+                "nested_values_mutated": True,
+            },
+            observed,
+        )
+        entries = result.snapshot.to_entries()
+        self.assertEqual(6, len(entries))
+        self.assertTrue(all(entry.reason == "fixture" for entry in entries))
+        self.assertTrue(all(entry.matched_groups == ["fixture_group"] for entry in entries))
+        self.assertTrue(all(entry.details == ["fixture_detail"] for entry in entries))
+        self.assertTrue(all(
+            entry.trace["conditions"][0]["nested"]["value"]
+            == entry.evaluation_index + 1
+            for entry in entries
+        ))
+
+    def test_context_entry_reuse_is_byte_equivalent_to_deep_recreation(self) -> None:
+        def deep_recreated_context_provider(index, side, candles, prior_entries):
+            recreated = [
+                ValidationReplayEntry(**entry.to_dict())
+                for entry in prior_entries
+            ]
+            return build_validation_average_price_context(
+                index,
+                side,
+                candles,
+                recreated,
+            )
+
+        historical = self._historical(closes=(10, 11, 12, 13, 9))
+        optimized = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            historical,
+            context_provider=build_validation_average_price_context,
+        )
+        reference = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            historical,
+            context_provider=deep_recreated_context_provider,
+        )
+
+        self.assertTrue(optimized.ok, optimized)
+        self.assertTrue(reference.ok, reference)
+
+        def canonical(snapshot):
+            return json.dumps(
+                {
+                    "stock": {
+                        "code": snapshot.stock.code,
+                        "name": snapshot.stock.name,
+                    },
+                    "timeframe_minutes": snapshot.timeframe_minutes,
+                    "settings_hash": snapshot.settings_hash,
+                    "historical_request_id": snapshot.historical_request_id,
+                    "candle_count": snapshot.candle_count,
+                    "evaluated_start_index": snapshot.evaluated_start_index,
+                    "evaluated_end_index": snapshot.evaluated_end_index,
+                    "dropped_raw_rows_count": snapshot.dropped_raw_rows_count,
+                    "candles": snapshot.to_candles(),
+                    "entries": [
+                        entry.to_dict()
+                        for entry in snapshot.to_entries()
+                    ],
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        self.assertEqual(canonical(reference.snapshot), canonical(optimized.snapshot))
 
     def test_snapshot_metadata_preserves_validation_identity(self) -> None:
         result = ValidationHistoricalReplay(self._session()).evaluate(

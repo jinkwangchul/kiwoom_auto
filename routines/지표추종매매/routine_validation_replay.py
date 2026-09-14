@@ -371,7 +371,7 @@ class ValidationHistoricalReplay:
                             evaluation_index,
                             side,
                             _fresh_json(prefix_json),
-                            [_copy_entry(entry) for entry in entries],
+                            list(entries),
                         )
                         if not isinstance(supplied, dict):
                             raise TypeError("context_provider must return a mapping")
