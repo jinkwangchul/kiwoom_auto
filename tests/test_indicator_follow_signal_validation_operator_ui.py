@@ -259,13 +259,22 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertEqual([], window.control_tab.findChildren(QScrollArea))
 
         window._show_with_initial_control_section_state()
-        self.assertTrue(window.buy_detail_expanded)
+        self.assertEqual("summary", window._control_section_mode)
+        self.assertFalse(window.buy_detail_expanded)
         self.assertFalse(window.sell_detail_expanded)
+        self.assertTrue(window.basic_box.isVisible())
+        self.assertTrue(window.buy_box.isVisible())
+        self.assertTrue(window.sell_box.isVisible())
+        self.assertEqual("▶ 기본설정", window.basic_toggle_button.text())
+        self.assertEqual("▶ 매수설정", window.buy_title.text())
+        self.assertEqual("▶ 매도설정", window.sell_title.text())
+        self.assertFalse(window.buy_detail_widget.isVisible())
+        self.assertFalse(window.sell_detail_widget.isVisible())
         window._toggle_control_section_mode("sell")
-        self.assertTrue(window.buy_detail_expanded)
+        self.assertFalse(window.buy_detail_expanded)
         self.assertTrue(window.sell_detail_expanded)
         window._toggle_control_section_mode("buy")
-        self.assertFalse(window.buy_detail_expanded)
+        self.assertTrue(window.buy_detail_expanded)
         self.assertTrue(window.sell_detail_expanded)
 
     def test_recent_row_toggles_inline_as_exactly_one_line(self):
@@ -283,11 +292,16 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         before_header_height = window.basic_box.height()
         before_buy_position = window.buy_box.pos()
         before_sell_position = window.sell_box.pos()
+        selection_requests = []
+        window.stock_selection_requested.connect(
+            lambda: selection_requests.append(True)
+        )
 
         QTest.mouseClick(window.compact_header_arrow, Qt.LeftButton)
         self.app.processEvents()
         self.assertEqual("▼ 기본설정", window.compact_header_arrow.text())
         self.assertTrue(window.recent_stock_row.isVisible())
+        self.assertTrue(window.stock_selection_button.isVisible())
         self.assertGreater(window.basic_box.height(), before_header_height)
         self.assertGreater(window.buy_box.pos().y(), before_buy_position.y())
         self.assertGreater(window.sell_box.pos().y(), before_sell_position.y())
@@ -301,6 +315,38 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             1,
             len({button.pos().y() for button in window.recent_stock_row.stock_buttons}),
         )
+        panel_margins = window.recent_stock_panel_layout.contentsMargins()
+        self.assertGreater(panel_margins.left(), 0)
+        self.assertGreater(panel_margins.top(), 0)
+        self.assertGreater(panel_margins.right(), 0)
+        self.assertGreater(panel_margins.bottom(), 0)
+        select_center_y = window.stock_selection_button.mapTo(
+            window.recent_stock_panel,
+            window.stock_selection_button.rect().center(),
+        ).y()
+        recent_center_y = window.recent_stock_row.mapTo(
+            window.recent_stock_panel,
+            window.recent_stock_row.rect().center(),
+        ).y()
+        self.assertLessEqual(abs(select_center_y - recent_center_y), 1)
+        select_right_x = window.stock_selection_button.mapTo(
+            window.basic_box,
+            window.stock_selection_button.rect().topRight(),
+        ).x()
+        basic_center_x = window.basic_toggle_button.mapTo(
+            window.basic_box,
+            window.basic_toggle_button.rect().center(),
+        ).x()
+        self.assertEqual(basic_center_x, select_right_x)
+        self.assertGreater(
+            window.stock_selection_button.mapTo(
+                window.basic_box,
+                window.stock_selection_button.rect().topLeft(),
+            ).y(),
+            window.basic_box.rect().top(),
+        )
+        QTest.mouseClick(window.stock_selection_button, Qt.LeftButton)
+        self.assertEqual([True], selection_requests)
 
         QTest.mouseClick(window.compact_header_arrow, Qt.LeftButton)
         self.app.processEvents()

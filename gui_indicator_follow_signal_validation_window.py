@@ -722,8 +722,31 @@ class IndicatorFollowSignalValidationWindow(
         self.recent_stock_row.projection_fitted.connect(
             self.recent_stocks_fitted.emit
         )
+        self.recent_stock_panel = QWidget()
+        self.recent_stock_panel_layout = QHBoxLayout(self.recent_stock_panel)
+        self.recent_stock_panel_layout.setContentsMargins(4, 3, 4, 3)
+        self.recent_stock_panel_layout.setSpacing(8)
+        self.stock_selection_button = QPushButton("종목선택")
+        self.stock_selection_button.setFixedHeight(26)
+        self.stock_selection_button.setCursor(Qt.PointingHandCursor)
+        self.stock_selection_button.setStyleSheet(
+            "QPushButton { font-size: 9pt; padding: 0 3px; }"
+        )
+        self.stock_selection_button.clicked.connect(
+            lambda _checked=False: self.stock_selection_requested.emit()
+        )
+        self.recent_stock_panel_layout.addWidget(self.stock_selection_button)
+        self.recent_stock_panel_layout.addWidget(self.recent_stock_row, 1)
+        self.recent_stock_panel.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
+        self.recent_stock_panel_layout.activate()
+        self.recent_stock_panel.setFixedHeight(
+            self.recent_stock_panel_layout.sizeHint().height()
+        )
         self._recent_stock_row_expanded = False
-        self.recent_stock_row.setVisible(False)
+        self.recent_stock_panel.setVisible(False)
         self.compact_stock_display.set_current_stock(self.stock)
         self.basic_signal_interval_combo = QComboBox()
         self.basic_signal_interval_combo.addItems(
@@ -752,7 +775,7 @@ class IndicatorFollowSignalValidationWindow(
         header_row.addWidget(QLabel("봉"))
         header_row.addStretch(1)
         basic_layout.addWidget(header_widget)
-        basic_layout.addWidget(self.recent_stock_row)
+        basic_layout.addWidget(self.recent_stock_panel)
         self.basic_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         basic_layout.activate()
         self.basic_box.setFixedHeight(basic_layout.sizeHint().height())
@@ -789,7 +812,7 @@ class IndicatorFollowSignalValidationWindow(
 
     def _show_with_initial_control_section_state(self) -> None:
         self.showNormal()
-        self._apply_control_section_mode("buy", force=True)
+        self._apply_control_section_mode("summary", force=True)
         QTimer.singleShot(0, self._center_on_initial_screen)
 
     def _defer_fit_dialog_height_to_control_mode(self, mode=None) -> None:
@@ -982,7 +1005,7 @@ class IndicatorFollowSignalValidationWindow(
         self.basic_toggle_button.setText(
             "▼ 기본설정" if self._recent_stock_row_expanded else "▶ 기본설정"
         )
-        self.recent_stock_row.setVisible(self._recent_stock_row_expanded)
+        self.recent_stock_panel.setVisible(self._recent_stock_row_expanded)
         self._sync_basic_header_height()
         self._sync_recent_stock_row_width()
         QTimer.singleShot(0, self._fit_signal_validation_window)
@@ -1000,13 +1023,32 @@ class IndicatorFollowSignalValidationWindow(
     def _sync_recent_stock_row_width(self) -> None:
         if not hasattr(self, "recent_stock_row"):
             return
-        layout = self.basic_box.layout()
-        if layout is None:
+        panel_layout = self.recent_stock_panel_layout
+        panel_layout.invalidate()
+        panel_layout.activate()
+        header_center_x = self.basic_toggle_button.mapTo(
+            self.basic_box,
+            self.basic_toggle_button.rect().center(),
+        ).x()
+        button_left_x = self.stock_selection_button.mapTo(
+            self.basic_box,
+            QPoint(0, 0),
+        ).x()
+        selection_width = header_center_x - button_left_x + 1
+        if selection_width <= 0:
             return
-        margins = layout.contentsMargins()
+        if self.stock_selection_button.width() != selection_width:
+            self.stock_selection_button.setFixedWidth(selection_width)
+            panel_layout.invalidate()
+            panel_layout.activate()
+        margins = panel_layout.contentsMargins()
         available_width = max(
             0,
-            self.basic_box.contentsRect().width() - margins.left() - margins.right(),
+            self.recent_stock_panel.contentsRect().width()
+            - margins.left()
+            - margins.right()
+            - self.stock_selection_button.width()
+            - panel_layout.spacing(),
         )
         self.recent_stock_row.set_available_width(available_width)
 
