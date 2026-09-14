@@ -258,9 +258,18 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             "market": "KOSPI",
             "classification": "일반종목",
             "nxt_available": True,
-            "status": "정상",
+            "status": "정상 | 증거금40% | 신용가능 | 담보대출",
             "master_stock_state": "거래정상",
             "master_construction": "정상",
+            "master_stock_info": "시장구분0|코스피",
+            "master_stock_market_kind": "대형주",
+            "current_price": 249500,
+            "open_price": 249500,
+            "high_price": 250500,
+            "low_price": 249000,
+            "change_rate": -3.85,
+            "previous_day_volume_rate": -38.26,
+            "execution_strength": 83.9,
         }
         with patch(
             "gui_indicator_follow_signal_validation_window.QToolTip.showText"
@@ -269,11 +278,18 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         ) as hide_tooltip:
             selector.set_current_stock(stock, metadata)
             tooltip = selector.tooltip_text
-            for expected in (
-                "▪", "005930", "삼성전자", "KOSPI", "상태 정상",
-                "일반종목", "NXT", "거래정상", " | ",
+            self.assertEqual(
+                "▪  005930 삼성전자  |  KOSPI  |  상태 정상  |  NXT\n"
+                "▪  현재가 249,500  |  시가 249,500  |  고가 250,500  |  저가 249,000\n"
+                "▪  등락률 -3.85%  |  전일대비 -38.26%  |  체결강도 83.9",
+                tooltip,
+            )
+            self.assertEqual(3, len(tooltip.splitlines()))
+            for excluded in (
+                "분류", "기초상태", "거래정상", "시장구분", "대형주",
+                "증거금", "신용가능", "담보대출",
             ):
-                self.assertIn(expected, tooltip)
+                self.assertNotIn(excluded, tooltip)
             selector.enterEvent(QEvent(QEvent.Enter))
             show_tooltip.assert_called_once()
             selector.leaveEvent(QEvent(QEvent.Leave))
@@ -282,7 +298,20 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             hide_tooltip.reset_mock()
             selector.set_current_stock(ValidationStockRef("000660", "SK하이닉스"), {})
             hide_tooltip.assert_called_once()
-            self.assertIn("-", selector.tooltip_text)
+            self.assertEqual(
+                "▪  000660 SK하이닉스  |  -  |  상태 -\n"
+                "▪  현재가 -  |  시가 -  |  고가 -  |  저가 -\n"
+                "▪  등락률 -  |  전일대비 -  |  체결강도 -",
+                selector.tooltip_text,
+            )
+
+            selector.set_current_stock(
+                ValidationStockRef("035420", "NAVER"),
+                {"status": "투자경고 | 관리종목 | 증거금100% | 신용가능"},
+            )
+            self.assertIn("상태 투자경고 | 관리종목", selector.tooltip_text)
+            self.assertNotIn("증거금", selector.tooltip_text)
+            self.assertNotIn("신용가능", selector.tooltip_text)
 
             show_tooltip.reset_mock()
             selector.set_current_stock(None)

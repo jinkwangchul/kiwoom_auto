@@ -119,9 +119,42 @@ def _stock_metadata_tooltip(
     if stock is None:
         return ""
     record = dict(metadata) if isinstance(metadata, dict) else {}
-    market = str(record.get("market", "") or "").strip() or "-"
-    status = str(record.get("status", "") or "").strip() or "-"
-    classification = str(record.get("classification", "") or "").strip() or "-"
+
+    def finite_number(value: object) -> float | None:
+        if isinstance(value, bool) or value in (None, "", "-"):
+            return None
+        try:
+            number = float(str(value).replace(",", "").replace("%", "").strip())
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def price_text(value: object) -> str:
+        number = finite_number(value)
+        if number is None or number <= 0:
+            return "-"
+        return f"{int(number):,}" if number.is_integer() else f"{number:,.2f}"
+
+    def signed_percent_text(value: object) -> str:
+        number = finite_number(value)
+        return f"{number:+.2f}%" if number is not None else "-"
+
+    def strength_text(value: object) -> str:
+        number = finite_number(value)
+        return f"{number:.1f}" if number is not None and number >= 0 else "-"
+
+    status_tokens = [
+        token.strip()
+        for token in str(record.get("status", "") or "").split("|")
+        if token.strip()
+    ]
+    status = " | ".join(
+        token
+        for token in status_tokens
+        if not token.startswith("증거금")
+        and token not in {"담보대출", "신용가능"}
+    ) or "-"
+    market = str(record.get("market", "") or "").strip().upper() or "-"
     first_line = [
         f"▪  {stock.code} {stock.name}",
         market,
@@ -129,22 +162,21 @@ def _stock_metadata_tooltip(
     ]
     if record.get("nxt_available") is True:
         first_line.append("NXT")
-    master_fields = [
-        str(record.get(field, "") or "").strip()
-        for field in (
-            "master_stock_state",
-            "master_construction",
-            "master_stock_info",
-            "master_stock_market_kind",
-        )
+    second_line = [
+        f"▪  현재가 {price_text(record.get('current_price'))}",
+        f"시가 {price_text(record.get('open_price'))}",
+        f"고가 {price_text(record.get('high_price'))}",
+        f"저가 {price_text(record.get('low_price'))}",
     ]
-    master_text = "  |  ".join(value for value in master_fields if value) or "-"
+    third_line = [
+        f"▪  등락률 {signed_percent_text(record.get('change_rate'))}",
+        f"전일대비 {signed_percent_text(record.get('previous_day_volume_rate'))}",
+        f"체결강도 {strength_text(record.get('execution_strength'))}",
+    ]
+    separator = "  |  "
     return "\n".join(
-        (
-            "  |  ".join(first_line),
-            f"▪  분류 {classification}",
-            f"▪  기초상태 {master_text}",
-        )
+        separator.join(parts)
+        for parts in (first_line, second_line, third_line)
     )
 
 
