@@ -98,6 +98,7 @@ class _FakeWindow(QDialog):
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
+    recent_stock_selected = pyqtSignal(object)
 
     def __init__(self, stock, seed, parent=None):
         super().__init__(parent)
@@ -109,6 +110,8 @@ class _FakeWindow(QDialog):
         self.apply_results = []
         self.historical_candle_count = None
         self.validation_requests = 0
+        self.recent_stock_projections = []
+        self.stock_metadata_projections = []
 
     def set_historical_candle_count(self, count):
         self.historical_candle_count = count
@@ -138,6 +141,12 @@ class _FakeWindow(QDialog):
         self.snapshots.clear()
         return True
 
+    def set_recent_stocks(self, stocks):
+        self.recent_stock_projections.append(tuple(stocks))
+
+    def set_stock_metadata(self, metadata):
+        self.stock_metadata_projections.append(metadata)
+
     def show_settings_apply_result(self, message, *, success):
         self.apply_results.append((message, success))
 
@@ -149,6 +158,34 @@ class _FakePicker:
 
     def exec_(self):
         return self._result
+
+
+class _MemoryRecentStockStore:
+    def __init__(self, stocks=(), metadata=None):
+        self._stocks = tuple(stocks)
+        self._metadata = dict(metadata or {})
+        self.write_count = 0
+
+    @property
+    def recent_stocks(self):
+        return tuple(self._stocks)
+
+    def metadata_for(self, stock):
+        if not isinstance(stock, ValidationStockRef):
+            return None
+        record = self._metadata.get(stock.code)
+        return None if record is None else dict(record)
+
+    def activate(self, stock):
+        updated = (stock,) + tuple(
+            candidate for candidate in self._stocks if candidate.code != stock.code
+        )
+        updated = updated[:15]
+        if updated == self._stocks:
+            return False
+        self._stocks = updated
+        self.write_count += 1
+        return True
 
 
 class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
@@ -516,6 +553,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             historical_provider_factory=forbidden_downstream,
             replay_factory=forbidden_downstream,
             window_factory=window_factory,
+            recent_stock_store=_MemoryRecentStockStore(),
         )
         # Use a real QObject signal carrier to exercise bind_dialog.
         class Carrier(QDialog):
@@ -547,7 +585,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual((), flow.open_windows)
 
-        default_flow = IndicatorFollowSignalValidationFlow(broker)
+        default_flow = IndicatorFollowSignalValidationFlow(
+            broker,
+            recent_stock_store=_MemoryRecentStockStore(),
+        )
         self.assertEqual(
             "IndicatorFollowValidationStockPicker",
             default_flow.host._stock_picker_factory.__name__,
@@ -568,6 +609,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             broker,
             host=host,
             window_factory=window_factory,
+            recent_stock_store=_MemoryRecentStockStore(),
         )
         carrier = type(
             "Carrier",
@@ -600,7 +642,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual("종목 선택", window.compact_stock_label.text())
         self.assertIsNone(window.request_validation())
         self.assertEqual([], runs)
-        self.assertIn("더블클릭", window.validation_status_label.text())
+        self.assertIn("두 번 클릭", window.validation_status_label.text())
 
         QTest.mouseClick(window.compact_stock_label, Qt.LeftButton)
         self.assertEqual([], selections)
@@ -618,10 +660,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             created.append(window)
             return window
 
+        recent_store = _MemoryRecentStockStore()
         flow = IndicatorFollowSignalValidationFlow(
             _FakeBroker(True),
             host=host,
             window_factory=window_factory,
+            recent_stock_store=recent_store,
         )
         carrier = type(
             "Carrier",
@@ -647,13 +691,18 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual(self.stock, flow.last_selected_stock)
             self.assertEqual(1, first.validation_requests)
             self.assertIs(first, host.picker_parents[-1])
+            self.assertEqual((self.stock,), flow.recent_stocks)
+            self.assertEqual(1, recent_store.write_count)
 
             generation = flow._request_generation[id(first)]
             requests = first.validation_requests
+            first.snapshots.append("preserved-result")
             host.pickers.append(_FakePicker(QDialog.Accepted, self.stock))
             first.stock_selection_requested.emit()
             self.assertEqual(generation, flow._request_generation[id(first)])
             self.assertEqual(requests, first.validation_requests)
+            self.assertEqual(["preserved-result"], first.snapshots)
+            self.assertEqual(1, recent_store.write_count)
 
             other = ValidationStockRef("000660", "SK하이닉스")
             host.pickers.append(_FakePicker(QDialog.Rejected, other))
@@ -662,6 +711,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual(self.stock, flow.last_selected_stock)
             self.assertEqual(generation, flow._request_generation[id(first)])
             self.assertEqual(requests, first.validation_requests)
+            self.assertEqual(1, recent_store.write_count)
 
             carrier.signal_validation_requested.emit(self._seed())
             second = created[-1]
@@ -669,12 +719,28 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual(1, len(callbacks))
             callbacks.pop()()
             self.assertEqual(1, second.initial_requests)
+            self.assertEqual((self.stock,), second.recent_stock_projections[-1])
+            second.snapshots.append("window2-result")
 
-            host.pickers.append(_FakePicker(QDialog.Accepted, other))
-            first.stock_selection_requested.emit()
+            first.recent_stock_selected.emit(other)
             self.assertEqual(other, first.stock)
             self.assertEqual(self.stock, second.stock)
+            self.assertEqual(["window2-result"], second.snapshots)
             self.assertEqual(other, flow.last_selected_stock)
+            self.assertEqual((other, self.stock), flow.recent_stocks)
+            self.assertEqual(2, recent_store.write_count)
+            self.assertEqual((other, self.stock), first.recent_stock_projections[-1])
+            self.assertEqual((other, self.stock), second.recent_stock_projections[-1])
+            self.assertEqual(0, second.validation_requests)
+
+            changed_generation = flow._request_generation[id(first)]
+            changed_requests = first.validation_requests
+            first.snapshots.append("other-result")
+            first.recent_stock_selected.emit(other)
+            self.assertEqual(changed_generation, flow._request_generation[id(first)])
+            self.assertEqual(changed_requests, first.validation_requests)
+            self.assertEqual(["other-result"], first.snapshots)
+            self.assertEqual(2, recent_store.write_count)
 
             carrier.signal_validation_requested.emit(self._seed())
             third = created[-1]
@@ -749,6 +815,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             historical_provider_factory=Provider,
             replay_factory=Replay,
             window_factory=window_factory,
+            recent_stock_store=_MemoryRecentStockStore(),
         )
         carrier = type(
             "Carrier",
@@ -865,6 +932,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             historical_provider_factory=Provider,
             replay_factory=Replay,
             window_factory=window_factory,
+            recent_stock_store=_MemoryRecentStockStore(),
         )
         flow._last_selected_stock = self.stock
         carrier = type("Carrier", (QDialog,), {"signal_validation_requested": pyqtSignal(object)})()

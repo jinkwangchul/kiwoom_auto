@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import math
 from typing import Any
 
-from PyQt5.QtCore import QEvent, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -109,6 +110,42 @@ def estimated_signal_return_percent(
         return None
     value = (sell_close - average_buy) / average_buy * 100.0
     return value if math.isfinite(value) else None
+
+
+def _stock_metadata_tooltip(
+    stock: ValidationStockRef | None,
+    metadata: object,
+) -> str:
+    if stock is None:
+        return ""
+    record = dict(metadata) if isinstance(metadata, dict) else {}
+    market = str(record.get("market", "") or "").strip() or "-"
+    status = str(record.get("status", "") or "").strip() or "-"
+    classification = str(record.get("classification", "") or "").strip() or "-"
+    first_line = [
+        f"▪  {stock.code} {stock.name}",
+        market,
+        f"상태 {status}",
+    ]
+    if record.get("nxt_available") is True:
+        first_line.append("NXT")
+    master_fields = [
+        str(record.get(field, "") or "").strip()
+        for field in (
+            "master_stock_state",
+            "master_construction",
+            "master_stock_info",
+            "master_stock_market_kind",
+        )
+    ]
+    master_text = "  |  ".join(value for value in master_fields if value) or "-"
+    return "\n".join(
+        (
+            "  |  ".join(first_line),
+            f"▪  분류 {classification}",
+            f"▪  기초상태 {master_text}",
+        )
+    )
 
 
 def _valid_close(value: Any) -> float | None:
@@ -266,6 +303,169 @@ class IndicatorFollowSignalValidationChartCanvas(
             )
 
 
+class IndicatorFollowSignalValidationStockSelector(QComboBox):
+    """Arrowless recent-stock selector with delayed single-click popup."""
+
+    recent_stock_activated = pyqtSignal(object)
+    full_stock_selection_requested = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._current_stock: ValidationStockRef | None = None
+        self._recent_stocks: tuple[ValidationStockRef, ...] = ()
+        self._suppress_next_left_release = False
+        self._tooltip_text = ""
+        self._single_click_timer = QTimer(self)
+        self._single_click_timer.setSingleShot(True)
+        self._single_click_timer.timeout.connect(self._show_recent_popup)
+        self.activated[int].connect(self._emit_recent_stock)
+        self.setEditable(False)
+        self.setPlaceholderText("종목 선택")
+        self.setMinimumWidth(260)
+        self.setFixedHeight(30)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(
+            "QComboBox { font-size: 13pt; font-weight: bold; padding: 0 4px; }"
+            "QComboBox::drop-down { width: 0; border: 0; }"
+            "QComboBox::down-arrow { image: none; width: 0; height: 0; }"
+            "QToolTip { font-size: 12pt; }"
+        )
+
+    def text(self) -> str:
+        return self.currentText() or self.placeholderText()
+
+    @property
+    def recent_stocks(self) -> tuple[ValidationStockRef, ...]:
+        return tuple(self._recent_stocks)
+
+    @property
+    def tooltip_text(self) -> str:
+        return self._tooltip_text
+
+    def set_recent_stocks(self, stocks: object) -> None:
+        normalized: list[ValidationStockRef] = []
+        seen_codes: set[str] = set()
+        source = stocks if isinstance(stocks, (list, tuple)) else ()
+        for stock in source:
+            if (
+                not isinstance(stock, ValidationStockRef)
+                or not stock.code
+                or not stock.name
+                or stock.code in seen_codes
+            ):
+                continue
+            normalized.append(ValidationStockRef(stock.code, stock.name))
+            seen_codes.add(stock.code)
+            if len(normalized) == 15:
+                break
+        self._recent_stocks = tuple(normalized)
+        self._rebuild_items()
+
+    def set_current_stock(
+        self,
+        stock: ValidationStockRef | None,
+        metadata: object = None,
+    ) -> None:
+        if stock is not None and (
+            not isinstance(stock, ValidationStockRef) or not stock.code or not stock.name
+        ):
+            raise TypeError("stock must be None or a populated ValidationStockRef")
+        self._hide_tooltip()
+        self._current_stock = (
+            None if stock is None else ValidationStockRef(stock.code, stock.name)
+        )
+        self._tooltip_text = _stock_metadata_tooltip(self._current_stock, metadata)
+        self.setToolTip(self._tooltip_text)
+        self._rebuild_items()
+
+    def _rebuild_items(self) -> None:
+        projection = list(self._recent_stocks)
+        current = self._current_stock
+        if current is not None and all(
+            candidate.code != current.code for candidate in projection
+        ):
+            projection.insert(0, current)
+        previous = self.blockSignals(True)
+        try:
+            self.clear()
+            current_index = -1
+            for index, stock in enumerate(projection):
+                self.addItem(
+                    f"{stock.code} {stock.name}",
+                    {"code": stock.code, "name": stock.name},
+                )
+                if current is not None and stock.code == current.code:
+                    current_index = index
+            self.setCurrentIndex(current_index)
+        finally:
+            self.blockSignals(previous)
+
+    def _emit_recent_stock(self, index: int) -> None:
+        data = self.itemData(index)
+        if not isinstance(data, dict):
+            return
+        stock = ValidationStockRef(data.get("code", ""), data.get("name", ""))
+        if stock.code and stock.name:
+            self.recent_stock_activated.emit(stock)
+
+    def _show_recent_popup(self) -> None:
+        self._hide_tooltip()
+        self.showPopup()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.setFocus(Qt.MouseFocusReason)
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        if self._suppress_next_left_release:
+            self._suppress_next_left_release = False
+            event.accept()
+            return
+        self._single_click_timer.start(QApplication.doubleClickInterval())
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        self._single_click_timer.stop()
+        self._suppress_next_left_release = True
+        self.hidePopup()
+        self._hide_tooltip()
+        self.full_stock_selection_requested.emit()
+        event.accept()
+
+    def enterEvent(self, event) -> None:
+        if self._tooltip_text:
+            QToolTip.showText(
+                self.mapToGlobal(QPoint(0, self.height())),
+                self._tooltip_text,
+                self,
+                self.rect(),
+                2_000_000_000,
+            )
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hide_tooltip()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._single_click_timer.stop()
+        self._hide_tooltip()
+        super().hideEvent(event)
+
+    @staticmethod
+    def _hide_tooltip() -> None:
+        QToolTip.hideText()
+
+
 class IndicatorFollowSignalValidationWindow(
     IndicatorFollowRoutineSettingsDialog
 ):
@@ -274,6 +474,7 @@ class IndicatorFollowSignalValidationWindow(
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
+    recent_stock_selected = pyqtSignal(object)
 
     def __init__(
         self,
@@ -315,10 +516,6 @@ class IndicatorFollowSignalValidationWindow(
     @property
     def stock(self) -> ValidationStockRef | None:
         return self._signal_validation_stock
-
-    def _stock_display_text(self) -> str:
-        stock = self.stock
-        return "종목 선택" if stock is None else f"{stock.code} {stock.name}"
 
     @property
     def replay_snapshot(self) -> ValidationReplaySnapshot | None:
@@ -371,7 +568,7 @@ class IndicatorFollowSignalValidationWindow(
 
         self.chart_stack = QStackedWidget()
         self.loading_label = QLabel(
-            "상단 종목명을 더블클릭하여 검증 종목을 선택하세요."
+            "상단 종목 영역을 두 번 클릭하여 검증 종목을 선택하세요."
             if self.stock is None
             else "과거 분봉 데이터 조회 중..."
         )
@@ -441,11 +638,15 @@ class IndicatorFollowSignalValidationWindow(
         header_row.setSpacing(8)
         self.compact_header_arrow = QLabel("▶")
         self.compact_header_arrow.setStyleSheet("font-size: 13pt; font-weight: bold;")
-        self.compact_stock_label = QLabel(self._stock_display_text())
-        self.compact_stock_label.setStyleSheet("font-size: 13pt; font-weight: bold;")
-        self.compact_stock_label.setToolTip("더블클릭하여 검증 종목 선택")
-        self.compact_stock_label.setCursor(Qt.PointingHandCursor)
-        self.compact_stock_label.installEventFilter(self)
+        self.compact_stock_selector = IndicatorFollowSignalValidationStockSelector()
+        self.compact_stock_selector.full_stock_selection_requested.connect(
+            self.stock_selection_requested.emit
+        )
+        self.compact_stock_selector.recent_stock_activated.connect(
+            self.recent_stock_selected.emit
+        )
+        self.compact_stock_selector.set_current_stock(self.stock)
+        self.compact_stock_label = self.compact_stock_selector
         self.basic_signal_interval_combo = QComboBox()
         self.basic_signal_interval_combo.addItems(
             ["1", "3", "5", "10", "15", "30", "60", "120", "240"]
@@ -461,7 +662,7 @@ class IndicatorFollowSignalValidationWindow(
         self.historical_candle_count_spin.setFixedWidth(80)
         self.historical_candle_count_spin.setFixedHeight(30)
         header_row.addWidget(self.compact_header_arrow)
-        header_row.addWidget(self.compact_stock_label)
+        header_row.addWidget(self.compact_stock_selector)
         header_row.addWidget(QLabel("|"))
         header_row.addWidget(QLabel("기준봉"))
         header_row.addWidget(self.basic_signal_interval_combo)
@@ -501,17 +702,7 @@ class IndicatorFollowSignalValidationWindow(
         self.apply_signal_validation_ui_state(
             self._signal_validation_seed.to_ui_state()
         )
-        self.compact_stock_label.setText(self._stock_display_text())
-
-    def eventFilter(self, watched, event):
-        if (
-            watched is self.compact_stock_label
-            and event.type() == QEvent.MouseButtonDblClick
-            and event.button() == Qt.LeftButton
-        ):
-            self.stock_selection_requested.emit()
-            return True
-        return super().eventFilter(watched, event)
+        self.compact_stock_selector.set_current_stock(self.stock)
 
     def _show_with_initial_control_section_state(self) -> None:
         self.showNormal()
@@ -591,7 +782,7 @@ class IndicatorFollowSignalValidationWindow(
     def _request_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
         if self.stock is None:
             self.show_validation_error(
-                "상단 종목명을 더블클릭하여 검증 종목을 선택하세요."
+                "상단 종목 영역을 두 번 클릭하여 검증 종목을 선택하세요."
             )
             return None
         try:
@@ -692,9 +883,15 @@ class IndicatorFollowSignalValidationWindow(
         if selected == self.stock:
             return False
         self._signal_validation_stock = selected
-        self.compact_stock_label.setText(self._stock_display_text())
+        self.compact_stock_selector.set_current_stock(selected)
         self._clear_validation_result("새 종목 검증 준비 중")
         return True
+
+    def set_recent_stocks(self, stocks: object) -> None:
+        self.compact_stock_selector.set_recent_stocks(stocks)
+
+    def set_stock_metadata(self, metadata: object) -> None:
+        self.compact_stock_selector.set_current_stock(self.stock, metadata)
 
     def _clear_validation_result(self, message: str) -> None:
         self._replay_snapshot = None

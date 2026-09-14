@@ -1,0 +1,315 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt5.QtCore import QEvent, QSettings, Qt
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication
+
+from gui_indicator_follow_signal_validation_flow import (
+    IndicatorFollowSignalValidationFlow,
+)
+from gui_indicator_follow_signal_validation_window import (
+    IndicatorFollowSignalValidationStockSelector,
+)
+from gui_stock_data import (
+    STOCK_LIBRARY_READY,
+    STOCK_LIBRARY_RUNTIME_SOURCE,
+    StockLibraryLoadSnapshot,
+)
+from indicator_follow_signal_validation_recent_stocks import (
+    MAX_RECENT_STOCKS,
+    RECENT_STOCKS_SETTINGS_KEY,
+    IndicatorFollowSignalValidationRecentStockStore,
+)
+from routines.지표추종매매.routine_validation_contract import ValidationStockRef
+
+
+class _FakeSettings:
+    def __init__(self, value=""):
+        self.stored_value = value
+        self.set_calls = []
+        self.sync_calls = 0
+
+    def value(self, key, default=""):
+        return self.stored_value if key == RECENT_STOCKS_SETTINGS_KEY else default
+
+    def setValue(self, key, value):
+        self.set_calls.append((key, value))
+        self.stored_value = value
+
+    def sync(self):
+        self.sync_calls += 1
+
+
+class _Selector(IndicatorFollowSignalValidationStockSelector):
+    def __init__(self):
+        super().__init__()
+        self.popup_count = 0
+
+    def showPopup(self):
+        self.popup_count += 1
+
+
+class _ConnectedBroker:
+    def is_connected(self):
+        return True
+
+
+def _record(index: int, *, name: str | None = None) -> dict[str, object]:
+    code = f"{index:06d}"
+    return {
+        "code": code,
+        "name": name or f"종목{index}",
+        "market": "KOSPI",
+        "classification": "일반종목",
+        "nxt_available": True,
+        "status": "정상",
+        "master_stock_state": "정상",
+        "master_construction": "정상",
+    }
+
+
+def _loader(records):
+    snapshot = StockLibraryLoadSnapshot(
+        STOCK_LIBRARY_READY,
+        STOCK_LIBRARY_RUNTIME_SOURCE,
+        tuple(records),
+    )
+    return lambda _project_root=None: snapshot
+
+
+class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        cls.project_root = Path(__file__).resolve().parents[1]
+
+    def setUp(self):
+        self.widgets = []
+
+    def tearDown(self):
+        for widget in self.widgets:
+            widget.close()
+            widget.deleteLater()
+        self.app.processEvents()
+
+    def _selector(self):
+        selector = _Selector()
+        selector.resize(320, 30)
+        selector.show()
+        self.widgets.append(selector)
+        self.app.processEvents()
+        return selector
+
+    def test_mru_order_dedup_limit_and_restart_restore(self):
+        records = [_record(index) for index in range(1, 18)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = str(Path(temp_dir) / "v2-recent.ini")
+            settings = QSettings(ini_path, QSettings.IniFormat)
+            store = IndicatorFollowSignalValidationRecentStockStore(
+                settings=settings,
+                snapshot_loader=_loader(records),
+            )
+            self.assertEqual((), store.recent_stocks)
+
+            a = ValidationStockRef("000001", "저장시이름")
+            b = ValidationStockRef("000002", "종목2")
+            self.assertTrue(store.activate(a))
+            self.assertTrue(store.activate(b))
+            self.assertTrue(store.activate(a))
+            self.assertFalse(store.activate(ValidationStockRef("000001", "종목1")))
+            self.assertEqual(("000001", "000002"), tuple(
+                stock.code for stock in store.recent_stocks
+            ))
+            self.assertEqual("종목1", store.recent_stocks[0].name)
+
+            for index in range(3, 18):
+                store.activate(ValidationStockRef(f"{index:06d}", f"종목{index}"))
+            self.assertEqual(MAX_RECENT_STOCKS, len(store.recent_stocks))
+            self.assertEqual("000017", store.recent_stocks[0].code)
+            self.assertNotIn("000002", {stock.code for stock in store.recent_stocks})
+
+            restored = IndicatorFollowSignalValidationRecentStockStore(
+                settings=QSettings(ini_path, QSettings.IniFormat),
+                snapshot_loader=_loader(records),
+            )
+            self.assertEqual(store.recent_stocks, restored.recent_stocks)
+            flow = IndicatorFollowSignalValidationFlow(
+                _ConnectedBroker(),
+                recent_stock_store=restored,
+            )
+            self.assertEqual(restored.recent_stocks[0], flow.last_selected_stock)
+
+    def test_bad_preferences_and_unverified_library_fail_empty_without_rewrite(self):
+        records = [_record(1), _record(2)]
+        for raw_value in ("{bad json", json.dumps({"code": "000001"})):
+            settings = _FakeSettings(raw_value)
+            store = IndicatorFollowSignalValidationRecentStockStore(
+                settings=settings,
+                snapshot_loader=_loader(records),
+            )
+            self.assertEqual((), store.recent_stocks)
+            self.assertEqual([], settings.set_calls)
+            self.assertEqual(0, settings.sync_calls)
+
+        mixed = json.dumps([
+            {"code": "000001", "name": "오래된이름"},
+            {"code": "000001", "name": "중복"},
+            {"code": "999999", "name": "없음"},
+            {"code": "", "name": "누락"},
+            "not-a-dict",
+        ])
+        settings = _FakeSettings(mixed)
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings,
+            snapshot_loader=_loader(records),
+        )
+        self.assertEqual((ValidationStockRef("000001", "종목1"),), store.recent_stocks)
+        self.assertEqual([], settings.set_calls)
+
+        unavailable = IndicatorFollowSignalValidationRecentStockStore(
+            settings=_FakeSettings(mixed),
+            snapshot_loader=lambda _root=None: StockLibraryLoadSnapshot(
+                "FAILED", "EMPTY", (), "UNAVAILABLE"
+            ),
+        )
+        self.assertEqual((), unavailable.recent_stocks)
+
+    def test_settings_write_occurs_only_when_mru_order_changes(self):
+        settings = _FakeSettings("")
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings,
+            snapshot_loader=_loader([_record(1), _record(2)]),
+        )
+        a = ValidationStockRef("000001", "종목1")
+        b = ValidationStockRef("000002", "종목2")
+        self.assertTrue(store.activate(a))
+        self.assertFalse(store.activate(a))
+        self.assertTrue(store.activate(b))
+        self.assertTrue(store.activate(a))
+        self.assertEqual(3, len(settings.set_calls))
+        self.assertEqual(3, settings.sync_calls)
+        payload = json.loads(settings.stored_value)
+        self.assertEqual(["000001", "000002"], [item["code"] for item in payload])
+
+    def test_single_double_and_right_click_contract(self):
+        selector = self._selector()
+        selections = []
+        selector.full_stock_selection_requested.connect(lambda: selections.append(True))
+
+        QTest.mouseClick(selector, Qt.LeftButton)
+        self.assertEqual(0, selector.popup_count)
+        self.assertTrue(selector._single_click_timer.isActive())
+        QTest.qWait(QApplication.doubleClickInterval() + 20)
+        self.assertEqual(1, selector.popup_count)
+
+        selector = self._selector()
+        selections = []
+        selector.full_stock_selection_requested.connect(lambda: selections.append(True))
+        QTest.mouseDClick(selector, Qt.LeftButton)
+        QTest.qWait(QApplication.doubleClickInterval() + 20)
+        self.assertEqual([True], selections)
+        self.assertEqual(0, selector.popup_count)
+        self.assertFalse(selector._single_click_timer.isActive())
+
+        selector = self._selector()
+        selections = []
+        selector.full_stock_selection_requested.connect(lambda: selections.append(True))
+        QTest.mouseClick(selector, Qt.LeftButton)
+        QTest.mouseDClick(selector, Qt.LeftButton)
+        QTest.qWait(QApplication.doubleClickInterval() + 20)
+        self.assertEqual([True], selections)
+        self.assertEqual(0, selector.popup_count)
+        self.assertFalse(selector._single_click_timer.isActive())
+
+        QTest.mouseClick(selector, Qt.RightButton)
+        QTest.qWait(QApplication.doubleClickInterval() + 20)
+        self.assertEqual([True], selections)
+        self.assertEqual(0, selector.popup_count)
+
+    def test_recent_popup_emits_only_explicit_activated_selection(self):
+        selector = self._selector()
+        a = ValidationStockRef("005930", "삼성전자")
+        b = ValidationStockRef("000660", "SK하이닉스")
+        selected = []
+        selector.recent_stock_activated.connect(selected.append)
+        selector.set_recent_stocks((a, b))
+        selector.set_current_stock(a)
+        self.assertEqual([], selected)
+        selector.activated[int].emit(1)
+        self.assertEqual([b], selected)
+        self.assertFalse(selector.isEditable())
+        self.assertIn("width: 0", selector.styleSheet())
+        self.assertEqual(2, selector.count())
+
+    def test_tooltip_uses_only_loaded_static_metadata_and_hides_on_boundaries(self):
+        selector = self._selector()
+        stock = ValidationStockRef("005930", "삼성전자")
+        metadata = {
+            "market": "KOSPI",
+            "classification": "일반종목",
+            "nxt_available": True,
+            "status": "정상",
+            "master_stock_state": "거래정상",
+            "master_construction": "정상",
+        }
+        with patch(
+            "gui_indicator_follow_signal_validation_window.QToolTip.showText"
+        ) as show_tooltip, patch(
+            "gui_indicator_follow_signal_validation_window.QToolTip.hideText"
+        ) as hide_tooltip:
+            selector.set_current_stock(stock, metadata)
+            tooltip = selector.tooltip_text
+            for expected in (
+                "▪", "005930", "삼성전자", "KOSPI", "상태 정상",
+                "일반종목", "NXT", "거래정상", " | ",
+            ):
+                self.assertIn(expected, tooltip)
+            selector.enterEvent(QEvent(QEvent.Enter))
+            show_tooltip.assert_called_once()
+            selector.leaveEvent(QEvent(QEvent.Leave))
+            self.assertTrue(hide_tooltip.called)
+
+            hide_tooltip.reset_mock()
+            selector.set_current_stock(ValidationStockRef("000660", "SK하이닉스"), {})
+            hide_tooltip.assert_called_once()
+            self.assertIn("-", selector.tooltip_text)
+
+            show_tooltip.reset_mock()
+            selector.set_current_stock(None)
+            selector.enterEvent(QEvent(QEvent.Enter))
+            show_tooltip.assert_not_called()
+            self.assertEqual("", selector.tooltip_text)
+
+    def test_source_boundaries_exclude_main_runtime_broker_and_mock_resolvers(self):
+        sources = "\n".join(
+            (self.project_root / path).read_text(encoding="utf-8")
+            for path in (
+                "gui_indicator_follow_signal_validation_window.py",
+                "indicator_follow_signal_validation_recent_stocks.py",
+            )
+        )
+        for forbidden in (
+            "gui_main_table_loader",
+            "main_monitoring_auto_trade_operation_host",
+            "_main_stock_live_tooltip",
+            "request_initial_market_snapshot",
+            "request_stock_ranking_snapshot",
+            "SetRealReg",
+            "gui_market_data_host",
+            "mock_validation",
+        ):
+            self.assertNotIn(forbidden, sources)
+
+
+if __name__ == "__main__":
+    unittest.main()

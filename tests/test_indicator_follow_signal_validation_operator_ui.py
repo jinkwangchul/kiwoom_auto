@@ -70,6 +70,7 @@ class _AutoWindow(QDialog):
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
+    recent_stock_selected = pyqtSignal(object)
 
     def __init__(self, stock, seed, parent=None):
         super().__init__(parent)
@@ -99,6 +100,28 @@ class _AutoWindow(QDialog):
 
     def request_validation(self):
         return None
+
+    def set_recent_stocks(self, _stocks):
+        pass
+
+    def set_stock_metadata(self, _metadata):
+        pass
+
+
+class _MemoryRecentStockStore:
+    recent_stocks = ()
+
+    def metadata_for(self, _stock):
+        return None
+
+    def activate(self, stock):
+        updated = (stock,) + tuple(
+            candidate for candidate in self.recent_stocks
+            if candidate.code != stock.code
+        )
+        changed = updated[:15] != self.recent_stocks
+        self.recent_stocks = updated[:15]
+        return changed
 
 
 class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
@@ -265,6 +288,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             _ConnectedBroker(),
             host=_Host(self.stock),
             window_factory=factory,
+            recent_stock_store=_MemoryRecentStockStore(),
         )
         flow._last_selected_stock = self.stock
         carrier = type("Carrier", (QDialog,), {"signal_validation_requested": pyqtSignal(object)})()
@@ -661,6 +685,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             _ConnectedBroker(),
             host=_Host(self.stock),
             window_factory=factory,
+            recent_stock_store=_MemoryRecentStockStore(),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rules.json"

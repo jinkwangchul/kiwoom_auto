@@ -14,6 +14,9 @@ from gui_indicator_follow_signal_validation_window import (
     IndicatorFollowSignalValidationWindow,
 )
 from gui_indicator_follow_validation_host import IndicatorFollowValidationHost
+from indicator_follow_signal_validation_recent_stocks import (
+    IndicatorFollowSignalValidationRecentStockStore,
+)
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRunRequest,
@@ -58,6 +61,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         historical_provider_factory: Callable[..., object] = ValidationHistoricalProvider,
         replay_factory: Callable[..., object] = ValidationHistoricalReplay,
         window_factory: Callable[..., object] = IndicatorFollowSignalValidationWindow,
+        recent_stock_store: object | None = None,
     ) -> None:
         super().__init__(parent)
         if (
@@ -79,11 +83,17 @@ class IndicatorFollowSignalValidationFlow(QObject):
         self._historical_provider_factory = historical_provider_factory
         self._replay_factory = replay_factory
         self._window_factory = window_factory
+        self._recent_stock_store = (
+            recent_stock_store
+            if recent_stock_store is not None
+            else IndicatorFollowSignalValidationRecentStockStore()
+        )
         self._host = host if host is not None else IndicatorFollowValidationHost(
             parent,
             operation_active_reader=operation_active_reader,
         )
-        self._last_selected_stock: ValidationStockRef | None = None
+        restored = self._read_recent_stocks()
+        self._last_selected_stock = restored[0] if restored else None
         self._bound_dialog_ids: set[int] = set()
         self._open_windows: dict[int, object] = {}
         self._request_generation: dict[int, int] = {}
@@ -101,6 +111,31 @@ class IndicatorFollowSignalValidationFlow(QObject):
     @property
     def last_selected_stock(self) -> ValidationStockRef | None:
         return self._last_selected_stock
+
+    @property
+    def recent_stocks(self) -> tuple[ValidationStockRef, ...]:
+        return self._read_recent_stocks()
+
+    def _read_recent_stocks(self) -> tuple[ValidationStockRef, ...]:
+        try:
+            stocks = self._recent_stock_store.recent_stocks
+        except Exception:
+            return ()
+        return tuple(
+            ValidationStockRef(stock.code, stock.name)
+            for stock in stocks
+            if isinstance(stock, ValidationStockRef) and stock.code and stock.name
+        )[:15]
+
+    def _metadata_for(self, stock: object) -> dict[str, object] | None:
+        resolver = getattr(self._recent_stock_store, "metadata_for", None)
+        if not callable(resolver):
+            return None
+        try:
+            metadata = resolver(stock)
+        except Exception:
+            return None
+        return dict(metadata) if isinstance(metadata, dict) else None
 
     def bind_dialog(self, dialog: object) -> bool:
         signal = getattr(dialog, "signal_validation_requested", None)
@@ -193,6 +228,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 seed,
                 parent=None,
             )
+            self._sync_window_stock_projection(window)
             set_historical_candle_count = getattr(
                 window,
                 "set_historical_candle_count",
@@ -224,6 +260,15 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 raise TypeError("stock selection request signal is unavailable")
             stock_signal.connect(
                 lambda ref=window_ref: self._select_stock_for_window(ref())
+            )
+            recent_signal = getattr(window, "recent_stock_selected", None)
+            if not callable(getattr(recent_signal, "connect", None)):
+                raise TypeError("recent stock selection signal is unavailable")
+            recent_signal.connect(
+                lambda stock, ref=window_ref: self._activate_stock_for_window(
+                    ref(),
+                    stock,
+                )
             )
             if callable(getattr(window, "setAttribute", None)):
                 window.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -265,6 +310,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
         except Exception as exc:
             self._fail_window(window, f"STOCK_PICKER_ERROR: {exc}")
             return
+        self._activate_stock_for_window(window, selected)
+
+    def _activate_stock_for_window(self, window: object, selected: object) -> None:
+        window_key = id(window)
+        if window_key not in self._open_windows:
+            return
         if (
             not isinstance(selected, ValidationStockRef)
             or not selected.code
@@ -272,7 +323,14 @@ class IndicatorFollowSignalValidationFlow(QObject):
         ):
             self._fail_window(window, "INVALID_SELECTED_STOCK")
             return
-        if selected == getattr(window, "stock", None):
+        selected = ValidationStockRef(selected.code, selected.name)
+        current_stock = getattr(window, "stock", None)
+        if (
+            isinstance(current_stock, ValidationStockRef)
+            and current_stock.code == selected.code
+        ):
+            if self._remember_stock(selected):
+                self._refresh_open_window_stock_projections()
             return
         set_stock = getattr(window, "set_validation_stock", None)
         request_validation = getattr(window, "request_validation", None)
@@ -283,7 +341,36 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if set_stock(selected) is not True:
             return
         self._last_selected_stock = ValidationStockRef(selected.code, selected.name)
+        self._remember_stock(selected)
+        self._refresh_open_window_stock_projections()
         request_validation()
+
+    def _remember_stock(self, stock: ValidationStockRef) -> bool:
+        activate = getattr(self._recent_stock_store, "activate", None)
+        if not callable(activate):
+            self._last_selected_stock = ValidationStockRef(stock.code, stock.name)
+            return False
+        try:
+            changed = activate(stock) is True
+        except Exception:
+            changed = False
+        recent = self._read_recent_stocks()
+        self._last_selected_stock = (
+            recent[0] if recent else ValidationStockRef(stock.code, stock.name)
+        )
+        return changed
+
+    def _sync_window_stock_projection(self, window: object) -> None:
+        set_recent = getattr(window, "set_recent_stocks", None)
+        if callable(set_recent):
+            set_recent(self._read_recent_stocks())
+        set_metadata = getattr(window, "set_stock_metadata", None)
+        if callable(set_metadata):
+            set_metadata(self._metadata_for(getattr(window, "stock", None)))
+
+    def _refresh_open_window_stock_projections(self) -> None:
+        for window in tuple(self._open_windows.values()):
+            self._sync_window_stock_projection(window)
 
     def _invalidate_window_requests(self, window_key: int) -> None:
         if window_key in self._request_generation:
