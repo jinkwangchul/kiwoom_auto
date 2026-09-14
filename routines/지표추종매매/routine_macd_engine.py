@@ -1521,7 +1521,14 @@ def evaluate_indicator_follow_routine(
 
     ui_signal_names = {"ui_condition_a", "ui_condition_b", "ui_condition_c"}
     active_ui_signal_names = [name for name in active_sell_names if name in ui_signal_names]
-    aggregation_sell_names = list(active_sell_names)
+    independent_sell_names = [
+        name for name in active_sell_names if name not in ui_signal_names
+    ]
+    aggregation_sell_names = list(independent_sell_names)
+    aggregation_group_signal_names = [
+        name for name in independent_sell_names if name != "profit_rate_sell"
+    ]
+    causal_condition_sell_names = list(aggregation_group_signal_names)
     ui_expression_passed: bool | None = None
     ui_expression_contract: dict[str, Any] | None = None
     ui_expression_values: dict[str, bool] = {}
@@ -1531,40 +1538,49 @@ def evaluate_indicator_follow_routine(
             for name in active_ui_signal_names
             if isinstance(condition_sell_signals.get(name), dict)
         ]
-        expression_contracts = [value for value in expression_contracts if isinstance(value, dict)]
-        if expression_contracts:
+        if (
+            expression_contracts
+            and len(expression_contracts) == len(active_ui_signal_names)
+            and all(isinstance(value, dict) for value in expression_contracts)
+            and all(value == expression_contracts[0] for value in expression_contracts[1:])
+        ):
             canonical_expression = expression_contracts[0]
-            ui_expression_contract = canonical_expression
-            if any(value != canonical_expression for value in expression_contracts[1:]):
-                ui_expression_passed = False
-            else:
-                identifier_map = canonical_expression.get("identifier_map")
-                identifiers = canonical_expression.get("identifiers")
-                if isinstance(identifier_map, dict) and isinstance(identifiers, list):
-                    expression_values: dict[str, bool] = {}
-                    for raw_identifier in identifiers:
-                        identifier = str(raw_identifier or "").strip().upper()
-                        signal_name = str(identifier_map.get(identifier) or "").strip()
-                        if signal_name not in condition_sell_passed:
-                            expression_values = {}
-                            break
-                        expression_values[identifier] = bool(condition_sell_passed[signal_name])
-                    if expression_values:
-                        ui_expression_values = dict(expression_values)
-                        evaluated = evaluate_condition_expression(
-                            canonical_expression.get("ast"),
-                            expression_values,
-                            current_identity=sell_index,
-                        )
-                        ui_expression_passed = bool(evaluated.get("passed")) if evaluated.get("ok") else False
-                    else:
-                        ui_expression_passed = False
-                else:
-                    ui_expression_passed = False
-            aggregation_sell_names = [
-                name for name in aggregation_sell_names if name not in ui_signal_names
-            ]
-            aggregation_sell_names.append("ui_signal_expression")
+            identifier_map = canonical_expression.get("identifier_map")
+            identifiers = canonical_expression.get("identifiers")
+            expression_ast = canonical_expression.get("ast")
+            if (
+                isinstance(identifier_map, dict)
+                and isinstance(identifiers, list)
+                and identifiers
+                and isinstance(expression_ast, dict)
+            ):
+                expression_values: dict[str, bool] = {}
+                referenced_signal_names: list[str] = []
+                for raw_identifier in identifiers:
+                    identifier = str(raw_identifier or "").strip().upper()
+                    signal_name = str(identifier_map.get(identifier) or "").strip()
+                    if signal_name not in condition_sell_passed or signal_name not in ui_signal_names:
+                        expression_values = {}
+                        referenced_signal_names = []
+                        break
+                    expression_values[identifier] = bool(condition_sell_passed[signal_name])
+                    if signal_name not in referenced_signal_names:
+                        referenced_signal_names.append(signal_name)
+                if expression_values:
+                    ui_expression_contract = canonical_expression
+                    ui_expression_values = dict(expression_values)
+                    evaluated = evaluate_condition_expression(
+                        expression_ast,
+                        expression_values,
+                        current_identity=sell_index,
+                    )
+                    ui_expression_passed = (
+                        bool(evaluated.get("passed")) if evaluated.get("ok") else False
+                    )
+                    aggregation_sell_names.append("ui_signal_expression")
+                    aggregation_group_signal_names.extend(referenced_signal_names)
+                    if ui_expression_passed:
+                        causal_condition_sell_names.extend(referenced_signal_names)
 
     sell_logic = _logic(sell_cfg.get("signal_logic", "OR"), "OR")
     if not aggregation_sell_names:
@@ -1583,8 +1599,7 @@ def evaluate_indicator_follow_routine(
 
     active_sell_group_paths = [
         f"sell.signals.{signal_name}.groups[{group_index}]"
-        for signal_name in active_sell_names
-        if signal_name != "profit_rate_sell"
+        for signal_name in aggregation_group_signal_names
         for group_index, group in enumerate(
             condition_sell_signals.get(signal_name, {}).get("groups", [])
             if isinstance(condition_sell_signals.get(signal_name, {}).get("groups"), list)
@@ -1594,8 +1609,7 @@ def evaluate_indicator_follow_routine(
     ]
     matched_sell_group_paths = [
         f"sell.signals.{signal_name}.groups[{group_index}]"
-        for signal_name in active_sell_names
-        if signal_name != "profit_rate_sell"
+        for signal_name in causal_condition_sell_names
         for group_index, result in enumerate(condition_sell_results.get(signal_name, []))
         if result.passed
     ]
@@ -1612,7 +1626,7 @@ def evaluate_indicator_follow_routine(
     if sell_passed and evaluate_side != "BUY":
         matched = [
             result.group_name
-            for signal_name in active_sell_names
+            for signal_name in causal_condition_sell_names
             for result in condition_sell_results.get(signal_name, [])
             if result.passed
         ]
@@ -1620,13 +1634,13 @@ def evaluate_indicator_follow_routine(
             matched.append(profit_name)
         details = [
             detail
-            for signal_name in active_sell_names
+            for signal_name in causal_condition_sell_names
             for result in condition_sell_results.get(signal_name, [])
             for detail in result.details
         ] + profit_details
         matched_indexes = [
             condition_sell_indexes[name]
-            for name in active_sell_names
+            for name in causal_condition_sell_names
             if condition_sell_passed.get(name)
             and name in condition_sell_indexes
         ]
