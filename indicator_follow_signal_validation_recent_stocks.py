@@ -18,7 +18,6 @@ from routines.지표추종매매.routine_validation_contract import ValidationSt
 
 
 RECENT_STOCKS_SETTINGS_KEY = "ui/signal_validation_v2/recent_stocks"
-MAX_RECENT_STOCKS = 15
 
 
 def _default_settings() -> QSettings:
@@ -111,8 +110,6 @@ class IndicatorFollowSignalValidationRecentStockStore:
                 continue
             recent.append(current)
             seen_codes.add(current.code)
-            if len(recent) == MAX_RECENT_STOCKS:
-                break
         return tuple(recent)
 
     @property
@@ -143,7 +140,23 @@ class IndicatorFollowSignalValidationRecentStockStore:
             for candidate in self._recent_stocks
             if candidate.code != selected.code
         )
-        normalized = tuple(updated[:MAX_RECENT_STOCKS])
+        normalized = tuple(updated)
+        if normalized == self._recent_stocks:
+            return False
+        self._recent_stocks = normalized
+        self._write_recent_stocks()
+        return True
+
+    def retain_prefix(self, stocks: object) -> bool:
+        source = stocks if isinstance(stocks, (list, tuple)) else ()
+        retained: list[ValidationStockRef] = []
+        for stock in source:
+            if not isinstance(stock, ValidationStockRef):
+                return False
+            retained.append(ValidationStockRef(stock.code, stock.name))
+        normalized = tuple(retained)
+        if normalized != self._recent_stocks[:len(normalized)]:
+            return False
         if normalized == self._recent_stocks:
             return False
         self._recent_stocks = normalized

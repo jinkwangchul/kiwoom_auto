@@ -125,7 +125,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             ValidationStockRef(stock.code, stock.name)
             for stock in stocks
             if isinstance(stock, ValidationStockRef) and stock.code and stock.name
-        )[:15]
+        )
 
     def _metadata_for(self, stock: object) -> dict[str, object] | None:
         resolver = getattr(self._recent_stock_store, "metadata_for", None)
@@ -270,6 +270,14 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     stock,
                 )
             )
+            fitted_signal = getattr(window, "recent_stocks_fitted", None)
+            if callable(getattr(fitted_signal, "connect", None)):
+                fitted_signal.connect(
+                    lambda stocks, ref=window_ref: self._retain_recent_stock_projection(
+                        ref(),
+                        stocks,
+                    )
+                )
             if callable(getattr(window, "setAttribute", None)):
                 window.setAttribute(Qt.WA_DeleteOnClose, True)
             key = id(window)
@@ -371,6 +379,23 @@ class IndicatorFollowSignalValidationFlow(QObject):
     def _refresh_open_window_stock_projections(self) -> None:
         for window in tuple(self._open_windows.values()):
             self._sync_window_stock_projection(window)
+
+    def _retain_recent_stock_projection(self, window: object, stocks: object) -> None:
+        if id(window) not in self._open_windows:
+            return
+        retain_prefix = getattr(self._recent_stock_store, "retain_prefix", None)
+        if not callable(retain_prefix):
+            return
+        try:
+            changed = retain_prefix(stocks) is True
+        except Exception:
+            changed = False
+        if not changed:
+            return
+        recent = self._read_recent_stocks()
+        if recent:
+            self._last_selected_stock = recent[0]
+        QTimer.singleShot(0, self._refresh_open_window_stock_projections)
 
     def _invalidate_window_requests(self, window_key: int) -> None:
         if window_key in self._request_generation:

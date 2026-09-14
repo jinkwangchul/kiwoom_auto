@@ -12,12 +12,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QEvent, QSettings, Qt
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QComboBox
+from PyQt5.QtWidgets import QApplication, QLabel
 
 from gui_indicator_follow_signal_validation_flow import (
     IndicatorFollowSignalValidationFlow,
 )
 from gui_indicator_follow_signal_validation_window import (
+    IndicatorFollowSignalValidationRecentStockRow,
     IndicatorFollowSignalValidationStockDisplay,
 )
 from gui_stock_data import (
@@ -26,7 +27,6 @@ from gui_stock_data import (
     StockLibraryLoadSnapshot,
 )
 from indicator_follow_signal_validation_recent_stocks import (
-    MAX_RECENT_STOCKS,
     RECENT_STOCKS_SETTINGS_KEY,
     IndicatorFollowSignalValidationRecentStockStore,
 )
@@ -101,7 +101,7 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         self.app.processEvents()
         return selector
 
-    def test_mru_order_dedup_limit_and_restart_restore(self):
+    def test_mru_order_dedup_width_trim_and_restart_restore(self):
         records = [_record(index) for index in range(1, 18)]
         with tempfile.TemporaryDirectory() as temp_dir:
             ini_path = str(Path(temp_dir) / "v2-recent.ini")
@@ -125,9 +125,18 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
 
             for index in range(3, 18):
                 store.activate(ValidationStockRef(f"{index:06d}", f"종목{index}"))
-            self.assertEqual(MAX_RECENT_STOCKS, len(store.recent_stocks))
+            self.assertEqual(17, len(store.recent_stocks))
             self.assertEqual("000017", store.recent_stocks[0].code)
-            self.assertNotIn("000002", {stock.code for stock in store.recent_stocks})
+            retained = store.recent_stocks[:4]
+            self.assertTrue(store.retain_prefix(retained))
+            self.assertFalse(store.retain_prefix(retained))
+            self.assertFalse(store.retain_prefix(store.recent_stocks[1:]))
+            self.assertEqual(retained, store.recent_stocks)
+            payload = json.loads(settings.value(RECENT_STOCKS_SETTINGS_KEY))
+            self.assertEqual(
+                [stock.code for stock in retained],
+                [item["code"] for item in payload],
+            )
 
             restored = IndicatorFollowSignalValidationRecentStockStore(
                 settings=QSettings(ini_path, QSettings.IniFormat),
@@ -192,55 +201,93 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         payload = json.loads(settings.stored_value)
         self.assertEqual(["000001", "000002"], [item["code"] for item in payload])
 
-    def test_arrow_popup_and_plain_stock_label_click_contract(self):
+    def test_plain_stock_label_click_contract(self):
         selector = self._selector()
-        selector.set_recent_stocks((
-            ValidationStockRef("005930", "삼성전자"),
-            ValidationStockRef("000660", "SK하이닉스"),
-        ))
         selections = []
         selector.full_stock_selection_requested.connect(lambda: selections.append(True))
 
         QTest.mouseClick(selector.stock_label, Qt.LeftButton)
         self.assertEqual([], selections)
-        self.assertFalse(selector.recent_popup.isVisible())
         QTest.mouseDClick(selector.stock_label, Qt.LeftButton)
         self.assertEqual([True], selections)
 
         QTest.mouseClick(selector.stock_label, Qt.RightButton)
         self.assertEqual([True], selections)
-        self.assertFalse(selector.recent_popup.isVisible())
 
-        QTest.mouseClick(selector.arrow_button, Qt.LeftButton)
-        self.app.processEvents()
-        self.assertTrue(selector.recent_popup.isVisible())
-        self.assertTrue(selector.recent_popup.windowFlags() & Qt.Popup)
-        QTest.mouseClick(selector.arrow_button, Qt.LeftButton)
-        self.app.processEvents()
-        self.assertFalse(selector.recent_popup.isVisible())
-
-    def test_recent_popup_emits_only_explicit_activated_selection(self):
-        selector = self._selector()
+    def test_recent_row_fits_full_names_to_actual_width_and_emits_selection(self):
+        row = IndicatorFollowSignalValidationRecentStockRow()
+        self.widgets.append(row)
         stocks = tuple(
             ValidationStockRef(f"{index:06d}", f"종목{index}")
-            for index in range(1, 18)
+            for index in range(1, 6)
         )
         selected = []
-        selector.recent_stock_activated.connect(selected.append)
-        selector.set_recent_stocks(stocks)
-        selector.set_current_stock(stocks[0])
-        self.assertEqual([], selected)
-        self.assertEqual(15, len(selector.recent_stocks))
-        self.assertEqual(15, selector.recent_popup.stock_list.count())
-        self.assertFalse(isinstance(selector.stock_label, QComboBox))
-        self.assertEqual("000001 종목1", selector.stock_label.text())
+        projections = []
+        row.stock_activated.connect(selected.append)
+        row.projection_fitted.connect(projections.append)
+        row.set_recent_stocks(stocks)
+        metrics = row.fontMetrics()
+        separator_width = metrics.horizontalAdvance(row._SEPARATOR_TEXT)
+        item_widths = [
+            metrics.horizontalAdvance(f"{stock.code} {stock.name}")
+            + row._ITEM_HORIZONTAL_PADDING * 2
+            for stock in stocks
+        ]
+        wide_width = sum(item_widths) + separator_width * (len(stocks) - 1)
+        narrow_width = sum(item_widths[:3]) + separator_width * 2
+        row.set_available_width(wide_width)
+        self.assertEqual(stocks, row.recent_stocks)
+        self.assertEqual(5, len(row.stock_buttons))
+        self.assertEqual(row.minimumHeight(), row.maximumHeight())
 
-        QTest.mouseClick(selector.arrow_button, Qt.LeftButton)
+        row.set_available_width(narrow_width)
+        self.assertEqual(stocks[:3], row.recent_stocks)
+        self.assertEqual(3, len(row.stock_buttons))
+        self.assertEqual(
+            [f"{stock.code} {stock.name}" for stock in stocks[:3]],
+            [button.text() for button in row.stock_buttons],
+        )
+        labels = [label.text() for label in row.findChildren(QLabel)]
+        self.assertEqual([" | ", " | "], labels)
+
+        QTest.mouseClick(row.stock_buttons[1], Qt.LeftButton)
         self.app.processEvents()
-        item = selector.recent_popup.stock_list.item(1)
-        selector.recent_popup.stock_list.itemClicked.emit(item)
         self.assertEqual([stocks[1]], selected)
-        self.assertFalse(selector.recent_popup.isVisible())
+        self.assertEqual(stocks[:3], projections[-1])
+
+    def test_width_fitted_projection_removes_hidden_stocks_from_qsettings(self):
+        records = [_record(index) for index in range(1, 6)]
+        settings = _FakeSettings("")
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings,
+            snapshot_loader=_loader(records),
+        )
+        for index in range(1, 6):
+            store.activate(ValidationStockRef(f"{index:06d}", f"종목{index}"))
+
+        row = IndicatorFollowSignalValidationRecentStockRow()
+        self.widgets.append(row)
+        row.projection_fitted.connect(store.retain_prefix)
+        stocks = store.recent_stocks
+        row.set_recent_stocks(stocks)
+        metrics = row.fontMetrics()
+        item_widths = [
+            metrics.horizontalAdvance(f"{stock.code} {stock.name}")
+            + row._ITEM_HORIZONTAL_PADDING * 2
+            for stock in stocks
+        ]
+        available_width = (
+            sum(item_widths[:3])
+            + metrics.horizontalAdvance(row._SEPARATOR_TEXT) * 2
+        )
+        row.set_available_width(available_width)
+
+        self.assertEqual(stocks[:3], store.recent_stocks)
+        payload = json.loads(settings.stored_value)
+        self.assertEqual(
+            [stock.code for stock in stocks[:3]],
+            [item["code"] for item in payload],
+        )
 
     def test_tooltip_uses_only_loaded_static_metadata_and_hides_on_boundaries(self):
         selector = self._selector()
@@ -324,10 +371,15 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             (self.project_root / path).read_text(encoding="utf-8")
             for path in (
                 "gui_indicator_follow_signal_validation_window.py",
+                "gui_indicator_follow_signal_validation_flow.py",
                 "indicator_follow_signal_validation_recent_stocks.py",
             )
         )
         for forbidden in (
+            "MAX_RECENT_STOCKS",
+            "IndicatorFollowSignalValidationRecentStockPopup",
+            "Qt.Popup",
+            "QListWidget",
             "gui_main_table_loader",
             "main_monitoring_auto_trade_operation_host",
             "_main_stock_live_tooltip",

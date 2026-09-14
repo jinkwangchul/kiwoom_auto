@@ -127,8 +127,8 @@ class _MemoryRecentStockStore:
             candidate for candidate in self.recent_stocks
             if candidate.code != stock.code
         )
-        changed = updated[:15] != self.recent_stocks
-        self.recent_stocks = updated[:15]
+        changed = updated != self.recent_stocks
+        self.recent_stocks = updated
         return changed
 
 
@@ -222,7 +222,8 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertIsInstance(window.compact_stock_label, QLabel)
         self.assertNotIsInstance(window.compact_stock_label, QComboBox)
         self.assertFalse(hasattr(window, "compact_stock_selector"))
-        self.assertEqual("▶", window.compact_header_arrow.text())
+        self.assertEqual("▶ 기본설정", window.compact_header_arrow.text())
+        self.assertFalse(window.recent_stock_row.isVisible())
         self.assertEqual([], window.compact_stock_display.findChildren(QComboBox))
         self.assertEqual("5", window.basic_signal_interval_combo.currentText())
         self.assertEqual(100, window.historical_candle_count_spin.value())
@@ -246,8 +247,15 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             "control_scroll",
         ):
             self.assertFalse(hasattr(window, forbidden_attribute), forbidden_attribute)
-        for forbidden_text in ("기본설정", "중복신호처리", "오류발생"):
+        for forbidden_text in ("중복신호처리", "오류발생"):
             self.assertNotIn(forbidden_text, all_labels)
+        self.assertEqual(
+            1,
+            sum(
+                button.text().endswith("기본설정")
+                for button in window.findChildren(dialog_module.QPushButton)
+            ),
+        )
         self.assertEqual([], window.control_tab.findChildren(QScrollArea))
 
         window._show_with_initial_control_section_state()
@@ -260,13 +268,16 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertFalse(window.buy_detail_expanded)
         self.assertTrue(window.sell_detail_expanded)
 
-    def test_recent_popup_is_floating_and_never_changes_window_geometry(self):
+    def test_recent_row_toggles_inline_as_exactly_one_line(self):
         window = self._window()
-        window.set_recent_stocks((
-            ValidationStockRef("005930", "삼성전자"),
-            ValidationStockRef("000660", "SK하이닉스"),
-        ))
+        stocks = tuple(
+            ValidationStockRef(f"{index:06d}", f"종목{index}")
+            for index in range(1, 8)
+        )
+        window.set_recent_stocks(stocks)
         window.show()
+        self.app.processEvents()
+        window._fit_signal_validation_window()
         self.app.processEvents()
         before_size = window.size()
         before_header_height = window.basic_box.height()
@@ -275,24 +286,30 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
 
         QTest.mouseClick(window.compact_header_arrow, Qt.LeftButton)
         self.app.processEvents()
-        popup = window.compact_stock_display.recent_popup
-        self.assertTrue(popup.isVisible())
-        self.assertTrue(popup.windowFlags() & Qt.Popup)
-        self.assertEqual(before_size, window.size())
-        self.assertEqual(before_header_height, window.basic_box.height())
-        self.assertEqual(before_buy_position, window.buy_box.pos())
-        self.assertEqual(before_sell_position, window.sell_box.pos())
-
-        QTest.mouseClick(window.validation_status_label, Qt.LeftButton)
-        self.app.processEvents()
-        self.assertFalse(popup.isVisible())
+        self.assertEqual("▼ 기본설정", window.compact_header_arrow.text())
+        self.assertTrue(window.recent_stock_row.isVisible())
+        self.assertGreater(window.basic_box.height(), before_header_height)
+        self.assertGreater(window.buy_box.pos().y(), before_buy_position.y())
+        self.assertGreater(window.sell_box.pos().y(), before_sell_position.y())
+        self.assertGreaterEqual(window.height(), before_size.height())
+        self.assertEqual(
+            window.recent_stock_row.minimumHeight(),
+            window.recent_stock_row.maximumHeight(),
+        )
+        self.assertEqual([], window.recent_stock_row.findChildren(QScrollArea))
+        self.assertEqual(
+            1,
+            len({button.pos().y() for button in window.recent_stock_row.stock_buttons}),
+        )
 
         QTest.mouseClick(window.compact_header_arrow, Qt.LeftButton)
         self.app.processEvents()
-        self.assertTrue(popup.isVisible())
-        window.close()
-        self.app.processEvents()
-        self.assertFalse(popup.isVisible())
+        self.assertEqual("▶ 기본설정", window.compact_header_arrow.text())
+        self.assertFalse(window.recent_stock_row.isVisible())
+        self.assertEqual(before_header_height, window.basic_box.height())
+        self.assertEqual(before_buy_position, window.buy_box.pos())
+        self.assertEqual(before_sell_position, window.sell_box.pos())
+        self.assertEqual(before_size.height(), window.height())
 
     def test_existing_registration_basic_controls_remain_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:

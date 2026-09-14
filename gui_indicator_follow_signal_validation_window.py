@@ -9,20 +9,17 @@ import math
 from typing import Any
 
 from PyQt5.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QPainter
+from PyQt5.QtGui import QColor, QFontMetrics, QPainter
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
     QAbstractItemView,
     QApplication,
     QComboBox,
     QDialog,
-    QFrame,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -338,101 +335,17 @@ class IndicatorFollowSignalValidationChartCanvas(
             )
 
 
-class IndicatorFollowSignalValidationRecentStockPopup(QFrame):
-    """V2-only floating list projected from the existing recent-stock MRU."""
-
-    stock_activated = pyqtSignal(object)
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
-        self._anchor: QWidget | None = None
-        self._application_filter_installed = False
-        self.setFrameShape(QFrame.StyledPanel)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(1, 1, 1, 1)
-        self.stock_list = QListWidget()
-        self.stock_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.stock_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.stock_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.stock_list.itemClicked.connect(self._activate_item)
-        layout.addWidget(self.stock_list)
-
-    def set_recent_stocks(self, stocks: tuple[ValidationStockRef, ...]) -> None:
-        self.stock_list.clear()
-        for stock in stocks:
-            item = QListWidgetItem(f"{stock.code} {stock.name}")
-            item.setData(Qt.UserRole, {"code": stock.code, "name": stock.name})
-            self.stock_list.addItem(item)
-
-    def show_below(self, anchor: QWidget) -> None:
-        self._anchor = anchor
-        row_height = self.stock_list.sizeHintForRow(0)
-        if row_height <= 0:
-            row_height = 28
-        count = self.stock_list.count()
-        popup_height = max(row_height + 4, row_height * count + 4)
-        popup_width = max(anchor.width(), self.stock_list.sizeHintForColumn(0) + 28)
-        self.resize(popup_width, popup_height)
-        self.move(anchor.mapToGlobal(QPoint(0, anchor.height())))
-        application = QApplication.instance()
-        if application is not None and not self._application_filter_installed:
-            application.installEventFilter(self)
-            self._application_filter_installed = True
-        self.show()
-        self.raise_()
-        self.stock_list.setFocus(Qt.PopupFocusReason)
-
-    def _activate_item(self, item: QListWidgetItem) -> None:
-        data = item.data(Qt.UserRole)
-        if not isinstance(data, dict):
-            return
-        stock = ValidationStockRef(data.get("code", ""), data.get("name", ""))
-        if not stock.code or not stock.name:
-            return
-        self.close()
-        self.stock_activated.emit(stock)
-
-    def eventFilter(self, watched, event):
-        if self.isVisible() and event.type() == QEvent.MouseButtonPress:
-            widget = watched if isinstance(watched, QWidget) else None
-            anchor = self._anchor
-            inside_popup = widget is not None and (
-                widget is self or self.isAncestorOf(widget)
-            )
-            inside_anchor = widget is not None and anchor is not None and (
-                widget is anchor or anchor.isAncestorOf(widget)
-            )
-            if not inside_popup and not inside_anchor:
-                self.close()
-        return super().eventFilter(watched, event)
-
-    def hideEvent(self, event) -> None:
-        application = QApplication.instance()
-        if application is not None and self._application_filter_installed:
-            application.removeEventFilter(self)
-        self._application_filter_installed = False
-        super().hideEvent(event)
-
-
 class IndicatorFollowSignalValidationStockDisplay(QWidget):
-    """Clickable arrow plus plain stock label for the V2 compact header."""
+    """Plain stock identity display for the V2 compact header."""
 
-    recent_stock_activated = pyqtSignal(object)
     full_stock_selection_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._recent_stocks: tuple[ValidationStockRef, ...] = ()
         self._tooltip_text = ""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        self.arrow_button = QPushButton("▶")
-        self.arrow_button.setFlat(True)
-        self.arrow_button.setFixedSize(24, 30)
-        self.arrow_button.setCursor(Qt.PointingHandCursor)
-        self.arrow_button.setStyleSheet("font-size: 13pt; font-weight: bold; padding: 0;")
-        self.arrow_button.clicked.connect(self.toggle_recent_popup)
+        layout.setSpacing(0)
         self.stock_label = QLabel("종목 선택")
         self.stock_label.setMinimumWidth(232)
         self.stock_label.setFixedHeight(30)
@@ -442,37 +355,11 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
         )
         self.stock_label.setCursor(Qt.PointingHandCursor)
         self.stock_label.installEventFilter(self)
-        layout.addWidget(self.arrow_button)
         layout.addWidget(self.stock_label)
-        self.recent_popup = IndicatorFollowSignalValidationRecentStockPopup(self)
-        self.recent_popup.stock_activated.connect(self._activate_recent_stock)
-
-    @property
-    def recent_stocks(self) -> tuple[ValidationStockRef, ...]:
-        return tuple(self._recent_stocks)
 
     @property
     def tooltip_text(self) -> str:
         return self._tooltip_text
-
-    def set_recent_stocks(self, stocks: object) -> None:
-        normalized: list[ValidationStockRef] = []
-        seen_codes: set[str] = set()
-        source = stocks if isinstance(stocks, (list, tuple)) else ()
-        for stock in source:
-            if (
-                not isinstance(stock, ValidationStockRef)
-                or not stock.code
-                or not stock.name
-                or stock.code in seen_codes
-            ):
-                continue
-            normalized.append(ValidationStockRef(stock.code, stock.name))
-            seen_codes.add(stock.code)
-            if len(normalized) == 15:
-                break
-        self._recent_stocks = tuple(normalized)
-        self.recent_popup.set_recent_stocks(self._recent_stocks)
 
     def set_current_stock(
         self,
@@ -483,7 +370,6 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
             not isinstance(stock, ValidationStockRef) or not stock.code or not stock.name
         ):
             raise TypeError("stock must be None or a populated ValidationStockRef")
-        self.close_popup()
         self._hide_tooltip()
         self.stock_label.setText(
             "종목 선택" if stock is None else f"{stock.code} {stock.name}"
@@ -491,25 +377,10 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
         self._tooltip_text = _stock_metadata_tooltip(stock, metadata)
         self.stock_label.setToolTip(self._tooltip_text)
 
-    def toggle_recent_popup(self) -> None:
-        if self.recent_popup.isVisible():
-            self.close_popup()
-            return
-        self._hide_tooltip()
-        self.recent_popup.show_below(self)
-
-    def close_popup(self) -> None:
-        self.recent_popup.close()
-
-    def _activate_recent_stock(self, stock: ValidationStockRef) -> None:
-        self.close_popup()
-        self.recent_stock_activated.emit(stock)
-
     def eventFilter(self, watched, event):
         if watched is self.stock_label:
             if event.type() == QEvent.MouseButtonDblClick:
                 if event.button() == Qt.LeftButton:
-                    self.close_popup()
                     self._hide_tooltip()
                     self.full_stock_selection_requested.emit()
                     return True
@@ -526,13 +397,131 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
         return super().eventFilter(watched, event)
 
     def hideEvent(self, event) -> None:
-        self.close_popup()
         self._hide_tooltip()
         super().hideEvent(event)
 
     @staticmethod
     def _hide_tooltip() -> None:
         QToolTip.hideText()
+
+
+class IndicatorFollowSignalValidationRecentStockRow(QWidget):
+    """Single-line width-fitted projection of the V2 recent-stock MRU."""
+
+    stock_activated = pyqtSignal(object)
+    projection_fitted = pyqtSignal(object)
+
+    _ITEM_HORIZONTAL_PADDING = 8
+    _SEPARATOR_TEXT = " | "
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._source_stocks: tuple[ValidationStockRef, ...] = ()
+        self._fitted_stocks: tuple[ValidationStockRef, ...] = ()
+        self._available_width = 0
+        self.stock_buttons: list[QPushButton] = []
+        self._row_layout = QHBoxLayout(self)
+        self._row_layout.setContentsMargins(0, 0, 0, 0)
+        self._row_layout.setSpacing(0)
+        row_height = max(26, QFontMetrics(self.font()).height() + 8)
+        self.setFixedHeight(row_height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    @property
+    def recent_stocks(self) -> tuple[ValidationStockRef, ...]:
+        return tuple(self._fitted_stocks)
+
+    def set_recent_stocks(self, stocks: object) -> None:
+        normalized: list[ValidationStockRef] = []
+        seen_codes: set[str] = set()
+        source = stocks if isinstance(stocks, (list, tuple)) else ()
+        for stock in source:
+            if (
+                not isinstance(stock, ValidationStockRef)
+                or not stock.code
+                or not stock.name
+                or stock.code in seen_codes
+            ):
+                continue
+            normalized.append(ValidationStockRef(stock.code, stock.name))
+            seen_codes.add(stock.code)
+        self._source_stocks = tuple(normalized)
+        self._refresh_projection()
+
+    def set_available_width(self, width: int) -> None:
+        normalized_width = max(0, int(width))
+        if normalized_width == self._available_width:
+            return
+        self._available_width = normalized_width
+        self._refresh_projection()
+
+    def fitting_stocks_for_width(
+        self,
+        available_width: int,
+    ) -> tuple[ValidationStockRef, ...]:
+        available = max(0, int(available_width))
+        if available <= 0:
+            return ()
+        metrics = QFontMetrics(self.font())
+        separator_width = metrics.horizontalAdvance(self._SEPARATOR_TEXT)
+        used_width = 0
+        fitted: list[ValidationStockRef] = []
+        for stock in self._source_stocks:
+            text_width = metrics.horizontalAdvance(f"{stock.code} {stock.name}")
+            required_width = text_width + self._ITEM_HORIZONTAL_PADDING * 2
+            if fitted:
+                required_width += separator_width
+            if used_width + required_width > available:
+                break
+            fitted.append(stock)
+            used_width += required_width
+        return tuple(fitted)
+
+    def _refresh_projection(self) -> None:
+        if self._available_width <= 0:
+            return
+        fitted = self.fitting_stocks_for_width(self._available_width)
+        if fitted == self._fitted_stocks and len(self.stock_buttons) == len(fitted):
+            return
+        changed = fitted != self._fitted_stocks
+        self._fitted_stocks = fitted
+        self._clear_row()
+        metrics = QFontMetrics(self.font())
+        for index, stock in enumerate(fitted):
+            if index:
+                separator = QLabel(self._SEPARATOR_TEXT)
+                separator.setFixedWidth(metrics.horizontalAdvance(self._SEPARATOR_TEXT))
+                separator.setAlignment(Qt.AlignCenter)
+                self._row_layout.addWidget(separator)
+            text = f"{stock.code} {stock.name}"
+            button = QPushButton(text)
+            button.setFlat(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedHeight(self.height())
+            button.setFixedWidth(
+                metrics.horizontalAdvance(text) + self._ITEM_HORIZONTAL_PADDING * 2
+            )
+            button.setStyleSheet(
+                "QPushButton { border: none; background: transparent; padding: 0 8px; }"
+                "QPushButton:hover { text-decoration: underline; }"
+            )
+            button.clicked.connect(
+                lambda _checked=False, selected=stock: self.stock_activated.emit(selected)
+            )
+            self.stock_buttons.append(button)
+            self._row_layout.addWidget(button)
+        self._row_layout.addStretch(1)
+        if changed:
+            self.projection_fitted.emit(tuple(fitted))
+
+    def _clear_row(self) -> None:
+        self.stock_buttons = []
+        while self._row_layout.count():
+            item = self._row_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
 
 
 class IndicatorFollowSignalValidationWindow(
@@ -544,6 +533,7 @@ class IndicatorFollowSignalValidationWindow(
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
     recent_stock_selected = pyqtSignal(object)
+    recent_stocks_fitted = pyqtSignal(object)
 
     def __init__(
         self,
@@ -702,18 +692,38 @@ class IndicatorFollowSignalValidationWindow(
             "border: 1px solid #8A98A8; border-radius: 2px; background: transparent;"
             "}"
         )
-        header_row = QHBoxLayout(self.basic_box)
-        header_row.setContentsMargins(10, 3, 10, 3)
+        basic_layout = QVBoxLayout(self.basic_box)
+        basic_layout.setContentsMargins(10, 3, 10, 3)
+        basic_layout.setSpacing(2)
+        header_widget = QWidget()
+        header_row = QHBoxLayout(header_widget)
+        header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(8)
+        self.basic_toggle_button = QPushButton("▶ 기본설정")
+        self.basic_toggle_button.setFlat(True)
+        self.basic_toggle_button.setCursor(Qt.PointingHandCursor)
+        self.basic_toggle_button.setFixedHeight(30)
+        self.basic_toggle_button.setStyleSheet(
+            "QPushButton { font-size: 13pt; font-weight: bold; color: #2E6B3A;"
+            " padding: 0 5px; border: 1px solid #000000; border-radius: 2px;"
+            " background: transparent; }"
+        )
+        self.basic_toggle_button.clicked.connect(self._toggle_recent_stock_row)
         self.compact_stock_display = IndicatorFollowSignalValidationStockDisplay()
-        self.compact_header_arrow = self.compact_stock_display.arrow_button
+        self.compact_header_arrow = self.basic_toggle_button
         self.compact_stock_label = self.compact_stock_display.stock_label
         self.compact_stock_display.full_stock_selection_requested.connect(
             self.stock_selection_requested.emit
         )
-        self.compact_stock_display.recent_stock_activated.connect(
+        self.recent_stock_row = IndicatorFollowSignalValidationRecentStockRow()
+        self.recent_stock_row.stock_activated.connect(
             self.recent_stock_selected.emit
         )
+        self.recent_stock_row.projection_fitted.connect(
+            self.recent_stocks_fitted.emit
+        )
+        self._recent_stock_row_expanded = False
+        self.recent_stock_row.setVisible(False)
         self.compact_stock_display.set_current_stock(self.stock)
         self.basic_signal_interval_combo = QComboBox()
         self.basic_signal_interval_combo.addItems(
@@ -729,6 +739,8 @@ class IndicatorFollowSignalValidationWindow(
         self.historical_candle_count_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.historical_candle_count_spin.setFixedWidth(80)
         self.historical_candle_count_spin.setFixedHeight(30)
+        header_row.addWidget(self.basic_toggle_button)
+        header_row.addWidget(QLabel("|"))
         header_row.addWidget(self.compact_stock_display)
         header_row.addWidget(QLabel("|"))
         header_row.addWidget(QLabel("기준봉"))
@@ -739,7 +751,11 @@ class IndicatorFollowSignalValidationWindow(
         header_row.addWidget(self.historical_candle_count_spin)
         header_row.addWidget(QLabel("봉"))
         header_row.addStretch(1)
-        self.basic_box.setMaximumHeight(52)
+        basic_layout.addWidget(header_widget)
+        basic_layout.addWidget(self.recent_stock_row)
+        self.basic_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        basic_layout.activate()
+        self.basic_box.setFixedHeight(basic_layout.sizeHint().height())
         page_layout.addWidget(self.basic_box)
 
         buy_title = self._build_control_buy_section(page_layout)
@@ -955,14 +971,53 @@ class IndicatorFollowSignalValidationWindow(
         return True
 
     def set_recent_stocks(self, stocks: object) -> None:
-        self.compact_stock_display.set_recent_stocks(stocks)
+        self.recent_stock_row.set_recent_stocks(stocks)
+        QTimer.singleShot(0, self._sync_recent_stock_row_width)
 
     def set_stock_metadata(self, metadata: object) -> None:
         self.compact_stock_display.set_current_stock(self.stock, metadata)
 
-    def hideEvent(self, event) -> None:
-        self.compact_stock_display.close_popup()
-        super().hideEvent(event)
+    def _toggle_recent_stock_row(self) -> None:
+        self._recent_stock_row_expanded = not self._recent_stock_row_expanded
+        self.basic_toggle_button.setText(
+            "▼ 기본설정" if self._recent_stock_row_expanded else "▶ 기본설정"
+        )
+        self.recent_stock_row.setVisible(self._recent_stock_row_expanded)
+        self._sync_basic_header_height()
+        self._sync_recent_stock_row_width()
+        QTimer.singleShot(0, self._fit_signal_validation_window)
+
+    def _sync_basic_header_height(self) -> None:
+        layout = self.basic_box.layout()
+        if layout is None:
+            return
+        layout.invalidate()
+        layout.activate()
+        target_height = layout.sizeHint().height()
+        if target_height > 0:
+            self.basic_box.setFixedHeight(target_height)
+
+    def _sync_recent_stock_row_width(self) -> None:
+        if not hasattr(self, "recent_stock_row"):
+            return
+        layout = self.basic_box.layout()
+        if layout is None:
+            return
+        margins = layout.contentsMargins()
+        available_width = max(
+            0,
+            self.basic_box.contentsRect().width() - margins.left() - margins.right(),
+        )
+        self.recent_stock_row.set_available_width(available_width)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._sync_recent_stock_row_width)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.isVisible():
+            QTimer.singleShot(0, self._sync_recent_stock_row_width)
 
     def _clear_validation_result(self, message: str) -> None:
         self._replay_snapshot = None
