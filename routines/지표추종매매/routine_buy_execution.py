@@ -153,7 +153,6 @@ def inspect_buy_time_slice_continuation(
     intent = _as_dict(subject.get("execution_intent"))
     if intent.get("side") != "BUY" or intent.get("execution_mode") not in {"MULTI_TIME", "MULTI_RATIO"}:
         return ""
-    from running_budget_adjustment import project_running_budget_adjustment_config
     from routine_main_facts import validate_routine_main_facts
 
     try:
@@ -173,7 +172,6 @@ def inspect_buy_time_slice_continuation(
             return "BUY_TIME_SLICE_CURRENT_CONTEXT_UNAVAILABLE"
         if config.get("assigned_routine_instance_id") != instance:
             return "BUY_TIME_SLICE_ASSIGNMENT_CHANGED"
-        config, _ = project_running_budget_adjustment_config(config, state)
         orders = facts.get("orders")
         fill_records = facts.get("fills")
         position_records = facts.get("positions")

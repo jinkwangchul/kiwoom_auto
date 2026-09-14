@@ -286,10 +286,26 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
         stock_dir = root / "stocks" / "005930"
         stock_dir.mkdir(parents=True)
         config = {"code": "005930", "assigned_routine_instance_id": "INSTANCE_A",
-                  "buy_limit_enabled": True, "buy_limit_amount": 700}
+                  "buy_limit_enabled": True, "buy_limit_amount": 1000}
         config_path = stock_dir / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
-        (stock_dir / "state.json").write_text("{}", encoding="utf-8")
+        state = {
+            "trade_enabled": True,
+            "trade_started_at": "2026-09-02T09:00:00",
+            "running_budget_adjustment": {
+                "state": "WAIT_SELL",
+                "operation_session_started_at": "2026-09-02T09:00:00",
+                "mode": "QUANTITY",
+                "previous_value": 1,
+                "apply_limit": True,
+                "previous_limit": {
+                    "buy_limit_enabled": True,
+                    "buy_limit_amount": 700,
+                },
+            },
+        }
+        state_path = stock_dir / "state.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
         for name in ("order_queue.json", "fills.json", "positions.json"):
             data = json.loads((self.root / name).read_text(encoding="utf-8"))
             if name == "positions.json":
@@ -309,9 +325,16 @@ class BuyTimeSliceProductionTest(unittest.TestCase):
             return buy_tests.bridge.inspect_buy_time_slice_continuation(
                 subject=proposal["signal"], rules=self.rules, main_facts=facts)
 
+        facts = capture_routine_main_facts(
+            project_root=root,
+            stock_dirs={"005930": stock_dir},
+            selected_account_no="12345678",
+            allowed_stock_codes=("005930",),
+        ).to_payload()
+        self.assertEqual(700, facts["stock_configs"]["005930"]["buy_limit_amount"])
         self.assertEqual("", check())
-        config["buy_limit_amount"] = 699
-        config_path.write_text(json.dumps(config), encoding="utf-8")
+        state["running_budget_adjustment"]["previous_limit"]["buy_limit_amount"] = 699
+        state_path.write_text(json.dumps(state), encoding="utf-8")
         self.assertEqual("BUY_TIME_SLICE_STOCK_LIMIT_EXCEEDED", check())
         config.update(buy_limit_amount=1000, assigned_routine_instance_id="OTHER")
         config_path.write_text(json.dumps(config), encoding="utf-8")

@@ -22,7 +22,6 @@ from execution_signal_ownership_guard import signal_dispatch_block_reasons
 from execution_unfilled_cancel_eligibility import inspect_unfilled_cancel_eligibility
 import gui_auto_trade_timer
 import gui_indicator_follow_routine_settings_dialog as dialog_module
-from routine_signal_probe import _requires_base_bar_entry_projection
 from routine_signal_consumer import apply_duplicate_signal_priority, block_signal_pre_dispatch_orders
 
 
@@ -343,10 +342,18 @@ class RuntimeLifecycleContractTest(unittest.TestCase):
 
     def test_ocr_zero_and_n_use_current_base_bar_entry_index(self) -> None:
         engine = _load("lifecycle_engine", "routine_macd_engine.py")
+        sys.path.insert(0, str(ROUTINE_DIR))
+        try:
+            routine = _load("lifecycle_projection_routine", "routine.py")
+        finally:
+            sys.path.remove(str(ROUTINE_DIR))
         candles = [{"close": value} for value in range(5)]
-        self.assertTrue(_requires_base_bar_entry_projection({
-            "buy": {"filters": {"ocr": {"order_delay_bars": 0}}}
-        }))
+        self.assertEqual(
+            "FORMING_BASE_BAR",
+            routine.market_bar_projection_request({
+                "buy": {"filters": {"ocr": {"order_delay_bars": 0}}}
+            })["projection"],
+        )
         self.assertEqual(4, engine._delay_index(candles, 0))
         self.assertEqual(3, engine._delay_index(candles, 1))
         self.assertEqual(2, engine._delay_index(candles, 2))

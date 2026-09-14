@@ -107,6 +107,8 @@ def capture_routine_main_facts(
     now: datetime | None = None,
 ) -> RoutineMainFacts:
     """Capture all Main-owned evidence once without mutating any source."""
+    from running_budget_adjustment import project_running_budget_adjustment_config
+
     root = Path(project_root)
     runtime = root / "runtime"
     roots_by_filename: dict[str, dict[str, Any]] = {}
@@ -126,8 +128,14 @@ def capture_routine_main_facts(
         if not code:
             continue
         stock_dir = Path(raw_dir)
-        configs[code] = _read_object(stock_dir / "config.json")
-        states[code] = _read_object(stock_dir / "state.json")
+        config = _read_object(stock_dir / "config.json")
+        state = _read_object(stock_dir / "state.json")
+        effective_config, _adjustment = project_running_budget_adjustment_config(
+            config,
+            state,
+        )
+        configs[code] = effective_config
+        states[code] = state
     captured = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     price_projection = deepcopy(dict(actionable_prices_by_code or {}))
     limit_projection = deepcopy(dict(limits or {}))

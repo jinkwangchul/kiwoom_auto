@@ -76,15 +76,6 @@ TRIGGER_PROVENANCE_FIELDS = (
 _DEFAULT_DECISION_TRACE_OBSERVER: Any = None
 
 
-def _requires_base_bar_entry_projection(rules: dict[str, Any] | None) -> bool:
-    """Compatibility query delegated to the routine-owned OCR contract."""
-    try:
-        from routines.지표추종매매.routine import market_bar_projection_request
-        return market_bar_projection_request(rules).get("projection") == "FORMING_BASE_BAR"
-    except Exception:
-        return False
-
-
 def _routine_observer_owner() -> Any:
     return sys.modules[__name__]
 
