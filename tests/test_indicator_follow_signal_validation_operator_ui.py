@@ -13,6 +13,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QObject, QRect, Qt, pyqtSignal
+from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication,
@@ -342,6 +343,118 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window._fit_signal_validation_window()
         self.app.processEvents()
         self.assertEqual(user_width, window.width())
+
+    def test_header_internal_alignment_separators_and_stock_button_are_normalized(self):
+        window = self._window()
+        window.show()
+        self.app.processEvents()
+
+        titles = (
+            window.basic_toggle_button,
+            window.buy_title,
+            window.sell_title,
+        )
+        headers = (
+            window.basic_header_widget,
+            window.buy_header_widget,
+            window.sell_header_widget,
+        )
+        separators = (
+            window.basic_header_separator,
+            window.buy_header_separator,
+            window.sell_header_separator,
+        )
+        self.assertEqual(
+            [(132, 30)] * 3,
+            [(item.width(), item.height()) for item in titles],
+        )
+        self.assertEqual(
+            ["▶ 기본설정", "▶ 매수설정", "▶ 매도설정"],
+            [item.text() for item in titles],
+        )
+        for title in titles:
+            self.assertLessEqual(
+                QFontMetrics(title.font()).horizontalAdvance(title.text()),
+                title.contentsRect().width(),
+            )
+        title_center_ys = [
+            title.mapTo(header, title.rect().center()).y()
+            for title, header in zip(titles, headers)
+        ]
+        self.assertLessEqual(max(title_center_ys) - min(title_center_ys), 1)
+
+        self.assertEqual(
+            [(12, 30)] * 3,
+            [(item.width(), item.height()) for item in separators],
+        )
+        self.assertEqual(["|"] * 3, [item.text() for item in separators])
+        self.assertEqual(1, len({item.styleSheet() for item in separators}))
+        separator_center_xs = [
+            separator.mapTo(box, separator.rect().center()).x()
+            for separator, box in zip(
+                separators,
+                (window.basic_box, window.buy_box, window.sell_box),
+            )
+        ]
+        separator_center_ys = [
+            separator.mapTo(header, separator.rect().center()).y()
+            for separator, header in zip(separators, headers)
+        ]
+        self.assertLessEqual(max(separator_center_xs) - min(separator_center_xs), 1)
+        self.assertLessEqual(max(separator_center_ys) - min(separator_center_ys), 1)
+
+        following_widgets = tuple(
+            header.layout().itemAt(2).widget() for header in headers
+        )
+        following_start_xs = [
+            widget.mapTo(box, widget.rect().topLeft()).x()
+            for widget, box in zip(
+                following_widgets,
+                (window.basic_box, window.buy_box, window.sell_box),
+            )
+        ]
+        self.assertLessEqual(max(following_start_xs) - min(following_start_xs), 1)
+        header_center_ys = [header.rect().center().y() for header in headers]
+        for header, title, separator, following in zip(
+            headers,
+            titles,
+            separators,
+            following_widgets,
+        ):
+            expected_center_y = header.rect().center().y()
+            for widget in (title, separator, following):
+                actual_center_y = widget.mapTo(header, widget.rect().center()).y()
+                self.assertLessEqual(abs(actual_center_y - expected_center_y), 1)
+        self.assertLessEqual(max(header_center_ys) - min(header_center_ys), 1)
+
+        button_style = window.stock_selection_button.styleSheet()
+        self.assertIn("border: 1px solid", button_style)
+        self.assertIn("background:", button_style)
+        self.assertIn(":hover", button_style)
+        self.assertIn(":pressed", button_style)
+        self.assertEqual(26, window.stock_selection_button.height())
+
+        window._apply_control_section_mode("all", force=True)
+        window._toggle_recent_stock_row()
+        self.app.processEvents()
+        self.assertEqual(
+            ["▼ 기본설정", "▼ 매수설정", "▼ 매도설정"],
+            [item.text() for item in titles],
+        )
+        for title in titles:
+            self.assertLessEqual(
+                QFontMetrics(title.font()).horizontalAdvance(title.text()),
+                title.contentsRect().width(),
+            )
+        select_right_x = window.stock_selection_button.mapTo(
+            window.basic_box,
+            window.stock_selection_button.rect().topRight(),
+        ).x()
+        basic_center_x = window.basic_toggle_button.mapTo(
+            window.basic_box,
+            window.basic_toggle_button.rect().center(),
+        ).x()
+        self.assertEqual(basic_center_x, select_right_x)
 
     def test_recent_row_toggles_inline_as_exactly_one_line(self):
         window = self._window()

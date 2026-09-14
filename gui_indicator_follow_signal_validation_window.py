@@ -734,10 +734,23 @@ class IndicatorFollowSignalValidationWindow(
         self.recent_stock_panel_layout.setContentsMargins(4, 3, 4, 3)
         self.recent_stock_panel_layout.setSpacing(8)
         self.stock_selection_button = QPushButton("종목선택")
+        self.stock_selection_button.setObjectName(
+            "signalValidationStockSelectionButton"
+        )
         self.stock_selection_button.setFixedHeight(26)
         self.stock_selection_button.setCursor(Qt.PointingHandCursor)
         self.stock_selection_button.setStyleSheet(
-            "QPushButton { font-size: 9pt; padding: 0 3px; }"
+            "QPushButton#signalValidationStockSelectionButton {"
+            "font-size: 9pt; padding: 0 3px; text-align: center;"
+            "border: 1px solid #7A8794; border-radius: 3px;"
+            "background: #F4F6F8; color: #1F2933;"
+            "}"
+            "QPushButton#signalValidationStockSelectionButton:hover {"
+            "border-color: #4C78A8; background: #E8F1FA;"
+            "}"
+            "QPushButton#signalValidationStockSelectionButton:pressed {"
+            "border-color: #3B638A; background: #D7E4F0;"
+            "}"
         )
         self.stock_selection_button.clicked.connect(
             lambda _checked=False: self.stock_selection_requested.emit()
@@ -791,6 +804,7 @@ class IndicatorFollowSignalValidationWindow(
         buy_title = self._build_control_buy_section(page_layout)
         sell_title = self._build_control_sell_section(page_layout)
         self._normalize_v2_section_geometry()
+        self._normalize_v2_header_internal_geometry()
         self._control_section_mode = "summary"
         self._control_header_click_modes = {
             buy_title: "buy",
@@ -834,6 +848,42 @@ class IndicatorFollowSignalValidationWindow(
         self._v2_collapsed_section_height = collapsed_height
         self._buy_collapsed_height = collapsed_height
         self._sell_collapsed_height = collapsed_height
+
+    def _normalize_v2_header_internal_geometry(self) -> None:
+        separator_style = (
+            "font-size: 13pt; font-weight: bold; color: #000000; padding: 0px;"
+        )
+        header_contracts = (
+            (
+                "basic",
+                self.basic_header_widget,
+                self.basic_toggle_button,
+                "QPushButton",
+                "#2E6B3A",
+            ),
+            ("buy", self.buy_header_widget, self.buy_title, "QLabel", "#1565C0"),
+            ("sell", self.sell_header_widget, self.sell_title, "QLabel", "#C62828"),
+        )
+        for name, header_widget, title_widget, selector, color in header_contracts:
+            header_layout = header_widget.layout()
+            header_layout.setAlignment(Qt.AlignVCenter)
+            title_widget.setFixedSize(132, 30)
+            title_widget.setStyleSheet(
+                f"{selector} {{"
+                "font-family: 'Malgun Gothic'; font-size: 12pt; font-weight: bold;"
+                f"color: {color}; padding: 0px; text-align: center;"
+                "border: 1px solid #000000; border-radius: 2px;"
+                "background: transparent;"
+                "}"
+            )
+            if isinstance(title_widget, QLabel):
+                title_widget.setAlignment(Qt.AlignCenter)
+            separator = header_layout.itemAt(1).widget()
+            separator.setText("|")
+            separator.setFixedSize(12, 30)
+            separator.setAlignment(Qt.AlignCenter)
+            separator.setStyleSheet(separator_style)
+            setattr(self, f"{name}_header_separator", separator)
 
     @staticmethod
     def _detail_view() -> QPlainTextEdit:
