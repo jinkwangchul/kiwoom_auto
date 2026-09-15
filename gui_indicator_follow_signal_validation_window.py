@@ -760,7 +760,7 @@ class IndicatorFollowSignalValidationChartCanvas(
             candle.get(field) if candle.get(field) is not None else "-"
         )
         return "\n".join((
-            f"평가 시각: {_display_time(candle.get('time'))}",
+            _display_time(candle.get("time")),
             f"시가: {value('open')}",
             f"고가: {value('high')}",
             f"저가: {value('low')}",
@@ -2236,10 +2236,10 @@ class IndicatorFollowSignalValidationWindow(
         return payload
 
     def show_settings_apply_result(self, message: str, *, success: bool) -> None:
-        self.validation_status_label.setText(str(message or "설정 적용 실패"))
         if success:
             self._set_primary_validation_action_state("apply")
             return
+        self.validation_status_label.setText(str(message or "설정 적용 실패"))
         try:
             fingerprint_matches = (
                 self._validated_ui_fingerprint is not None

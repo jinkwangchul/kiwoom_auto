@@ -556,7 +556,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 show_result("일부 검증값을 적용할 수 없습니다.", success=False)
             return
         if callable(show_result):
-            show_result("설정 적용 완료", success=True)
+            show_result("", success=True)
 
     def _restore_entry_state_to_source(
         self,

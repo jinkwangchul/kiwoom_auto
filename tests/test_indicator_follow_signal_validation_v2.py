@@ -735,10 +735,11 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                     canvas._x_for_index(index),
                     hover_y,
                 )
-                self.assertIn(
-                    f"평가 시각: 2026-09-14 12:{25 + index:02d}",
-                    tooltip,
+                self.assertEqual(
+                    f"2026-09-14 12:{25 + index:02d}",
+                    tooltip.splitlines()[0],
                 )
+                self.assertNotIn("평가 시각", tooltip)
                 self.assertIn(f"시가: {252250.0 + index}", tooltip)
                 self.assertIn(f"고가: {253000.0 + index}", tooltip)
                 self.assertIn(f"저가: {252000.0 + index}", tooltip)
@@ -869,10 +870,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             hit_bottom = min(scale.plot_bottom, max(high_y, low_y))
             self.assertLessEqual(hit_top, hit_bottom)
             edge_y = hit_top if clipped_edge == "top" else hit_bottom
-            self.assertIn("평가 시각:", canvas.candle_tooltip_at(
+            tooltip = canvas.candle_tooltip_at(
                 canvas._x_for_index(0),
                 edge_y,
-            ))
+            )
+            self.assertEqual("2026-09-14 12:30", tooltip.splitlines()[0])
+            self.assertNotIn("평가 시각", tooltip)
             outside_y = hit_bottom + 1 if clipped_edge == "top" else hit_top - 1
             self.assertTrue(scale.plot_top <= outside_y <= scale.plot_bottom)
             self.assertEqual("", canvas.candle_tooltip_at(
@@ -1758,7 +1761,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             "A or D",
             applies[-1].to_ui_state()["basic"]["buy_signal_expr_line"],
         )
+        validation_summary = window.validation_status_label.text()
         window.show_settings_apply_result("설정 적용 완료", success=True)
+        self.assertEqual(validation_summary, window.validation_status_label.text())
+        self.assertNotIn("설정 적용 완료", window.validation_status_label.text())
         self.assertEqual("설정적용", window.primary_validation_action_button.text())
         self.assertTrue(window.primary_validation_action_button.isEnabled())
 

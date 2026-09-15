@@ -1564,7 +1564,9 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
 
         def accept(payload):
             emitted.append(payload)
+            validation_summary = window.validation_status_label.text()
             window.show_settings_apply_result("설정 적용 완료", success=True)
+            self.assertEqual(validation_summary, window.validation_status_label.text())
 
         window.validation_run_requested.connect(runs.append)
         window.settings_apply_requested.connect(accept)
@@ -1576,6 +1578,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             self.assertEqual(expected_count, len(runs))
             window.set_replay_snapshot(self._snapshot([]))
             self.assertEqual(expected_count, len(emitted))
+            self.assertNotIn("설정 적용 완료", window.validation_status_label.text())
             self.assertEqual(
                 expression,
                 emitted[-1].to_ui_state()["basic"]["buy_signal_expr_line"],
@@ -1657,7 +1660,12 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                         payload.to_ui_state()
                     )
                     self.assertEqual([], result["skipped"])
+                    validation_summary = window.validation_status_label.text()
                     window.show_settings_apply_result("설정 적용 완료", success=True)
+                    self.assertEqual(
+                        validation_summary,
+                        window.validation_status_label.text(),
+                    )
 
                 window.validation_run_requested.connect(complete_validation)
                 window.settings_apply_requested.connect(apply_candidate)
@@ -1745,7 +1753,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             payload = IndicatorFollowSignalValidationApplyPayload(state)
             window.settings_apply_requested.emit(payload)
             self.assertEqual("B or C", source.buy_signal_expr_line.text())
-            self.assertEqual(("설정 적용 완료", True), window.apply_results[-1])
+            self.assertEqual(("", True), window.apply_results[-1])
             self.assertFalse(hasattr(source, "_registration_undo_target_snapshot"))
             source.restore_settings_undo_snapshot()
             self.assertEqual(launch_expression, source.buy_signal_expr_line.text())
