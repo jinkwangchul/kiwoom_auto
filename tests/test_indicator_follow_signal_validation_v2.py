@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics, QMouseEvent, QPixmap, QWheelEvent
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
@@ -273,7 +273,13 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             trace={"conditions": [], "groups": [], "aggregations": []},
         )
 
-    def _replay_snapshot(self, entries, closes=(100.0, 120.0, 150.0)):
+    def _replay_snapshot(
+        self,
+        entries,
+        closes=(100.0, 120.0, 150.0),
+        *,
+        timeframe_minutes=5,
+    ):
         candles = [
             {
                 "time": f"2026091114{index:02d}00",
@@ -287,7 +293,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         ]
         return ValidationReplaySnapshot(
             stock=self.stock,
-            timeframe_minutes=5,
+            timeframe_minutes=timeframe_minutes,
             settings_hash="hash",
             historical_request_id="REQUEST",
             evaluated_start_index=0,
@@ -523,7 +529,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.buy_rsi_value_line.setText("33")
         run_request = window._request_validation()
         self.assertIsInstance(run_request, IndicatorFollowSignalValidationRunRequest)
-        self.assertEqual([run_request], emitted)
+        self.assertEqual(2, len(emitted))
+        self.assertEqual(15, emitted[0].settings_snapshot.to_dict()["bar"]["bar_minutes"])
+        self.assertEqual(100, emitted[0].candle_count)
+        self.assertIs(run_request, emitted[1])
         self.assertEqual(500, run_request.candle_count)
         snapshot = run_request.settings_snapshot
         rules = snapshot.to_dict()
@@ -1224,16 +1233,47 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             for record in window.canvas.time_axis_records()
         ))
 
-    def test_primary_action_requires_matching_validation_before_apply(self):
+    def test_validation_context_changes_refresh_without_candidate_emission(self):
         window = self._window()
         runs = []
         applies = []
         window.validation_run_requested.connect(runs.append)
         window.settings_apply_requested.connect(applies.append)
 
-        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+        window.basic_signal_interval_combo.setCurrentText("3")
+        self.assertEqual(1, len(runs))
+        self.assertEqual(
+            3,
+            runs[-1].settings_snapshot.to_dict()["bar"]["bar_minutes"],
+        )
+        self.assertEqual(100, runs[-1].candle_count)
+        self.assertEqual([], applies)
+        window.set_replay_snapshot(
+            self._replay_snapshot([], timeframe_minutes=3)
+        )
+        self.assertIn("3분봉", window.result_summary_label.text())
+        self.assertEqual([], applies)
+
+        window.historical_candle_count_spin.lineEdit().setText("200")
+        self.assertEqual(1, len(runs))
+        window.historical_candle_count_spin.editingFinished.emit()
+        self.assertEqual(2, len(runs))
+        self.assertEqual(200, runs[-1].candle_count)
+        self.assertEqual([], applies)
+
+    def test_primary_settings_apply_validates_stale_state_then_emits_once(self):
+        window = self._window()
+        runs = []
+        applies = []
+        window.validation_run_requested.connect(runs.append)
+        window.settings_apply_requested.connect(applies.append)
+
+        self.assertEqual("설정적용", window.primary_validation_action_button.text())
         self.assertIs(window.run_validation_button, window.primary_validation_action_button)
         self.assertFalse(hasattr(window, "apply_settings_button"))
+        window.buy_signal_expr_line.setText("A or D")
+        self.assertEqual([], runs)
+        self.assertEqual([], applies)
         window.primary_validation_action_button.click()
         self.assertEqual(1, len(runs))
         self.assertEqual([], applies)
@@ -1243,35 +1283,135 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 self._entry("SELL", 2, "SELL"),
             ])
         )
-        self.assertEqual("검증적용", window.primary_validation_action_button.text())
-        self.assertEqual([], applies)
-
-        original_expression = window.buy_signal_expr_line.text()
-        blocker = QSignalBlocker(window.buy_signal_expr_line)
-        window.buy_signal_expr_line.setText("A or D")
-        del blocker
-        self.assertIsNone(window._request_settings_apply())
-        self.assertEqual([], applies)
-        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
-
-        window.buy_signal_expr_line.setText(original_expression)
-        window._request_validation()
-        window.set_replay_snapshot(self._replay_snapshot([]))
-        window.primary_validation_action_button.click()
         self.assertEqual(1, len(applies))
-        window.show_settings_apply_result("검증적용 완료", success=True)
-        self.assertEqual("적용 완료", window.primary_validation_action_button.text())
-        window.buy_rsi_value_line.setText("44")
-        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+        self.assertEqual(
+            "A or D",
+            applies[-1].to_ui_state()["basic"]["buy_signal_expr_line"],
+        )
+        window.show_settings_apply_result("설정 적용 완료", success=True)
+        self.assertEqual("설정적용", window.primary_validation_action_button.text())
+        self.assertTrue(window.primary_validation_action_button.isEnabled())
 
-        window._request_validation()
+        window.primary_validation_action_button.click()
+        self.assertEqual(1, len(runs))
+        self.assertEqual(2, len(applies))
+
+        window.buy_rsi_value_line.setText("44")
+        self.assertEqual(1, len(runs))
+        self.assertEqual(2, len(applies))
+        window.primary_validation_action_button.click()
+        self.assertEqual(2, len(runs))
         window.show_validation_error("검증 실패")
-        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
-        window._request_validation()
-        window.set_replay_snapshot(self._replay_snapshot([]))
-        self.assertEqual("검증적용", window.primary_validation_action_button.text())
+        self.assertEqual(2, len(applies))
+        self.assertEqual("설정적용", window.primary_validation_action_button.text())
+        self.assertTrue(window.primary_validation_action_button.isEnabled())
+
         window.set_validation_stock(ValidationStockRef("000660", "SK하이닉스"))
-        self.assertEqual("검증 실행", window.primary_validation_action_button.text())
+        self.assertEqual("설정적용", window.primary_validation_action_button.text())
+
+    def test_failed_settings_apply_validation_never_emits_candidate(self):
+        window = self._window()
+        runs = []
+        applies = []
+        window.validation_run_requested.connect(runs.append)
+        window.settings_apply_requested.connect(applies.append)
+
+        window.buy_signal_expr_line.setText("C")
+        window.primary_validation_action_button.click()
+        self.assertEqual(1, len(runs))
+        window.show_validation_error("REPLAY: INVALID_RESULT")
+
+        self.assertEqual([], applies)
+        self.assertFalse(window._settings_apply_after_validation)
+        self.assertEqual("설정적용", window.primary_validation_action_button.text())
+        self.assertTrue(window.primary_validation_action_button.isEnabled())
+
+    def test_latest_context_request_generation_owns_result(self):
+        pending = []
+
+        class Provider:
+            def __init__(_self, session, requester):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                pending.append((_self.session, count, callback))
+
+        class Replay:
+            def __init__(_self, session):
+                _self.session = session
+
+            def evaluate(_self, historical):
+                request = _self.session.request
+                return ValidationReplayResult(True, snapshot=ValidationReplaySnapshot(
+                    stock=request.stock,
+                    timeframe_minutes=request.timeframe_minutes,
+                    settings_hash=request.settings_snapshot.rules_hash,
+                    historical_request_id=historical.request_id,
+                    evaluated_start_index=0,
+                    evaluated_end_index=0,
+                    dropped_raw_rows_count=0,
+                    candles=[{
+                        "time": "20260911143000",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100,
+                        "volume": 1,
+                    }],
+                    entries=[],
+                ))
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=_FakeHost(self.stock),
+            historical_provider_factory=Provider,
+            replay_factory=Replay,
+            recent_stock_store=_MemoryRecentStockStore(),
+        )
+        window = _FakeWindow(self.stock, self._seed())
+        self.widgets.append(window)
+        window_key = id(window)
+        flow._open_windows[window_key] = window
+        flow._request_generation[window_key] = 0
+
+        for timeframe, count in ((3, 200), (5, 500)):
+            rules = deepcopy(self.rules)
+            rules["bar"]["bar_minutes"] = timeframe
+            ui_state = self._seed().to_ui_state()
+            ui_state["basic"]["basic_signal_interval_combo"] = str(timeframe)
+            request = IndicatorFollowSignalValidationRunRequest(
+                build_signal_validation_snapshot(rules, ui_state=ui_state),
+                count,
+            )
+            flow._run_validation(window, request)
+
+        def result(session, count, request_id):
+            request = session.request
+            return ValidationHistoricalResult(
+                True,
+                snapshot=ValidationHistoricalSnapshot(
+                    stock=request.stock,
+                    timeframe_minutes=request.timeframe_minutes,
+                    requested_count=count,
+                    request_id=request_id,
+                    rows=[{
+                        "체결시간": "20260911143000",
+                        "시가": "100",
+                        "고가": "101",
+                        "저가": "99",
+                        "현재가": "100",
+                        "거래량": "1",
+                    }],
+                ),
+            )
+
+        self.assertEqual(2, len(pending))
+        pending[0][2](result(pending[0][0], pending[0][1], "OLD"))
+        self.assertEqual([], window.snapshots)
+        pending[1][2](result(pending[1][0], pending[1][1], "LATEST"))
+        self.assertEqual(1, len(window.snapshots))
+        self.assertEqual(5, window.snapshots[0].timeframe_minutes)
+        self.assertEqual("LATEST", window.snapshots[0].historical_request_id)
 
     def test_result_summary_keeps_estimate_in_left_cluster(self):
         window = self._window()

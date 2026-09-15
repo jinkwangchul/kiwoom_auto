@@ -600,7 +600,6 @@ class IndicatorFollowRoutineSettingsDialog(
         self.rules_data = {}
         self._approval_session_path = self._default_rule_approval_session_path()
         self._initial_settings_undo_snapshot = None
-        self._registration_undo_target_snapshot = None
 
         self._build_ui()
         self.load_rules()
@@ -1426,26 +1425,13 @@ class IndicatorFollowRoutineSettingsDialog(
             self.collect_indicator_follow_ui_state()
         )
 
-    def capture_signal_validation_launch_snapshot(self):
-        """Return a detached parent Working snapshot for one V2 launch."""
-        return self._capture_settings_ui_snapshot()
-
-    def apply_signal_validation_candidate_ui_state(self, state, launch_snapshot):
-        """Apply one final V2 candidate in memory and commit its undo target."""
-        canonical_launch_snapshot = self._canonical_settings_ui_snapshot(
-            self._settings_ui_state_from_snapshot(launch_snapshot)
-        )
-        result = self.apply_signal_validation_ui_state(state)
-        skipped = result.get("skipped", []) if isinstance(result, dict) else ["invalid"]
-        if not skipped and self.settings_mode == "registration":
-            self._registration_undo_target_snapshot = canonical_launch_snapshot
-        return result
+    def apply_signal_validation_candidate_ui_state(self, state):
+        """Apply one final V2 candidate to the in-memory Working UI only."""
+        return self.apply_signal_validation_ui_state(state)
 
     def restore_settings_undo_snapshot(self):
         """Restore the context baseline without rereading persistent settings."""
         snapshot = self._initial_settings_undo_snapshot
-        if self.settings_mode == "registration":
-            snapshot = self._registration_undo_target_snapshot or snapshot
         if snapshot is None:
             return None
         state = self._settings_ui_state_from_snapshot(snapshot)

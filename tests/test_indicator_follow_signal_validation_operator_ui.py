@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -1391,7 +1392,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             self._entry("SELL", 1, signal="SELL"),
         ]))
         window._request_settings_apply()
-        window.show_settings_apply_result("검증적용 완료", success=True)
+        window.show_settings_apply_result("설정 적용 완료", success=True)
         for toggle in (
             window._toggle_recent_stock_row,
             window._toggle_recent_stock_row,
@@ -1478,7 +1479,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 )
                 self.assertEqual(file_before, rules_path.read_bytes())
 
-    def test_registration_undo_uses_initial_then_latest_successful_v2_launch_snapshot(self):
+    def test_registration_undo_always_restores_dialog_open_baseline(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
@@ -1496,65 +1497,27 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             self.assertEqual("되돌리기", source.reload_button.text())
 
             source.basic_signal_interval_combo.setCurrentText("10")
-            source.restore_settings_undo_snapshot()
-            self.assertEqual(initial_interval, source.basic_signal_interval_combo.currentText())
+            for interval in ("15", "30", "60"):
+                candidate = self._seed().to_ui_state()
+                candidate["basic"]["basic_signal_interval_combo"] = interval
+                result = source.apply_signal_validation_candidate_ui_state(candidate)
+                self.assertEqual([], result["skipped"])
+                self.assertEqual(interval, source.basic_signal_interval_combo.currentText())
+                self.assertEqual(file_before, rules_path.read_bytes())
 
-            source.basic_signal_interval_combo.setCurrentText("10")
-            first_launch = source.capture_signal_validation_launch_snapshot()
-            first_candidate = self._seed().to_ui_state()
-            first_candidate["basic"]["basic_signal_interval_combo"] = "15"
-            result = source.apply_signal_validation_candidate_ui_state(
-                first_candidate,
-                first_launch,
-            )
-            self.assertEqual([], result["skipped"])
-            self.assertEqual("15", source.basic_signal_interval_combo.currentText())
-            self.assertEqual(file_before, rules_path.read_bytes())
             registration = source.build_registration_rules_from_current_ui_state()
             self.assertTrue(registration["success"], registration.get("error"))
             self.assertEqual(
-                "15",
+                "60",
                 registration["rules"]["indicator_follow_ui_state"]["state"]
                 ["basic"]["basic_signal_interval_combo"],
             )
-
-            source.basic_signal_interval_combo.setCurrentText("30")
-            second_launch = source.capture_signal_validation_launch_snapshot()
-            second_candidate = self._seed().to_ui_state()
-            second_candidate["basic"]["basic_signal_interval_combo"] = "60"
-            source.apply_signal_validation_candidate_ui_state(
-                second_candidate,
-                second_launch,
-            )
-            self.assertEqual("60", source.basic_signal_interval_combo.currentText())
-            source.restore_settings_undo_snapshot()
-            self.assertEqual("30", source.basic_signal_interval_combo.currentText())
+            self.assertFalse(hasattr(source, "_registration_undo_target_snapshot"))
+            with patch.object(source, "load_rules") as persistent_reload:
+                source.restore_settings_undo_snapshot()
+            persistent_reload.assert_not_called()
+            self.assertEqual(initial_interval, source.basic_signal_interval_combo.currentText())
             self.assertEqual(file_before, rules_path.read_bytes())
-
-    def test_registration_cancel_does_not_replace_successful_undo_target(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            rules_path = Path(temp_dir) / "rules.json"
-            rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
-            with patch.object(dialog_module.QTimer, "singleShot"):
-                source = dialog_module.IndicatorFollowRoutineSettingsDialog(
-                    rules_path=rules_path,
-                    routine_path=self.routine_dir,
-                    routine_name="지표추종매매",
-                    definition_id="indicator_follow",
-                    settings_mode="registration",
-                )
-            self.widgets.append(source)
-            source.basic_signal_interval_combo.setCurrentText("10")
-            accepted_launch = source.capture_signal_validation_launch_snapshot()
-            accepted = self._seed().to_ui_state()
-            accepted["basic"]["basic_signal_interval_combo"] = "15"
-            source.apply_signal_validation_candidate_ui_state(accepted, accepted_launch)
-
-            source.basic_signal_interval_combo.setCurrentText("30")
-            cancelled_launch = source.capture_signal_validation_launch_snapshot()
-            self.assertIsInstance(cancelled_launch, str)
-            source.restore_settings_undo_snapshot()
-            self.assertEqual("10", source.basic_signal_interval_combo.currentText())
 
     def test_edit_undo_always_restores_dialog_open_baseline_without_persistent_read(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1573,10 +1536,9 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             baseline = source.collect_indicator_follow_ui_state()
             file_before = rules_path.read_bytes()
             source.basic_signal_interval_combo.setCurrentText("10")
-            launch = source.capture_signal_validation_launch_snapshot()
             candidate = self._seed().to_ui_state()
             candidate["basic"]["basic_signal_interval_combo"] = "15"
-            result = source.apply_signal_validation_candidate_ui_state(candidate, launch)
+            result = source.apply_signal_validation_candidate_ui_state(candidate)
             self.assertEqual([], result["skipped"])
             self.assertEqual("15", source.basic_signal_interval_combo.currentText())
             edit_rules = source.build_rules_with_indicator_follow_ui_state()
@@ -1595,36 +1557,156 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             )
             self.assertEqual(file_before, rules_path.read_bytes())
 
-    def test_v2_emits_only_final_validated_candidate_once_and_payload_is_detached(self):
+    def test_v2_repeated_settings_apply_emits_each_validated_candidate_once(self):
         window = self._window()
+        runs = []
         emitted = []
 
         def accept(payload):
             emitted.append(payload)
-            window.show_settings_apply_result("검증적용 완료", success=True)
+            window.show_settings_apply_result("설정 적용 완료", success=True)
 
+        window.validation_run_requested.connect(runs.append)
         window.settings_apply_requested.connect(accept)
-        for expression in ("A", "B", "C", "D"):
+        for expected_count, expression in enumerate(("B", "C", "D"), start=1):
             window.buy_signal_expr_line.setText(expression)
-            self.assertEqual([], emitted)
-        window._request_validation()
-        window.set_replay_snapshot(self._snapshot([]))
-        self.assertEqual("검증적용", window.primary_validation_action_button.text())
-        payload = window._request_settings_apply()
-        self.assertIsNotNone(payload)
-        self.assertEqual(1, len(emitted))
-        self.assertEqual(
-            "D",
-            emitted[0].to_ui_state()["basic"]["buy_signal_expr_line"],
-        )
-        detached = emitted[0].to_ui_state()
+            self.assertEqual(expected_count - 1, len(runs))
+            self.assertEqual(expected_count - 1, len(emitted))
+            window.primary_validation_action_button.click()
+            self.assertEqual(expected_count, len(runs))
+            window.set_replay_snapshot(self._snapshot([]))
+            self.assertEqual(expected_count, len(emitted))
+            self.assertEqual(
+                expression,
+                emitted[-1].to_ui_state()["basic"]["buy_signal_expr_line"],
+            )
+            self.assertEqual("설정적용", window.primary_validation_action_button.text())
+            self.assertTrue(window.primary_validation_action_button.isEnabled())
+
+        detached = emitted[-1].to_ui_state()
         detached["basic"]["buy_signal_expr_line"] = "A"
         self.assertEqual(
             "D",
-            emitted[0].to_ui_state()["basic"]["buy_signal_expr_line"],
+            emitted[-1].to_ui_state()["basic"]["buy_signal_expr_line"],
         )
-        self.assertIsNone(window._request_settings_apply())
-        self.assertEqual(1, len(emitted))
+
+    def test_parent_v2_context_apply_and_fixed_undo_workflow(self):
+        for mode in ("registration", "edit"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                rules_path = Path(temp_dir) / "rules.json"
+                rules_path.write_text(
+                    json.dumps(self.rules, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                kwargs = dict(
+                    rules_path=rules_path,
+                    routine_path=self.routine_dir,
+                    routine_name="지표추종매매",
+                    definition_id="indicator_follow",
+                    settings_mode=mode,
+                )
+                if mode == "edit":
+                    kwargs["instance_id"] = "INSTANCE-CONTEXT-APPLY"
+                with patch.object(dialog_module.QTimer, "singleShot"):
+                    source = dialog_module.IndicatorFollowRoutineSettingsDialog(**kwargs)
+                    seed = IndicatorFollowSignalValidationSeed(
+                        ValidationSettingsSnapshot(self.rules),
+                        source.collect_indicator_follow_ui_state(),
+                    )
+                    window = IndicatorFollowSignalValidationWindow(self.stock, seed)
+                self.widgets.extend([source, window])
+                source.show()
+                window.show()
+                self.app.processEvents()
+
+                baseline = source.collect_indicator_follow_ui_state()
+                file_before = rules_path.read_bytes()
+                run_requests = []
+                candidates = []
+
+                def complete_validation(run_request):
+                    run_requests.append(run_request)
+                    candle_count = run_request.candle_count
+                    timeframe = run_request.settings_snapshot.to_dict()["bar"]["bar_minutes"]
+                    start = datetime(2026, 9, 14, 9, 0)
+                    candles = [{
+                        "time": (start + timedelta(minutes=timeframe * index)).strftime(
+                            "%Y%m%d%H%M%S"
+                        ),
+                        "open": 100 + index,
+                        "high": 101 + index,
+                        "low": 99 + index,
+                        "close": 100 + index,
+                        "volume": 1,
+                    } for index in range(candle_count)]
+                    window.set_replay_snapshot(ValidationReplaySnapshot(
+                        stock=self.stock,
+                        timeframe_minutes=timeframe,
+                        settings_hash=run_request.settings_snapshot.rules_hash,
+                        historical_request_id=f"HARNESS-{len(run_requests)}",
+                        evaluated_start_index=0,
+                        evaluated_end_index=candle_count - 1,
+                        dropped_raw_rows_count=0,
+                        candles=candles,
+                        entries=[],
+                    ))
+
+                def apply_candidate(payload):
+                    candidates.append(payload)
+                    result = source.apply_signal_validation_candidate_ui_state(
+                        payload.to_ui_state()
+                    )
+                    self.assertEqual([], result["skipped"])
+                    window.show_settings_apply_result("설정 적용 완료", success=True)
+
+                window.validation_run_requested.connect(complete_validation)
+                window.settings_apply_requested.connect(apply_candidate)
+
+                window.historical_candle_count_spin.lineEdit().setText("200")
+                window.historical_candle_count_spin.editingFinished.emit()
+                self.assertEqual(200, len(window._candles))
+                self.assertEqual([], candidates)
+
+                window.basic_signal_interval_combo.setCurrentText("3")
+                self.assertEqual(3, window.replay_snapshot.timeframe_minutes)
+                self.assertEqual(
+                    baseline["basic"]["basic_signal_interval_combo"],
+                    source.basic_signal_interval_combo.currentText(),
+                )
+                self.assertEqual([], candidates)
+
+                prior_runs = len(run_requests)
+                for expected_count, expression in enumerate(("B", "C", "D"), start=1):
+                    window.buy_signal_expr_line.setText(expression)
+                    self.assertEqual(prior_runs + expected_count - 1, len(run_requests))
+                    window.primary_validation_action_button.click()
+                    self.assertEqual(prior_runs + expected_count, len(run_requests))
+                    self.assertEqual(expected_count, len(candidates))
+                    self.assertEqual(
+                        expression,
+                        source.buy_signal_expr_line.text(),
+                    )
+                    self.assertEqual("3", source.basic_signal_interval_combo.currentText())
+                    self.assertTrue(window.primary_validation_action_button.isEnabled())
+
+                payload = source.build_registration_rules_from_current_ui_state()
+                if mode == "registration":
+                    self.assertTrue(payload["success"], payload.get("error"))
+                    final_rules = payload["rules"]
+                else:
+                    final_rules = source.build_rules_with_indicator_follow_ui_state()
+                final_state = final_rules["indicator_follow_ui_state"]["state"]
+                self.assertEqual("3", final_state["basic"]["basic_signal_interval_combo"])
+                self.assertEqual("D", final_state["basic"]["buy_signal_expr_line"])
+                self.assertNotIn("candle_count", json.dumps(final_state))
+                self.assertEqual(file_before, rules_path.read_bytes())
+
+                source.restore_settings_undo_snapshot()
+                self.assertEqual(
+                    baseline,
+                    source.collect_indicator_follow_ui_state(),
+                )
+                self.assertEqual(file_before, rules_path.read_bytes())
 
     def test_flow_apply_uses_source_weakref_and_closed_source_fails_closed(self):
         created = []
@@ -1663,8 +1745,8 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             payload = IndicatorFollowSignalValidationApplyPayload(state)
             window.settings_apply_requested.emit(payload)
             self.assertEqual("B or C", source.buy_signal_expr_line.text())
-            self.assertEqual(("검증적용 완료", True), window.apply_results[-1])
-            self.assertIsNotNone(source._registration_undo_target_snapshot)
+            self.assertEqual(("설정 적용 완료", True), window.apply_results[-1])
+            self.assertFalse(hasattr(source, "_registration_undo_target_snapshot"))
             source.restore_settings_undo_snapshot()
             self.assertEqual(launch_expression, source.buy_signal_expr_line.text())
             self.assertIn(window, flow.open_windows)

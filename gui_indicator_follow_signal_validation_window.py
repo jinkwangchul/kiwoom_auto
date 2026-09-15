@@ -1234,6 +1234,7 @@ class IndicatorFollowSignalValidationWindow(
         self._initial_geometry_committed = False
         self._user_geometry_owned = False
         self._primary_validation_action_state = "validate"
+        self._settings_apply_after_validation = False
         self._pending_validation_ui_fingerprint: str | None = None
         self._validated_ui_fingerprint: str | None = None
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
@@ -1316,7 +1317,7 @@ class IndicatorFollowSignalValidationWindow(
         self.result_summary_label = QLabel("Candle -  |  BUY -  |  SELL -")
         self.estimated_return_label = QLabel("|  추정 손익률 -")
         self.estimated_return_label.setStyleSheet("font-weight: bold;")
-        self.primary_validation_action_button = QPushButton("검증 실행")
+        self.primary_validation_action_button = QPushButton("설정적용")
         self.run_validation_button = self.primary_validation_action_button
         self.close_button = QPushButton("닫기")
         self.primary_validation_action_button.clicked.connect(
@@ -1911,16 +1912,31 @@ class IndicatorFollowSignalValidationWindow(
 
     def _connect_signal_ui_change_tracking(self) -> None:
         for line_edit in self.findChildren(QLineEdit):
+            if self.historical_candle_count_spin.isAncestorOf(line_edit):
+                continue
             line_edit.textChanged.connect(self._on_signal_validation_ui_changed)
         for combo in self.findChildren(QComboBox):
+            if combo is self.basic_signal_interval_combo:
+                continue
             combo.currentTextChanged.connect(self._on_signal_validation_ui_changed)
         for checkbox in self.findChildren(QCheckBox):
             checkbox.toggled.connect(self._on_signal_validation_ui_changed)
+        self.basic_signal_interval_combo.currentTextChanged.connect(
+            self._on_validation_context_changed
+        )
+        self.historical_candle_count_spin.editingFinished.connect(
+            self._on_validation_context_changed
+        )
 
     def _on_signal_validation_ui_changed(self, *_args) -> None:
+        self._settings_apply_after_validation = False
         self._pending_validation_ui_fingerprint = None
         self._validated_ui_fingerprint = None
         self._set_primary_validation_action_state("validate")
+
+    def _on_validation_context_changed(self, *_args) -> None:
+        self._settings_apply_after_validation = False
+        self._request_validation()
 
     def _set_primary_validation_action_state(
         self,
@@ -1928,23 +1944,23 @@ class IndicatorFollowSignalValidationWindow(
         *,
         enabled: bool | None = None,
     ) -> None:
-        if state not in {"validate", "apply", "applied"}:
+        if state not in {"validate", "apply"}:
             raise ValueError("unknown primary validation action state")
         self._primary_validation_action_state = state
-        self.primary_validation_action_button.setText({
-            "validate": "검증 실행",
-            "apply": "검증적용",
-            "applied": "적용 완료",
-        }[state])
+        self.primary_validation_action_button.setText("설정적용")
         if enabled is None:
-            enabled = state != "applied"
+            enabled = True
         self.primary_validation_action_button.setEnabled(bool(enabled))
 
     def _handle_primary_validation_action(self):
         if self._primary_validation_action_state == "apply":
             return self._request_settings_apply()
         if self._primary_validation_action_state == "validate":
-            return self._request_validation()
+            self._settings_apply_after_validation = True
+            request = self._request_validation()
+            if request is None:
+                self._settings_apply_after_validation = False
+            return request
         return None
 
     def _request_validation(self) -> IndicatorFollowSignalValidationRunRequest | None:
@@ -2049,9 +2065,9 @@ class IndicatorFollowSignalValidationWindow(
         return payload
 
     def show_settings_apply_result(self, message: str, *, success: bool) -> None:
-        self.validation_status_label.setText(str(message or "검증적용 실패"))
+        self.validation_status_label.setText(str(message or "설정 적용 실패"))
         if success:
-            self._set_primary_validation_action_state("applied")
+            self._set_primary_validation_action_state("apply")
             return
         try:
             fingerprint_matches = (
@@ -2073,6 +2089,7 @@ class IndicatorFollowSignalValidationWindow(
         self._pending_validation_ui_fingerprint = None
         self._pending_result_settings_snapshot = None
         self._validated_ui_fingerprint = None
+        self._settings_apply_after_validation = False
         self._set_primary_validation_action_state("validate")
 
     def set_validation_stock(self, stock: ValidationStockRef) -> bool:
@@ -2210,6 +2227,7 @@ class IndicatorFollowSignalValidationWindow(
         self.chart_stack.setCurrentWidget(self.loading_label)
         self._pending_validation_ui_fingerprint = None
         self._validated_ui_fingerprint = None
+        self._settings_apply_after_validation = False
         self._set_primary_validation_action_state("validate")
 
     def set_replay_snapshot(self, replay_snapshot: ValidationReplaySnapshot) -> None:
@@ -2310,8 +2328,13 @@ class IndicatorFollowSignalValidationWindow(
         ):
             self._validated_ui_fingerprint = pending_fingerprint
             self._set_primary_validation_action_state("apply")
+            apply_after_validation = self._settings_apply_after_validation
+            self._settings_apply_after_validation = False
+            if apply_after_validation:
+                self._request_settings_apply()
         else:
             self._validated_ui_fingerprint = None
+            self._settings_apply_after_validation = False
             self._set_primary_validation_action_state("validate")
         self.select_evaluation_index(replay_snapshot.evaluated_end_index)
 

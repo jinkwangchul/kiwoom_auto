@@ -238,17 +238,6 @@ class IndicatorFollowSignalValidationFlow(QObject):
         source_ref: weakref.ReferenceType[object],
     ) -> object | None:
         try:
-            source = source_ref()
-            capture_launch_snapshot = getattr(
-                source,
-                "capture_signal_validation_launch_snapshot",
-                None,
-            )
-            launch_snapshot = (
-                capture_launch_snapshot()
-                if callable(capture_launch_snapshot)
-                else None
-            )
             window = self._window_factory(
                 self._last_selected_stock,
                 seed,
@@ -275,12 +264,10 @@ class IndicatorFollowSignalValidationFlow(QObject):
             if not callable(getattr(apply_signal, "connect", None)):
                 raise TypeError("signal validation apply signal is unavailable")
             apply_signal.connect(
-                lambda payload, ref=window_ref, source=source_ref,
-                snapshot=launch_snapshot: self._apply_to_source(
+                lambda payload, ref=window_ref, source=source_ref: self._apply_to_source(
                     ref(),
                     source,
                     payload,
-                    snapshot,
                 )
             )
             stock_signal = getattr(window, "stock_selection_requested", None)
@@ -512,12 +499,11 @@ class IndicatorFollowSignalValidationFlow(QObject):
         window: object,
         source_ref: weakref.ReferenceType[object],
         payload: object,
-        launch_snapshot: object = None,
     ) -> None:
         show_result = getattr(window, "show_settings_apply_result", None)
         if not isinstance(payload, IndicatorFollowSignalValidationApplyPayload):
             if callable(show_result):
-                show_result("검증적용 데이터가 올바르지 않습니다.", success=False)
+                show_result("설정적용 데이터가 올바르지 않습니다.", success=False)
             return
         source = source_ref()
         if not self._valid_requester(source):
@@ -538,8 +524,8 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 show_result("원본 설정창에 검증값을 적용할 수 없습니다.", success=False)
             return
         try:
-            if callable(apply_candidate) and launch_snapshot is not None:
-                result = apply_candidate(payload.to_ui_state(), launch_snapshot)
+            if callable(apply_candidate):
+                result = apply_candidate(payload.to_ui_state())
             else:
                 result = apply_state(payload.to_ui_state())
         except Exception:
@@ -552,7 +538,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 show_result("일부 검증값을 적용할 수 없습니다.", success=False)
             return
         if callable(show_result):
-            show_result("검증적용 완료", success=True)
+            show_result("설정 적용 완료", success=True)
 
     def _release_window(self, window_key: int) -> None:
         self._open_windows.pop(window_key, None)
