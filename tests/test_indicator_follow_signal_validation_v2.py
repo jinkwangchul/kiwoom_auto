@@ -1673,9 +1673,15 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.set_replay_snapshot(self._candle_count_snapshot(100))
         window._validated_ui_fingerprint = window._current_signal_ui_fingerprint()
         window._set_primary_validation_action_state("apply")
-        self.assertIsNone(window._request_settings_apply())
+        status_before = window.validation_status_label.text()
+        with patch(
+            "gui_indicator_follow_signal_validation_window.show_toast"
+        ) as toast:
+            self.assertIsNone(window._request_settings_apply())
         self.assertEqual([], candidate_payloads)
-        self.assertIn("현재가 또는 평단가", window.validation_status_label.text())
+        toast.assert_called_once()
+        self.assertIn("매도조건 A", toast.call_args.args[1])
+        self.assertEqual(status_before, window.validation_status_label.text())
 
     def test_registration_and_edit_restore_unresolved_entry_without_persistence(self):
         unresolved = self._unresolved_seed().to_ui_state()
@@ -1789,6 +1795,108 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertFalse(window._settings_apply_after_validation)
         self.assertEqual("설정적용", window.primary_validation_action_button.text())
         self.assertTrue(window.primary_validation_action_button.isEnabled())
+
+    def test_sell_input_error_uses_toast_without_overwriting_run_status(self):
+        window = self._window()
+        state = window.collect_indicator_follow_ui_state()
+        state["basic"]["sell_signal_expr_line"] = "C"
+        condition_c = state["sell_ui"]["signal_conditions"]["condition_c"]
+        condition_c["gap_check"] = True
+        condition_c["gap_left_combo"] = "주문가"
+        status_before = window.validation_status_label.text()
+        runs = []
+        window.validation_run_requested.connect(runs.append)
+
+        with patch.object(
+            window,
+            "collect_indicator_follow_ui_state",
+            return_value=state,
+        ), patch(
+            "gui_indicator_follow_signal_validation_window.show_toast"
+        ) as toast:
+            self.assertIsNone(window.request_validation())
+
+        toast.assert_called_once()
+        self.assertIn("매도조건 C", toast.call_args.args[1])
+        self.assertEqual(status_before, window.validation_status_label.text())
+        self.assertEqual([], runs)
+
+    def test_sell_expression_error_precedes_price_error_toast(self):
+        window = self._window()
+        state = window.collect_indicator_follow_ui_state()
+        state["basic"]["sell_signal_expr_line"] = "C AND"
+        condition_c = state["sell_ui"]["signal_conditions"]["condition_c"]
+        condition_c["gap_check"] = True
+        condition_c["gap_left_combo"] = "주문가"
+        status_before = window.validation_status_label.text()
+
+        with patch.object(
+            window,
+            "collect_indicator_follow_ui_state",
+            return_value=state,
+        ), patch(
+            "gui_indicator_follow_signal_validation_window.show_toast"
+        ) as toast:
+            self.assertIsNone(window.request_validation())
+
+        toast.assert_called_once()
+        self.assertIn("조합식", toast.call_args.args[1])
+        self.assertNotIn("가격비교", toast.call_args.args[1])
+        self.assertEqual(status_before, window.validation_status_label.text())
+
+    def test_sell_input_error_uses_toast_without_emitting_apply_candidate(self):
+        window = self._window()
+        state = window.collect_indicator_follow_ui_state()
+        state["basic"]["sell_signal_expr_line"] = "C"
+        condition_c = state["sell_ui"]["signal_conditions"]["condition_c"]
+        condition_c["gap_check"] = True
+        condition_c["gap_left_combo"] = "주문가"
+        window._validated_ui_fingerprint = window._signal_ui_fingerprint(state)
+        window._set_primary_validation_action_state("apply")
+        status_before = window.validation_status_label.text()
+        candidates = []
+        window.settings_apply_requested.connect(candidates.append)
+
+        with patch.object(
+            window,
+            "collect_indicator_follow_ui_state",
+            return_value=state,
+        ), patch(
+            "gui_indicator_follow_signal_validation_window.show_toast"
+        ) as toast:
+            self.assertIsNone(window._request_settings_apply())
+
+        toast.assert_called_once()
+        self.assertIn("매도조건 C", toast.call_args.args[1])
+        self.assertEqual(status_before, window.validation_status_label.text())
+        self.assertEqual([], candidates)
+
+    def test_apply_payload_checks_only_referenced_active_sell_price_filters(self):
+        state = self._window().collect_indicator_follow_ui_state()
+        conditions = state["sell_ui"]["signal_conditions"]
+
+        state["basic"]["sell_signal_expr_line"] = "C"
+        conditions["condition_a"]["gap_left_combo"] = "주문가"
+        conditions["condition_b"]["gap_left_combo"] = "주문가"
+        self.assertIsInstance(
+            IndicatorFollowSignalValidationApplyPayload(state),
+            IndicatorFollowSignalValidationApplyPayload,
+        )
+
+        conditions["condition_c"]["gap_check"] = False
+        conditions["condition_c"]["gap_left_combo"] = "주문가"
+        self.assertIsInstance(
+            IndicatorFollowSignalValidationApplyPayload(state),
+            IndicatorFollowSignalValidationApplyPayload,
+        )
+
+        conditions["condition_c"]["gap_check"] = True
+        with self.assertRaisesRegex(ValueError, "매도조건 C"):
+            IndicatorFollowSignalValidationApplyPayload(state)
+
+        state["basic"]["sell_signal_expr_line"] = "C AND"
+        with self.assertRaisesRegex(ValueError, "조합식 오류"):
+            IndicatorFollowSignalValidationApplyPayload(state)
 
     def test_latest_context_request_generation_owns_result(self):
         pending = []

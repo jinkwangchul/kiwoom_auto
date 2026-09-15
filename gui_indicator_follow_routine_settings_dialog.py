@@ -73,8 +73,6 @@ from gui_indicator_follow_sell_controls import (
     SELL_PRICE_UNRESOLVED_PROPERTY,
     clear_sell_price_combo_unresolved,
     mark_sell_price_combo_unresolved,
-    require_resolved_sell_price_selections,
-    sell_price_selection_issues,
 )
 from gui_routine_registry import get_routine_records, normalize_routine_name
 from gui_toast import show_toast
@@ -1331,9 +1329,14 @@ class IndicatorFollowRoutineSettingsDialog(
             raise ValueError("validation base rules are unavailable")
 
         ui_state = self.collect_indicator_follow_ui_state()
-        unresolved_sell_price = sell_price_selection_issues(ui_state)
+        from indicator_follow_signal_validation_projection import (
+            expression_aware_sell_price_selection_issues,
+            require_expression_aware_sell_price_selections,
+        )
+
+        unresolved_sell_price = expression_aware_sell_price_selection_issues(ui_state)
         if unresolved_sell_price and not allow_unresolved_sell_price:
-            require_resolved_sell_price_selections(ui_state)
+            require_expression_aware_sell_price_selections(ui_state)
         mapper = self._load_indicator_follow_rule_mapper()
         preview = mapper.build_engine_rules_preview_from_ui_state(
             ui_state,

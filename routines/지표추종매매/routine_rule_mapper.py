@@ -2618,18 +2618,19 @@ def build_engine_rules_preview_from_ui_state(
     condition_a = _as_dict(signal_conditions.get("condition_a"))
     condition_b = _as_dict(signal_conditions.get("condition_b"))
     condition_c = _as_dict(signal_conditions.get("condition_c"))
-    for group_name, condition in (
-        ("A", condition_a),
-        ("B", condition_b),
-        ("C", condition_c),
-    ):
-        for field_name in ("gap_left_combo", "gap_right_combo"):
-            if field_name not in condition:
-                continue
-            if _series_target(condition.get(field_name)) not in {"CLOSE", "AVG_PRICE"}:
-                validation_warnings.append(
-                    f"sell condition {group_name} GAP 가격 기준 재선택 필요: {field_name}"
-                )
+    sell_expression_text = str(basic.get("sell_signal_expr_line") or "").strip()
+    parsed_sell_expression = None
+    if sell_expression_text:
+        parsed_sell_expression = parse_condition_expression(
+            sell_expression_text,
+            allowed_identifiers={"A", "B", "C"},
+            allow_duplicate_identifiers=False,
+        )
+        if not parsed_sell_expression.get("ok"):
+            validation_warnings.append(
+                "sell signal expression is invalid: "
+                f"{parsed_sell_expression.get('reason')}"
+            )
     sell_group_records: list[dict[str, Any]] = []
     for group_name, condition, builder, candidate_path in (
         ("A", condition_a, _build_sell_condition_a_signal_candidate, SELL_CONDITION_A_SIGNAL_PREVIEW_PATH),
@@ -2660,12 +2661,12 @@ def build_engine_rules_preview_from_ui_state(
             "has_active_conditions": has_active_conditions,
         })
 
-    parsed_sell_expression = _attach_sell_signal_expression(
-        sell_add_signal_candidates,
-        basic.get("sell_signal_expr_line"),
-        validation_warnings,
-    )
     if isinstance(parsed_sell_expression, dict) and parsed_sell_expression.get("ok"):
+        _attach_sell_signal_expression(
+            sell_add_signal_candidates,
+            sell_expression_text,
+            validation_warnings,
+        )
         referenced_groups = {
             str(identifier or "").strip().upper()
             for identifier in _as_list(parsed_sell_expression.get("identifiers"))
@@ -2706,6 +2707,8 @@ def build_engine_rules_preview_from_ui_state(
                 validation_warnings.append(
                     f"sell condition {group_name} candidate group was not generated"
                 )
+    elif sell_expression_text:
+        sell_add_signal_candidates.clear()
     else:
         for record in sell_group_records:
             validation_warnings.extend(record["warnings"])

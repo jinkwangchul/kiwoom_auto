@@ -49,11 +49,12 @@ from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
     build_signal_validation_snapshot,
     project_signal_validation_ui_state,
-    require_resolved_sell_price_selections,
+    require_expression_aware_sell_price_selections,
 )
 from indicator_follow_signal_validation_presentation import (
     signal_evidence_tooltip,
 )
+from gui_toast import show_toast
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
     ValidationStockRef,
@@ -2100,7 +2101,7 @@ class IndicatorFollowSignalValidationWindow(
             return None
         try:
             ui_state = self.collect_indicator_follow_ui_state()
-            require_resolved_sell_price_selections(ui_state)
+            require_expression_aware_sell_price_selections(ui_state)
             mapper = self._load_indicator_follow_rule_mapper()
             preview = mapper.build_engine_rules_preview_from_ui_state(
                 ui_state,
@@ -2112,7 +2113,7 @@ class IndicatorFollowSignalValidationWindow(
                 if str(item).lower().startswith(("sell condition", "sell signal"))
             ]
             if sell_warnings:
-                raise ValueError("; ".join(sell_warnings))
+                raise ValueError("SELL_VALIDATION_INPUT_ERROR: " + "; ".join(sell_warnings))
             preview_rules = preview.get("preview_rules")
             if not isinstance(preview_rules, dict):
                 raise ValueError("signal validation preview rules are unavailable")
@@ -2126,10 +2127,9 @@ class IndicatorFollowSignalValidationWindow(
             )
             pending_fingerprint = self._signal_ui_fingerprint(ui_state)
         except ValueError as exc:
-            if "가격 기준 재선택 필요" in str(exc):
-                self.show_validation_error(
-                    "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요."
-                )
+            toast_message = self._sell_input_error_toast_message(exc)
+            if toast_message:
+                show_toast(self, toast_message, duration_ms=2500)
                 return None
             self.show_validation_error("현재 신호설정으로 검증 데이터를 만들 수 없습니다.")
             return None
@@ -2147,6 +2147,18 @@ class IndicatorFollowSignalValidationWindow(
         self._set_primary_validation_action_state("validate", enabled=False)
         self.validation_run_requested.emit(run_request)
         return run_request
+
+    @staticmethod
+    def _sell_input_error_toast_message(error: ValueError) -> str:
+        message = str(error or "")
+        if message.startswith("매도 신호 조합식 오류:"):
+            reason = message.split(":", 1)[1].strip()
+            return f"매도 신호 조합식을 확인하세요.\n{reason}"
+        if message.startswith("가격 기준 재선택 필요:"):
+            return message.split(":", 1)[1].strip()
+        if message.startswith("SELL_VALIDATION_INPUT_ERROR:"):
+            return message.split(":", 1)[1].strip()
+        return ""
 
     def _request_entry_validation(
         self,
@@ -2204,11 +2216,9 @@ class IndicatorFollowSignalValidationWindow(
             payload = IndicatorFollowSignalValidationApplyPayload(ui_state)
         except ValueError as exc:
             self._on_signal_validation_ui_changed()
-            if "가격 기준 재선택 필요" in str(exc):
-                self.show_settings_apply_result(
-                    "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요.",
-                    success=False,
-                )
+            toast_message = self._sell_input_error_toast_message(exc)
+            if toast_message:
+                show_toast(self, toast_message, duration_ms=2500)
                 return None
             self.show_settings_apply_result(
                 "현재 신호설정을 반영용 데이터로 만들 수 없습니다.",

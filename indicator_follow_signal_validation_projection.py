@@ -8,10 +8,12 @@ from dataclasses import dataclass
 import json
 from typing import Any, Mapping
 
+from engines.condition_engine import parse_condition_expression
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
 )
 from gui_indicator_follow_sell_controls import (
+    SELL_PRICE_COMBO_VALUES,
     require_resolved_sell_price_selections,
     sell_price_selection_issues,
 )
@@ -39,6 +41,71 @@ _SELL_PREVIEW_TARGETS = {
     "sell.signals.ui_preview_condition_c": "ui_condition_c",
 }
 _SELL_VALIDATION_SIGNAL_NAMES = frozenset(_SELL_PREVIEW_TARGETS.values())
+_SELL_GROUP_KEYS = {
+    "A": "condition_a",
+    "B": "condition_b",
+    "C": "condition_c",
+}
+
+
+def _referenced_sell_groups(ui_state: Mapping[str, Any]) -> tuple[str, ...]:
+    if not isinstance(ui_state, Mapping):
+        raise TypeError("ui_state must be a mapping")
+    basic = ui_state.get("basic")
+    expression = (
+        str(basic.get("sell_signal_expr_line") or "").strip()
+        if isinstance(basic, Mapping)
+        else ""
+    )
+    if not expression:
+        return ()
+    parsed = parse_condition_expression(
+        expression,
+        allowed_identifiers=set(_SELL_GROUP_KEYS),
+        allow_duplicate_identifiers=False,
+    )
+    if not parsed.get("ok"):
+        raise ValueError(f"매도 신호 조합식 오류: {parsed.get('reason')}")
+    return tuple(dict.fromkeys(
+        str(identifier or "").strip().upper()
+        for identifier in parsed.get("identifiers", [])
+    ))
+
+
+def expression_aware_sell_price_selection_issues(
+    ui_state: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return unresolved operands only for referenced, active SELL GAP rows."""
+    referenced_groups = _referenced_sell_groups(ui_state)
+    sell_ui = ui_state.get("sell_ui")
+    conditions = (
+        sell_ui.get("signal_conditions")
+        if isinstance(sell_ui, Mapping)
+        else None
+    )
+    if not isinstance(conditions, Mapping):
+        return ()
+    issues = []
+    for group_name in referenced_groups:
+        condition = conditions.get(_SELL_GROUP_KEYS[group_name])
+        if not isinstance(condition, Mapping) or condition.get("gap_check") is not True:
+            continue
+        for field_name, side_name in (
+            ("gap_left_combo", "왼쪽"),
+            ("gap_right_combo", "오른쪽"),
+        ):
+            if str(condition.get(field_name) or "").strip() in SELL_PRICE_COMBO_VALUES:
+                continue
+            issues.append(f"매도조건 {group_name}의 가격비교 {side_name} 기준을 선택하세요.")
+    return tuple(issues)
+
+
+def require_expression_aware_sell_price_selections(
+    ui_state: Mapping[str, Any],
+) -> None:
+    issues = expression_aware_sell_price_selection_issues(ui_state)
+    if issues:
+        raise ValueError("가격 기준 재선택 필요: " + " ".join(issues))
 
 
 def _json_copy(value: Any) -> Any:
@@ -111,7 +178,7 @@ class IndicatorFollowSignalValidationApplyPayload:
     def __init__(self, ui_state: Mapping[str, Any]) -> None:
         if not isinstance(ui_state, Mapping):
             raise TypeError("ui_state must be a mapping")
-        require_resolved_sell_price_selections(ui_state)
+        require_expression_aware_sell_price_selections(ui_state)
         canonical = json.dumps(
             project_signal_validation_apply_ui_state(ui_state),
             ensure_ascii=False,
@@ -304,7 +371,7 @@ def project_signal_validation_apply_ui_state(
     ui_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return only V2-visible values that may be applied back to a source dialog."""
-    require_resolved_sell_price_selections(ui_state)
+    require_expression_aware_sell_price_selections(ui_state)
     projected = project_signal_validation_ui_state(ui_state)
     signal_filter = projected.get("buy_ui", {}).get("signal_filter")
     if isinstance(signal_filter, dict):
@@ -328,7 +395,7 @@ def project_signal_validation_rules(
     if not isinstance(rules, Mapping):
         raise TypeError("rules must be a mapping")
     if ui_state is not None:
-        require_resolved_sell_price_selections(ui_state)
+        require_expression_aware_sell_price_selections(ui_state)
     source_rules = _json_copy(rules)
     projected = _strip_dependent_conditions(source_rules)
 

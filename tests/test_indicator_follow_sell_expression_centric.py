@@ -46,11 +46,25 @@ class IndicatorFollowSellExpressionValidationTest(unittest.TestCase):
         )
 
     @staticmethod
+    def _resolve_dialog_gap_bases(dialog, groups=("a", "b")) -> None:
+        for group_name in groups:
+            getattr(
+                dialog,
+                f"sell_signal_condition_{group_name}_gap_left_combo",
+            ).setCurrentText("평단가")
+            getattr(
+                dialog,
+                f"sell_signal_condition_{group_name}_gap_right_combo",
+            ).setCurrentText("현재가")
+
+    @staticmethod
     def _state(base_state: dict, expression: str, active_groups: set[str]) -> dict:
         state = deepcopy(base_state)
         state["basic"]["sell_signal_expr_line"] = expression
         for condition_name, condition in state["sell_ui"]["signal_conditions"].items():
             group_name = condition_name[-1].upper()
+            condition["gap_left_combo"] = "평단가"
+            condition["gap_right_combo"] = "현재가"
             for key in condition:
                 if key.endswith("_check"):
                     condition[key] = group_name in active_groups
@@ -86,6 +100,65 @@ class IndicatorFollowSellExpressionValidationTest(unittest.TestCase):
                             "but has no active conditions",
                             result["blocked_reasons"],
                         )
+        finally:
+            dialog.close()
+
+    def test_sell_price_validation_follows_expression_and_active_gap_filter(self) -> None:
+        dialog = self._dialog(SOURCE_RULES_PATH)
+        try:
+            base_state = dialog.collect_indicator_follow_ui_state()
+
+            def preview_for(expression, active_groups, invalid_groups=(), gap_off=()):
+                state = self._state(base_state, expression, set(active_groups))
+                for condition in state["sell_ui"]["signal_conditions"].values():
+                    condition["gap_left_combo"] = "평단가"
+                    condition["gap_right_combo"] = "현재가"
+                for group_name in invalid_groups:
+                    condition = state["sell_ui"]["signal_conditions"][
+                        f"condition_{group_name.lower()}"
+                    ]
+                    condition["gap_left_combo"] = "주문가"
+                for group_name in gap_off:
+                    condition = state["sell_ui"]["signal_conditions"][
+                        f"condition_{group_name.lower()}"
+                    ]
+                    condition["gap_check"] = False
+                return routine_rule_mapper.build_engine_rules_preview_from_ui_state(
+                    state,
+                    dialog.rules_data,
+                )
+
+            cases = (
+                ("C", {"A", "B", "C"}, {"A", "B"}, set(), None),
+                ("C", {"C"}, {"C"}, {"C"}, None),
+                ("C", {"C"}, {"C"}, set(), "C"),
+                ("A AND C", {"A", "B", "C"}, {"B"}, set(), None),
+                ("A AND C", {"A", "C"}, {"A"}, {"A"}, None),
+            )
+            for expression, active, invalid, gap_off, blocked_group in cases:
+                with self.subTest(expression=expression, blocked_group=blocked_group):
+                    preview = preview_for(expression, active, invalid, gap_off)
+                    price_warnings = [
+                        warning for warning in preview["validation_warnings"]
+                        if "가격 기준 재선택 필요" in warning
+                    ]
+                    if blocked_group is None:
+                        self.assertEqual([], price_warnings)
+                    else:
+                        self.assertEqual(1, len(price_warnings))
+                        self.assertIn(
+                            f"sell condition {blocked_group}",
+                            price_warnings[0],
+                        )
+
+            invalid_syntax = preview_for("A AND", {"A", "B", "C"}, {"A", "B", "C"})
+            sell_warnings = [
+                warning for warning in invalid_syntax["validation_warnings"]
+                if warning.startswith(("sell signal", "sell condition"))
+            ]
+            self.assertTrue(sell_warnings)
+            self.assertTrue(sell_warnings[0].startswith("sell signal expression is invalid"))
+            self.assertFalse(any("가격 기준 재선택 필요" in item for item in sell_warnings))
         finally:
             dialog.close()
 
@@ -197,6 +270,7 @@ class IndicatorFollowSellExpressionValidationTest(unittest.TestCase):
             dialog = self._dialog(rules_path, instance_id=instance.instance_id)
             try:
                 dialog.sell_signal_expr_line.setText("A and B")
+                self._resolve_dialog_gap_bases(dialog)
                 dialog.sell_signal_condition_c_macd_check.setChecked(True)
                 dialog.sell_signal_condition_c_macd_value_line.setText("1.23")
                 with patch(
@@ -269,6 +343,7 @@ class IndicatorFollowSellExpressionValidationTest(unittest.TestCase):
             dialog = self._dialog(rules_path, instance_id=instance.instance_id)
             try:
                 dialog.sell_signal_expr_line.setText("A and B")
+                self._resolve_dialog_gap_bases(dialog)
                 dialog.sell_signal_condition_c_gap_check.setChecked(False)
                 dialog.sell_signal_condition_c_macd_check.setChecked(True)
                 dialog.sell_signal_condition_c_array_check.setChecked(False)
@@ -316,6 +391,7 @@ class IndicatorFollowSellExpressionValidationTest(unittest.TestCase):
             dialog = self._dialog(rules_path, instance_id=instance.instance_id)
             try:
                 dialog.sell_signal_expr_line.setText("A and B")
+                self._resolve_dialog_gap_bases(dialog)
                 dialog.sell_signal_condition_c_gap_check.setChecked(False)
                 dialog.sell_signal_condition_c_macd_check.setChecked(False)
                 dialog.sell_signal_condition_c_array_check.setChecked(False)
