@@ -936,6 +936,45 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         candle_tooltip.assert_not_called()
         self.assertEqual("BUY evidence", show_tooltip.call_args.args[1])
 
+    def test_candle_hover_hides_tooltip_immediately_outside_candle_hit(self):
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            [{
+                "time": "20260914122500",
+                "open": 252250.0,
+                "high": 253000.0,
+                "low": 252000.0,
+                "close": 253000.0,
+                "volume": 1,
+            }],
+            [],
+        )
+        canvas.resize(canvas.sizeHint().width(), 440)
+        canvas.show()
+        self.widgets.append(canvas)
+        scale = canvas.price_scale()
+        hover_x = int(canvas._x_for_index(0))
+        hover_y = int(
+            (
+                scale.y_for_price(253000.0)
+                + scale.y_for_price(252000.0)
+            )
+            / 2
+        )
+
+        with patch(
+            "gui_indicator_follow_signal_validation_window.QToolTip.showText",
+        ) as show_tooltip, patch(
+            "gui_indicator_follow_signal_validation_window.QToolTip.hideText",
+        ) as hide_tooltip:
+            QTest.mouseMove(canvas, QPoint(hover_x, hover_y))
+            self.app.processEvents()
+            self.assertEqual(1, show_tooltip.call_count)
+            self.assertIn("2026-09-14 12:25", show_tooltip.call_args.args[1])
+
+            QTest.mouseMove(canvas, QPoint(hover_x, int(scale.plot_top - 1)))
+            self.app.processEvents()
+            self.assertGreaterEqual(hide_tooltip.call_count, 1)
+
     def test_fixed_viewport_separates_total_candles_from_visible_span(self):
         window = self._window()
         window.resize(1400, 800)
@@ -1321,6 +1360,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self._replay_snapshot([], timeframe_minutes=3)
         )
         self.assertIn("3분봉", window.result_summary_label.text())
+        self.assertIn("기간내 추정손익 0.00%", window.estimated_return_label.text())
         self.assertEqual([], applies)
 
         window.historical_candle_count_spin.lineEdit().setText("200")
@@ -2010,10 +2050,19 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             )).split()
         )
         self.assertEqual(
-            "005930 삼성전자 | 5분봉 | Candle 3 | BUY 1 | SELL 1 | 추정 손익률 +50.00%",
+            "005930 삼성전자 | 5분봉 | 3캔들 | 매수신호 1 | 매도신호 1 | 기간내 추정손익 +50.00%",
             summary,
         )
         self.assertNotIn("검증 완료", summary)
+        self.assertNotIn("Candle", summary)
+        self.assertNotIn("BUY", summary)
+        self.assertNotIn("SELL", summary)
+        self.assertNotIn("추정 손익률", summary)
+        self.assertEqual(window.result_summary_label.font(), window.estimated_return_label.font())
+        self.assertEqual(
+            window.result_summary_label.palette().color(window.result_summary_label.foregroundRole()),
+            window.estimated_return_label.palette().color(window.estimated_return_label.foregroundRole()),
+        )
         layout = window._signal_validation_action_layout
         self.assertEqual(0, layout.indexOf(window.validation_status_label))
         self.assertEqual(1, layout.indexOf(window.result_summary_label))
@@ -2054,7 +2103,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window = self._window()
         window.set_replay_snapshot(trailing_sell)
         self.assertEqual(1, len(window.completed_cycles))
-        self.assertEqual("|  추정 손익률 +10.00%", window.estimated_return_label.text())
+        self.assertEqual("| 기간내 추정손익 +10.00%", window.estimated_return_label.text())
+
+        losing_cycle = self._replay_snapshot([
+            self._entry("BUY", 0, "BUY"),
+            self._entry("SELL", 1, "SELL"),
+        ], closes=(100.0, 90.0))
+        window.set_replay_snapshot(losing_cycle)
+        self.assertEqual("| 기간내 추정손익 -10.00%", window.estimated_return_label.text())
 
         offsetting_cycles = self._replay_snapshot([
             self._entry("BUY", 0, "BUY"),
@@ -2066,7 +2122,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(2, len(window.completed_cycles))
         self.assertAlmostEqual(-5.0, window.completed_cycles[-1].estimated_return_percent)
         self.assertAlmostEqual(0.0, estimated_signal_return_percent(offsetting_cycles))
-        self.assertEqual("|  추정 손익률 +0.00%", window.estimated_return_label.text())
+        self.assertEqual("| 기간내 추정손익 0.00%", window.estimated_return_label.text())
 
     def test_result_chart_markers_selection_trace_and_estimate_are_real(self):
         window = self._window()
@@ -2556,7 +2612,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(0, window.completed_cycle_table.rowCount())
         self.assertFalse(window.completed_cycle_table.isHidden())
         self.assertFalse(window.completed_cycle_empty_label.isHidden())
-        self.assertEqual("|  추정 손익률 -", window.estimated_return_label.text())
+        self.assertEqual("", window.estimated_return_label.text())
         self.assertIn("준비 중", window.validation_status_label.text())
 
     def test_each_run_uses_its_snapshot_timeframe_and_updates_real_replay_result(self):

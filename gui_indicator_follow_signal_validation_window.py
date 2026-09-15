@@ -433,6 +433,13 @@ def aggregate_completed_cycle_return_percent(
     return aggregate if math.isfinite(aggregate) else None
 
 
+def _format_summary_return_percent(value: float | None) -> str:
+    number = _finite_number(value)
+    if number is None:
+        number = 0.0
+    return f"{number:+.2f}%" if number != 0 else "0.00%"
+
+
 def completed_validation_cycles(
     candles: list[dict[str, Any]],
     entries: list[ValidationReplayEntry],
@@ -795,9 +802,11 @@ class IndicatorFollowSignalValidationChartCanvas(
         if not tooltip:
             tooltip = self.candle_tooltip_at(event.pos().x(), event.pos().y())
         if tooltip:
+            if tooltip != self._active_tooltip:
+                QToolTip.hideText()
             self._active_tooltip = tooltip
             QToolTip.showText(event.globalPos(), tooltip, self)
-        elif self._active_tooltip:
+        else:
             self.clear_marker_tooltip()
         super().mouseMoveEvent(event)
 
@@ -1348,9 +1357,12 @@ class IndicatorFollowSignalValidationWindow(
             if self.stock is None
             else "과거 분봉 데이터 조회 중..."
         )
-        self.result_summary_label = QLabel("Candle -  |  BUY -  |  SELL -")
-        self.estimated_return_label = QLabel("|  추정 손익률 -")
-        self.estimated_return_label.setStyleSheet("font-weight: bold;")
+        self.result_summary_label = QLabel("")
+        self.estimated_return_label = QLabel("")
+        summary_font = self.result_summary_label.font()
+        summary_font.setBold(False)
+        self.result_summary_label.setFont(summary_font)
+        self.estimated_return_label.setFont(summary_font)
         self.reset_button = QPushButton("초기화")
         self.primary_validation_action_button = QPushButton("설정적용")
         self.run_validation_button = self.primary_validation_action_button
@@ -2391,8 +2403,8 @@ class IndicatorFollowSignalValidationWindow(
         self.canvas = None
         self.fixed_price_axis.set_canvas(None)
         self._sync_time_navigation_scrollbar()
-        self.result_summary_label.setText("Candle -  |  BUY -  |  SELL -")
-        self.estimated_return_label.setText("|  추정 손익률 -")
+        self.result_summary_label.setText("")
+        self.estimated_return_label.setText("")
         self._populate_completed_cycles()
         self.validation_status_label.setText(message)
         self.loading_label.setText(message)
@@ -2524,17 +2536,16 @@ class IndicatorFollowSignalValidationWindow(
         buy_count = sum(marker["side"] == "BUY" for marker in markers)
         sell_count = sum(marker["side"] == "SELL" for marker in markers)
         self.result_summary_label.setText(
-            f"{self.stock.code} {self.stock.name}  |  "
-            f"{replay_snapshot.timeframe_minutes}분봉  |  "
-            f"Candle {len(self._candles)}  |  BUY {buy_count}  |  SELL {sell_count}"
+            f"{self.stock.code} {self.stock.name} | "
+            f"{replay_snapshot.timeframe_minutes}분봉 | "
+            f"{len(self._candles)}캔들 | "
+            f"매수신호 {buy_count} | 매도신호 {sell_count}"
         )
         estimated = aggregate_completed_cycle_return_percent(
             self._completed_cycles
         )
         self.estimated_return_label.setText(
-            "|  추정 손익률 -"
-            if estimated is None
-            else f"|  추정 손익률 {estimated:+.2f}%"
+            f"| 기간내 추정손익 {_format_summary_return_percent(estimated)}"
         )
         self.validation_status_label.setText("")
         pending_fingerprint = self._pending_validation_ui_fingerprint
