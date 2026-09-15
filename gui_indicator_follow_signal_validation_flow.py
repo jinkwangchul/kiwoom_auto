@@ -251,6 +251,9 @@ class IndicatorFollowSignalValidationFlow(QObject):
             )
             if callable(set_historical_candle_count):
                 set_historical_candle_count(self._historical_count)
+            commit_entry_state = getattr(window, "commit_entry_state", None)
+            if callable(commit_entry_state):
+                commit_entry_state()
             if not callable(getattr(window, "show", None)):
                 raise TypeError("signal validation window show is unavailable")
             run_signal = getattr(window, "validation_run_requested", None)
@@ -270,6 +273,18 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     payload,
                 )
             )
+            reset_signal = getattr(window, "entry_reset_requested", None)
+            reset_started_signal = getattr(window, "entry_reset_started", None)
+            if callable(getattr(reset_started_signal, "connect", None)):
+                reset_started_signal.connect(
+                    lambda ref=window_ref: self._begin_entry_state_reset(ref())
+                )
+            if callable(getattr(reset_signal, "connect", None)):
+                reset_signal.connect(
+                    lambda payload, ref=window_ref, source=source_ref: (
+                        self._reset_entry_state_to_source(ref(), source, payload)
+                    )
+                )
             stock_signal = getattr(window, "stock_selection_requested", None)
             if not callable(getattr(stock_signal, "connect", None)):
                 raise TypeError("stock selection request signal is unavailable")
@@ -539,6 +554,30 @@ class IndicatorFollowSignalValidationFlow(QObject):
             return
         if callable(show_result):
             show_result("설정 적용 완료", success=True)
+
+    def _reset_entry_state_to_source(
+        self,
+        window: object,
+        source_ref: weakref.ReferenceType[object],
+        payload: object,
+    ) -> None:
+        window_key = id(window)
+        if window_key not in self._open_windows:
+            return
+        stock = getattr(window, "stock", None)
+        if isinstance(stock, ValidationStockRef) and stock.code and stock.name:
+            self._last_selected_stock = ValidationStockRef(stock.code, stock.name)
+            self._request_market_snapshot_for_window(window)
+        self._apply_to_source(
+            window,
+            source_ref,
+            payload,
+        )
+
+    def _begin_entry_state_reset(self, window: object) -> None:
+        window_key = id(window)
+        if window_key in self._open_windows:
+            self._invalidate_window_requests(window_key)
 
     def _release_window(self, window_key: int) -> None:
         self._open_windows.pop(window_key, None)

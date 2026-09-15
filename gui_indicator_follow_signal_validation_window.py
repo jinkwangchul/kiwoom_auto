@@ -381,6 +381,32 @@ class IndicatorFollowValidationCompletedCycle:
     estimated_return_percent: float
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationEntryState:
+    ui_state_json: str
+    stock: ValidationStockRef | None
+    candle_count: int
+
+    def to_ui_state(self) -> dict[str, Any]:
+        state = json.loads(self.ui_state_json)
+        if not isinstance(state, dict):
+            raise ValueError("entry UI state must decode to an object")
+        return state
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationChartViewState:
+    visible_start_index: float
+    visible_candle_span: float
+    default_price_minimum: float | None
+    default_price_maximum: float | None
+    current_price_minimum: float | None
+    current_price_maximum: float | None
+    time_scale_manually_adjusted: bool
+    price_scale_manually_adjusted: bool
+    selected_evaluation_index: int | None
+
+
 def aggregate_completed_cycle_return_percent(
     cycles: list[IndicatorFollowValidationCompletedCycle]
     | tuple[IndicatorFollowValidationCompletedCycle, ...],
@@ -1196,6 +1222,8 @@ class IndicatorFollowSignalValidationWindow(
 
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
+    entry_reset_started = pyqtSignal()
+    entry_reset_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
     recent_stock_selected = pyqtSignal(object)
     recent_stocks_fitted = pyqtSignal(object)
@@ -1233,6 +1261,10 @@ class IndicatorFollowSignalValidationWindow(
         self._user_geometry_owned = False
         self._primary_validation_action_state = "validate"
         self._settings_apply_after_validation = False
+        self._entry_state: _ValidationEntryState | None = None
+        self._entry_chart_view_state: _ValidationChartViewState | None = None
+        self._entry_reset_in_progress = False
+        self._entry_reset_replay_pending = False
         self._pending_validation_ui_fingerprint: str | None = None
         self._validated_ui_fingerprint: str | None = None
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
@@ -1315,9 +1347,11 @@ class IndicatorFollowSignalValidationWindow(
         self.result_summary_label = QLabel("Candle -  |  BUY -  |  SELL -")
         self.estimated_return_label = QLabel("|  추정 손익률 -")
         self.estimated_return_label.setStyleSheet("font-weight: bold;")
+        self.reset_button = QPushButton("초기화")
         self.primary_validation_action_button = QPushButton("설정적용")
         self.run_validation_button = self.primary_validation_action_button
         self.close_button = QPushButton("닫기")
+        self.reset_button.clicked.connect(self.reset_to_entry_state)
         self.primary_validation_action_button.clicked.connect(
             self._handle_primary_validation_action
         )
@@ -1326,6 +1360,7 @@ class IndicatorFollowSignalValidationWindow(
         action_row.addWidget(self.result_summary_label)
         action_row.addWidget(self.estimated_return_label)
         action_row.addStretch(1)
+        action_row.addWidget(self.reset_button)
         action_row.addWidget(self.primary_validation_action_button)
         action_row.addWidget(self.close_button)
         self._signal_validation_action_layout = action_row
@@ -1891,6 +1926,27 @@ class IndicatorFollowSignalValidationWindow(
             raise ValueError("candle_count must be a positive integer")
         self.historical_candle_count_spin.setValue(candle_count)
 
+    def commit_entry_state(self) -> _ValidationEntryState:
+        """Capture the immutable V2-open baseline exactly once."""
+        if self._entry_state is None:
+            ui_state = project_signal_validation_ui_state(
+                self._signal_validation_seed.to_ui_state()
+            )
+            canonical = json.dumps(
+                ui_state,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            stock = self.stock
+            self._entry_state = _ValidationEntryState(
+                canonical,
+                None if stock is None else ValidationStockRef(stock.code, stock.name),
+                self.historical_candle_count_spin.value(),
+            )
+        return self._entry_state
+
     @staticmethod
     def _signal_ui_fingerprint(ui_state: object) -> str:
         projected = project_signal_validation_ui_state(ui_state)
@@ -1927,14 +1983,69 @@ class IndicatorFollowSignalValidationWindow(
         )
 
     def _on_signal_validation_ui_changed(self, *_args) -> None:
+        if self._entry_reset_in_progress:
+            return
         self._settings_apply_after_validation = False
         self._pending_validation_ui_fingerprint = None
         self._validated_ui_fingerprint = None
         self._set_primary_validation_action_state("validate")
 
     def _on_validation_context_changed(self, *_args) -> None:
+        if self._entry_reset_in_progress:
+            return
         self._settings_apply_after_validation = False
         self._request_validation()
+
+    def reset_to_entry_state(self):
+        self.entry_reset_started.emit()
+        entry = self.commit_entry_state()
+        entry_ui_state = entry.to_ui_state()
+        try:
+            self._entry_reset_in_progress = True
+            result = self.apply_signal_validation_ui_state(entry_ui_state)
+            skipped = (
+                result.get("skipped", [])
+                if isinstance(result, dict)
+                else ["invalid_result"]
+            )
+            fatal_skips = [
+                item
+                for item in skipped
+                if not isinstance(item, dict)
+                or item.get("reason") != "missing_widget"
+            ]
+            if fatal_skips:
+                raise ValueError("entry UI state could not be restored")
+            self.historical_candle_count_spin.setValue(entry.candle_count)
+            self._signal_validation_stock = (
+                None
+                if entry.stock is None
+                else ValidationStockRef(entry.stock.code, entry.stock.name)
+            )
+            self.compact_stock_display.set_current_stock(self.stock)
+        except Exception:
+            self._entry_reset_replay_pending = False
+            self.show_validation_error("V2 진입 상태를 복원할 수 없습니다.")
+            return None
+        finally:
+            self._entry_reset_in_progress = False
+
+        self._clear_validation_result("초기화 검증 준비 중")
+        self._entry_reset_replay_pending = True
+        try:
+            payload = IndicatorFollowSignalValidationApplyPayload(entry_ui_state)
+        except (TypeError, ValueError):
+            self._entry_reset_replay_pending = False
+            self.show_validation_error("V2 진입 설정을 부모창에 전달할 수 없습니다.")
+            return None
+        self.entry_reset_requested.emit(payload)
+        if self.stock is None:
+            self._entry_reset_replay_pending = False
+            self.show_validation_error(
+                "상단 종목 영역을 두 번 클릭하여 검증 종목을 선택하세요."
+            )
+            return payload
+        return self._request_validation()
 
     def _set_primary_validation_action_state(
         self,
@@ -2088,6 +2199,7 @@ class IndicatorFollowSignalValidationWindow(
         self._pending_result_settings_snapshot = None
         self._validated_ui_fingerprint = None
         self._settings_apply_after_validation = False
+        self._entry_reset_replay_pending = False
         self._set_primary_validation_action_state("validate")
 
     def set_validation_stock(self, stock: ValidationStockRef) -> bool:
@@ -2228,6 +2340,55 @@ class IndicatorFollowSignalValidationWindow(
         self._settings_apply_after_validation = False
         self._set_primary_validation_action_state("validate")
 
+    def _capture_entry_chart_view_state(self) -> None:
+        if self._entry_chart_view_state is not None:
+            return
+        self._entry_chart_view_state = _ValidationChartViewState(
+            visible_start_index=self._visible_start_index,
+            visible_candle_span=self._visible_candle_span,
+            default_price_minimum=self._default_price_minimum,
+            default_price_maximum=self._default_price_maximum,
+            current_price_minimum=self._current_price_minimum,
+            current_price_maximum=self._current_price_maximum,
+            time_scale_manually_adjusted=self._time_scale_manually_adjusted,
+            price_scale_manually_adjusted=self._price_scale_manually_adjusted,
+            selected_evaluation_index=self._selected_index,
+        )
+
+    def _restore_entry_chart_view_state(self) -> None:
+        state = self._entry_chart_view_state
+        canvas = self.canvas
+        if state is None or canvas is None:
+            return
+        self._default_price_minimum = state.default_price_minimum
+        self._default_price_maximum = state.default_price_maximum
+        self._current_price_minimum = state.current_price_minimum
+        self._current_price_maximum = state.current_price_maximum
+        if (
+            state.current_price_minimum is not None
+            and state.current_price_maximum is not None
+            and state.current_price_maximum > state.current_price_minimum
+        ):
+            canvas.set_price_view(
+                state.current_price_minimum,
+                state.current_price_maximum,
+            )
+        self._set_time_view(
+            state.visible_start_index,
+            state.visible_candle_span,
+            manually_adjusted=state.time_scale_manually_adjusted,
+        )
+        self._price_scale_manually_adjusted = state.price_scale_manually_adjusted
+        selected = state.selected_evaluation_index
+        if (
+            isinstance(selected, int)
+            and not isinstance(selected, bool)
+            and 0 <= selected < len(self._candles)
+        ):
+            self._selected_index = selected
+            canvas.set_selected_index(selected)
+        self.fixed_price_axis.refresh_scale()
+
     def set_replay_snapshot(self, replay_snapshot: ValidationReplaySnapshot) -> None:
         if not isinstance(replay_snapshot, ValidationReplaySnapshot):
             raise TypeError("replay_snapshot must be ValidationReplaySnapshot")
@@ -2335,6 +2496,10 @@ class IndicatorFollowSignalValidationWindow(
             self._settings_apply_after_validation = False
             self._set_primary_validation_action_state("validate")
         self.select_evaluation_index(replay_snapshot.evaluated_end_index)
+        self._capture_entry_chart_view_state()
+        if self._entry_reset_replay_pending:
+            self._restore_entry_chart_view_state()
+        self._entry_reset_replay_pending = False
 
     def select_evaluation_index(self, index: int) -> bool:
         snapshot = self._replay_snapshot

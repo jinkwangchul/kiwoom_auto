@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+import weakref
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -32,6 +33,7 @@ from gui_indicator_follow_signal_validation_window import (
     estimated_signal_return_percent,
 )
 from indicator_follow_signal_validation_projection import (
+    IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_signal_validation_snapshot,
@@ -117,6 +119,8 @@ class _FakeHost(QObject):
 class _FakeWindow(QDialog):
     validation_run_requested = pyqtSignal(object)
     settings_apply_requested = pyqtSignal(object)
+    entry_reset_started = pyqtSignal()
+    entry_reset_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
     recent_stock_selected = pyqtSignal(object)
 
@@ -132,9 +136,13 @@ class _FakeWindow(QDialog):
         self.validation_requests = 0
         self.recent_stock_projections = []
         self.stock_metadata_projections = []
+        self.entry_commit_count = 0
 
     def set_historical_candle_count(self, count):
         self.historical_candle_count = count
+
+    def commit_entry_state(self):
+        self.entry_commit_count += 1
 
     def set_replay_snapshot(self, snapshot):
         self.snapshots.append(snapshot)
@@ -1318,6 +1326,263 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(200, runs[-1].candle_count)
         self.assertEqual([], applies)
 
+    def test_entry_reset_restores_context_strategy_and_logical_chart_view(self):
+        window = self._window()
+        window.set_historical_candle_count(100)
+        entry = window.commit_entry_state()
+        entry_ui_state = entry.to_ui_state()
+        entry_buy = entry_ui_state["basic"]["buy_signal_expr_line"]
+        entry_sell = entry_ui_state["basic"]["sell_signal_expr_line"]
+        snapshot = self._candle_count_snapshot(500, include_signals=True)
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window.set_replay_snapshot(snapshot)
+        self.app.processEvents()
+        chart_entry = window._entry_chart_view_state
+        geometry = window.geometry()
+
+        runs = []
+        resets = []
+        window.validation_run_requested.connect(runs.append)
+        window.entry_reset_requested.connect(resets.append)
+        window.basic_signal_interval_combo.setCurrentText("3")
+        window.historical_candle_count_spin.lineEdit().setText("500")
+        window.historical_candle_count_spin.editingFinished.emit()
+        window.buy_signal_expr_line.setText("D")
+        window.sell_signal_expr_line.setText("A")
+        window._set_time_view(125.0, 50.0, manually_adjusted=True)
+        scale = window.canvas.price_scale()
+        cursor_y = (scale.plot_top + scale.plot_bottom) / 2
+        window._zoom_price_scale_at(cursor_y, 120)
+        window.select_evaluation_index(450)
+        self.assertNotEqual(chart_entry.visible_candle_span, window.visible_candle_span)
+        self.assertTrue(window.price_scale_manually_adjusted)
+        window.set_validation_stock(ValidationStockRef("000660", "SK하이닉스"))
+        runs_before_reset = len(runs)
+
+        window.reset_button.click()
+
+        self.assertEqual(runs_before_reset + 1, len(runs))
+        self.assertEqual(1, len(resets))
+        self.assertEqual("5", window.basic_signal_interval_combo.currentText())
+        self.assertEqual(100, window.historical_candle_count_spin.value())
+        self.assertEqual(entry_buy, window.buy_signal_expr_line.text())
+        self.assertEqual(entry_sell, window.sell_signal_expr_line.text())
+        self.assertEqual(self.stock, window.stock)
+        self.assertEqual(
+            IndicatorFollowSignalValidationApplyPayload(entry_ui_state).to_ui_state(),
+            resets[0].to_ui_state(),
+        )
+        self.assertIsNone(window.replay_snapshot)
+
+        window.set_replay_snapshot(snapshot)
+        self.app.processEvents()
+        self.assertEqual(chart_entry.visible_start_index, window.visible_start_index)
+        self.assertEqual(chart_entry.visible_candle_span, window.visible_candle_span)
+        self.assertEqual(
+            (chart_entry.current_price_minimum, chart_entry.current_price_maximum),
+            window.current_price_bounds,
+        )
+        self.assertEqual(
+            chart_entry.selected_evaluation_index,
+            window.selected_evaluation_index,
+        )
+        self.assertEqual(
+            chart_entry.time_scale_manually_adjusted,
+            window.time_scale_manually_adjusted,
+        )
+        self.assertEqual(
+            chart_entry.price_scale_manually_adjusted,
+            window.price_scale_manually_adjusted,
+        )
+        self.assertEqual(geometry, window.geometry())
+        self.assertTrue(window.primary_validation_action_button.isEnabled())
+
+        window.buy_signal_expr_line.setText("C")
+        second_runs = len(runs)
+        window.reset_button.click()
+        self.assertEqual(second_runs + 1, len(runs))
+        self.assertEqual(2, len(resets))
+        self.assertIs(entry, window.commit_entry_state())
+        self.assertEqual(entry_buy, window.buy_signal_expr_line.text())
+
+    def test_entry_reset_invalidates_stale_result_and_applies_entry_to_source(self):
+        pending = []
+
+        class Provider:
+            def __init__(_self, session, requester):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                pending.append((_self.session, count, callback))
+
+        class Replay:
+            def __init__(_self, session):
+                _self.session = session
+
+            def evaluate(_self, historical):
+                request = _self.session.request
+                candle = {
+                    "time": "20260911143000",
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 1,
+                }
+                return ValidationReplayResult(True, snapshot=ValidationReplaySnapshot(
+                    stock=request.stock,
+                    timeframe_minutes=request.timeframe_minutes,
+                    settings_hash=request.settings_snapshot.rules_hash,
+                    historical_request_id=historical.request_id,
+                    evaluated_start_index=0,
+                    evaluated_end_index=0,
+                    dropped_raw_rows_count=0,
+                    candles=[candle],
+                    entries=[],
+                ))
+
+        class Source(QDialog):
+            def __init__(_self):
+                super().__init__()
+                _self.applied = []
+
+            def apply_signal_validation_candidate_ui_state(_self, state):
+                _self.applied.append(deepcopy(state))
+                return {"applied": ["state"], "skipped": []}
+
+            def apply_signal_validation_ui_state(_self, state):
+                return _self.apply_signal_validation_candidate_ui_state(state)
+
+        def result(session, count, request_id):
+            request = session.request
+            return ValidationHistoricalResult(True, snapshot=ValidationHistoricalSnapshot(
+                stock=request.stock,
+                timeframe_minutes=request.timeframe_minutes,
+                requested_count=count,
+                request_id=request_id,
+                rows=[{
+                    "체결시간": "20260911143000",
+                    "시가": "100",
+                    "고가": "101",
+                    "저가": "99",
+                    "현재가": "100",
+                    "거래량": "1",
+                }],
+            ))
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _SnapshotBroker(True),
+            host=_FakeHost(self.stock),
+            historical_provider_factory=Provider,
+            replay_factory=Replay,
+            recent_stock_store=_MemoryRecentStockStore((self.stock,)),
+        )
+        source = Source()
+        window = self._window()
+        self.widgets.append(source)
+        window.set_historical_candle_count(100)
+        entry = window.commit_entry_state()
+        key = id(window)
+        flow._open_windows[key] = window
+        flow._request_generation[key] = 0
+        flow._market_snapshot_generation[key] = 0
+        window.validation_run_requested.connect(
+            lambda request: flow._run_validation(window, request)
+        )
+        window.entry_reset_started.connect(
+            lambda: flow._begin_entry_state_reset(window)
+        )
+        reset_start_generations = []
+        window.entry_reset_started.connect(
+            lambda: reset_start_generations.append(flow._request_generation[key])
+        )
+        window.entry_reset_requested.connect(
+            lambda payload: flow._reset_entry_state_to_source(
+                window,
+                weakref.ref(source),
+                payload,
+            )
+        )
+
+        window.basic_signal_interval_combo.setCurrentText("3")
+        window.historical_candle_count_spin.lineEdit().setText("500")
+        window.historical_candle_count_spin.editingFinished.emit()
+        stale_session, stale_count, stale_callback = pending[-1]
+        window.buy_signal_expr_line.setText("D")
+        generation_before_reset = flow._request_generation[key]
+        window.reset_button.click()
+        latest_session, latest_count, latest_callback = pending[-1]
+
+        self.assertEqual([generation_before_reset + 1], reset_start_generations)
+        self.assertEqual(generation_before_reset + 2, flow._request_generation[key])
+        self.assertEqual(500, stale_count)
+        self.assertEqual(100, latest_count)
+        self.assertEqual("5", window.basic_signal_interval_combo.currentText())
+        self.assertEqual(1, len(source.applied))
+        self.assertEqual(
+            IndicatorFollowSignalValidationApplyPayload(
+                entry.to_ui_state()
+            ).to_ui_state(),
+            source.applied[0],
+        )
+        stale_callback(result(stale_session, stale_count, "STALE"))
+        self.assertIsNone(window.replay_snapshot)
+        latest_callback(result(latest_session, latest_count, "RESET"))
+        self.assertEqual("RESET", window.replay_snapshot.historical_request_id)
+
+    def test_v2_entry_reset_and_parent_undo_keep_distinct_baselines(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(self.rules, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            original_bytes = rules_path.read_bytes()
+            with patch.object(dialog_module.QTimer, "singleShot"):
+                source = dialog_module.IndicatorFollowRoutineSettingsDialog(
+                    rules_path=rules_path,
+                    routine_path=self.routine_dir,
+                    routine_name="지표추종매매",
+                    definition_id="indicator_follow",
+                    settings_mode="registration",
+                )
+            self.widgets.append(source)
+            original_buy = source.buy_signal_expr_line.text()
+            source.buy_signal_expr_line.setText("A or D")
+            for group_name in "abc":
+                getattr(
+                    source,
+                    f"sell_signal_condition_{group_name}_gap_left_combo",
+                ).setCurrentText("평단가")
+                getattr(
+                    source,
+                    f"sell_signal_condition_{group_name}_gap_right_combo",
+                ).setCurrentText("현재가")
+            seeds = []
+            source.signal_validation_requested.connect(seeds.append)
+            source.signal_validation_button.click()
+            self.assertEqual(1, len(seeds))
+
+            window = IndicatorFollowSignalValidationWindow(self.stock, seeds[0])
+            self.widgets.append(window)
+            window.commit_entry_state()
+            window.entry_reset_requested.connect(
+                lambda payload: source.apply_signal_validation_candidate_ui_state(
+                    payload.to_ui_state()
+                )
+            )
+            source.buy_signal_expr_line.setText("C")
+            window.buy_signal_expr_line.setText("D")
+            window.reset_button.click()
+
+            self.assertEqual("A or D", window.buy_signal_expr_line.text())
+            self.assertEqual("A or D", source.buy_signal_expr_line.text())
+            source.restore_settings_undo_snapshot()
+            self.assertEqual(original_buy, source.buy_signal_expr_line.text())
+            self.assertEqual(original_bytes, rules_path.read_bytes())
+
     def test_primary_settings_apply_validates_stale_state_then_emits_once(self):
         window = self._window()
         runs = []
@@ -1495,8 +1760,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(1, layout.indexOf(window.result_summary_label))
         self.assertEqual(2, layout.indexOf(window.estimated_return_label))
         self.assertIsNotNone(layout.itemAt(3).spacerItem())
-        self.assertEqual(4, layout.indexOf(window.primary_validation_action_button))
-        self.assertEqual(5, layout.indexOf(window.close_button))
+        self.assertEqual(4, layout.indexOf(window.reset_button))
+        self.assertEqual(5, layout.indexOf(window.primary_validation_action_button))
+        self.assertEqual(6, layout.indexOf(window.close_button))
+        self.assertEqual("초기화", window.reset_button.text())
+        self.assertEqual(
+            window.primary_validation_action_button.sizeHint().height(),
+            window.reset_button.sizeHint().height(),
+        )
 
     def test_estimated_return_aggregates_completed_cycles_and_ignores_trailing_sell(self):
         snapshot = self._replay_snapshot([
@@ -2107,6 +2378,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window = created[0]
         self.assertEqual(100, DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT)
         self.assertEqual(DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT, window.historical_candle_count)
+        self.assertEqual(1, window.entry_commit_count)
         resolved_ui_state = self._seed().to_ui_state()
         for timeframe, candle_count in ((3, 300), (15, 500)):
             rules = deepcopy(self.rules)
