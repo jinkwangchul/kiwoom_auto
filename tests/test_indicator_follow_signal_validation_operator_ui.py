@@ -687,7 +687,13 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertFalse(window.result_widget.isHidden())
         self.assertIs(window.loading_label, window.chart_stack.currentWidget())
         self.assertIn("과거 분봉 데이터 조회 중", window.loading_label.text())
-        self.assertGreaterEqual(window.result_splitter.minimumHeight(), 280)
+        self.assertGreaterEqual(window.chart_stack.minimumHeight(), 280)
+        self.assertFalse(hasattr(window, "selection_summary"))
+        self.assertFalse(hasattr(window, "result_splitter"))
+        self.assertIs(
+            window.chart_stack,
+            window._signal_validation_result_layout.itemAt(0).widget(),
+        )
 
     def test_initial_validation_is_scheduled_once_after_both_signals_are_connected(self):
         callbacks = []
@@ -1191,19 +1197,18 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertFalse(hasattr(window, "signal_list_table"))
         self.assertEqual(1, window.completed_cycle_table.rowCount())
         self.assertEqual("09/13 10:01", window.completed_cycle_table.item(0, 4).text())
-        self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
+        self.assertEqual("second-reason", window._entries[1].reason)
         window.select_evaluation_index(0)
         self.assertEqual(0, window.selected_evaluation_index)
         window._completed_cycle_row_clicked(0, 0)
         self.assertEqual(1, window.selected_evaluation_index)
-        self.assertIn("SELL reason: second-reason", window.selection_summary.toPlainText())
         window.select_evaluation_index(0)
-        self.assertIn("종가: 101", window.selection_summary.toPlainText())
+        self.assertEqual(0, window.selected_evaluation_index)
 
     def test_completed_cycle_table_keeps_five_rows_and_markers_remain_independent(self):
         window = self._window()
         window.show()
-        candle_count = 100
+        candle_count = 200
         candles = [
             {
                 "time": f"20260913{9 + index // 60:02d}{index % 60:02d}00",
@@ -1273,7 +1278,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             window.chart_scroll_area.horizontalScrollBar().value(),
             scroll_value_before,
         )
-        self.assertGreaterEqual(window.result_splitter.height(), window.result_splitter.minimumHeight())
+        self.assertGreaterEqual(window.chart_stack.height(), window.chart_stack.minimumHeight())
 
     def test_cycle_table_height_scroll_and_column_ratios_are_row_count_independent(self):
         window = self._window()

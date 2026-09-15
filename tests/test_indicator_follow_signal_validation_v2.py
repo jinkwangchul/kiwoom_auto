@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QPoint, QSignalBlocker, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
@@ -590,6 +590,82 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual("1,500,000", expensive_axis.price_axis_records()[0]["label"])
         self.assertGreater(expensive_axis.width(), axis.width())
 
+    def test_candle_hover_uses_real_ohlc_time_and_rejects_chart_margins(self):
+        candles = [
+            {
+                "time": f"2026091412{25 + index:02d}00",
+                "open": 252250.0 + index,
+                "high": 253000.0 + index,
+                "low": 252000.0 + index,
+                "close": 253000.0 + index,
+                "volume": 1,
+            }
+            for index in range(3)
+        ]
+        canvas = IndicatorFollowSignalValidationChartCanvas(candles, [])
+        canvas.resize(canvas.sizeHint().width(), 440)
+        self.widgets.append(canvas)
+        scale = canvas.price_scale()
+        self.assertIsNotNone(scale)
+        hover_y = (scale.plot_top + scale.plot_bottom) / 2
+
+        for index in (0, 1, 2):
+            tooltip = canvas.candle_tooltip_at(
+                canvas._x_for_index(index),
+                hover_y,
+            )
+            self.assertIn(f"평가 시각: 2026-09-14 12:{25 + index:02d}", tooltip)
+            self.assertIn(f"시가: {252250.0 + index}", tooltip)
+            self.assertIn(f"고가: {253000.0 + index}", tooltip)
+            self.assertIn(f"저가: {252000.0 + index}", tooltip)
+            self.assertIn(f"종가: {253000.0 + index}", tooltip)
+
+        half_slot = canvas._BAR_SLOT / 2
+        self.assertEqual("", canvas.candle_tooltip_at(
+            canvas._x_for_index(0) - half_slot - 1,
+            hover_y,
+        ))
+        self.assertEqual("", canvas.candle_tooltip_at(
+            canvas._x_for_index(2) + half_slot + 1,
+            hover_y,
+        ))
+        self.assertEqual("", canvas.candle_tooltip_at(
+            canvas._x_for_index(1),
+            scale.plot_top - 1,
+        ))
+
+    def test_marker_evidence_hover_has_priority_over_candle_hover(self):
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            [{
+                "time": "20260914122500",
+                "open": 252250.0,
+                "high": 253000.0,
+                "low": 252000.0,
+                "close": 253000.0,
+                "volume": 1,
+            }],
+            [],
+        )
+        canvas.resize(canvas.sizeHint().width(), 440)
+        canvas.show()
+        self.widgets.append(canvas)
+        with patch.object(
+            canvas,
+            "marker_tooltip_at",
+            return_value="BUY evidence",
+        ), patch.object(
+            canvas,
+            "candle_tooltip_at",
+            return_value="Candle OHLC",
+        ) as candle_tooltip, patch(
+            "gui_indicator_follow_signal_validation_window.QToolTip.showText",
+        ) as show_tooltip:
+            QTest.mouseMove(canvas, QPoint(100, 100))
+            self.app.processEvents()
+
+        candle_tooltip.assert_not_called()
+        self.assertEqual("BUY evidence", show_tooltip.call_args.args[1])
+
     def test_primary_action_requires_matching_validation_before_apply(self):
         window = self._window()
         runs = []
@@ -739,8 +815,11 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(1, window.canvas.marker_count("BUY"))
         self.assertEqual(1, window.canvas.marker_count("SELL"))
         self.assertEqual(2, window.selected_evaluation_index)
-        self.assertIn("SELL reason: actual-reason", window.selection_summary.toPlainText())
-        self.assertIn("SELL signal_time: 2026-09-11 14:01", window.selection_summary.toPlainText())
+        self.assertFalse(hasattr(window, "selection_summary"))
+        self.assertFalse(hasattr(window, "result_splitter"))
+        sell_entry = next(entry for entry in window._entries if entry.evaluation_side == "SELL")
+        self.assertEqual("actual-reason", sell_entry.reason)
+        self.assertEqual("20260911140100", sell_entry.signal_time)
         self.assertFalse(hasattr(window, "filter_result_table"))
         self.assertEqual(1, window.completed_cycle_table.rowCount())
         self.assertEqual(

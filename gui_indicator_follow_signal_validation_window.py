@@ -25,12 +25,10 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QSizePolicy,
-    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -532,7 +530,7 @@ class IndicatorFollowSignalValidationChartCanvas(
     def __init__(self, candles, markers, parent=None) -> None:
         super().__init__(candles, markers, parent)
         self._time_axis_records = _time_axis_label_records(self._candles)
-        self._active_marker_tooltip = ""
+        self._active_tooltip = ""
         self.setMouseTracking(True)
         self.setMinimumHeight(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -583,12 +581,40 @@ class IndicatorFollowSignalValidationChartCanvas(
                 return str(marker.get("tooltip") or "")
         return ""
 
+    def candle_tooltip_at(self, x: float, y: float) -> str:
+        scale = self.price_scale()
+        if not self._candles or scale is None:
+            return ""
+        if not scale.plot_top <= y <= scale.plot_bottom:
+            return ""
+        half_slot = self._BAR_SLOT / 2
+        first_x = self._x_for_index(0)
+        last_x = self._x_for_index(len(self._candles) - 1)
+        if x < first_x - half_slot or x > last_x + half_slot:
+            return ""
+        index = self._nearest_candle_index(x)
+        if index is None:
+            return ""
+        candle = self._candles[index]
+        value = lambda field: (
+            candle.get(field) if candle.get(field) is not None else "-"
+        )
+        return "\n".join((
+            f"평가 시각: {_display_time(candle.get('time'))}",
+            f"시가: {value('open')}",
+            f"고가: {value('high')}",
+            f"저가: {value('low')}",
+            f"종가: {value('close')}",
+        ))
+
     def mouseMoveEvent(self, event) -> None:
         tooltip = self.marker_tooltip_at(event.pos().x(), event.pos().y())
+        if not tooltip:
+            tooltip = self.candle_tooltip_at(event.pos().x(), event.pos().y())
         if tooltip:
-            self._active_marker_tooltip = tooltip
+            self._active_tooltip = tooltip
             QToolTip.showText(event.globalPos(), tooltip, self)
-        elif self._active_marker_tooltip:
+        elif self._active_tooltip:
             self.clear_marker_tooltip()
         super().mouseMoveEvent(event)
 
@@ -601,7 +627,7 @@ class IndicatorFollowSignalValidationChartCanvas(
         super().hideEvent(event)
 
     def clear_marker_tooltip(self) -> None:
-        self._active_marker_tooltip = ""
+        self._active_tooltip = ""
         QToolTip.hideText()
 
     def paintEvent(self, event) -> None:
@@ -1120,17 +1146,8 @@ class IndicatorFollowSignalValidationWindow(
         self.chart_stack.addWidget(self.loading_label)
         self.chart_stack.addWidget(self.chart_view)
         self.chart_stack.setCurrentWidget(self.loading_label)
-
-        self.selection_summary = self._detail_view()
-        self.selection_summary.setObjectName("signalValidationCandleSummary")
-        self.selection_summary.setPlainText("선택 Candle 요약\n-")
-        self.result_splitter = QSplitter(Qt.Horizontal)
-        self.result_splitter.addWidget(self.chart_stack)
-        self.result_splitter.addWidget(self.selection_summary)
-        self.result_splitter.setStretchFactor(0, 3)
-        self.result_splitter.setStretchFactor(1, 1)
-        self.result_splitter.setMinimumHeight(280)
-        result_layout.addWidget(self.result_splitter, 1)
+        self.chart_stack.setMinimumHeight(280)
+        result_layout.addWidget(self.chart_stack, 1)
 
         self.completed_cycle_table = QTableWidget(0, 7)
         self.completed_cycle_table.setObjectName("signalValidationCompletedCycleTable")
@@ -1402,13 +1419,6 @@ class IndicatorFollowSignalValidationWindow(
             return True
         return super().eventFilter(watched, event)
 
-    @staticmethod
-    def _detail_view() -> QPlainTextEdit:
-        view = QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setLineWrapMode(QPlainTextEdit.NoWrap)
-        return view
-
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
         self.rules = deepcopy(self.rules_data)
@@ -1503,7 +1513,7 @@ class IndicatorFollowSignalValidationWindow(
         action_height = self._signal_validation_action_layout.sizeHint().height()
         cycle_summary_height = self.completed_cycle_table.height()
         result_height = (
-            self.result_splitter.minimumHeight()
+            self.chart_stack.minimumHeight()
             + cycle_summary_height
             + result_margins.top()
             + result_margins.bottom()
@@ -1833,7 +1843,6 @@ class IndicatorFollowSignalValidationWindow(
         self.fixed_price_axis.set_canvas(None)
         self.result_summary_label.setText("Candle -  |  BUY -  |  SELL -")
         self.estimated_return_label.setText("|  추정 손익률 -")
-        self.selection_summary.setPlainText("선택 Candle 요약\n-")
         self._populate_completed_cycles()
         self.validation_status_label.setText(message)
         self.loading_label.setText(message)
@@ -1925,67 +1934,7 @@ class IndicatorFollowSignalValidationWindow(
         self._selected_index = index
         self.canvas.set_selected_index(index)
         self._ensure_candle_visible(index)
-        if not snapshot.evaluated_start_index <= index <= snapshot.evaluated_end_index:
-            self.selection_summary.setPlainText(
-                "선택 Candle 요약\nReplay 평가 범위 밖\n"
-                f"평가시각: {_display_time(self._candles[index].get('time'))}"
-            )
-            return True
-        buy_entry = self._entry_at(index, "BUY")
-        sell_entry = self._entry_at(index, "SELL")
-        self.selection_summary.setPlainText(
-            self._selection_summary_text(index, buy_entry, sell_entry)
-        )
         return True
-
-    def _entry_at(self, index: int, side: str) -> ValidationReplayEntry | None:
-        return next(
-            (
-                candidate for candidate in self._entries
-                if candidate.evaluation_index == index
-                and candidate.evaluation_side == side
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _entry_summary_lines(side: str, entry: ValidationReplayEntry | None) -> list[str]:
-        if entry is None:
-            return [
-                f"{side} 신호: 미발생",
-                f"{side} reason: -",
-                f"{side} matched group: -",
-                f"{side} signal_time: -",
-                f"{side} delay_bar: -",
-            ]
-        return [
-            f"{side} 신호: {'발생' if entry.signal == side else '미발생'}",
-            f"{side} reason: {entry.reason or '-'}",
-            f"{side} matched group: {', '.join(entry.matched_groups) or '-'}",
-            f"{side} signal_time: {_display_time(entry.signal_time)}",
-            f"{side} delay_bar: {entry.delay_bar}",
-        ]
-
-    def _selection_summary_text(
-        self,
-        index: int,
-        buy_entry: ValidationReplayEntry | None,
-        sell_entry: ValidationReplayEntry | None,
-    ) -> str:
-        candle = self._candles[index]
-        lines = [
-            "선택 Candle 요약",
-            f"평가 시각: {_display_time(candle.get('time'))}",
-            f"시가: {candle.get('open') if candle.get('open') is not None else '-'}",
-            f"고가: {candle.get('high') if candle.get('high') is not None else '-'}",
-            f"저가: {candle.get('low') if candle.get('low') is not None else '-'}",
-            f"종가: {candle.get('close') if candle.get('close') is not None else '-'}",
-            "",
-        ]
-        lines.extend(self._entry_summary_lines("BUY", buy_entry))
-        lines.append("")
-        lines.extend(self._entry_summary_lines("SELL", sell_entry))
-        return "\n".join(lines)
 
     def _build_signal_tooltips(self) -> dict[tuple[int, str], str]:
         snapshot = self._result_settings_snapshot
