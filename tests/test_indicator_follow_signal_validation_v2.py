@@ -780,6 +780,60 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             ))
             replay.assert_not_called()
 
+    def test_candle_hover_clips_high_low_range_to_current_plot(self):
+        cases = (
+            ({"open": 170.0, "high": 200.0, "low": 150.0, "close": 160.0}, "top"),
+            ({"open": 140.0, "high": 150.0, "low": 100.0, "close": 130.0}, "bottom"),
+        )
+        for values, clipped_edge in cases:
+            candle = {
+                "time": "20260914123000",
+                "volume": 1,
+                **values,
+            }
+            canvas = IndicatorFollowSignalValidationChartCanvas([candle], [])
+            canvas.resize(canvas.sizeHint().width(), 440)
+            canvas.set_price_view(120.0, 180.0)
+            self.widgets.append(canvas)
+            scale = canvas.price_scale()
+            high_y = scale.y_for_price(candle["high"])
+            low_y = scale.y_for_price(candle["low"])
+            hit_top = max(scale.plot_top, min(high_y, low_y))
+            hit_bottom = min(scale.plot_bottom, max(high_y, low_y))
+            self.assertLessEqual(hit_top, hit_bottom)
+            edge_y = hit_top if clipped_edge == "top" else hit_bottom
+            self.assertIn("평가 시각:", canvas.candle_tooltip_at(
+                canvas._x_for_index(0),
+                edge_y,
+            ))
+            outside_y = hit_bottom + 1 if clipped_edge == "top" else hit_top - 1
+            self.assertTrue(scale.plot_top <= outside_y <= scale.plot_bottom)
+            self.assertEqual("", canvas.candle_tooltip_at(
+                canvas._x_for_index(0),
+                outside_y,
+            ))
+
+        for high, low in ((220.0, 200.0), (100.0, 80.0)):
+            canvas = IndicatorFollowSignalValidationChartCanvas(
+                [{
+                    "time": "20260914123000",
+                    "open": low,
+                    "high": high,
+                    "low": low,
+                    "close": high,
+                    "volume": 1,
+                }],
+                [],
+            )
+            canvas.resize(canvas.sizeHint().width(), 440)
+            canvas.set_price_view(120.0, 180.0)
+            self.widgets.append(canvas)
+            scale = canvas.price_scale()
+            self.assertEqual("", canvas.candle_tooltip_at(
+                canvas._x_for_index(0),
+                (scale.plot_top + scale.plot_bottom) / 2,
+            ))
+
     def test_marker_evidence_hover_has_priority_over_candle_hover(self):
         canvas = IndicatorFollowSignalValidationChartCanvas(
             [{
