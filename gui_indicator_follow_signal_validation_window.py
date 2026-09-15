@@ -90,7 +90,7 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
     _RIGHT = 24
     _TOP = 42
     _BOTTOM = 48
-    _BAR_SLOT = 12
+    _BAR_SLOT = 12.0
     _MIN_WIDTH = 640
 
     def __init__(self, candles, markers, parent=None) -> None:
@@ -98,6 +98,7 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
         self._candles = deepcopy(candles)
         self._markers = deepcopy(markers)
         self._selected_index: int | None = None
+        self._current_candle_slot_width = float(self._BAR_SLOT)
         self.setMinimumWidth(self._content_width())
 
     @property
@@ -107,6 +108,19 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
     @property
     def selected_index(self) -> int | None:
         return self._selected_index
+
+    @property
+    def current_candle_slot_width(self) -> float:
+        return self._current_candle_slot_width
+
+    def set_candle_slot_width(self, slot_width: float) -> None:
+        width = _finite_number(slot_width)
+        if width is None or width <= 0:
+            raise ValueError("slot_width must be a positive finite number")
+        self._current_candle_slot_width = width
+        self.setMinimumWidth(self._content_width())
+        self.updateGeometry()
+        self.update()
 
     def to_candles(self) -> list[dict[str, Any]]:
         return deepcopy(self._candles)
@@ -131,18 +145,21 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
         self.update()
 
     def _content_width(self) -> int:
-        return max(
+        return math.ceil(max(
             self._MIN_WIDTH,
-            self._LEFT + self._RIGHT + len(self._candles) * self._BAR_SLOT,
-        )
+            self._LEFT
+            + self._RIGHT
+            + len(self._candles) * self.current_candle_slot_width,
+        ))
 
     def _x_for_index(self, index: int) -> float:
-        return self._LEFT + (index + 0.5) * self._BAR_SLOT
+        return self._LEFT + (index + 0.5) * self.current_candle_slot_width
 
     def _nearest_candle_index(self, x: float) -> int | None:
         if not self._candles:
             return None
-        raw_index = round((x - self._LEFT - self._BAR_SLOT / 2) / self._BAR_SLOT)
+        slot_width = self.current_candle_slot_width
+        raw_index = round((x - self._LEFT - slot_width / 2) / slot_width)
         return min(max(raw_index, 0), len(self._candles) - 1)
 
     def mousePressEvent(self, event) -> None:
@@ -587,7 +604,7 @@ class IndicatorFollowSignalValidationChartCanvas(
             return ""
         if not scale.plot_top <= y <= scale.plot_bottom:
             return ""
-        half_slot = self._BAR_SLOT / 2
+        half_slot = self.current_candle_slot_width / 2
         first_x = self._x_for_index(0)
         last_x = self._x_for_index(len(self._candles) - 1)
         if x < first_x - half_slot or x > last_x + half_slot:
@@ -655,8 +672,9 @@ class IndicatorFollowSignalValidationChartCanvas(
 
         if self._selected_index is not None:
             selected_x = self._x_for_index(self._selected_index)
+            slot_width = self.current_candle_slot_width
             painter.fillRect(
-                QRectF(selected_x - self._BAR_SLOT / 2, 0, self._BAR_SLOT, self.height()),
+                QRectF(selected_x - slot_width / 2, 0, slot_width, self.height()),
                 QBrush(_SELECTION),
             )
             painter.setPen(QPen(_SELECTION_LINE, 1))
@@ -1008,6 +1026,10 @@ class IndicatorFollowSignalValidationWindow(
 
     _V2_SECTION_HEADER_HEIGHT = 44
     _V2_SECTION_VERTICAL_MARGIN = 6
+    _REFERENCE_CANDLE_COUNT = 100
+    _MIN_CANDLE_SLOT_WIDTH = 3.0
+    _MAX_CANDLE_SLOT_WIDTH = 48.0
+    _CANDLE_ZOOM_FACTOR = 1.15
     _INITIAL_AVAILABLE_GEOMETRY_RATIO = 0.85
     _CYCLE_TABLE_VISIBLE_ROWS = 5
     _CYCLE_TABLE_COLUMN_RATIOS = (0.06, 0.22, 0.09, 0.15, 0.20, 0.13, 0.15)
@@ -1055,6 +1077,11 @@ class IndicatorFollowSignalValidationWindow(
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
         self._result_settings_snapshot: ValidationSettingsSnapshot | None = None
         self._signal_tooltips: dict[tuple[int, str], str] = {}
+        self._base_candle_slot_width = float(
+            IndicatorFollowSignalValidationChartCanvas._BAR_SLOT
+        )
+        self._current_candle_slot_width = self._base_candle_slot_width
+        self._manual_candle_zoom = False
         super().__init__(
             rules_path=__file__,
             routine_name="지표추종매매 신호검증 V2",
@@ -1079,6 +1106,18 @@ class IndicatorFollowSignalValidationWindow(
     @property
     def selected_evaluation_index(self) -> int | None:
         return self._selected_index
+
+    @property
+    def base_candle_slot_width(self) -> float:
+        return self._base_candle_slot_width
+
+    @property
+    def current_candle_slot_width(self) -> float:
+        return self._current_candle_slot_width
+
+    @property
+    def manual_candle_zoom(self) -> bool:
+        return self._manual_candle_zoom
 
     def _update_window_title(self) -> None:
         self.setWindowTitle("지표추종매매 - 독립 신호검증 V2")
@@ -1134,6 +1173,7 @@ class IndicatorFollowSignalValidationWindow(
         self.chart_scroll_area.setWidgetResizable(True)
         self.chart_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.chart_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chart_scroll_area.viewport().installEventFilter(self)
         self.fixed_price_axis = IndicatorFollowSignalValidationFixedPriceAxis(
             self.chart_scroll_area
         )
@@ -1403,6 +1443,22 @@ class IndicatorFollowSignalValidationWindow(
             setattr(self, f"{name}_header_separator", separator)
 
     def eventFilter(self, watched, event):
+        chart_viewport = getattr(
+            getattr(self, "chart_scroll_area", None),
+            "viewport",
+            lambda: None,
+        )()
+        if watched is chart_viewport:
+            if event.type() == QEvent.Resize:
+                QTimer.singleShot(0, self._sync_candle_scale_to_viewport)
+            elif event.type() == QEvent.Wheel and event.angleDelta().y():
+                self._zoom_candle_scale_at(
+                    event.pos().x(),
+                    event.angleDelta().y(),
+                )
+                event.accept()
+                return True
+            return super().eventFilter(watched, event)
         cycle_table = getattr(self, "completed_cycle_table", None)
         if cycle_table is not None and watched is cycle_table.viewport():
             if event.type() == QEvent.Resize:
@@ -1418,6 +1474,65 @@ class IndicatorFollowSignalValidationWindow(
             event.accept()
             return True
         return super().eventFilter(watched, event)
+
+    @classmethod
+    def _clamped_candle_slot_width(cls, slot_width: float) -> float:
+        return min(
+            cls._MAX_CANDLE_SLOT_WIDTH,
+            max(cls._MIN_CANDLE_SLOT_WIDTH, float(slot_width)),
+        )
+
+    def _reference_candle_slot_width(self) -> float:
+        viewport_width = self.chart_scroll_area.viewport().width()
+        usable_width = max(
+            1,
+            viewport_width
+            - IndicatorFollowSignalValidationChartCanvas._LEFT
+            - IndicatorFollowSignalValidationChartCanvas._RIGHT,
+        )
+        return self._clamped_candle_slot_width(
+            usable_width / self._REFERENCE_CANDLE_COUNT
+        )
+
+    def _apply_current_candle_slot_width(self) -> None:
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.set_candle_slot_width(self._current_candle_slot_width)
+
+    def _sync_candle_scale_to_viewport(self) -> None:
+        self._base_candle_slot_width = self._reference_candle_slot_width()
+        if not self._manual_candle_zoom:
+            self._current_candle_slot_width = self._base_candle_slot_width
+        self._apply_current_candle_slot_width()
+
+    def _zoom_candle_scale_at(self, cursor_view_x: float, wheel_delta: int) -> None:
+        if not wheel_delta:
+            return
+        old_slot = self._current_candle_slot_width
+        zoom_steps = float(wheel_delta) / 120.0
+        new_slot = self._clamped_candle_slot_width(
+            old_slot * (self._CANDLE_ZOOM_FACTOR ** zoom_steps)
+        )
+        self._manual_candle_zoom = True
+        if math.isclose(new_slot, old_slot, rel_tol=0.0, abs_tol=1e-9):
+            return
+        scroll_bar = self.chart_scroll_area.horizontalScrollBar()
+        old_scroll = scroll_bar.value()
+        left_margin = IndicatorFollowSignalValidationChartCanvas._LEFT
+        anchor_index = (
+            (old_scroll + float(cursor_view_x) - left_margin) / old_slot
+        ) - 0.5
+        self._current_candle_slot_width = new_slot
+        self._apply_current_candle_slot_width()
+
+        def restore_cursor_anchor() -> None:
+            new_content_x = left_margin + (anchor_index + 0.5) * new_slot
+            requested_scroll = round(new_content_x - float(cursor_view_x))
+            scroll_bar.setValue(
+                min(scroll_bar.maximum(), max(scroll_bar.minimum(), requested_scroll))
+            )
+
+        QTimer.singleShot(0, restore_cursor_anchor)
 
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
@@ -1808,6 +1923,7 @@ class IndicatorFollowSignalValidationWindow(
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        QTimer.singleShot(0, self._sync_candle_scale_to_viewport)
         QTimer.singleShot(0, self._sync_recent_stock_row_width)
         QTimer.singleShot(0, self._sync_completed_cycle_table_geometry)
 
@@ -1883,6 +1999,7 @@ class IndicatorFollowSignalValidationWindow(
         if old_canvas is not None:
             old_canvas.deleteLater()
         self.canvas = IndicatorFollowSignalValidationChartCanvas(self._candles, markers)
+        self._sync_candle_scale_to_viewport()
         self.canvas.bar_selected.connect(self.select_evaluation_index)
         self.chart_scroll_area.setWidget(self.canvas)
         self.fixed_price_axis.set_canvas(self.canvas)

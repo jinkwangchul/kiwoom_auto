@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -291,6 +292,49 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             historical_request_id="REQUEST",
             evaluated_start_index=0,
             evaluated_end_index=len(candles) - 1,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=entries,
+        )
+
+    def _candle_count_snapshot(self, candle_count, *, include_signals=False):
+        start = datetime(2026, 9, 14, 9, 0)
+        candles = []
+        for index in range(candle_count):
+            close = 100.0 + index
+            candles.append({
+                "time": (start + timedelta(minutes=5 * index)).strftime(
+                    "%Y%m%d%H%M%S"
+                ),
+                "open": close - 0.5,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 100 + index,
+            })
+        entries = []
+        if include_signals:
+            for side, index in (("BUY", candle_count // 4), ("SELL", candle_count * 3 // 4)):
+                entries.append(ValidationReplayEntry(
+                    evaluation_side=side,
+                    evaluation_index=index,
+                    evaluation_time=candles[index]["time"],
+                    signal=side,
+                    reason="scale fixture",
+                    signal_index=index,
+                    signal_time=candles[index]["time"],
+                    delay_bar=0,
+                    matched_groups=[],
+                    details=[],
+                    trace={"conditions": [], "groups": [], "aggregations": []},
+                ))
+        return ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash="scale-hash",
+            historical_request_id=f"SCALE-{candle_count}",
+            evaluated_start_index=0,
+            evaluated_end_index=candle_count - 1,
             dropped_raw_rows_count=0,
             candles=candles,
             entries=entries,
@@ -620,7 +664,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertIn(f"저가: {252000.0 + index}", tooltip)
             self.assertIn(f"종가: {253000.0 + index}", tooltip)
 
-        half_slot = canvas._BAR_SLOT / 2
+        half_slot = canvas.current_candle_slot_width / 2
         self.assertEqual("", canvas.candle_tooltip_at(
             canvas._x_for_index(0) - half_slot - 1,
             hover_y,
@@ -665,6 +709,179 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
         candle_tooltip.assert_not_called()
         self.assertEqual("BUY evidence", show_tooltip.call_args.args[1])
+
+    def test_reference_density_fits_100_and_is_retained_for_200_and_500(self):
+        window = self._window()
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window._sync_candle_scale_to_viewport()
+
+        window.set_replay_snapshot(self._candle_count_snapshot(100))
+        self.app.processEvents()
+        window._sync_candle_scale_to_viewport()
+        viewport_width = window.chart_scroll_area.viewport().width()
+        expected_slot = (
+            viewport_width
+            - IndicatorFollowSignalValidationChartCanvas._LEFT
+            - IndicatorFollowSignalValidationChartCanvas._RIGHT
+        ) / 100
+        slot_100 = window.current_candle_slot_width
+        self.assertAlmostEqual(expected_slot, slot_100, places=6)
+        self.assertAlmostEqual(slot_100, window.canvas.current_candle_slot_width)
+        used_right = (
+            window.canvas._x_for_index(99)
+            + slot_100 / 2
+            + window.canvas._RIGHT
+        )
+        self.assertLessEqual(abs(window.canvas.width() - used_right), 1.0)
+        self.assertLessEqual(
+            window.chart_scroll_area.horizontalScrollBar().maximum(),
+            1,
+        )
+
+        window.set_replay_snapshot(self._candle_count_snapshot(200))
+        self.app.processEvents()
+        slot_200 = window.current_candle_slot_width
+        max_200 = window.chart_scroll_area.horizontalScrollBar().maximum()
+        self.assertAlmostEqual(slot_100, slot_200)
+        self.assertGreater(max_200, 0)
+
+        window.set_replay_snapshot(self._candle_count_snapshot(500))
+        self.app.processEvents()
+        self.assertAlmostEqual(slot_200, window.current_candle_slot_width)
+        self.assertGreater(
+            window.chart_scroll_area.horizontalScrollBar().maximum(),
+            max_200,
+        )
+
+    def test_wheel_scale_clamps_and_keeps_cursor_candle_anchored(self):
+        window = self._window()
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window._sync_candle_scale_to_viewport()
+        window.set_replay_snapshot(self._candle_count_snapshot(500))
+        self.app.processEvents()
+        scroll_bar = window.chart_scroll_area.horizontalScrollBar()
+        anchor_index = 200
+        cursor_x = 500
+        scroll_bar.setValue(round(window.canvas._x_for_index(anchor_index) - cursor_x))
+        before_view_x = window.canvas._x_for_index(anchor_index) - scroll_bar.value()
+        before_slot = window.current_candle_slot_width
+
+        def zoom(wheel_delta):
+            callbacks = []
+            with patch(
+                "gui_indicator_follow_signal_validation_window.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ):
+                window._zoom_candle_scale_at(cursor_x, wheel_delta)
+            self.app.processEvents()
+            for callback in callbacks:
+                callback()
+
+        zoom(120)
+        self.app.processEvents()
+        after_view_x = window.canvas._x_for_index(anchor_index) - scroll_bar.value()
+        self.assertTrue(window.manual_candle_zoom)
+        self.assertGreater(window.current_candle_slot_width, before_slot)
+        self.assertLessEqual(abs(after_view_x - before_view_x), 1.0)
+
+        zoomed_slot = window.current_candle_slot_width
+        zoom(-120)
+        self.assertLess(window.current_candle_slot_width, zoomed_slot)
+
+        window._current_candle_slot_width = (
+            window._MIN_CANDLE_SLOT_WIDTH * 1.01
+        )
+        window._apply_current_candle_slot_width()
+        zoom(-120)
+        self.assertEqual(
+            window._MIN_CANDLE_SLOT_WIDTH,
+            window.current_candle_slot_width,
+        )
+        window._current_candle_slot_width = (
+            window._MAX_CANDLE_SLOT_WIDTH / 1.01
+        )
+        window._apply_current_candle_slot_width()
+        zoom(120)
+        self.assertEqual(
+            window._MAX_CANDLE_SLOT_WIDTH,
+            window.current_candle_slot_width,
+        )
+
+    def test_resize_scale_rules_and_render_actions_do_not_run_replay(self):
+        window = self._window()
+        window.resize(1300, 800)
+        window.show()
+        self.app.processEvents()
+        window._sync_candle_scale_to_viewport()
+        window.set_replay_snapshot(
+            self._candle_count_snapshot(200, include_signals=True)
+        )
+        self.app.processEvents()
+        original_slot = window.current_candle_slot_width
+        marker_indexes = [
+            marker["evaluation_index"] for marker in window.canvas.marker_records()
+        ]
+        time_indexes = [
+            record["index"] for record in window.canvas.time_axis_records()
+        ]
+        window.select_evaluation_index(50)
+
+        with patch.object(ValidationHistoricalReplay, "evaluate") as replay:
+            window.resize(window.width() + 200, window.height())
+            QTest.qWait(10)
+            self.app.processEvents()
+            self.assertNotEqual(original_slot, window.current_candle_slot_width)
+            resized_slot = window.current_candle_slot_width
+
+            def zoom_without_pending_timer(wheel_delta):
+                callbacks = []
+                with patch(
+                    "gui_indicator_follow_signal_validation_window.QTimer.singleShot",
+                    side_effect=lambda _delay, callback: callbacks.append(callback),
+                ):
+                    window._zoom_candle_scale_at(400, wheel_delta)
+                self.app.processEvents()
+                for callback in callbacks:
+                    callback()
+
+            for wheel_index in range(20):
+                zoom_without_pending_timer(120 if wheel_index < 11 else -120)
+            manual_slot = window.current_candle_slot_width
+            self.assertNotEqual(resized_slot, manual_slot)
+            window.resize(window.width() + 100, window.height())
+            QTest.qWait(10)
+            self.app.processEvents()
+            self.assertAlmostEqual(manual_slot, window.current_candle_slot_width)
+            for scroll_value in (100, 200, 50):
+                window.chart_scroll_area.horizontalScrollBar().setValue(scroll_value)
+            scale = window.canvas.price_scale()
+            for hover_index in range(20, 40):
+                window.canvas.candle_tooltip_at(
+                    window.canvas._x_for_index(hover_index),
+                    (scale.plot_top + scale.plot_bottom) / 2,
+                )
+            replay.assert_not_called()
+
+        self.assertEqual(50, window.selected_evaluation_index)
+        self.assertEqual(
+            marker_indexes,
+            [marker["evaluation_index"] for marker in window.canvas.marker_records()],
+        )
+        self.assertEqual(
+            time_indexes,
+            [record["index"] for record in window.canvas.time_axis_records()],
+        )
+        for index in (0, 50, 199):
+            self.assertEqual(
+                index,
+                window.canvas._nearest_candle_index(
+                    window.canvas._x_for_index(index)
+                ),
+            )
 
     def test_primary_action_requires_matching_validation_before_apply(self):
         window = self._window()
