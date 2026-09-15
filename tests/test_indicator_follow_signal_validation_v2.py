@@ -1994,12 +1994,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
     def test_result_summary_keeps_estimate_in_left_cluster(self):
         window = self._window()
         window._request_validation()
+        self.assertEqual("Historical Candle 요청 중", window.validation_status_label.text())
         window.set_replay_snapshot(
             self._replay_snapshot([
                 self._entry("BUY", 0, "BUY"),
                 self._entry("SELL", 2, "SELL"),
             ])
         )
+        self.assertEqual("", window.validation_status_label.text())
         summary = " ".join(
             " ".join((
                 window.validation_status_label.text(),
@@ -2008,9 +2010,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             )).split()
         )
         self.assertEqual(
-            "검증 완료 005930 삼성전자 | 5분봉 | Candle 3 | BUY 1 | SELL 1 | 추정 손익률 +50.00%",
+            "005930 삼성전자 | 5분봉 | Candle 3 | BUY 1 | SELL 1 | 추정 손익률 +50.00%",
             summary,
         )
+        self.assertNotIn("검증 완료", summary)
         layout = window._signal_validation_action_layout
         self.assertEqual(0, layout.indexOf(window.validation_status_label))
         self.assertEqual(1, layout.indexOf(window.result_summary_label))
@@ -2024,6 +2027,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             window.primary_validation_action_button.sizeHint().height(),
             window.reset_button.sizeHint().height(),
         )
+        window.show_validation_error("검증 실패")
+        self.assertEqual("검증 실패", window.validation_status_label.text())
 
     def test_estimated_return_aggregates_completed_cycles_and_ignores_trailing_sell(self):
         snapshot = self._replay_snapshot([

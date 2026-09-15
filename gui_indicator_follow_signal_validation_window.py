@@ -2536,7 +2536,7 @@ class IndicatorFollowSignalValidationWindow(
             if estimated is None
             else f"|  추정 손익률 {estimated:+.2f}%"
         )
-        self.validation_status_label.setText("검증 완료")
+        self.validation_status_label.setText("")
         pending_fingerprint = self._pending_validation_ui_fingerprint
         self._pending_validation_ui_fingerprint = None
         try:
