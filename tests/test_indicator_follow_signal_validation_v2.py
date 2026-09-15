@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QObject, QPoint, QSignalBlocker, Qt, pyqtSignal
-from PyQt5.QtGui import QFontMetrics, QPixmap
+from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtGui import QFontMetrics, QMouseEvent, QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
 
@@ -664,7 +664,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertIn(f"저가: {252000.0 + index}", tooltip)
             self.assertIn(f"종가: {253000.0 + index}", tooltip)
 
-        half_slot = canvas.current_candle_slot_width / 2
+        half_slot = canvas.pixels_per_candle / 2
         self.assertEqual("", canvas.candle_tooltip_at(
             canvas._x_for_index(0) - half_slot - 1,
             hover_y,
@@ -710,156 +710,164 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         candle_tooltip.assert_not_called()
         self.assertEqual("BUY evidence", show_tooltip.call_args.args[1])
 
-    def test_reference_density_fits_100_and_is_retained_for_200_and_500(self):
+    def test_fixed_viewport_separates_total_candles_from_visible_span(self):
         window = self._window()
         window.resize(1400, 800)
         window.show()
         self.app.processEvents()
-        window._sync_candle_scale_to_viewport()
 
         window.set_replay_snapshot(self._candle_count_snapshot(100))
         self.app.processEvents()
-        window._sync_candle_scale_to_viewport()
-        viewport_width = window.chart_scroll_area.viewport().width()
-        expected_slot = (
-            viewport_width
-            - IndicatorFollowSignalValidationChartCanvas._LEFT
-            - IndicatorFollowSignalValidationChartCanvas._RIGHT
-        ) / 100
-        slot_100 = window.current_candle_slot_width
-        self.assertAlmostEqual(expected_slot, slot_100, places=6)
-        self.assertAlmostEqual(slot_100, window.canvas.current_candle_slot_width)
-        used_right = (
-            window.canvas._x_for_index(99)
-            + slot_100 / 2
-            + window.canvas._RIGHT
-        )
-        self.assertLessEqual(abs(window.canvas.width() - used_right), 1.0)
+        width_100 = window.canvas.width()
         self.assertLessEqual(
-            window.chart_scroll_area.horizontalScrollBar().maximum(),
+            abs(width_100 - window.chart_scroll_area.viewport().width()),
             1,
         )
+        self.assertEqual(100.0, window.visible_candle_span)
+        self.assertEqual(0.0, window.visible_start_index)
+        self.assertEqual(0, window.time_navigation_scrollbar.maximum())
+        self.assertFalse(window.time_navigation_scrollbar.isVisible())
 
         window.set_replay_snapshot(self._candle_count_snapshot(200))
         self.app.processEvents()
-        slot_200 = window.current_candle_slot_width
-        max_200 = window.chart_scroll_area.horizontalScrollBar().maximum()
-        self.assertAlmostEqual(slot_100, slot_200)
+        self.assertLessEqual(abs(width_100 - window.canvas.width()), 1)
+        self.assertEqual(100.0, window.visible_candle_span)
+        self.assertEqual(100.0, window.visible_start_index)
+        max_200 = window.time_navigation_scrollbar.maximum()
         self.assertGreater(max_200, 0)
+        self.assertTrue(window.time_navigation_scrollbar.isVisible())
 
         window.set_replay_snapshot(self._candle_count_snapshot(500))
         self.app.processEvents()
-        self.assertAlmostEqual(slot_200, window.current_candle_slot_width)
-        self.assertGreater(
+        self.assertLessEqual(abs(width_100 - window.canvas.width()), 1)
+        self.assertEqual(100.0, window.visible_candle_span)
+        self.assertEqual(400.0, window.visible_start_index)
+        self.assertGreater(window.time_navigation_scrollbar.maximum(), max_200)
+        self.assertEqual(
+            0,
             window.chart_scroll_area.horizontalScrollBar().maximum(),
-            max_200,
         )
 
-    def test_wheel_scale_clamps_and_keeps_cursor_candle_anchored(self):
+    def test_horizontal_drag_scales_time_with_anchor_clamps_and_click_threshold(self):
         window = self._window()
         window.resize(1400, 800)
         window.show()
         self.app.processEvents()
-        window._sync_candle_scale_to_viewport()
         window.set_replay_snapshot(self._candle_count_snapshot(500))
         self.app.processEvents()
-        scroll_bar = window.chart_scroll_area.horizontalScrollBar()
-        anchor_index = 200
-        cursor_x = 500
-        scroll_bar.setValue(round(window.canvas._x_for_index(anchor_index) - cursor_x))
-        before_view_x = window.canvas._x_for_index(anchor_index) - scroll_bar.value()
-        before_slot = window.current_candle_slot_width
+        canvas = window.canvas
+        canvas_width = canvas.width()
+        anchor_index = 450
+        cursor_x = canvas._x_for_index(anchor_index)
+        anchor_ratio = (cursor_x - canvas._LEFT) / canvas._plot_width()
+        before_x = canvas._x_for_index(anchor_index)
 
-        def zoom(wheel_delta):
-            callbacks = []
-            with patch(
-                "gui_indicator_follow_signal_validation_window.QTimer.singleShot",
-                side_effect=lambda _delay, callback: callbacks.append(callback),
-            ):
-                window._zoom_candle_scale_at(cursor_x, wheel_delta)
-            self.app.processEvents()
-            for callback in callbacks:
-                callback()
+        window._apply_time_scale_drag(70.0, anchor_index, anchor_ratio)
+        self.assertEqual(70.0, window.visible_candle_span)
+        self.assertLessEqual(abs(canvas._x_for_index(anchor_index) - before_x), 1.0)
+        self.assertEqual(canvas_width, canvas.width())
+        window._apply_time_scale_drag(150.0, anchor_index, anchor_ratio)
+        self.assertEqual(150.0, window.visible_candle_span)
+        self.assertEqual(canvas_width, canvas.width())
 
-        zoom(120)
-        self.app.processEvents()
-        after_view_x = window.canvas._x_for_index(anchor_index) - scroll_bar.value()
-        self.assertTrue(window.manual_candle_zoom)
-        self.assertGreater(window.current_candle_slot_width, before_slot)
-        self.assertLessEqual(abs(after_view_x - before_view_x), 1.0)
+        window._apply_time_scale_drag(1.0, anchor_index, anchor_ratio)
+        self.assertEqual(window._MIN_VISIBLE_CANDLE_SPAN, window.visible_candle_span)
+        window._apply_time_scale_drag(1000.0, anchor_index, anchor_ratio)
+        self.assertEqual(500.0, window.visible_candle_span)
 
-        zoomed_slot = window.current_candle_slot_width
-        zoom(-120)
-        self.assertLess(window.current_candle_slot_width, zoomed_slot)
+        window._set_time_view(200.0, 100.0)
+        selected = []
+        canvas.bar_selected.connect(selected.append)
+        click_x = round(canvas._x_for_index(240))
+        click_y = round((canvas.price_scale().plot_top + canvas.price_scale().plot_bottom) / 2)
+        QTest.mousePress(canvas, Qt.LeftButton, pos=QPoint(click_x, click_y))
+        QTest.mouseMove(canvas, QPoint(click_x + 2, click_y))
+        QTest.mouseRelease(canvas, Qt.LeftButton, pos=QPoint(click_x + 2, click_y))
+        self.assertEqual([240], selected)
 
-        window._current_candle_slot_width = (
-            window._MIN_CANDLE_SLOT_WIDTH * 1.01
-        )
-        window._apply_current_candle_slot_width()
-        zoom(-120)
-        self.assertEqual(
-            window._MIN_CANDLE_SLOT_WIDTH,
-            window.current_candle_slot_width,
-        )
-        window._current_candle_slot_width = (
-            window._MAX_CANDLE_SLOT_WIDTH / 1.01
-        )
-        window._apply_current_candle_slot_width()
-        zoom(120)
-        self.assertEqual(
-            window._MAX_CANDLE_SLOT_WIDTH,
-            window.current_candle_slot_width,
-        )
+        selected.clear()
+        span_before_right_drag = window.visible_candle_span
+        QTest.mousePress(canvas, Qt.LeftButton, pos=QPoint(click_x, click_y))
+        QApplication.sendEvent(canvas, QMouseEvent(
+            QEvent.MouseMove,
+            QPointF(click_x + 120, click_y),
+            Qt.NoButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        ))
+        QTest.mouseRelease(canvas, Qt.LeftButton, pos=QPoint(click_x + 120, click_y))
+        self.assertLess(window.visible_candle_span, span_before_right_drag)
+        self.assertEqual([], selected)
+        span_before_left_drag = window.visible_candle_span
+        QTest.mousePress(canvas, Qt.LeftButton, pos=QPoint(click_x, click_y))
+        QApplication.sendEvent(canvas, QMouseEvent(
+            QEvent.MouseMove,
+            QPointF(click_x - 120, click_y),
+            Qt.NoButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        ))
+        QTest.mouseRelease(canvas, Qt.LeftButton, pos=QPoint(click_x - 120, click_y))
+        self.assertGreater(window.visible_candle_span, span_before_left_drag)
+        self.assertEqual([], selected)
 
-    def test_resize_scale_rules_and_render_actions_do_not_run_replay(self):
+    def test_logical_scroll_resize_and_render_actions_do_not_run_replay(self):
         window = self._window()
         window.resize(1300, 800)
         window.show()
         self.app.processEvents()
-        window._sync_candle_scale_to_viewport()
         window.set_replay_snapshot(
-            self._candle_count_snapshot(200, include_signals=True)
+            self._candle_count_snapshot(500, include_signals=True)
         )
         self.app.processEvents()
-        original_slot = window.current_candle_slot_width
+        original_canvas_size = window.canvas.size()
+        original_span = window.visible_candle_span
+        original_price_bounds = (
+            window.canvas.price_scale().minimum,
+            window.canvas.price_scale().maximum,
+        )
         marker_indexes = [
             marker["evaluation_index"] for marker in window.canvas.marker_records()
         ]
-        time_indexes = [
-            record["index"] for record in window.canvas.time_axis_records()
-        ]
-        window.select_evaluation_index(50)
 
         with patch.object(ValidationHistoricalReplay, "evaluate") as replay:
+            window.time_navigation_scrollbar.setValue(0)
+            self.app.processEvents()
+            self.assertEqual(0.0, window.visible_start_index)
+            self.assertEqual(0, window.canvas._nearest_candle_index(
+                window.canvas._x_for_index(0)
+            ))
+            window.time_navigation_scrollbar.setValue(
+                window.time_navigation_scrollbar.maximum()
+            )
+            self.app.processEvents()
+            self.assertEqual(400.0, window.visible_start_index)
+            self.assertEqual(499, window.canvas._nearest_candle_index(
+                window.canvas._x_for_index(499)
+            ))
+            self.assertEqual(original_span, window.visible_candle_span)
+            self.assertEqual(
+                original_price_bounds,
+                (
+                    window.canvas.price_scale().minimum,
+                    window.canvas.price_scale().maximum,
+                ),
+            )
+
+            window.select_evaluation_index(50)
+            self.assertLessEqual(window.visible_start_index, 50)
+            self.assertLess(50, window.visible_start_index + window.visible_candle_span)
             window.resize(window.width() + 200, window.height())
             QTest.qWait(10)
             self.app.processEvents()
-            self.assertNotEqual(original_slot, window.current_candle_slot_width)
-            resized_slot = window.current_candle_slot_width
-
-            def zoom_without_pending_timer(wheel_delta):
-                callbacks = []
-                with patch(
-                    "gui_indicator_follow_signal_validation_window.QTimer.singleShot",
-                    side_effect=lambda _delay, callback: callbacks.append(callback),
-                ):
-                    window._zoom_candle_scale_at(400, wheel_delta)
-                self.app.processEvents()
-                for callback in callbacks:
-                    callback()
-
-            for wheel_index in range(20):
-                zoom_without_pending_timer(120 if wheel_index < 11 else -120)
-            manual_slot = window.current_candle_slot_width
-            self.assertNotEqual(resized_slot, manual_slot)
-            window.resize(window.width() + 100, window.height())
-            QTest.qWait(10)
-            self.app.processEvents()
-            self.assertAlmostEqual(manual_slot, window.current_candle_slot_width)
-            for scroll_value in (100, 200, 50):
-                window.chart_scroll_area.horizontalScrollBar().setValue(scroll_value)
+            self.assertEqual(original_span, window.visible_candle_span)
+            self.assertEqual(original_canvas_size.height(), window.canvas.height())
+            self.assertLessEqual(
+                abs(window.canvas.width() - window.chart_scroll_area.viewport().width()),
+                1,
+            )
             scale = window.canvas.price_scale()
-            for hover_index in range(20, 40):
+            for hover_index in range(50, 70):
                 window.canvas.candle_tooltip_at(
                     window.canvas._x_for_index(hover_index),
                     (scale.plot_top + scale.plot_bottom) / 2,
@@ -871,17 +879,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             marker_indexes,
             [marker["evaluation_index"] for marker in window.canvas.marker_records()],
         )
-        self.assertEqual(
-            time_indexes,
-            [record["index"] for record in window.canvas.time_axis_records()],
-        )
-        for index in (0, 50, 199):
-            self.assertEqual(
-                index,
-                window.canvas._nearest_candle_index(
-                    window.canvas._x_for_index(index)
-                ),
-            )
+        self.assertTrue(all(
+            window.visible_start_index
+            <= record["index"] + 0.5
+            <= window.visible_start_index + window.visible_candle_span
+            for record in window.canvas.time_axis_records()
+        ))
 
     def test_primary_action_requires_matching_validation_before_apply(self):
         window = self._window()

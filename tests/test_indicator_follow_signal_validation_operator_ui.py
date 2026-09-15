@@ -1270,12 +1270,12 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         )
         window.select_evaluation_index(0)
         self.app.processEvents()
-        scroll_value_before = window.chart_scroll_area.horizontalScrollBar().value()
+        scroll_value_before = window.time_navigation_scrollbar.value()
         window._completed_cycle_row_clicked(table.rowCount() - 1, 0)
         self.app.processEvents()
         self.assertEqual(candle_count - 1, window.selected_evaluation_index)
         self.assertGreater(
-            window.chart_scroll_area.horizontalScrollBar().value(),
+            window.time_navigation_scrollbar.value(),
             scroll_value_before,
         )
         self.assertGreaterEqual(window.chart_stack.height(), window.chart_stack.minimumHeight())

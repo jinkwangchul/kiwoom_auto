@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSpinBox,
     QSizePolicy,
     QStackedWidget,
@@ -85,21 +86,28 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
     """V2-owned read-only candle projection and selection boundary."""
 
     bar_selected = pyqtSignal(int)
+    time_scale_drag_requested = pyqtSignal(float, float, float)
 
     _LEFT = 48
     _RIGHT = 24
     _TOP = 42
     _BOTTOM = 48
-    _BAR_SLOT = 12.0
     _MIN_WIDTH = 640
+    _DRAG_THRESHOLD = 6
+    _DRAG_SENSITIVITY_RATIO = 0.75
 
     def __init__(self, candles, markers, parent=None) -> None:
         super().__init__(parent)
         self._candles = deepcopy(candles)
         self._markers = deepcopy(markers)
         self._selected_index: int | None = None
-        self._current_candle_slot_width = float(self._BAR_SLOT)
-        self.setMinimumWidth(self._content_width())
+        self._visible_start_index = 0.0
+        self._visible_candle_span = float(max(1, len(self._candles)))
+        self._drag_press_x: float | None = None
+        self._drag_initial_span: float | None = None
+        self._drag_anchor_index: float | None = None
+        self._drag_anchor_ratio: float | None = None
+        self._time_scale_drag_active = False
 
     @property
     def candle_count(self) -> int:
@@ -110,16 +118,27 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
         return self._selected_index
 
     @property
-    def current_candle_slot_width(self) -> float:
-        return self._current_candle_slot_width
+    def visible_start_index(self) -> float:
+        return self._visible_start_index
 
-    def set_candle_slot_width(self, slot_width: float) -> None:
-        width = _finite_number(slot_width)
-        if width is None or width <= 0:
-            raise ValueError("slot_width must be a positive finite number")
-        self._current_candle_slot_width = width
-        self.setMinimumWidth(self._content_width())
-        self.updateGeometry()
+    @property
+    def visible_candle_span(self) -> float:
+        return self._visible_candle_span
+
+    @property
+    def pixels_per_candle(self) -> float:
+        return self._plot_width() / self._visible_candle_span
+
+    def set_time_view(self, start_index: float, candle_span: float) -> None:
+        start = _finite_number(start_index)
+        span = _finite_number(candle_span)
+        if start is None or span is None or span <= 0:
+            raise ValueError("time view requires finite start and positive span")
+        candle_count = len(self._candles)
+        normalized_span = min(float(max(1, candle_count)), span)
+        maximum_start = max(0.0, candle_count - normalized_span)
+        self._visible_start_index = min(maximum_start, max(0.0, start))
+        self._visible_candle_span = normalized_span
         self.update()
 
     def to_candles(self) -> list[dict[str, Any]]:
@@ -144,32 +163,84 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
         self._selected_index = index
         self.update()
 
-    def _content_width(self) -> int:
-        return math.ceil(max(
-            self._MIN_WIDTH,
-            self._LEFT
-            + self._RIGHT
-            + len(self._candles) * self.current_candle_slot_width,
-        ))
+    def _plot_width(self) -> float:
+        return float(max(1, self.width() - self._LEFT - self._RIGHT))
 
     def _x_for_index(self, index: int) -> float:
-        return self._LEFT + (index + 0.5) * self.current_candle_slot_width
+        return self._LEFT + (
+            (float(index) - self._visible_start_index) + 0.5
+        ) * self.pixels_per_candle
+
+    def _index_float_for_x(self, x: float) -> float:
+        return (
+            self._visible_start_index
+            + (float(x) - self._LEFT) / self.pixels_per_candle
+            - 0.5
+        )
+
+    def _visible_index_bounds(self) -> tuple[int, int]:
+        if not self._candles:
+            return (0, 0)
+        start = max(0, math.floor(self._visible_start_index))
+        end = min(
+            len(self._candles),
+            math.ceil(self._visible_start_index + self._visible_candle_span),
+        )
+        return start, max(start, end)
+
+    def _is_index_visible(self, index: int) -> bool:
+        return (
+            0 <= index < len(self._candles)
+            and self._visible_start_index <= index + 0.5
+            <= self._visible_start_index + self._visible_candle_span
+        )
 
     def _nearest_candle_index(self, x: float) -> int | None:
-        if not self._candles:
+        if (
+            not self._candles
+            or x < self._LEFT
+            or x > self.width() - self._RIGHT
+        ):
             return None
-        slot_width = self.current_candle_slot_width
-        raw_index = round((x - self._LEFT - slot_width / 2) / slot_width)
-        return min(max(raw_index, 0), len(self._candles) - 1)
+        raw_index = round(self._index_float_for_x(x))
+        if not 0 <= raw_index < len(self._candles):
+            return None
+        return raw_index
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            index = self._nearest_candle_index(event.pos().x())
-            if index is not None:
-                self.set_selected_index(index)
-                self.bar_selected.emit(index)
-                return
+            x = float(event.pos().x())
+            self._drag_press_x = x
+            self._drag_initial_span = self._visible_candle_span
+            self._drag_anchor_index = self._index_float_for_x(x)
+            self._drag_anchor_ratio = min(
+                1.0,
+                max(0.0, (x - self._LEFT) / self._plot_width()),
+            )
+            self._time_scale_drag_active = False
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._drag_press_x is not None:
+            was_drag = self._time_scale_drag_active
+            self._clear_time_scale_drag()
+            if not was_drag:
+                index = self._nearest_candle_index(event.pos().x())
+                if index is not None:
+                    self.set_selected_index(index)
+                    self.bar_selected.emit(index)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _clear_time_scale_drag(self) -> None:
+        self._drag_press_x = None
+        self._drag_initial_span = None
+        self._drag_anchor_index = None
+        self._drag_anchor_ratio = None
+        self._time_scale_drag_active = False
 
 
 def _display_time(value: Any) -> str:
@@ -546,17 +617,21 @@ class IndicatorFollowSignalValidationChartCanvas(
 
     def __init__(self, candles, markers, parent=None) -> None:
         super().__init__(candles, markers, parent)
-        self._time_axis_records = _time_axis_label_records(self._candles)
         self._active_tooltip = ""
         self.setMouseTracking(True)
         self.setMinimumHeight(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def sizeHint(self) -> QSize:
-        return QSize(self._content_width(), 160)
+        return QSize(self._MIN_WIDTH, 160)
 
     def time_axis_records(self) -> list[dict[str, Any]]:
-        return deepcopy(self._time_axis_records)
+        start, end = self._visible_index_bounds()
+        records = _time_axis_label_records(self._candles[start:end])
+        return [
+            {**record, "index": record["index"] + start}
+            for record in records
+        ]
 
     @property
     def plot_left(self) -> int:
@@ -593,6 +668,8 @@ class IndicatorFollowSignalValidationChartCanvas(
                 continue
             if not 0 <= index < len(self._candles):
                 continue
+            if not self._is_index_visible(index):
+                continue
             marker_y = plot_bottom + 12 if side == "BUY" else plot_top - 12
             if abs(x - self._x_for_index(index)) <= 7 and abs(y - marker_y) <= 11:
                 return str(marker.get("tooltip") or "")
@@ -603,11 +680,6 @@ class IndicatorFollowSignalValidationChartCanvas(
         if not self._candles or scale is None:
             return ""
         if not scale.plot_top <= y <= scale.plot_bottom:
-            return ""
-        half_slot = self.current_candle_slot_width / 2
-        first_x = self._x_for_index(0)
-        last_x = self._x_for_index(len(self._candles) - 1)
-        if x < first_x - half_slot or x > last_x + half_slot:
             return ""
         index = self._nearest_candle_index(x)
         if index is None:
@@ -625,6 +697,29 @@ class IndicatorFollowSignalValidationChartCanvas(
         ))
 
     def mouseMoveEvent(self, event) -> None:
+        if self._drag_press_x is not None:
+            drag_dx = float(event.pos().x()) - self._drag_press_x
+            if (
+                not self._time_scale_drag_active
+                and abs(drag_dx) >= self._DRAG_THRESHOLD
+            ):
+                self._time_scale_drag_active = True
+                self.clear_marker_tooltip()
+            if self._time_scale_drag_active:
+                sensitivity = max(
+                    1.0,
+                    self._plot_width() * self._DRAG_SENSITIVITY_RATIO,
+                )
+                requested_span = self._drag_initial_span * math.exp(
+                    -drag_dx / sensitivity
+                )
+                self.time_scale_drag_requested.emit(
+                    requested_span,
+                    self._drag_anchor_index,
+                    self._drag_anchor_ratio,
+                )
+                event.accept()
+                return
         tooltip = self.marker_tooltip_at(event.pos().x(), event.pos().y())
         if not tooltip:
             tooltip = self.candle_tooltip_at(event.pos().x(), event.pos().y())
@@ -640,6 +735,7 @@ class IndicatorFollowSignalValidationChartCanvas(
         super().leaveEvent(event)
 
     def hideEvent(self, event) -> None:
+        self._clear_time_scale_drag()
         self.clear_marker_tooltip()
         super().hideEvent(event)
 
@@ -670,9 +766,12 @@ class IndicatorFollowSignalValidationChartCanvas(
                 record["y"],
             )
 
-        if self._selected_index is not None:
+        if (
+            self._selected_index is not None
+            and self._is_index_visible(self._selected_index)
+        ):
             selected_x = self._x_for_index(self._selected_index)
-            slot_width = self.current_candle_slot_width
+            slot_width = self.pixels_per_candle
             painter.fillRect(
                 QRectF(selected_x - slot_width / 2, 0, slot_width, self.height()),
                 QBrush(_SELECTION),
@@ -680,7 +779,9 @@ class IndicatorFollowSignalValidationChartCanvas(
             painter.setPen(QPen(_SELECTION_LINE, 1))
             painter.drawLine(int(selected_x), 0, int(selected_x), self.height())
 
-        for index, candle in enumerate(self._candles):
+        visible_start, visible_end = self._visible_index_bounds()
+        for index in range(visible_start, visible_end):
+            candle = self._candles[index]
             close = _finite_number(candle.get("close"))
             if close is None:
                 continue
@@ -715,6 +816,8 @@ class IndicatorFollowSignalValidationChartCanvas(
                 continue
             if not 0 <= index < len(self._candles):
                 continue
+            if not self._is_index_visible(index):
+                continue
             x = self._x_for_index(index)
             if side == "BUY":
                 y = scale.plot_bottom + 12
@@ -738,14 +841,15 @@ class IndicatorFollowSignalValidationChartCanvas(
             painter.setBrush(QBrush(color))
             painter.drawPolygon(QPolygonF(points))
 
-        if not self._time_axis_records:
+        time_axis_records = self.time_axis_records()
+        if not time_axis_records:
             return
         painter.setPen(_TEXT)
         font = painter.font()
         font.setPointSize(max(7, font.pointSize() - 1))
         painter.setFont(font)
         label_top = max(0, self.height() - 32)
-        for record in self._time_axis_records:
+        for record in time_axis_records:
             center_x = self._x_for_index(record["index"])
             painter.drawText(
                 QRectF(center_x - 42, label_top, 84, 26),
@@ -765,7 +869,6 @@ class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
         self._canvas: IndicatorFollowSignalValidationChartCanvas | None = None
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self._scroll_area.viewport().installEventFilter(self)
-        self._scroll_area.horizontalScrollBar().installEventFilter(self)
         self._sync_width()
 
     def set_canvas(
@@ -1026,10 +1129,9 @@ class IndicatorFollowSignalValidationWindow(
 
     _V2_SECTION_HEADER_HEIGHT = 44
     _V2_SECTION_VERTICAL_MARGIN = 6
-    _REFERENCE_CANDLE_COUNT = 100
-    _MIN_CANDLE_SLOT_WIDTH = 3.0
-    _MAX_CANDLE_SLOT_WIDTH = 48.0
-    _CANDLE_ZOOM_FACTOR = 1.15
+    _REFERENCE_CANDLE_COUNT = 100.0
+    _MIN_VISIBLE_CANDLE_SPAN = 10.0
+    _TIME_SCROLL_UNITS_PER_CANDLE = 1000
     _INITIAL_AVAILABLE_GEOMETRY_RATIO = 0.85
     _CYCLE_TABLE_VISIBLE_ROWS = 5
     _CYCLE_TABLE_COLUMN_RATIOS = (0.06, 0.22, 0.09, 0.15, 0.20, 0.13, 0.15)
@@ -1077,11 +1179,10 @@ class IndicatorFollowSignalValidationWindow(
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
         self._result_settings_snapshot: ValidationSettingsSnapshot | None = None
         self._signal_tooltips: dict[tuple[int, str], str] = {}
-        self._base_candle_slot_width = float(
-            IndicatorFollowSignalValidationChartCanvas._BAR_SLOT
-        )
-        self._current_candle_slot_width = self._base_candle_slot_width
-        self._manual_candle_zoom = False
+        self._visible_start_index = 0.0
+        self._visible_candle_span = 1.0
+        self._time_scale_manually_adjusted = False
+        self._syncing_time_navigation_scrollbar = False
         super().__init__(
             rules_path=__file__,
             routine_name="지표추종매매 신호검증 V2",
@@ -1108,16 +1209,16 @@ class IndicatorFollowSignalValidationWindow(
         return self._selected_index
 
     @property
-    def base_candle_slot_width(self) -> float:
-        return self._base_candle_slot_width
+    def visible_start_index(self) -> float:
+        return self._visible_start_index
 
     @property
-    def current_candle_slot_width(self) -> float:
-        return self._current_candle_slot_width
+    def visible_candle_span(self) -> float:
+        return self._visible_candle_span
 
     @property
-    def manual_candle_zoom(self) -> bool:
-        return self._manual_candle_zoom
+    def time_scale_manually_adjusted(self) -> bool:
+        return self._time_scale_manually_adjusted
 
     def _update_window_title(self) -> None:
         self.setWindowTitle("지표추종매매 - 독립 신호검증 V2")
@@ -1171,9 +1272,14 @@ class IndicatorFollowSignalValidationWindow(
         self.loading_label.setStyleSheet("font-size: 12pt; color: #555555;")
         self.chart_scroll_area = QScrollArea()
         self.chart_scroll_area.setWidgetResizable(True)
-        self.chart_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.chart_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.chart_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.chart_scroll_area.viewport().installEventFilter(self)
+        self.time_navigation_scrollbar = QScrollBar(Qt.Horizontal)
+        self.time_navigation_scrollbar.setVisible(False)
+        self.time_navigation_scrollbar.valueChanged.connect(
+            self._time_navigation_scrollbar_changed
+        )
         self.fixed_price_axis = IndicatorFollowSignalValidationFixedPriceAxis(
             self.chart_scroll_area
         )
@@ -1182,7 +1288,13 @@ class IndicatorFollowSignalValidationWindow(
         chart_view_layout.setContentsMargins(0, 0, 0, 0)
         chart_view_layout.setSpacing(0)
         chart_view_layout.addWidget(self.fixed_price_axis)
-        chart_view_layout.addWidget(self.chart_scroll_area, 1)
+        self.chart_viewport_column = QWidget()
+        chart_viewport_layout = QVBoxLayout(self.chart_viewport_column)
+        chart_viewport_layout.setContentsMargins(0, 0, 0, 0)
+        chart_viewport_layout.setSpacing(0)
+        chart_viewport_layout.addWidget(self.chart_scroll_area, 1)
+        chart_viewport_layout.addWidget(self.time_navigation_scrollbar, 0)
+        chart_view_layout.addWidget(self.chart_viewport_column, 1)
         self.chart_stack.addWidget(self.loading_label)
         self.chart_stack.addWidget(self.chart_view)
         self.chart_stack.setCurrentWidget(self.loading_label)
@@ -1450,14 +1562,9 @@ class IndicatorFollowSignalValidationWindow(
         )()
         if watched is chart_viewport:
             if event.type() == QEvent.Resize:
-                QTimer.singleShot(0, self._sync_candle_scale_to_viewport)
-            elif event.type() == QEvent.Wheel and event.angleDelta().y():
-                self._zoom_candle_scale_at(
-                    event.pos().x(),
-                    event.angleDelta().y(),
-                )
-                event.accept()
-                return True
+                canvas = getattr(self, "canvas", None)
+                if canvas is not None:
+                    QTimer.singleShot(0, canvas.update)
             return super().eventFilter(watched, event)
         cycle_table = getattr(self, "completed_cycle_table", None)
         if cycle_table is not None and watched is cycle_table.viewport():
@@ -1475,64 +1582,74 @@ class IndicatorFollowSignalValidationWindow(
             return True
         return super().eventFilter(watched, event)
 
-    @classmethod
-    def _clamped_candle_slot_width(cls, slot_width: float) -> float:
-        return min(
-            cls._MAX_CANDLE_SLOT_WIDTH,
-            max(cls._MIN_CANDLE_SLOT_WIDTH, float(slot_width)),
-        )
+    def _clamped_visible_candle_span(self, requested_span: float) -> float:
+        candle_count = len(self._candles)
+        if candle_count <= 0:
+            return 1.0
+        minimum_span = min(self._MIN_VISIBLE_CANDLE_SPAN, float(candle_count))
+        return min(float(candle_count), max(minimum_span, float(requested_span)))
 
-    def _reference_candle_slot_width(self) -> float:
-        viewport_width = self.chart_scroll_area.viewport().width()
-        usable_width = max(
-            1,
-            viewport_width
-            - IndicatorFollowSignalValidationChartCanvas._LEFT
-            - IndicatorFollowSignalValidationChartCanvas._RIGHT,
+    def _maximum_visible_start(self, span: float | None = None) -> float:
+        effective_span = (
+            self._visible_candle_span if span is None else float(span)
         )
-        return self._clamped_candle_slot_width(
-            usable_width / self._REFERENCE_CANDLE_COUNT
-        )
+        return max(0.0, len(self._candles) - effective_span)
 
-    def _apply_current_candle_slot_width(self) -> None:
+    def _set_time_view(
+        self,
+        start_index: float,
+        candle_span: float,
+        *,
+        manually_adjusted: bool | None = None,
+    ) -> None:
+        span = self._clamped_visible_candle_span(candle_span)
+        start = min(
+            self._maximum_visible_start(span),
+            max(0.0, float(start_index)),
+        )
+        self._visible_start_index = start
+        self._visible_candle_span = span
+        if manually_adjusted is not None:
+            self._time_scale_manually_adjusted = bool(manually_adjusted)
         canvas = getattr(self, "canvas", None)
         if canvas is not None:
-            canvas.set_candle_slot_width(self._current_candle_slot_width)
+            canvas.set_time_view(start, span)
+        self._sync_time_navigation_scrollbar()
 
-    def _sync_candle_scale_to_viewport(self) -> None:
-        self._base_candle_slot_width = self._reference_candle_slot_width()
-        if not self._manual_candle_zoom:
-            self._current_candle_slot_width = self._base_candle_slot_width
-        self._apply_current_candle_slot_width()
+    def _apply_time_scale_drag(
+        self,
+        requested_span: float,
+        anchor_index: float,
+        anchor_ratio: float,
+    ) -> None:
+        span = self._clamped_visible_candle_span(requested_span)
+        start = float(anchor_index) + 0.5 - float(anchor_ratio) * span
+        self._set_time_view(start, span, manually_adjusted=True)
 
-    def _zoom_candle_scale_at(self, cursor_view_x: float, wheel_delta: int) -> None:
-        if not wheel_delta:
+    def _sync_time_navigation_scrollbar(self) -> None:
+        scrollbar = getattr(self, "time_navigation_scrollbar", None)
+        if scrollbar is None:
             return
-        old_slot = self._current_candle_slot_width
-        zoom_steps = float(wheel_delta) / 120.0
-        new_slot = self._clamped_candle_slot_width(
-            old_slot * (self._CANDLE_ZOOM_FACTOR ** zoom_steps)
-        )
-        self._manual_candle_zoom = True
-        if math.isclose(new_slot, old_slot, rel_tol=0.0, abs_tol=1e-9):
+        units = self._TIME_SCROLL_UNITS_PER_CANDLE
+        maximum = round(self._maximum_visible_start() * units)
+        value = round(self._visible_start_index * units)
+        page_step = max(1, round(self._visible_candle_span * units))
+        self._syncing_time_navigation_scrollbar = True
+        try:
+            scrollbar.setRange(0, maximum)
+            scrollbar.setPageStep(page_step)
+            scrollbar.setSingleStep(units)
+            scrollbar.setValue(min(maximum, max(0, value)))
+            scrollbar.setVisible(maximum > 0)
+            scrollbar.setEnabled(maximum > 0)
+        finally:
+            self._syncing_time_navigation_scrollbar = False
+
+    def _time_navigation_scrollbar_changed(self, value: int) -> None:
+        if self._syncing_time_navigation_scrollbar:
             return
-        scroll_bar = self.chart_scroll_area.horizontalScrollBar()
-        old_scroll = scroll_bar.value()
-        left_margin = IndicatorFollowSignalValidationChartCanvas._LEFT
-        anchor_index = (
-            (old_scroll + float(cursor_view_x) - left_margin) / old_slot
-        ) - 0.5
-        self._current_candle_slot_width = new_slot
-        self._apply_current_candle_slot_width()
-
-        def restore_cursor_anchor() -> None:
-            new_content_x = left_margin + (anchor_index + 0.5) * new_slot
-            requested_scroll = round(new_content_x - float(cursor_view_x))
-            scroll_bar.setValue(
-                min(scroll_bar.maximum(), max(scroll_bar.minimum(), requested_scroll))
-            )
-
-        QTimer.singleShot(0, restore_cursor_anchor)
+        start = float(value) / self._TIME_SCROLL_UNITS_PER_CANDLE
+        self._set_time_view(start, self._visible_candle_span)
 
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
@@ -1923,7 +2040,6 @@ class IndicatorFollowSignalValidationWindow(
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        QTimer.singleShot(0, self._sync_candle_scale_to_viewport)
         QTimer.singleShot(0, self._sync_recent_stock_row_width)
         QTimer.singleShot(0, self._sync_completed_cycle_table_geometry)
 
@@ -1949,6 +2065,9 @@ class IndicatorFollowSignalValidationWindow(
         self._entries = []
         self._completed_cycles = []
         self._selected_index = None
+        self._visible_start_index = 0.0
+        self._visible_candle_span = 1.0
+        self._time_scale_manually_adjusted = False
         self._signal_tooltips = {}
         self._pending_result_settings_snapshot = None
         self._result_settings_snapshot = None
@@ -1957,6 +2076,7 @@ class IndicatorFollowSignalValidationWindow(
             old_canvas.deleteLater()
         self.canvas = None
         self.fixed_price_axis.set_canvas(None)
+        self._sync_time_navigation_scrollbar()
         self.result_summary_label.setText("Candle -  |  BUY -  |  SELL -")
         self.estimated_return_label.setText("|  추정 손익률 -")
         self._populate_completed_cycles()
@@ -1998,10 +2118,29 @@ class IndicatorFollowSignalValidationWindow(
         old_canvas = self.chart_scroll_area.takeWidget()
         if old_canvas is not None:
             old_canvas.deleteLater()
+        candle_count = len(self._candles)
+        self._visible_candle_span = min(
+            self._REFERENCE_CANDLE_COUNT,
+            float(max(1, candle_count)),
+        )
+        visible_end = min(
+            max(0, replay_snapshot.evaluated_end_index),
+            max(0, candle_count - 1),
+        )
+        self._visible_start_index = min(
+            max(0.0, candle_count - self._visible_candle_span),
+            max(0.0, visible_end - self._visible_candle_span + 1.0),
+        )
+        self._time_scale_manually_adjusted = False
         self.canvas = IndicatorFollowSignalValidationChartCanvas(self._candles, markers)
-        self._sync_candle_scale_to_viewport()
+        self.canvas.set_time_view(
+            self._visible_start_index,
+            self._visible_candle_span,
+        )
         self.canvas.bar_selected.connect(self.select_evaluation_index)
+        self.canvas.time_scale_drag_requested.connect(self._apply_time_scale_drag)
         self.chart_scroll_area.setWidget(self.canvas)
+        self._sync_time_navigation_scrollbar()
         self.fixed_price_axis.set_canvas(self.canvas)
         self.chart_stack.setCurrentWidget(self.chart_view)
         self._populate_completed_cycles()
@@ -2216,12 +2355,15 @@ class IndicatorFollowSignalValidationWindow(
     def _ensure_candle_visible(self, index: int) -> None:
         if self.canvas is None:
             return
-        self.chart_scroll_area.ensureVisible(
-            int(self.canvas._x_for_index(index)),
-            max(0, self.canvas.height() // 2),
-            48,
-            0,
-        )
+        start = self._visible_start_index
+        end = start + self._visible_candle_span
+        if index < start:
+            start = float(index)
+        elif index + 1 > end:
+            start = float(index) + 1.0 - self._visible_candle_span
+        else:
+            return
+        self._set_time_view(start, self._visible_candle_span)
 
     def hideEvent(self, event) -> None:
         QToolTip.hideText()

@@ -216,8 +216,8 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
             widget.deleteLater()
         self.app.processEvents()
 
-    def test_axis_stays_fixed_while_candles_and_time_axis_scroll(self):
-        candles = _candles([1_500_000.0 + index * 100 for index in range(100)])
+    def test_axis_stays_fixed_while_logical_time_view_moves(self):
+        candles = _candles([1_500_000.0 + index * 100 for index in range(200)])
         sell_index = 90
         markers = [{
             "side": "SELL",
@@ -232,6 +232,7 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         canvas = IndicatorFollowSignalValidationChartCanvas(candles, markers)
+        canvas.set_time_view(0.0, 100.0)
         scroll.setWidget(canvas)
         axis = IndicatorFollowSignalValidationFixedPriceAxis(scroll)
         axis.set_canvas(canvas)
@@ -244,7 +245,7 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
 
         records = axis.price_axis_records()
         self.assertEqual(5, len(records))
-        self.assertEqual("1,509,902", records[0]["label"])
+        self.assertEqual("1,519,902", records[0]["label"])
         widest = max(
             QFontMetrics(axis.font()).horizontalAdvance(record["label"])
             for record in records
@@ -265,9 +266,8 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
         time_x_before = canvas.mapToGlobal(
             QPoint(int(canvas._x_for_index(time_tick_index)), 0)
         ).x()
-        scrollbar = scroll.horizontalScrollBar()
-        self.assertGreater(scrollbar.maximum(), 0)
-        scrollbar.setValue(scrollbar.maximum())
+        self.assertEqual(0, scroll.horizontalScrollBar().maximum())
+        canvas.set_time_view(50.0, 100.0)
         self.app.processEvents()
 
         self.assertEqual(axis_x_before, axis.mapToGlobal(QPoint(0, 0)).x())
