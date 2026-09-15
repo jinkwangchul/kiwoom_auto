@@ -904,6 +904,62 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             window.chart_scroll_area.horizontalScrollBar().maximum(),
         )
 
+    def test_candle_body_width_tracks_time_span_with_small_fixed_gap(self):
+        window = self._window()
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window.set_replay_snapshot(self._candle_count_snapshot(500))
+        self.app.processEvents()
+        canvas = window.canvas
+        canvas_size = canvas.size()
+        marker_indexes = [
+            marker["evaluation_index"] for marker in canvas.marker_records()
+        ]
+        selected_index = window.selected_evaluation_index
+
+        baseline_span = window.visible_candle_span
+        baseline_slot = canvas.pixels_per_candle
+        baseline_body = canvas._candle_body_width()
+        self.assertAlmostEqual(
+            canvas._CANDLE_HORIZONTAL_GAP,
+            baseline_slot - baseline_body,
+        )
+        self.assertGreater(baseline_body, 6.0)
+        self.assertLess(baseline_body, baseline_slot)
+
+        anchor_index = 450
+        anchor_x = canvas._x_for_index(anchor_index)
+        anchor_ratio = (anchor_x - canvas._LEFT) / canvas._plot_width()
+        window._apply_time_scale_drag(75.0, anchor_index, anchor_ratio)
+        zoomed_slot = canvas.pixels_per_candle
+        zoomed_body = canvas._candle_body_width()
+        self.assertLess(window.visible_candle_span, baseline_span)
+        self.assertGreater(zoomed_slot, baseline_slot)
+        self.assertGreater(zoomed_body, baseline_body)
+        self.assertAlmostEqual(
+            canvas._CANDLE_HORIZONTAL_GAP,
+            zoomed_slot - zoomed_body,
+        )
+        self.assertEqual(canvas_size, canvas.size())
+
+        window._apply_time_scale_drag(150.0, anchor_index, anchor_ratio)
+        zoomed_out_slot = canvas.pixels_per_candle
+        zoomed_out_body = canvas._candle_body_width()
+        self.assertGreater(window.visible_candle_span, baseline_span)
+        self.assertLess(zoomed_out_slot, baseline_slot)
+        self.assertLess(zoomed_out_body, baseline_body)
+        self.assertAlmostEqual(
+            canvas._CANDLE_HORIZONTAL_GAP,
+            zoomed_out_slot - zoomed_out_body,
+        )
+        self.assertEqual(canvas_size, canvas.size())
+        self.assertEqual(selected_index, window.selected_evaluation_index)
+        self.assertEqual(
+            marker_indexes,
+            [marker["evaluation_index"] for marker in canvas.marker_records()],
+        )
+
     def test_horizontal_drag_scales_time_with_anchor_clamps_and_click_threshold(self):
         window = self._window()
         window.resize(1400, 800)
@@ -981,6 +1037,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             window.visible_candle_span,
         )
         canvas_size_before = canvas.size()
+        body_width_before = canvas._candle_body_width()
         selected_before = window.selected_evaluation_index
         axis_labels_before = [
             record["label"] for record in window.fixed_price_axis.price_axis_records()
@@ -1027,6 +1084,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 window.visible_candle_span,
             ))
             self.assertEqual(canvas_size_before, canvas.size())
+            self.assertEqual(body_width_before, canvas._candle_body_width())
             self.assertEqual(selected_before, window.selected_evaluation_index)
             self.assertNotEqual(
                 axis_labels_before,
@@ -1100,6 +1158,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.app.processEvents()
         original_canvas_size = window.canvas.size()
         original_span = window.visible_candle_span
+        original_body_width = window.canvas._candle_body_width()
         original_price_bounds = (
             window.canvas.price_scale().minimum,
             window.canvas.price_scale().maximum,
@@ -1124,6 +1183,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 window.canvas._x_for_index(499)
             ))
             self.assertEqual(original_span, window.visible_candle_span)
+            self.assertEqual(original_body_width, window.canvas._candle_body_width())
             self.assertEqual(
                 original_price_bounds,
                 (

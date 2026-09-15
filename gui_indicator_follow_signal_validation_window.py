@@ -621,6 +621,7 @@ class IndicatorFollowSignalValidationChartCanvas(
     """V2 scroll canvas containing Candle, marker, grid, and real time labels."""
 
     _LEFT = 12
+    _CANDLE_HORIZONTAL_GAP = 2.0
 
     def __init__(self, candles, markers, parent=None) -> None:
         super().__init__(candles, markers, parent)
@@ -633,6 +634,14 @@ class IndicatorFollowSignalValidationChartCanvas(
 
     def sizeHint(self) -> QSize:
         return QSize(self._MIN_WIDTH, 160)
+
+    def _candle_body_width(self) -> float:
+        slot_width = self.pixels_per_candle
+        effective_gap = min(
+            self._CANDLE_HORIZONTAL_GAP,
+            max(0.0, slot_width - 1.0),
+        )
+        return max(1.0, slot_width - effective_gap)
 
     def time_axis_records(self) -> list[dict[str, Any]]:
         start, end = self._visible_index_bounds()
@@ -816,6 +825,8 @@ class IndicatorFollowSignalValidationChartCanvas(
             painter.drawLine(int(selected_x), 0, int(selected_x), self.height())
 
         visible_start, visible_end = self._visible_index_bounds()
+        body_width = self._candle_body_width()
+        half_body = body_width / 2
         for index in range(visible_start, visible_end):
             candle = self._candles[index]
             close = _finite_number(candle.get("close"))
@@ -828,7 +839,10 @@ class IndicatorFollowSignalValidationChartCanvas(
             if opened is None or high is None or low is None:
                 painter.setPen(QPen(_FLAT, 2))
                 y = scale.y_for_price(close)
-                painter.drawLine(int(x - 3), int(y), int(x + 3), int(y))
+                painter.drawLine(
+                    QPointF(x - half_body, y),
+                    QPointF(x + half_body, y),
+                )
                 continue
             color = _UP if close > opened else _DOWN if close < opened else _FLAT
             painter.setPen(QPen(color, 1))
@@ -843,7 +857,10 @@ class IndicatorFollowSignalValidationChartCanvas(
                 abs(scale.y_for_price(opened) - scale.y_for_price(close)),
                 1.0,
             )
-            painter.fillRect(QRectF(x - 3, body_top, 6, body_height), QBrush(color))
+            painter.fillRect(
+                QRectF(x - half_body, body_top, body_width, body_height),
+                QBrush(color),
+            )
 
         for marker in self._markers:
             index = marker.get("evaluation_index")
