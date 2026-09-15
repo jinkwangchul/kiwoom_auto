@@ -56,32 +56,85 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 dialog,
                 f"sell_signal_condition_{group_name}_gap_right_combo",
             ).setCurrentText("현재가")
-        if dialog.buy_bollinger_sign_combo.currentIndex() < 0:
-            dialog.buy_bollinger_sign_combo.setCurrentText("-")
         return dialog
 
-    def test_legacy_missing_bollinger_sign_is_unresolved_and_blocks_registration(self) -> None:
-        dialog = IndicatorFollowRoutineSettingsDialog(
-            rules_path=self.source_rules_path,
-            routine_path=self.routine_dir,
-            routine_name="검증 루틴",
-            definition_id="indicator_follow",
-            settings_mode="registration",
-        )
+    def test_legacy_missing_bollinger_sign_normalizes_and_allows_registration(self) -> None:
+        before = hashlib.sha256(self.source_rules_path.read_bytes()).hexdigest()
+        dialog = self._dialog(self.source_rules_path)
         try:
-            self.assertEqual(dialog.buy_bollinger_sign_combo.currentIndex(), -1)
+            self.assertEqual(dialog.buy_bollinger_direction_combo.currentText(), "하향")
+            self.assertEqual(dialog.buy_bollinger_sign_combo.currentText(), "-")
             result = dialog.build_registration_rules_from_current_ui_state()
         finally:
             dialog.close()
+
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(
+            "-",
+            result["rules"]["indicator_follow_ui_state"]["state"]["buy_ui"]
+            ["signal_filter"]["buy_bollinger_sign_combo"],
+        )
+        self.assertEqual(
+            before,
+            hashlib.sha256(self.source_rules_path.read_bytes()).hexdigest(),
+        )
+
+    def test_legacy_upper_direction_normalizes_to_plus_without_overwriting_explicit_sign(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        signal_filter = source["indicator_follow_ui_state"]["state"]["buy_ui"]["signal_filter"]
+        signal_filter["buy_bollinger_direction_combo"] = "상향"
+        signal_filter.pop("buy_bollinger_sign_combo", None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            dialog = self._dialog(rules_path)
+            try:
+                self.assertEqual(dialog.buy_bollinger_sign_combo.currentText(), "+")
+            finally:
+                dialog.close()
+
+            signal_filter["buy_bollinger_direction_combo"] = "하향"
+            signal_filter["buy_bollinger_sign_combo"] = "+"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            explicit = self._dialog(rules_path)
+            try:
+                self.assertEqual(explicit.buy_bollinger_sign_combo.currentText(), "+")
+            finally:
+                explicit.close()
+
+    def test_invalid_explicit_bollinger_sign_remains_fail_closed(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        signal_filter = source["indicator_follow_ui_state"]["state"]["buy_ui"]["signal_filter"]
+        signal_filter["buy_bollinger_sign_combo"] = "X"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            dialog = IndicatorFollowRoutineSettingsDialog(
+                rules_path=rules_path,
+                routine_path=self.routine_dir,
+                routine_name="검증 루틴",
+                definition_id="indicator_follow",
+                settings_mode="registration",
+            )
+            try:
+                self.assertEqual(dialog.buy_bollinger_sign_combo.currentIndex(), -1)
+                result = dialog.build_registration_rules_from_current_ui_state()
+            finally:
+                dialog.close()
 
         self.assertFalse(result["success"])
         self.assertIn(
             "buy Bollinger sign selection is required",
             result["internal_blocked_reasons"],
-        )
-        self.assertIn(
-            "매수 볼린저밴드의 +/- 부호를 선택하세요.",
-            result["user_messages"],
         )
 
     def test_bollinger_signed_percent_registration_snapshot_reloads_exact_ui_state(self) -> None:
@@ -113,6 +166,41 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 self.assertEqual(reloaded.buy_bollinger_sign_combo.currentText(), "+")
                 self.assertEqual(reloaded.buy_bollinger_value_line.text(), "0.1")
                 self.assertEqual(reloaded.buy_bollinger_compare_combo.currentText(), "이하")
+            finally:
+                reloaded.close()
+
+    def test_legacy_normalized_bollinger_sign_is_persisted_by_existing_save_boundary(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        signal_filter = source["indicator_follow_ui_state"]["state"]["buy_ui"]["signal_filter"]
+        signal_filter["buy_bollinger_direction_combo"] = "상향"
+        signal_filter.pop("buy_bollinger_sign_combo", None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            dialog = self._dialog(rules_path)
+            try:
+                self.assertEqual(dialog.buy_bollinger_sign_combo.currentText(), "+")
+                result = dialog.build_registration_rules_from_current_ui_state()
+            finally:
+                dialog.close()
+
+            self.assertTrue(result["success"], result.get("error"))
+            saved_state = result["rules"]["indicator_follow_ui_state"]["state"]
+            self.assertEqual(
+                "+",
+                saved_state["buy_ui"]["signal_filter"]["buy_bollinger_sign_combo"],
+            )
+            rules_path.write_text(
+                json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            reloaded = self._dialog(rules_path)
+            try:
+                self.assertEqual(reloaded.buy_bollinger_direction_combo.currentText(), "상향")
+                self.assertEqual(reloaded.buy_bollinger_sign_combo.currentText(), "+")
             finally:
                 reloaded.close()
 

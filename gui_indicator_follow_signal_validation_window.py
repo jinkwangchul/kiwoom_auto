@@ -1825,29 +1825,9 @@ class IndicatorFollowSignalValidationWindow(
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
         self.rules = deepcopy(self.rules_data)
-        entry_state = self._signal_validation_seed.to_ui_state()
-        signal_filter = entry_state.get("buy_ui", {}).get("signal_filter")
-        missing_bollinger_sign = (
-            isinstance(signal_filter, dict)
-            and any(
-                name in signal_filter
-                for name in (
-                    "buy_bollinger_direction_combo",
-                    "buy_bollinger_value_line",
-                    "buy_bollinger_compare_combo",
-                )
-            )
-            and str(signal_filter.get("buy_bollinger_sign_combo") or "").strip()
-            not in {"-", "+"}
+        self.apply_signal_validation_ui_state(
+            self._signal_validation_seed.to_ui_state()
         )
-        if missing_bollinger_sign:
-            entry_state = deepcopy(entry_state)
-            entry_state["buy_ui"]["signal_filter"][
-                "buy_bollinger_sign_combo"
-            ] = "-"
-        self.apply_signal_validation_ui_state(entry_state)
-        if missing_bollinger_sign:
-            self.buy_bollinger_sign_combo.setCurrentIndex(-1)
         self.compact_stock_display.set_current_stock(self.stock)
 
     def _show_with_initial_control_section_state(self) -> None:

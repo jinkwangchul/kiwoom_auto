@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from PyQt5 import sip
 from PyQt5.QtCore import Qt, QEvent
 from PyQt5.QtWidgets import (
@@ -26,6 +28,37 @@ BUY_BOLLINGER_SIGN_VALUES = frozenset({"-", "+"})
 
 def mark_buy_bollinger_sign_combo_unresolved(combo):
     combo.setCurrentIndex(-1)
+
+
+def normalize_legacy_buy_bollinger_sign_ui_state(ui_state):
+    if not isinstance(ui_state, dict):
+        return ui_state
+    buy_ui = ui_state.get("buy_ui")
+    signal_filter = (
+        buy_ui.get("signal_filter") if isinstance(buy_ui, dict) else None
+    )
+    if not isinstance(signal_filter, dict):
+        return ui_state
+    legacy_fields = {
+        "buy_bollinger_direction_combo",
+        "buy_bollinger_value_line",
+        "buy_bollinger_compare_combo",
+    }
+    if not legacy_fields.issubset(signal_filter):
+        return ui_state
+    if "buy_bollinger_sign_combo" in signal_filter:
+        return ui_state
+    legacy_sign = {
+        "하향": "-",
+        "상향": "+",
+    }.get(str(signal_filter.get("buy_bollinger_direction_combo") or "").strip())
+    if legacy_sign is None:
+        return ui_state
+    normalized = deepcopy(ui_state)
+    normalized["buy_ui"]["signal_filter"][
+        "buy_bollinger_sign_combo"
+    ] = legacy_sign
+    return normalized
 
 
 def buy_bollinger_sign_selection_issues(ui_state):

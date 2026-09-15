@@ -200,7 +200,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
         )
         self.assertAlmostEqual(float(self._detail_value(detail, "threshold")), 109890.0)
 
-    def test_legacy_bollinger_alias_fails_closed(self):
+    def test_legacy_bollinger_alias_uses_lower_band_compatibility(self):
         buy_cfg = self._bollinger_buy_cfg({
             "enabled": True,
             "conditions": [{
@@ -217,8 +217,11 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
             self._series([99900.0], [100000.0]),
             0,
         )
-        self.assertFalse(passed)
-        self.assertEqual(self._reason(detail), "unsupported_compare_target")
+        self.assertTrue(passed)
+        self.assertEqual(
+            self._detail_value(detail, "compare_target"),
+            "BOLLINGER_LOWER",
+        )
 
     # ------------------------------------------------------------------
     # lower band (below lower band) pass / block

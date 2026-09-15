@@ -1826,9 +1826,45 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.set_validation_stock(ValidationStockRef("000660", "SK하이닉스"))
         self.assertEqual("설정적용", window.primary_validation_action_button.text())
 
-    def test_legacy_missing_bollinger_sign_is_unresolved_and_blocks_v2_run_and_apply(self):
+    def test_legacy_missing_bollinger_sign_normalizes_and_allows_v2_run_and_apply(self):
         state = deepcopy(self.ui_state)
         state["buy_ui"]["signal_filter"].pop("buy_bollinger_sign_combo", None)
+        for group_name in ("condition_a", "condition_b", "condition_c"):
+            group = state["sell_ui"]["signal_conditions"][group_name]
+            group["gap_left_combo"] = "평단가"
+            group["gap_right_combo"] = "현재가"
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            window = IndicatorFollowSignalValidationWindow(
+                self.stock,
+                IndicatorFollowSignalValidationSeed(
+                    ValidationSettingsSnapshot(self.rules),
+                    state,
+                ),
+            )
+        self.widgets.append(window)
+
+        self.assertEqual(window.buy_bollinger_direction_combo.currentText(), "하향")
+        self.assertEqual(window.buy_bollinger_sign_combo.currentText(), "-")
+        runs = []
+        window.validation_run_requested.connect(runs.append)
+        with patch("gui_indicator_follow_signal_validation_window.show_toast") as toast:
+            request = window.request_initial_validation()
+        self.assertIsNotNone(request)
+        self.assertEqual(1, len(runs))
+        toast.assert_not_called()
+        self.assertEqual("과거 분봉 데이터 조회 중...", window.loading_label.text())
+        payload = IndicatorFollowSignalValidationApplyPayload(
+            window.collect_indicator_follow_ui_state()
+        )
+        self.assertEqual(
+            "-",
+            payload.to_ui_state()["buy_ui"]["signal_filter"]
+            ["buy_bollinger_sign_combo"],
+        )
+
+    def test_invalid_explicit_bollinger_sign_remains_unresolved_and_blocks_v2_run(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"]["buy_bollinger_sign_combo"] = "X"
         for group_name in ("condition_a", "condition_b", "condition_c"):
             group = state["sell_ui"]["signal_conditions"][group_name]
             group["gap_left_combo"] = "평단가"
@@ -1847,14 +1883,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         runs = []
         window.validation_run_requested.connect(runs.append)
         with patch("gui_indicator_follow_signal_validation_window.show_toast") as toast:
-            self.assertIsNone(window._request_validation())
+            self.assertIsNone(window.request_initial_validation())
         self.assertEqual([], runs)
         toast.assert_called_once()
         self.assertIn("+/- 부호를 선택", toast.call_args.args[1])
-        with self.assertRaisesRegex(ValueError, "BUY_BOLLINGER_SIGN_SELECTION_REQUIRED"):
-            IndicatorFollowSignalValidationApplyPayload(
-                window.collect_indicator_follow_ui_state()
-            )
 
     def test_failed_settings_apply_validation_never_emits_candidate(self):
         window = self._window()

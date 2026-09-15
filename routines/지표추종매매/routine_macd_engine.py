@@ -741,6 +741,8 @@ def _evaluate_buy_bollinger_filter(
         )
 
     compare_target = str(compare_target or "").strip().upper()
+    if compare_target == "BOLLINGER":
+        compare_target = "BOLLINGER_LOWER"
     if compare_target not in {"BOLLINGER_LOWER", "BOLLINGER_UPPER"}:
         return False, _bollinger_detail(
             enabled=True,
