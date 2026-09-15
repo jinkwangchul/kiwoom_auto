@@ -706,9 +706,17 @@ class IndicatorFollowSignalValidationChartCanvas(
         if not scale.plot_top <= y <= scale.plot_bottom:
             return ""
         index = self._nearest_candle_index(x)
-        if index is None:
+        if index is None or not self._is_index_visible(index):
             return ""
         candle = self._candles[index]
+        high = _finite_number(candle.get("high"))
+        low = _finite_number(candle.get("low"))
+        if high is None or low is None:
+            return ""
+        high_y = scale.y_for_price(high)
+        low_y = scale.y_for_price(low)
+        if not min(high_y, low_y) <= y <= max(high_y, low_y):
+            return ""
         value = lambda field: (
             candle.get(field) if candle.get(field) is not None else "-"
         )

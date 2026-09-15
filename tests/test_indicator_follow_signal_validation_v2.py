@@ -637,7 +637,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual("1,500,000", expensive_axis.price_axis_records()[0]["label"])
         self.assertGreater(expensive_axis.width(), axis.width())
 
-    def test_candle_hover_uses_real_ohlc_time_and_rejects_chart_margins(self):
+    def test_candle_hover_requires_candle_x_and_high_low_ranges(self):
         candles = [
             {
                 "time": f"2026091412{25 + index:02d}00",
@@ -654,20 +654,43 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.widgets.append(canvas)
         scale = canvas.price_scale()
         self.assertIsNotNone(scale)
-        hover_y = (scale.plot_top + scale.plot_bottom) / 2
 
         for index in (0, 1, 2):
-            tooltip = canvas.candle_tooltip_at(
+            candle = candles[index]
+            high_y = scale.y_for_price(candle["high"])
+            low_y = scale.y_for_price(candle["low"])
+            open_y = scale.y_for_price(candle["open"])
+            close_y = scale.y_for_price(candle["close"])
+            body_y = (open_y + close_y) / 2
+            wick_y = (open_y + low_y) / 2
+            for hover_y in (high_y, body_y, low_y, wick_y):
+                tooltip = canvas.candle_tooltip_at(
+                    canvas._x_for_index(index),
+                    hover_y,
+                )
+                self.assertIn(
+                    f"평가 시각: 2026-09-14 12:{25 + index:02d}",
+                    tooltip,
+                )
+                self.assertIn(f"시가: {252250.0 + index}", tooltip)
+                self.assertIn(f"고가: {253000.0 + index}", tooltip)
+                self.assertIn(f"저가: {252000.0 + index}", tooltip)
+                self.assertIn(f"종가: {253000.0 + index}", tooltip)
+
+            self.assertEqual("", canvas.candle_tooltip_at(
                 canvas._x_for_index(index),
-                hover_y,
-            )
-            self.assertIn(f"평가 시각: 2026-09-14 12:{25 + index:02d}", tooltip)
-            self.assertIn(f"시가: {252250.0 + index}", tooltip)
-            self.assertIn(f"고가: {253000.0 + index}", tooltip)
-            self.assertIn(f"저가: {252000.0 + index}", tooltip)
-            self.assertIn(f"종가: {253000.0 + index}", tooltip)
+                min(high_y, low_y) - 1,
+            ))
+            self.assertEqual("", canvas.candle_tooltip_at(
+                canvas._x_for_index(index),
+                max(high_y, low_y) + 1,
+            ))
 
         half_slot = canvas.pixels_per_candle / 2
+        hover_y = (
+            scale.y_for_price(candles[0]["high"])
+            + scale.y_for_price(candles[0]["low"])
+        ) / 2
         self.assertEqual("", canvas.candle_tooltip_at(
             canvas._x_for_index(0) - half_slot - 1,
             hover_y,
@@ -680,6 +703,82 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             canvas._x_for_index(1),
             scale.plot_top - 1,
         ))
+
+        canvas.set_time_view(2.0, 1.0)
+        self.assertEqual("", canvas.candle_tooltip_at(
+            canvas._x_for_index(0),
+            hover_y,
+        ))
+
+        close_only = IndicatorFollowSignalValidationChartCanvas(
+            [{
+                "time": "20260914123000",
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": 253000.0,
+                "volume": 1,
+            }],
+            [],
+        )
+        close_only.resize(close_only.sizeHint().width(), 440)
+        self.widgets.append(close_only)
+        close_scale = close_only.price_scale()
+        self.assertEqual("", close_only.candle_tooltip_at(
+            close_only._x_for_index(0),
+            close_scale.y_for_price(253000.0),
+        ))
+
+    def test_candle_hover_tracks_current_time_and_price_transforms_without_replay(self):
+        window = self._window()
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window.set_replay_snapshot(self._candle_count_snapshot(500))
+        self.app.processEvents()
+        index = 450
+        candle = window.canvas.to_candles()[index]
+        expected_time = datetime.strptime(
+            candle["time"], "%Y%m%d%H%M%S"
+        ).strftime("%Y-%m-%d %H:%M")
+
+        with patch.object(ValidationHistoricalReplay, "evaluate") as replay:
+            old_x = window.canvas._x_for_index(index)
+            anchor_ratio = (
+                (old_x - window.canvas._LEFT) / window.canvas._plot_width()
+            )
+            window._apply_time_scale_drag(70.0, index, anchor_ratio)
+            new_x = window.canvas._x_for_index(index)
+            self.assertLessEqual(abs(new_x - old_x), 1.0)
+
+            scale = window.canvas.price_scale()
+            hover_y = (
+                scale.y_for_price(candle["high"])
+                + scale.y_for_price(candle["low"])
+            ) / 2
+            self.assertIn(
+                expected_time,
+                window.canvas.candle_tooltip_at(new_x, hover_y),
+            )
+
+            window._zoom_price_scale_at(hover_y, 120)
+            zoomed_scale = window.canvas.price_scale()
+            zoomed_high_y = zoomed_scale.y_for_price(candle["high"])
+            zoomed_low_y = zoomed_scale.y_for_price(candle["low"])
+            zoomed_hover_y = (zoomed_high_y + zoomed_low_y) / 2
+            self.assertIn(
+                expected_time,
+                window.canvas.candle_tooltip_at(new_x, zoomed_hover_y),
+            )
+            self.assertEqual("", window.canvas.candle_tooltip_at(
+                new_x,
+                min(zoomed_high_y, zoomed_low_y) - 1,
+            ))
+            self.assertEqual("", window.canvas.candle_tooltip_at(
+                new_x,
+                max(zoomed_high_y, zoomed_low_y) + 1,
+            ))
+            replay.assert_not_called()
 
     def test_marker_evidence_hover_has_priority_over_candle_hover(self):
         canvas = IndicatorFollowSignalValidationChartCanvas(
