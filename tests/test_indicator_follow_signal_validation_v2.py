@@ -1243,7 +1243,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 self._entry("SELL", 2, "SELL"),
             ])
         )
-        self.assertEqual("설정 반영", window.primary_validation_action_button.text())
+        self.assertEqual("검증적용", window.primary_validation_action_button.text())
         self.assertEqual([], applies)
 
         original_expression = window.buy_signal_expr_line.text()
@@ -1259,8 +1259,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.set_replay_snapshot(self._replay_snapshot([]))
         window.primary_validation_action_button.click()
         self.assertEqual(1, len(applies))
-        window.show_settings_apply_result("설정 반영 완료", success=True)
-        self.assertEqual("반영 완료", window.primary_validation_action_button.text())
+        window.show_settings_apply_result("검증적용 완료", success=True)
+        self.assertEqual("적용 완료", window.primary_validation_action_button.text())
         window.buy_rsi_value_line.setText("44")
         self.assertEqual("검증 실행", window.primary_validation_action_button.text())
 
@@ -1269,7 +1269,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual("검증 실행", window.primary_validation_action_button.text())
         window._request_validation()
         window.set_replay_snapshot(self._replay_snapshot([]))
-        self.assertEqual("설정 반영", window.primary_validation_action_button.text())
+        self.assertEqual("검증적용", window.primary_validation_action_button.text())
         window.set_validation_stock(ValidationStockRef("000660", "SK하이닉스"))
         self.assertEqual("검증 실행", window.primary_validation_action_button.text())
 

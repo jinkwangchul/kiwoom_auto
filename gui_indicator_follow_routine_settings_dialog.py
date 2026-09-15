@@ -599,9 +599,12 @@ class IndicatorFollowRoutineSettingsDialog(
             self.definition_id = self._default_definition_id()
         self.rules_data = {}
         self._approval_session_path = self._default_rule_approval_session_path()
+        self._initial_settings_undo_snapshot = None
+        self._registration_undo_target_snapshot = None
 
         self._build_ui()
         self.load_rules()
+        self._initial_settings_undo_snapshot = self._capture_settings_ui_snapshot()
         self._bind_optional_signal_validation()
         QTimer.singleShot(0, self._show_with_initial_control_section_state)
 
@@ -703,7 +706,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self._build_validation_tab()
 
         button_row = QHBoxLayout()
-        self.reload_button = QPushButton("다시 불러오기")
+        self.reload_button = QPushButton("되돌리기")
         self.signal_validation_button = QPushButton("검증차트2")
         if self.settings_mode == "edit":
             self.save_button = QPushButton("변경")
@@ -715,7 +718,7 @@ class IndicatorFollowRoutineSettingsDialog(
 
         self.save_button.setEnabled(True)
 
-        self.reload_button.clicked.connect(self.load_rules)
+        self.reload_button.clicked.connect(self.restore_settings_undo_snapshot)
         self.signal_validation_button.clicked.connect(
             self._handle_signal_validation_clicked
         )
@@ -1396,6 +1399,57 @@ class IndicatorFollowRoutineSettingsDialog(
             return None
         self.signal_validation_requested.emit(seed)
         return seed
+
+    @staticmethod
+    def _canonical_settings_ui_snapshot(state):
+        if not isinstance(state, dict):
+            raise TypeError("settings UI snapshot must be a mapping")
+        return json.dumps(
+            state,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _settings_ui_state_from_snapshot(snapshot):
+        if not isinstance(snapshot, str) or not snapshot:
+            raise TypeError("settings UI snapshot must be canonical JSON")
+        state = json.loads(snapshot)
+        if not isinstance(state, dict):
+            raise ValueError("settings UI snapshot must decode to a mapping")
+        return state
+
+    def _capture_settings_ui_snapshot(self):
+        return self._canonical_settings_ui_snapshot(
+            self.collect_indicator_follow_ui_state()
+        )
+
+    def capture_signal_validation_launch_snapshot(self):
+        """Return a detached parent Working snapshot for one V2 launch."""
+        return self._capture_settings_ui_snapshot()
+
+    def apply_signal_validation_candidate_ui_state(self, state, launch_snapshot):
+        """Apply one final V2 candidate in memory and commit its undo target."""
+        canonical_launch_snapshot = self._canonical_settings_ui_snapshot(
+            self._settings_ui_state_from_snapshot(launch_snapshot)
+        )
+        result = self.apply_signal_validation_ui_state(state)
+        skipped = result.get("skipped", []) if isinstance(result, dict) else ["invalid"]
+        if not skipped and self.settings_mode == "registration":
+            self._registration_undo_target_snapshot = canonical_launch_snapshot
+        return result
+
+    def restore_settings_undo_snapshot(self):
+        """Restore the context baseline without rereading persistent settings."""
+        snapshot = self._initial_settings_undo_snapshot
+        if self.settings_mode == "registration":
+            snapshot = self._registration_undo_target_snapshot or snapshot
+        if snapshot is None:
+            return None
+        state = self._settings_ui_state_from_snapshot(snapshot)
+        return self.apply_indicator_follow_ui_state(state)
 
     def build_engine_rules_preview_from_current_ui_state(self):
         rules = getattr(self, "rules", None)

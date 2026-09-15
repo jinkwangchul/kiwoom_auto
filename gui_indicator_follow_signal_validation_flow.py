@@ -238,6 +238,17 @@ class IndicatorFollowSignalValidationFlow(QObject):
         source_ref: weakref.ReferenceType[object],
     ) -> object | None:
         try:
+            source = source_ref()
+            capture_launch_snapshot = getattr(
+                source,
+                "capture_signal_validation_launch_snapshot",
+                None,
+            )
+            launch_snapshot = (
+                capture_launch_snapshot()
+                if callable(capture_launch_snapshot)
+                else None
+            )
             window = self._window_factory(
                 self._last_selected_stock,
                 seed,
@@ -264,10 +275,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
             if not callable(getattr(apply_signal, "connect", None)):
                 raise TypeError("signal validation apply signal is unavailable")
             apply_signal.connect(
-                lambda payload, ref=window_ref, source=source_ref: self._apply_to_source(
+                lambda payload, ref=window_ref, source=source_ref,
+                snapshot=launch_snapshot: self._apply_to_source(
                     ref(),
                     source,
                     payload,
+                    snapshot,
                 )
             )
             stock_signal = getattr(window, "stock_selection_requested", None)
@@ -499,38 +512,47 @@ class IndicatorFollowSignalValidationFlow(QObject):
         window: object,
         source_ref: weakref.ReferenceType[object],
         payload: object,
+        launch_snapshot: object = None,
     ) -> None:
         show_result = getattr(window, "show_settings_apply_result", None)
         if not isinstance(payload, IndicatorFollowSignalValidationApplyPayload):
             if callable(show_result):
-                show_result("설정 반영 데이터가 올바르지 않습니다.", success=False)
+                show_result("검증적용 데이터가 올바르지 않습니다.", success=False)
             return
         source = source_ref()
         if not self._valid_requester(source):
             if callable(show_result):
                 show_result(
-                    "원본 설정창이 닫혀 있어 설정을 반영할 수 없습니다.",
+                    "원본 설정창이 닫혀 있어 검증값을 적용할 수 없습니다.",
                     success=False,
                 )
             return
+        apply_candidate = getattr(
+            source,
+            "apply_signal_validation_candidate_ui_state",
+            None,
+        )
         apply_state = getattr(source, "apply_signal_validation_ui_state", None)
         if not callable(apply_state):
             if callable(show_result):
-                show_result("원본 설정창에 신호설정을 반영할 수 없습니다.", success=False)
+                show_result("원본 설정창에 검증값을 적용할 수 없습니다.", success=False)
             return
         try:
-            result = apply_state(payload.to_ui_state())
+            if callable(apply_candidate) and launch_snapshot is not None:
+                result = apply_candidate(payload.to_ui_state(), launch_snapshot)
+            else:
+                result = apply_state(payload.to_ui_state())
         except Exception:
             if callable(show_result):
-                show_result("신호설정 반영 중 오류가 발생했습니다.", success=False)
+                show_result("검증값 적용 중 오류가 발생했습니다.", success=False)
             return
         skipped = result.get("skipped", []) if isinstance(result, dict) else ["invalid_result"]
         if skipped:
             if callable(show_result):
-                show_result("일부 신호설정을 반영할 수 없습니다.", success=False)
+                show_result("일부 검증값을 적용할 수 없습니다.", success=False)
             return
         if callable(show_result):
-            show_result("설정 반영 완료", success=True)
+            show_result("검증적용 완료", success=True)
 
     def _release_window(self, window_key: int) -> None:
         self._open_windows.pop(window_key, None)

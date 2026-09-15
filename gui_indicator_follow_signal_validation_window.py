@@ -1933,8 +1933,8 @@ class IndicatorFollowSignalValidationWindow(
         self._primary_validation_action_state = state
         self.primary_validation_action_button.setText({
             "validate": "검증 실행",
-            "apply": "설정 반영",
-            "applied": "반영 완료",
+            "apply": "검증적용",
+            "applied": "적용 완료",
         }[state])
         if enabled is None:
             enabled = state != "applied"
@@ -2049,7 +2049,7 @@ class IndicatorFollowSignalValidationWindow(
         return payload
 
     def show_settings_apply_result(self, message: str, *, success: bool) -> None:
-        self.validation_status_label.setText(str(message or "설정 반영 실패"))
+        self.validation_status_label.setText(str(message or "검증적용 실패"))
         if success:
             self._set_primary_validation_action_state("applied")
             return
