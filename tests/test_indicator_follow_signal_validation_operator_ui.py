@@ -152,6 +152,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             (cls.routine_dir / "rules.json").read_text(encoding="utf-8")
         )
         cls.ui_state = cls.rules["indicator_follow_ui_state"]["state"]
+        cls.ui_state["buy_ui"]["signal_filter"]["buy_bollinger_sign_combo"] = "-"
         cls.stock = ValidationStockRef("005930", "삼성전자")
 
     def setUp(self):
@@ -1442,6 +1443,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.historical_candle_count_spin.setValue(777)
                 window.buy_signal_expr_line.setText("A or D")
                 window.buy_rsi_value_line.setText("39")
+                window.buy_bollinger_direction_combo.setCurrentText("하향")
+                window.buy_bollinger_sign_combo.setCurrentText("+")
+                window.buy_bollinger_value_line.setText("0.1")
+                window.buy_bollinger_compare_combo.setCurrentText("이하")
                 window.sell_signal_condition_a_rsi_value_line.setText("57")
                 window.sell_signal_condition_a_gap_left_combo.setCurrentText("현재가")
                 window.sell_signal_condition_a_gap_right_combo.setCurrentText("평단가")
@@ -1460,6 +1465,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual("15", after["basic"]["basic_signal_interval_combo"])
                 self.assertEqual("A or D", after["basic"]["buy_signal_expr_line"])
                 self.assertEqual("39", after["buy_ui"]["signal_filter"]["buy_rsi_value_line"])
+                bollinger = after["buy_ui"]["signal_filter"]
+                self.assertEqual("하향", bollinger["buy_bollinger_direction_combo"])
+                self.assertEqual("+", bollinger["buy_bollinger_sign_combo"])
+                self.assertEqual("0.1", bollinger["buy_bollinger_value_line"])
+                self.assertEqual("이하", bollinger["buy_bollinger_compare_combo"])
                 self.assertEqual("57", after["sell_ui"]["signal_conditions"]["condition_a"]["rsi_value_line"])
                 sell_a = after["sell_ui"]["signal_conditions"]["condition_a"]
                 self.assertEqual("현재가", sell_a["gap_left_combo"])

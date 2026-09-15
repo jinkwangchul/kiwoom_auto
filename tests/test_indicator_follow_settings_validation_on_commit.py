@@ -56,7 +56,65 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 dialog,
                 f"sell_signal_condition_{group_name}_gap_right_combo",
             ).setCurrentText("현재가")
+        if dialog.buy_bollinger_sign_combo.currentIndex() < 0:
+            dialog.buy_bollinger_sign_combo.setCurrentText("-")
         return dialog
+
+    def test_legacy_missing_bollinger_sign_is_unresolved_and_blocks_registration(self) -> None:
+        dialog = IndicatorFollowRoutineSettingsDialog(
+            rules_path=self.source_rules_path,
+            routine_path=self.routine_dir,
+            routine_name="검증 루틴",
+            definition_id="indicator_follow",
+            settings_mode="registration",
+        )
+        try:
+            self.assertEqual(dialog.buy_bollinger_sign_combo.currentIndex(), -1)
+            result = dialog.build_registration_rules_from_current_ui_state()
+        finally:
+            dialog.close()
+
+        self.assertFalse(result["success"])
+        self.assertIn(
+            "buy Bollinger sign selection is required",
+            result["internal_blocked_reasons"],
+        )
+        self.assertIn(
+            "매수 볼린저밴드의 +/- 부호를 선택하세요.",
+            result["user_messages"],
+        )
+
+    def test_bollinger_signed_percent_registration_snapshot_reloads_exact_ui_state(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            dialog = self._dialog(rules_path)
+            try:
+                dialog.buy_bollinger_direction_combo.setCurrentText("상향")
+                dialog.buy_bollinger_sign_combo.setCurrentText("+")
+                dialog.buy_bollinger_value_line.setText("0.1")
+                dialog.buy_bollinger_compare_combo.setCurrentText("이하")
+                result = dialog.build_registration_rules_from_current_ui_state()
+            finally:
+                dialog.close()
+
+            self.assertTrue(result["success"], result.get("error"))
+            rules_path.write_text(
+                json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            reloaded = self._dialog(rules_path)
+            try:
+                self.assertEqual(reloaded.buy_bollinger_direction_combo.currentText(), "상향")
+                self.assertEqual(reloaded.buy_bollinger_sign_combo.currentText(), "+")
+                self.assertEqual(reloaded.buy_bollinger_value_line.text(), "0.1")
+                self.assertEqual(reloaded.buy_bollinger_compare_combo.currentText(), "이하")
+            finally:
+                reloaded.close()
 
     def test_validation_button_is_absent_and_registration_snapshot_is_applied(self) -> None:
         before = hashlib.sha256(self.source_rules_path.read_bytes()).hexdigest()

@@ -49,6 +49,7 @@ from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
     build_signal_validation_snapshot,
     project_signal_validation_ui_state,
+    require_resolved_buy_bollinger_sign_selection,
     require_expression_aware_sell_price_selections,
 )
 from indicator_follow_signal_validation_presentation import (
@@ -1824,9 +1825,29 @@ class IndicatorFollowSignalValidationWindow(
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
         self.rules = deepcopy(self.rules_data)
-        self.apply_signal_validation_ui_state(
-            self._signal_validation_seed.to_ui_state()
+        entry_state = self._signal_validation_seed.to_ui_state()
+        signal_filter = entry_state.get("buy_ui", {}).get("signal_filter")
+        missing_bollinger_sign = (
+            isinstance(signal_filter, dict)
+            and any(
+                name in signal_filter
+                for name in (
+                    "buy_bollinger_direction_combo",
+                    "buy_bollinger_value_line",
+                    "buy_bollinger_compare_combo",
+                )
+            )
+            and str(signal_filter.get("buy_bollinger_sign_combo") or "").strip()
+            not in {"-", "+"}
         )
+        if missing_bollinger_sign:
+            entry_state = deepcopy(entry_state)
+            entry_state["buy_ui"]["signal_filter"][
+                "buy_bollinger_sign_combo"
+            ] = "-"
+        self.apply_signal_validation_ui_state(entry_state)
+        if missing_bollinger_sign:
+            self.buy_bollinger_sign_combo.setCurrentIndex(-1)
         self.compact_stock_display.set_current_stock(self.stock)
 
     def _show_with_initial_control_section_state(self) -> None:
@@ -2114,6 +2135,7 @@ class IndicatorFollowSignalValidationWindow(
         try:
             ui_state = self.collect_indicator_follow_ui_state()
             require_expression_aware_sell_price_selections(ui_state)
+            require_resolved_buy_bollinger_sign_selection(ui_state)
             mapper = self._load_indicator_follow_rule_mapper()
             preview = mapper.build_engine_rules_preview_from_ui_state(
                 ui_state,
@@ -2169,6 +2191,8 @@ class IndicatorFollowSignalValidationWindow(
         if message.startswith("가격 기준 재선택 필요:"):
             return message.split(":", 1)[1].strip()
         if message.startswith("SELL_VALIDATION_INPUT_ERROR:"):
+            return message.split(":", 1)[1].strip()
+        if message.startswith("BUY_BOLLINGER_SIGN_SELECTION_REQUIRED:"):
             return message.split(":", 1)[1].strip()
         return ""
 

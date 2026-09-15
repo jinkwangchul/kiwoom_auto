@@ -113,6 +113,7 @@ def _buy_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
         ),
         "B": (
             f"볼린저밴드 {_field(state, 'buy_bollinger_direction_combo')} "
+            f"{_field(state, 'buy_bollinger_sign_combo', '')}"
             f"{_field(state, 'buy_bollinger_value_line')}% "
             f"{_field(state, 'buy_bollinger_compare_combo')}"
         ),
@@ -208,8 +209,14 @@ def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str
         elif filter_type == "BOLLINGER":
             close_price = _text(fields.get("close_price"))
             bollinger_value = _text(fields.get("bollinger_value"))
+            threshold = _text(fields.get("threshold"))
+            band_name = {
+                "BOLLINGER_UPPER": "상단밴드",
+                "BOLLINGER_LOWER": "하단밴드",
+            }.get(_text(fields.get("compare_target")), "밴드")
             actual = "-" if close_price == bollinger_value == "-" else (
-                f"현재가 {close_price} / 밴드 {bollinger_value}"
+                f"현재가 {close_price} / {band_name} {bollinger_value}"
+                + ("" if threshold == "-" else f" / 기준 {threshold}")
             )
         elif filter_type == "MOVING_AVERAGE":
             current_value = _text(fields.get("current_value"))

@@ -504,6 +504,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "buy_ma_compare_combo": "\ub3cc\ud304",
             "buy_bollinger_enabled": True,
             "buy_bollinger_direction_combo": "\ud558\ud5a5",
+            "buy_bollinger_sign_combo": "+",
             "buy_bollinger_value_line": "0.1",
             "buy_bollinger_compare_combo": "\uc774\uc0c1",
         }
@@ -528,6 +529,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         # Verify mapped paths include Bollinger and price_compare filters
         self.assertIn("buy.filters.bollinger", result["mapped_paths"])
         self.assertIn("buy.filters.price_compare", result["mapped_paths"])
+        bollinger_condition = result["preview_rules"]["buy"]["filters"]["bollinger"]["conditions"][0]
+        self.assertEqual(bollinger_condition["compare_target"], "BOLLINGER_LOWER")
+        self.assertEqual(bollinger_condition["value"], 0.1)
 
         # Verify the buy rules are unchanged (no new conditions added)
         self.assertEqual(result["preview_rules"]["buy"]["groups"][0]["conditions"], [
@@ -538,6 +542,48 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "operator": "TURN_UP",
             }
         ])
+
+    def test_buy_bollinger_band_sign_and_operator_are_independent(self):
+        cases = (
+            ("\ud558\ud5a5", "+", "\uc774\uc0c1", "BOLLINGER_LOWER", 0.1, ">="),
+            ("\ud558\ud5a5", "-", "\uc774\ud558", "BOLLINGER_LOWER", -0.1, "<="),
+            ("\uc0c1\ud5a5", "+", "\uc774\ud558", "BOLLINGER_UPPER", 0.1, "<="),
+            ("\uc0c1\ud5a5", "-", "\uc774\uc0c1", "BOLLINGER_UPPER", -0.1, ">="),
+        )
+        for direction, sign, compare, target, value, operator in cases:
+            with self.subTest(direction=direction, sign=sign, compare=compare):
+                state = deepcopy(self.ui_state)
+                state["buy_ui"]["signal_filter"].update({
+                    "buy_bollinger_direction_combo": direction,
+                    "buy_bollinger_sign_combo": sign,
+                    "buy_bollinger_value_line": "0.1",
+                    "buy_bollinger_compare_combo": compare,
+                })
+                result = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state,
+                    deepcopy(self.current_rules),
+                )
+                condition = result["preview_rules"]["buy"]["filters"]["bollinger"]["conditions"][0]
+                self.assertEqual(condition["compare_target"], target)
+                self.assertEqual(condition["value"], value)
+                self.assertEqual(condition["operator"], operator)
+
+    def test_buy_bollinger_missing_sign_blocks_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"].update({
+            "buy_bollinger_direction_combo": "\ud558\ud5a5",
+            "buy_bollinger_value_line": "0.1",
+            "buy_bollinger_compare_combo": "\uc774\ud558",
+        })
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            deepcopy(self.current_rules),
+        )
+        self.assertNotIn("buy.filters.bollinger", result["mapped_paths"])
+        self.assertIn(
+            "buy Bollinger sign selection is required",
+            result["validation_warnings"],
+        )
 
     def test_actual_buy_price_compare_gui_fields_create_price_compare_filter(self):
         state = deepcopy(self.ui_state)
@@ -841,6 +887,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         rules_path = self._rules_json_path()
         saved_rules = json.loads(rules_path.read_text(encoding="utf-8"))
         ui_state = saved_rules["indicator_follow_ui_state"]["state"]
+        ui_state["buy_ui"]["signal_filter"]["buy_bollinger_sign_combo"] = "-"
 
         generated = self.mapper.build_engine_rules_pending_from_ui_state(
             deepcopy(ui_state),

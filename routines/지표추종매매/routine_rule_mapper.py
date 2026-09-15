@@ -1475,7 +1475,18 @@ def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warning
         return None
 
     direction = str(signal_filter.get("buy_bollinger_direction_combo") or "").strip()
-    signed_threshold = -abs(threshold) if direction == "\ud558\ud5a5" else abs(threshold)
+    compare_target = {
+        "\uc0c1\ud5a5": "BOLLINGER_UPPER",
+        "\ud558\ud5a5": "BOLLINGER_LOWER",
+    }.get(direction)
+    if compare_target is None:
+        warnings.append(f"buy Bollinger direction is not mapped: {direction!r}")
+        return None
+    sign = str(signal_filter.get("buy_bollinger_sign_combo") or "").strip()
+    if sign not in {"-", "+"}:
+        warnings.append("buy Bollinger sign selection is required")
+        return None
+    signed_threshold = abs(threshold) if sign == "+" else -abs(threshold)
     return {
         "path": BUY_BOLLINGER_FILTER_PATH,
         "value": {
@@ -1485,7 +1496,7 @@ def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warning
                 "not": False,
                 "target": "CLOSE",
                 "operator": operator,
-                "compare_target": "BOLLINGER",
+                "compare_target": compare_target,
                 "value": signed_threshold,
                 "description": "UI preview: BUY current price / Bollinger filter",
             }],

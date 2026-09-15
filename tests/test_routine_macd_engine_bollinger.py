@@ -43,14 +43,27 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
     def _bollinger_buy_cfg(self, filter_cfg):
         return {"filters": {"bollinger": filter_cfg}}
 
-    def _series(self, close, bollinger):
-        return {"CLOSE": close, "BOLLINGER": bollinger}
+    def _series(self, close, bollinger_lower, bollinger_upper=None):
+        return {
+            "CLOSE": close,
+            "BOLLINGER_LOWER": bollinger_lower,
+            "BOLLINGER_UPPER": (
+                bollinger_lower if bollinger_upper is None else bollinger_upper
+            ),
+        }
 
     def _reason(self, detail):
         if not detail:
             return None
         for token in detail.split():
             if token.startswith("reason="):
+                return token.split("=", 1)[1]
+        return None
+
+    def _detail_value(self, detail, name):
+        prefix = f"{name}="
+        for token in (detail or "").split():
+            if token.startswith(prefix):
                 return token.split("=", 1)[1]
         return None
 
@@ -79,7 +92,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -97,7 +110,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -115,7 +128,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 5.0,
             }],
         })
@@ -131,6 +144,82 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
         )
         self.assertFalse(passed)
 
+    def test_signed_percent_threshold_uses_selected_lower_band(self):
+        cases = (
+            (0.1, 100100.0, "<=", True),
+            (0.1, 100100.01, "<=", False),
+            (-0.1, 99900.0, "<=", True),
+            (-0.1, 99900.01, "<=", False),
+        )
+        for signed_percent, close, operator, expected in cases:
+            with self.subTest(signed_percent=signed_percent, close=close):
+                buy_cfg = self._bollinger_buy_cfg({
+                    "enabled": True,
+                    "conditions": [{
+                        "enabled": True,
+                        "target": "CLOSE",
+                        "operator": operator,
+                        "compare_target": "BOLLINGER_LOWER",
+                        "value": signed_percent,
+                    }],
+                })
+                passed, detail = self.engine._evaluate_buy_bollinger_filter(
+                    self.default_config,
+                    buy_cfg,
+                    self._series([close], [100000.0], [120000.0]),
+                    0,
+                )
+                self.assertEqual(passed, expected)
+                expected_threshold = 100000.0 * (1.0 + signed_percent / 100.0)
+                self.assertAlmostEqual(
+                    float(self._detail_value(detail, "threshold")),
+                    expected_threshold,
+                )
+
+    def test_upper_band_is_selected_independently_from_sign_and_operator(self):
+        buy_cfg = self._bollinger_buy_cfg({
+            "enabled": True,
+            "conditions": [{
+                "enabled": True,
+                "target": "CLOSE",
+                "operator": ">=",
+                "compare_target": "BOLLINGER_UPPER",
+                "value": -0.1,
+            }],
+        })
+        passed, detail = self.engine._evaluate_buy_bollinger_filter(
+            self.default_config,
+            buy_cfg,
+            self._series([109890.0], [90000.0], [110000.0]),
+            0,
+        )
+        self.assertTrue(passed)
+        self.assertEqual(
+            self._detail_value(detail, "compare_target"),
+            "BOLLINGER_UPPER",
+        )
+        self.assertAlmostEqual(float(self._detail_value(detail, "threshold")), 109890.0)
+
+    def test_legacy_bollinger_alias_fails_closed(self):
+        buy_cfg = self._bollinger_buy_cfg({
+            "enabled": True,
+            "conditions": [{
+                "enabled": True,
+                "target": "CLOSE",
+                "operator": "<=",
+                "compare_target": "BOLLINGER",
+                "value": -0.1,
+            }],
+        })
+        passed, detail = self.engine._evaluate_buy_bollinger_filter(
+            self.default_config,
+            buy_cfg,
+            self._series([99900.0], [100000.0]),
+            0,
+        )
+        self.assertFalse(passed)
+        self.assertEqual(self._reason(detail), "unsupported_compare_target")
+
     # ------------------------------------------------------------------
     # lower band (below lower band) pass / block
     # ------------------------------------------------------------------
@@ -141,7 +230,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": "<=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -159,7 +248,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": "<=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -180,7 +269,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "period": "not_a_period",
                 "value": 0.0,
             }],
@@ -199,7 +288,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "period": 0,
                 "value": 0.0,
             }],
@@ -218,7 +307,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": "INVALID_OP",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -236,7 +325,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": "not_a_number",
             }],
         })
@@ -257,7 +346,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -275,7 +364,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -342,7 +431,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -365,7 +454,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                 "enabled": True,
                 "target": "CLOSE",
                 "operator": ">=",
-                "compare_target": "BOLLINGER",
+                "compare_target": "BOLLINGER_LOWER",
                 "value": 0.0,
             }],
         })
@@ -419,7 +508,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                     "enabled": True,
                     "target": "CLOSE",
                     "operator": ">=",
-                    "compare_target": "BOLLINGER",
+                    "compare_target": "BOLLINGER_LOWER",
                     "value": 1000.0,
                 }],
             }
@@ -463,7 +552,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                     "enabled": True,
                     "target": "CLOSE",
                     "operator": ">=",
-                    "compare_target": "BOLLINGER",
+                    "compare_target": "BOLLINGER_LOWER",
                     "value": 1000.0,
                 }],
             }
@@ -526,7 +615,7 @@ class RoutineMacdBollingerFilterTest(unittest.TestCase):
                     "enabled": True,
                     "target": "CLOSE",
                     "operator": ">=",
-                    "compare_target": "BOLLINGER",
+                    "compare_target": "BOLLINGER_LOWER",
                     "value": 1000.0,
                 }],
             },

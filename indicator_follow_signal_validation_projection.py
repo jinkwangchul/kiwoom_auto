@@ -17,6 +17,9 @@ from gui_indicator_follow_sell_controls import (
     require_resolved_sell_price_selections,
     sell_price_selection_issues,
 )
+from gui_indicator_follow_buy_controls import (
+    require_resolved_buy_bollinger_sign_selection,
+)
 
 
 _FORBIDDEN_PRICE_TARGETS = {
@@ -372,6 +375,7 @@ def project_signal_validation_apply_ui_state(
 ) -> dict[str, Any]:
     """Return only V2-visible values that may be applied back to a source dialog."""
     require_expression_aware_sell_price_selections(ui_state)
+    require_resolved_buy_bollinger_sign_selection(dict(ui_state))
     projected = project_signal_validation_ui_state(ui_state)
     signal_filter = projected.get("buy_ui", {}).get("signal_filter")
     if isinstance(signal_filter, dict):
@@ -396,6 +400,7 @@ def project_signal_validation_rules(
         raise TypeError("rules must be a mapping")
     if ui_state is not None:
         require_expression_aware_sell_price_selections(ui_state)
+        require_resolved_buy_bollinger_sign_selection(dict(ui_state))
     source_rules = _json_copy(rules)
     projected = _strip_dependent_conditions(source_rules)
 

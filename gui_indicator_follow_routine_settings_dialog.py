@@ -65,7 +65,11 @@ class _TabHostStub:
 
 from gui_indicator_follow_common_widgets import IndicatorFollowCommonWidgetsMixin
 from gui_indicator_follow_control_tab import IndicatorFollowControlTabMixin
-from gui_indicator_follow_buy_controls import IndicatorFollowBuyControlsMixin
+from gui_indicator_follow_buy_controls import (
+    BUY_BOLLINGER_SIGN_VALUES,
+    IndicatorFollowBuyControlsMixin,
+    mark_buy_bollinger_sign_combo_unresolved,
+)
 from gui_indicator_follow_sell_controls import (
     IndicatorFollowSellControlsMixin,
     SELL_PRICE_COMBO_VALUES,
@@ -131,6 +135,8 @@ def _validation_fallback_message(context):
 def _settings_validation_user_reason(reason, *, context="change"):
     text = str(reason or "")
     lowered = text.lower()
+    if "buy Bollinger sign selection is required" in text:
+        return "매수 볼린저밴드의 +/- 부호를 선택하세요."
     if "가격 기준 재선택 필요" in text:
         return "매도 가격비교의 가격 기준을 현재가 또는 평단가로 다시 선택하세요."
     if (
@@ -2943,6 +2949,11 @@ class IndicatorFollowRoutineSettingsDialog(
             widget.setChecked(bool(value))
             return None
         if isinstance(widget, QComboBox):
+            if name == "buy_bollinger_sign_combo":
+                text = str(value or "").strip()
+                if text not in BUY_BOLLINGER_SIGN_VALUES:
+                    mark_buy_bollinger_sign_combo_unresolved(widget)
+                    return None
             if name in SELL_PRICE_COMBO_WIDGET_NAMES:
                 text = str(value or "").strip()
                 if text not in SELL_PRICE_COMBO_VALUES:
@@ -3223,6 +3234,22 @@ class IndicatorFollowRoutineSettingsDialog(
             return result
         return self._apply_projected_signal_validation_ui_state(projected)
 
+    def _mark_missing_buy_bollinger_sign_unresolved(self, signal_filter):
+        if not isinstance(signal_filter, dict):
+            return
+        legacy_fields = {
+            "buy_bollinger_direction_combo",
+            "buy_bollinger_value_line",
+            "buy_bollinger_compare_combo",
+        }
+        if (
+            legacy_fields.intersection(signal_filter)
+            and "buy_bollinger_sign_combo" not in signal_filter
+        ):
+            combo = getattr(self, "buy_bollinger_sign_combo", None)
+            if isinstance(combo, QComboBox):
+                mark_buy_bollinger_sign_combo_unresolved(combo)
+
     def _apply_projected_signal_validation_ui_state(self, projected):
         result = {"applied": [], "skipped": []}
         if not isinstance(projected, dict):
@@ -3243,6 +3270,7 @@ class IndicatorFollowRoutineSettingsDialog(
             for key, value in signal_filter.items()
             if key != "buy_composite"
         } if isinstance(signal_filter, dict) else {}
+        self._mark_missing_buy_bollinger_sign_unresolved(signal_filter)
         self._apply_named_ui_values(flat_signal_filter, result=result)
         if isinstance(signal_filter, dict) and "buy_composite" in signal_filter:
             self._apply_buy_composite_ui_state(
@@ -3291,6 +3319,7 @@ class IndicatorFollowRoutineSettingsDialog(
                 for key, value in signal_filter.items()
                 if key != "buy_composite"
             } if isinstance(signal_filter, dict) else {}
+            self._mark_missing_buy_bollinger_sign_unresolved(signal_filter)
             self._apply_named_ui_values(flat_signal_filter, result=result)
             self._apply_buy_composite_ui_state(
                 signal_filter.get("buy_composite") if isinstance(signal_filter, dict) else None,

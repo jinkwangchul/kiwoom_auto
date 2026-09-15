@@ -21,6 +21,41 @@ from gui_indicator_follow_buy_method_controls import (
 )
 
 
+BUY_BOLLINGER_SIGN_VALUES = frozenset({"-", "+"})
+
+
+def mark_buy_bollinger_sign_combo_unresolved(combo):
+    combo.setCurrentIndex(-1)
+
+
+def buy_bollinger_sign_selection_issues(ui_state):
+    if not isinstance(ui_state, dict):
+        return ()
+    buy_ui = ui_state.get("buy_ui")
+    signal_filter = (
+        buy_ui.get("signal_filter") if isinstance(buy_ui, dict) else None
+    )
+    if not isinstance(signal_filter, dict):
+        return ()
+    bollinger_fields = {
+        "buy_bollinger_direction_combo",
+        "buy_bollinger_value_line",
+        "buy_bollinger_compare_combo",
+    }
+    if not bollinger_fields.intersection(signal_filter):
+        return ()
+    sign = str(signal_filter.get("buy_bollinger_sign_combo") or "").strip()
+    if sign in BUY_BOLLINGER_SIGN_VALUES:
+        return ()
+    return ("매수 볼린저밴드의 +/- 부호를 선택하세요.",)
+
+
+def require_resolved_buy_bollinger_sign_selection(ui_state):
+    issues = buy_bollinger_sign_selection_issues(ui_state)
+    if issues:
+        raise ValueError("BUY_BOLLINGER_SIGN_SELECTION_REQUIRED: " + " ".join(issues))
+
+
 class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
     def _make_buy_filter_overview_controls(self):
         box = QGroupBox("신호검출필터")
@@ -97,11 +132,13 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
 
         # B: 볼린저밴드
         self.buy_bollinger_direction_combo = make_combo(["상향", "하향"], "하향", 64)
+        self.buy_bollinger_sign_combo = make_combo(["-", "+"], "-", 52)
         self.buy_bollinger_value_line = make_line("0.1", 42)
         self.buy_bollinger_compare_combo = make_combo(["이상", "이하"], "이상", 64)
         add_filter_group("B", [
             QLabel("볼린저밴드"),
             self.buy_bollinger_direction_combo,
+            self.buy_bollinger_sign_combo,
             self.buy_bollinger_value_line,
             QLabel("%"),
             self.buy_bollinger_compare_combo,

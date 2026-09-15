@@ -252,6 +252,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                 "buy_rsi_value_line": "",
                 "buy_bollinger_enabled": True,
                 "buy_bollinger_direction_combo": "하향",
+                "buy_bollinger_sign_combo": "-",
                 "buy_bollinger_value_line": "0.1",
                 "buy_bollinger_compare_combo": "이상",
             }
@@ -303,6 +304,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                 "buy_ma_compare_combo": "\ub3cc\ud30c",
                 "buy_bollinger_enabled": True,
                 "buy_bollinger_direction_combo": "\ud558\ud5a5",
+                "buy_bollinger_sign_combo": "-",
                 "buy_bollinger_value_line": "0.1",
                 "buy_bollinger_compare_combo": "\uc774\uc0c1",
             }

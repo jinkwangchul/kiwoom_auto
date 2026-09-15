@@ -630,16 +630,19 @@ def _bollinger_detail(
     passed: bool,
     reason: str,
     evaluation_index: int,
+    compare_target: Any = None,
+    threshold: Any = None,
 ) -> str:
     return (
         "filter_type=BOLLINGER "
         f"enabled={enabled} "
         "target=CLOSE "
-        "compare_target=BOLLINGER "
+        f"compare_target={compare_target} "
         f"operator={operator} "
         f"value={value} "
         f"close_price={close_price} "
         f"bollinger_value={bollinger_value} "
+        f"threshold={threshold} "
         f"passed={passed} "
         f"reason={reason} "
         f"evaluation_index={evaluation_index}"
@@ -654,9 +657,8 @@ def _evaluate_buy_bollinger_filter(
 ) -> tuple[bool, str | None]:
     """Evaluate BUY Bollinger filter.
 
-    The Bollinger filter compares the close price against the Bollinger Band value.
-    - compare_target="BOLLINGER" refers to the lower Bollinger Band (for "above" conditions)
-    - The value is the offset from the band (positive for above lower band, negative for below)
+    The Bollinger filter compares close against a signed percent offset from
+    the explicitly selected upper or lower Bollinger Band.
     """
     filter_cfg = _buy_bollinger_filter_config(config, buy_cfg)
     if not filter_cfg:
@@ -735,6 +737,21 @@ def _evaluate_buy_bollinger_filter(
             passed=False,
             reason="unsupported_operator",
             evaluation_index=evaluation_index,
+            compare_target=compare_target,
+        )
+
+    compare_target = str(compare_target or "").strip().upper()
+    if compare_target not in {"BOLLINGER_LOWER", "BOLLINGER_UPPER"}:
+        return False, _bollinger_detail(
+            enabled=True,
+            operator=operator,
+            value=raw_value,
+            close_price=None,
+            bollinger_value=None,
+            passed=False,
+            reason="unsupported_compare_target",
+            evaluation_index=evaluation_index,
+            compare_target=compare_target,
         )
 
     # Validate value (offset from the band must be numeric when supplied)
@@ -756,7 +773,7 @@ def _evaluate_buy_bollinger_filter(
     close_price = close_series[evaluation_index] if isinstance(close_series, list) and 0 <= evaluation_index < len(close_series) else None
 
     # Get Bollinger band value
-    bollinger_series = series_map.get("BOLLINGER")
+    bollinger_series = series_map.get(compare_target)
     bollinger_value = bollinger_series[evaluation_index] if isinstance(bollinger_series, list) and 0 <= evaluation_index < len(bollinger_series) else None
 
     if close_price is None or bollinger_value is None:
@@ -769,11 +786,14 @@ def _evaluate_buy_bollinger_filter(
             passed=False,
             reason="insufficient_data",
             evaluation_index=evaluation_index,
+            compare_target=compare_target,
         )
 
-    # Calculate the threshold value
-    # The value in the condition represents the offset from the Bollinger band
-    threshold = bollinger_value + (value if value is not None else 0.0)
+    signed_percent = value if value is not None else 0.0
+    threshold = round(
+        bollinger_value * (1.0 + signed_percent / 100.0),
+        8,
+    )
 
     # Evaluate the condition
     if operator == ">=":
@@ -796,6 +816,8 @@ def _evaluate_buy_bollinger_filter(
         passed=passed,
         reason="matched" if passed else "not_matched",
         evaluation_index=evaluation_index,
+        compare_target=compare_target,
+        threshold=round(threshold, 8),
     )
 
 
