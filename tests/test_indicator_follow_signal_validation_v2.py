@@ -28,6 +28,7 @@ from gui_indicator_follow_signal_validation_window import (
     IndicatorFollowSignalValidationFixedPriceAxis,
     IndicatorFollowSignalValidationWindow,
     _time_axis_label_records,
+    _validation_price_text,
     estimated_signal_return_percent,
 )
 from indicator_follow_signal_validation_projection import (
@@ -646,6 +647,54 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual("1,500,000", expensive_axis.price_axis_records()[0]["label"])
         self.assertGreater(expensive_axis.width(), axis.width())
 
+    def test_price_axis_labels_round_only_the_integer_won_display(self):
+        self.assertEqual("250,500", _validation_price_text(250500.0))
+        self.assertEqual("258,605", _validation_price_text(258605.39))
+        self.assertEqual("253,690", _validation_price_text(253690.14))
+        self.assertEqual("248,775", _validation_price_text(248774.88))
+        self.assertEqual("250,501", _validation_price_text(250500.51))
+
+        canvas = IndicatorFollowSignalValidationChartCanvas([
+            {
+                "time": "20260911140000",
+                "open": 248774.88,
+                "high": 258605.39,
+                "low": 238944.37,
+                "close": 253690.14,
+                "volume": 1,
+            }
+        ], [])
+        canvas.resize(canvas.sizeHint().width(), 440)
+        canvas.set_price_view(238944.37, 258605.39)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(canvas)
+        axis = IndicatorFollowSignalValidationFixedPriceAxis(scroll_area)
+        axis.set_canvas(canvas)
+        self.widgets.extend([scroll_area, axis])
+        scroll_area.resize(640, 440)
+        axis.resize(axis.width(), 440)
+        scroll_area.show()
+        axis.show()
+        self.app.processEvents()
+
+        scale = canvas.price_scale()
+        grid_records = canvas.grid_line_records()
+        axis_records = axis.price_axis_records()
+        raw_prices = [record["price"] for record in grid_records]
+        raw_y = [record["y"] for record in grid_records]
+        candle_y = scale.y_for_price(253690.14)
+
+        self.assertEqual(raw_prices, [record["price"] for record in axis_records])
+        self.assertEqual(258605.39, raw_prices[0])
+        self.assertEqual("258,605", axis_records[0]["label"])
+        self.assertTrue(all("." not in record["label"] for record in axis_records))
+        self.assertEqual(238944.37, scale.minimum)
+        self.assertEqual(258605.39, scale.maximum)
+        self.assertEqual(raw_y, [record["y"] for record in canvas.grid_line_records()])
+        self.assertEqual(candle_y, scale.y_for_price(253690.14))
+        self.assertAlmostEqual(253690.14, scale.price_for_y(candle_y))
+
     def test_candle_hover_requires_candle_x_and_high_low_ranges(self):
         candles = [
             {
@@ -1101,6 +1150,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                     record["label"]
                     for record in window.fixed_price_axis.price_axis_records()
                 ],
+            )
+            self.assertTrue(all(
+                "." not in record["label"]
+                for record in window.fixed_price_axis.price_axis_records()
+            ))
+            self.assertTrue(
+                not scale_zoomed.minimum.is_integer()
+                or not scale_zoomed.maximum.is_integer()
             )
 
             zoomed_range = scale_zoomed.maximum - scale_zoomed.minimum

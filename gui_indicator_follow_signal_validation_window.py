@@ -610,9 +610,7 @@ def _validation_price_scale(
 
 
 def _validation_price_text(value: float) -> str:
-    if float(value).is_integer():
-        return f"{int(value):,}"
-    return f"{value:,.2f}".rstrip("0").rstrip(".")
+    return f"{float(value):,.0f}"
 
 
 class IndicatorFollowSignalValidationChartCanvas(
