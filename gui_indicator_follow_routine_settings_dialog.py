@@ -3186,7 +3186,6 @@ class IndicatorFollowRoutineSettingsDialog(
 
     def apply_signal_validation_ui_state(self, state):
         """Apply only V2-visible signal controls in memory; never touch execution settings."""
-        result = {"applied": [], "skipped": []}
         try:
             from indicator_follow_signal_validation_projection import (
                 project_signal_validation_apply_ui_state,
@@ -3194,10 +3193,39 @@ class IndicatorFollowRoutineSettingsDialog(
 
             projected = project_signal_validation_apply_ui_state(state)
         except (TypeError, ValueError) as exc:
+            result = {"applied": [], "skipped": []}
             result["skipped"].append({
                 "name": "state",
                 "reason": "invalid_signal_validation_state",
                 "error": str(exc),
+            })
+            return result
+        return self._apply_projected_signal_validation_ui_state(projected)
+
+    def restore_signal_validation_entry_ui_state(self, state):
+        """Restore an already accepted V2 Entry projection in memory only."""
+        try:
+            from indicator_follow_signal_validation_projection import (
+                project_signal_validation_restore_ui_state,
+            )
+
+            projected = project_signal_validation_restore_ui_state(state)
+        except (TypeError, ValueError) as exc:
+            result = {"applied": [], "skipped": []}
+            result["skipped"].append({
+                "name": "state",
+                "reason": "invalid_signal_validation_restore_state",
+                "error": str(exc),
+            })
+            return result
+        return self._apply_projected_signal_validation_ui_state(projected)
+
+    def _apply_projected_signal_validation_ui_state(self, projected):
+        result = {"applied": [], "skipped": []}
+        if not isinstance(projected, dict):
+            result["skipped"].append({
+                "name": "state",
+                "reason": "projected_state_not_dict",
             })
             return result
 
@@ -3207,7 +3235,17 @@ class IndicatorFollowRoutineSettingsDialog(
         signal_filter = (
             buy_ui.get("signal_filter", {}) if isinstance(buy_ui, dict) else {}
         )
-        self._apply_named_ui_values(signal_filter, result=result)
+        flat_signal_filter = {
+            key: value
+            for key, value in signal_filter.items()
+            if key != "buy_composite"
+        } if isinstance(signal_filter, dict) else {}
+        self._apply_named_ui_values(flat_signal_filter, result=result)
+        if isinstance(signal_filter, dict) and "buy_composite" in signal_filter:
+            self._apply_buy_composite_ui_state(
+                signal_filter.get("buy_composite"),
+                result=result,
+            )
 
         sell_ui = projected.get("sell_ui", {})
         signal_conditions = (

@@ -128,6 +128,31 @@ class IndicatorFollowSignalValidationApplyPayload:
         return value
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class IndicatorFollowSignalValidationRestorePayload:
+    """Immutable V2-entry values for restore without Candidate approval."""
+
+    _ui_state_json: str
+
+    def __init__(self, ui_state: Mapping[str, Any]) -> None:
+        if not isinstance(ui_state, Mapping):
+            raise TypeError("ui_state must be a mapping")
+        canonical = json.dumps(
+            project_signal_validation_restore_ui_state(ui_state),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        object.__setattr__(self, "_ui_state_json", canonical)
+
+    def to_ui_state(self) -> dict[str, Any]:
+        value = json.loads(self._ui_state_json)
+        if not isinstance(value, dict):
+            raise ValueError("canonical restore UI state must decode to an object")
+        return value
+
+
 def _depends_on_execution_price(value: Mapping[str, Any]) -> bool:
     for key, field_value in value.items():
         if str(key).strip().lower() not in _DEPENDENCY_FIELDS:
@@ -285,6 +310,13 @@ def project_signal_validation_apply_ui_state(
     if isinstance(signal_filter, dict):
         signal_filter.pop("buy_composite", None)
     return projected
+
+
+def project_signal_validation_restore_ui_state(
+    ui_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return detached V2-visible entry values without Candidate validation."""
+    return project_signal_validation_ui_state(ui_state)
 
 
 def project_signal_validation_rules(

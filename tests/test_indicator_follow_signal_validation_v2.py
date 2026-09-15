@@ -34,6 +34,7 @@ from gui_indicator_follow_signal_validation_window import (
 )
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
+    IndicatorFollowSignalValidationRestorePayload,
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_signal_validation_snapshot,
@@ -1371,7 +1372,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(entry_sell, window.sell_signal_expr_line.text())
         self.assertEqual(self.stock, window.stock)
         self.assertEqual(
-            IndicatorFollowSignalValidationApplyPayload(entry_ui_state).to_ui_state(),
+            IndicatorFollowSignalValidationRestorePayload(entry_ui_state).to_ui_state(),
             resets[0].to_ui_state(),
         )
         self.assertIsNone(window.replay_snapshot)
@@ -1447,6 +1448,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             def __init__(_self):
                 super().__init__()
                 _self.applied = []
+                _self.restored = []
 
             def apply_signal_validation_candidate_ui_state(_self, state):
                 _self.applied.append(deepcopy(state))
@@ -1454,6 +1456,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
             def apply_signal_validation_ui_state(_self, state):
                 return _self.apply_signal_validation_candidate_ui_state(state)
+
+            def restore_signal_validation_entry_ui_state(_self, state):
+                _self.restored.append(deepcopy(state))
+                return {"applied": ["state"], "skipped": []}
 
         def result(session, count, request_id):
             request = session.request
@@ -1492,14 +1498,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             lambda request: flow._run_validation(window, request)
         )
         window.entry_reset_started.connect(
-            lambda: flow._begin_entry_state_reset(window)
+            lambda: flow._begin_entry_state_reset(window, weakref.ref(source))
         )
         reset_start_generations = []
         window.entry_reset_started.connect(
             lambda: reset_start_generations.append(flow._request_generation[key])
         )
         window.entry_reset_requested.connect(
-            lambda payload: flow._reset_entry_state_to_source(
+            lambda payload: flow._restore_entry_state_to_source(
                 window,
                 weakref.ref(source),
                 payload,
@@ -1520,17 +1526,59 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(500, stale_count)
         self.assertEqual(100, latest_count)
         self.assertEqual("5", window.basic_signal_interval_combo.currentText())
-        self.assertEqual(1, len(source.applied))
+        self.assertEqual([], source.applied)
+        self.assertEqual(1, len(source.restored))
         self.assertEqual(
-            IndicatorFollowSignalValidationApplyPayload(
+            IndicatorFollowSignalValidationRestorePayload(
                 entry.to_ui_state()
             ).to_ui_state(),
-            source.applied[0],
+            source.restored[0],
         )
         stale_callback(result(stale_session, stale_count, "STALE"))
         self.assertIsNone(window.replay_snapshot)
         latest_callback(result(latest_session, latest_count, "RESET"))
         self.assertEqual("RESET", window.replay_snapshot.historical_request_id)
+
+    def test_entry_reset_aborts_before_local_mutation_without_parent_restore(self):
+        flow = IndicatorFollowSignalValidationFlow(
+            _SnapshotBroker(True),
+            host=_FakeHost(self.stock),
+            recent_stock_store=_MemoryRecentStockStore((self.stock,)),
+        )
+        source = QDialog()
+        window = self._window()
+        self.widgets.append(source)
+        window.set_historical_candle_count(100)
+        entry = window.commit_entry_state()
+        key = id(window)
+        flow._open_windows[key] = window
+        flow._request_generation[key] = 0
+        flow._market_snapshot_generation[key] = 0
+        source_ref = weakref.ref(source)
+        window.entry_reset_started.connect(
+            lambda: flow._begin_entry_state_reset(window, source_ref)
+        )
+        window.entry_reset_requested.connect(
+            lambda payload: flow._restore_entry_state_to_source(
+                window,
+                source_ref,
+                payload,
+            )
+        )
+        runs = []
+        window.validation_run_requested.connect(runs.append)
+        window.buy_signal_expr_line.setText("D")
+
+        window.reset_button.click()
+
+        self.assertEqual("D", window.buy_signal_expr_line.text())
+        self.assertNotEqual(
+            entry.to_ui_state()["basic"]["buy_signal_expr_line"],
+            window.buy_signal_expr_line.text(),
+        )
+        self.assertEqual([], runs)
+        self.assertIn("원본 설정창", window.validation_status_label.text())
+        self.assertEqual(1, flow._request_generation[key])
 
     def test_v2_entry_reset_and_parent_undo_keep_distinct_baselines(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1569,7 +1617,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.widgets.append(window)
             window.commit_entry_state()
             window.entry_reset_requested.connect(
-                lambda payload: source.apply_signal_validation_candidate_ui_state(
+                lambda payload: source.restore_signal_validation_entry_ui_state(
                     payload.to_ui_state()
                 )
             )
@@ -1582,6 +1630,100 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             source.restore_settings_undo_snapshot()
             self.assertEqual(original_buy, source.buy_signal_expr_line.text())
             self.assertEqual(original_bytes, rules_path.read_bytes())
+
+    def test_unresolved_entry_reset_restores_and_runs_without_candidate_approval(self):
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            window = IndicatorFollowSignalValidationWindow(
+                self.stock,
+                self._unresolved_seed(),
+            )
+        self.widgets.append(window)
+        window.set_historical_candle_count(100)
+        entry = window.commit_entry_state()
+        entry_buy = entry.to_ui_state()["basic"]["buy_signal_expr_line"]
+        starts = []
+        restores = []
+        runs = []
+        window.entry_reset_started.connect(lambda: starts.append(True))
+        window.entry_reset_requested.connect(restores.append)
+        window.validation_run_requested.connect(runs.append)
+        window.buy_signal_expr_line.setText("D")
+
+        window.reset_button.click()
+
+        self.assertNotIn(
+            "V2 진입 상태를 복원할 수 없습니다.",
+            window.validation_status_label.text(),
+        )
+        self.assertEqual(entry_buy, window.buy_signal_expr_line.text())
+        self.assertEqual([True], starts)
+        self.assertEqual(1, len(restores))
+        self.assertEqual(1, len(runs))
+        self.assertEqual(100, runs[0].candle_count)
+        self.assertIs(runs[0].settings_snapshot, window._signal_validation_seed.settings_snapshot)
+        self.assertIsInstance(
+            restores[0],
+            IndicatorFollowSignalValidationRestorePayload,
+        )
+        with self.assertRaisesRegex(ValueError, "재선택"):
+            IndicatorFollowSignalValidationApplyPayload(entry.to_ui_state())
+
+        candidate_payloads = []
+        window.settings_apply_requested.connect(candidate_payloads.append)
+        window.set_replay_snapshot(self._candle_count_snapshot(100))
+        window._validated_ui_fingerprint = window._current_signal_ui_fingerprint()
+        window._set_primary_validation_action_state("apply")
+        self.assertIsNone(window._request_settings_apply())
+        self.assertEqual([], candidate_payloads)
+        self.assertIn("현재가 또는 평단가", window.validation_status_label.text())
+
+    def test_registration_and_edit_restore_unresolved_entry_without_persistence(self):
+        unresolved = self._unresolved_seed().to_ui_state()
+        entry_buy = unresolved["basic"]["buy_signal_expr_line"]
+        for mode in ("registration", "edit"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                rules_path = Path(temp_dir) / "rules.json"
+                rules_path.write_text(
+                    json.dumps(self.rules, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                original_bytes = rules_path.read_bytes()
+                kwargs = dict(
+                    rules_path=rules_path,
+                    routine_path=self.routine_dir,
+                    routine_name="지표추종매매",
+                    definition_id="indicator_follow",
+                    settings_mode=mode,
+                )
+                if mode == "edit":
+                    kwargs["instance_id"] = "RESTORE-ENTRY-EDIT"
+                with patch.object(dialog_module.QTimer, "singleShot"):
+                    source = dialog_module.IndicatorFollowRoutineSettingsDialog(
+                        **kwargs
+                    )
+                self.widgets.append(source)
+                source.buy_signal_expr_line.setText("D")
+
+                result = source.restore_signal_validation_entry_ui_state(
+                    IndicatorFollowSignalValidationRestorePayload(
+                        unresolved
+                    ).to_ui_state()
+                )
+
+                self.assertEqual([], result["skipped"])
+                restored = source.collect_indicator_follow_ui_state()
+                self.assertEqual(entry_buy, restored["basic"]["buy_signal_expr_line"])
+                self.assertEqual(
+                    "주문가",
+                    restored["sell_ui"]["signal_conditions"]["condition_a"][
+                        "gap_left_combo"
+                    ],
+                )
+                source.buy_signal_expr_line.setText("C")
+                strict_result = source.apply_signal_validation_ui_state(unresolved)
+                self.assertTrue(strict_result["skipped"])
+                self.assertEqual("C", source.buy_signal_expr_line.text())
+                self.assertEqual(original_bytes, rules_path.read_bytes())
 
     def test_primary_settings_apply_validates_stale_state_then_emits_once(self):
         window = self._window()

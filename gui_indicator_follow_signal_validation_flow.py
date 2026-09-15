@@ -19,6 +19,7 @@ from indicator_follow_signal_validation_recent_stocks import (
 )
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
+    IndicatorFollowSignalValidationRestorePayload,
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_validation_average_price_context,
@@ -277,12 +278,14 @@ class IndicatorFollowSignalValidationFlow(QObject):
             reset_started_signal = getattr(window, "entry_reset_started", None)
             if callable(getattr(reset_started_signal, "connect", None)):
                 reset_started_signal.connect(
-                    lambda ref=window_ref: self._begin_entry_state_reset(ref())
+                    lambda ref=window_ref, source=source_ref: (
+                        self._begin_entry_state_reset(ref(), source)
+                    )
                 )
             if callable(getattr(reset_signal, "connect", None)):
                 reset_signal.connect(
                     lambda payload, ref=window_ref, source=source_ref: (
-                        self._reset_entry_state_to_source(ref(), source, payload)
+                        self._restore_entry_state_to_source(ref(), source, payload)
                     )
                 )
             stock_signal = getattr(window, "stock_selection_requested", None)
@@ -555,7 +558,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if callable(show_result):
             show_result("설정 적용 완료", success=True)
 
-    def _reset_entry_state_to_source(
+    def _restore_entry_state_to_source(
         self,
         window: object,
         source_ref: weakref.ReferenceType[object],
@@ -564,20 +567,62 @@ class IndicatorFollowSignalValidationFlow(QObject):
         window_key = id(window)
         if window_key not in self._open_windows:
             return
+        set_result = getattr(window, "set_entry_reset_source_result", None)
+        if not isinstance(payload, IndicatorFollowSignalValidationRestorePayload):
+            if callable(set_result):
+                set_result(False, "초기화 데이터가 올바르지 않습니다.")
+            return
+        source = source_ref()
+        if not self._valid_requester(source):
+            if callable(set_result):
+                set_result(False, "원본 설정창이 닫혀 있어 초기화할 수 없습니다.")
+            return
+        restore_state = getattr(source, "restore_signal_validation_entry_ui_state", None)
+        if not callable(restore_state):
+            if callable(set_result):
+                set_result(False, "원본 설정창에 진입 상태를 복원할 수 없습니다.")
+            return
+        try:
+            result = restore_state(payload.to_ui_state())
+        except Exception:
+            if callable(set_result):
+                set_result(False, "원본 설정창 초기화 중 오류가 발생했습니다.")
+            return
+        skipped = result.get("skipped", []) if isinstance(result, dict) else ["invalid_result"]
+        if skipped:
+            if callable(set_result):
+                set_result(False, "일부 진입 상태를 복원할 수 없습니다.")
+            return
+        if callable(set_result):
+            set_result(True, "")
         stock = getattr(window, "stock", None)
         if isinstance(stock, ValidationStockRef) and stock.code and stock.name:
             self._last_selected_stock = ValidationStockRef(stock.code, stock.name)
             self._request_market_snapshot_for_window(window)
-        self._apply_to_source(
-            window,
-            source_ref,
-            payload,
-        )
 
-    def _begin_entry_state_reset(self, window: object) -> None:
+    def _begin_entry_state_reset(
+        self,
+        window: object,
+        source_ref: weakref.ReferenceType[object],
+    ) -> None:
         window_key = id(window)
-        if window_key in self._open_windows:
-            self._invalidate_window_requests(window_key)
+        if window_key not in self._open_windows:
+            return
+        self._invalidate_window_requests(window_key)
+        source = source_ref()
+        restore_state = getattr(
+            source,
+            "restore_signal_validation_entry_ui_state",
+            None,
+        ) if self._valid_requester(source) else None
+        set_result = getattr(window, "set_entry_reset_source_result", None)
+        if callable(set_result):
+            if callable(restore_state):
+                set_result(True, "")
+            elif self._valid_requester(source):
+                set_result(False, "원본 설정창에 진입 상태를 복원할 수 없습니다.")
+            else:
+                set_result(False, "원본 설정창이 닫혀 있어 초기화할 수 없습니다.")
 
     def _release_window(self, window_key: int) -> None:
         self._open_windows.pop(window_key, None)

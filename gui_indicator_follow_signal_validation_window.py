@@ -43,6 +43,7 @@ from gui_indicator_follow_routine_settings_dialog import (
 )
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
+    IndicatorFollowSignalValidationRestorePayload,
     IndicatorFollowSignalValidationRunRequest,
     IndicatorFollowSignalValidationSeed,
     build_validation_average_price_context,
@@ -1265,6 +1266,8 @@ class IndicatorFollowSignalValidationWindow(
         self._entry_chart_view_state: _ValidationChartViewState | None = None
         self._entry_reset_in_progress = False
         self._entry_reset_replay_pending = False
+        self._entry_reset_source_ready: bool | None = None
+        self._entry_reset_source_message = ""
         self._pending_validation_ui_fingerprint: str | None = None
         self._validated_ui_fingerprint: str | None = None
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
@@ -1997,12 +2000,19 @@ class IndicatorFollowSignalValidationWindow(
         self._request_validation()
 
     def reset_to_entry_state(self):
+        self._entry_reset_source_ready = None
+        self._entry_reset_source_message = ""
         self.entry_reset_started.emit()
+        if self._entry_reset_source_ready is False:
+            self.show_validation_error(
+                self._entry_reset_source_message or "원본 설정창을 초기화할 수 없습니다."
+            )
+            return None
         entry = self.commit_entry_state()
         entry_ui_state = entry.to_ui_state()
         try:
             self._entry_reset_in_progress = True
-            result = self.apply_signal_validation_ui_state(entry_ui_state)
+            result = self.restore_signal_validation_entry_ui_state(entry_ui_state)
             skipped = (
                 result.get("skipped", [])
                 if isinstance(result, dict)
@@ -2030,22 +2040,32 @@ class IndicatorFollowSignalValidationWindow(
         finally:
             self._entry_reset_in_progress = False
 
-        self._clear_validation_result("초기화 검증 준비 중")
-        self._entry_reset_replay_pending = True
         try:
-            payload = IndicatorFollowSignalValidationApplyPayload(entry_ui_state)
+            payload = IndicatorFollowSignalValidationRestorePayload(entry_ui_state)
         except (TypeError, ValueError):
             self._entry_reset_replay_pending = False
             self.show_validation_error("V2 진입 설정을 부모창에 전달할 수 없습니다.")
             return None
         self.entry_reset_requested.emit(payload)
+        if self._entry_reset_source_ready is False:
+            self._entry_reset_replay_pending = False
+            self.show_validation_error(
+                self._entry_reset_source_message or "원본 설정창을 초기화할 수 없습니다."
+            )
+            return payload
+        self._clear_validation_result("초기화 검증 준비 중")
+        self._entry_reset_replay_pending = True
         if self.stock is None:
             self._entry_reset_replay_pending = False
             self.show_validation_error(
                 "상단 종목 영역을 두 번 클릭하여 검증 종목을 선택하세요."
             )
             return payload
-        return self._request_validation()
+        return self._request_entry_validation(entry_ui_state, entry.candle_count)
+
+    def set_entry_reset_source_result(self, success: bool, message: str = "") -> None:
+        self._entry_reset_source_ready = bool(success)
+        self._entry_reset_source_message = str(message or "")
 
     def _set_primary_validation_action_state(
         self,
@@ -2124,6 +2144,38 @@ class IndicatorFollowSignalValidationWindow(
         self.loading_label.setText("과거 분봉 데이터 조회 중...")
         if self._replay_snapshot is None:
             self.chart_stack.setCurrentWidget(self.loading_label)
+        self._set_primary_validation_action_state("validate", enabled=False)
+        self.validation_run_requested.emit(run_request)
+        return run_request
+
+    def _request_entry_validation(
+        self,
+        entry_ui_state: dict[str, Any],
+        candle_count: int,
+    ) -> IndicatorFollowSignalValidationRunRequest | None:
+        """Replay the immutable, entry-approved snapshot without Candidate approval."""
+        if self.stock is None:
+            self.show_validation_error(
+                "상단 종목 영역을 두 번 클릭하여 검증 종목을 선택하세요."
+            )
+            return None
+        try:
+            run_request = IndicatorFollowSignalValidationRunRequest(
+                self._signal_validation_seed.settings_snapshot,
+                candle_count,
+            )
+            pending_fingerprint = self._signal_ui_fingerprint(entry_ui_state)
+        except (TypeError, ValueError):
+            self.show_validation_error("V2 진입 설정으로 검증 데이터를 만들 수 없습니다.")
+            return None
+        self._result_ui_state = deepcopy(entry_ui_state)
+        self._pending_result_settings_snapshot = run_request.settings_snapshot
+        self._pending_validation_ui_fingerprint = pending_fingerprint
+        self._validated_ui_fingerprint = None
+        self._settings_apply_after_validation = False
+        self.validation_status_label.setText("Historical Candle 요청 중")
+        self.loading_label.setText("과거 분봉 데이터 조회 중...")
+        self.chart_stack.setCurrentWidget(self.loading_label)
         self._set_primary_validation_action_state("validate", enabled=False)
         self.validation_run_requested.emit(run_request)
         return run_request
