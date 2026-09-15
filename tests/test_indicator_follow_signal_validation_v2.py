@@ -13,7 +13,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, QSignalBlocker, Qt, pyqtSignal
-from PyQt5.QtGui import QFontMetrics, QMouseEvent, QPixmap
+from PyQt5.QtGui import QFontMetrics, QMouseEvent, QPixmap, QWheelEvent
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
 
@@ -585,6 +585,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         canvas.resize(canvas.sizeHint().width(), 440)
         records = axis.price_axis_records()
         grid_records = canvas.grid_line_records()
+        scale = canvas.price_scale()
 
         self.assertEqual(5, len(records))
         self.assertEqual(250_500.0, records[0]["price"])
@@ -592,6 +593,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(249_750.0, records[2]["price"])
         self.assertEqual("250,500", records[0]["label"])
         self.assertEqual("249,000", records[-1]["label"])
+        for price in (scale.minimum, 249_750.0, scale.maximum):
+            self.assertAlmostEqual(price, scale.price_for_y(scale.y_for_price(price)))
         viewport_top = scroll_area.viewport().geometry().top()
         self.assertEqual(
             [viewport_top + record["y"] for record in grid_records],
@@ -810,6 +813,128 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         QTest.mouseRelease(canvas, Qt.LeftButton, pos=QPoint(click_x - 120, click_y))
         self.assertGreater(window.visible_candle_span, span_before_left_drag)
         self.assertEqual([], selected)
+
+    def test_wheel_scales_price_with_cursor_anchor_and_preserves_time_view(self):
+        window = self._window()
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window.set_replay_snapshot(self._candle_count_snapshot(500, include_signals=True))
+        self.app.processEvents()
+        canvas = window.canvas
+        viewport = window.chart_scroll_area.viewport()
+        time_view_before = (
+            window.visible_start_index,
+            window.visible_candle_span,
+        )
+        canvas_size_before = canvas.size()
+        selected_before = window.selected_evaluation_index
+        axis_labels_before = [
+            record["label"] for record in window.fixed_price_axis.price_axis_records()
+        ]
+        scale_before = canvas.price_scale()
+        cursor_y = round(
+            scale_before.plot_top
+            + (scale_before.plot_bottom - scale_before.plot_top) * 0.35
+        )
+        anchor_price = scale_before.price_for_y(cursor_y)
+        range_before = scale_before.maximum - scale_before.minimum
+
+        def send_wheel(delta):
+            viewport_pos = QPoint(canvas._LEFT + 200, cursor_y)
+            global_pos = viewport.mapToGlobal(viewport_pos)
+            event = QWheelEvent(
+                QPointF(viewport_pos),
+                QPointF(global_pos),
+                QPoint(),
+                QPoint(0, delta),
+                Qt.NoButton,
+                Qt.NoModifier,
+                Qt.NoScrollPhase,
+                False,
+            )
+            QApplication.sendEvent(viewport, event)
+
+        with patch.object(ValidationHistoricalReplay, "evaluate") as replay:
+            send_wheel(120)
+            self.app.processEvents()
+            scale_zoomed = canvas.price_scale()
+            self.assertLess(
+                scale_zoomed.maximum - scale_zoomed.minimum,
+                range_before,
+            )
+            self.assertAlmostEqual(
+                anchor_price,
+                scale_zoomed.price_for_y(cursor_y),
+                places=8,
+            )
+            self.assertTrue(window.price_scale_manually_adjusted)
+            self.assertEqual(time_view_before, (
+                window.visible_start_index,
+                window.visible_candle_span,
+            ))
+            self.assertEqual(canvas_size_before, canvas.size())
+            self.assertEqual(selected_before, window.selected_evaluation_index)
+            self.assertNotEqual(
+                axis_labels_before,
+                [
+                    record["label"]
+                    for record in window.fixed_price_axis.price_axis_records()
+                ],
+            )
+
+            zoomed_range = scale_zoomed.maximum - scale_zoomed.minimum
+            send_wheel(-120)
+            self.app.processEvents()
+            scale_restored = canvas.price_scale()
+            self.assertGreater(
+                scale_restored.maximum - scale_restored.minimum,
+                zoomed_range,
+            )
+
+            for _index in range(100):
+                window._zoom_price_scale_at(cursor_y, 120)
+            minimum_range = range_before * window._MIN_PRICE_RANGE_RATIO
+            self.assertAlmostEqual(
+                minimum_range,
+                canvas.price_scale().maximum - canvas.price_scale().minimum,
+                places=8,
+            )
+            for _index in range(200):
+                window._zoom_price_scale_at(cursor_y, -120)
+            maximum_range = range_before * window._MAX_PRICE_RANGE_RATIO
+            self.assertAlmostEqual(
+                maximum_range,
+                canvas.price_scale().maximum - canvas.price_scale().minimum,
+                places=6,
+            )
+            manual_price_bounds = window.current_price_bounds
+            window.resize(window.width() + 120, window.height() + 40)
+            QTest.qWait(10)
+            self.app.processEvents()
+            self.assertEqual(manual_price_bounds, window.current_price_bounds)
+            self.assertEqual(manual_price_bounds, (
+                canvas.price_scale().minimum,
+                canvas.price_scale().maximum,
+            ))
+            self.assertEqual(time_view_before, (
+                window.visible_start_index,
+                window.visible_candle_span,
+            ))
+            replay.assert_not_called()
+
+        self.assertEqual(time_view_before, (
+            window.visible_start_index,
+            window.visible_candle_span,
+        ))
+        window.set_replay_snapshot(self._candle_count_snapshot(200))
+        self.app.processEvents()
+        self.assertFalse(window.price_scale_manually_adjusted)
+        self.assertEqual((99.0, 300.0), window.current_price_bounds)
+        self.assertEqual(window.current_price_bounds, (
+            window.canvas.price_scale().minimum,
+            window.canvas.price_scale().maximum,
+        ))
 
     def test_logical_scroll_resize_and_render_actions_do_not_run_replay(self):
         window = self._window()

@@ -562,6 +562,10 @@ class _ValidationPriceScale:
         ratio = (self.maximum - price) / (self.maximum - self.minimum)
         return self.plot_top + ratio * (self.plot_bottom - self.plot_top)
 
+    def price_for_y(self, y: float) -> float:
+        ratio = (float(y) - self.plot_top) / (self.plot_bottom - self.plot_top)
+        return self.maximum - ratio * (self.maximum - self.minimum)
+
     def tick_records(self) -> list[dict[str, Any]]:
         return [
             {
@@ -579,17 +583,20 @@ def _validation_price_scale(
     *,
     plot_top: int,
     plot_bottom_margin: int,
+    minimum: float | None = None,
+    maximum: float | None = None,
 ) -> _ValidationPriceScale | None:
-    prices = [
-        number
-        for candle in candles
-        for field in ("open", "high", "low", "close")
-        if (number := _finite_number(candle.get(field))) is not None
-    ]
-    if not prices:
-        return None
-    minimum = min(prices)
-    maximum = max(prices)
+    if minimum is None or maximum is None:
+        prices = [
+            number
+            for candle in candles
+            for field in ("open", "high", "low", "close")
+            if (number := _finite_number(candle.get(field))) is not None
+        ]
+        if not prices:
+            return None
+        minimum = min(prices)
+        maximum = max(prices)
     if maximum == minimum:
         padding = max(abs(maximum) * 0.01, 1.0)
         minimum -= padding
@@ -618,6 +625,8 @@ class IndicatorFollowSignalValidationChartCanvas(
     def __init__(self, candles, markers, parent=None) -> None:
         super().__init__(candles, markers, parent)
         self._active_tooltip = ""
+        self._price_minimum: float | None = None
+        self._price_maximum: float | None = None
         self.setMouseTracking(True)
         self.setMinimumHeight(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -647,7 +656,22 @@ class IndicatorFollowSignalValidationChartCanvas(
             self.height(),
             plot_top=self._TOP,
             plot_bottom_margin=self._BOTTOM,
+            minimum=self._price_minimum,
+            maximum=self._price_maximum,
         )
+
+    def set_price_view(self, minimum: float, maximum: float) -> None:
+        resolved_minimum = _finite_number(minimum)
+        resolved_maximum = _finite_number(maximum)
+        if (
+            resolved_minimum is None
+            or resolved_maximum is None
+            or resolved_maximum <= resolved_minimum
+        ):
+            raise ValueError("price view requires finite increasing bounds")
+        self._price_minimum = resolved_minimum
+        self._price_maximum = resolved_maximum
+        self.update()
 
     def grid_line_records(self) -> list[dict[str, Any]]:
         scale = self.price_scale()
@@ -902,6 +926,10 @@ class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
         widest = max((metrics.horizontalAdvance(label) for label in labels), default=0)
         self.setFixedWidth(max(1, widest + self._HORIZONTAL_PADDING * 2))
 
+    def refresh_scale(self) -> None:
+        self._sync_width()
+        self.update()
+
     def price_axis_records(self) -> list[dict[str, Any]]:
         if self._canvas is None:
             return []
@@ -1132,6 +1160,9 @@ class IndicatorFollowSignalValidationWindow(
     _REFERENCE_CANDLE_COUNT = 100.0
     _MIN_VISIBLE_CANDLE_SPAN = 10.0
     _TIME_SCROLL_UNITS_PER_CANDLE = 1000
+    _PRICE_ZOOM_FACTOR = 1.15
+    _MIN_PRICE_RANGE_RATIO = 0.001
+    _MAX_PRICE_RANGE_RATIO = 100.0
     _INITIAL_AVAILABLE_GEOMETRY_RATIO = 0.85
     _CYCLE_TABLE_VISIBLE_ROWS = 5
     _CYCLE_TABLE_COLUMN_RATIOS = (0.06, 0.22, 0.09, 0.15, 0.20, 0.13, 0.15)
@@ -1183,6 +1214,11 @@ class IndicatorFollowSignalValidationWindow(
         self._visible_candle_span = 1.0
         self._time_scale_manually_adjusted = False
         self._syncing_time_navigation_scrollbar = False
+        self._default_price_minimum: float | None = None
+        self._default_price_maximum: float | None = None
+        self._current_price_minimum: float | None = None
+        self._current_price_maximum: float | None = None
+        self._price_scale_manually_adjusted = False
         super().__init__(
             rules_path=__file__,
             routine_name="지표추종매매 신호검증 V2",
@@ -1219,6 +1255,16 @@ class IndicatorFollowSignalValidationWindow(
     @property
     def time_scale_manually_adjusted(self) -> bool:
         return self._time_scale_manually_adjusted
+
+    @property
+    def current_price_bounds(self) -> tuple[float, float] | None:
+        if self._current_price_minimum is None or self._current_price_maximum is None:
+            return None
+        return self._current_price_minimum, self._current_price_maximum
+
+    @property
+    def price_scale_manually_adjusted(self) -> bool:
+        return self._price_scale_manually_adjusted
 
     def _update_window_title(self) -> None:
         self.setWindowTitle("지표추종매매 - 독립 신호검증 V2")
@@ -1565,6 +1611,13 @@ class IndicatorFollowSignalValidationWindow(
                 canvas = getattr(self, "canvas", None)
                 if canvas is not None:
                     QTimer.singleShot(0, canvas.update)
+            elif event.type() == QEvent.Wheel and event.angleDelta().y():
+                self._zoom_price_scale_at(
+                    event.pos().y(),
+                    event.angleDelta().y(),
+                )
+                event.accept()
+                return True
             return super().eventFilter(watched, event)
         cycle_table = getattr(self, "completed_cycle_table", None)
         if cycle_table is not None and watched is cycle_table.viewport():
@@ -1650,6 +1703,44 @@ class IndicatorFollowSignalValidationWindow(
             return
         start = float(value) / self._TIME_SCROLL_UNITS_PER_CANDLE
         self._set_time_view(start, self._visible_candle_span)
+
+    def _zoom_price_scale_at(self, cursor_y: float, wheel_delta: int) -> None:
+        canvas = getattr(self, "canvas", None)
+        scale = None if canvas is None else canvas.price_scale()
+        if scale is None or not wheel_delta:
+            return
+        if self._default_price_minimum is None or self._default_price_maximum is None:
+            return
+        default_range = self._default_price_maximum - self._default_price_minimum
+        if default_range <= 0:
+            return
+        current_range = scale.maximum - scale.minimum
+        wheel_steps = abs(float(wheel_delta)) / 120.0
+        factor = self._PRICE_ZOOM_FACTOR ** wheel_steps
+        requested_range = (
+            current_range / factor if wheel_delta > 0 else current_range * factor
+        )
+        minimum_range = max(default_range * self._MIN_PRICE_RANGE_RATIO, 1e-9)
+        maximum_range = default_range * self._MAX_PRICE_RANGE_RATIO
+        new_range = min(maximum_range, max(minimum_range, requested_range))
+        bounded_y = min(scale.plot_bottom, max(scale.plot_top, float(cursor_y)))
+        anchor_price = scale.price_for_y(bounded_y)
+        cursor_ratio = (
+            (bounded_y - scale.plot_top) / (scale.plot_bottom - scale.plot_top)
+        )
+        maximum = anchor_price + cursor_ratio * new_range
+        minimum = maximum - new_range
+        if maximum < self._default_price_minimum:
+            maximum = self._default_price_minimum
+            minimum = maximum - new_range
+        elif minimum > self._default_price_maximum:
+            minimum = self._default_price_maximum
+            maximum = minimum + new_range
+        self._current_price_minimum = minimum
+        self._current_price_maximum = maximum
+        self._price_scale_manually_adjusted = True
+        canvas.set_price_view(minimum, maximum)
+        self.fixed_price_axis.refresh_scale()
 
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
@@ -2068,6 +2159,11 @@ class IndicatorFollowSignalValidationWindow(
         self._visible_start_index = 0.0
         self._visible_candle_span = 1.0
         self._time_scale_manually_adjusted = False
+        self._default_price_minimum = None
+        self._default_price_maximum = None
+        self._current_price_minimum = None
+        self._current_price_maximum = None
+        self._price_scale_manually_adjusted = False
         self._signal_tooltips = {}
         self._pending_result_settings_snapshot = None
         self._result_settings_snapshot = None
@@ -2133,6 +2229,18 @@ class IndicatorFollowSignalValidationWindow(
         )
         self._time_scale_manually_adjusted = False
         self.canvas = IndicatorFollowSignalValidationChartCanvas(self._candles, markers)
+        initial_price_scale = self.canvas.price_scale()
+        if initial_price_scale is None:
+            self._default_price_minimum = None
+            self._default_price_maximum = None
+            self._current_price_minimum = None
+            self._current_price_maximum = None
+        else:
+            self._default_price_minimum = initial_price_scale.minimum
+            self._default_price_maximum = initial_price_scale.maximum
+            self._current_price_minimum = initial_price_scale.minimum
+            self._current_price_maximum = initial_price_scale.maximum
+        self._price_scale_manually_adjusted = False
         self.canvas.set_time_view(
             self._visible_start_index,
             self._visible_candle_span,
