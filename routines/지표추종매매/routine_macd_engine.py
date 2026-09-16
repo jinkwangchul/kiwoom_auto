@@ -1726,6 +1726,18 @@ def evaluate_indicator_follow_routine(
                 if expression_values:
                     ui_expression_contract = canonical_expression
                     ui_expression_values = dict(expression_values)
+                    aggregation_sell_names = [
+                        name for name in aggregation_sell_names
+                        if name != "macd_sell"
+                    ]
+                    aggregation_group_signal_names = [
+                        name for name in aggregation_group_signal_names
+                        if name != "macd_sell"
+                    ]
+                    causal_condition_sell_names = [
+                        name for name in causal_condition_sell_names
+                        if name != "macd_sell"
+                    ]
                     evaluated = evaluate_condition_expression(
                         expression_ast,
                         expression_values,

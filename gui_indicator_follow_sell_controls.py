@@ -25,6 +25,7 @@ SELL_PRICE_COMBO_WIDGET_NAMES = frozenset(
     for side in ("left", "right")
 )
 SELL_PRICE_BOX_SIGN_VALUES = frozenset({"-", "+"})
+SELL_BOLLINGER_SIGN_VALUES = frozenset({"-", "+"})
 
 
 def normalize_legacy_sell_price_box_sign_ui_state(ui_state):
@@ -63,6 +64,46 @@ def normalize_legacy_sell_price_box_sign_ui_state(ui_state):
     normalized = deepcopy(ui_state)
     normalized["sell_ui"]["signal_conditions"]["condition_b"][
         "price_box_sign_combo"
+    ] = legacy_sign
+    return normalized
+
+
+def normalize_legacy_sell_bollinger_sign_ui_state(ui_state):
+    if not isinstance(ui_state, dict):
+        return ui_state
+    sell_ui = ui_state.get("sell_ui")
+    signal_conditions = (
+        sell_ui.get("signal_conditions") if isinstance(sell_ui, dict) else None
+    )
+    condition_b = (
+        signal_conditions.get("condition_b")
+        if isinstance(signal_conditions, dict)
+        else None
+    )
+    if not isinstance(condition_b, dict):
+        return ui_state
+    legacy_fields = {
+        "bollinger_direction_combo",
+        "bollinger_value_line",
+        "bollinger_compare_combo",
+    }
+    if not legacy_fields.issubset(condition_b):
+        return ui_state
+    if "bollinger_sign_combo" in condition_b:
+        return ui_state
+    legacy_sign = {
+        "이상": "+",
+        ">=": "+",
+        "GTE": "+",
+        "이하": "-",
+        "<=": "-",
+        "LTE": "-",
+    }.get(str(condition_b.get("bollinger_compare_combo") or "").strip().upper())
+    if legacy_sign is None:
+        return ui_state
+    normalized = deepcopy(ui_state)
+    normalized["sell_ui"]["signal_conditions"]["condition_b"][
+        "bollinger_sign_combo"
     ] = legacy_sign
     return normalized
 
@@ -396,18 +437,21 @@ class IndicatorFollowSellControlsMixin:
         self.sell_signal_condition_b_price_box_logic_combo = filter_row_entries[-1]["logic"]
 
         bollinger_direction_combo = make_combo(["상향", "하향"], "하향", 64)
+        bollinger_sign_combo = make_combo(["-", "+"], "+", 52)
         bollinger_value_line = make_line("0.1", 44)
         bollinger_compare_combo = make_combo(["이상", "이하"], "이상", 66)
 
         bollinger_check = add_filter_row([
             QLabel("볼린저밴드"),
             bollinger_direction_combo,
+            bollinger_sign_combo,
             bollinger_value_line,
             QLabel("%"),
             bollinger_compare_combo,
         ], "AND", True, not getattr(self, "_signal_validation_mode", False))
         self.sell_signal_condition_b_bollinger_check = bollinger_check
         self.sell_signal_condition_b_bollinger_direction_combo = bollinger_direction_combo
+        self.sell_signal_condition_b_bollinger_sign_combo = bollinger_sign_combo
         self.sell_signal_condition_b_bollinger_value_line = bollinger_value_line
         self.sell_signal_condition_b_bollinger_compare_combo = bollinger_compare_combo
         self.sell_signal_condition_b_bollinger_logic_combo = filter_row_entries[-1]["logic"]

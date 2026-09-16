@@ -276,6 +276,78 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             finally:
                 reloaded.close()
 
+    def test_sell_bollinger_legacy_sign_and_explicit_round_trip(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        for direction, compare, expected_sign in (
+            ("하향", "이상", "+"),
+            ("하향", "이하", "-"),
+            ("상향", "이상", "+"),
+            ("상향", "이하", "-"),
+        ):
+            with self.subTest(direction=direction, compare=compare):
+                legacy = deepcopy(source)
+                legacy_condition = legacy["indicator_follow_ui_state"]["state"][
+                    "sell_ui"
+                ]["signal_conditions"]["condition_b"]
+                legacy_condition["bollinger_direction_combo"] = direction
+                legacy_condition["bollinger_compare_combo"] = compare
+                legacy_condition.pop("bollinger_sign_combo", None)
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    rules_path = Path(temp_dir) / "rules.json"
+                    rules_path.write_text(
+                        json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    dialog = self._dialog(rules_path)
+                    try:
+                        self.assertEqual(
+                            expected_sign,
+                            dialog.sell_signal_condition_b_bollinger_sign_combo.currentText(),
+                        )
+                    finally:
+                        dialog.close()
+
+        condition_b = source["indicator_follow_ui_state"]["state"]["sell_ui"][
+            "signal_conditions"
+        ]["condition_b"]
+        condition_b["bollinger_direction_combo"] = "하향"
+        condition_b["bollinger_sign_combo"] = "-"
+        condition_b["bollinger_value_line"] = "0.1"
+        condition_b["bollinger_compare_combo"] = "이상"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            dialog = self._dialog(rules_path)
+            try:
+                self.assertEqual(
+                    "-",
+                    dialog.sell_signal_condition_b_bollinger_sign_combo.currentText(),
+                )
+                result = dialog.build_registration_rules_from_current_ui_state()
+            finally:
+                dialog.close()
+            self.assertTrue(result["success"], result.get("error"))
+            rules_path.write_text(
+                json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            reloaded = self._dialog(rules_path)
+            try:
+                self.assertEqual(
+                    ("하향", "-", "0.1", "이상"),
+                    (
+                        reloaded.sell_signal_condition_b_bollinger_direction_combo.currentText(),
+                        reloaded.sell_signal_condition_b_bollinger_sign_combo.currentText(),
+                        reloaded.sell_signal_condition_b_bollinger_value_line.text(),
+                        reloaded.sell_signal_condition_b_bollinger_compare_combo.currentText(),
+                    ),
+                )
+            finally:
+                reloaded.close()
+
     def test_validation_button_is_absent_and_registration_snapshot_is_applied(self) -> None:
         before = hashlib.sha256(self.source_rules_path.read_bytes()).hexdigest()
         dialog = self._dialog(self.source_rules_path)

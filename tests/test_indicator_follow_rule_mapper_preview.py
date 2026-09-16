@@ -1263,6 +1263,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(condition["operator"], ">=")
         self.assertEqual(condition["compare_target"], "BOLLINGER_UPPER")
         self.assertEqual(condition["value"], 0.1)
+        self.assertIs(condition["signed_percent_offset"], True)
 
     def test_sell_condition_b_bollinger_upper_lte_creates_signal_candidate(self):
         state = deepcopy(self.ui_state)
@@ -1282,9 +1283,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(condition["operator"], "<=")
         self.assertEqual(condition["compare_target"], "BOLLINGER_UPPER")
-        self.assertEqual(condition["value"], 0.1)
+        self.assertEqual(condition["value"], -0.1)
+        self.assertIs(condition["signed_percent_offset"], True)
 
-    def test_sell_condition_b_bollinger_lower_gte_uses_negative_offset(self):
+    def test_sell_condition_b_bollinger_lower_gte_legacy_uses_positive_offset(self):
         state = deepcopy(self.ui_state)
         state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
         state["sell_ui"]["signal_conditions"]["condition_b"] = {
@@ -1302,7 +1304,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(condition["operator"], ">=")
         self.assertEqual(condition["compare_target"], "BOLLINGER_LOWER")
-        self.assertEqual(condition["value"], -0.1)
+        self.assertEqual(condition["value"], 0.1)
+        self.assertIs(condition["signed_percent_offset"], True)
 
     def test_sell_condition_b_bollinger_lower_lte_uses_negative_offset(self):
         state = deepcopy(self.ui_state)
@@ -1323,6 +1326,42 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(condition["operator"], "<=")
         self.assertEqual(condition["compare_target"], "BOLLINGER_LOWER")
         self.assertEqual(condition["value"], -0.1)
+        self.assertIs(condition["signed_percent_offset"], True)
+
+    def test_sell_condition_b_bollinger_explicit_sign_is_independent(self):
+        cases = (
+            ("하향", "+", "이상", "BOLLINGER_LOWER", 0.1, ">="),
+            ("하향", "-", "이상", "BOLLINGER_LOWER", -0.1, ">="),
+            ("상향", "+", "이하", "BOLLINGER_UPPER", 0.1, "<="),
+            ("상향", "-", "이하", "BOLLINGER_UPPER", -0.1, "<="),
+        )
+        for direction, sign, compare, target, value, operator in cases:
+            with self.subTest(direction=direction, sign=sign, compare=compare):
+                state = deepcopy(self.ui_state)
+                state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+                state["sell_ui"]["signal_conditions"]["condition_b"] = {
+                    "bollinger_check": True,
+                    "bollinger_direction_combo": direction,
+                    "bollinger_sign_combo": sign,
+                    "bollinger_compare_combo": compare,
+                    "bollinger_value_line": "0.1",
+                    "bollinger_logic_combo": "AND",
+                }
+
+                result = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state,
+                    deepcopy(self.current_rules),
+                )
+                condition = result["preview_rules"]["indicator_follow_rule_preview"][
+                    "candidates"
+                ]["sell"]["add_signal_candidate"]["value"]["groups"][0][
+                    "conditions"
+                ][0]
+
+                self.assertEqual(target, condition["compare_target"])
+                self.assertEqual(value, condition["value"])
+                self.assertEqual(operator, condition["operator"])
+                self.assertIs(condition["signed_percent_offset"], True)
 
     def test_sell_condition_b_bollinger_inactive_does_not_create_candidate(self):
         state = deepcopy(self.ui_state)

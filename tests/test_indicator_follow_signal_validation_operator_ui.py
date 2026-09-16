@@ -1457,6 +1457,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.sell_signal_condition_b_price_box_sign_combo.setCurrentText("-")
                 window.sell_signal_condition_b_price_box_value_line.setText("0.1")
                 window.sell_signal_condition_b_price_box_compare_combo.setCurrentText("이상")
+                window.sell_signal_condition_b_bollinger_direction_combo.setCurrentText("상향")
+                window.sell_signal_condition_b_bollinger_sign_combo.setCurrentText("-")
+                window.sell_signal_condition_b_bollinger_value_line.setText("0.2")
+                window.sell_signal_condition_b_bollinger_compare_combo.setCurrentText("이하")
                 payload = IndicatorFollowSignalValidationApplyPayload(
                     window.collect_indicator_follow_ui_state()
                 )
@@ -1486,6 +1490,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual("-", sell_b["price_box_sign_combo"])
                 self.assertEqual("0.1", sell_b["price_box_value_line"])
                 self.assertEqual("이상", sell_b["price_box_compare_combo"])
+                self.assertEqual("상향", sell_b["bollinger_direction_combo"])
+                self.assertEqual("-", sell_b["bollinger_sign_combo"])
+                self.assertEqual("0.2", sell_b["bollinger_value_line"])
+                self.assertEqual("이하", sell_b["bollinger_compare_combo"])
                 self.assertEqual(before["buy_ui"] | {"signal_filter": after["buy_ui"]["signal_filter"]}, after["buy_ui"])
                 self.assertEqual(before["sell_ui"] | {"signal_conditions": after["sell_ui"]["signal_conditions"]}, after["sell_ui"])
                 self.assertEqual(

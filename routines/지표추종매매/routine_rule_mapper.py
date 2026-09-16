@@ -2101,6 +2101,7 @@ def _build_sell_condition_b_bollinger_condition(condition_b: dict[str, Any], war
 
     if not any(key in condition_b for key in (
         "bollinger_direction_combo",
+        "bollinger_sign_combo",
         "bollinger_value_line",
         "bollinger_compare_combo",
     )):
@@ -2122,17 +2123,30 @@ def _build_sell_condition_b_bollinger_condition(condition_b: dict[str, Any], war
         warnings.append(f"sell condition B Bollinger compare is not mapped: {condition_b.get('bollinger_compare_combo')!r}")
         return None
 
+    if "bollinger_sign_combo" in condition_b:
+        sign = str(condition_b.get("bollinger_sign_combo") or "").strip()
+    else:
+        sign = "+" if operator == ">=" else "-"
+    if sign not in {"-", "+"}:
+        warnings.append(
+            "sell condition B Bollinger sign is not mapped: "
+            f"{condition_b.get('bollinger_sign_combo')!r}"
+        )
+        return None
+
     offset = _safe_float(condition_b.get("bollinger_value_line"))
     if offset is None:
         warnings.append("sell condition B Bollinger offset is not numeric")
         return None
+    signed_value = abs(offset) if sign == "+" else -abs(offset)
     return {
         "enabled": True,
         "not": False,
         "target": "CLOSE",
         "operator": operator,
         "compare_target": compare_target,
-        "value": abs(offset) if compare_target == "BOLLINGER_UPPER" else -abs(offset),
+        "value": signed_value,
+        "signed_percent_offset": True,
         "description": "UI preview: sell condition B Bollinger band condition",
     }
 

@@ -260,6 +260,94 @@ class SellEmptyExpressionRuntimeTest(unittest.TestCase):
                 self.assertEqual(expression, aggregation["ui_signal_expression"])
                 self.assertTrue(aggregation["ui_expression_result"])
 
+    def test_valid_b_expression_excludes_passing_legacy_macd(self) -> None:
+        expression = self._expression("B")
+        config = self._config(expression=expression, macd_passed=True)
+
+        result, trace = self._evaluate(config)
+
+        self.assertIsNone(result.signal)
+        aggregation = trace["aggregations"][-1]["payload"]
+        self.assertFalse(aggregation["result"])
+        self.assertNotIn(
+            "sell.signals.macd_sell.groups[0]",
+            aggregation["active_group_paths"],
+        )
+        self.assertNotIn(
+            "sell.signals.macd_sell.groups[0]",
+            aggregation["matched_group_paths"],
+        )
+
+    def test_valid_b_expression_passes_without_legacy_macd(self) -> None:
+        expression = self._expression("B")
+        config = self._config(ui_passed={"B"}, expression=expression)
+
+        result, trace = self._evaluate(config)
+
+        self.assertEqual("SELL", result.signal)
+        self.assertEqual(["ui_b"], result.matched_groups)
+        self.assertFalse(any("macd" in detail.lower() for detail in result.details))
+        aggregation = trace["aggregations"][-1]["payload"]
+        self.assertEqual(
+            ["sell.signals.ui_condition_b.groups[0]"],
+            aggregation["matched_group_paths"],
+        )
+
+    def test_valid_and_expression_is_not_rescued_by_legacy_macd(self) -> None:
+        expression = self._expression("A and B")
+        config = self._config(
+            ui_passed={"B"},
+            expression=expression,
+            macd_passed=True,
+        )
+
+        result, _trace = self._evaluate(config)
+
+        self.assertIsNone(result.signal)
+
+    def test_valid_or_expression_reports_only_surviving_ui_evidence(self) -> None:
+        expression = self._expression("A or B")
+        config = self._config(
+            ui_passed={"B"},
+            expression=expression,
+            macd_passed=True,
+        )
+
+        result, trace = self._evaluate(config)
+
+        self.assertEqual("SELL", result.signal)
+        self.assertEqual(["ui_b"], result.matched_groups)
+        aggregation = trace["aggregations"][-1]["payload"]
+        self.assertEqual(
+            ["sell.signals.ui_condition_b.groups[0]"],
+            aggregation["matched_group_paths"],
+        )
+        self.assertFalse(any(
+            "macd_sell" in path
+            for path in aggregation["active_group_paths"]
+            + aggregation["matched_group_paths"]
+        ))
+
+    def test_valid_ui_expression_does_not_change_profit_rate_sell(self) -> None:
+        expression = self._expression("B")
+        config = self._config(
+            expression=expression,
+            macd_passed=True,
+            profit_enabled=True,
+        )
+
+        result, trace = self._evaluate(config, profit_context=True)
+
+        self.assertEqual("SELL", result.signal)
+        self.assertEqual(["profit_rate_sell"], result.matched_groups)
+        self.assertTrue(any("profit_rate_sell" in detail for detail in result.details))
+        aggregation = trace["aggregations"][-1]["payload"]
+        self.assertFalse(any(
+            "macd_sell" in path
+            for path in aggregation["active_group_paths"]
+            + aggregation["matched_group_paths"]
+        ))
+
 
 class SellEmptyExpressionV2IntegrationTest(unittest.TestCase):
     @classmethod
