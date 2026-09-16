@@ -1371,6 +1371,106 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(200, runs[-1].candle_count)
         self.assertEqual([], applies)
 
+    def test_candle_count_enter_and_outside_click_commit_exactly_once(self):
+        enter_window = self._window()
+        enter_window.show()
+        self.app.processEvents()
+        enter_runs = []
+        enter_window.validation_run_requested.connect(enter_runs.append)
+        enter_editor = enter_window.historical_candle_count_spin.lineEdit()
+        enter_editor.selectAll()
+        QTest.keyClicks(enter_editor, "200")
+        QTest.keyClick(enter_editor, Qt.Key_Return)
+        self.app.processEvents()
+
+        self.assertEqual(200, enter_window.historical_candle_count_spin.value())
+        self.assertEqual(1, len(enter_runs))
+        self.assertEqual(200, enter_runs[0].candle_count)
+
+        outside_window = self._window()
+        outside_window.show()
+        self.app.processEvents()
+        outside_runs = []
+        outside_window.validation_run_requested.connect(outside_runs.append)
+        outside_editor = outside_window.historical_candle_count_spin.lineEdit()
+        outside_editor.setText("200")
+        QTest.mouseClick(outside_editor, Qt.LeftButton)
+        self.assertEqual([], outside_runs)
+        QTest.mouseClick(outside_window.validation_status_label, Qt.LeftButton)
+        self.app.processEvents()
+
+        self.assertEqual(200, outside_window.historical_candle_count_spin.value())
+        self.assertEqual(1, len(outside_runs))
+        self.assertEqual(200, outside_runs[0].candle_count)
+        outside_window.historical_candle_count_spin.editingFinished.emit()
+        self.assertEqual(1, len(outside_runs))
+
+        outside_window.historical_candle_count_spin.lineEdit().setText("200")
+        QTest.mouseClick(outside_window.result_summary_label, Qt.LeftButton)
+        self.app.processEvents()
+        self.assertEqual(1, len(outside_runs))
+
+    def test_candle_count_settings_apply_click_commits_then_applies_after_replay(self):
+        window = self._window()
+        window.show()
+        self.app.processEvents()
+        runs = []
+        applies = []
+        window.validation_run_requested.connect(runs.append)
+        window.settings_apply_requested.connect(applies.append)
+        window.historical_candle_count_spin.lineEdit().setText("200")
+
+        QTest.mouseClick(window.primary_validation_action_button, Qt.LeftButton)
+        self.app.processEvents()
+
+        self.assertEqual(1, len(runs))
+        self.assertEqual(200, runs[0].candle_count)
+        self.assertEqual([], applies)
+        self.assertTrue(window._settings_apply_after_validation)
+
+        window.set_replay_snapshot(self._candle_count_snapshot(200))
+
+        self.assertEqual(1, len(runs))
+        self.assertEqual(1, len(applies))
+        self.assertFalse(window._settings_apply_after_validation)
+
+    def test_candle_count_outside_chart_click_preserves_candle_selection(self):
+        window = self._window()
+        window.resize(1400, 800)
+        window.show()
+        self.app.processEvents()
+        window.set_replay_snapshot(self._candle_count_snapshot(100))
+        self.app.processEvents()
+        runs = []
+        window.validation_run_requested.connect(runs.append)
+        window.historical_candle_count_spin.lineEdit().setText("200")
+        selected_index = 20
+        click_x = round(window.canvas._x_for_index(selected_index))
+        scale = window.canvas.price_scale()
+        click_y = round((scale.plot_top + scale.plot_bottom) / 2)
+
+        QTest.mouseClick(
+            window.canvas,
+            Qt.LeftButton,
+            pos=QPoint(click_x, click_y),
+        )
+        self.app.processEvents()
+
+        self.assertEqual(1, len(runs))
+        self.assertEqual(200, runs[0].candle_count)
+        self.assertEqual(selected_index, window.selected_evaluation_index)
+
+    def test_programmatic_candle_count_set_does_not_request_validation(self):
+        window = self._window()
+        runs = []
+        window.validation_run_requested.connect(runs.append)
+
+        window.set_historical_candle_count(200)
+        window.historical_candle_count_spin.editingFinished.emit()
+
+        self.assertEqual(200, window.historical_candle_count_spin.value())
+        self.assertEqual([], runs)
+
     def test_entry_reset_restores_context_strategy_and_logical_chart_view(self):
         window = self._window()
         window.set_historical_candle_count(100)

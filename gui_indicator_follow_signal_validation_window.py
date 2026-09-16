@@ -1303,7 +1303,11 @@ class IndicatorFollowSignalValidationWindow(
         self.setModal(False)
         self.setMinimumSize(0, 700)
         self.resize(max(1, self.sizeHint().width()), 900)
+        self._last_committed_historical_candle_count = (
+            self.historical_candle_count_spin.value()
+        )
         self._connect_signal_ui_change_tracking()
+        QApplication.instance().installEventFilter(self)
         self._set_primary_validation_action_state("validate")
 
     @property
@@ -1681,6 +1685,31 @@ class IndicatorFollowSignalValidationWindow(
             setattr(self, f"{name}_header_separator", separator)
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.MouseButtonPress:
+            watched_widget = watched if isinstance(watched, QWidget) else None
+            spin = getattr(self, "historical_candle_count_spin", None)
+            click_is_in_window = (
+                watched_widget is self
+                or (
+                    watched_widget is not None
+                    and self.isAncestorOf(watched_widget)
+                )
+            )
+            click_is_in_spin = (
+                spin is not None
+                and watched_widget is not None
+                and (
+                    watched_widget is spin
+                    or spin.isAncestorOf(watched_widget)
+                )
+            )
+            if click_is_in_window and not click_is_in_spin:
+                self._commit_historical_candle_count_if_changed(
+                    apply_after_validation=(
+                        watched_widget
+                        is getattr(self, "primary_validation_action_button", None)
+                    )
+                )
         chart_viewport = getattr(
             getattr(self, "chart_scroll_area", None),
             "viewport",
@@ -1942,6 +1971,9 @@ class IndicatorFollowSignalValidationWindow(
         ):
             raise ValueError("candle_count must be a positive integer")
         self.historical_candle_count_spin.setValue(candle_count)
+        self._last_committed_historical_candle_count = (
+            self.historical_candle_count_spin.value()
+        )
 
     def commit_entry_state(self) -> _ValidationEntryState:
         """Capture the immutable V2-open baseline exactly once."""
@@ -1996,8 +2028,23 @@ class IndicatorFollowSignalValidationWindow(
             self._on_validation_context_changed
         )
         self.historical_candle_count_spin.editingFinished.connect(
-            self._on_validation_context_changed
+            self._commit_historical_candle_count_if_changed
         )
+
+    def _commit_historical_candle_count_if_changed(
+        self,
+        *,
+        apply_after_validation: bool = False,
+    ) -> bool:
+        self.historical_candle_count_spin.interpretText()
+        candle_count = self.historical_candle_count_spin.value()
+        if candle_count == self._last_committed_historical_candle_count:
+            return False
+        self._last_committed_historical_candle_count = candle_count
+        self._on_validation_context_changed(
+            apply_after_validation=apply_after_validation
+        )
+        return True
 
     def _on_signal_validation_ui_changed(self, *_args) -> None:
         if self._entry_reset_in_progress:
@@ -2007,11 +2054,16 @@ class IndicatorFollowSignalValidationWindow(
         self._validated_ui_fingerprint = None
         self._set_primary_validation_action_state("validate")
 
-    def _on_validation_context_changed(self, *_args) -> None:
+    def _on_validation_context_changed(
+        self,
+        *_args,
+        apply_after_validation: bool = False,
+    ) -> None:
         if self._entry_reset_in_progress:
             return
-        self._settings_apply_after_validation = False
-        self._request_validation()
+        self._settings_apply_after_validation = apply_after_validation
+        if self._request_validation() is None:
+            self._settings_apply_after_validation = False
 
     def reset_to_entry_state(self):
         self._entry_reset_source_ready = None
@@ -2041,6 +2093,9 @@ class IndicatorFollowSignalValidationWindow(
             if fatal_skips:
                 raise ValueError("entry UI state could not be restored")
             self.historical_candle_count_spin.setValue(entry.candle_count)
+            self._last_committed_historical_candle_count = (
+                self.historical_candle_count_spin.value()
+            )
             self._signal_validation_stock = (
                 None
                 if entry.stock is None
