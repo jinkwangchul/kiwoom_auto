@@ -947,7 +947,7 @@ class ConnectedUiAndSaveLoadTest(unittest.TestCase):
         self.assertEqual(condition_a["ocr_logic_combo"], "OR")
         self.assertEqual(condition_c["macd_logic_combo"], "NOT")
 
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
         other = dialog_module.IndicatorFollowRoutineSettingsDialog(rules_path=self.rules_path)
         try:

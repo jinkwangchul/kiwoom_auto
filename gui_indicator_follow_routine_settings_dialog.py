@@ -84,6 +84,11 @@ from gui_indicator_follow_sell_controls import (
     normalize_legacy_sell_price_box_sign_ui_state,
     normalize_legacy_sell_bollinger_sign_ui_state,
 )
+from indicator_follow_settings_compatibility import (
+    canonical_indicator_follow_ui_state,
+    get_canonical_fresh_defaults,
+    normalize_sell_selected_set_authority,
+)
 from gui_routine_registry import get_routine_records, normalize_routine_name
 from gui_toast import show_toast
 from gui_window_policy import (
@@ -1534,31 +1539,53 @@ class IndicatorFollowRoutineSettingsDialog(
             self._settings_undo_unavailable_reason = (
                 "Canonical Fresh Defaults are not configured."
             )
-            if not self.group_id or not self.definition_id:
-                return
-            try:
-                remembered = LogicalGroupRepository(
-                    Path(__file__).resolve().parent
-                ).remembered_registration_state(
-                    self.group_id,
-                    self.definition_id,
-                )
-                if not isinstance(remembered, dict):
+            if self.group_id and self.definition_id:
+                try:
+                    remembered = LogicalGroupRepository(
+                        Path(__file__).resolve().parent
+                    ).remembered_registration_state(
+                        self.group_id,
+                        self.definition_id,
+                    )
+                except Exception as exc:
+                    self._last_state_authority_error = str(exc)
+                    remembered = None
+                if isinstance(remembered, dict):
+                    try:
+                        state = remembered.get("indicator_follow_ui_state")
+                        if not isinstance(state, dict):
+                            raise ValueError("group remembered UI state is unavailable")
+                        result = self.apply_indicator_follow_ui_state(
+                            deepcopy(state),
+                            source=STATE_AUTHORITY_GROUP_REMEMBERED,
+                        )
+                        if result.get("sync_errors"):
+                            raise ValueError("group remembered UI state could not be applied")
+                        self._registration_initial_state_source = (
+                            STATE_AUTHORITY_GROUP_REMEMBERED
+                        )
+                    except Exception as exc:
+                        self._last_state_authority_error = str(exc)
                     return
-                state = remembered.get("indicator_follow_ui_state")
-                if not isinstance(state, dict):
-                    raise ValueError("group remembered UI state is unavailable")
+
+            canonical_defaults = get_canonical_fresh_defaults(self.definition_id)
+            if isinstance(canonical_defaults, dict):
                 result = self.apply_indicator_follow_ui_state(
-                    deepcopy(state),
-                    source=STATE_AUTHORITY_GROUP_REMEMBERED,
+                    deepcopy(canonical_defaults),
+                    source=STATE_AUTHORITY_CANONICAL_DEFAULT,
                 )
                 if result.get("sync_errors"):
-                    raise ValueError("group remembered UI state could not be applied")
+                    self._last_state_authority_error = (
+                        "Canonical Fresh Defaults could not be applied."
+                    )
+                    return
                 self._registration_initial_state_source = (
-                    STATE_AUTHORITY_GROUP_REMEMBERED
+                    STATE_AUTHORITY_CANONICAL_DEFAULT
                 )
-            except Exception as exc:
-                self._last_state_authority_error = str(exc)
+                self._initial_settings_undo_snapshot = (
+                    self._canonical_settings_ui_snapshot(canonical_defaults)
+                )
+                self._settings_undo_unavailable_reason = ""
             return
 
         self._registration_initial_state_source = STATE_AUTHORITY_INSTANCE_CURRENT
@@ -2800,6 +2827,23 @@ class IndicatorFollowRoutineSettingsDialog(
         return comparison
 
     def save_indicator_follow_ui_state_to_rules(self):
+        """Block the obsolete direct writer on normal Registration/Edit paths."""
+        result = {
+            "success": False,
+            "path": str(self.rules_path),
+            "saved_namespace": "indicator_follow_ui_state",
+            "core_keys_unchanged": {},
+            "error": (
+                "direct UI-state writer is maintenance-only; use the validated "
+                "Registration/Edit commit boundary"
+            ),
+            "writer_authority": "MAINTENANCE_ONLY",
+        }
+        self._last_ui_state_save_result = result
+        return result
+
+    def save_indicator_follow_ui_state_to_rules_for_maintenance(self):
+        """Persist only isolated maintenance/test fixtures, never normal Save."""
         core_keys = [
             "buy",
             "sell",
@@ -2910,6 +2954,20 @@ class IndicatorFollowRoutineSettingsDialog(
         return result
 
     def save_indicator_follow_rule_pending_to_rules(self):
+        """Block the obsolete pending-state direct writer on normal paths."""
+        return {
+            "success": False,
+            "path": str(self.rules_path),
+            "saved_namespace": "indicator_follow_rule_pending",
+            "core_keys_unchanged": {},
+            "error": (
+                "direct pending-state writer is maintenance-only; use the "
+                "validated commit boundary"
+            ),
+            "writer_authority": "MAINTENANCE_ONLY",
+        }
+
+    def save_indicator_follow_rule_pending_to_rules_for_maintenance(self):
         core_keys = [
             "bar",
             "buy",
@@ -3498,6 +3556,7 @@ class IndicatorFollowRoutineSettingsDialog(
             state,
             source=source,
         )
+        state = normalize_sell_selected_set_authority(state)
         state = normalize_indicator_follow_basic_ui_state(state)
         self._apply_named_ui_values(state.get("basic", {}), result=result)
 
@@ -3661,6 +3720,15 @@ class IndicatorFollowRoutineSettingsDialog(
                 "reason": "values_not_dict",
             })
 
+        complete_ui = state.get("complete_ui", {})
+        if isinstance(complete_ui, dict):
+            self._apply_named_ui_values(complete_ui, result=result)
+        else:
+            result["skipped"].append({
+                "name": "complete_ui",
+                "reason": "values_not_dict",
+            })
+
         result["sync_errors"].extend(self._sync_indicator_follow_ui_after_apply())
         return result
 
@@ -3672,9 +3740,6 @@ class IndicatorFollowRoutineSettingsDialog(
             "basic_error_policy_combo",
             "buy_signal_expr_line",
             "sell_signal_expr_line",
-            "sell_method_select_a_check",
-            "sell_method_select_b_check",
-            "sell_method_select_c_check",
         ]
 
         buy_base_names = sorted(
@@ -3807,11 +3872,21 @@ class IndicatorFollowRoutineSettingsDialog(
             "complete_policy_active_buy_value_line",
         ]
 
+        selected_sets = {
+            "a": bool(getattr(self, "sell_method_select_a_check", None).isChecked())
+            if getattr(self, "sell_method_select_a_check", None) is not None
+            else False,
+            "b": bool(getattr(self, "sell_method_select_b_check", None).isChecked())
+            if getattr(self, "sell_method_select_b_check", None) is not None
+            else False,
+            "c": bool(getattr(self, "sell_method_select_c_check", None).isChecked())
+            if getattr(self, "sell_method_select_c_check", None) is not None
+            else False,
+        }
         legacy_sell_summary = {}
         legacy_sell_summary.update(
             self._collect_prefixed_ui_values(
                 (
-                    "sell_method_",
                     "sell_complete_",
                     "macd_sell_",
                     "profit_sell_",
@@ -3831,6 +3906,11 @@ class IndicatorFollowRoutineSettingsDialog(
                 ]
             )
         )
+        legacy_sell_summary.update({
+            "sell_method_select_a_check": selected_sets["a"],
+            "sell_method_select_b_check": selected_sets["b"],
+            "sell_method_select_c_check": selected_sets["c"],
+        })
         sell_setting_excluded_names = {
             name
             for name in vars(self)
@@ -3857,17 +3937,7 @@ class IndicatorFollowRoutineSettingsDialog(
             },
             "selected_sets": dict(self._sell_method_selection_load_error)
             if isinstance(getattr(self, "_sell_method_selection_load_error", None), dict)
-            else {
-                "a": bool(getattr(self, "sell_method_select_a_check", None).isChecked())
-                if getattr(self, "sell_method_select_a_check", None) is not None
-                else False,
-                "b": bool(getattr(self, "sell_method_select_b_check", None).isChecked())
-                if getattr(self, "sell_method_select_b_check", None) is not None
-                else False,
-                "c": bool(getattr(self, "sell_method_select_c_check", None).isChecked())
-                if getattr(self, "sell_method_select_c_check", None) is not None
-                else False,
-            },
+            else selected_sets,
             "setting_a": self._collect_prefixed_ui_values_without_prefix(
                 "sell_a_",
                 excluded_names=sell_setting_excluded_names,
@@ -3883,12 +3953,12 @@ class IndicatorFollowRoutineSettingsDialog(
             "legacy_summary": legacy_sell_summary,
         }
 
-        return {
+        return canonical_indicator_follow_ui_state({
             "basic": self._collect_named_ui_values(basic_names),
             "buy_ui": buy_ui,
             "sell_ui": sell_ui,
             "complete_ui": self._collect_named_ui_values(complete_names),
-        }
+        })
 def main():
     rules_path = sys.argv[1] if len(sys.argv) >= 2 else None
     app = QApplication(sys.argv)

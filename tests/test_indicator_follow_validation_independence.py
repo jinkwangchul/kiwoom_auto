@@ -382,7 +382,7 @@ class IndicatorFollowValidationIndependenceTest(unittest.TestCase):
                 assert isinstance(dialog.collect_indicator_follow_ui_state(), dict)
                 preview = dialog.build_engine_rules_preview_from_current_ui_state()
                 assert isinstance(preview, dict)
-                saved = dialog.save_indicator_follow_ui_state_to_rules()
+                saved = dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
                 assert saved.get("success") is True, saved
                 dialog.close()
                 owner.close()

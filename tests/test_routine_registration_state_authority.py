@@ -35,6 +35,7 @@ from routine_instance_repository import (
 GROUP_1 = "dbf3790f-c00f-427f-90dc-15d8283f4e1a"
 GROUP_2 = "0cb21141-cadc-4701-acce-7c915a9c0259"
 INSTANCE_1 = UUID("8898a834-e994-4fc6-bcdd-df118622df88")
+INSTANCE_2 = UUID("f109ad1e-b388-456f-a8ed-04232301f6ad")
 
 
 class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
@@ -180,6 +181,101 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
             self.assertEqual(template_before, template_path.read_bytes())
 
     @patch("routine_instance_repository._append_instance_lifecycle_event")
+    def test_registration_round_trip_updates_only_group_memory_and_new_instance(
+        self,
+        _event,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_definition(root)
+            self._write_group(root, GROUP_1)
+            instance_ids = iter((INSTANCE_1, INSTANCE_2))
+            repository = RoutineInstanceRepository(
+                root,
+                id_factory=lambda: next(instance_ids),
+                now_factory=lambda: datetime(
+                    2026, 9, 16, 10, 0, tzinfo=timezone.utc
+                ),
+            )
+            state_b = {
+                "basic": {"value": "B"},
+                "sell_ui": {"selected_sets": {"a": True, "b": False, "c": False}},
+            }
+            rules_b = self._rules(state_b)
+            first = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="instance-1",
+                    group_id=GROUP_1,
+                ),
+                rules_b,
+            )
+            self.assertTrue(first.success, first.error)
+            _remember_successful_registration_state(
+                project_root=root,
+                group_id=GROUP_1,
+                definition_id="indicator_follow",
+                instance=first.instance,
+                expected_rules=rules_b,
+            )
+
+            first_rules_path = Path(first.instance.rules_path)
+            first_baseline_path = first_rules_path.parent / REGISTRATION_BASELINE_FILE
+            first_rules_before = first_rules_path.read_bytes()
+            first_baseline_before = first_baseline_path.read_bytes()
+            current_b = json.loads(first_rules_before)["indicator_follow_ui_state"][
+                "state"
+            ]
+            baseline_b = repository.load_registration_baseline(
+                first.instance.instance_id
+            )["indicator_follow_ui_state"]
+            remembered_b = LogicalGroupRepository(root).remembered_registration_state(
+                GROUP_1,
+                "indicator_follow",
+            )["indicator_follow_ui_state"]
+            self.assertEqual(state_b, current_b)
+            self.assertEqual(state_b, baseline_b)
+            self.assertEqual(state_b, remembered_b)
+
+            state_c = {
+                "basic": {"value": "C"},
+                "sell_ui": {"selected_sets": {"a": False, "b": True, "c": False}},
+            }
+            rules_c = self._rules(state_c)
+            second = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="instance-2",
+                    group_id=GROUP_1,
+                ),
+                rules_c,
+            )
+            self.assertTrue(second.success, second.error)
+            _remember_successful_registration_state(
+                project_root=root,
+                group_id=GROUP_1,
+                definition_id="indicator_follow",
+                instance=second.instance,
+                expected_rules=rules_c,
+            )
+
+            self.assertEqual(first_rules_before, first_rules_path.read_bytes())
+            self.assertEqual(first_baseline_before, first_baseline_path.read_bytes())
+            self.assertEqual(
+                state_c,
+                LogicalGroupRepository(root).remembered_registration_state(
+                    GROUP_1,
+                    "indicator_follow",
+                )["indicator_follow_ui_state"],
+            )
+            self.assertEqual(
+                state_c,
+                repository.load_registration_baseline(second.instance.instance_id)[
+                    "indicator_follow_ui_state"
+                ],
+            )
+
+    @patch("routine_instance_repository._append_instance_lifecycle_event")
     def test_legacy_instance_without_baseline_is_not_backfilled(self, _event) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -286,7 +382,9 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
         dialog.apply_indicator_follow_ui_state = apply_state
         with patch(
             "gui_indicator_follow_routine_settings_dialog.LogicalGroupRepository"
-        ) as repository_type:
+        ) as repository_type, patch(
+            "gui_indicator_follow_routine_settings_dialog.get_canonical_fresh_defaults"
+        ) as canonical_defaults:
             repository_type.return_value.remembered_registration_state.return_value = {
                 "indicator_follow_ui_state": remembered_state
             }
@@ -304,6 +402,78 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
         )
         self.assertIsNone(dialog._initial_settings_undo_snapshot)
         self.assertEqual(STATE_AUTHORITY_CANONICAL_DEFAULT, dialog._settings_undo_source)
+        canonical_defaults.assert_not_called()
+
+    def test_registration_uses_canonical_default_only_when_group_memory_is_absent(self) -> None:
+        canonical_state = {
+            "basic": {"basic_signal_interval_combo": "5"},
+            "sell_ui": {"selected_sets": {"a": True, "b": False, "c": False}},
+        }
+        captured = {}
+        dialog = SimpleNamespace(
+            settings_mode="registration",
+            group_id=GROUP_1,
+            definition_id="indicator_follow",
+            _canonical_settings_ui_snapshot=lambda state: json.dumps(
+                state,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+        def apply_state(state, *, source=None):
+            captured["state"] = state
+            captured["source"] = source
+            return {"sync_errors": []}
+
+        dialog.apply_indicator_follow_ui_state = apply_state
+        with patch(
+            "gui_indicator_follow_routine_settings_dialog.LogicalGroupRepository"
+        ) as repository_type, patch(
+            "gui_indicator_follow_routine_settings_dialog.get_canonical_fresh_defaults",
+            return_value=canonical_state,
+        ):
+            repository_type.return_value.remembered_registration_state.return_value = None
+            IndicatorFollowRoutineSettingsDialog._initialize_settings_state_authority(dialog)
+
+        self.assertEqual(STATE_AUTHORITY_CANONICAL_DEFAULT, captured["source"])
+        self.assertEqual(canonical_state, captured["state"])
+        self.assertEqual(
+            STATE_AUTHORITY_CANONICAL_DEFAULT,
+            dialog._registration_initial_state_source,
+        )
+        self.assertEqual(
+            canonical_state,
+            json.loads(dialog._initial_settings_undo_snapshot),
+        )
+        self.assertEqual("", dialog._settings_undo_unavailable_reason)
+
+    def test_invalid_existing_group_memory_does_not_fall_through_to_defaults(self) -> None:
+        dialog = SimpleNamespace(
+            settings_mode="registration",
+            group_id=GROUP_1,
+            definition_id="indicator_follow",
+            apply_indicator_follow_ui_state=Mock(),
+        )
+        with patch(
+            "gui_indicator_follow_routine_settings_dialog.LogicalGroupRepository"
+        ) as repository_type, patch(
+            "gui_indicator_follow_routine_settings_dialog.get_canonical_fresh_defaults",
+            return_value={"basic": {"value": "DEFAULT"}},
+        ) as canonical_defaults:
+            repository_type.return_value.remembered_registration_state.return_value = {
+                "indicator_follow_ui_state": "invalid"
+            }
+            IndicatorFollowRoutineSettingsDialog._initialize_settings_state_authority(dialog)
+
+        canonical_defaults.assert_not_called()
+        dialog.apply_indicator_follow_ui_state.assert_not_called()
+        self.assertEqual(
+            STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
+            dialog._registration_initial_state_source,
+        )
+        self.assertIn("unavailable", dialog._last_state_authority_error)
 
     def test_registration_without_group_memory_is_explicit_legacy_fallback(self) -> None:
         dialog = SimpleNamespace(
@@ -314,7 +484,10 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
         )
         with patch(
             "gui_indicator_follow_routine_settings_dialog.LogicalGroupRepository"
-        ) as repository_type:
+        ) as repository_type, patch(
+            "gui_indicator_follow_routine_settings_dialog.get_canonical_fresh_defaults",
+            return_value=None,
+        ):
             repository_type.return_value.remembered_registration_state.return_value = None
             IndicatorFollowRoutineSettingsDialog._initialize_settings_state_authority(dialog)
         self.assertEqual(
@@ -426,6 +599,66 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
                     )
                 )
             remember.assert_not_called()
+
+    @patch("gui_indicator_follow_routine_settings_dialog._refresh_routine_assignment_views")
+    @patch("gui_indicator_follow_routine_settings_dialog.show_toast")
+    @patch("gui_indicator_follow_routine_settings_dialog.load_persisted_routine_instances", return_value=[])
+    @patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.warning")
+    @patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.critical")
+    def test_group_memory_failure_is_secondary_after_instance_create(
+        self,
+        critical,
+        warning,
+        _instances,
+        _toast,
+        _refresh,
+    ) -> None:
+        owner = SimpleNamespace()
+        registration_request = RoutineInstanceCreateRequest(
+            definition_id="indicator_follow",
+            display_name="instance",
+            group_id=GROUP_1,
+        )
+        fake_dialog = Mock()
+        fake_dialog.exec_.return_value = QDialog.Accepted
+        fake_dialog.registration_request = registration_request
+        instance = SimpleNamespace(
+            instance_id=str(INSTANCE_1),
+            display_name="instance",
+            rules_path="unused.json",
+            created_at="2026-09-16T10:00:00+00:00",
+        )
+        create_result = RoutineInstanceCreateResult(True, instance=instance)
+
+        with patch(
+            "gui_routine_registration_dialog.RoutineRegistrationDialog",
+            return_value=fake_dialog,
+        ), patch.object(
+            RoutineInstanceRepository,
+            "create_instance",
+            return_value=create_result,
+        ) as create_instance, patch(
+            "gui_indicator_follow_routine_settings_dialog._remember_successful_registration_state",
+            side_effect=OSError("remember failed"),
+        ) as remember:
+            actual = register_routine_instance_snapshot(
+                owner,
+                definition_id="indicator_follow",
+                definition_display_name="지표추종매매",
+                group_id=GROUP_1,
+                rules_provider=lambda: {
+                    "success": True,
+                    "rules": self._rules({"basic": {"value": "B"}}),
+                },
+            )
+
+        self.assertIs(instance, actual)
+        create_instance.assert_called_once()
+        remember.assert_called_once()
+        critical.assert_not_called()
+        warning.assert_called_once()
+        self.assertEqual(str(INSTANCE_1), owner.last_registered_instance_id)
+        self.assertEqual("remember failed", owner._last_routine_registration_error)
 
 
 if __name__ == "__main__":

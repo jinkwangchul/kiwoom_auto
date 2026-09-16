@@ -705,7 +705,9 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                     RoutineInstanceRepository,
                     "create_instance",
                 ) as create_instance:
-                    result = dialog.save_indicator_follow_ui_state_to_rules()
+                    result = (
+                        dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
+                    )
                 create_instance.assert_not_called()
                 self.assertTrue(result["success"], result.get("error"))
             finally:

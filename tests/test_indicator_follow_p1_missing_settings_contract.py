@@ -127,7 +127,7 @@ class AdditionalNamespaceContractTest(unittest.TestCase):
         self.dialog.buy_additional_active_method_combo.setCurrentText("현재가")
         expected = self.dialog.collect_indicator_follow_ui_state()["buy_ui"]["additional"]
 
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
         actual = payload["indicator_follow_ui_state"]["state"]["buy_ui"]["additional"]
 

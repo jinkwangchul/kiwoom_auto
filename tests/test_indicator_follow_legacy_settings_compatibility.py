@@ -14,8 +14,11 @@ from gui_indicator_follow_routine_settings_dialog import (
     normalize_buy_situation_ui_state,
 )
 from indicator_follow_settings_compatibility import (
+    canonical_indicator_follow_ui_state,
+    get_canonical_fresh_defaults,
     legacy_buy_bollinger_sign,
     legacy_sell_signed_percent_sign,
+    normalize_sell_selected_set_authority,
 )
 
 
@@ -216,6 +219,114 @@ class IndicatorFollowLegacySettingsCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(STATE_AUTHORITY_CANONICAL_DEFAULT, result["source"])
         self.assertEqual(-1, index)
+
+    def test_fresh_default_provider_is_explicitly_unavailable(self) -> None:
+        self.assertIsNone(get_canonical_fresh_defaults("indicator_follow"))
+
+    def test_sell_selected_sets_are_canonical_and_legacy_fields_are_derived(self) -> None:
+        state = {
+            "basic": {
+                "sell_method_select_a_check": False,
+                "sell_method_select_b_check": True,
+                "sell_method_select_c_check": False,
+            },
+            "sell_ui": {
+                "selected_sets": {"a": True, "b": False, "c": True},
+                "legacy_summary": {
+                    "sell_method_select_a_check": False,
+                    "sell_method_select_b_check": True,
+                    "sell_method_select_c_check": False,
+                    "other_legacy_value": "kept",
+                },
+            },
+        }
+
+        normalized = normalize_sell_selected_set_authority(state)
+
+        self.assertEqual(
+            {"a": True, "b": False, "c": True},
+            normalized["sell_ui"]["selected_sets"],
+        )
+        self.assertNotIn("sell_method_select_a_check", normalized["basic"])
+        self.assertEqual(
+            {
+                "sell_method_select_a_check": True,
+                "sell_method_select_b_check": False,
+                "sell_method_select_c_check": True,
+                "other_legacy_value": "kept",
+            },
+            normalized["sell_ui"]["legacy_summary"],
+        )
+
+    def test_legacy_selected_set_is_used_only_when_canonical_value_is_absent(self) -> None:
+        normalized = normalize_sell_selected_set_authority(
+            {
+                "basic": {
+                    "sell_method_select_a_check": False,
+                    "sell_method_select_b_check": True,
+                    "sell_method_select_c_check": False,
+                },
+                "sell_ui": {"legacy_summary": {}},
+            }
+        )
+
+        self.assertEqual(
+            {"a": False, "b": True, "c": False},
+            normalized["sell_ui"]["selected_sets"],
+        )
+        self.assertEqual(
+            False,
+            normalized["sell_ui"]["legacy_summary"][
+                "sell_method_select_a_check"
+            ],
+        )
+
+    def test_full_collect_apply_collect_is_canonically_equal(self) -> None:
+        source = self._dialog()
+        target = self._dialog()
+        try:
+            source.sell_method_select_a_check.setChecked(False)
+            source.sell_method_select_b_check.setChecked(True)
+            source.sell_method_select_c_check.setChecked(False)
+            before = source.collect_indicator_follow_ui_state()
+            result = target.apply_indicator_follow_ui_state(
+                before,
+                source=STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
+            )
+            after = target.collect_indicator_follow_ui_state()
+        finally:
+            source.close()
+            target.close()
+
+        self.assertFalse(result["sync_errors"])
+        self.assertEqual(
+            canonical_indicator_follow_ui_state(before),
+            canonical_indicator_follow_ui_state(after),
+        )
+        self.assertNotIn(
+            "sell_method_select_a_check",
+            after["basic"],
+        )
+        self.assertEqual(
+            {"a": False, "b": True, "c": False},
+            after["sell_ui"]["selected_sets"],
+        )
+
+    def test_normal_direct_writers_are_blocked_and_template_is_unchanged(self) -> None:
+        dialog = self._dialog()
+        template_before = self.rules_path.read_bytes()
+        try:
+            dialog.basic_signal_interval_combo.setCurrentText("3")
+            ui_result = dialog.save_indicator_follow_ui_state_to_rules()
+            pending_result = dialog.save_indicator_follow_rule_pending_to_rules()
+        finally:
+            dialog.close()
+
+        self.assertFalse(ui_result["success"])
+        self.assertFalse(pending_result["success"])
+        self.assertEqual("MAINTENANCE_ONLY", ui_result["writer_authority"])
+        self.assertEqual("MAINTENANCE_ONLY", pending_result["writer_authority"])
+        self.assertEqual(template_before, self.rules_path.read_bytes())
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_additional_active_compare_combo.setCurrentText("이탈")
         expected = deepcopy(self._state()["buy_ui"]["additional"])
 
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
         self.dialog.buy_price_compare_skip_ratio_line.setText("9")
         self.dialog.buy_additional_active_ratio_line.setText("8")
@@ -179,7 +179,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_base_ratio_compare_combo.setCurrentText("이탈")
         expected = deepcopy(self._state()["buy_ui"]["base"])
 
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
         payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
         self.dialog.buy_base_ratio_direction_combo.setCurrentText("상향")
@@ -355,7 +355,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_situation_response_setting2_compare_combo.setCurrentText("이하")
         expected = deepcopy(self._state()["buy_ui"]["situation"])
 
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
         payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
         self.dialog.buy_situation_response_setting1_direction_combo.setCurrentText("상향")
@@ -560,7 +560,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_last_round_active_compare_combo.setCurrentText("이하")
         expected = deepcopy(self._state()["buy_ui"]["base"]["last_round_active_buy"])
 
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
         self.dialog.buy_last_round_active_ratio_line.setText("9")
         payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
@@ -627,7 +627,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_cycle_time_mode_combo.setCurrentText("다중비율")
         self.dialog.buy_cycle_ratio_value_line.setText("0.37")
         expected_cycle = deepcopy(self._state()["buy_ui"]["cycle"])
-        saved = self.dialog.save_indicator_follow_ui_state_to_rules()
+        saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
         self.dialog.buy_cycle_ratio_value_line.setText("9")
         payload = json.loads(self.rules_path.read_text(encoding="utf-8"))
