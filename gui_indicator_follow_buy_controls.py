@@ -21,6 +21,7 @@ from gui_indicator_follow_buy_method_controls import (
     IndicatorFollowBuyMethodControlsMixin,
     sync_buy_direction_comparator,
 )
+from indicator_follow_settings_compatibility import legacy_buy_bollinger_sign
 
 
 BUY_BOLLINGER_SIGN_VALUES = frozenset({"-", "+"})
@@ -48,10 +49,7 @@ def normalize_legacy_buy_bollinger_sign_ui_state(ui_state):
         return ui_state
     if "buy_bollinger_sign_combo" in signal_filter:
         return ui_state
-    legacy_sign = {
-        "하향": "-",
-        "상향": "+",
-    }.get(str(signal_filter.get("buy_bollinger_direction_combo") or "").strip())
+    legacy_sign = legacy_buy_bollinger_sign(signal_filter)
     if legacy_sign is None:
         return ui_state
     normalized = deepcopy(ui_state)

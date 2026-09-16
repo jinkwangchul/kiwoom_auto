@@ -15,6 +15,10 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from indicator_follow_settings_compatibility import (
+    legacy_sell_signed_percent_sign,
+)
+
 
 SELL_PRICE_COMBO_VALUES = ("현재가", "평단가")
 SELL_PRICE_RESELECTION_TEXT = "가격 기준 재선택 필요"
@@ -51,14 +55,10 @@ def normalize_legacy_sell_price_box_sign_ui_state(ui_state):
         return ui_state
     if "price_box_sign_combo" in condition_b:
         return ui_state
-    legacy_sign = {
-        "이상": "+",
-        ">=": "+",
-        "GTE": "+",
-        "이하": "-",
-        "<=": "-",
-        "LTE": "-",
-    }.get(str(condition_b.get("price_box_compare_combo") or "").strip().upper())
+    legacy_sign = legacy_sell_signed_percent_sign(
+        condition_b,
+        compare_field="price_box_compare_combo",
+    )
     if legacy_sign is None:
         return ui_state
     normalized = deepcopy(ui_state)
@@ -91,14 +91,10 @@ def normalize_legacy_sell_bollinger_sign_ui_state(ui_state):
         return ui_state
     if "bollinger_sign_combo" in condition_b:
         return ui_state
-    legacy_sign = {
-        "이상": "+",
-        ">=": "+",
-        "GTE": "+",
-        "이하": "-",
-        "<=": "-",
-        "LTE": "-",
-    }.get(str(condition_b.get("bollinger_compare_combo") or "").strip().upper())
+    legacy_sign = legacy_sell_signed_percent_sign(
+        condition_b,
+        compare_field="bollinger_compare_combo",
+    )
     if legacy_sign is None:
         return ui_state
     normalized = deepcopy(ui_state)

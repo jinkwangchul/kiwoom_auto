@@ -278,8 +278,9 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
             definition_id="indicator_follow",
         )
 
-        def apply_state(state):
+        def apply_state(state, *, source=None):
             captured["state"] = normalize_legacy_buy_bollinger_sign_ui_state(state)
+            captured["source"] = source
             return {"sync_errors": []}
 
         dialog.apply_indicator_follow_ui_state = apply_state
@@ -294,6 +295,7 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
             )
 
         self.assertEqual(STATE_AUTHORITY_GROUP_REMEMBERED, dialog._registration_initial_state_source)
+        self.assertEqual(STATE_AUTHORITY_GROUP_REMEMBERED, captured["source"])
         self.assertEqual(
             "+",
             captured["state"]["buy_ui"]["signal_filter"][
@@ -350,7 +352,10 @@ class RoutineRegistrationStateAuthorityTest(unittest.TestCase):
             IndicatorFollowRoutineSettingsDialog.settings_undo_target(edit)
         )
         applied = IndicatorFollowRoutineSettingsDialog.restore_settings_undo_snapshot(edit)
-        edit.apply_indicator_follow_ui_state.assert_called_once_with(baseline_state)
+        edit.apply_indicator_follow_ui_state.assert_called_once_with(
+            baseline_state,
+            source=STATE_AUTHORITY_INSTANCE_BASELINE,
+        )
         self.assertTrue(applied["available"])
         self.assertEqual(STATE_AUTHORITY_INSTANCE_BASELINE, applied["source"])
 

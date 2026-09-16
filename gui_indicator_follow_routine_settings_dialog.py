@@ -268,10 +268,12 @@ def normalize_buy_situation_ui_state(value):
         state["setting1_enabled_check"] = True
         state["setting2_enabled_check"] = False
     if has_new_slots or "price_enabled_check" in state:
-        state["setting1_enabled_check"] = True
-        if state.get("setting2_enabled_check") is False:
-            state["setting2_left_combo"] = "무설정"
-        elif state.get("setting2_enabled_check") is True and state.get("setting2_left_combo") in {None, "", "무설정"}:
+        if "setting1_enabled_check" not in state:
+            state["setting1_enabled_check"] = True
+        if (
+            state.get("setting2_enabled_check") is True
+            and "setting2_left_combo" not in state
+        ):
             state["setting2_left_combo"] = "주문가"
     for key in (
         "left_combo", "right_combo", "direction_combo", "ratio_line",
@@ -290,6 +292,10 @@ STATE_AUTHORITY_GROUP_REMEMBERED = "GROUP_REMEMBERED"
 STATE_AUTHORITY_INSTANCE_CURRENT = "INSTANCE_CURRENT"
 STATE_AUTHORITY_INSTANCE_BASELINE = "INSTANCE_BASELINE"
 STATE_AUTHORITY_CANONICAL_DEFAULT = "CANONICAL_DEFAULT"
+
+_COMBO_RESTORE_ALIASES = {
+    ("buy_price_compare_condition_combo", "=<"): "<=",
+}
 
 
 def _default_buy_additional_ui_state():
@@ -1005,7 +1011,12 @@ class IndicatorFollowRoutineSettingsDialog(
             return None
 
         try:
-            result = self.apply_indicator_follow_ui_state(ui_state)
+            source = (
+                STATE_AUTHORITY_INSTANCE_CURRENT
+                if self.settings_mode == "edit"
+                else STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK
+            )
+            result = self.apply_indicator_follow_ui_state(ui_state, source=source)
         except Exception as exc:
             result = {
                 "applied": [],
@@ -1537,7 +1548,10 @@ class IndicatorFollowRoutineSettingsDialog(
                 state = remembered.get("indicator_follow_ui_state")
                 if not isinstance(state, dict):
                     raise ValueError("group remembered UI state is unavailable")
-                result = self.apply_indicator_follow_ui_state(deepcopy(state))
+                result = self.apply_indicator_follow_ui_state(
+                    deepcopy(state),
+                    source=STATE_AUTHORITY_GROUP_REMEMBERED,
+                )
                 if result.get("sync_errors"):
                     raise ValueError("group remembered UI state could not be applied")
                 self._registration_initial_state_source = (
@@ -1597,7 +1611,10 @@ class IndicatorFollowRoutineSettingsDialog(
         target = self.settings_undo_target()
         if target.get("available") is not True:
             return target
-        result = self.apply_indicator_follow_ui_state(target.get("state"))
+        result = self.apply_indicator_follow_ui_state(
+            target.get("state"),
+            source=STATE_AUTHORITY_INSTANCE_BASELINE,
+        )
         if isinstance(result, dict):
             result["available"] = True
             result["source"] = target.get("source")
@@ -3106,6 +3123,7 @@ class IndicatorFollowRoutineSettingsDialog(
             widget.setChecked(bool(value))
             return None
         if isinstance(widget, QComboBox):
+            value = _COMBO_RESTORE_ALIASES.get((name, str(value)), value)
             if name == "buy_bollinger_sign_combo":
                 text = str(value or "").strip()
                 if text not in BUY_BOLLINGER_SIGN_VALUES:
@@ -3129,6 +3147,7 @@ class IndicatorFollowRoutineSettingsDialog(
                 clear_sell_price_combo_unresolved(widget)
             index = widget.findText(str(value))
             if index < 0:
+                widget.setCurrentIndex(-1)
                 return {
                     "name": name,
                     "reason": "combo_value_not_found",
@@ -3179,6 +3198,8 @@ class IndicatorFollowRoutineSettingsDialog(
                 result["applied"].append(name)
             else:
                 result["skipped"].append(skipped)
+                if skipped.get("reason") == "combo_value_not_found":
+                    result.setdefault("sync_errors", []).append(dict(skipped))
         return result
 
     def _apply_prefixed_ui_values(self, values, prefix, result=None):
@@ -3403,10 +3424,12 @@ class IndicatorFollowRoutineSettingsDialog(
             return result
         return self._apply_projected_signal_validation_ui_state(projected)
 
-    def _prepare_buy_bollinger_sign_ui_state_for_load(self, state):
-        normalized = normalize_legacy_buy_bollinger_sign_ui_state(state)
-        normalized = normalize_legacy_sell_price_box_sign_ui_state(normalized)
-        normalized = normalize_legacy_sell_bollinger_sign_ui_state(normalized)
+    def _prepare_buy_bollinger_sign_ui_state_for_load(self, state, *, source=None):
+        normalized = state
+        if source != STATE_AUTHORITY_CANONICAL_DEFAULT:
+            normalized = normalize_legacy_buy_bollinger_sign_ui_state(normalized)
+            normalized = normalize_legacy_sell_price_box_sign_ui_state(normalized)
+            normalized = normalize_legacy_sell_bollinger_sign_ui_state(normalized)
         if buy_bollinger_sign_selection_issues(normalized):
             combo = getattr(self, "buy_bollinger_sign_combo", None)
             if isinstance(combo, QComboBox):
@@ -3455,13 +3478,14 @@ class IndicatorFollowRoutineSettingsDialog(
                 )
         return result
 
-    def apply_indicator_follow_ui_state(self, state):
+    def apply_indicator_follow_ui_state(self, state, *, source=None):
         """Apply a collected UI state in memory only; this never writes rules.json."""
         result = {
             "applied": [],
             "skipped": [],
             "sync_errors": [],
             "compatibility_warnings": [],
+            "source": source,
         }
         if not isinstance(state, dict):
             result["skipped"].append({
@@ -3470,7 +3494,10 @@ class IndicatorFollowRoutineSettingsDialog(
             })
             return result
 
-        state = self._prepare_buy_bollinger_sign_ui_state_for_load(state)
+        state = self._prepare_buy_bollinger_sign_ui_state_for_load(
+            state,
+            source=source,
+        )
         state = normalize_indicator_follow_basic_ui_state(state)
         self._apply_named_ui_values(state.get("basic", {}), result=result)
 

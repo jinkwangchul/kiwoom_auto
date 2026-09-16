@@ -434,6 +434,9 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         with (
             patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=fake_dialog),
             patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository", return_value=repository),
+            patch(
+                "gui_indicator_follow_routine_settings_dialog._remember_successful_registration_state"
+            ) as remember_state,
             patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.information") as information,
             patch(
                 "gui_indicator_follow_routine_settings_dialog.show_toast",
@@ -444,6 +447,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
 
         self.assertIs(instance, result)
         repository.create_instance.assert_called_once_with(request, {"buy": {}})
+        remember_state.assert_called_once()
         parent.refresh_auto_trade_assignment_views.assert_called_once_with()
         parent.refresh_all.assert_not_called()
         information.assert_not_called()
@@ -606,6 +610,15 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                 dialog.show()
                 self.app.processEvents()
                 self.assertTrue(dialog.grab().save(screenshot_path))
+            for group_name in "abc":
+                getattr(
+                    dialog,
+                    f"sell_signal_condition_{group_name}_gap_left_combo",
+                ).setCurrentText("평단가")
+                getattr(
+                    dialog,
+                    f"sell_signal_condition_{group_name}_gap_right_combo",
+                ).setCurrentText("현재가")
             result = dialog.build_registration_rules_from_current_ui_state()
         finally:
             dialog.close()

@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from engines.condition_engine import parse_condition_expression
+from indicator_follow_settings_compatibility import (
+    legacy_sell_signed_percent_sign,
+)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -2078,7 +2081,10 @@ def _build_sell_condition_b_price_box_condition(condition_b: dict[str, Any], war
     if "price_box_sign_combo" in condition_b:
         sign = str(condition_b.get("price_box_sign_combo") or "").strip()
     else:
-        sign = "+" if operator == ">=" else "-" if operator == "<=" else ""
+        sign = legacy_sell_signed_percent_sign(
+            condition_b,
+            compare_field="price_box_compare_combo",
+        ) or ""
     if compare_target is None or operator not in {">=", "<="} or value is None or sign not in {"-", "+"}:
         warnings.append("sell condition B Price Box policy is invalid")
         return None
@@ -2126,7 +2132,10 @@ def _build_sell_condition_b_bollinger_condition(condition_b: dict[str, Any], war
     if "bollinger_sign_combo" in condition_b:
         sign = str(condition_b.get("bollinger_sign_combo") or "").strip()
     else:
-        sign = "+" if operator == ">=" else "-"
+        sign = legacy_sell_signed_percent_sign(
+            condition_b,
+            compare_field="bollinger_compare_combo",
+        ) or ""
     if sign not in {"-", "+"}:
         warnings.append(
             "sell condition B Bollinger sign is not mapped: "
