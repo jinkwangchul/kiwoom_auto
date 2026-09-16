@@ -74,11 +74,13 @@ from gui_indicator_follow_buy_controls import (
 )
 from gui_indicator_follow_sell_controls import (
     IndicatorFollowSellControlsMixin,
+    SELL_PRICE_BOX_SIGN_VALUES,
     SELL_PRICE_COMBO_VALUES,
     SELL_PRICE_COMBO_WIDGET_NAMES,
     SELL_PRICE_UNRESOLVED_PROPERTY,
     clear_sell_price_combo_unresolved,
     mark_sell_price_combo_unresolved,
+    normalize_legacy_sell_price_box_sign_ui_state,
 )
 from gui_routine_registry import get_routine_records, normalize_routine_name
 from gui_toast import show_toast
@@ -2956,6 +2958,11 @@ class IndicatorFollowRoutineSettingsDialog(
                 if text not in BUY_BOLLINGER_SIGN_VALUES:
                     mark_buy_bollinger_sign_combo_unresolved(widget)
                     return None
+            if name == "sell_signal_condition_b_price_box_sign_combo":
+                text = str(value or "").strip()
+                if text not in SELL_PRICE_BOX_SIGN_VALUES:
+                    widget.setCurrentIndex(-1)
+                    return None
             if name in SELL_PRICE_COMBO_WIDGET_NAMES:
                 text = str(value or "").strip()
                 if text not in SELL_PRICE_COMBO_VALUES:
@@ -3240,6 +3247,7 @@ class IndicatorFollowRoutineSettingsDialog(
 
     def _prepare_buy_bollinger_sign_ui_state_for_load(self, state):
         normalized = normalize_legacy_buy_bollinger_sign_ui_state(state)
+        normalized = normalize_legacy_sell_price_box_sign_ui_state(normalized)
         if buy_bollinger_sign_selection_issues(normalized):
             combo = getattr(self, "buy_bollinger_sign_combo", None)
             if isinstance(combo, QComboBox):

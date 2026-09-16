@@ -2,6 +2,7 @@ from copy import deepcopy
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import unittest
+from unittest.mock import Mock
 
 from engines.condition_engine import evaluate_condition, evaluate_group, evaluate_groups_or
 
@@ -43,6 +44,67 @@ class ConditionEngineTest(unittest.TestCase):
 
     def test_rsi_condition_threshold(self):
         self.assertConditionPassed({"target": "RSI", "operator": "<=", "value": 45})
+
+    def test_signed_percent_offset_is_independent_from_compare_operator(self):
+        cases = (
+            (0.1, ">=", 100100.0),
+            (-0.1, ">=", 99900.0),
+            (0.1, "<=", 100100.0),
+            (-0.1, "<=", 99900.0),
+        )
+        for signed_percent, operator, expected_threshold in cases:
+            with self.subTest(signed_percent=signed_percent, operator=operator):
+                observer = Mock()
+                result = evaluate_condition(
+                    {
+                        "target": "CLOSE",
+                        "operator": operator,
+                        "compare_target": "PRICE_BOX_LOWER",
+                        "value": signed_percent,
+                        "signed_percent_offset": True,
+                    },
+                    {
+                        "CLOSE": [
+                            expected_threshold + 0.01
+                            if operator == ">="
+                            else expected_threshold - 0.01
+                        ],
+                        "PRICE_BOX_LOWER": [100000.0],
+                    },
+                    0,
+                    observer,
+                )
+                self.assertTrue(result.passed, result)
+                payload = observer.observe_condition.call_args.args[0]
+                self.assertAlmostEqual(
+                    expected_threshold,
+                    payload["right_operand"]["value"],
+                )
+
+    def test_unsigned_percent_offset_keeps_legacy_operator_semantics(self):
+        for operator, close, expected_threshold in (
+            (">=", 100100.0, 100100.0),
+            ("<=", 99900.0, 99900.0),
+        ):
+            with self.subTest(operator=operator):
+                observer = Mock()
+                result = evaluate_condition(
+                    {
+                        "target": "CLOSE",
+                        "operator": operator,
+                        "compare_target": "PRICE_BOX_LOWER",
+                        "value": -0.1,
+                    },
+                    {"CLOSE": [close], "PRICE_BOX_LOWER": [100000.0]},
+                    0,
+                    observer,
+                )
+                self.assertTrue(result.passed, result)
+                payload = observer.observe_condition.call_args.args[0]
+                self.assertAlmostEqual(
+                    expected_threshold,
+                    payload["right_operand"]["value"],
+                )
 
     def test_macd_signal_position_condition(self):
         self.assertConditionPassed({"target": "MACD", "operator": ">", "compare_target": "SIGNAL"})

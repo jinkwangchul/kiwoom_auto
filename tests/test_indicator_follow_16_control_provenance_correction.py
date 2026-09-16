@@ -608,9 +608,11 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         self.assertIn("PRICE_BOX_MIDDLE", series)
         self.assertIn("PRICE_BOX_LOWER", series)
 
-        for direction, compare, target, operator in (
-            ("상향", "이상", "PRICE_BOX_UPPER", ">="),
-            ("하향", "이하", "PRICE_BOX_LOWER", "<="),
+        for direction, sign, compare, target, operator, expected_value in (
+            ("상향", "+", "이상", "PRICE_BOX_UPPER", ">=", 0.62),
+            ("상향", "-", "이하", "PRICE_BOX_UPPER", "<=", -0.62),
+            ("하향", "+", "이하", "PRICE_BOX_LOWER", "<=", 0.62),
+            ("하향", "-", "이상", "PRICE_BOX_LOWER", ">=", -0.62),
         ):
             state = {
                 "basic": {"basic_signal_interval_combo": "1", "sell_signal_expr_line": "B"},
@@ -618,6 +620,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
                 "sell_ui": {"signal_conditions": {"condition_b": {
                     "price_box_check": True,
                     "price_box_direction_combo": direction,
+                    "price_box_sign_combo": sign,
                     "price_box_value_line": "0.62",
                     "price_box_compare_combo": compare,
                     "bollinger_check": False,
@@ -630,7 +633,29 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             self.assertTrue(candidate["value"]["enabled"])
             self.assertEqual(condition["compare_target"], target)
             self.assertEqual(condition["operator"], operator)
-            self.assertEqual(condition["value"], 0.62)
+            self.assertEqual(condition["value"], expected_value)
+            self.assertIs(condition["signed_percent_offset"], True)
+
+        legacy_state = {
+            "basic": {"basic_signal_interval_combo": "1", "sell_signal_expr_line": "B"},
+            "buy_ui": {"signal_filter": {}, "price_compare": {}},
+            "sell_ui": {"signal_conditions": {"condition_b": {
+                "price_box_check": True,
+                "price_box_direction_combo": "하향",
+                "price_box_value_line": "0.62",
+                "price_box_compare_combo": "이하",
+                "bollinger_check": False,
+                "gap_check": False,
+            }}},
+        }
+        legacy_preview = self.mapper.build_engine_rules_preview_from_ui_state(
+            legacy_state,
+            self._rules(),
+        )
+        legacy_condition = legacy_preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
+        self.assertEqual(-0.62, legacy_condition["value"])
+        self.assertEqual("PRICE_BOX_LOWER", legacy_condition["compare_target"])
+        self.assertEqual("<=", legacy_condition["operator"])
 
         upper_result = evaluate_condition(
             {"target": "CLOSE", "operator": ">=", "compare_target": "PRICE_BOX_UPPER", "value": 0.5},

@@ -307,6 +307,12 @@ def _apply_percent_offset(base_value: float | None, operator: str, offset_percen
     return base_value
 
 
+def _apply_signed_percent_offset(base_value: float | None, offset_percent: float | None) -> float | None:
+    if base_value is None or offset_percent is None:
+        return base_value
+    return base_value * (1 + offset_percent / 100)
+
+
 def _notify_observer(observer: Any, method_name: str, payload: dict[str, Any]) -> None:
     if observer is None:
         return
@@ -494,7 +500,17 @@ def evaluate_condition(
             compare_key = _series_key(condition, "compare_target")
             right_value = _value_at(series_map.get(compare_key), effective_index)
             offset_percent = _safe_float(condition.get("value"))
-            right_value = _apply_percent_offset(right_value, operator, offset_percent)
+            if condition.get("signed_percent_offset") is True:
+                right_value = _apply_signed_percent_offset(
+                    right_value,
+                    offset_percent,
+                )
+            else:
+                right_value = _apply_percent_offset(
+                    right_value,
+                    operator,
+                    offset_percent,
+                )
             detail = (
                 f"{target_key} {operator} {compare_key}"
                 if offset_percent is None

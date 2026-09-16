@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from copy import deepcopy
 
 from PyQt5.QtCore import Qt, QEvent
 from PyQt5.QtWidgets import (
@@ -23,6 +24,47 @@ SELL_PRICE_COMBO_WIDGET_NAMES = frozenset(
     for group in "abc"
     for side in ("left", "right")
 )
+SELL_PRICE_BOX_SIGN_VALUES = frozenset({"-", "+"})
+
+
+def normalize_legacy_sell_price_box_sign_ui_state(ui_state):
+    if not isinstance(ui_state, dict):
+        return ui_state
+    sell_ui = ui_state.get("sell_ui")
+    signal_conditions = (
+        sell_ui.get("signal_conditions") if isinstance(sell_ui, dict) else None
+    )
+    condition_b = (
+        signal_conditions.get("condition_b")
+        if isinstance(signal_conditions, dict)
+        else None
+    )
+    if not isinstance(condition_b, dict):
+        return ui_state
+    legacy_fields = {
+        "price_box_direction_combo",
+        "price_box_value_line",
+        "price_box_compare_combo",
+    }
+    if not legacy_fields.issubset(condition_b):
+        return ui_state
+    if "price_box_sign_combo" in condition_b:
+        return ui_state
+    legacy_sign = {
+        "이상": "+",
+        ">=": "+",
+        "GTE": "+",
+        "이하": "-",
+        "<=": "-",
+        "LTE": "-",
+    }.get(str(condition_b.get("price_box_compare_combo") or "").strip().upper())
+    if legacy_sign is None:
+        return ui_state
+    normalized = deepcopy(ui_state)
+    normalized["sell_ui"]["signal_conditions"]["condition_b"][
+        "price_box_sign_combo"
+    ] = legacy_sign
+    return normalized
 
 
 def mark_sell_price_combo_unresolved(combo, original_value):
@@ -334,18 +376,21 @@ class IndicatorFollowSellControlsMixin:
             return row_check
 
         price_box_direction_combo = make_combo(["상향", "하향"], "하향", 64)
+        price_box_sign_combo = make_combo(["-", "+"], "+", 52)
         price_box_value_line = make_line("0.1", 44)
         price_box_compare_combo = make_combo(["이상", "이하"], "이상", 66)
 
         price_box_check = add_filter_row([
             QLabel("가격박스"),
             price_box_direction_combo,
+            price_box_sign_combo,
             price_box_value_line,
             QLabel("%"),
             price_box_compare_combo,
         ], "AND", True)
         self.sell_signal_condition_b_price_box_check = price_box_check
         self.sell_signal_condition_b_price_box_direction_combo = price_box_direction_combo
+        self.sell_signal_condition_b_price_box_sign_combo = price_box_sign_combo
         self.sell_signal_condition_b_price_box_value_line = price_box_value_line
         self.sell_signal_condition_b_price_box_compare_combo = price_box_compare_combo
         self.sell_signal_condition_b_price_box_logic_combo = filter_row_entries[-1]["logic"]

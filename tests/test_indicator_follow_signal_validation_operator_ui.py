@@ -1453,6 +1453,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.sell_signal_condition_a_gap_direction_combo.setCurrentText("하향")
                 window.sell_signal_condition_a_gap_value_line.setText("0.75")
                 window.sell_signal_condition_a_gap_compare_combo.setCurrentText("이상")
+                window.sell_signal_condition_b_price_box_direction_combo.setCurrentText("하향")
+                window.sell_signal_condition_b_price_box_sign_combo.setCurrentText("-")
+                window.sell_signal_condition_b_price_box_value_line.setText("0.1")
+                window.sell_signal_condition_b_price_box_compare_combo.setCurrentText("이상")
                 payload = IndicatorFollowSignalValidationApplyPayload(
                     window.collect_indicator_follow_ui_state()
                 )
@@ -1477,6 +1481,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual("하향", sell_a["gap_direction_combo"])
                 self.assertEqual("0.75", sell_a["gap_value_line"])
                 self.assertEqual("이상", sell_a["gap_compare_combo"])
+                sell_b = after["sell_ui"]["signal_conditions"]["condition_b"]
+                self.assertEqual("하향", sell_b["price_box_direction_combo"])
+                self.assertEqual("-", sell_b["price_box_sign_combo"])
+                self.assertEqual("0.1", sell_b["price_box_value_line"])
+                self.assertEqual("이상", sell_b["price_box_compare_combo"])
                 self.assertEqual(before["buy_ui"] | {"signal_filter": after["buy_ui"]["signal_filter"]}, after["buy_ui"])
                 self.assertEqual(before["sell_ui"] | {"signal_conditions": after["sell_ui"]["signal_conditions"]}, after["sell_ui"])
                 self.assertEqual(

@@ -2065,7 +2065,7 @@ def _attach_sell_signal_expression(
 def _build_sell_condition_b_price_box_condition(condition_b: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     if condition_b.get("price_box_check") is False:
         return None
-    if not any(key in condition_b for key in ("price_box_direction_combo", "price_box_value_line", "price_box_compare_combo")):
+    if not any(key in condition_b for key in ("price_box_direction_combo", "price_box_sign_combo", "price_box_value_line", "price_box_compare_combo")):
         return None
     compare_target = {
         "상향": "PRICE_BOX_UPPER",
@@ -2075,16 +2075,22 @@ def _build_sell_condition_b_price_box_condition(condition_b: dict[str, Any], war
     }.get(str(condition_b.get("price_box_direction_combo") or "").strip())
     operator = _compare_operator(condition_b.get("price_box_compare_combo"))
     value = _safe_float(condition_b.get("price_box_value_line"))
-    if compare_target is None or operator not in {">=", "<="} or value is None or value < 0:
+    if "price_box_sign_combo" in condition_b:
+        sign = str(condition_b.get("price_box_sign_combo") or "").strip()
+    else:
+        sign = "+" if operator == ">=" else "-" if operator == "<=" else ""
+    if compare_target is None or operator not in {">=", "<="} or value is None or sign not in {"-", "+"}:
         warnings.append("sell condition B Price Box policy is invalid")
         return None
+    signed_value = abs(value) if sign == "+" else -abs(value)
     return {
         "enabled": True,
         "not": False,
         "target": "CLOSE",
         "operator": operator,
         "compare_target": compare_target,
-        "value": value,
+        "value": signed_value,
+        "signed_percent_offset": True,
         "description": "UI preview: sell condition B Price Box condition",
     }
 
