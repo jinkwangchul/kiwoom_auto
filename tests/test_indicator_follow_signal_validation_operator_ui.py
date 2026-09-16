@@ -1506,7 +1506,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 )
                 self.assertEqual(file_before, rules_path.read_bytes())
 
-    def test_registration_undo_always_restores_dialog_open_baseline(self):
+    def test_registration_undo_is_unavailable_without_canonical_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
@@ -1520,7 +1520,6 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 )
             self.widgets.append(source)
             file_before = rules_path.read_bytes()
-            initial_interval = source.basic_signal_interval_combo.currentText()
             self.assertEqual("되돌리기", source.reload_button.text())
 
             source.basic_signal_interval_combo.setCurrentText("10")
@@ -1541,16 +1540,61 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             )
             self.assertFalse(hasattr(source, "_registration_undo_target_snapshot"))
             with patch.object(source, "load_rules") as persistent_reload:
-                source.restore_settings_undo_snapshot()
+                undo = source.restore_settings_undo_snapshot()
             persistent_reload.assert_not_called()
-            self.assertEqual(initial_interval, source.basic_signal_interval_combo.currentText())
+            self.assertFalse(undo["available"])
+            self.assertEqual(dialog_module.STATE_AUTHORITY_CANONICAL_DEFAULT, undo["source"])
+            self.assertEqual("60", source.basic_signal_interval_combo.currentText())
             self.assertEqual(file_before, rules_path.read_bytes())
 
-    def test_edit_undo_always_restores_dialog_open_baseline_without_persistent_read(self):
+    def test_group_remembered_state_overrides_legacy_template_on_registration_open(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
-            with patch.object(dialog_module.QTimer, "singleShot"):
+            remembered = deepcopy(
+                self.rules["indicator_follow_ui_state"]["state"]
+            )
+            remembered["basic"]["basic_signal_interval_combo"] = "60"
+            remembered["buy_ui"]["signal_filter"][
+                "buy_bollinger_sign_combo"
+            ] = "+"
+            with patch.object(dialog_module.QTimer, "singleShot"), patch.object(
+                dialog_module,
+                "LogicalGroupRepository",
+            ) as repository_type:
+                repository_type.return_value.remembered_registration_state.return_value = {
+                    "indicator_follow_ui_state": remembered
+                }
+                source = dialog_module.IndicatorFollowRoutineSettingsDialog(
+                    rules_path=rules_path,
+                    routine_path=self.routine_dir,
+                    routine_name="지표추종매매",
+                    definition_id="indicator_follow",
+                    group_id="dbf3790f-c00f-427f-90dc-15d8283f4e1a",
+                    settings_mode="registration",
+                )
+            self.widgets.append(source)
+            self.assertEqual("60", source.basic_signal_interval_combo.currentText())
+            self.assertEqual("+", source.buy_bollinger_sign_combo.currentText())
+            self.assertEqual(
+                dialog_module.STATE_AUTHORITY_GROUP_REMEMBERED,
+                source._registration_initial_state_source,
+            )
+
+    def test_edit_undo_restores_immutable_registration_baseline_without_persistent_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
+            registration_state = deepcopy(
+                self.rules["indicator_follow_ui_state"]["state"]
+            )
+            with patch.object(dialog_module.QTimer, "singleShot"), patch.object(
+                dialog_module,
+                "RoutineInstanceRepository",
+            ) as repository_type:
+                repository_type.return_value.load_registration_baseline.return_value = {
+                    "indicator_follow_ui_state": registration_state
+                }
                 source = dialog_module.IndicatorFollowRoutineSettingsDialog(
                     rules_path=rules_path,
                     routine_path=self.routine_dir,
@@ -1637,7 +1681,18 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 )
                 if mode == "edit":
                     kwargs["instance_id"] = "INSTANCE-CONTEXT-APPLY"
-                with patch.object(dialog_module.QTimer, "singleShot"):
+                registration_state = deepcopy(
+                    self.rules["indicator_follow_ui_state"]["state"]
+                )
+                repository_patch = patch.object(
+                    dialog_module,
+                    "RoutineInstanceRepository",
+                )
+                with patch.object(dialog_module.QTimer, "singleShot"), repository_patch as repository_type:
+                    if mode == "edit":
+                        repository_type.return_value.load_registration_baseline.return_value = {
+                            "indicator_follow_ui_state": registration_state
+                        }
                     source = dialog_module.IndicatorFollowRoutineSettingsDialog(**kwargs)
                     seed = IndicatorFollowSignalValidationSeed(
                         ValidationSettingsSnapshot(self.rules),
@@ -1736,11 +1791,24 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertNotIn("candle_count", json.dumps(final_state))
                 self.assertEqual(file_before, rules_path.read_bytes())
 
-                source.restore_settings_undo_snapshot()
-                self.assertEqual(
-                    baseline,
-                    source.collect_indicator_follow_ui_state(),
-                )
+                before_undo = source.collect_indicator_follow_ui_state()
+                undo = source.restore_settings_undo_snapshot()
+                if mode == "registration":
+                    self.assertFalse(undo["available"])
+                    self.assertEqual(
+                        dialog_module.STATE_AUTHORITY_CANONICAL_DEFAULT,
+                        undo["source"],
+                    )
+                    self.assertEqual(
+                        before_undo,
+                        source.collect_indicator_follow_ui_state(),
+                    )
+                else:
+                    self.assertTrue(undo["available"])
+                    self.assertEqual(
+                        baseline,
+                        source.collect_indicator_follow_ui_state(),
+                    )
                 self.assertEqual(file_before, rules_path.read_bytes())
 
     def test_flow_apply_uses_source_weakref_and_closed_source_fails_closed(self):
@@ -1782,8 +1850,14 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             self.assertEqual("B or C", source.buy_signal_expr_line.text())
             self.assertEqual(("", True), window.apply_results[-1])
             self.assertFalse(hasattr(source, "_registration_undo_target_snapshot"))
-            source.restore_settings_undo_snapshot()
-            self.assertEqual(launch_expression, source.buy_signal_expr_line.text())
+            undo = source.restore_settings_undo_snapshot()
+            self.assertFalse(undo["available"])
+            self.assertEqual(
+                dialog_module.STATE_AUTHORITY_CANONICAL_DEFAULT,
+                undo["source"],
+            )
+            self.assertNotEqual(launch_expression, source.buy_signal_expr_line.text())
+            self.assertEqual("B or C", source.buy_signal_expr_line.text())
             self.assertIn(window, flow.open_windows)
 
             before = source.collect_indicator_follow_ui_state()

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +22,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 GROUP_SCHEMA_VERSION = "1.0"
 GROUP_REGISTRY_SCHEMA_VERSION = "1.0"
 GROUP_REGISTRY_MODE_LOGICAL = "logical"
+GROUP_REMEMBERED_REGISTRATION_STATE_SCHEMA_VERSION = "1.0"
+GROUP_REMEMBERED_REGISTRATION_STATES_KEY = "remembered_registration_states"
 _CREATE_ATTEMPTS = 32
 _REGISTRY_LOCK = RLock()
 
@@ -119,6 +123,105 @@ class LogicalGroupRepository:
         if not group_dir.is_dir():
             return None
         return self._load_group_directory(group_dir)
+
+    def remembered_registration_state(
+        self,
+        group_id: str,
+        definition_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one verified group+definition registration UI snapshot."""
+        group = self.get_group(group_id)
+        clean_definition_id = str(definition_id or "").strip()
+        if group is None or not clean_definition_id:
+            return None
+        if group.definition_id != clean_definition_id:
+            return None
+        metadata = self._read_group_metadata(group.group_dir)
+        remembered = metadata.get(GROUP_REMEMBERED_REGISTRATION_STATES_KEY)
+        if remembered is None:
+            return None
+        if not isinstance(remembered, dict):
+            raise ValueError("remembered_registration_states must contain an object")
+        if clean_definition_id not in remembered:
+            return None
+        payload = remembered.get(clean_definition_id)
+        if not isinstance(payload, dict):
+            raise ValueError("remembered registration state must contain an object")
+        if str(payload.get("schema_version") or "") != GROUP_REMEMBERED_REGISTRATION_STATE_SCHEMA_VERSION:
+            raise ValueError("unsupported remembered registration state schema_version")
+        if str(payload.get("definition_id") or "").strip() != clean_definition_id:
+            raise ValueError("remembered registration state definition_id mismatch")
+        state = payload.get("indicator_follow_ui_state")
+        if not isinstance(state, dict):
+            raise ValueError("remembered registration state must contain an object")
+        expected_hash = self._stable_json_hash(state)
+        if str(payload.get("stable_hash") or "") != expected_hash:
+            raise ValueError("remembered registration state hash mismatch")
+        return deepcopy(payload)
+
+    def remember_registration_state(
+        self,
+        group_id: str,
+        definition_id: str,
+        state: dict[str, Any],
+        *,
+        source_instance_id: str,
+        registered_at: str,
+    ) -> dict[str, Any]:
+        """Atomically persist one successful registration read-back snapshot."""
+        clean_group_id = self._canonical_uuid(group_id)
+        clean_definition_id = str(definition_id or "").strip()
+        clean_instance_id = str(source_instance_id or "").strip()
+        if not clean_group_id or not clean_definition_id or not clean_instance_id:
+            raise ValueError("group_id, definition_id and source_instance_id are required")
+        if not isinstance(state, dict):
+            raise ValueError("remembered registration state must contain an object")
+        try:
+            datetime.fromisoformat(str(registered_at or "").strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("registered_at must be ISO8601") from exc
+
+        group = self.get_group(clean_group_id)
+        if group is None:
+            raise ValueError("logical Group does not exist")
+        if group.definition_id != clean_definition_id:
+            raise ValueError("logical Group definition_id mismatch")
+
+        detached_state = deepcopy(state)
+        payload = {
+            "schema_version": GROUP_REMEMBERED_REGISTRATION_STATE_SCHEMA_VERSION,
+            "definition_id": clean_definition_id,
+            "source_instance_id": clean_instance_id,
+            "registered_at": str(registered_at).strip(),
+            "indicator_follow_ui_state": detached_state,
+            "stable_hash": self._stable_json_hash(detached_state),
+        }
+        with _REGISTRY_LOCK:
+            metadata = self._read_group_metadata(group.group_dir)
+            remembered = metadata.get(GROUP_REMEMBERED_REGISTRATION_STATES_KEY)
+            if remembered is None:
+                remembered = {}
+            if not isinstance(remembered, dict):
+                raise ValueError("remembered_registration_states must contain an object")
+            updated = deepcopy(remembered)
+            updated[clean_definition_id] = deepcopy(payload)
+            metadata[GROUP_REMEMBERED_REGISTRATION_STATES_KEY] = updated
+            temp_path = group.group_dir / f".group.{uuid4().hex}.tmp"
+            try:
+                self._write_json(temp_path, metadata)
+                staged = self._read_group_metadata(group.group_dir, path=temp_path)
+                if staged != metadata:
+                    raise ValueError("staged group remembered state verification mismatch")
+                os.replace(temp_path, group.group_dir / "group.json")
+                saved = self.remembered_registration_state(
+                    clean_group_id,
+                    clean_definition_id,
+                )
+                if saved != payload:
+                    raise ValueError("group remembered state read-back verification mismatch")
+            finally:
+                temp_path.unlink(missing_ok=True)
+        return deepcopy(payload)
 
     def registry_state(self, *, path: Path | None = None) -> LogicalGroupRegistryState:
         registry_path = Path(path) if path is not None else self.registry_path
@@ -442,6 +545,29 @@ class LogicalGroupRepository:
             created_at=created_at,
             group_dir=group_dir,
         )
+
+    @staticmethod
+    def _read_group_metadata(
+        group_dir: Path,
+        *,
+        path: Path | None = None,
+    ) -> dict[str, Any]:
+        metadata_path = Path(path) if path is not None else group_dir / "group.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError(f"group.json must contain an object: {metadata_path}")
+        return metadata
+
+    @staticmethod
+    def _stable_json_hash(value: dict[str, Any]) -> str:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _canonical_uuid(value: object) -> str:

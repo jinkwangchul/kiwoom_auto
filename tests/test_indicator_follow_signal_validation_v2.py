@@ -1771,8 +1771,13 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
             self.assertEqual("A or D", window.buy_signal_expr_line.text())
             self.assertEqual("A or D", source.buy_signal_expr_line.text())
-            source.restore_settings_undo_snapshot()
-            self.assertEqual(original_buy, source.buy_signal_expr_line.text())
+            undo = source.restore_settings_undo_snapshot()
+            self.assertFalse(undo["available"])
+            self.assertEqual(
+                dialog_module.STATE_AUTHORITY_CANONICAL_DEFAULT,
+                undo["source"],
+            )
+            self.assertEqual("A or D", source.buy_signal_expr_line.text())
             self.assertEqual(original_bytes, rules_path.read_bytes())
 
     def test_unresolved_entry_reset_restores_and_runs_without_candidate_approval(self):

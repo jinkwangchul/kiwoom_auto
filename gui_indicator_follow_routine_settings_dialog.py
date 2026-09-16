@@ -91,6 +91,7 @@ from gui_window_policy import (
     persistent_feature_owner,
     persistent_feature_root,
 )
+from logical_group_registry import LogicalGroupRepository
 import rule_approval_session_file_service as rule_approval_session_file_service
 import rule_apply_commit_service as rule_apply_commit_service
 import rule_commit_dry_run_service as rule_commit_dry_run_service
@@ -284,6 +285,11 @@ from event_journal_production import append_production_event
 
 DEFAULT_BUY_SIGNAL_EXPR = "A and B and C and D"
 LEGACY_ADDITIONAL_STATE_PARTIAL_LOSS = "LEGACY_ADDITIONAL_STATE_PARTIAL_LOSS"
+STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK = "LEGACY_TEMPLATE_FALLBACK"
+STATE_AUTHORITY_GROUP_REMEMBERED = "GROUP_REMEMBERED"
+STATE_AUTHORITY_INSTANCE_CURRENT = "INSTANCE_CURRENT"
+STATE_AUTHORITY_INSTANCE_BASELINE = "INSTANCE_BASELINE"
+STATE_AUTHORITY_CANONICAL_DEFAULT = "CANONICAL_DEFAULT"
 
 
 def _default_buy_additional_ui_state():
@@ -402,6 +408,48 @@ def _refresh_routine_assignment_views(owner):
     refresh_all = getattr(refresh_owner, "refresh_all", None)
     if callable(refresh_all):
         refresh_all()
+
+
+def _remember_successful_registration_state(
+    *,
+    project_root,
+    group_id,
+    definition_id,
+    instance,
+    expected_rules,
+):
+    """Persist group memory only from a verified saved instance rules read-back."""
+    clean_group_id = str(group_id or "").strip()
+    if not clean_group_id:
+        return None
+    saved_rules = json.loads(Path(instance.rules_path).read_text(encoding="utf-8"))
+    ui_state_root = saved_rules.get("indicator_follow_ui_state")
+    saved_ui_state = (
+        ui_state_root.get("state")
+        if isinstance(ui_state_root, dict)
+        else None
+    )
+    if not isinstance(saved_ui_state, dict):
+        raise ValueError("saved instance UI state is unavailable")
+    expected_ui_state_root = (
+        expected_rules.get("indicator_follow_ui_state")
+        if isinstance(expected_rules, dict)
+        else None
+    )
+    expected_ui_state = (
+        expected_ui_state_root.get("state")
+        if isinstance(expected_ui_state_root, dict)
+        else None
+    )
+    if saved_ui_state != expected_ui_state:
+        raise ValueError("saved instance UI state read-back mismatch")
+    return LogicalGroupRepository(project_root).remember_registration_state(
+        clean_group_id,
+        str(definition_id or "").strip(),
+        saved_ui_state,
+        source_instance_id=instance.instance_id,
+        registered_at=instance.created_at,
+    )
 
 
 def register_routine_instance_snapshot(
@@ -534,6 +582,24 @@ def register_routine_instance_snapshot(
         )
         return None
 
+    clean_group_id = str(group_id or "").strip()
+    if clean_group_id:
+        try:
+            _remember_successful_registration_state(
+                project_root=Path(__file__).resolve().parent,
+                group_id=clean_group_id,
+                definition_id=clean_definition_id,
+                instance=result.instance,
+                expected_rules=rules_result.get("rules"),
+            )
+        except Exception as exc:
+            owner._last_routine_registration_error = str(exc)
+            QMessageBox.warning(
+                owner,
+                "루틴 등록 상태 저장 실패",
+                "루틴은 등록했지만 다음 신규등록 시작 상태를 저장하지 못했습니다.",
+            )
+
     owner.last_registered_instance_id = result.instance.instance_id
     success_message = f"'{result.instance.display_name}' 루틴을 등록했습니다."
     notification_owner = persistent_feature_root(owner) or owner
@@ -610,10 +676,14 @@ class IndicatorFollowRoutineSettingsDialog(
         self.rules_data = {}
         self._approval_session_path = self._default_rule_approval_session_path()
         self._initial_settings_undo_snapshot = None
+        self._registration_initial_state_source = ""
+        self._settings_undo_source = ""
+        self._settings_undo_unavailable_reason = ""
+        self._last_state_authority_error = ""
 
         self._build_ui()
         self.load_rules()
-        self._initial_settings_undo_snapshot = self._capture_settings_ui_snapshot()
+        self._initialize_settings_state_authority()
         self._bind_optional_signal_validation()
         QTimer.singleShot(0, self._show_with_initial_control_section_state)
 
@@ -1440,17 +1510,98 @@ class IndicatorFollowRoutineSettingsDialog(
             self.collect_indicator_follow_ui_state()
         )
 
+    def _initialize_settings_state_authority(self):
+        """Resolve initial display and Undo authority without writing persistence."""
+        self._initial_settings_undo_snapshot = None
+        self._settings_undo_unavailable_reason = ""
+        self._last_state_authority_error = ""
+        if self.settings_mode == "registration":
+            self._registration_initial_state_source = (
+                STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK
+            )
+            self._settings_undo_source = STATE_AUTHORITY_CANONICAL_DEFAULT
+            self._settings_undo_unavailable_reason = (
+                "Canonical Fresh Defaults are not configured."
+            )
+            if not self.group_id or not self.definition_id:
+                return
+            try:
+                remembered = LogicalGroupRepository(
+                    Path(__file__).resolve().parent
+                ).remembered_registration_state(
+                    self.group_id,
+                    self.definition_id,
+                )
+                if not isinstance(remembered, dict):
+                    return
+                state = remembered.get("indicator_follow_ui_state")
+                if not isinstance(state, dict):
+                    raise ValueError("group remembered UI state is unavailable")
+                result = self.apply_indicator_follow_ui_state(deepcopy(state))
+                if result.get("sync_errors"):
+                    raise ValueError("group remembered UI state could not be applied")
+                self._registration_initial_state_source = (
+                    STATE_AUTHORITY_GROUP_REMEMBERED
+                )
+            except Exception as exc:
+                self._last_state_authority_error = str(exc)
+            return
+
+        self._registration_initial_state_source = STATE_AUTHORITY_INSTANCE_CURRENT
+        self._settings_undo_source = STATE_AUTHORITY_INSTANCE_BASELINE
+        try:
+            baseline = RoutineInstanceRepository(
+                Path(__file__).resolve().parent
+            ).load_registration_baseline(self.instance_id)
+            if not isinstance(baseline, dict):
+                self._settings_undo_unavailable_reason = (
+                    "Instance registration baseline is unavailable."
+                )
+                return
+            state = baseline.get("indicator_follow_ui_state")
+            if not isinstance(state, dict):
+                raise ValueError("instance registration baseline UI state is unavailable")
+            self._initial_settings_undo_snapshot = self._canonical_settings_ui_snapshot(
+                state
+            )
+        except Exception as exc:
+            self._last_state_authority_error = str(exc)
+            self._settings_undo_unavailable_reason = (
+                "Instance registration baseline is unavailable."
+            )
+
+    def settings_undo_target(self):
+        """Describe the explicit Undo provider without inventing fallback values."""
+        if self._initial_settings_undo_snapshot is None:
+            return {
+                "available": False,
+                "source": self._settings_undo_source,
+                "reason": self._settings_undo_unavailable_reason,
+                "state": None,
+            }
+        return {
+            "available": True,
+            "source": self._settings_undo_source,
+            "reason": "",
+            "state": self._settings_ui_state_from_snapshot(
+                self._initial_settings_undo_snapshot
+            ),
+        }
+
     def apply_signal_validation_candidate_ui_state(self, state):
         """Apply one final V2 candidate to the in-memory Working UI only."""
         return self.apply_signal_validation_ui_state(state)
 
     def restore_settings_undo_snapshot(self):
         """Restore the context baseline without rereading persistent settings."""
-        snapshot = self._initial_settings_undo_snapshot
-        if snapshot is None:
-            return None
-        state = self._settings_ui_state_from_snapshot(snapshot)
-        return self.apply_indicator_follow_ui_state(state)
+        target = self.settings_undo_target()
+        if target.get("available") is not True:
+            return target
+        result = self.apply_indicator_follow_ui_state(target.get("state"))
+        if isinstance(result, dict):
+            result["available"] = True
+            result["source"] = target.get("source")
+        return result
 
     def build_engine_rules_preview_from_current_ui_state(self):
         rules = getattr(self, "rules", None)

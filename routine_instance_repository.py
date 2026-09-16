@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ from routine_instance_registry import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 INSTANCE_SCHEMA_VERSION = "1.0"
+REGISTRATION_BASELINE_SCHEMA_VERSION = "1.0"
+REGISTRATION_BASELINE_FILE = "registration_baseline.json"
 
 
 def _append_instance_setting_changed(
@@ -162,6 +165,22 @@ class RoutineInstanceRepository:
         )
         return record if record is not None and record.persisted else None
 
+    def load_registration_baseline(self, instance_id: str) -> dict[str, Any] | None:
+        """Load one verified immutable registration snapshot, if it exists."""
+        instance = self.get_instance(instance_id)
+        if instance is None or instance.rules_path is None:
+            return None
+        baseline_path = Path(instance.rules_path).parent / REGISTRATION_BASELINE_FILE
+        if not baseline_path.exists():
+            return None
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        self._verify_registration_baseline(
+            baseline,
+            expected_instance_id=instance.instance_id,
+            expected_definition_id=instance.definition_id,
+        )
+        return deepcopy(baseline)
+
     def validate_create(self, request: RoutineInstanceCreateRequest) -> tuple[str, str]:
         definition_id = str(request.definition_id or "").strip()
         if routine_definition_by_id(
@@ -234,13 +253,24 @@ class RoutineInstanceRepository:
         group_id = str(request.group_id or "").strip()
         if group_id:
             metadata["group_id"] = group_id
+        registration_baseline = self._build_registration_baseline(metadata, rules)
 
         try:
             self.instances_root.mkdir(parents=True, exist_ok=True)
             temp_dir.mkdir()
             self._write_json(temp_dir / "instance.json", metadata)
             self._write_json(temp_dir / "rules.json", deepcopy(rules))
-            self._verify_staged_instance(temp_dir, metadata, rules)
+            if registration_baseline is not None:
+                self._write_json(
+                    temp_dir / REGISTRATION_BASELINE_FILE,
+                    registration_baseline,
+                )
+            self._verify_staged_instance(
+                temp_dir,
+                metadata,
+                rules,
+                registration_baseline,
+            )
             os.replace(temp_dir, final_dir)
 
             instance = self.get_instance(instance_id)
@@ -249,6 +279,9 @@ class RoutineInstanceRepository:
             saved_rules = json.loads(Path(instance.rules_path).read_text(encoding="utf-8"))
             if saved_rules != rules:
                 raise RuntimeError("등록된 적용 설정이 검증된 설정과 일치하지 않습니다.")
+            saved_baseline = self.load_registration_baseline(instance_id)
+            if saved_baseline != registration_baseline:
+                raise RuntimeError("등록 baseline read-back 검증이 일치하지 않습니다.")
             _append_instance_lifecycle_event(
                 "ROUTINE_INSTANCE_CREATED",
                 instance=instance,
@@ -624,6 +657,7 @@ class RoutineInstanceRepository:
         instance_dir: Path,
         expected_metadata: dict[str, Any],
         expected_rules: dict[str, Any],
+        expected_registration_baseline: dict[str, Any] | None = None,
     ) -> None:
         metadata = json.loads((instance_dir / "instance.json").read_text(encoding="utf-8"))
         rules = json.loads((instance_dir / "rules.json").read_text(encoding="utf-8"))
@@ -633,3 +667,79 @@ class RoutineInstanceRepository:
             raise ValueError("rules.json 저장 후 JSON 객체 검증에 실패했습니다.")
         if rules != expected_rules:
             raise ValueError("rules.json 저장 후 검증된 적용 설정과 일치하지 않습니다.")
+        baseline_path = instance_dir / REGISTRATION_BASELINE_FILE
+        if expected_registration_baseline is None:
+            if baseline_path.exists():
+                raise ValueError("등록 baseline이 예상하지 않은 instance에 생성되었습니다.")
+            return
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if baseline != expected_registration_baseline:
+            raise ValueError("등록 baseline 저장 후 검증이 일치하지 않습니다.")
+        RoutineInstanceRepository._verify_registration_baseline(
+            baseline,
+            expected_instance_id=str(expected_metadata.get("instance_id") or ""),
+            expected_definition_id=str(expected_metadata.get("definition_id") or ""),
+        )
+
+    @staticmethod
+    def _build_registration_baseline(
+        metadata: dict[str, Any],
+        rules: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        ui_state_root = rules.get("indicator_follow_ui_state")
+        if not isinstance(ui_state_root, dict):
+            return None
+        state = ui_state_root.get("state")
+        if not isinstance(state, dict):
+            return None
+        payload = {
+            "schema_version": REGISTRATION_BASELINE_SCHEMA_VERSION,
+            "definition_id": str(metadata.get("definition_id") or "").strip(),
+            "instance_id": str(metadata.get("instance_id") or "").strip(),
+            "registered_at": str(metadata.get("created_at") or "").strip(),
+            "indicator_follow_ui_state": deepcopy(state),
+        }
+        payload["stable_hash"] = RoutineInstanceRepository._stable_json_hash(payload)
+        return payload
+
+    @staticmethod
+    def _verify_registration_baseline(
+        baseline: object,
+        *,
+        expected_instance_id: str,
+        expected_definition_id: str,
+    ) -> None:
+        if not isinstance(baseline, dict):
+            raise ValueError("registration baseline must contain an object")
+        if str(baseline.get("schema_version") or "") != REGISTRATION_BASELINE_SCHEMA_VERSION:
+            raise ValueError("unsupported registration baseline schema_version")
+        if str(baseline.get("instance_id") or "") != str(expected_instance_id or ""):
+            raise ValueError("registration baseline instance_id mismatch")
+        if str(baseline.get("definition_id") or "") != str(expected_definition_id or ""):
+            raise ValueError("registration baseline definition_id mismatch")
+        if not isinstance(baseline.get("indicator_follow_ui_state"), dict):
+            raise ValueError("registration baseline UI state must contain an object")
+        registered_at = str(baseline.get("registered_at") or "").strip()
+        try:
+            datetime.fromisoformat(registered_at)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("registration baseline registered_at must be ISO8601") from exc
+        expected_hash = str(baseline.get("stable_hash") or "")
+        hash_payload = {
+            key: deepcopy(value)
+            for key, value in baseline.items()
+            if key != "stable_hash"
+        }
+        if expected_hash != RoutineInstanceRepository._stable_json_hash(hash_payload):
+            raise ValueError("registration baseline stable_hash mismatch")
+
+    @staticmethod
+    def _stable_json_hash(value: dict[str, Any]) -> str:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
