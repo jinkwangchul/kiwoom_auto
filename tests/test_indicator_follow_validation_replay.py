@@ -10,10 +10,14 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
+from engines.condition_engine import parse_condition_expression
 from engines.signal_result import RoutineSignal
 from routines.지표추종매매 import routine_macd_engine
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
+)
+from indicator_follow_signal_validation_presentation import (
+    signal_evidence_lines_for_entry,
 )
 from routines.지표추종매매.routine_validation_contract import (
     ValidationRequest,
@@ -278,6 +282,118 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             self.assertTrue(trace["conditions"])
             self.assertTrue(trace["groups"])
             self.assertTrue(trace["aggregations"])
+
+    def test_bollinger_only_expression_replay_is_not_limited_by_legacy_osc_group(self) -> None:
+        rules = self._rules()
+        rules["buy"]["groups"] = [{
+            "enabled": True,
+            "name": "legacy_osc_turn_up",
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "OSC",
+                "operator": "TURN_UP",
+            }],
+        }]
+        parsed = parse_condition_expression(
+            "B",
+            allowed_identifiers={"A", "B", "C", "D"},
+        )
+        self.assertTrue(parsed["ok"], parsed)
+        rules["buy"]["filters"] = {
+            "bollinger": {
+                "enabled": True,
+                "conditions": [{
+                    "enabled": True,
+                    "not": False,
+                    "target": "CLOSE",
+                    "operator": ">=",
+                    "compare_target": "BOLLINGER_LOWER",
+                    "value": -0.1,
+                }],
+            },
+            "composite": {
+                "enabled": True,
+                "expression": {
+                    "source": "B",
+                    "normalized": parsed["normalized"],
+                    "ast": parsed["ast"],
+                    "identifiers": parsed["identifiers"],
+                    "identifier_map": {
+                        "A": "ocr",
+                        "B": "bollinger",
+                        "C": "moving_average",
+                        "D": "rsi",
+                    },
+                },
+                "include_unreferenced_active_filters": "AND_REQUIRED",
+                "groups": [],
+            },
+        }
+        rules["sell"] = {
+            "delay_bar": 0,
+            "signal_logic": "OR",
+            "signals": {"macd_sell": {"enabled": False, "groups": []}},
+        }
+        settings = ValidationSettingsSnapshot(rules)
+        request = ValidationRequest(self.stock, settings, 3)
+        session = ValidationSession(
+            request,
+            operation_active_reader=Mock(return_value=False),
+        )
+        historical = self._historical(closes=(100,) * 30)
+
+        expression_result = ValidationHistoricalReplay(session).evaluate(historical)
+
+        legacy_rules = deepcopy(rules)
+        legacy_rules["buy"]["filters"].pop("composite")
+        legacy_settings = ValidationSettingsSnapshot(legacy_rules)
+        legacy_request = ValidationRequest(self.stock, legacy_settings, 3)
+        legacy_session = ValidationSession(
+            legacy_request,
+            operation_active_reader=Mock(return_value=False),
+        )
+        legacy_result = ValidationHistoricalReplay(legacy_session).evaluate(historical)
+
+        self.assertTrue(expression_result.ok, expression_result)
+        self.assertTrue(legacy_result.ok, legacy_result)
+        expression_buys = [
+            entry
+            for entry in expression_result.snapshot.to_entries()
+            if entry.evaluation_side == "BUY" and entry.signal == "BUY"
+        ]
+        legacy_buys = [
+            entry
+            for entry in legacy_result.snapshot.to_entries()
+            if entry.evaluation_side == "BUY" and entry.signal == "BUY"
+        ]
+        self.assertEqual(11, len(expression_buys))
+        self.assertEqual(0, len(legacy_buys))
+        for entry in expression_buys:
+            self.assertEqual(entry.evaluation_index, entry.signal_index)
+            self.assertEqual(0, entry.delay_bar)
+            self.assertEqual([], entry.matched_groups)
+            self.assertTrue(any("filter_type=BOLLINGER" in detail for detail in entry.details))
+            self.assertTrue(any("referenced_filters=bollinger" in detail for detail in entry.details))
+            self.assertFalse(
+                any(
+                    str(group.get("group_ref", {}).get("path", "")).startswith("buy.groups")
+                    for group in entry.trace.get("groups", [])
+                    if isinstance(group, dict)
+                )
+            )
+            self.assertFalse(
+                any(
+                    aggregation.get("side") == "BUY"
+                    and aggregation.get("payload", {}).get("active_group_paths")
+                    for aggregation in entry.trace.get("aggregations", [])
+                    if isinstance(aggregation, dict)
+                )
+            )
+            evidence = signal_evidence_lines_for_entry(entry, rules)
+            self.assertEqual(1, len(evidence))
+            self.assertIn("볼린저밴드", evidence[0])
+            self.assertNotIn("OCR", evidence[0])
 
     def test_signal_and_evaluation_times_are_preserved_separately(self) -> None:
         rules = self._rules()

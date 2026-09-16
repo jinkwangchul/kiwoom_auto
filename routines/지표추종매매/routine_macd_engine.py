@@ -1343,6 +1343,120 @@ def _evaluate_buy_composite_filter(
     )
 
 
+def _is_buy_expression_mode(composite_cfg: Any) -> bool:
+    if not isinstance(composite_cfg, dict) or not bool(composite_cfg.get("enabled", False)):
+        return False
+    expression = composite_cfg.get("expression")
+    if not isinstance(expression, dict):
+        return False
+    expression_ast = expression.get("ast")
+    identifiers = expression.get("identifiers")
+    identifier_map = expression.get("identifier_map")
+    if (
+        not isinstance(expression_ast, dict)
+        or not isinstance(identifiers, list)
+        or not identifiers
+        or not isinstance(identifier_map, dict)
+    ):
+        return False
+    values: dict[str, bool] = {}
+    allowed_filters = {"ocr", "bollinger", "moving_average", "rsi"}
+    for raw_identifier in identifiers:
+        identifier = str(raw_identifier or "").strip().upper()
+        filter_name = str(identifier_map.get(identifier) or "").strip().lower()
+        if not identifier or filter_name not in allowed_filters:
+            return False
+        values[identifier] = True
+    return bool(evaluate_condition_expression(expression_ast, values).get("ok"))
+
+
+def _evaluate_buy_expression_mode(
+    cfg: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    composite_cfg: dict[str, Any],
+    candles: list[dict[str, Any]],
+    series_map: dict[str, list[float | None]],
+    buy_index: int,
+    buy_delay: int,
+    observer: Any,
+) -> RoutineSignal:
+    filter_cfgs = _buy_filter_config_map(cfg, buy_cfg)
+    filter_results: dict[str, dict[str, Any]] = {}
+    details: list[str] = []
+
+    rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(
+        cfg, buy_cfg, candles, buy_index
+    )
+    if rsi_detail:
+        details.append(rsi_detail)
+    filter_results["rsi"] = {
+        "passed": rsi_passed,
+        "detail": rsi_detail,
+        "configured": bool(filter_cfgs["rsi"]),
+        "enabled": bool(filter_cfgs["rsi"].get("enabled", True)) if filter_cfgs["rsi"] else False,
+    }
+
+    ma_passed, ma_detail = _evaluate_buy_moving_average_filter(
+        cfg, buy_cfg, series_map, buy_index, observer
+    )
+    if ma_detail:
+        details.append(ma_detail)
+    filter_results["moving_average"] = {
+        "passed": ma_passed,
+        "detail": ma_detail,
+        "configured": bool(filter_cfgs["moving_average"]),
+        "enabled": bool(filter_cfgs["moving_average"].get("enabled", True)) if filter_cfgs["moving_average"] else False,
+    }
+
+    bollinger_passed, bollinger_detail = _evaluate_buy_bollinger_filter(
+        cfg, buy_cfg, series_map, buy_index
+    )
+    if bollinger_detail:
+        details.append(bollinger_detail)
+    filter_results["bollinger"] = {
+        "passed": bollinger_passed,
+        "detail": bollinger_detail,
+        "configured": bool(filter_cfgs["bollinger"]),
+        "enabled": bool(filter_cfgs["bollinger"].get("enabled", True)) if filter_cfgs["bollinger"] else False,
+    }
+
+    ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(
+        cfg, buy_cfg, series_map, buy_index, observer
+    )
+    if ocr_detail:
+        details.append(ocr_detail)
+    filter_results["ocr"] = {
+        "passed": ocr_passed,
+        "detail": ocr_detail,
+        "configured": bool(filter_cfgs["ocr"]),
+        "enabled": bool(filter_cfgs["ocr"].get("enabled", True)) if filter_cfgs["ocr"] else False,
+    }
+
+    composite_passed, composite_detail = _evaluate_buy_composite_filter(
+        composite_cfg,
+        filter_results,
+    )
+    if composite_detail:
+        details.append(composite_detail)
+    if not composite_passed:
+        return RoutineSignal(
+            None,
+            "BUY composite filter blocked",
+            [],
+            details,
+            buy_index,
+            buy_delay,
+        )
+    return RoutineSignal(
+        "BUY",
+        "매수조건 충족",
+        [],
+        details,
+        buy_index,
+        buy_delay,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -1695,6 +1809,19 @@ def evaluate_indicator_follow_routine(
         return RoutineSignal(None, "매도조건 미충족", [], [], sell_index, sell_delay)
 
     buy_index = _delay_index(candles, buy_delay)
+    composite_cfg = _buy_composite_filter_config(cfg, buy_cfg)
+    if _is_buy_expression_mode(composite_cfg):
+        return _evaluate_buy_expression_mode(
+            cfg,
+            buy_cfg,
+            composite_cfg,
+            candles,
+            series_map,
+            buy_index,
+            buy_delay,
+            observer,
+        )
+
     buy_groups = buy_cfg.get("groups", []) if isinstance(buy_cfg.get("groups"), list) else []
     buy_passed, buy_results = evaluate_groups_or(
         buy_groups,
@@ -1720,7 +1847,6 @@ def evaluate_indicator_follow_routine(
     if buy_passed:
         matched = [result.group_name for result in buy_results if result.passed]
         details = [detail for result in buy_results for detail in result.details]
-        composite_cfg = _buy_composite_filter_config(cfg, buy_cfg)
         if composite_cfg and bool(composite_cfg.get("enabled", False)):
             filter_cfgs = _buy_filter_config_map(cfg, buy_cfg)
             filter_results: dict[str, dict[str, Any]] = {}

@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest import mock
 import unittest
 
+from engines.condition_engine import parse_condition_expression
+
 
 def _load_routine_engine_module():
     project_root = Path(__file__).resolve().parents[1]
@@ -84,6 +86,66 @@ class RoutineMacdCompositeFilterTest(unittest.TestCase):
             for name in self.engine.BUY_FILTER_ORDER
         }
 
+    def _expression_composite(self, source):
+        parsed = parse_condition_expression(
+            source,
+            allowed_identifiers={"A", "B", "C", "D"},
+        )
+        self.assertTrue(parsed["ok"], parsed)
+        return {
+            "enabled": True,
+            "expression": {
+                "source": source,
+                "normalized": parsed["normalized"],
+                "ast": parsed["ast"],
+                "identifiers": parsed["identifiers"],
+                "identifier_map": {
+                    "A": "ocr",
+                    "B": "bollinger",
+                    "C": "moving_average",
+                    "D": "rsi",
+                },
+            },
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": [],
+        }
+
+    def _expression_config(self, source):
+        filters = self._base_filter_configs()
+        filters["composite"] = self._expression_composite(source)
+        config = self._config(filters=filters)
+        config["buy"]["groups"][0]["conditions"] = [
+            {"enabled": True, "target": "CLOSE", "operator": ">", "value": 9999}
+        ]
+        return config
+
+    def _evaluate_expression(self, source, *, a=False, b=True, c=False, d=False):
+        observer = mock.Mock()
+        with (
+            mock.patch.object(self.engine, "evaluate_groups_or") as legacy_groups,
+            mock.patch.object(self.engine, "_evaluate_buy_ocr_filter", return_value=(a, "ocr_detail")) as ocr,
+            mock.patch.object(self.engine, "_evaluate_buy_bollinger_filter", return_value=(b, "bollinger_detail")) as bollinger,
+            mock.patch.object(self.engine, "_evaluate_buy_moving_average_filter", return_value=(c, "ma_detail")) as moving_average,
+            mock.patch.object(self.engine, "_evaluate_buy_rsi_filter", return_value=(d, "rsi_detail")) as rsi,
+            mock.patch.object(self.engine, "_evaluate_buy_price_compare_filter") as price_compare,
+        ):
+            signal = self.engine.evaluate_indicator_follow_routine(
+                self._candles(),
+                self._expression_config(source),
+                {"decision_trace_observer": observer},
+            )
+        legacy_groups.assert_not_called()
+        price_compare.assert_not_called()
+        for evaluator in (ocr, bollinger, moving_average, rsi):
+            evaluator.assert_called_once()
+        self.assertFalse(
+            any(
+                call.args and call.args[0] == "BUY"
+                for call in observer.observe_aggregation.call_args_list
+            )
+        )
+        return signal
+
     def _detail_reason(self, detail):
         if not detail:
             return None
@@ -108,6 +170,52 @@ class RoutineMacdCompositeFilterTest(unittest.TestCase):
         self.assertEqual("BUY RSI filter blocked", signal.reason)
         rsi.assert_called_once()
         ma.assert_not_called()
+
+    def test_expression_b_is_authoritative_over_failing_legacy_group_and_unreferenced_filters(self):
+        signal = self._evaluate_expression("B", a=False, b=True, c=False, d=False)
+
+        self.assertEqual("BUY", signal.signal)
+        self.assertEqual([], signal.matched_groups)
+        self.assertIn("filter_type=COMPOSITE", " ".join(signal.details))
+        self.assertIn("referenced_filters=bollinger", " ".join(signal.details))
+
+    def test_expression_b_failure_blocks_regardless_of_legacy_group(self):
+        signal = self._evaluate_expression("B", a=True, b=False, c=True, d=True)
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual("BUY composite filter blocked", signal.reason)
+
+    def test_expression_and_or_not_use_only_referenced_identifiers(self):
+        cases = (
+            ("A and B", None),
+            ("A or B", "BUY"),
+            ("B NOT A", "BUY"),
+        )
+        for expression, expected in cases:
+            with self.subTest(expression=expression):
+                signal = self._evaluate_expression(
+                    expression,
+                    a=False,
+                    b=True,
+                    c=False,
+                    d=False,
+                )
+                self.assertEqual(expected, signal.signal)
+
+    def test_legacy_group_remains_authoritative_without_expression(self):
+        config = self._config(filters=None)
+        config["buy"]["groups"][0]["conditions"] = [
+            {"enabled": True, "target": "CLOSE", "operator": ">", "value": 9999}
+        ]
+
+        signal = self.engine.evaluate_indicator_follow_routine(
+            self._candles(),
+            config,
+            {},
+        )
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual("조건 미충족", signal.reason)
 
     def test_composite_disabled_keeps_existing_sequential_result(self):
         config = self._config(filters={"rsi": {"enabled": True}, "composite": self._composite(enabled=False)})
