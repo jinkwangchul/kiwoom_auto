@@ -32,6 +32,107 @@ from mock_validation_contract import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_MOCK_VALIDATION_ROOT = PROJECT_ROOT / "mock_validation"
 
+# Runtime-only dedupe/checkpoint evidence must stay bounded. Meaningful Mock
+# lifecycle/order/fill events remain durable in their existing ledgers/journal.
+MAX_MOCK_EVALUATION_CYCLE_CHECKPOINTS = 512
+MAX_MOCK_MARK_TO_MARKET_DEDUPE_CHECKPOINTS = 64
+_LEGACY_TRANSIENT_APPLIED_OPERATIONS = frozenset({"VIRTUAL_MARK_TO_MARKET"})
+
+
+def _transient_session_runtime_compaction_needed(document: dict[str, Any]) -> bool:
+    applied = document.get("applied_commands")
+    if isinstance(applied, dict) and any(
+        isinstance(entry, dict)
+        and clean_text(entry.get("operation")) in _LEGACY_TRANSIENT_APPLIED_OPERATIONS
+        for entry in applied.values()
+    ):
+        return True
+    progression_by_instance = document.get("progression_by_instance")
+    if not isinstance(progression_by_instance, dict):
+        return False
+    for progression in progression_by_instance.values():
+        if not isinstance(progression, dict):
+            continue
+        adapter = progression.get("indicator_follow_mock_adapter")
+        cycles = adapter.get("evaluation_cycles") if isinstance(adapter, dict) else None
+        if isinstance(cycles, dict) and len(cycles) > MAX_MOCK_EVALUATION_CYCLE_CHECKPOINTS:
+            return True
+    return False
+
+
+def _compact_transient_session_runtime(document: dict[str, Any]) -> dict[str, Any]:
+    """Remove legacy high-frequency evidence and bound runtime checkpoints."""
+
+    if not _transient_session_runtime_compaction_needed(document):
+        return document
+    result = deepcopy(document)
+    applied = result.get("applied_commands")
+    legacy_marks_by_instance: dict[str, list[tuple[str, str]]] = {}
+    if isinstance(applied, dict):
+        durable_commands: dict[str, Any] = {}
+        for command_id, entry in applied.items():
+            is_transient_mark = bool(
+                isinstance(entry, dict)
+                and clean_text(entry.get("operation"))
+                in _LEGACY_TRANSIENT_APPLIED_OPERATIONS
+            )
+            if not is_transient_mark:
+                durable_commands[command_id] = entry
+                continue
+            instance_id = clean_text(entry.get("entity_id"))
+            if instance_id:
+                legacy_marks_by_instance.setdefault(instance_id, []).append(
+                    (clean_text(entry.get("applied_at")), clean_text(command_id))
+                )
+        result["applied_commands"] = durable_commands
+
+    pnl_records = result.get("pnl")
+    if isinstance(pnl_records, list):
+        for pnl in pnl_records:
+            if not isinstance(pnl, dict):
+                continue
+            instance_id = clean_text(pnl.get("routine_instance_id"))
+            legacy_marks = sorted(legacy_marks_by_instance.get(instance_id, ()))
+            existing = [
+                clean_text(value)
+                for value in pnl.get("recent_mark_to_market_commands", ())
+                if clean_text(value)
+            ]
+            merged: list[str] = []
+            for command_id in [item[1] for item in legacy_marks] + existing:
+                if command_id and command_id not in merged:
+                    merged.append(command_id)
+            if merged:
+                pnl["recent_mark_to_market_commands"] = merged[
+                    -MAX_MOCK_MARK_TO_MARKET_DEDUPE_CHECKPOINTS:
+                ]
+                pnl["mark_command_id"] = pnl["recent_mark_to_market_commands"][-1]
+
+    progression_by_instance = result.get("progression_by_instance")
+    if isinstance(progression_by_instance, dict):
+        for progression in progression_by_instance.values():
+            if not isinstance(progression, dict):
+                continue
+            adapter = progression.get("indicator_follow_mock_adapter")
+            if not isinstance(adapter, dict):
+                continue
+            cycles = adapter.get("evaluation_cycles")
+            if not isinstance(cycles, dict) or len(cycles) <= MAX_MOCK_EVALUATION_CYCLE_CHECKPOINTS:
+                continue
+            ordered = sorted(
+                cycles.items(),
+                key=lambda item: (
+                    clean_text(item[1].get("recorded_at"))
+                    if isinstance(item[1], dict)
+                    else "",
+                    clean_text(item[0]),
+                ),
+            )
+            adapter["evaluation_cycles"] = dict(
+                ordered[-MAX_MOCK_EVALUATION_CYCLE_CHECKPOINTS:]
+            )
+    return result
+
 
 def _inside(path: Path, parent: Path) -> bool:
     try:
@@ -326,7 +427,9 @@ class MockValidationRepository:
                 raise MockValidationError("MOCK_SESSION_REVISION_CONFLICT")
             candidate = mutation(deepcopy(before))
             after = candidate if isinstance(candidate, dict) else before
-            checked = validate_session_document(after)
+            checked = validate_session_document(
+                _compact_transient_session_runtime(after)
+            )
             if payload_hash(checked) == payload_hash(before):
                 return {"changed": False, "document": before, "revision": revision}
             checked["revision"] = revision + 1

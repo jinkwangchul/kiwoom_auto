@@ -36,7 +36,10 @@ from mock_validation_market_data import (
     MockOrderbookSnapshot,
     MockTradeSnapshot,
 )
-from mock_validation_repository import MockValidationRepository
+from mock_validation_repository import (
+    MAX_MOCK_MARK_TO_MARKET_DEDUPE_CHECKPOINTS,
+    MockValidationRepository,
+)
 from mock_validation_session_service import MockValidationSessionService
 
 
@@ -44,6 +47,8 @@ RESULT_ACCEPTED = "ACCEPTED"
 RESULT_BLOCKED = "BLOCKED"
 RESULT_NOOP = "NOOP"
 RESULT_PROGRESS = "PROGRESS"
+
+MAX_RECENT_MARK_TO_MARKET_COMMANDS = MAX_MOCK_MARK_TO_MARKET_DEDUPE_CHECKPOINTS
 
 FILLABLE_STATES = {ORDER_OPEN, ORDER_PARTIAL_FILL, ORDER_CANCEL_PENDING}
 LIVE_STATES = {ORDER_OPEN, ORDER_PARTIAL_FILL, ORDER_CANCEL_PENDING}
@@ -701,48 +706,112 @@ class MockVirtualExecutionEngine:
         market_identity: str,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Update the existing isolated PnL ledger from one fresh market fact."""
+        """Update isolated PnL without growing the durable command ledger."""
+
         command = clean_text(command_id) or new_mock_identity("MC")
         before = self.repository.read_session(session_id)
         instance_id = self._instance(before, routine_instance_id)
         self._progression(before, instance_id)
-        previous = self._command_result(before, command)
-        if previous is not None:
-            return {"status": RESULT_NOOP, "duplicate": True, "document": before}
         price = _decimal(current_price, "MOCK_MARK_TO_MARKET_PRICE_INVALID", positive=True)
         identity = clean_text(market_identity)
         if not identity:
             raise MockValidationError("MOCK_MARK_TO_MARKET_IDENTITY_MISSING")
+
+        pnl_before = self._pnl(before, instance_id)
+        recent_commands = [
+            clean_text(value)
+            for value in pnl_before.get("recent_mark_to_market_commands", ())
+            if clean_text(value)
+        ]
+        previous = self._command_result(before, command)
+        legacy_mtm_present = any(
+            isinstance(entry, dict)
+            and clean_text(entry.get("operation")) == "VIRTUAL_MARK_TO_MARKET"
+            for entry in before.get("applied_commands", {}).values()
+        )
+
+        def compact_legacy(document: dict[str, Any]) -> dict[str, Any]:
+            if not legacy_mtm_present:
+                return document
+            return self.repository.mutate_session(
+                session_id,
+                lambda value: value,
+                expected_revision=document["revision"],
+            )["document"]
+
+        if previous is not None or command in recent_commands:
+            compacted = compact_legacy(before)
+            return {"status": RESULT_NOOP, "duplicate": True, "document": compacted}
+
+        position = self._position(before, instance_id)
+        quantity = int(position.get("holding_qty", 0) or 0)
+        if quantity <= 0:
+            compacted = compact_legacy(before)
+            return {
+                "status": RESULT_NOOP,
+                "duplicate": False,
+                "document": compacted,
+            }
+
+        average = _decimal(
+            position.get("average_price", 0),
+            "MOCK_POSITION_AVERAGE_PRICE_INVALID",
+        )
+        unrealized = (price - average) * quantity
+        realized = _signed_decimal(
+            pnl_before.get("realized_pnl", 0),
+            "MOCK_PNL_REALIZED_INVALID",
+        )
+        commission = _decimal(
+            pnl_before.get("commission", 0),
+            "MOCK_PNL_COMMISSION_INVALID",
+        )
+        tax = _decimal(pnl_before.get("mock_tax", 0), "MOCK_PNL_TAX_INVALID")
+        gross = realized + unrealized
+        target = {
+            "unrealized_pnl": _number(unrealized),
+            "gross_pnl": _number(gross),
+            "net_pnl": _number(gross - commission - tax),
+            "mark_price": _number(price),
+        }
+        if not legacy_mtm_present and all(
+            pnl_before.get(field) == value for field, value in target.items()
+        ):
+            return {"status": RESULT_NOOP, "duplicate": False, "document": before}
+
         timestamp = self._now().isoformat(timespec="microseconds")
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
-            position = self._position(document, instance_id)
             pnl = self._pnl(document, instance_id)
-            quantity = int(position.get("holding_qty", 0) or 0)
-            average = _decimal(position.get("average_price", 0), "MOCK_POSITION_AVERAGE_PRICE_INVALID")
-            unrealized = (price - average) * quantity if quantity > 0 else Decimal(0)
-            realized = _signed_decimal(pnl.get("realized_pnl", 0), "MOCK_PNL_REALIZED_INVALID")
-            commission = _decimal(pnl.get("commission", 0), "MOCK_PNL_COMMISSION_INVALID")
-            tax = _decimal(pnl.get("mock_tax", 0), "MOCK_PNL_TAX_INVALID")
-            gross = realized + unrealized
-            pnl.update({
-                "unrealized_pnl": _number(unrealized),
-                "gross_pnl": _number(gross),
-                "net_pnl": _number(gross - commission - tax),
-                "updated_at": timestamp,
-                "market_identity": identity,
-                "mark_price": _number(price),
-            })
-            document["applied_commands"][command] = {
-                "operation": "VIRTUAL_MARK_TO_MARKET",
-                "applied_at": timestamp,
-                "entity_id": instance_id,
-                "market_identity": identity,
-            }
+            recent = [
+                clean_text(value)
+                for value in pnl.get("recent_mark_to_market_commands", ())
+                if clean_text(value) and clean_text(value) != command
+            ]
+            recent.append(command)
+            pnl.update(
+                {
+                    **target,
+                    "updated_at": timestamp,
+                    "market_identity": identity,
+                    "mark_command_id": command,
+                    "recent_mark_to_market_commands": recent[
+                        -MAX_RECENT_MARK_TO_MARKET_COMMANDS:
+                    ],
+                }
+            )
             return document
 
-        result = self.repository.mutate_session(session_id, mutation, expected_revision=before["revision"])
-        return {"status": RESULT_PROGRESS, "duplicate": False, **result}
+        result = self.repository.mutate_session(
+            session_id,
+            mutation,
+            expected_revision=before["revision"],
+        )
+        return {
+            "status": RESULT_PROGRESS if result.get("changed") else RESULT_NOOP,
+            "duplicate": False,
+            **result,
+        }
 
     def process_orderbook(
         self,
