@@ -907,13 +907,22 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
             state,
             datetime(2026, 8, 27, 8, 49, 59),
         )
-        active = self._activation(
+        waiting = self._activation(
             config,
             state,
             datetime(2026, 8, 27, 8, 50, 0),
         )
+        active = self._activation(
+            config,
+            state,
+            datetime(2026, 8, 27, 9, 0, 0),
+        )
 
         self.assertEqual("PRE_OPERATION_BOUNDARY", before["projection_phase"])
+        self.assertEqual(
+            "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
+            waiting["projection_phase"],
+        )
         self.assertEqual("ACTIVE_SESSION", active["projection_phase"])
         self.assertEqual("08:50:00", active["trade_window_start"])
 

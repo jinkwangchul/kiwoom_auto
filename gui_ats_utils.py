@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Callable
 
 from state_policy import (
+    EXCHANGE_NXT_SESSION_RANGES,
+    EXCHANGE_REGULAR_SESSION_RANGES,
     effective_schedule_times,
     normalize_operation_mode,
     normalized_hhmmss_or_empty,
@@ -115,6 +117,40 @@ def operation_policy_time_range_seconds(
         return None
 
 
+def _effective_exchange_session_ranges(
+    session_name: str,
+    start_seconds: int,
+    end_seconds: int,
+) -> tuple[tuple[str, int, int], ...]:
+    """Clip one configured Program session to actual exchange availability.
+
+    Operation participation may begin before a tradable interval, but a
+    configured interval that never overlaps an actual exchange session must not
+    extend the day's re-entry horizon.
+    """
+
+    if start_seconds >= end_seconds:
+        return ()
+    exchange_ranges = (
+        EXCHANGE_REGULAR_SESSION_RANGES
+        if session_name in {"scheduled", "regular"}
+        else tuple(
+            item
+            for item in EXCHANGE_NXT_SESSION_RANGES
+            if str(item[0]).strip().upper() != "KRX"
+        )
+    )
+    result: list[tuple[str, int, int]] = []
+    for _exchange_name, exchange_start, exchange_end in exchange_ranges:
+        exchange_start_seconds = seconds_from_hhmmss(exchange_start, exchange_start)
+        exchange_end_seconds = seconds_from_hhmmss(exchange_end, exchange_end)
+        clipped_start = max(start_seconds, exchange_start_seconds)
+        clipped_end = min(end_seconds, exchange_end_seconds)
+        if clipped_start < clipped_end:
+            result.append((session_name, clipped_start, clipped_end))
+    return tuple(result)
+
+
 def auto_trade_operation_session_phase(
     config: dict[str, object],
     state: dict[str, object],
@@ -195,7 +231,10 @@ def auto_trade_operation_session_phase(
                 continue
             windows.append((str(key), seconds[0], seconds[1]))
 
-    if invalid_sessions or not windows:
+    configured = tuple(
+        sorted(windows, key=lambda item: (item[1], item[2], item[0]))
+    )
+    if invalid_sessions or not configured:
         return {
             "evaluable": False,
             "phase": "SESSION_EVIDENCE_INVALID",
@@ -203,11 +242,13 @@ def auto_trade_operation_session_phase(
             "active": False,
             "future_session_exists": False,
             "final_session_ended": False,
-            "sessions": tuple(windows),
+            "sessions": (),
+            "configured_sessions": configured,
             "active_sessions": (),
             "invalid_sessions": tuple(invalid_sessions),
+            "unavailable_sessions": (),
         }
-    if any(start >= end for _name, start, end in windows):
+    if any(start >= end for _name, start, end in configured):
         return {
             "evaluable": False,
             "phase": "OVERNIGHT_SESSION_UNRESOLVED",
@@ -215,14 +256,61 @@ def auto_trade_operation_session_phase(
             "active": False,
             "future_session_exists": False,
             "final_session_ended": False,
-            "sessions": tuple(windows),
+            "sessions": (),
+            "configured_sessions": configured,
             "active_sessions": (),
             "invalid_sessions": (),
+            "unavailable_sessions": (),
         }
 
-    ordered = tuple(sorted(windows, key=lambda item: (item[1], item[2], item[0])))
+    scheduled_regular_range: tuple[int, int] | None = None
+    if mode == "SCHEDULED":
+        regular = policy.get("regular_market", {}) if isinstance(policy, dict) else {}
+        scheduled_regular_range = operation_policy_time_range_seconds(
+            regular if isinstance(regular, dict) else {},
+            default_start="09:00:00",
+            default_end="15:20:00",
+        )
+
+    effective_windows: list[tuple[str, int, int]] = []
+    unavailable_sessions: list[str] = []
+    for session_name, start_seconds, end_seconds in configured:
+        effective_start = start_seconds
+        effective_end = end_seconds
+        if session_name == "scheduled" and scheduled_regular_range is not None:
+            effective_start = max(effective_start, scheduled_regular_range[0])
+            effective_end = min(effective_end, scheduled_regular_range[1])
+        clipped = _effective_exchange_session_ranges(
+            session_name,
+            effective_start,
+            effective_end,
+        )
+        if not clipped:
+            unavailable_sessions.append(session_name)
+            continue
+        effective_windows.extend(clipped)
+    ordered = tuple(
+        sorted(effective_windows, key=lambda item: (item[1], item[2], item[0]))
+    )
+    if not ordered:
+        return {
+            "evaluable": False,
+            "phase": "NO_EFFECTIVE_SESSION",
+            "mode": mode,
+            "active": False,
+            "future_session_exists": False,
+            "final_session_ended": False,
+            "sessions": (),
+            "configured_sessions": configured,
+            "active_sessions": (),
+            "invalid_sessions": (),
+            "unavailable_sessions": tuple(dict.fromkeys(unavailable_sessions)),
+        }
+
     active_sessions = tuple(
-        name for name, start, end in ordered if start <= current_seconds < end
+        dict.fromkeys(
+            name for name, start, end in ordered if start <= current_seconds < end
+        )
     )
     active = bool(active_sessions)
     future = any(start > current_seconds for _name, start, _end in ordered)
@@ -242,8 +330,10 @@ def auto_trade_operation_session_phase(
         "future_session_exists": future,
         "final_session_ended": phase == "FINAL_SESSION_ENDED",
         "sessions": ordered,
+        "configured_sessions": configured,
         "active_sessions": active_sessions,
         "invalid_sessions": (),
+        "unavailable_sessions": tuple(dict.fromkeys(unavailable_sessions)),
     }
 
 

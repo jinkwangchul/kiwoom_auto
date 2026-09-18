@@ -651,6 +651,8 @@ class MockOperationLifecycleCoordinator:
         execution = before["instance_execution"][instance_id]
         if execution.get("state") == INSTANCE_ERROR:
             raise MockValidationError("MOCK_INSTANCE_ERROR_STOPPED")
+        if execution.get("state") == SESSION_ENDED:
+            raise MockValidationError("MOCK_INSTANCE_OPERATION_ENDED")
         root = _root(before)
         stock_operation = root.get("current")
         if isinstance(stock_operation, dict) and stock_operation.get("state") in {
@@ -664,8 +666,6 @@ class MockOperationLifecycleCoordinator:
         if isinstance(previous, dict):
             if previous.get("state") in {OPERATION_RUNNING, OPERATION_CLOSING}:
                 return {"status": "NOOP", "duplicate": True, "document": before}
-            if previous.get("state") == OPERATION_ENDED:
-                raise MockValidationError("MOCK_INSTANCE_OPERATION_ENDED")
         timestamp = as_of.isoformat(timespec="microseconds")
         operation_id = deterministic_mock_identity(
             "MS", session_id, instance_id, date_text, command
@@ -2912,6 +2912,9 @@ class MockOperationLifecycleCoordinator:
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
             root = _root(document)
             operation = root["instance_operations"][instance_id]
+            return_to_waiting = (
+                clean_text(operation.get("close_source")).upper() == "EARLY"
+            )
             operation.update(
                 {
                     "state": OPERATION_ENDED,
@@ -2941,7 +2944,9 @@ class MockOperationLifecycleCoordinator:
             execution = document["instance_execution"][instance_id]
             execution.update(
                 {
-                    "state": SESSION_ENDED,
+                    "state": (
+                        SESSION_WAITING if return_to_waiting else SESSION_ENDED
+                    ),
                     "progression_allowed": False,
                     "last_operation_session_id": operation["operation_session_id"],
                     "operation_session_id": "",

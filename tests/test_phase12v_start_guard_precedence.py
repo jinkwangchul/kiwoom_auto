@@ -169,7 +169,7 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
         window.recalculate_stock_status_by_operation_policy.assert_not_called()
         writer.assert_not_called()
 
-    def test_authenticated_outside_time_target_starts_and_registers_participant(self) -> None:
+    def test_authenticated_after_final_session_blocks_before_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _target(Path(temp_dir), "012210")
             window = _PrecedenceWindow([target])
@@ -179,29 +179,18 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                 now=run_control.datetime(2026, 8, 25, 21, 0),
             )
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(1, result["started_count"])
-        self.assertEqual((target,), result["time_eligible_targets"])
-        self.assertEqual((), result["time_blocked_targets"])
-        window.filter_start_targets_by_recovery.assert_called_once_with(
-            [target], action="운영시작"
-        )
+        self.assertFalse(result["ok"])
+        self.assertEqual("NO_STARTABLE_TARGETS", result["reason"])
+        self.assertEqual(0, result["started_count"])
+        self.assertEqual((), result["time_eligible_targets"])
+        self.assertEqual((f"{target[1]} {target[2]}",), result["time_blocked_targets"])
         self.assertEqual(
-            ("012210",),
-            run_control.auto_trade_current_session_operation_participant_codes(window),
+            "FINAL_SESSION_ENDED",
+            result["blocked_target_details"][0]["reason"],
         )
-        writer.assert_called_once_with(participant_stock_codes=["012210"])
-        time_status = order_permission.canonical_stock_trading_time_status(
-            config={
-                "operation_mode": "SCHEDULED",
-                "start_time": "09:00:00",
-                "end_buy_time": "13:30:00",
-            },
-            state={},
-            now_dt=run_control.datetime(2026, 8, 25, 21, 0),
-        )
-        self.assertIs(time_status["active"], False)
-        self.assertEqual("OUTSIDE_OPERATION_TIME", time_status["reason"])
+        window.filter_start_targets_by_recovery.assert_not_called()
+        self.assertEqual((), run_control.auto_trade_current_session_operation_participant_codes(window))
+        writer.assert_not_called()
 
     def test_pre_market_ats_active_start_allows_ats_order_time(self) -> None:
         operation_policy = {
@@ -233,15 +222,15 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
             state_path.write_text(json.dumps(state), encoding="utf-8")
             window = _PrecedenceWindow([target])
 
-            result, writer = self._run(
-                window,
-                now=run_control.datetime(2026, 8, 25, 8, 10),
-            )
             with patch.object(
                 ats_utils,
                 "read_operation_policy",
                 return_value=operation_policy,
             ):
+                result, writer = self._run(
+                    window,
+                    now=run_control.datetime(2026, 8, 25, 8, 10),
+                )
                 time_status = order_permission.canonical_stock_trading_time_status(
                     config=config,
                     state=state,
@@ -288,15 +277,15 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
             state_path.write_text(json.dumps(state), encoding="utf-8")
             window = _PrecedenceWindow([target])
 
-            result, _writer = self._run(
-                window,
-                now=run_control.datetime(2026, 8, 25, 7, 59, 59),
-            )
             with patch.object(
                 ats_utils,
                 "read_operation_policy",
                 return_value=operation_policy,
             ):
+                result, _writer = self._run(
+                    window,
+                    now=run_control.datetime(2026, 8, 25, 7, 59, 59),
+                )
                 time_status = order_permission.canonical_stock_trading_time_status(
                     config=config,
                     state=state,
@@ -441,7 +430,7 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
         window.split_start_targets.assert_not_called()
         writer.assert_not_called()
 
-    def test_mixed_trade_windows_all_reach_recovery_admission(self) -> None:
+    def test_mixed_reentry_windows_only_effective_target_reaches_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             outside = _target(Path(temp_dir), "000001", start="18:00:00", end="19:00:00")
             inside = _target(Path(temp_dir), "000002")
@@ -451,31 +440,31 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(
-            [outside, inside],
+            [inside],
             window.filter_start_targets_by_recovery.call_args.args[0],
         )
-        self.assertEqual((outside, inside), result["time_eligible_targets"])
-        self.assertEqual((), result["time_blocked_targets"])
-        self.assertNotIn("매매 운영 시간이 아닙니다", result["user_message"])
+        self.assertEqual((inside,), result["time_eligible_targets"])
+        self.assertEqual((f"{outside[1]} {outside[2]}",), result["time_blocked_targets"])
+        blocked = result["blocked_target_details"]
+        self.assertEqual(1, len(blocked))
+        self.assertEqual("NO_EFFECTIVE_SESSION", blocked[0]["reason"])
 
-    def test_all_outside_time_starts_after_recovery(self) -> None:
+    def test_all_after_final_session_blocks_before_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _target(Path(temp_dir), "012210")
             window = _PrecedenceWindow([target])
 
-            result, _writer = self._run(
+            result, writer = self._run(
                 window,
                 now=run_control.datetime(2026, 8, 25, 21, 0),
             )
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(1, result["started_count"])
-        self.assertEqual((target,), result["time_eligible_targets"])
-        self.assertEqual((), result["time_blocked_targets"])
-        window.filter_start_targets_by_recovery.assert_called_once_with(
-            [target], action="운영시작"
-        )
-        self.assertNotIn("검토관리와 자동매매 설정", result["user_message"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(0, result["started_count"])
+        self.assertEqual((), result["time_eligible_targets"])
+        self.assertEqual((f"{target[1]} {target[2]}",), result["time_blocked_targets"])
+        window.filter_start_targets_by_recovery.assert_not_called()
+        writer.assert_not_called()
 
     def test_main_global_caller_blocks_global_prerequisite_before_time(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

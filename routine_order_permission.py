@@ -149,8 +149,12 @@ def canonical_stock_trading_time_status(
             )
             regular_active = bool(
                 regular_active
+                and activation.get("regular_session_active") is True
                 and activation.get("operation_boundary_reached") is True
                 and activation.get("trade_window_started") is True
+            )
+            ats_active = bool(
+                ats_active and activation.get("ats_session_active") is True
             )
             return {
                 "evaluable": True,
@@ -172,6 +176,8 @@ def canonical_stock_trading_time_status(
         )
         active = bool(
             scheduled_status_for_now(config, current) == "RUNNING"
+            and activation.get("actual_trading_session_active") is True
+            and activation.get("regular_session_active") is True
             and activation.get("operation_boundary_reached") is True
             and activation.get("trade_window_started") is True
         )

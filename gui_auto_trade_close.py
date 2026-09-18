@@ -43,6 +43,7 @@ from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
 )
 from gui_auto_trade_policy import (
+    auto_trade_retire_current_session_operation_participants,
     operation_policy_section,
     auto_trade_setting_early_close_requested,
     auto_trade_setting_has_buy_pending_problem,
@@ -687,6 +688,33 @@ def _resume_existing_close_order(
     }
 
 
+def _retire_completed_early_close_participant(
+    window,
+    stock_code: object,
+) -> dict[str, object]:
+    """Withdraw a completed early-close stock from current Operation participation."""
+
+    code = str(stock_code or "").strip()
+    if not code:
+        return {"removed": (), "remaining": ()}
+    try:
+        result = auto_trade_retire_current_session_operation_participants(
+            window,
+            (code,),
+        )
+    except Exception as exc:
+        LOGGER.exception(
+            "Completed early-close participant retirement failed: stock=%s",
+            code,
+        )
+        return {
+            "removed": (),
+            "reason_code": "EARLY_CLOSE_PARTICIPANT_RETIREMENT_FAILED",
+            "error": str(exc),
+        }
+    return dict(result) if isinstance(result, dict) else {"removed": ()}
+
+
 def _persist_early_close_execution_result(
     window,
     *,
@@ -717,6 +745,8 @@ def _persist_early_close_execution_result(
         str(state.get("status") or "").strip().upper() == runtime_status
         and str(state.get("operation_notice") or "").strip().upper() == notice
     ):
+        if runtime_status == "EARLY_CLOSED":
+            _retire_completed_early_close_participant(window, code)
         return True
 
     metadata: dict[str, object] = {
@@ -750,7 +780,7 @@ def _persist_early_close_execution_result(
                 "review_location": "운영 중",
             }
         )
-    return bool(
+    saved = bool(
         window.update_stock_status(
             stock_dir,
             code,
@@ -760,6 +790,9 @@ def _persist_early_close_execution_result(
             f"조기마감/{stage or runtime_status}",
         )
     )
+    if saved and runtime_status == "EARLY_CLOSED":
+        _retire_completed_early_close_participant(window, code)
+    return saved
 
 
 def _start_close_liquidation_execution(

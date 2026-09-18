@@ -42,6 +42,7 @@ from gui_auto_trade_policy import (
     auto_trade_register_current_session_operation_participants,
     auto_trade_retire_current_session_operation_participants,
     auto_trade_setting_should_preserve_raw_status,
+    auto_trade_setting_start_target_decision,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_trade_started,
     clear_early_close_runtime_metadata_only,
@@ -620,17 +621,25 @@ def _close_completion_evidence_for_today(
 
 def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> bool:
     status = str(state.get("status") or "").strip().upper()
+    operation_notice = str(state.get("operation_notice") or "").strip().upper()
+    completed_early_close = (
+        status == "EARLY_CLOSED"
+        and operation_notice == "EARLY_CLOSE_COMPLETED"
+    )
     stale_early_close_status = (
         status in {"EARLY_CLOSE", "EARLY_CLOSING", "EARLY_CLOSED"}
         and not auto_trade_setting_should_preserve_raw_status(state, status)
     )
     if status in _ACTIVE_CLOSE_STATUSES and not stale_early_close_status:
         return True
-    if bool(state.get("liquidation_policy_forced", False)):
+    if not completed_early_close and bool(
+        state.get("liquidation_policy_forced", False)
+    ):
         return True
-    if bool(state.get("close_routine_final_sell_ordered", False)) or str(
-        state.get("close_routine_final_sell_ordered_at") or ""
-    ).strip():
+    if not completed_early_close and (
+        bool(state.get("close_routine_final_sell_ordered", False))
+        or str(state.get("close_routine_final_sell_ordered_at") or "").strip()
+    ):
         return True
     for key in _LIQUIDATION_REQUEST_KEYS:
         request = state.get(key)
@@ -647,10 +656,12 @@ def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> 
         if request_status not in _LIQUIDATION_REQUEST_TERMINAL_STATUSES:
             return True
 
+    if completed_early_close:
+        return False
+
     command_mode = str(state.get("operation_command_mode") or "").strip().upper()
     if command_mode == "EARLY_CLOSE" and not stale_early_close_status:
-        notice = str(state.get("operation_notice") or "").strip().upper()
-        if notice != "EARLY_CLOSE_NO_TARGET" and not _close_completion_evidence_for_today(
+        if operation_notice != "EARLY_CLOSE_NO_TARGET" and not _close_completion_evidence_for_today(
             state, now_dt
         ):
             return True
@@ -1515,6 +1526,9 @@ def _start_failure_user_message(
 
 
 _START_BLOCK_REASON_LABELS = {
+    "NO_EFFECTIVE_SESSION": "\uc720\ud6a8 \uc6b4\uc601\uc138\uc158 \uc5c6\uc74c",
+    "SESSION_EVIDENCE_INVALID": "\uc6b4\uc601\uc2dc\uac04 \uc124\uc815 \ud655\uc778 \ud544\uc694",
+    "OVERNIGHT_SESSION_UNRESOLVED": "\uc6b4\uc601\uc2dc\uac04 \uc124\uc815 \ud655\uc778 \ud544\uc694",
     "FINAL_SESSION_ENDED": "시간운영 종료",
     "TIME_OPERATION_FINAL_END": "시간운영 종료",
     "REVIEW_REQUIRED": "검토관리 필요",
@@ -2282,6 +2296,7 @@ def auto_trade_start_selected_auto_trades(
     per_stock_restart_source = start_source in {
         "auto_trade_context_menu",
         "main_monitoring_window",
+        "main_routine_start",
         "auto_trade_status_indicator",
     }
     if not per_stock_restart_source and _today_normal_ended(operation_state, request_now):
@@ -2422,6 +2437,7 @@ def auto_trade_start_selected_auto_trades(
     candidate_targets: list[tuple[Path, str, str]] = []
     excluded_review: list[str] = []
     blocked_target_details: list[dict[str, object]] = list(start_exclusions)
+    reentry_time_blocked_targets: list[str] = []
     for stock_dir, code, name in selected:
         isolated = (
             bool(review_checker(stock_dir, code))
@@ -2444,6 +2460,47 @@ def auto_trade_start_selected_auto_trades(
     try:
         start_targets, skipped = window.split_start_targets(candidate_targets)
         blocked_target_details.extend(_start_target_block_details(window))
+
+        # Canonical per-stock re-entry admission must not depend on one UI host's
+        # split implementation. Waiting targets may join before/between effective
+        # sessions, but never after their last effective session has ended.
+        canonical_start_targets: list[tuple[Path, str, str]] = []
+        for stock_dir, code, name in start_targets:
+            state = read_json_dict(Path(stock_dir) / "state.json")
+            config = read_json_dict(Path(stock_dir) / "config.json")
+            decision = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                code,
+                config=config,
+                now_dt=request_now,
+            )
+            if decision.get("allowed") is True:
+                canonical_start_targets.append((stock_dir, code, name))
+                continue
+            status = str(state.get("status") or "STOPPED").strip().upper() or "STOPPED"
+            skipped.append(
+                f"{code} {name}({auto_trade_status_display(status)})"
+            )
+            reentry_time_blocked_targets.append(
+                f"{code} {name}".strip()
+            )
+            blocked_target_details.append(
+                {
+                    "stock_code": str(code),
+                    "stock_name": str(name),
+                    "reason": str(decision.get("reason") or "NOT_STARTABLE"),
+                    "status": status,
+                    "operation_mode": str(
+                        decision.get("operation_mode") or ""
+                    ),
+                    "session_phase": dict(
+                        decision.get("session_phase") or {}
+                    ),
+                    "display_label": f"{code} {name}".strip(),
+                }
+            )
+        start_targets = canonical_start_targets
         blocked_target_details = tuple(blocked_target_details)
     except Exception:
         LOGGER.exception("운영 시작 대상 분류 실패")
@@ -2558,10 +2615,11 @@ def auto_trade_start_selected_auto_trades(
             _show_start_failure_once(window, result)
         return result
 
-    # Operation Start establishes participation and may run before or between
-    # actual trading sessions. Order permission owns the fail-closed time gate.
+    # Operation Start may establish participation before or between effective
+    # sessions only while a future effective session remains. Order permission
+    # separately owns the current tradable-time gate.
     time_eligible_targets: list[tuple[Path, str, str]] = list(start_targets)
-    time_blocked_targets: list[str] = []
+    time_blocked_targets: list[str] = list(reentry_time_blocked_targets)
 
     recovery_filter = getattr(window, "filter_start_targets_by_recovery", None)
     if callable(recovery_filter):
@@ -3128,15 +3186,14 @@ def auto_trade_start_selected_rows_auto_trades(
         return None
 
     running_targets = window.running_registered_operation_targets()
-    global_running = today_global_operation_status(
-        read_operation_state()
-    ) in {"RUNNING", "CLOSING"}
+    operation_state = read_operation_state()
+    today_started = today_operation_start_evidence(operation_state)
     running_keys = {
         str(code or "").strip() or str(Path(stock_dir).resolve())
         for stock_dir, code, _name in running_targets
     }
 
-    if not running_targets and not global_running:
+    if not running_targets and not today_started:
         start_targets: list[tuple[Path, str, str]] = []
         selected_keys: set[str] = set()
         for target in selected_targets:

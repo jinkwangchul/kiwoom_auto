@@ -823,7 +823,16 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
             )
         return "protected", before_status, before_status
 
-    if auto_trade_setting_should_preserve_raw_status(state, before_status):
+    completed_early_close_restart = bool(
+        start_requested
+        and before_status == "EARLY_CLOSED"
+        and str(state.get("operation_notice") or "").strip().upper()
+        == "EARLY_CLOSE_COMPLETED"
+    )
+    if (
+        auto_trade_setting_should_preserve_raw_status(state, before_status)
+        and not completed_early_close_restart
+    ):
         if not silent_unchanged:
             append_stock_log(
                 stock_dir,

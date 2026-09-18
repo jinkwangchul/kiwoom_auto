@@ -789,7 +789,7 @@ class MockValidationHost:
                     in {SESSION_WAITING, INSTANCE_VALIDATION_STOPPED}
                 )
             )
-            and operation_state not in {"RUNNING", "CLOSING", "ENDED"}
+            and operation_state not in {"RUNNING", "CLOSING"}
         )
 
     def _instance_start_admission(
@@ -820,10 +820,14 @@ class MockValidationHost:
             operation_policy_reader=lambda: policy,
             ats_session_reader=ats_reader,
         )
-        final_ended = (
-            str(session_phase.get("phase") or "").strip().upper()
-            == "FINAL_SESSION_ENDED"
-        )
+        phase_name = str(session_phase.get("phase") or "").strip().upper()
+        if session_phase.get("evaluable") is not True:
+            return {
+                "allowed": False,
+                "reason": phase_name or "SESSION_EVIDENCE_INVALID",
+                "session_phase": session_phase,
+            }
+        final_ended = phase_name == "FINAL_SESSION_ENDED"
         return {
             "allowed": not final_ended,
             "reason": "FINAL_SESSION_ENDED" if final_ended else "",

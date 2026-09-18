@@ -287,6 +287,91 @@ class SameDayRestartGuardTest(unittest.TestCase):
                     "CLOSE_LIQUIDATION_ACTIVE", self.guard(state=state)["reason"]
                 )
 
+    def test_completed_early_close_is_restartable_after_obligations_clear(self) -> None:
+        completed = dict(
+            self.state,
+            status="EARLY_CLOSED",
+            holding_qty=0,
+            trade_enabled=True,
+            early_close_requested_at="2026-08-10 10:00:00",
+            early_close_source="routine_context_menu",
+            liquidation_policy_forced=True,
+            liquidation_policy_reason="EARLY_CLOSE",
+            close_routine_final_sell_ordered=True,
+            close_routine_final_sell_ordered_at="2026-08-10 10:30:00",
+            operation_command_mode="EARLY_CLOSE",
+            operation_notice="EARLY_CLOSE_COMPLETED",
+        )
+        result = self.guard(
+            now=datetime(2026, 8, 10, 11, 0, 0),
+            state=completed,
+        )
+        self.assertTrue(result["allowed"])
+        self.assertEqual("ALLOWED", result["reason"])
+
+    def test_completed_early_close_backend_restarts_as_new_operation(self) -> None:
+        (self.stock_dir / "config.json").write_text(
+            json.dumps(self.config, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        completed = dict(
+            self.state,
+            status="EARLY_CLOSED",
+            holding_qty=0,
+            trade_enabled=True,
+            trade_started_at="2026-08-10 09:00:00",
+            early_close_requested_at="2026-08-10 10:00:00",
+            early_close_source="routine_context_menu",
+            early_close_method="??",
+            early_close_policy={"method": "??"},
+            liquidation_policy_forced=True,
+            liquidation_policy_reason="EARLY_CLOSE",
+            close_routine_final_sell_ordered=True,
+            close_routine_final_sell_ordered_at="2026-08-10 10:30:00",
+            operation_command_mode="EARLY_CLOSE",
+            operation_notice="EARLY_CLOSE_COMPLETED",
+        )
+        (self.stock_dir / "state.json").write_text(
+            json.dumps(completed, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        target = (self.stock_dir, "005930", "????")
+        window = _PersistingStartWindow(target)
+        window._main_monitoring_auto_trade_operation_host = AutoTradeOperationHost(None)
+
+        with (
+            patch.object(run_control, "current_datetime", return_value=self.NOW),
+            patch.object(run_control, "now_text", return_value="2026-08-10 11:00:00"),
+            patch.object(run_control, "status_after_operation_mode_change", return_value="RUNNING"),
+            patch.object(run_control, "ORDER_QUEUE_PATH", self.queue_path),
+            patch.object(run_control, "read_operation_state", return_value=self.operation_state),
+            patch.object(run_control, "write_global_operation_running_state"),
+            patch.object(run_control, "append_changelog"),
+            patch.object(run_control, "append_production_event"),
+            patch.object(status_ops, "append_stock_log"),
+        ):
+            result = run_control.auto_trade_start_selected_auto_trades(
+                window,
+                selected_targets=[target],
+                request_scope=run_control.START_REQUEST_SINGLE,
+                source="auto_trade_context_menu",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            ("005930",),
+            run_control.auto_trade_current_session_operation_participant_codes(window),
+        )
+        saved = json.loads(
+            (self.stock_dir / "state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("RUNNING", saved["status"])
+        self.assertEqual("2026-08-10 11:00:00", saved["trade_started_at"])
+        self.assertEqual("", saved.get("early_close_requested_at", ""))
+        self.assertEqual("", saved.get("early_close_source", ""))
+        self.assertFalse(saved.get("liquidation_policy_forced", False))
+        self.assertEqual("", saved.get("operation_notice", ""))
+
     def test_successful_backend_restart_restores_canonical_permission_atomically(self) -> None:
         (self.stock_dir / "config.json").write_text(
             json.dumps(self.config, ensure_ascii=False), encoding="utf-8"
@@ -411,7 +496,11 @@ class SameDayRestartGuardTest(unittest.TestCase):
         self.assertEqual([], window.recalculate_calls)
         write.assert_not_called()
 
-        for source in ("auto_trade_context_menu", "main_monitoring_window"):
+        for source in (
+            "auto_trade_context_menu",
+            "main_monitoring_window",
+            "main_routine_start",
+        ):
             with self.subTest(source=source):
                 restart_window = _PersistingStartWindow(target)
                 restart_window._main_monitoring_auto_trade_operation_host = (

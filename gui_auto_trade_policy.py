@@ -659,6 +659,9 @@ _OPERATION_START_ALLOWED_STATUSES = frozenset(
 _EARLY_CLOSE_STATUS_VALUES = frozenset(
     {"EARLY_CLOSE", "EARLY_CLOSING", "EARLY_CLOSED"}
 )
+_COMPLETED_CLOSE_STATUS_VALUES = frozenset(
+    {"EARLY_CLOSED", "AUTO_CLOSED", "LIQUIDATED"}
+)
 
 
 def auto_trade_setting_start_target_decision(
@@ -696,7 +699,15 @@ def auto_trade_setting_start_target_decision(
         )
     except Exception:
         session_phase = {}
-    if str(session_phase.get("phase") or "").strip().upper() == "FINAL_SESSION_ENDED":
+    phase_name = str(session_phase.get("phase") or "").strip().upper()
+    if session_phase.get("evaluable") is not True:
+        return {
+            "allowed": False,
+            "reason": phase_name or "SESSION_EVIDENCE_INVALID",
+            "session_phase": session_phase,
+            "operation_mode": effective_mode,
+        }
+    if phase_name == "FINAL_SESSION_ENDED":
         return {
             "allowed": False,
             "reason": "FINAL_SESSION_ENDED",
@@ -723,6 +734,13 @@ def auto_trade_setting_start_target_decision(
             "operation_mode": effective_mode,
         }
     if raw_status in _OPERATION_START_ALLOWED_STATUSES:
+        return {
+            "allowed": True,
+            "reason": "",
+            "session_phase": session_phase,
+            "operation_mode": effective_mode,
+        }
+    if raw_status in _COMPLETED_CLOSE_STATUS_VALUES:
         return {
             "allowed": True,
             "reason": "",

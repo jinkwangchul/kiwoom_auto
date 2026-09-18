@@ -733,13 +733,28 @@ class MockOperationLifecycleTest(unittest.TestCase):
         self.assertEqual(2, positions["A"])
         self.assertEqual(0, positions["B"])
         self.assertEqual(0, positions["C"])
-        self.assertEqual(SESSION_ENDED, after["instance_execution"]["B"]["state"])
+        self.assertEqual(SESSION_WAITING, after["instance_execution"]["B"]["state"])
         self.assertEqual(
             sibling_hashes,
             {
                 instance_id: self.instance_snapshot(after, instance_id)
                 for instance_id in ("A", "C")
             },
+        )
+        ended_operation_id = after["mock_operation_lifecycle"]["instance_operations"]["B"][
+            "operation_session_id"
+        ]
+        restarted = self.start_instance(
+            "B",
+            command="MC-instance-restart-B",
+        )
+        self.assertEqual(
+            SESSION_RUNNING,
+            restarted["document"]["instance_execution"]["B"]["state"],
+        )
+        self.assertNotEqual(
+            ended_operation_id,
+            restarted["operation"]["operation_session_id"],
         )
 
     def test_instance_close_carryover_requires_mock_snapshot_long_hold(self):
