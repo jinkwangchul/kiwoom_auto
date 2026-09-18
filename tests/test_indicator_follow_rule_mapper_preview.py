@@ -367,6 +367,34 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(value["logic"], "AND")
         self.assertEqual(value["groups"], groups)
 
+    def test_buy_composite_disabled_does_not_validate_inactive_children(self):
+        groups = [{"enabled": True, "logic": "BAD", "filters": ["unsupported"]}]
+        config = self._composite_config(enabled=False, logic="BAD", groups=groups)
+        config["include_unreferenced_active_filters"] = "BAD"
+
+        result = self._build_preview_with_composite(config)
+        value = self._composite_candidate_value(result)
+
+        self.assertEqual(False, value["enabled"])
+        self.assertEqual("BAD", value["logic"])
+        self.assertEqual("BAD", value["include_unreferenced_active_filters"])
+        self.assertEqual(groups, value["groups"])
+        self.assertFalse(any("buy composite" in item for item in result["validation_warnings"]))
+
+    def test_buy_composite_disabled_group_does_not_validate_inactive_children(self):
+        groups = [
+            {"enabled": False, "logic": "BAD", "filters": ["unsupported"]},
+            {"enabled": True, "logic": "AND", "filters": ["rsi"]},
+        ]
+
+        result = self._build_preview_with_composite(
+            self._composite_config(enabled=True, logic="AND", groups=groups)
+        )
+        value = self._composite_candidate_value(result)
+
+        self.assertEqual(groups, value["groups"])
+        self.assertFalse(any("group 1" in item for item in result["validation_warnings"]))
+
     def test_buy_composite_maps_top_and_group_logic(self):
         groups = [
             {"enabled": True, "logic": "OR", "filters": ["rsi"]},
@@ -3685,17 +3713,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "ratio_value": 1.5,
             "ratio_compare": ">=",
             "ratio_count": 2,
-            "last_round_active_buy": {
-                "enabled": False,
-                "applies_to": "LAST_MULTI_POINT_CHILD",
-                "budget_policy_override": "NONE",
-                "purpose": "BUY_METHOD_SPECIAL_ACTION",
-                "subject": "AVERAGE_PRICE",
-                "reference": "MULTI_POINT_SET_PRICE",
-                "direction": "UP",
-                "ratio_percent": 0.45,
-                "comparator": ">=",
-            },
+            "last_round_active_buy": {"enabled": False},
             "execution_connected": True,
             "execution_lock_reason": "",
             "buy_completion_policy": {

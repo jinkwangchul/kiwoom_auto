@@ -109,6 +109,36 @@ class PreviousRoundPriceSkipConsumerTest(unittest.TestCase):
         rules["buy"]["execution"]["additional"] = _additional(skip=enabled)
         return rules
 
+    def test_disabled_additional_details_are_not_runtime_requirements(self) -> None:
+        rules = self.helper._rules()
+        rules["buy"]["execution"]["additional"] = {
+            "previous_round_price_skip": {"enabled": False},
+            "last_plus_one": {"enabled": False},
+            "execution_connected": True,
+            "execution_lock_reason": "",
+        }
+
+        self.assertEqual(
+            "",
+            bridge.inspect_buy_execution_support(subject={"side": "BUY"}, rules=rules),
+        )
+
+    def test_non_active_last_plus_one_does_not_require_active_condition(self) -> None:
+        rules = self.helper._rules()
+        policy = _additional(last=True, method="MARKET")
+        policy["last_plus_one"].pop("active_condition")
+        rules["buy"]["execution"]["additional"] = policy
+
+        self.assertEqual(
+            "",
+            bridge.inspect_buy_execution_support(subject={"side": "BUY"}, rules=rules),
+        )
+        policy["last_plus_one"]["method"] = "ACTIVE"
+        self.assertEqual(
+            "BUY_ADDITIONAL_POLICY_INVALID",
+            bridge.inspect_buy_execution_support(subject={"side": "BUY"}, rules=rules),
+        )
+
     def test_first_buy_is_not_applicable(self) -> None:
         self.assertEqual("READY", self.helper._build(rules=self.rules(), price=110)["status"])
 

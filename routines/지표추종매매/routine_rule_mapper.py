@@ -565,16 +565,31 @@ def _build_buy_composite_filter_candidate(signal_filter: dict[str, Any], warning
 
     enabled = _truthy_ui(source.get("enabled"))
     logic = str(source.get("logic", "AND") or "").strip().upper()
+    include_policy = str(
+        source.get("include_unreferenced_active_filters", "AND_REQUIRED") or ""
+    ).strip().upper()
+    groups = source.get("groups")
+    if not enabled:
+        # Disabled composite configuration is stored for UI round-trip only.
+        # Runtime exits before reading its child logic/groups, so inactive child
+        # values must not become a save/validation gate.
+        return {
+            "path": BUY_COMPOSITE_FILTER_PATH,
+            "value": {
+                "enabled": False,
+                "logic": logic,
+                "include_unreferenced_active_filters": include_policy,
+                "groups": deepcopy(groups),
+            },
+        }
     if logic not in {"AND", "OR"}:
         warnings.append(f"buy composite logic is not supported: {source.get('logic')!r}")
         return None
 
-    include_policy = str(source.get("include_unreferenced_active_filters", "AND_REQUIRED") or "").strip().upper()
     if include_policy != "AND_REQUIRED":
         warnings.append(f"buy composite include policy is not supported: {source.get('include_unreferenced_active_filters')!r}")
         return None
 
-    groups = source.get("groups")
     if not isinstance(groups, list):
         warnings.append("buy composite groups is not a list")
         return None
@@ -589,6 +604,13 @@ def _build_buy_composite_filter_candidate(signal_filter: dict[str, Any], warning
 
         group_enabled = _truthy_ui(group.get("enabled"))
         group_logic = str(group.get("logic", "AND") or "").strip().upper()
+        if not group_enabled:
+            normalized_groups.append({
+                "enabled": False,
+                "logic": group_logic,
+                "filters": deepcopy(group.get("filters")),
+            })
+            continue
         if group_logic not in {"AND", "OR"}:
             warnings.append(f"buy composite group {index + 1} logic is not supported: {group.get('logic')!r}")
             return None
@@ -959,6 +981,10 @@ def _build_last_round_active_buy_policy(
     if enabled is None:
         warnings.append("buy last-round active enabled must be boolean")
         return None, False
+    if not enabled:
+        # Disabled child controls are retained only in UI state. They must not
+        # create validation requirements or strategy-affecting engine fields.
+        return {"enabled": False}, False
     policy = {
         "enabled": enabled,
         "applies_to": "LAST_MULTI_POINT_CHILD",
@@ -1000,52 +1026,59 @@ def _build_buy_execution_additional_candidate(
         warnings.append("buy additional enabled values must be boolean")
         return None
 
-    price_policy = {
-        "enabled": price_enabled,
-        "reference_source": "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
-        "current_source": "ACTIONABLE_ORDER_PRICE",
-        "direction": _direction_token(price.get("direction_combo")),
-        "ratio_percent": _nonnegative_float(price.get("ratio_line")),
-        "comparator": _ratio_compare_token(price.get("compare_combo")),
-        "action": "SKIP_CURRENT_GENERATION",
-        "skipped_round_increment": False,
-    }
-    if (
-        price_policy["direction"] not in {"UP", "DOWN", "BOTH"}
-        or price_policy["ratio_percent"] is None
-        or price_policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
-    ):
-        warnings.append("buy previous-round price skip policy is invalid")
-        return None
+    if price_enabled:
+        price_policy = {
+            "enabled": True,
+            "reference_source": "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
+            "current_source": "ACTIONABLE_ORDER_PRICE",
+            "direction": _direction_token(price.get("direction_combo")),
+            "ratio_percent": _nonnegative_float(price.get("ratio_line")),
+            "comparator": _ratio_compare_token(price.get("compare_combo")),
+            "action": "SKIP_CURRENT_GENERATION",
+            "skipped_round_increment": False,
+        }
+        if (
+            price_policy["direction"] not in {"UP", "DOWN", "BOTH"}
+            or price_policy["ratio_percent"] is None
+            or price_policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+        ):
+            warnings.append("buy previous-round price skip policy is invalid")
+            return None
+    else:
+        price_policy = {"enabled": False}
 
-    method = _last_plus_one_method_token(last.get("method_combo"))
-    active_condition = {
-        "lhs_source": "ACTIONABLE_ORDER_PRICE",
-        "rhs_source": "AVERAGE_PRICE",
-        "direction": _direction_token(last.get("direction_combo")),
-        "ratio_percent": _nonnegative_float(last.get("ratio_line")),
-        "comparator": _ratio_compare_token(last.get("compare_combo")),
-    }
-    if method not in {"MARKET", "CURRENT_PRICE", "ACTIVE"}:
-        warnings.append("buy last+1 method is invalid")
-        return None
-    if (
-        active_condition["direction"] not in {"UP", "DOWN", "BOTH"}
-        or active_condition["ratio_percent"] is None
-        or active_condition["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
-    ):
-        warnings.append("buy last+1 active condition is invalid")
-        return None
-    last_policy = {
-        "enabled": last_enabled,
-        "generation_kind": "LAST_PLUS_ONE",
-        "trigger": "AFTER_NORMAL_MAX_ROUND_COMPLETED",
-        "max_occurrences": 1,
-        "method": method,
-        "active_condition": active_condition,
-        "budget_basis": "LAST_NORMAL_ROUND_APPROVED_BUDGET",
-        "terminal_after_completed_fill": True,
-    }
+    if last_enabled:
+        method = _last_plus_one_method_token(last.get("method_combo"))
+        if method not in {"MARKET", "CURRENT_PRICE", "ACTIVE"}:
+            warnings.append("buy last+1 method is invalid")
+            return None
+        last_policy = {
+            "enabled": True,
+            "generation_kind": "LAST_PLUS_ONE",
+            "trigger": "AFTER_NORMAL_MAX_ROUND_COMPLETED",
+            "max_occurrences": 1,
+            "method": method,
+            "budget_basis": "LAST_NORMAL_ROUND_APPROVED_BUDGET",
+            "terminal_after_completed_fill": True,
+        }
+        if method == "ACTIVE":
+            active_condition = {
+                "lhs_source": "ACTIONABLE_ORDER_PRICE",
+                "rhs_source": "AVERAGE_PRICE",
+                "direction": _direction_token(last.get("direction_combo")),
+                "ratio_percent": _nonnegative_float(last.get("ratio_line")),
+                "comparator": _ratio_compare_token(last.get("compare_combo")),
+            }
+            if (
+                active_condition["direction"] not in {"UP", "DOWN", "BOTH"}
+                or active_condition["ratio_percent"] is None
+                or active_condition["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+            ):
+                warnings.append("buy last+1 active condition is invalid")
+                return None
+            last_policy["active_condition"] = active_condition
+    else:
+        last_policy = {"enabled": False}
     locked = False
     value = {
         "previous_round_price_skip": price_policy,

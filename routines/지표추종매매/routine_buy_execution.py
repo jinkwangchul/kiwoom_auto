@@ -48,30 +48,41 @@ def inspect_buy_execution_support(*, subject: dict[str, Any], rules: dict[str, A
             return "MAPPED_BUT_EXECUTION_NOT_CONNECTED"
         price_skip = _as_dict(additional.get("previous_round_price_skip"))
         last_plus_one = _as_dict(additional.get("last_plus_one"))
-        active_condition = _as_dict(last_plus_one.get("active_condition"))
         if (
             not price_skip
             or not last_plus_one
             or not isinstance(price_skip.get("enabled"), bool)
-            or price_skip.get("reference_source") != "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
+            or not isinstance(last_plus_one.get("enabled"), bool)
+        ):
+            return "BUY_ADDITIONAL_POLICY_INVALID"
+        if price_skip.get("enabled") is True and (
+            price_skip.get("reference_source") != "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
             or price_skip.get("current_source") != "ACTIONABLE_ORDER_PRICE"
             or price_skip.get("action") != "SKIP_CURRENT_GENERATION"
             or price_skip.get("skipped_round_increment") is not False
             or price_skip.get("direction") not in {"UP", "DOWN", "BOTH"}
             or price_skip.get("comparator") not in {">=", "<=", "WITHIN", "OUTSIDE"}
             or not nonnegative_number(price_skip.get("ratio_percent"))
-            or not isinstance(last_plus_one.get("enabled"), bool)
-            or last_plus_one.get("generation_kind") != "LAST_PLUS_ONE"
-            or last_plus_one.get("trigger") != "AFTER_NORMAL_MAX_ROUND_COMPLETED"
-            or last_plus_one.get("max_occurrences") != 1
-            or last_plus_one.get("method") not in {"MARKET", "CURRENT_PRICE", "ACTIVE"}
-            or last_plus_one.get("budget_basis") != "LAST_NORMAL_ROUND_APPROVED_BUDGET"
-            or last_plus_one.get("terminal_after_completed_fill") is not True
-            or active_condition.get("direction") not in {"UP", "DOWN", "BOTH"}
-            or active_condition.get("comparator") not in {">=", "<=", "WITHIN", "OUTSIDE"}
-            or not nonnegative_number(active_condition.get("ratio_percent"))
         ):
             return "BUY_ADDITIONAL_POLICY_INVALID"
+        if last_plus_one.get("enabled") is True:
+            if (
+                last_plus_one.get("generation_kind") != "LAST_PLUS_ONE"
+                or last_plus_one.get("trigger") != "AFTER_NORMAL_MAX_ROUND_COMPLETED"
+                or last_plus_one.get("max_occurrences") != 1
+                or last_plus_one.get("method") not in {"MARKET", "CURRENT_PRICE", "ACTIVE"}
+                or last_plus_one.get("budget_basis") != "LAST_NORMAL_ROUND_APPROVED_BUDGET"
+                or last_plus_one.get("terminal_after_completed_fill") is not True
+            ):
+                return "BUY_ADDITIONAL_POLICY_INVALID"
+            if last_plus_one.get("method") == "ACTIVE":
+                active_condition = _as_dict(last_plus_one.get("active_condition"))
+                if (
+                    active_condition.get("direction") not in {"UP", "DOWN", "BOTH"}
+                    or active_condition.get("comparator") not in {">=", "<=", "WITHIN", "OUTSIDE"}
+                    or not nonnegative_number(active_condition.get("ratio_percent"))
+                ):
+                    return "BUY_ADDITIONAL_POLICY_INVALID"
     cycle_policy = _as_dict(execution.get("cycle"))
     if cycle_policy and cycle_policy.get("execution_connected") is not True:
         return str(cycle_policy.get("execution_lock_reason") or "CYCLE_OPTION_EXECUTION_NOT_CONNECTED")

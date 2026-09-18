@@ -953,17 +953,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                     "ratio_value": 1.5,
                     "ratio_compare": ">=",
                     "ratio_count": 2,
-                    "last_round_active_buy": {
-                        "enabled": False,
-                        "applies_to": "LAST_MULTI_POINT_CHILD",
-                        "budget_policy_override": "NONE",
-                        "purpose": "BUY_METHOD_SPECIAL_ACTION",
-                        "subject": "AVERAGE_PRICE",
-                        "reference": "MULTI_POINT_SET_PRICE",
-                        "direction": "UP",
-                        "ratio_percent": 0.45,
-                        "comparator": ">=",
-                    },
+                    "last_round_active_buy": {"enabled": False},
                     "execution_connected": True,
                     "execution_lock_reason": "",
                     "buy_completion_policy": {

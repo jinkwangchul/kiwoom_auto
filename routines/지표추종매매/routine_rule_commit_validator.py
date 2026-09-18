@@ -303,19 +303,19 @@ def validate_committed_rules(
         policy = _get_path(post_rules, last_round_active_path)
         enabled = policy.get("enabled") if isinstance(policy, dict) else None
         ratio = policy.get("ratio_percent") if isinstance(policy, dict) else None
-        valid = (
-            isinstance(policy, dict)
-            and isinstance(enabled, bool)
-            and policy.get("applies_to") == "LAST_MULTI_POINT_CHILD"
-            and policy.get("budget_policy_override") == "NONE"
-            and policy.get("purpose") == "BUY_METHOD_SPECIAL_ACTION"
-            and policy.get("subject") == "AVERAGE_PRICE"
-            and policy.get("reference") == "MULTI_POINT_SET_PRICE"
-            and policy.get("direction") in {"UP", "DOWN", "BOTH"}
-            and isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
-            and isfinite(ratio) and ratio >= 0
-            and policy.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
-        )
+        valid = isinstance(policy, dict) and isinstance(enabled, bool)
+        if valid and enabled:
+            valid = (
+                policy.get("applies_to") == "LAST_MULTI_POINT_CHILD"
+                and policy.get("budget_policy_override") == "NONE"
+                and policy.get("purpose") == "BUY_METHOD_SPECIAL_ACTION"
+                and policy.get("subject") == "AVERAGE_PRICE"
+                and policy.get("reference") == "MULTI_POINT_SET_PRICE"
+                and policy.get("direction") in {"UP", "DOWN", "BOTH"}
+                and isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
+                and isfinite(ratio) and ratio >= 0
+                and policy.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+            )
         add_check("buy_last_round_active_policy_valid", valid)
         add_check("buy_last_round_active_execution_connected", valid)
         if not valid:
@@ -337,26 +337,35 @@ def validate_committed_rules(
             and isinstance(last, dict)
             and isinstance(price_enabled, bool)
             and isinstance(last_enabled, bool)
-            and price.get("reference_source") == "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
-            and price.get("current_source") == "ACTIONABLE_ORDER_PRICE"
-            and price.get("action") == "SKIP_CURRENT_GENERATION"
-            and price.get("skipped_round_increment") is False
-            and last.get("generation_kind") == "LAST_PLUS_ONE"
-            and last.get("trigger") == "AFTER_NORMAL_MAX_ROUND_COMPLETED"
-            and last.get("max_occurrences") == 1
-            and last.get("method") in {"MARKET", "CURRENT_PRICE", "ACTIVE"}
-            and last.get("budget_basis") == "LAST_NORMAL_ROUND_APPROVED_BUDGET"
-            and last.get("terminal_after_completed_fill") is True
-            and price.get("direction") in {"UP", "DOWN", "BOTH"}
-            and isinstance(price_ratio, (int, float)) and not isinstance(price_ratio, bool)
-            and isfinite(price_ratio) and price_ratio >= 0
-            and price.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
-            and isinstance(active, dict)
-            and active.get("direction") in {"UP", "DOWN", "BOTH"}
-            and isinstance(active_ratio, (int, float)) and not isinstance(active_ratio, bool)
-            and isfinite(active_ratio) and active_ratio >= 0
-            and active.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
         )
+        if valid and price_enabled:
+            valid = (
+                price.get("reference_source") == "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
+                and price.get("current_source") == "ACTIONABLE_ORDER_PRICE"
+                and price.get("action") == "SKIP_CURRENT_GENERATION"
+                and price.get("skipped_round_increment") is False
+                and price.get("direction") in {"UP", "DOWN", "BOTH"}
+                and isinstance(price_ratio, (int, float)) and not isinstance(price_ratio, bool)
+                and isfinite(price_ratio) and price_ratio >= 0
+                and price.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+            )
+        if valid and last_enabled:
+            valid = (
+                last.get("generation_kind") == "LAST_PLUS_ONE"
+                and last.get("trigger") == "AFTER_NORMAL_MAX_ROUND_COMPLETED"
+                and last.get("max_occurrences") == 1
+                and last.get("method") in {"MARKET", "CURRENT_PRICE", "ACTIVE"}
+                and last.get("budget_basis") == "LAST_NORMAL_ROUND_APPROVED_BUDGET"
+                and last.get("terminal_after_completed_fill") is True
+            )
+        if valid and last_enabled and last.get("method") == "ACTIVE":
+            valid = (
+                isinstance(active, dict)
+                and active.get("direction") in {"UP", "DOWN", "BOTH"}
+                and isinstance(active_ratio, (int, float)) and not isinstance(active_ratio, bool)
+                and isfinite(active_ratio) and active_ratio >= 0
+                and active.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+            )
         execution_connected = policy.get("execution_connected") is True
         add_check("buy_additional_policy_valid", valid)
         add_check("buy_additional_execution_connected", execution_connected)

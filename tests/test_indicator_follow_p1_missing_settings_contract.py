@@ -249,6 +249,52 @@ class MapperContractTest(unittest.TestCase):
         self.assertTrue(any("invalid" in item for item in price_preview["validation_warnings"]))
         self.assertTrue(any("invalid" in item for item in last_preview["validation_warnings"]))
 
+    def test_disabled_additional_children_do_not_create_validation_contract(self) -> None:
+        additional = self._additional(price=False, last=False)
+        additional["price_compare_skip"].update(
+            direction_combo="UNKNOWN",
+            ratio_line="not-a-number",
+            compare_combo="UNKNOWN",
+        )
+        additional["last_plus_one"].update(
+            method_combo="UNKNOWN",
+            direction_combo="UNKNOWN",
+            ratio_line="not-a-number",
+            compare_combo="UNKNOWN",
+        )
+
+        preview = self._preview({"additional": additional})
+        candidate = self._execution_candidate(preview, "additional")
+
+        self.assertEqual({"enabled": False}, candidate["value"]["previous_round_price_skip"])
+        self.assertEqual({"enabled": False}, candidate["value"]["last_plus_one"])
+        self.assertFalse(any("additional" in item and "invalid" in item for item in preview["validation_warnings"]))
+
+        post = deepcopy(self.rules)
+        post["buy"].setdefault("execution", {})["additional"] = deepcopy(candidate["value"])
+        validated = self.validator.validate_committed_rules(
+            self.rules,
+            post,
+            [{"operation": "set_execution_policy", "path": "buy.execution.additional", "value": candidate["value"]}],
+            {"rules_json_write": False, "engine_connected": False, "buy_groups_replace": False, "macd_sell_replace": False},
+        )
+        self.assertTrue(validated["ok"], validated)
+
+    def test_last_plus_one_non_active_method_ignores_inactive_condition_children(self) -> None:
+        additional = self._additional(last=True, method="시장가")
+        additional["last_plus_one"].update(
+            direction_combo="UNKNOWN",
+            ratio_line="not-a-number",
+            compare_combo="UNKNOWN",
+        )
+
+        preview = self._preview({"additional": additional})
+        policy = self._execution_candidate(preview, "additional")["value"]["last_plus_one"]
+
+        self.assertTrue(policy["enabled"])
+        self.assertEqual("MARKET", policy["method"])
+        self.assertNotIn("active_condition", policy)
+
     def test_last_round_active_is_dedicated_base_policy(self) -> None:
         preview = self._preview({"base": self._base(active=True)})
         candidate = self._execution_candidate(preview, "base")
@@ -269,6 +315,29 @@ class MapperContractTest(unittest.TestCase):
             self._execution_candidate(default_preview, "base")["value"]["last_round_active_buy"]["enabled"]
         )
         self.assertNotIn("buy.execution.base", invalid_preview["mapped_paths"])
+
+    def test_disabled_last_round_active_children_do_not_create_validation_contract(self) -> None:
+        base = self._base(active=False)
+        base["last_round_active_buy"].update(
+            direction="UNKNOWN",
+            ratio_percent="not-a-number",
+            comparator="UNKNOWN",
+        )
+
+        preview = self._preview({"base": base})
+        candidate = self._execution_candidate(preview, "base")
+
+        self.assertEqual({"enabled": False}, candidate["value"]["last_round_active_buy"])
+
+        post = deepcopy(self.rules)
+        post["buy"].setdefault("execution", {})["base"] = deepcopy(candidate["value"])
+        validated = self.validator.validate_committed_rules(
+            self.rules,
+            post,
+            [{"operation": "set_execution_policy", "path": "buy.execution.base", "value": candidate["value"]}],
+            {"rules_json_write": False, "engine_connected": False, "buy_groups_replace": False, "macd_sell_replace": False},
+        )
+        self.assertTrue(validated["ok"], validated)
 
     def test_cycle_is_residual_only_recovery_and_connected(self) -> None:
         preview = self._preview({"cycle": self._cycle()})
