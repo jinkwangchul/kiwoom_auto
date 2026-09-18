@@ -106,27 +106,21 @@ def normalize_legacy_sell_bollinger_sign_ui_state(ui_state):
 
 def mark_sell_price_combo_unresolved(combo, original_value):
     original = str(original_value or "").strip()
+    # Keep the visible/selectable Combo contract strictly to 현재가/평단가.
+    # Legacy ORDER_PRICE remains provenance only and is never shown as a third
+    # pseudo-option or silently converted to a modern value.
+    combo.setEditable(False)
     combo.setCurrentIndex(-1)
-    combo.setPlaceholderText(SELL_PRICE_RESELECTION_TEXT)
-    # A non-editable QComboBox does not consistently paint its placeholder on
-    # the Windows styles used by the settings windows.  Keep the selectable
-    # model limited to the two modern values while showing the unresolved
-    # state explicitly in its read-only edit surface.
-    combo.setEditable(True)
-    line_edit = combo.lineEdit()
-    if line_edit is not None:
-        line_edit.setReadOnly(True)
-    combo.setEditText(SELL_PRICE_RESELECTION_TEXT)
+    combo.setPlaceholderText("")
     combo.setProperty(SELL_PRICE_UNRESOLVED_PROPERTY, original)
     combo.setToolTip(
-        f"{SELL_PRICE_RESELECTION_TEXT} (기존값: {original or '-'})"
+        f"기존 가격 기준({original or '-'})은 폐기되었습니다. 현재가 또는 평단가를 선택하세요."
     )
 
 
 def clear_sell_price_combo_unresolved(combo):
     combo.setProperty(SELL_PRICE_UNRESOLVED_PROPERTY, None)
-    if combo.isEditable():
-        combo.setEditText(combo.currentText())
+    combo.setEditable(False)
     combo.setToolTip("")
 
 
@@ -304,8 +298,8 @@ class IndicatorFollowSellControlsMixin:
         gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
         sync_gap_compare_combo()
 
-        gap_left_combo = make_sell_price_combo("", 78, 30)
-        gap_right_combo = make_sell_price_combo("평단가", 78, 30)
+        gap_left_combo = make_sell_price_combo("평단가", 78, 30)
+        gap_right_combo = make_sell_price_combo("현재가", 78, 30)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
             gap_left_combo,
@@ -478,7 +472,7 @@ class IndicatorFollowSellControlsMixin:
 
         gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
         sync_gap_compare_combo()
-        gap_left_combo = make_sell_price_combo("", 78, 32)
+        gap_left_combo = make_sell_price_combo("평단가", 78, 32)
         gap_right_combo = make_sell_price_combo("현재가", 78, 32)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
@@ -596,7 +590,7 @@ class IndicatorFollowSellControlsMixin:
 
         gap_direction_combo.currentTextChanged.connect(lambda _: sync_gap_compare_combo())
         sync_gap_compare_combo()
-        gap_left_combo = make_sell_price_combo("", 78, 32)
+        gap_left_combo = make_sell_price_combo("평단가", 78, 32)
         gap_right_combo = make_sell_price_combo("현재가", 78, 32)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([

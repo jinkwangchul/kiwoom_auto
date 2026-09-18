@@ -15,8 +15,8 @@ from PyQt5.QtWidgets import QApplication
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 from gui_indicator_follow_routine_settings_dialog import (
     IndicatorFollowRoutineSettingsDialog,
+    STATE_AUTHORITY_CANONICAL_DEFAULT,
     STATE_AUTHORITY_INSTANCE_CURRENT,
-    STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
 )
 from gui_indicator_follow_sell_controls import (
     SELL_PRICE_COMBO_VALUES,
@@ -112,28 +112,22 @@ class SellPriceOperandParityTest(unittest.TestCase):
         self.widgets.append(window)
         return window
 
-    def test_fresh_template_does_not_override_initial_operand_state(self):
-        fresh = self._dialog(template=False)
-        expected = fresh.collect_indicator_follow_ui_state()
+    def test_fresh_registration_uses_canonical_modern_price_operands(self):
         registration = self._dialog(template=True)
         actual = registration.collect_indicator_follow_ui_state()
 
         self.assertEqual(
-            STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
+            STATE_AUTHORITY_CANONICAL_DEFAULT,
             registration._registration_initial_state_source,
         )
-        for group_name, side, combo in self._operand_widgets(registration):
-            field = f"gap_{side}_combo"
-            if side == "left":
-                self.assertEqual(
-                    expected["sell_ui"]["signal_conditions"][f"condition_{group_name}"][field],
-                    actual["sell_ui"]["signal_conditions"][f"condition_{group_name}"][field],
-                )
-            self.assertNotEqual("주문가", actual["sell_ui"]["signal_conditions"][f"condition_{group_name}"][field])
+        for group_name, _side, combo in self._operand_widgets(registration):
+            condition = actual["sell_ui"]["signal_conditions"][f"condition_{group_name}"]
+            self.assertEqual("평단가", condition["gap_left_combo"])
+            self.assertEqual("현재가", condition["gap_right_combo"])
             self.assertEqual(list(SELL_PRICE_COMBO_VALUES), [
                 combo.itemText(index) for index in range(combo.count())
             ])
-            self.assertNotEqual("", combo.currentText())
+            self.assertIn(combo.currentText(), SELL_PRICE_COMBO_VALUES)
 
     def test_modern_parent_and_v2_preserve_each_operand(self):
         parent = self._dialog(template=False)
@@ -167,7 +161,9 @@ class SellPriceOperandParityTest(unittest.TestCase):
         for owner in (parent, v2):
             for _group_name, _side, combo in self._operand_widgets(owner):
                 self.assertEqual(-1, combo.currentIndex())
-                self.assertEqual(SELL_PRICE_RESELECTION_TEXT, combo.currentText())
+                self.assertEqual("", combo.currentText())
+                self.assertFalse(combo.isEditable())
+                self.assertIn("현재가 또는 평단가", combo.toolTip())
                 self.assertEqual("ORDER_PRICE", combo.property(SELL_PRICE_UNRESOLVED_PROPERTY))
                 self.assertEqual(list(SELL_PRICE_COMBO_VALUES), [
                     combo.itemText(index) for index in range(combo.count())

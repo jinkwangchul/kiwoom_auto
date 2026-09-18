@@ -55,13 +55,17 @@ class IndicatorFollowLegacySettingsCompatibilityTest(unittest.TestCase):
         self.assertFalse(normalized["setting2_enabled_check"])
         self.assertEqual("현재가", normalized["setting2_left_combo"])
 
-    def test_rules_load_records_legacy_and_instance_sources_separately(self) -> None:
+    def test_rules_load_and_registration_authority_sources_remain_distinct(self) -> None:
         registration = self._dialog()
         edit = self._dialog(mode="edit")
         try:
             self.assertEqual(
                 STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
                 registration._last_ui_state_apply_result["source"],
+            )
+            self.assertEqual(
+                STATE_AUTHORITY_CANONICAL_DEFAULT,
+                registration._registration_initial_state_source,
             )
             self.assertEqual(
                 STATE_AUTHORITY_INSTANCE_CURRENT,
@@ -188,13 +192,13 @@ class IndicatorFollowLegacySettingsCompatibilityTest(unittest.TestCase):
             dialog.close()
 
         self.assertEqual(
-            STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
+            STATE_AUTHORITY_CANONICAL_DEFAULT,
             dialog._registration_initial_state_source,
         )
         for group in "abc":
             condition = state["sell_ui"]["signal_conditions"][f"condition_{group}"]
-            self.assertIn(condition["gap_left_combo"], {"", "현재가", "평단가"})
-            self.assertIn(condition["gap_right_combo"], {"", "현재가", "평단가"})
+            self.assertEqual("평단가", condition["gap_left_combo"])
+            self.assertEqual("현재가", condition["gap_right_combo"])
             self.assertNotEqual("주문가", condition["gap_left_combo"])
             self.assertNotEqual("주문가", condition["gap_right_combo"])
 
@@ -214,8 +218,61 @@ class IndicatorFollowLegacySettingsCompatibilityTest(unittest.TestCase):
         self.assertEqual(STATE_AUTHORITY_CANONICAL_DEFAULT, result["source"])
         self.assertEqual(-1, index)
 
-    def test_fresh_default_provider_is_explicitly_unavailable(self) -> None:
-        self.assertIsNone(get_canonical_fresh_defaults("indicator_follow"))
+    def test_fresh_default_provider_matches_user_approved_screen_snapshot(self) -> None:
+        state = get_canonical_fresh_defaults("indicator_follow")
+        self.assertIsInstance(state, dict)
+        self.assertIsNone(get_canonical_fresh_defaults("other"))
+
+        def leaf_count(value):
+            if isinstance(value, dict):
+                return sum(leaf_count(item) for item in value.values())
+            if isinstance(value, list):
+                return sum(leaf_count(item) for item in value)
+            return 1
+
+        self.assertEqual(382, leaf_count(state))
+        self.assertEqual("3", state["basic"]["basic_signal_interval_combo"])
+        self.assertEqual("선행신호 우선", state["basic"]["basic_duplicate_signal_combo"])
+        self.assertEqual("매매중지", state["basic"]["basic_error_policy_combo"])
+        self.assertEqual("A", state["basic"]["buy_signal_expr_line"])
+        self.assertEqual("A", state["basic"]["sell_signal_expr_line"])
+        self.assertEqual("0.5", state["buy_ui"]["signal_filter"]["buy_bollinger_value_line"])
+        self.assertEqual("30", state["buy_ui"]["signal_filter"]["buy_rsi_value_line"])
+        self.assertTrue(state["buy_ui"]["repeat"]["apply_all_check"])
+        self.assertTrue(state["buy_ui"]["situation"]["unfilled_enabled_check"])
+        self.assertFalse(state["buy_ui"]["situation"]["price_enabled_check"])
+        self.assertEqual("평단가", state["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"])
+        self.assertEqual("평단가", state["sell_ui"]["signal_conditions"]["condition_b"]["gap_left_combo"])
+        self.assertEqual("평단가", state["sell_ui"]["signal_conditions"]["condition_c"]["gap_left_combo"])
+        self.assertEqual(
+            state["sell_ui"]["setting_a"],
+            state["sell_ui"]["setting_b"],
+        )
+        self.assertEqual(
+            state["sell_ui"]["setting_a"],
+            state["sell_ui"]["setting_c"],
+        )
+
+        state["basic"]["buy_signal_expr_line"] = "B"
+        self.assertEqual(
+            "A",
+            get_canonical_fresh_defaults("indicator_follow")["basic"]["buy_signal_expr_line"],
+        )
+
+    def test_registration_collect_matches_canonical_defaults(self) -> None:
+        dialog = self._dialog()
+        try:
+            actual = canonical_indicator_follow_ui_state(
+                dialog.collect_indicator_follow_ui_state()
+            )
+            expected = canonical_indicator_follow_ui_state(
+                get_canonical_fresh_defaults("indicator_follow")
+            )
+        finally:
+            dialog.close()
+
+        self.assertEqual(STATE_AUTHORITY_CANONICAL_DEFAULT, dialog._registration_initial_state_source)
+        self.assertEqual(expected, actual)
 
     def test_sell_selected_sets_are_canonical_and_legacy_fields_are_derived(self) -> None:
         state = {
