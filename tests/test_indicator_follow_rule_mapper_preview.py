@@ -3906,6 +3906,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         state["sell_ui"]["setting_a"] = {
             "perform1_title_combo": "\ub2e8\uc77c\ud638\uac00",
             "perform1_single_combo": "\uc8fc\ubb38\uac00",
+            "complete_policy_carry_check": True,
+            "complete_policy_market_check": True,
         }
         state["sell_ui"]["setting_b"] = {
             "perform1_title_combo": "\ub2e4\uc911\ud638\uac00",
@@ -3933,6 +3935,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(method_candidates["sell.method.setting_c"]["candidate_type"], "set_method_policy")
         self.assertFalse(method_candidates["sell.method.setting_a"]["value"]["preview_only"])
         self.assertTrue(method_candidates["sell.method.setting_a"]["value"]["execution_connected"])
+        self.assertNotIn(
+            "complete_policy_carry_check",
+            method_candidates["sell.method.setting_a"]["value"],
+        )
+        self.assertNotIn(
+            "complete_policy_market_check",
+            method_candidates["sell.method.setting_a"]["value"],
+        )
         self.assertFalse(method_candidates["sell.method.setting_b"]["value"]["runtime_write"])
         self.assertFalse(method_candidates["sell.method.setting_c"]["value"]["send_order"])
         self.assertIn("sell.method.selected_sets", result["mapped_paths"])

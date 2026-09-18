@@ -1454,7 +1454,17 @@ def _build_sell_method_policy_candidates(
         setting = sell_ui.get(ui_key)
         if not isinstance(setting, dict) or not setting:
             continue
-        value = deepcopy(setting)
+        # Completion checkboxes are disabled, derived UI indicators. Runtime
+        # completion is determined from the configured exit conditions, so these
+        # display-only mirrors must not become independent engine-rule authority.
+        value = {
+            key: deepcopy(item)
+            for key, item in setting.items()
+            if key not in {
+                "complete_policy_carry_check",
+                "complete_policy_market_check",
+            }
+        }
         value["preview_only"] = False
         value["execution_connected"] = True
         value["runtime_write"] = False
