@@ -180,29 +180,23 @@ class IndicatorFollowLegacySettingsCompatibilityTest(unittest.TestCase):
                     ),
                 )
 
-    def test_legacy_order_price_is_preserved_unresolved_and_blocks_registration(self) -> None:
+    def test_legacy_template_order_price_does_not_override_fresh_operand_state(self) -> None:
         dialog = self._dialog()
         try:
             state = dialog.collect_indicator_follow_ui_state()
-            result = dialog.build_registration_rules_from_current_ui_state()
         finally:
             dialog.close()
 
-        self.assertEqual(STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK, dialog._registration_initial_state_source)
-        for group in "abc":
-            self.assertEqual(
-                "주문가",
-                state["sell_ui"]["signal_conditions"][f"condition_{group}"][
-                    "gap_left_combo"
-                ],
-            )
-        self.assertFalse(result["success"])
-        self.assertTrue(
-            all(
-                "가격 기준 재선택 필요" in reason
-                for reason in result["internal_blocked_reasons"]
-            )
+        self.assertEqual(
+            STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK,
+            dialog._registration_initial_state_source,
         )
+        for group in "abc":
+            condition = state["sell_ui"]["signal_conditions"][f"condition_{group}"]
+            self.assertIn(condition["gap_left_combo"], {"", "현재가", "평단가"})
+            self.assertIn(condition["gap_right_combo"], {"", "현재가", "평단가"})
+            self.assertNotEqual("주문가", condition["gap_left_combo"])
+            self.assertNotEqual("주문가", condition["gap_right_combo"])
 
     def test_canonical_default_does_not_run_missing_sign_inference(self) -> None:
         dialog = self._dialog()
