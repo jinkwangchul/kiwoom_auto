@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Minimal, fail-closed session boundary for indicator-follow validation."""
+"""Minimal read-only session boundary for indicator-follow validation."""
 
 from __future__ import annotations
 
@@ -7,14 +7,6 @@ from collections.abc import Callable
 
 from .routine_validation_contract import ValidationAvailability, ValidationRequest
 from .routine_validation_trace import ValidationTraceObserver
-
-
-REASON_OPERATION_ACTIVE_READER_UNAVAILABLE = (
-    "OPERATION_ACTIVE_READER_UNAVAILABLE"
-)
-REASON_OPERATION_ACTIVE_READER_ERROR = "OPERATION_ACTIVE_READER_ERROR"
-REASON_OPERATION_ACTIVE_READER_INVALID = "OPERATION_ACTIVE_READER_INVALID"
-REASON_OPERATION_ACTIVE = "OPERATION_ACTIVE"
 
 
 class ValidationSession:
@@ -38,27 +30,10 @@ class ValidationSession:
         self.operation_active_reader = operation_active_reader
 
     def readiness(self) -> ValidationAvailability:
-        reader = self.operation_active_reader
-        if not callable(reader):
-            return ValidationAvailability(
-                allowed=False,
-                reason=REASON_OPERATION_ACTIVE_READER_UNAVAILABLE,
-            )
-        try:
-            active = reader()
-        except Exception:
-            return ValidationAvailability(
-                allowed=False,
-                reason=REASON_OPERATION_ACTIVE_READER_ERROR,
-            )
-        if not isinstance(active, bool):
-            return ValidationAvailability(
-                allowed=False,
-                reason=REASON_OPERATION_ACTIVE_READER_INVALID,
-            )
-        if active:
-            return ValidationAvailability(
-                allowed=False,
-                reason=REASON_OPERATION_ACTIVE,
-            )
+        """Validation is available regardless of Production Operation state.
+
+        operation_active_reader remains constructor-compatible for existing
+        callers, but Operation activity is intentionally not consulted. The
+        validation path is read-only with respect to Production trading state.
+        """
         return ValidationAvailability(allowed=True, reason=None)

@@ -22,11 +22,7 @@ from routines.지표추종매매.routine_validation_historical import (
     ValidationHistoricalProvider,
     ValidationHistoricalSnapshot,
 )
-from routines.지표추종매매.routine_validation_session import (
-    REASON_OPERATION_ACTIVE,
-    REASON_OPERATION_ACTIVE_READER_ERROR,
-    ValidationSession,
-)
+from routines.지표추종매매.routine_validation_session import ValidationSession
 
 
 class _FakeBroker:
@@ -131,27 +127,21 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
                 self.assertEqual([], broker.calls)
                 self.assertEqual(0, provider.cache.size)
 
-    def test_operation_active_before_request_blocks_broker(self) -> None:
-        reader = Mock(return_value=True)
-        provider, broker = self._provider(reader)
-        results = []
+    def test_operation_state_does_not_block_historical_request(self) -> None:
+        for reader in (
+            Mock(return_value=True),
+            Mock(side_effect=RuntimeError("must not be called")),
+        ):
+            with self.subTest(reader=reader):
+                provider, broker = self._provider(reader)
+                results = []
 
-        returned = provider.request_latest(2, results.append)
+                returned = provider.request_latest(2, results.append)
 
-        self.assertEqual(REASON_OPERATION_ACTIVE, returned.reason)
-        self.assertEqual([], broker.calls)
-        self.assertEqual(0, provider.cache.size)
-        reader.assert_called_once_with()
-
-    def test_operation_reader_error_before_request_is_fail_closed(self) -> None:
-        reader = Mock(side_effect=RuntimeError("unavailable"))
-        provider, broker = self._provider(reader)
-
-        returned = provider.request_latest(2, Mock())
-
-        self.assertEqual(REASON_OPERATION_ACTIVE_READER_ERROR, returned.reason)
-        self.assertEqual([], broker.calls)
-        self.assertEqual(0, provider.cache.size)
+                self.assertIsNone(returned)
+                self.assertEqual(1, len(broker.calls))
+                self.assertEqual(0, provider.cache.size)
+                reader.assert_not_called()
 
     def test_valid_request_uses_only_read_only_broker_method(self) -> None:
         reader = Mock(side_effect=(False, False))
@@ -175,7 +165,7 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertTrue(results[0].ok)
         self.assertEqual(1, provider.cache.size)
-        self.assertEqual(2, reader.call_count)
+        reader.assert_not_called()
 
     def test_valid_callback_creates_snapshot_and_caches_once(self) -> None:
         provider, broker = self._provider(Mock(side_effect=(False, False)))
@@ -307,8 +297,8 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
                 self.assertEqual([returned], results)
                 self.assertEqual(0, provider.cache.size)
 
-    def test_operation_start_during_tr_discards_response(self) -> None:
-        reader = Mock(side_effect=(False, True))
+    def test_operation_change_during_tr_does_not_discard_response(self) -> None:
+        reader = Mock(side_effect=AssertionError("operation reader must not be called"))
         provider, broker = self._provider(reader)
         results = []
         provider.request_latest(2, results.append)
@@ -317,11 +307,10 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
 
         self.assertEqual(1, len(broker.calls))
         self.assertEqual(1, len(results))
-        self.assertFalse(results[0].ok)
-        self.assertEqual(REASON_OPERATION_ACTIVE, results[0].reason)
-        self.assertIsNone(results[0].snapshot)
-        self.assertEqual(0, provider.cache.size)
-        self.assertEqual(2, reader.call_count)
+        self.assertTrue(results[0].ok)
+        self.assertIsNotNone(results[0].snapshot)
+        self.assertEqual(1, provider.cache.size)
+        reader.assert_not_called()
 
     def test_cache_replaces_same_key_and_clear_works(self) -> None:
         cache = ValidationHistoricalMemoryCache()

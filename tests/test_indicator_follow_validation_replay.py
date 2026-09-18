@@ -37,10 +37,7 @@ from routines.지표추종매매.routine_validation_replay import (
     ValidationReplayEntry,
     project_validation_candles,
 )
-from routines.지표추종매매.routine_validation_session import (
-    REASON_OPERATION_ACTIVE,
-    ValidationSession,
-)
+from routines.지표추종매매.routine_validation_session import ValidationSession
 from routines.지표추종매매.routine_validation_trace import ValidationTraceObserver
 
 
@@ -443,34 +440,33 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
                 self.assertEqual(REASON_INVALID_ROUTINE_SIGNAL, result.reason)
                 self.assertIsNone(result.snapshot)
 
-    def test_operation_active_before_replay_prevents_evaluator_calls(self) -> None:
+    def test_operation_state_does_not_block_replay(self) -> None:
         evaluator = Mock(return_value=self._none_signal())
-        reader = Mock(return_value=True)
+        reader = Mock(side_effect=AssertionError("operation reader must not be called"))
 
         result = ValidationHistoricalReplay(
             self._session(reader),
             evaluator=evaluator,
         ).evaluate(self._historical())
 
-        self.assertFalse(result.ok)
-        self.assertEqual(REASON_OPERATION_ACTIVE, result.reason)
-        evaluator.assert_not_called()
-        reader.assert_called_once_with()
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(result.snapshot)
+        self.assertGreater(evaluator.call_count, 0)
+        reader.assert_not_called()
 
-    def test_operation_start_during_replay_discards_computed_result(self) -> None:
+    def test_operation_change_during_replay_does_not_discard_result(self) -> None:
         evaluator = Mock(return_value=self._none_signal())
-        reader = Mock(side_effect=(False, True))
+        reader = Mock(side_effect=AssertionError("operation reader must not be called"))
 
         result = ValidationHistoricalReplay(
             self._session(reader),
             evaluator=evaluator,
         ).evaluate(self._historical(closes=(10, 11, 12)))
 
-        self.assertFalse(result.ok)
-        self.assertEqual(REASON_OPERATION_ACTIVE, result.reason)
-        self.assertIsNone(result.snapshot)
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(result.snapshot)
         self.assertEqual(6, evaluator.call_count)
-        self.assertEqual(2, reader.call_count)
+        reader.assert_not_called()
 
     def test_historical_stock_and_timeframe_mismatch_fail_closed(self) -> None:
         cases = (

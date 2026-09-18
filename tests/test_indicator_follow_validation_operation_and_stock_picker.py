@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import ast
-from datetime import date
-import json
 import os
 from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -31,118 +28,10 @@ from gui_stock_library_browser import (
     stock_browser_table_required_width,
 )
 from routines.지표추종매매.routine_validation_contract import ValidationStockRef
-from routines.지표추종매매.routine_validation_operation_reader import (
-    ValidationOperationStateReadError,
-    is_operation_active,
-)
-from routines.지표추종매매.routine_validation_session import (
-    REASON_OPERATION_ACTIVE_READER_ERROR,
-    ValidationSession,
-)
 from routines.지표추종매매.routine_validation_contract import (
     ValidationRequest,
     ValidationSettingsSnapshot,
 )
-
-
-class ValidationOperationReaderTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.state_path = Path(self.temp_dir.name) / "operation_state.json"
-        self.today = date(2026, 9, 13)
-
-    def tearDown(self) -> None:
-        self.temp_dir.cleanup()
-
-    def _write_state(self, operation_date: str, status: str) -> None:
-        self.state_path.write_text(
-            json.dumps(
-                {
-                    "operation_date": operation_date,
-                    "operation_status": status,
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    def _session(self, reader) -> ValidationSession:
-        request = ValidationRequest(
-            ValidationStockRef("005930", "삼성전자"),
-            ValidationSettingsSnapshot({"bar": {"bar_minutes": 3}}),
-            3,
-        )
-        return ValidationSession(request, operation_active_reader=reader)
-
-    def test_today_running_and_closing_are_active(self) -> None:
-        for status in ("RUNNING", "CLOSING"):
-            with self.subTest(status=status):
-                self._write_state(self.today.isoformat(), status)
-                self.assertTrue(
-                    is_operation_active(self.state_path, today=self.today)
-                )
-
-    def test_normal_ended_and_prior_day_are_inactive(self) -> None:
-        self._write_state(self.today.isoformat(), "NORMAL_ENDED")
-        self.assertFalse(is_operation_active(self.state_path, today=self.today))
-        self._write_state("2026-09-12", "RUNNING")
-        self.assertFalse(is_operation_active(self.state_path, today=self.today))
-
-    def test_missing_malformed_and_unknown_fail_closed(self) -> None:
-        cases = (
-            None,
-            "not-json",
-            json.dumps({"operation_date": self.today.isoformat()}),
-            json.dumps(
-                {
-                    "operation_date": self.today.isoformat(),
-                    "operation_status": "UNKNOWN",
-                }
-            ),
-        )
-        for content in cases:
-            with self.subTest(content=content):
-                if self.state_path.exists():
-                    self.state_path.unlink()
-                if content is not None:
-                    self.state_path.write_text(content, encoding="utf-8")
-                reader = lambda: is_operation_active(
-                    self.state_path, today=self.today
-                )
-                availability = self._session(reader).readiness()
-                self.assertFalse(availability.allowed)
-                self.assertEqual(
-                    REASON_OPERATION_ACTIVE_READER_ERROR,
-                    availability.reason,
-                )
-                with self.assertRaises(ValidationOperationStateReadError):
-                    reader()
-
-    def test_reader_never_writes(self) -> None:
-        self._write_state(self.today.isoformat(), "RUNNING")
-        with patch.object(Path, "write_text", side_effect=AssertionError("write")), \
-             patch.object(Path, "write_bytes", side_effect=AssertionError("write")):
-            self.assertTrue(is_operation_active(self.state_path, today=self.today))
-
-    def test_reader_imports_only_standard_library(self) -> None:
-        source_path = (
-            Path(__file__).resolve().parents[1]
-            / "routines"
-            / "지표추종매매"
-            / "routine_validation_operation_reader.py"
-        )
-        tree = ast.parse(source_path.read_text(encoding="utf-8-sig"))
-        imported_roots = {
-            alias.name.split(".", 1)[0]
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        }
-        imported_roots.update(
-            node.module.split(".", 1)[0]
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        )
-        self.assertLessEqual(imported_roots, {"__future__", "datetime", "json", "pathlib"})
 
 
 class IndicatorFollowValidationStockPickerTest(unittest.TestCase):

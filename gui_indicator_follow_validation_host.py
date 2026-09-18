@@ -16,16 +16,7 @@ from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
     ValidationStockRef,
 )
-from routines.지표추종매매.routine_validation_operation_reader import (
-    is_operation_active,
-)
-from routines.지표추종매매.routine_validation_session import (
-    REASON_OPERATION_ACTIVE,
-    REASON_OPERATION_ACTIVE_READER_ERROR,
-    REASON_OPERATION_ACTIVE_READER_INVALID,
-    REASON_OPERATION_ACTIVE_READER_UNAVAILABLE,
-    ValidationSession,
-)
+from routines.지표추종매매.routine_validation_session import ValidationSession
 
 
 REASON_INVALID_SETTINGS_SNAPSHOT = "INVALID_SETTINGS_SNAPSHOT"
@@ -43,7 +34,7 @@ class IndicatorFollowValidationHost(QObject):
         self,
         parent=None,
         *,
-        operation_active_reader: Callable[[], bool] | None = is_operation_active,
+        operation_active_reader: Callable[[], bool] | None = None,
         stock_picker_factory: Callable[[object], object] = (
             IndicatorFollowValidationStockPicker
         ),
@@ -97,7 +88,7 @@ class IndicatorFollowValidationHost(QObject):
         self,
         settings_snapshot: object,
     ) -> str | None:
-        """Read-only settings/operation gate shared by V1 and V2 entry."""
+        """Read-only settings gate shared by V1 and V2 entry."""
         if not isinstance(settings_snapshot, ValidationSettingsSnapshot):
             return REASON_INVALID_SETTINGS_SNAPSHOT
         try:
@@ -110,7 +101,7 @@ class IndicatorFollowValidationHost(QObject):
             or timeframe_minutes <= 0
         ):
             return REASON_INVALID_TIMEFRAME
-        return self._preflight_operation_block_reason()
+        return None
 
     def create_stock_picker(self, ui_parent: object = None) -> object:
         return self._stock_picker_factory(self._picker_parent(ui_parent))
@@ -130,18 +121,4 @@ class IndicatorFollowValidationHost(QObject):
             except RuntimeError:
                 return None
             return lifetime_parent
-        return None
-
-    def _preflight_operation_block_reason(self) -> str | None:
-        reader = self._operation_active_reader
-        if not callable(reader):
-            return REASON_OPERATION_ACTIVE_READER_UNAVAILABLE
-        try:
-            active = reader()
-        except Exception:
-            return REASON_OPERATION_ACTIVE_READER_ERROR
-        if not isinstance(active, bool):
-            return REASON_OPERATION_ACTIVE_READER_INVALID
-        if active:
-            return REASON_OPERATION_ACTIVE
         return None

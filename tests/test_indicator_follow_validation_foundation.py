@@ -12,12 +12,7 @@ from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
     ValidationStockRef,
 )
-from routines.지표추종매매.routine_validation_session import (
-    REASON_OPERATION_ACTIVE,
-    REASON_OPERATION_ACTIVE_READER_ERROR,
-    REASON_OPERATION_ACTIVE_READER_UNAVAILABLE,
-    ValidationSession,
-)
+from routines.지표추종매매.routine_validation_session import ValidationSession
 from routines.지표추종매매.routine_validation_trace import (
     ValidationTraceObserver,
 )
@@ -125,28 +120,15 @@ class ValidationTraceObserverTest(unittest.TestCase):
 
 
 class ValidationAvailabilityTest(unittest.TestCase):
-    def test_missing_reader_is_fail_closed(self):
-        readiness = _request().readiness()
-        self.assertFalse(readiness.allowed)
-        self.assertEqual(REASON_OPERATION_ACTIVE_READER_UNAVAILABLE, readiness.reason)
-
-    def test_reader_error_is_fail_closed(self):
+    def test_operation_state_does_not_gate_validation(self):
         def broken_reader():
-            raise RuntimeError("unavailable")
+            raise RuntimeError("must not be called")
 
-        readiness = _request(broken_reader).readiness()
-        self.assertFalse(readiness.allowed)
-        self.assertEqual(REASON_OPERATION_ACTIVE_READER_ERROR, readiness.reason)
-
-    def test_active_operation_is_blocked(self):
-        readiness = _request(lambda: True).readiness()
-        self.assertFalse(readiness.allowed)
-        self.assertEqual(REASON_OPERATION_ACTIVE, readiness.reason)
-
-    def test_inactive_operation_is_allowed(self):
-        readiness = _request(lambda: False).readiness()
-        self.assertTrue(readiness.allowed)
-        self.assertIsNone(readiness.reason)
+        for reader in (None, lambda: False, lambda: True, broken_reader):
+            with self.subTest(reader=reader):
+                readiness = _request(reader).readiness()
+                self.assertTrue(readiness.allowed)
+                self.assertIsNone(readiness.reason)
 
 
 class ValidationIndependenceTest(unittest.TestCase):

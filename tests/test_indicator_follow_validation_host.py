@@ -21,13 +21,7 @@ from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
     ValidationStockRef,
 )
-from routines.지표추종매매.routine_validation_session import (
-    REASON_OPERATION_ACTIVE,
-    REASON_OPERATION_ACTIVE_READER_ERROR,
-    REASON_OPERATION_ACTIVE_READER_INVALID,
-    REASON_OPERATION_ACTIVE_READER_UNAVAILABLE,
-    ValidationSession,
-)
+from routines.지표추종매매.routine_validation_session import ValidationSession
 
 
 class _FakePicker:
@@ -102,52 +96,28 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
                 self.assertEqual([], ready)
                 factory.assert_not_called()
 
-    def test_operation_active_blocks_before_picker(self) -> None:
-        picker = _FakePicker(QDialog.Accepted)
-        reader = Mock(return_value=True)
-        host, factory, blocked, ready = self._host(reader, picker)
+    def test_operation_state_never_blocks_before_picker(self) -> None:
+        selected = ValidationStockRef("005930", "삼성전자")
+        readers = (
+            None,
+            Mock(return_value=False),
+            Mock(return_value=True),
+            Mock(return_value=1),
+            Mock(side_effect=RuntimeError("must not be called")),
+        )
+        for reader in readers:
+            with self.subTest(reader=reader):
+                picker = _FakePicker(QDialog.Accepted, selected)
+                host, factory, blocked, ready = self._host(reader, picker)
 
-        result = host.start(self._snapshot())
+                result = host.start(self._snapshot())
 
-        self.assertIsNone(result)
-        self.assertEqual([REASON_OPERATION_ACTIVE], blocked)
-        self.assertEqual([], ready)
-        reader.assert_called_once_with()
-        factory.assert_not_called()
-
-    def test_operation_reader_error_blocks_before_picker(self) -> None:
-        picker = _FakePicker(QDialog.Accepted)
-        reader = Mock(side_effect=RuntimeError("unavailable"))
-        host, factory, blocked, ready = self._host(reader, picker)
-
-        result = host.start(self._snapshot())
-
-        self.assertIsNone(result)
-        self.assertEqual([REASON_OPERATION_ACTIVE_READER_ERROR], blocked)
-        self.assertEqual([], ready)
-        factory.assert_not_called()
-
-    def test_operation_reader_invalid_return_blocks_before_picker(self) -> None:
-        picker = _FakePicker(QDialog.Accepted)
-        host, factory, blocked, ready = self._host(Mock(return_value=1), picker)
-
-        result = host.start(self._snapshot())
-
-        self.assertIsNone(result)
-        self.assertEqual([REASON_OPERATION_ACTIVE_READER_INVALID], blocked)
-        self.assertEqual([], ready)
-        factory.assert_not_called()
-
-    def test_missing_operation_reader_blocks_before_picker(self) -> None:
-        picker = _FakePicker(QDialog.Accepted)
-        host, factory, blocked, ready = self._host(None, picker)
-
-        result = host.start(self._snapshot())
-
-        self.assertIsNone(result)
-        self.assertEqual([REASON_OPERATION_ACTIVE_READER_UNAVAILABLE], blocked)
-        self.assertEqual([], ready)
-        factory.assert_not_called()
+                self.assertIsInstance(result, ValidationSession)
+                self.assertEqual([], blocked)
+                self.assertEqual([result], ready)
+                factory.assert_called_once_with(None)
+                if isinstance(reader, Mock):
+                    reader.assert_not_called()
 
     def test_picker_cancel_returns_without_block_or_ready(self) -> None:
         picker = _FakePicker(QDialog.Rejected)
@@ -161,7 +131,7 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual([], blocked)
         self.assertEqual([], ready)
-        reader.assert_called_once_with()
+        reader.assert_not_called()
         factory.assert_called_once_with(None)
         self.assertEqual(1, picker.exec_calls)
 
@@ -174,7 +144,7 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
         result = host.preflight_block_reason(snapshot)
 
         self.assertIsNone(result)
-        reader.assert_called_once_with()
+        reader.assert_not_called()
         factory.assert_not_called()
         self.assertEqual([], blocked)
         self.assertEqual([], ready)
@@ -195,7 +165,7 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
         self.assertEqual(7, result.request.timeframe_minutes)
         self.assertEqual([], blocked)
         self.assertEqual([result], ready)
-        self.assertEqual(2, reader.call_count)
+        reader.assert_not_called()
         factory.assert_called_once_with(None)
 
     def test_explicit_ui_parent_is_used_without_changing_host_lifetime_parent(
@@ -220,20 +190,20 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
         self.assertIs(owner, host.parent())
         factory.assert_called_once_with(requester)
 
-    def test_fresh_operation_recheck_blocks_after_picker(self) -> None:
+    def test_operation_change_during_entry_does_not_block(self) -> None:
         picker = _FakePicker(
             QDialog.Accepted,
             ValidationStockRef("005930", "삼성전자"),
         )
-        reader = Mock(side_effect=(False, True))
+        reader = Mock(side_effect=AssertionError("operation reader must not be called"))
         host, factory, blocked, ready = self._host(reader, picker)
 
         result = host.start(self._snapshot())
 
-        self.assertIsNone(result)
-        self.assertEqual([REASON_OPERATION_ACTIVE], blocked)
-        self.assertEqual([], ready)
-        self.assertEqual(2, reader.call_count)
+        self.assertIsInstance(result, ValidationSession)
+        self.assertEqual([], blocked)
+        self.assertEqual([result], ready)
+        reader.assert_not_called()
         factory.assert_called_once_with(None)
 
     def test_invalid_selected_stock_fails_closed(self) -> None:
@@ -254,7 +224,7 @@ class IndicatorFollowValidationHostTest(unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertEqual([REASON_INVALID_SELECTED_STOCK], blocked)
                 self.assertEqual([], ready)
-                reader.assert_called_once_with()
+                reader.assert_not_called()
                 factory.assert_called_once_with(None)
 
     def test_host_imports_exclude_production_execution_and_mock(self) -> None:

@@ -32,9 +32,6 @@ from routines.지표추종매매.routine_validation_historical import (
     ValidationHistoricalProvider,
     ValidationHistoricalResult,
 )
-from routines.지표추종매매.routine_validation_operation_reader import (
-    is_operation_active,
-)
 from routines.지표추종매매.routine_validation_replay import (
     ValidationHistoricalReplay,
     ValidationReplayResult,
@@ -70,7 +67,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         parent: QObject | None = None,
         *,
         host: IndicatorFollowValidationHost | None = None,
-        operation_active_reader: Callable[[], bool] | None = is_operation_active,
+        operation_active_reader: Callable[[], bool] | None = None,
         historical_count: int = DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT,
         historical_provider_factory: Callable[..., object] = ValidationHistoricalProvider,
         replay_factory: Callable[..., object] = ValidationHistoricalReplay,
