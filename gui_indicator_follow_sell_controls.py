@@ -108,6 +108,15 @@ def mark_sell_price_combo_unresolved(combo, original_value):
     original = str(original_value or "").strip()
     combo.setCurrentIndex(-1)
     combo.setPlaceholderText(SELL_PRICE_RESELECTION_TEXT)
+    # A non-editable QComboBox does not consistently paint its placeholder on
+    # the Windows styles used by the settings windows.  Keep the selectable
+    # model limited to the two modern values while showing the unresolved
+    # state explicitly in its read-only edit surface.
+    combo.setEditable(True)
+    line_edit = combo.lineEdit()
+    if line_edit is not None:
+        line_edit.setReadOnly(True)
+    combo.setEditText(SELL_PRICE_RESELECTION_TEXT)
     combo.setProperty(SELL_PRICE_UNRESOLVED_PROPERTY, original)
     combo.setToolTip(
         f"{SELL_PRICE_RESELECTION_TEXT} (기존값: {original or '-'})"
@@ -116,6 +125,8 @@ def mark_sell_price_combo_unresolved(combo, original_value):
 
 def clear_sell_price_combo_unresolved(combo):
     combo.setProperty(SELL_PRICE_UNRESOLVED_PROPERTY, None)
+    if combo.isEditable():
+        combo.setEditText(combo.currentText())
     combo.setToolTip("")
 
 

@@ -3127,7 +3127,7 @@ class IndicatorFollowRoutineSettingsDialog(
         if isinstance(widget, QComboBox):
             if name in SELL_PRICE_COMBO_WIDGET_NAMES:
                 unresolved = widget.property(SELL_PRICE_UNRESOLVED_PROPERTY)
-                if unresolved:
+                if unresolved is not None:
                     return str(unresolved)
             return widget.currentText()
         if isinstance(widget, QLineEdit):
@@ -3552,6 +3552,8 @@ class IndicatorFollowRoutineSettingsDialog(
             })
             return result
 
+        if source == STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK:
+            state = self._without_retired_sell_price_template_operands(state)
         state = self._prepare_buy_bollinger_sign_ui_state_for_load(
             state,
             source=source,
@@ -3731,6 +3733,27 @@ class IndicatorFollowRoutineSettingsDialog(
 
         result["sync_errors"].extend(self._sync_indicator_follow_ui_after_apply())
         return result
+
+    @staticmethod
+    def _without_retired_sell_price_template_operands(state):
+        """Do not let a retired template operand become fresh UI authority."""
+        normalized = deepcopy(state)
+        conditions = (
+            normalized.get("sell_ui", {}).get("signal_conditions")
+            if isinstance(normalized.get("sell_ui"), dict)
+            else None
+        )
+        if not isinstance(conditions, dict):
+            return normalized
+        for group_name in ("condition_a", "condition_b", "condition_c"):
+            condition = conditions.get(group_name)
+            if not isinstance(condition, dict):
+                continue
+            for field_name in ("gap_left_combo", "gap_right_combo"):
+                value = str(condition.get(field_name) or "").strip()
+                if value == "주문가" or value.upper() == "ORDER_PRICE":
+                    condition.pop(field_name, None)
+        return normalized
 
     def collect_indicator_follow_ui_state(self):
         """Collect editable UI values for preview only; this never writes rules.json."""

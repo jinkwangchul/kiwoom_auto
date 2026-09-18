@@ -1854,7 +1854,10 @@ class IndicatorFollowSignalValidationWindow(
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
         self.rules = deepcopy(self.rules_data)
-        self.apply_signal_validation_ui_state(
+        # Entry restoration must retain unresolved legacy operands for an
+        # explicit operator re-selection.  The strict apply projection is for
+        # applying a validated V2 candidate back to its parent dialog.
+        self.restore_signal_validation_entry_ui_state(
             self._signal_validation_seed.to_ui_state()
         )
         self.compact_stock_display.set_current_stock(self.stock)
