@@ -171,6 +171,32 @@ class ValidationIndependenceTest(unittest.TestCase):
                         root = (node.module or "").split(".", 1)[0]
                         self.assertIn(root, allowed_roots)
 
+    def test_operation_state_is_not_a_validation_admission_authority(self):
+        routine_dir = next(
+            (PROJECT_ROOT / "routines").glob("*/routine_validation_session.py")
+        ).parent
+        modules = (
+            PROJECT_ROOT / "gui_indicator_follow_signal_validation_flow.py",
+            PROJECT_ROOT / "gui_indicator_follow_validation_host.py",
+            routine_dir / "routine_validation_session.py",
+            routine_dir / "routine_validation_historical.py",
+            routine_dir / "routine_validation_replay.py",
+        )
+        forbidden = (
+            "routine_validation_operation_reader",
+            "is_operation_active",
+            "operation_state.json",
+            "REASON_OPERATION_ACTIVE",
+        )
+        for module_path in modules:
+            source = module_path.read_text(encoding="utf-8-sig")
+            with self.subTest(module=module_path.name):
+                for fragment in forbidden:
+                    self.assertNotIn(fragment, source)
+        self.assertFalse(
+            (routine_dir / "routine_validation_operation_reader.py").exists()
+        )
+
     def test_foundation_api_does_not_call_filesystem_writers(self):
         session = _request(lambda: False)
         observer = session.trace_observer
