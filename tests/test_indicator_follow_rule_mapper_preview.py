@@ -3926,6 +3926,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         method_candidates = candidates.get("sell", {}).get("method_policy_candidates", {})
 
         self.assertEqual(method_candidates["sell.method.selected_sets"]["value"], ["setting_a"])
+        self.assertFalse(method_candidates["sell.method.selected_sets"]["preview_only"])
+        self.assertTrue(method_candidates["sell.method.selected_sets"]["execution_connected"])
         self.assertEqual(method_candidates["sell.method.setting_a"]["candidate_type"], "set_method_policy")
         self.assertEqual(method_candidates["sell.method.setting_b"]["candidate_type"], "set_method_policy")
         self.assertEqual(method_candidates["sell.method.setting_c"]["candidate_type"], "set_method_policy")

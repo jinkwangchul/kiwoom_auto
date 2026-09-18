@@ -300,7 +300,7 @@ def _preview_diff_note(path: str) -> str:
             "Signal-scoped BUY residual-recovery cycle policy."
         ),
         SELL_METHOD_SELECTED_SETS_PATH: (
-            "UI preview-only SELL method selected sets policy candidate."
+            "SELL method selected sets policy candidate consumed by the SELL intent builder."
         ),
         SELL_METHOD_SETTING_A_PATH: (
             "UI preview-only SELL method setting A policy candidate."
@@ -1436,8 +1436,12 @@ def _build_sell_method_policy_candidates(
             "operation": "set_method_policy",
             "candidate_type": "set_method_policy",
             "value": selected_sets,
-            "preview_only": True,
-            "execution_connected": False,
+            # The selected method is a required runtime input: the SELL
+            # intent builder resolves this exact path before it can create
+            # an order intent.  Keep candidate metadata aligned with that
+            # actual consumer; this does not perform a runtime write here.
+            "preview_only": False,
+            "execution_connected": True,
             "runtime_write": False,
             "send_order": False,
         }
