@@ -506,11 +506,16 @@ class RetirementServiceAndHostTests(unittest.TestCase):
                 {"012210", "063440"}
             )
         )
-        result = self._run_service(
-            window,
-            [(ended, "012210", "Ended"), (future, "063440", "Future")],
-            datetime(2026, 8, 26, 15, 30),
-        )
+        with patch.object(
+            run_control,
+            "stock_nxt_availability",
+            return_value=True,
+        ):
+            result = self._run_service(
+                window,
+                [(ended, "012210", "Ended"), (future, "063440", "Future")],
+                datetime(2026, 8, 26, 15, 30),
+            )
         self.assertEqual(("012210",), result["removed"])
         self.assertEqual(("063440",), result["remaining"])
 

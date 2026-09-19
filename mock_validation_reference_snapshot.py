@@ -78,6 +78,11 @@ def build_mock_reference_snapshot(
         "routine_instances": records,
         "snapshot_created_at": clean_text(created_at) or now_text(),
     }
+    if "nxt_available" in stock:
+        nxt_available = stock.get("nxt_available")
+        if nxt_available not in {True, False, None}:
+            raise MockValidationError("MOCK_NXT_AVAILABILITY_INVALID")
+        snapshot["nxt_available"] = nxt_available
     if display_contract is not None:
         snapshot["display_contract"] = deepcopy(dict(display_contract))
     snapshot["snapshot_hash"] = payload_hash(snapshot)

@@ -99,6 +99,11 @@ def _mock_instance_activation_phase(
         now_dt=as_of,
         operation_policy_reader=lambda: snapshot,
         ats_session_reader=ats_reader,
+        **(
+            {"nxt_available": snapshot.get("mock_stock_nxt_available")}
+            if "mock_stock_nxt_available" in snapshot
+            else {}
+        ),
     )
     activation = auto_trade_operation_activation_phase(
         config,

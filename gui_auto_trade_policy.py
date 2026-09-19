@@ -41,6 +41,7 @@ from gui_ats_utils import (
     manual_ats_enabled_labels,
 )
 from stock_code_contract import normalize_stock_code
+from gui_stock_data import stock_nxt_availability
 from gui_window_policy import persistent_feature_owner
 from operation_command_service import (
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
@@ -390,6 +391,7 @@ def auto_trade_stock_operation_category(
                 config,
                 state if isinstance(state, dict) else {},
                 now_dt=now_dt,
+                nxt_available=stock_nxt_availability(stock_code),
             )
         except Exception:
             phase = {}
@@ -469,6 +471,7 @@ def auto_trade_setting_row_projection(
     current_session_trade_started: bool,
     persisted_trade_started: bool | None = None,
     now_dt: datetime | None = None,
+    stock_code: object = "",
 ) -> dict[str, object]:
     """Project shared status/method/liquidation cells without mutating runtime.
 
@@ -480,10 +483,16 @@ def auto_trade_setting_row_projection(
     stock_config = config if isinstance(config, dict) else {}
     category = str(operation_category or "waiting").strip().lower() or "waiting"
     inactive_bucket = category in {"waiting", "ended", "review", "excluded"}
+    nxt_kwargs = (
+        {"nxt_available": stock_nxt_availability(stock_code)}
+        if str(stock_code or "").strip()
+        else {}
+    )
     session_phase = auto_trade_operation_session_phase(
         stock_config,
         runtime_state,
         now_dt=now_dt,
+        **nxt_kwargs,
     )
     activation_phase = auto_trade_operation_activation_phase(
         stock_config,
@@ -491,6 +500,7 @@ def auto_trade_setting_row_projection(
         now_dt=now_dt,
         session_phase=session_phase,
         operation_policy_reader=read_operation_policy,
+        **nxt_kwargs,
     )
     projection_phase = str(
         activation_phase.get("projection_phase") or "SESSION_EVIDENCE_INVALID"
@@ -730,6 +740,7 @@ def auto_trade_setting_start_target_decision(
             start_config,
             state or {},
             now_dt=now_dt,
+            nxt_available=stock_nxt_availability(stock_code),
         )
     except Exception:
         session_phase = {}

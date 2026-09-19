@@ -23,6 +23,9 @@ from state_policy import (
 from manual_ats_runtime import manual_ats_runtime_selected_keys
 
 
+_NXT_ELIGIBILITY_UNSPECIFIED = object()
+
+
 def manual_ats_session_labels() -> dict[str, str]:
     """환경설정(operation_policy.json)의 추가시간 이름을 ATS 표시명으로 사용한다."""
     fallback = {"extra1": "추가1", "extra2": "추가2", "extra3": "추가3"}
@@ -121,6 +124,8 @@ def _effective_exchange_session_ranges(
     session_name: str,
     start_seconds: int,
     end_seconds: int,
+    *,
+    nxt_available: object = _NXT_ELIGIBILITY_UNSPECIFIED,
 ) -> tuple[tuple[str, int, int], ...]:
     """Clip one configured Program session to actual exchange availability.
 
@@ -131,15 +136,19 @@ def _effective_exchange_session_ranges(
 
     if start_seconds >= end_seconds:
         return ()
-    exchange_ranges = (
-        EXCHANGE_REGULAR_SESSION_RANGES
-        if session_name in {"scheduled", "regular"}
-        else tuple(
+    if session_name in {"scheduled", "regular"}:
+        exchange_ranges = EXCHANGE_REGULAR_SESSION_RANGES
+    else:
+        if (
+            nxt_available is not _NXT_ELIGIBILITY_UNSPECIFIED
+            and nxt_available is not True
+        ):
+            return ()
+        exchange_ranges = tuple(
             item
             for item in EXCHANGE_NXT_SESSION_RANGES
             if str(item[0]).strip().upper() != "KRX"
         )
-    )
     result: list[tuple[str, int, int]] = []
     for _exchange_name, exchange_start, exchange_end in exchange_ranges:
         exchange_start_seconds = seconds_from_hhmmss(exchange_start, exchange_start)
@@ -158,6 +167,7 @@ def auto_trade_operation_session_phase(
     now_dt: datetime | None = None,
     operation_policy_reader: Callable[[], dict[str, object]] | None = None,
     ats_session_reader: Callable[[str], dict[str, object]] | None = None,
+    nxt_available: object = _NXT_ELIGIBILITY_UNSPECIFIED,
 ) -> dict[str, object]:
     """Classify configured regular/ATS windows for retirement and display."""
 
@@ -284,6 +294,7 @@ def auto_trade_operation_session_phase(
             session_name,
             effective_start,
             effective_end,
+            nxt_available=nxt_available,
         )
         if not clipped:
             unavailable_sessions.append(session_name)
@@ -293,9 +304,15 @@ def auto_trade_operation_session_phase(
         sorted(effective_windows, key=lambda item: (item[1], item[2], item[0]))
     )
     if not ordered:
+        nxt_blocked = bool(
+            mode == "CONTINUOUS"
+            and nxt_available is not _NXT_ELIGIBILITY_UNSPECIFIED
+            and nxt_available is not True
+            and any(name.startswith("extra") for name, _start, _end in configured)
+        )
         return {
             "evaluable": False,
-            "phase": "NO_EFFECTIVE_SESSION",
+            "phase": "NXT_SESSION_UNAVAILABLE" if nxt_blocked else "NO_EFFECTIVE_SESSION",
             "mode": mode,
             "active": False,
             "future_session_exists": False,
@@ -334,6 +351,11 @@ def auto_trade_operation_session_phase(
         "active_sessions": active_sessions,
         "invalid_sessions": (),
         "unavailable_sessions": tuple(dict.fromkeys(unavailable_sessions)),
+        "nxt_available": (
+            None
+            if nxt_available is _NXT_ELIGIBILITY_UNSPECIFIED
+            else nxt_available
+        ),
     }
 
 
@@ -357,6 +379,7 @@ def auto_trade_operation_activation_phase(
     now_dt: datetime | None = None,
     session_phase: dict[str, object] | None = None,
     operation_policy_reader: Callable[[], dict[str, object]] | None = None,
+    nxt_available: object = _NXT_ELIGIBILITY_UNSPECIFIED,
 ) -> dict[str, object]:
     """Project transient operation/trade boundaries without persisting a phase."""
 
@@ -404,6 +427,7 @@ def auto_trade_operation_activation_phase(
         state,
         now_dt=current,
         operation_policy_reader=policy_reader,
+        nxt_available=nxt_available,
     )
     phase_name = str(phase.get("phase") or "").strip().upper()
     active_sessions = tuple(
@@ -508,6 +532,8 @@ def manual_ats_active_now(
     config: dict[str, object] | None,
     state: dict[str, object] | None = None,
     now_dt: datetime | None = None,
+    *,
+    nxt_available: object = _NXT_ELIGIBILITY_UNSPECIFIED,
 ) -> bool:
     """현재 시간이 해당 종목의 지속 ATS 선택 시간 안인지 판단한다.
 
@@ -516,6 +542,11 @@ def manual_ats_active_now(
     """
     selected_keys, _source = manual_ats_selected_keys_and_source(config, state)
     if not selected_keys:
+        return False
+    if (
+        nxt_available is not _NXT_ELIGIBILITY_UNSPECIFIED
+        and nxt_available is not True
+    ):
         return False
 
     current_seconds = current_time_in_seconds(now_dt)
@@ -534,7 +565,16 @@ def manual_ats_active_now(
             continue
 
         start_seconds, end_seconds = seconds
-        if seconds_in_range(current_seconds, start_seconds, end_seconds):
+        effective_ranges = _effective_exchange_session_ranges(
+            key,
+            start_seconds,
+            end_seconds,
+            nxt_available=nxt_available,
+        )
+        if any(
+            seconds_in_range(current_seconds, effective_start, effective_end)
+            for _name, effective_start, effective_end in effective_ranges
+        ):
             return True
 
     return False

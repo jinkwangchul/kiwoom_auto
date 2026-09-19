@@ -93,6 +93,7 @@ from gui_ats_utils import (
     auto_trade_operation_session_phase,
     manual_ats_session_definition,
 )
+from gui_stock_data import stock_nxt_availability
 from gui_routine_registry import get_group_records
 from main_group_projection import (
     build_main_group_projection,
@@ -804,6 +805,7 @@ def auto_trade_final_session_phase(
     config: dict[str, object],
     state: dict[str, object],
     *,
+    stock_code: object = "",
     now_dt: datetime | None = None,
 ) -> dict[str, object]:
     """Classify today's real trading windows without using UI status text."""
@@ -813,6 +815,11 @@ def auto_trade_final_session_phase(
         now_dt=now_dt or current_datetime(),
         operation_policy_reader=read_operation_policy,
         ats_session_reader=manual_ats_session_definition,
+        **(
+            {"nxt_available": stock_nxt_availability(stock_code)}
+            if str(stock_code or "").strip()
+            else {}
+        ),
     )
 
 
@@ -867,7 +874,12 @@ def auto_trade_time_end_retirement_eligibility(
     """Fail-closed read-only eligibility for normal final-time retirement."""
 
     current = now_dt or current_datetime()
-    phase = auto_trade_final_session_phase(config, state, now_dt=current)
+    phase = auto_trade_final_session_phase(
+        config,
+        state,
+        stock_code=stock_code,
+        now_dt=current,
+    )
     blockers: list[str] = []
     if phase.get("evaluable") is not True:
         blockers.append(str(phase.get("phase") or "SESSION_EVIDENCE_INVALID"))

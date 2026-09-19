@@ -15,6 +15,7 @@ from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_close_routine_order_allowed,
 )
+from gui_stock_data import stock_nxt_availability
 from operation_policy_gate import is_emergency_stop
 from state_policy import (
     in_manual_trading_session,
@@ -117,6 +118,7 @@ def canonical_stock_trading_time_status(
     config: dict[str, Any] | None,
     state: dict[str, Any] | None,
     now_dt: datetime | None = None,
+    stock_code: object = "",
 ) -> dict[str, Any]:
     """Project the existing per-stock regular/ATS trading-time contract."""
 
@@ -137,15 +139,22 @@ def canonical_stock_trading_time_status(
                 now_dt=current,
                 config=config,
             )
+            nxt_kwargs = (
+                {"nxt_available": stock_nxt_availability(stock_code)}
+                if str(stock_code or "").strip()
+                else {}
+            )
             ats_active = manual_ats_active_now(
                 config,
                 runtime_state,
                 current,
+                **nxt_kwargs,
             )
             activation = auto_trade_operation_activation_phase(
                 config,
                 runtime_state,
                 now_dt=current,
+                **nxt_kwargs,
             )
             regular_active = bool(
                 regular_active
@@ -173,6 +182,11 @@ def canonical_stock_trading_time_status(
             config,
             state if isinstance(state, dict) else {},
             now_dt=current,
+            **(
+                {"nxt_available": stock_nxt_availability(stock_code)}
+                if str(stock_code or "").strip()
+                else {}
+            ),
         )
         active = bool(
             scheduled_status_for_now(config, current) == "RUNNING"
@@ -205,6 +219,7 @@ def canonical_routine_order_permission(
     config: dict[str, Any] | None = None,
     operation_state: dict[str, Any] | None = None,
     now_dt: datetime | None = None,
+    stock_code: object = "",
 ) -> dict[str, Any]:
     """Return canonical, read-only BUY/SELL permission for OrderManager."""
     runtime_state = state if isinstance(state, dict) else {}
@@ -293,6 +308,7 @@ def canonical_routine_order_permission(
             config=config,
             state=runtime_state,
             now_dt=current,
+            stock_code=stock_code,
         )
         if time_status.get("active") is not True:
             return blocked("운영시간 밖")

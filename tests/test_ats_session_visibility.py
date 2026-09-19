@@ -165,12 +165,17 @@ class AtsSessionVisibilityTest(unittest.TestCase):
 
             window = MagicMock()
             window.capture_stock_table_view_state.return_value = (set(), 0)
-            result = ats_ops.auto_trade_save_manual_ats_state_for_targets(
-                window,
-                targets,
-                {"extra1": True, "extra2": False, "extra3": False},
-                editable_keys=("extra1",),
-            )
+            with patch.object(
+                ats_ops,
+                "stock_nxt_availability",
+                return_value=True,
+            ):
+                result = ats_ops.auto_trade_save_manual_ats_state_for_targets(
+                    window,
+                    targets,
+                    {"extra1": True, "extra2": False, "extra3": False},
+                    editable_keys=("extra1",),
+                )
 
             self.assertEqual(2, result["succeeded"])
             for (stock_dir, _code, _name), hidden_keys in zip(targets, expected_hidden):

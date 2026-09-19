@@ -28,7 +28,7 @@ from gui_auto_trade_policy import (
 )
 from operation_policy_gate import read_operation_state
 from routine_order_permission import canonical_routine_order_permission
-from gui_auto_trade_runtime import write_state_json
+from gui_auto_trade_runtime import parse_stock_folder_name, write_state_json
 from runtime_io import read_json_dict
 
 
@@ -55,6 +55,7 @@ def decide_routine_order(
     config: dict[str, Any] | None = None,
     operation_state: dict[str, Any] | None = None,
     now_dt: datetime | None = None,
+    stock_code: object = "",
 ) -> dict[str, Any]:
     """루틴 신호에 대한 메인프로그램 주문판정 결과를 반환한다.
 
@@ -87,6 +88,7 @@ def decide_routine_order(
         config=config,
         operation_state=operation_state,
         now_dt=now_dt,
+        stock_code=stock_code,
     )
 
 
@@ -134,6 +136,7 @@ def decide_routine_order_for_stock_dir(
     path = Path(stock_dir)
     state = read_json_dict(path / "state.json")
     config = read_json_dict(path / "config.json")
+    stock_code, _stock_name = parse_stock_folder_name(path.name)
     decision = decide_routine_order(
         state,
         signal_type,
@@ -141,6 +144,7 @@ def decide_routine_order_for_stock_dir(
         config=config,
         operation_state=read_operation_state(),
         now_dt=current_datetime(),
+        stock_code=stock_code,
     )
     decision["stock_dir"] = str(path)
     return decision

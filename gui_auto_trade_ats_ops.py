@@ -51,6 +51,7 @@ from operation_close_completion_evaluator import resolve_liquidation_holding_qua
 from event_journal_trade_observer import observe_manual_ats_liquidation_outcome
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
+from gui_stock_data import stock_nxt_availability
 from manual_ats_runtime import (
     manual_ats_runtime_selected_keys,
     write_manual_ats_runtime_selection,
@@ -124,6 +125,12 @@ def _manual_ats_liquidation_target_eligibility(
     config = read_json_dict(stock_dir / "config.json")
     state = read_json_dict(stock_dir / "state.json")
     selected_sessions = manual_ats_runtime_selected_keys(state, now_dt=now_dt)
+    if selected_sessions and stock_nxt_availability(stock_code) is not True:
+        return {
+            "eligible": False,
+            "selected_sessions": selected_sessions,
+            "blocked_reasons": ["NXT_NOT_AVAILABLE"],
+        }
     if owner is not None and str(stock_code or "").strip():
         availability = inspect_close_liquidation_availability(
             owner,
@@ -144,7 +151,12 @@ def _manual_ats_liquidation_target_eligibility(
     reasons: list[str] = []
     if not auto_trade_setting_trade_started(state):
         reasons.append("auto trade is not running")
-    if not manual_ats_active_now(config, state, now_dt):
+    if not manual_ats_active_now(
+        config,
+        state,
+        now_dt,
+        nxt_available=stock_nxt_availability(stock_code),
+    ):
         reasons.append("current time is outside the selected ATS sessions")
     holding_qty = get_real_holding_qty(state)
     if holding_qty is None or holding_qty <= 0:
@@ -231,6 +243,19 @@ def auto_trade_save_manual_ats_state_for_targets(
             key: bool(ats_state.get(key, False)) if key in editable else key in current_keys
             for key in all_keys
         }
+        if any(normalized.values()) and stock_nxt_availability(code) is not True:
+            target_results.append(
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "stock_dir": str(stock_dir),
+                    "success": None,
+                    "status": "NXT_NOT_AVAILABLE",
+                    "reason": "NXT 거래 가능 종목이 아니거나 거래자격 확인이 완료되지 않았습니다.",
+                }
+            )
+            result["excluded"] = int(result["excluded"]) + 1
+            continue
 
         if not write_manual_ats_runtime_selection(stock_dir, normalized):
             target_results.append(

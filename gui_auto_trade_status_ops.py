@@ -15,6 +15,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import QMessageBox
 from gui_operation_ui_context import operation_dialog_parent, refresh_auto_trade_views
 from gui_toast import show_toast
+from gui_common_utils import safe_int_value
 from event_journal_production import append_production_event
 
 from gui_config_utils import default_config, default_state
@@ -23,6 +24,7 @@ from gui_schedule_utils import (
     schedule_config_updates,
 )
 from runtime_io import read_json_dict
+from gui_stock_data import stock_nxt_availability
 from group_scope import load_group_scope
 from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_order_utils import pending_order_side_quantities
@@ -891,6 +893,10 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
             or bool(snapshot_metadata)
         )
     ):
+        # A time trigger without an actual holding is not a Close lifecycle.
+        # Keep the current operation state and create no AUTO close evidence.
+        if safe_int_value(state.get("holding_qty"), 0) <= 0:
+            return "unchanged", before_status, before_status
         recovery = _production_recovery_gate(
             window,
             code,
@@ -1266,7 +1272,12 @@ def auto_trade_update_stock_operation_mode(
         mode,
         decision_now,
         ats_runtime_active=(
-            manual_ats_active_now(config, runtime_state, decision_now)
+            manual_ats_active_now(
+                config,
+                runtime_state,
+                decision_now,
+                nxt_available=stock_nxt_availability(code),
+            )
             and current_session_trading_active
         ),
         runtime_status=runtime_status,

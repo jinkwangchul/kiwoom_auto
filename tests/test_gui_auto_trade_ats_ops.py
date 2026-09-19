@@ -23,6 +23,19 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         )
         self.outcome_observer = self.outcome_observer_patch.start()
         self.addCleanup(self.outcome_observer_patch.stop)
+        self.nxt_availability_patch = patch.object(
+            ats_ops,
+            "stock_nxt_availability",
+            return_value=True,
+        )
+        self.nxt_availability_patch.start()
+        self.addCleanup(self.nxt_availability_patch.stop)
+        self.close_nxt_availability_patch = patch(
+            "close_liquidation_command.stock_nxt_availability",
+            return_value=True,
+        )
+        self.close_nxt_availability_patch.start()
+        self.addCleanup(self.close_nxt_availability_patch.stop)
 
     def test_liquidation_availability_uses_selected_session_time_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -299,6 +312,62 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         window.statusBarMessage.assert_called_once_with(
             "ATS설정 변경 완료: ATS 장전 ON / 2개"
         )
+
+    def test_non_nxt_stock_cannot_enable_ats_but_can_clear_existing_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp)
+            (stock_dir / "config.json").write_text(
+                json.dumps({"operation_mode": "CONTINUOUS"}),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps({"status": "WAIT_BUY"}),
+                encoding="utf-8",
+            )
+            window = MagicMock()
+            selected = [(stock_dir, "005930", "Test")]
+            window.selected_stock_infos.return_value = selected
+
+            with patch.object(
+                ats_ops,
+                "stock_nxt_availability",
+                return_value=False,
+            ):
+                blocked = ats_ops.auto_trade_save_manual_ats_state_for_targets(
+                    window,
+                    selected,
+                    {"extra1": True, "extra2": False, "extra3": False},
+                )
+
+            state_after_block = json.loads(
+                (stock_dir / "state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(0, blocked["succeeded"])
+            self.assertEqual(1, blocked["excluded"])
+            self.assertEqual(
+                "NXT_NOT_AVAILABLE",
+                blocked["results"][0]["status"],
+            )
+            self.assertNotIn("manual_ats_selection", state_after_block)
+
+            self.assertTrue(
+                write_manual_ats_runtime_selection(stock_dir, ("extra1",))
+            )
+            with patch.object(
+                ats_ops,
+                "stock_nxt_availability",
+                return_value=False,
+            ):
+                cleared = ats_ops.auto_trade_save_manual_ats_state_for_targets(
+                    window,
+                    selected,
+                    {"extra1": False, "extra2": False, "extra3": False},
+                )
+            state_after_clear = json.loads(
+                (stock_dir / "state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(1, cleared["succeeded"])
+            self.assertEqual([], state_after_clear["manual_ats_selection"]["selected_sessions"])
 
     def test_apply_selection_writes_runtime_only_and_ignores_legacy_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

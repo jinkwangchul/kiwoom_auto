@@ -3157,6 +3157,7 @@ def _routine_tree_stock_display_values(
         sell_pending_qty=sell_pending_qty,
         current_session_trade_started=current_session_trade_started,
         persisted_trade_started=trade_started,
+        stock_code=code,
     )
     display_status = str(row_projection["display_status"])
     operation_display = auto_trade_operation_display(config, state)
@@ -3324,6 +3325,7 @@ def _routine_tree_stock_display_snapshots(
         sell_pending_qty=sell_pending_qty,
         current_session_trade_started=current_session_trade_started,
         persisted_trade_started=trade_started,
+        stock_code=code,
     )
     display_status = str(row_projection["display_status"])
     operation_display = auto_trade_operation_display(config, state)
@@ -4684,6 +4686,7 @@ def main_load_running_stock_table(window) -> None:
             sell_pending_qty=sell_pending_qty,
             current_session_trade_started=current_session_trade_started,
             persisted_trade_started=trade_started,
+            stock_code=code,
         )
         display_status = str(row_projection["display_status"])
         status_cell_active = bool(row_projection["status_cell_active"])

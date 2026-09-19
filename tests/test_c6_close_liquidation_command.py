@@ -266,6 +266,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
             with (
                 patch.object(command, "manual_ats_runtime_selected_keys", return_value=("NXT_PRE",)),
                 patch.object(command, "manual_ats_active_now", return_value=True),
+                patch.object(command, "stock_nxt_availability", return_value=True),
             ):
                 manual_ats = command.inspect_close_liquidation_availability(
                     self._owner(),
@@ -281,6 +282,74 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 self.assertTrue(result.allowed)
                 self.assertEqual("", result.reason_code)
         self.assertEqual("NO_HOLDING", manual_ats.reason_code)
+
+    def test_manual_ats_requires_verified_nxt_and_actual_exchange_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(
+                Path(temp),
+                holding_qty=3,
+                state_patch={
+                    "manual_ats_selection": {"selected_sessions": ["extra2"]},
+                },
+            )
+            config = json.loads((stock / "config.json").read_text(encoding="utf-8"))
+            config["operation_mode"] = "CONTINUOUS"
+            (stock / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+            session = {
+                "enabled": True,
+                "start_time": "15:30:00",
+                "end_time": "19:50:00",
+            }
+            with (
+                patch(
+                    "gui_ats_utils.manual_ats_session_definition",
+                    return_value=session,
+                ),
+                patch.object(command, "stock_nxt_availability", return_value=True),
+            ):
+                configured_gap = command.inspect_close_liquidation_availability(
+                    self._owner(),
+                    stock,
+                    CODE,
+                    intent=command.MANUAL_ATS_LIQUIDATION,
+                    requested_method="시장가",
+                    now_dt=datetime(2026, 8, 30, 15, 35),
+                    recovery_inspector=self._recovery_allowed,
+                )
+                actual_open = command.inspect_close_liquidation_availability(
+                    self._owner(),
+                    stock,
+                    CODE,
+                    intent=command.MANUAL_ATS_LIQUIDATION,
+                    requested_method="시장가",
+                    now_dt=datetime(2026, 8, 30, 15, 40),
+                    recovery_inspector=self._recovery_allowed,
+                )
+
+            with (
+                patch(
+                    "gui_ats_utils.manual_ats_session_definition",
+                    return_value=session,
+                ),
+                patch.object(command, "stock_nxt_availability", return_value=False),
+            ):
+                non_nxt = command.inspect_close_liquidation_availability(
+                    self._owner(),
+                    stock,
+                    CODE,
+                    intent=command.MANUAL_ATS_LIQUIDATION,
+                    requested_method="시장가",
+                    now_dt=datetime(2026, 8, 30, 15, 40),
+                    recovery_inspector=self._recovery_allowed,
+                )
+
+        self.assertFalse(configured_gap.allowed)
+        self.assertEqual("SESSION_NOT_ALLOWED", configured_gap.reason_code)
+        self.assertTrue(actual_open.allowed)
+        self.assertEqual("", actual_open.reason_code)
+        self.assertFalse(non_nxt.allowed)
+        self.assertEqual("NXT_NOT_AVAILABLE", non_nxt.reason_code)
 
     def test_zero_holding_precedes_participant_and_safety_guards(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -791,7 +860,10 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 "sell_method": "MARKET",
             }
             writer = Mock()
-            with patch.object(command, "manual_ats_active_now", return_value=True):
+            with (
+                patch.object(command, "manual_ats_active_now", return_value=True),
+                patch.object(command, "stock_nxt_availability", return_value=True),
+            ):
                 blocked = command.execute_manual_ats_liquidation_request_command(
                     self._owner(participant=False),
                     preview,
@@ -831,7 +903,10 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                     "blocked_reasons": [],
                 }
             )
-            with patch.object(command, "manual_ats_active_now", return_value=True):
+            with (
+                patch.object(command, "manual_ats_active_now", return_value=True),
+                patch.object(command, "stock_nxt_availability", return_value=True),
+            ):
                 result = command.execute_manual_ats_liquidation_request_command(
                     self._owner(),
                     preview,
@@ -875,7 +950,10 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                     "blocked_reasons": [],
                 }
             )
-            with patch.object(command, "manual_ats_active_now", return_value=True):
+            with (
+                patch.object(command, "manual_ats_active_now", return_value=True),
+                patch.object(command, "stock_nxt_availability", return_value=True),
+            ):
                 result = command.execute_manual_ats_liquidation_request_command(
                     self._owner(),
                     preview,

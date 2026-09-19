@@ -501,6 +501,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 sell_pending_qty=sell_pending_qty,
                 current_session_trade_started=current_session_trade_started,
                 persisted_trade_started=trade_started,
+                stock_code=code,
             )
             display_status = str(row_projection["display_status"])
             method_text = str(row_projection["method_text"])

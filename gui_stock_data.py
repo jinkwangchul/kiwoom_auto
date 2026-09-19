@@ -212,6 +212,63 @@ def load_stock_library(project_root: Path | None = None) -> list[dict[str, objec
     return [dict(item) for item in load_stock_library_snapshot(project_root).records]
 
 
+_STOCK_NXT_CACHE_SIGNATURE: tuple[object, ...] | None = None
+_STOCK_NXT_CACHE: dict[str, bool | None] = {}
+
+
+def _stock_library_runtime_signature(
+    project_root: Path | None = None,
+) -> tuple[object, ...]:
+    root = Path(project_root) if project_root is not None else PROJECT_ROOT
+    runtime_path = root / "runtime" / "stock_library.json"
+    metadata_path = root / "runtime" / "stock_library_meta.json"
+
+    def signature(path: Path) -> tuple[bool, int, int]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return False, 0, 0
+        return True, int(stat.st_mtime_ns), int(stat.st_size)
+
+    return (
+        str(root.resolve()),
+        *signature(runtime_path),
+        *signature(metadata_path),
+    )
+
+
+def stock_nxt_availability(
+    code: object,
+    project_root: Path | None = None,
+) -> bool | None:
+    """Return verified per-stock NXT eligibility without repeated library parsing.
+
+    None means current verified Master-Library evidence is unavailable or the
+    stock has no explicit NXT eligibility. ATS authority must fail closed for
+    both False and None.
+    """
+
+    normalized_code = normalize_stock_code(str(code or ""))
+    if not normalized_code:
+        return None
+
+    global _STOCK_NXT_CACHE_SIGNATURE, _STOCK_NXT_CACHE
+    signature = _stock_library_runtime_signature(project_root)
+    if signature != _STOCK_NXT_CACHE_SIGNATURE:
+        snapshot = load_stock_library_snapshot(project_root)
+        _STOCK_NXT_CACHE = {
+            normalize_stock_code(str(item.get("code") or "")): (
+                item.get("nxt_available")
+                if item.get("nxt_available") in {True, False}
+                else None
+            )
+            for item in snapshot.records
+            if isinstance(item, dict)
+            and normalize_stock_code(str(item.get("code") or ""))
+        }
+        _STOCK_NXT_CACHE_SIGNATURE = signature
+    return _STOCK_NXT_CACHE.get(normalized_code)
+
 
 def find_library_stock_by_code(code: str) -> dict[str, object] | None:
     """

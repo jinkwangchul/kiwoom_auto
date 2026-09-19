@@ -813,12 +813,19 @@ class MockValidationHost:
             operation_policy=policy,
         )
         config, state, ats_reader = self._mock_operation_phase_inputs(settings, policy)
+        reference = document.get("reference_snapshot")
+        reference = reference if isinstance(reference, dict) else {}
         session_phase = auto_trade_operation_session_phase(
             config,
             state,
             now_dt=now,
             operation_policy_reader=lambda: policy,
             ats_session_reader=ats_reader,
+            **(
+                {"nxt_available": reference.get("nxt_available")}
+                if "nxt_available" in reference
+                else {}
+            ),
         )
         phase_name = str(session_phase.get("phase") or "").strip().upper()
         if session_phase.get("evaluable") is not True:
@@ -861,6 +868,16 @@ class MockValidationHost:
             as_of=now,
             operation_policy_snapshot={
                 **operation_policy,
+                **(
+                    {
+                        "mock_stock_nxt_available": document[
+                            "reference_snapshot"
+                        ].get("nxt_available")
+                    }
+                    if isinstance(document.get("reference_snapshot"), dict)
+                    and "nxt_available" in document["reference_snapshot"]
+                    else {}
+                ),
                 "mock_tax_enabled": document["session"]["mock_tax_enabled"],
                 "mock_tax_rate": document["session"]["mock_tax_rate"],
                 "mock_rules_snapshot_by_instance": rules_snapshot_by_instance,
@@ -923,6 +940,16 @@ class MockValidationHost:
             as_of=now,
             operation_policy_snapshot={
                 **operation_policy,
+                **(
+                    {
+                        "mock_stock_nxt_available": document[
+                            "reference_snapshot"
+                        ].get("nxt_available")
+                    }
+                    if isinstance(document.get("reference_snapshot"), dict)
+                    and "nxt_available" in document["reference_snapshot"]
+                    else {}
+                ),
                 "mock_tax_enabled": document["session"]["mock_tax_enabled"],
                 "mock_tax_rate": document["session"]["mock_tax_rate"],
                 "mock_instance_rules_snapshot": rules_snapshot,
@@ -1648,12 +1675,18 @@ class MockValidationHost:
         config, state, ats_reader = self._mock_operation_phase_inputs(
             settings, policy
         )
+        nxt_kwargs = (
+            {"nxt_available": policy.get("mock_stock_nxt_available")}
+            if "mock_stock_nxt_available" in policy
+            else {}
+        )
         session_phase = auto_trade_operation_session_phase(
             config,
             state,
             now_dt=now,
             operation_policy_reader=lambda: policy,
             ats_session_reader=ats_reader,
+            **nxt_kwargs,
         )
         return auto_trade_operation_activation_phase(
             config,
@@ -1661,6 +1694,7 @@ class MockValidationHost:
             now_dt=now,
             session_phase=session_phase,
             operation_policy_reader=lambda: policy,
+            **nxt_kwargs,
         )
 
     def _mock_market_session_phase(

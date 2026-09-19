@@ -827,6 +827,7 @@ def project_stock_operation_header_display(
             sell_pending_qty=sell_pending_qty,
             current_session_trade_started=current_session_trade_started,
             persisted_trade_started=trade_started,
+            stock_code=code,
         )
         display_status = str(row_projection.get("display_status") or "감시/대기")
         method_text = str(row_projection.get("method_text") or "루틴")

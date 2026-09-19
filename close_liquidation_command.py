@@ -63,6 +63,7 @@ from operation_command_service import (
 from order_candidate_engine import get_real_holding_qty
 from operation_policy_gate import write_global_operation_closing_state
 from runtime_io import read_json_dict
+from gui_stock_data import stock_nxt_availability
 from state_policy import normalize_operation_mode, seconds_from_hhmmss
 from transition_evidence_reader import COMMAND_REQUEST_SCOPE, TransitionEvidenceScope
 from transition_production_guard import evaluate_production_transition
@@ -515,10 +516,18 @@ def inspect_close_liquidation_availability(
             return _blocked(reason_code="NOT_MANUAL_OPERATION", **common)
         if not manual_ats_runtime_selected_keys(state, now_dt=now_dt):
             return _blocked(reason_code="ATS_SESSION_NOT_SELECTED", **common)
-        if not manual_ats_active_now(config, state, now_dt):
-            return _blocked(reason_code="SESSION_NOT_ALLOWED", **common)
         if holding_qty <= 0:
             return _blocked(reason_code="NO_HOLDING", **common)
+        nxt_available = stock_nxt_availability(code)
+        if nxt_available is not True:
+            return _blocked(reason_code="NXT_NOT_AVAILABLE", **common)
+        if not manual_ats_active_now(
+            config,
+            state,
+            now_dt,
+            nxt_available=nxt_available,
+        ):
+            return _blocked(reason_code="SESSION_NOT_ALLOWED", **common)
         if not normalize_manual_ats_sell_method(requested_method):
             return _blocked(reason_code="INVALID_LIQUIDATION_METHOD", **common)
 

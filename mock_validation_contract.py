@@ -801,6 +801,12 @@ def validate_reference_snapshot(snapshot: Any) -> dict[str, Any]:
         raise MockValidationError("MOCK_STOCK_NAME_MISSING")
     if not clean_text(result.get("snapshot_created_at")):
         raise MockValidationError("MOCK_REFERENCE_TIMESTAMP_MISSING")
+    if "nxt_available" in result and result.get("nxt_available") not in {
+        True,
+        False,
+        None,
+    }:
+        raise MockValidationError("MOCK_NXT_AVAILABILITY_INVALID")
     instances = result.get("routine_instances")
     if not isinstance(instances, list) or not instances:
         raise MockValidationError("MOCK_ROUTINE_INSTANCES_MISSING")
