@@ -2895,7 +2895,11 @@ def auto_trade_start_selected_auto_trades(
             continue
 
         operation_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-        start_status = status_after_operation_mode_change(operation_mode, config)
+        start_status = status_after_operation_mode_change(
+            operation_mode,
+            config,
+            now_dt=request_now,
+        )
         mode_display = operation_mode_display(operation_mode)
         started_at = now_text()
         operation_policy = read_operation_policy()

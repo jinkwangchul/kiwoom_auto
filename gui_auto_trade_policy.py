@@ -361,8 +361,17 @@ def auto_trade_stock_operation_category(
     persisted_trade_started: bool,
     operation_excluded: bool,
     review_required: bool,
+    config: dict[str, object] | None = None,
+    state: dict[str, object] | None = None,
+    now_dt: datetime | None = None,
 ) -> str:
-    """Project one registered stock into the current operator-facing category."""
+    """Project one registered stock into the current operator-facing category.
+
+    waiting is reserved for nonparticipants that still have a current or future
+    effective Program/Exchange session in which they can explicitly re-enter.
+    Once the last effective session has ended, the nonparticipant is terminal
+    for the trading day and is projected as ended instead.
+    """
 
     if review_required:
         return "review"
@@ -374,6 +383,18 @@ def auto_trade_stock_operation_category(
         stock_code,
     ):
         return "operation"
+
+    if isinstance(config, dict):
+        try:
+            phase = auto_trade_operation_session_phase(
+                config,
+                state if isinstance(state, dict) else {},
+                now_dt=now_dt,
+            )
+        except Exception:
+            phase = {}
+        if phase.get("evaluable") is True and phase.get("final_session_ended") is True:
+            return "ended"
     return "waiting"
 
 
@@ -458,7 +479,7 @@ def auto_trade_setting_row_projection(
     runtime_state = state if isinstance(state, dict) else {}
     stock_config = config if isinstance(config, dict) else {}
     category = str(operation_category or "waiting").strip().lower() or "waiting"
-    inactive_bucket = category in {"waiting", "review", "excluded"}
+    inactive_bucket = category in {"waiting", "ended", "review", "excluded"}
     session_phase = auto_trade_operation_session_phase(
         stock_config,
         runtime_state,
@@ -478,7 +499,9 @@ def auto_trade_setting_row_projection(
     normal_operation = False
 
     if inactive_bucket:
-        display_status = auto_trade_setting_display_status("감시/대기")
+        display_status = auto_trade_setting_display_status(
+            "운영종료" if category == "ended" else "감시/대기"
+        )
     else:
         display_status = auto_trade_setting_display_status_for_current_session(
             runtime_state,
@@ -517,18 +540,29 @@ def auto_trade_setting_row_projection(
             between_sessions = phase_name == "BETWEEN_SESSIONS"
             if projection_phase == "ACTIVE_SESSION":
                 display_status = auto_trade_setting_display_status("매수/매도")
+            elif projection_phase == "FINAL_END":
+                display_status = auto_trade_setting_display_status("운영종료")
             elif projection_phase in {
                 "PRE_OPERATION_BOUNDARY",
                 "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
                 "INTER_SESSION_NON_TRADING_GAP",
-                "FINAL_END",
             }:
                 display_status = auto_trade_setting_display_status("감시/대기")
 
-    method_text = "루틴" if inactive_bucket else auto_trade_setting_method_text(
-        display_status,
-        stock_config,
-        runtime_state,
+    terminal_projection = bool(
+        category == "ended"
+        or (normal_operation and projection_phase == "FINAL_END")
+    )
+    method_text = (
+        "-"
+        if terminal_projection
+        else "루틴"
+        if inactive_bucket
+        else auto_trade_setting_method_text(
+            display_status,
+            stock_config,
+            runtime_state,
+        )
     )
     ats_method_active = bool(
         not inactive_bucket

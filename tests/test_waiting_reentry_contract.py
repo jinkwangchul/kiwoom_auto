@@ -230,6 +230,109 @@ class WaitingReentryContractTest(unittest.TestCase):
         self.assertFalse(blocked["allowed"])
         self.assertEqual("FINAL_SESSION_ENDED", blocked["reason"])
 
+    def test_waiting_category_exists_only_while_reentry_horizon_remains(self):
+        scheduled = {
+            "operation_mode": "SCHEDULED",
+            "start_time": "09:00:00",
+            "end_buy_time": "13:30:00",
+        }
+        state = {
+            "status": "EARLY_CLOSED",
+            "trade_enabled": True,
+            "trade_started_at": "2026-09-19 09:00:00",
+            "early_close_requested_at": "2026-09-19 10:00:00",
+            "early_close_source": "OPERATOR",
+            "operation_notice": "EARLY_CLOSE_COMPLETED",
+        }
+        local_policy = dict(self.policy)
+        local_policy["scheduled_operation"] = {
+            "default_start_time": "09:00:00",
+            "default_end_buy_time": "13:30:00",
+        }
+
+        with (
+            patch.object(ats_utils, "read_operation_policy", return_value=local_policy),
+            patch.object(policy, "read_operation_policy", return_value=local_policy),
+        ):
+            waiting_category = policy.auto_trade_stock_operation_category(
+                self.window,
+                stock_code="005930",
+                persisted_trade_started=True,
+                operation_excluded=False,
+                review_required=False,
+                config=scheduled,
+                state=state,
+                now_dt=datetime(2026, 9, 19, 11, 0, 0),
+            )
+            waiting_projection = policy.auto_trade_setting_row_projection(
+                state,
+                scheduled,
+                operation_category=waiting_category,
+                holding_qty=0,
+                current_session_trade_started=False,
+                persisted_trade_started=True,
+                now_dt=datetime(2026, 9, 19, 11, 0, 0),
+            )
+            ended_category = policy.auto_trade_stock_operation_category(
+                self.window,
+                stock_code="005930",
+                persisted_trade_started=True,
+                operation_excluded=False,
+                review_required=False,
+                config=scheduled,
+                state=state,
+                now_dt=datetime(2026, 9, 19, 13, 30, 0),
+            )
+            ended_projection = policy.auto_trade_setting_row_projection(
+                state,
+                scheduled,
+                operation_category=ended_category,
+                holding_qty=0,
+                current_session_trade_started=False,
+                persisted_trade_started=True,
+                now_dt=datetime(2026, 9, 19, 13, 30, 0),
+            )
+
+        self.assertEqual("waiting", waiting_category)
+        self.assertEqual("감시/대기", waiting_projection["display_status"])
+        self.assertEqual("ended", ended_category)
+        self.assertEqual("운영종료", ended_projection["display_status"])
+        self.assertEqual("-", ended_projection["method_text"])
+
+    def test_manual_ats_gap_is_waiting_but_last_effective_end_is_terminal(self):
+        config = {"operation_mode": "CONTINUOUS"}
+        state = {
+            "status": "WAIT_BUY",
+            "manual_ats_selection": {"selected_sessions": ["extra2"]},
+        }
+        with (
+            patch.object(ats_utils, "read_operation_policy", return_value=self.policy),
+            patch.object(policy, "read_operation_policy", return_value=self.policy),
+        ):
+            gap = policy.auto_trade_stock_operation_category(
+                self.window,
+                stock_code="005930",
+                persisted_trade_started=False,
+                operation_excluded=False,
+                review_required=False,
+                config=config,
+                state=state,
+                now_dt=datetime(2026, 9, 19, 15, 30, 0),
+            )
+            final = policy.auto_trade_stock_operation_category(
+                self.window,
+                stock_code="005930",
+                persisted_trade_started=False,
+                operation_excluded=False,
+                review_required=False,
+                config=config,
+                state=state,
+                now_dt=datetime(2026, 9, 19, 19, 50, 0),
+            )
+
+        self.assertEqual("waiting", gap)
+        self.assertEqual("ended", final)
+
     def test_early_closed_waiting_stock_can_reenter_before_scheduled_close_boundary(self):
         config = {
             "operation_mode": "SCHEDULED",
@@ -552,6 +655,13 @@ class MockWaitingReentryHostContractTest(unittest.TestCase):
                 completed_early_close,
             )["document"]
             self.assertTrue(host._instance_lifecycle_start_available(current, "A"))
+            from mock_validation_ui_projection import mock_instance_projection
+            waiting_projection = mock_instance_projection(
+                current,
+                "A",
+                as_of=datetime(2026, 9, 19, 11, 0, 0),
+            )
+            self.assertEqual("감시/대기", waiting_projection["display_status"])
 
             active_admission = host._instance_start_admission(
                 current,
@@ -578,6 +688,12 @@ class MockWaitingReentryHostContractTest(unittest.TestCase):
                 terminal_execution,
             )["document"]
             self.assertFalse(host._instance_lifecycle_start_available(terminal, "A"))
+            terminal_projection = mock_instance_projection(
+                terminal,
+                "A",
+                as_of=datetime(2026, 9, 19, 13, 30, 0),
+            )
+            self.assertEqual("운영종료", terminal_projection["display_status"])
 
 
 class EarlyCloseParticipantRetirementTest(unittest.TestCase):

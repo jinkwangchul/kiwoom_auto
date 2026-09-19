@@ -815,6 +815,8 @@ def project_stock_operation_header_display(
             persisted_trade_started=trade_started,
             operation_excluded=operation_excluded,
             review_required=review_required,
+            config=config,
+            state=state,
         )
         row_projection = auto_trade_setting_row_projection(
             state,

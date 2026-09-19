@@ -138,7 +138,9 @@ def _mock_instance_display_status(
         return "검토종목", False, False, False, {}
 
     operation_state = clean_text(operation.get("state"))
-    if state in {"WAITING", "ENDED", "VALIDATION_STOPPED"}:
+    if state == "ENDED":
+        return "운영종료", False, False, False, {}
+    if state in {"WAITING", "VALIDATION_STOPPED"}:
         return "감시/대기", False, False, False, {}
     close_source = clean_text(operation.get("close_source")).upper()
     close_method = clean_text(operation.get("close_method")).upper()
@@ -164,10 +166,15 @@ def _mock_instance_display_status(
             "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
             "ACTIVE_SESSION",
         }
-        return (
-            "매수/매도"
+        display_status = (
+            "운영종료"
+            if projection_phase == "FINAL_END"
+            else "매수/매도"
             if activation.get("actual_trading_session_active") is True
-            else "감시/대기",
+            else "감시/대기"
+        )
+        return (
+            display_status,
             True,
             controls_active,
             False,

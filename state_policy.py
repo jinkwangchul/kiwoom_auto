@@ -20,6 +20,7 @@ OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 
 FINAL_AUTO_TRADE_DISPLAY_STATUSES = (
     "감시/대기",
+    "운영종료",
     "매수/매도",
     "자동마감",
     "감시/매도",  # 구버전 표시명 호환
@@ -68,6 +69,9 @@ _AUTO_TRADE_STATUS_DISPLAY_MAP = {
     "WAIT_BUY": "감시/대기",
     "WAIT_SELL": "감시/대기",
     "SCHEDULED": "감시/대기",
+    "ENDED": "운영종료",
+    "OPERATION_ENDED": "운영종료",
+    "FINAL_SESSION_ENDED": "운영종료",
     "STARTED": "매수/매도",
     "AUTO": "매수/매도",
     "TRADING": "매수/매도",
@@ -126,6 +130,7 @@ def canonical_auto_trade_status(raw_status: object) -> CanonicalAutoTradeStatus:
         )
     display_to_class = {
         "감시/대기": "NORMAL_OPERATION",
+        "운영종료": "TERMINAL",
         "매수/매도": "NORMAL_OPERATION",
         "자동마감": "CLOSE_OPERATION",
         "조기마감": "CLOSE_OPERATION",
@@ -223,6 +228,7 @@ def auto_trade_status_color(display_status: str) -> str:
     color_map = {
         # 최신 표시명
         "감시/대기": "#2563eb",
+        "운영종료": "#6B7280",
         "매수/매도": "#16a34a",
         "자동마감": "#7c3aed",
         "감시/매도": "#7c3aed",  # 구버전 표시명 호환
@@ -863,8 +869,13 @@ def operation_mode_recalculation_target_status(current_status: object) -> str | 
     return None
 
 
-def status_after_operation_mode_change(mode: str, config: dict[str, object]) -> str:
+def status_after_operation_mode_change(
+    mode: str,
+    config: dict[str, object],
+    now_dt: datetime | None = None,
+) -> str:
+    """Return the start/status policy from one captured operation clock."""
     normalized_mode = normalize_operation_mode(mode)
     if normalized_mode == "CONTINUOUS":
-        return manual_status_for_now(config=config)
-    return scheduled_status_for_now(config)
+        return manual_status_for_now(now_dt=now_dt, config=config)
+    return scheduled_status_for_now(config, now_dt)

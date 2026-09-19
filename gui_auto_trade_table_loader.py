@@ -361,6 +361,8 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 persisted_trade_started=trade_started,
                 operation_excluded=operation_excluded,
                 review_required=review_required,
+                config=config,
+                state=state,
             )
 
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
@@ -445,6 +447,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             if stock_status_filter == "normal" and operation_category not in {
                 "operation",
                 "waiting",
+                "ended",
             }:
                 continue
             if (

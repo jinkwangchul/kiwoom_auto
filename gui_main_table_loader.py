@@ -237,6 +237,7 @@ ROUTINE_ROW_MOCK_INSTANCE = "mock_instance"
 MAIN_STOCK_OPERATION_CATEGORY_LABELS = {
     "operation": "운영",
     "waiting": "대기",
+    "ended": "운영종료",
     "excluded": "제외",
     "review": "검토",
 }
@@ -698,6 +699,7 @@ def main_stock_operator_status(
     stock_state: dict[str, object] | None,
     operation_excluded: bool,
     review_required: bool,
+    stock_config: dict[str, object] | None = None,
 ) -> str:
     """Project one Stock into the same operator category used by Main badges."""
 
@@ -708,6 +710,8 @@ def main_stock_operator_status(
         persisted_trade_started=auto_trade_setting_trade_started(state),
         operation_excluded=bool(operation_excluded),
         review_required=bool(review_required),
+        config=stock_config if isinstance(stock_config, dict) else None,
+        state=state,
     )
     return MAIN_STOCK_OPERATION_CATEGORY_LABELS.get(category, "-")
 
@@ -1882,6 +1886,7 @@ def _instance_stock_counts(
                 "operation_or_stopped": 0,
                 "operation_running": 0,
                 "waiting": 0,
+                "ended": 0,
                 "normal": 0,
                 "excluded": 0,
                 "review": 0,
@@ -1902,6 +1907,8 @@ def _instance_stock_counts(
             persisted_trade_started=auto_trade_setting_trade_started(state),
             operation_excluded=operation_excluded,
             review_required=review_required,
+            config=stock.get("config") if isinstance(stock.get("config"), dict) else None,
+            state=state,
         )
         if category == "review":
             item["review"] += 1
@@ -1912,8 +1919,10 @@ def _instance_stock_counts(
             item["operation_or_stopped"] += 1
             if category == "operation":
                 item["operation_running"] += 1
-            else:
+            elif category == "waiting":
                 item["waiting"] += 1
+            elif category == "ended":
+                item["ended"] += 1
         if clean_scope == "all":
             include_stock_row = not review_required
         elif clean_scope == "excluded":
@@ -2034,6 +2043,7 @@ def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
                 "stock_dir_key": str(stock_dir),
                 "instance_id": instance_id,
                 "operation_excluded": is_operation_excluded(config),
+                "config": dict(config),
                 "code": str(stock.get("code", "") or "").strip(),
                 "name": str(stock.get("name", "") or "").strip(),
                 "enabled": bool(stock.get("enabled", True)),
@@ -2380,8 +2390,7 @@ def _update_main_routine_summary(
             )
             if valid_projection and projection_supplied
             else sum(
-                int(count.get("operation_running", 0) or 0)
-                + int(count.get("waiting", 0) or 0)
+                int(count.get("normal", 0) or 0)
                 for count in instance_counts.values()
             )
             if valid_projection
@@ -3136,6 +3145,8 @@ def _routine_tree_stock_display_values(
         persisted_trade_started=trade_started,
         operation_excluded=is_operation_excluded(config),
         review_required=review_inspection.review_required,
+        config=config,
+        state=state,
     )
     row_projection = auto_trade_setting_row_projection(
         state,
@@ -3301,6 +3312,8 @@ def _routine_tree_stock_display_snapshots(
         persisted_trade_started=trade_started,
         operation_excluded=is_operation_excluded(config),
         review_required=review_inspection.review_required,
+        config=config,
+        state=state,
     )
     row_projection = auto_trade_setting_row_projection(
         state,
@@ -3687,6 +3700,7 @@ def _routine_tree_stock_row(
         stock_state=stock_state,
         operation_excluded=is_operation_excluded(stock_config),
         review_required=review_inspection.review_required,
+        stock_config=stock_config,
     )
     current_price = main_stock_current_price(window, stock, stock_state)
     return {
@@ -4658,6 +4672,8 @@ def main_load_running_stock_table(window) -> None:
             persisted_trade_started=trade_started,
             operation_excluded=is_operation_excluded(config),
             review_required=False,
+            config=config,
+            state=state,
         )
         row_projection = auto_trade_setting_row_projection(
             state,
@@ -4677,6 +4693,7 @@ def main_load_running_stock_table(window) -> None:
             stock_state=state,
             operation_excluded=is_operation_excluded(config),
             review_required=review_inspection.review_required,
+            stock_config=config,
         )
 
         stock_metadata = stock_tooltip_metadata_by_code.get(

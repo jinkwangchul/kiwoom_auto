@@ -966,7 +966,7 @@ class OperationTimeBoundaryContractTest(unittest.TestCase):
             (datetime(2026, 8, 27, 15, 20, 0), "INTER_SESSION_NON_TRADING_GAP", "감시/대기", "루틴", False),
             (datetime(2026, 8, 27, 15, 39, 59), "INTER_SESSION_NON_TRADING_GAP", "감시/대기", "루틴", False),
             (datetime(2026, 8, 27, 15, 40, 0), "ACTIVE_SESSION", "매수/매도", "루틴", True),
-            (datetime(2026, 8, 27, 19, 50, 0), "FINAL_END", "감시/대기", "루틴", False),
+            (datetime(2026, 8, 27, 19, 50, 0), "FINAL_END", "운영종료", "-", False),
         )
         for now_dt, phase, status, method, method_active in cases:
             with self.subTest(now=now_dt.time()):
