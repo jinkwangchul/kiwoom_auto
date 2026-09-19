@@ -9,6 +9,11 @@ import json
 from typing import Any, Mapping
 
 from engines.condition_engine import parse_condition_expression
+from indicator_follow_signal_validation_execution import (
+    DEFAULT_VALIDATION_EXECUTION,
+    normalize_validation_execution_policy,
+    validation_virtual_fill_price,
+)
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
 )
@@ -255,7 +260,7 @@ def build_validation_average_price_context(
     candles: list[dict[str, Any]],
     prior_entries: list[Any],
 ) -> dict[str, Any]:
-    """Build a replay-local average from BUY signals after the previous SELL."""
+    """Build a replay-local average from BUY virtual fills after the previous SELL."""
     if (
         isinstance(evaluation_index, bool)
         or not isinstance(evaluation_index, int)
@@ -274,34 +279,28 @@ def build_validation_average_price_context(
         ):
             signals_by_index.setdefault(index, set()).add(signal)
 
-    running_closes: list[float] = []
+    running_fill_prices: list[float] = []
     running_indexes: list[int] = []
     average_series: list[float | None] = []
     contributor_series: list[list[int]] = []
     for index in range(evaluation_index + 1):
         average = (
-            sum(running_closes) / len(running_closes)
-            if running_closes
+            sum(running_fill_prices) / len(running_fill_prices)
+            if running_fill_prices
             else None
         )
         average_series.append(average)
         contributor_series.append(list(running_indexes))
         signals = signals_by_index.get(index, set())
         if "SELL" in signals:
-            running_closes.clear()
+            running_fill_prices.clear()
             running_indexes.clear()
             continue
         if "BUY" not in signals:
             continue
-        raw_close = candles[index].get("close")
-        if raw_close is None or isinstance(raw_close, bool):
-            continue
-        try:
-            close = float(raw_close)
-        except (TypeError, ValueError):
-            continue
-        if close > 0:
-            running_closes.append(close)
+        fill_price = validation_virtual_fill_price(candles[index])
+        if fill_price is not None:
+            running_fill_prices.append(fill_price)
             running_indexes.append(index)
 
     current_average = average_series[evaluation_index]
@@ -313,9 +312,82 @@ def build_validation_average_price_context(
             "evaluation_index": evaluation_index,
             "estimated_average_price": current_average,
             "contributing_buy_indexes": contributor_series[evaluation_index],
-            "average_source": "VALIDATION_BUY_EVALUATION_CLOSE_SEGMENT",
+            "average_source": "VALIDATION_BUY_OHLC4_VIRTUAL_FILL_SEGMENT",
         },
     }
+
+
+
+_VALIDATION_REPEAT_MODE_TOKENS = {
+    "회차기준": "ROUND",
+    "회차증가": "ROUND",
+    "예산기준": "BUDGET",
+    "금액증가": "BUDGET",
+    "능동매수": "ACTIVE_BUY",
+}
+_VALIDATION_DIRECTION_TOKENS = {
+    "상향": "UP",
+    "하향": "DOWN",
+    "상하": "BOTH",
+}
+_VALIDATION_COMPARE_TOKENS = {
+    "이상": ">=",
+    "이하": "<=",
+    "이내": "WITHIN",
+    "이탈": "OUTSIDE",
+}
+
+
+def _validation_token(value: Any, mapping: Mapping[str, str], default: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    upper = text.upper()
+    if upper in set(mapping.values()):
+        return upper
+    return mapping.get(text, default)
+
+
+def project_validation_execution_state(
+    ui_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project only the approved simplified Validation execution controls."""
+    if not isinstance(ui_state, Mapping):
+        raise TypeError("ui_state must be a mapping")
+    existing = ui_state.get("validation_execution")
+    if isinstance(existing, Mapping):
+        return normalize_validation_execution_policy(existing)
+
+    buy_ui = ui_state.get("buy_ui")
+    repeat = buy_ui.get("repeat") if isinstance(buy_ui, Mapping) else None
+    repeat = repeat if isinstance(repeat, Mapping) else {}
+    candidate = dict(DEFAULT_VALIDATION_EXECUTION)
+    candidate.update({
+        "repeat_mode": _validation_token(
+            repeat.get("detail_mode_combo"),
+            _VALIDATION_REPEAT_MODE_TOKENS,
+            "ROUND",
+        ),
+        "round_operator": _validation_token(
+            repeat.get("round_operator_combo"),
+            {"+": "ADD", "x": "MULTIPLY", "X": "MULTIPLY", "*": "MULTIPLY"},
+            "ADD",
+        ),
+        "round_budget_value": repeat.get("round_budget_line", 0.5),
+        "budget_ratio": repeat.get("budget_ratio_line", 0.5),
+        "active_direction": _validation_token(
+            repeat.get("active_direction_combo"),
+            _VALIDATION_DIRECTION_TOKENS,
+            "UP",
+        ),
+        "active_ratio": repeat.get("active_ratio_line", 0.45),
+        "active_compare": _validation_token(
+            repeat.get("active_compare_combo"),
+            _VALIDATION_COMPARE_TOKENS,
+            ">=",
+        ),
+    })
+    return normalize_validation_execution_policy(candidate)
 
 
 def project_signal_validation_ui_state(
@@ -367,6 +439,7 @@ def project_signal_validation_ui_state(
         },
         "buy_ui": {"signal_filter": safe_signal_filter},
         "sell_ui": {"signal_conditions": safe_conditions},
+        "validation_execution": project_validation_execution_state(state),
     }
 
 
@@ -377,6 +450,7 @@ def project_signal_validation_apply_ui_state(
     require_expression_aware_sell_price_selections(ui_state)
     require_resolved_buy_bollinger_sign_selection(dict(ui_state))
     projected = project_signal_validation_ui_state(ui_state)
+    projected.pop("validation_execution", None)
     signal_filter = projected.get("buy_ui", {}).get("signal_filter")
     if isinstance(signal_filter, dict):
         signal_filter.pop("buy_composite", None)
@@ -402,6 +476,18 @@ def project_signal_validation_rules(
         require_expression_aware_sell_price_selections(ui_state)
         require_resolved_buy_bollinger_sign_selection(dict(ui_state))
     source_rules = _json_copy(rules)
+    source_buy = source_rules.get("buy") if isinstance(source_rules.get("buy"), dict) else {}
+    source_sell = source_rules.get("sell") if isinstance(source_rules.get("sell"), dict) else {}
+    validation_visualization_rules = {
+        "buy": {
+            "filters": deepcopy(source_buy.get("filters", {})),
+            "groups": deepcopy(source_buy.get("groups", [])),
+        },
+        "sell": {
+            "filters": deepcopy(source_sell.get("filters", {})),
+            "signals": _materialize_validation_sell_signals(source_rules),
+        },
+    }
     projected = _strip_dependent_conditions(source_rules)
 
     for key in ("buy_management", "order_policy", "cancel_policy"):
@@ -437,16 +523,22 @@ def project_signal_validation_rules(
             filters.pop("price_compare", None)
         sell["signals"] = _materialize_validation_sell_signals(source_rules)
 
+    projected["validation_visualization_rules"] = validation_visualization_rules
+
     if ui_state is None:
         root = projected.get("indicator_follow_ui_state")
         source_state = root.get("state") if isinstance(root, dict) else {}
     else:
         source_state = ui_state
+    projected_ui_state = project_signal_validation_ui_state(
+        source_state if isinstance(source_state, Mapping) else {}
+    )
+    projected["validation_execution"] = deepcopy(
+        projected_ui_state["validation_execution"]
+    )
     projected["indicator_follow_ui_state"] = {
         "ui_state_version": "0.1",
-        "state": project_signal_validation_ui_state(
-            source_state if isinstance(source_state, Mapping) else {}
-        ),
+        "state": projected_ui_state,
     }
     projected.pop("indicator_follow_rule_preview", None)
     return projected

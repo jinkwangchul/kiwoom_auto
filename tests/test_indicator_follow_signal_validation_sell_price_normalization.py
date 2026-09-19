@@ -253,7 +253,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual([payload], apply_payloads)
 
-    def test_new_sell_price_left_defaults_are_explicitly_unselected(self):
+    def test_new_sell_price_defaults_are_average_to_current_and_v2_can_run(self):
         class FreshDialog(IndicatorFollowRoutineSettingsDialog):
             def load_rules(self):
                 self.rules_data = {}
@@ -268,17 +268,41 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                 settings_mode="registration",
             )
         self.widgets.append(dialog)
-        for group_name, right_default in zip("abc", ("평단가", "현재가", "현재가")):
+        for group_name in "abc":
             left = getattr(dialog, f"sell_signal_condition_{group_name}_gap_left_combo")
             right = getattr(dialog, f"sell_signal_condition_{group_name}_gap_right_combo")
-            self.assertEqual(-1, left.currentIndex())
-            self.assertEqual("가격 기준 재선택 필요", left.placeholderText())
-            self.assertIn("기존값: -", left.toolTip())
-            self.assertEqual("", left.property(
-                "indicatorFollowUnresolvedSellPriceBasis"
-            ) or "")
-            self.assertEqual(right_default, right.currentText())
-            self.assertNotIn("주문가", [left.itemText(i) for i in range(left.count())])
+            self.assertEqual("평단가", left.currentText())
+            self.assertEqual("현재가", right.currentText())
+            self.assertFalse(left.property("indicatorFollowUnresolvedSellPriceBasis"))
+            for combo in (left, right):
+                self.assertNotIn(
+                    "주문가", [combo.itemText(i) for i in range(combo.count())]
+                )
+
+        fresh_state = dialog.collect_indicator_follow_ui_state()
+        self.assertEqual((), sell_price_selection_issues(fresh_state))
+        seed = IndicatorFollowSignalValidationSeed(
+            ValidationSettingsSnapshot(self.rules), fresh_state
+        )
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            window = IndicatorFollowSignalValidationWindow(self.stock, seed)
+        self.widgets.append(window)
+        for group_name in "abc":
+            self.assertEqual(
+                "평단가",
+                getattr(
+                    window,
+                    f"sell_signal_condition_{group_name}_gap_left_combo",
+                ).currentText(),
+            )
+            self.assertEqual(
+                "현재가",
+                getattr(
+                    window,
+                    f"sell_signal_condition_{group_name}_gap_right_combo",
+                ).currentText(),
+            )
+        self.assertIsNotNone(window.request_initial_validation())
 
     def test_v2_entry_only_ignores_reselection_warning_not_other_sell_errors(self):
         dialog, _path = self._dialog()
@@ -471,7 +495,14 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
 
     def test_estimated_return_aggregates_completed_sell_segments(self):
         candles = [
-            {"time": f"2026091409{index:02d}00", "close": close}
+            {
+                "time": f"2026091409{index:02d}00",
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1,
+            }
             for index, close in enumerate((100.0, 110.0, 120.0, 130.0, 140.0))
         ]
         entries = [

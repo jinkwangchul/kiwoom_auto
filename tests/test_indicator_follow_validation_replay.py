@@ -13,6 +13,7 @@ from unittest.mock import Mock
 from engines.condition_engine import parse_condition_expression
 from engines.signal_result import RoutineSignal
 from routines.지표추종매매 import routine_macd_engine
+from indicator_follow_signal_validation_execution import ValidationVirtualPositionTracker
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
 )
@@ -190,6 +191,79 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         self.assertEqual(3, dropped)
         self.assertEqual(original_rows, historical.to_rows())
 
+    def test_projection_excludes_only_the_current_forming_bucket(self) -> None:
+        historical = self._historical(
+            timeframe=5,
+            rows=[
+                {
+                    "체결시간": "20260918100000",
+                    "시가": "110",
+                    "고가": "115",
+                    "저가": "108",
+                    "현재가": "112",
+                    "거래량": "10",
+                },
+                {
+                    "체결시간": "20260918095500",
+                    "시가": "100",
+                    "고가": "111",
+                    "저가": "99",
+                    "현재가": "110",
+                    "거래량": "20",
+                },
+            ],
+        )
+
+        candles, dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 10, 3, 30),
+        )
+
+        self.assertEqual(["20260918095500"], [candle["time"] for candle in candles])
+        self.assertEqual(1, dropped)
+
+    def test_projection_keeps_latest_completed_bucket_when_current_bucket_has_no_row(self) -> None:
+        historical = self._historical(
+            timeframe=5,
+            rows=[{
+                "체결시간": "20260918095500",
+                "시가": "100",
+                "고가": "111",
+                "저가": "99",
+                "현재가": "110",
+                "거래량": "20",
+            }],
+        )
+
+        candles, dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 10, 3, 30),
+        )
+
+        self.assertEqual(["20260918095500"], [candle["time"] for candle in candles])
+        self.assertEqual(0, dropped)
+
+    def test_projection_keeps_last_regular_session_bucket_after_close(self) -> None:
+        historical = self._historical(
+            timeframe=240,
+            rows=[{
+                "체결시간": "20260918130000",
+                "시가": "100",
+                "고가": "111",
+                "저가": "99",
+                "현재가": "110",
+                "거래량": "20",
+            }],
+        )
+
+        candles, dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 15, 31, 0),
+        )
+
+        self.assertEqual(["20260918130000"], [candle["time"] for candle in candles])
+        self.assertEqual(0, dropped)
+
     def test_projection_excludes_missing_close_and_invalid_time(self) -> None:
         historical = self._historical(
             rows=[
@@ -265,6 +339,92 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         self.assertEqual("BUY", by_bar_side[(2, "BUY")].signal)
         self.assertEqual("SELL", by_bar_side[(3, "SELL")].signal)
         self.assertIsNone(by_bar_side[(4, "SELL")].signal)
+
+    def test_virtual_fill_price_does_not_move_close_only_signal_locations(self) -> None:
+        closes = (10.0, 11.0, 12.0, 13.0, 9.0)
+        baseline = self._historical(closes=closes)
+        varied_rows = []
+        for index, close in reversed(list(enumerate(closes))):
+            varied_rows.append({
+                "체결시간": f"2026091309{index:02d}00",
+                "시가": str(close * 0.9),
+                "고가": str(close * 1.4),
+                "저가": str(close * 0.8),
+                "현재가": str(close),
+                "거래량": str(100 + index),
+            })
+        varied = self._historical(rows=varied_rows)
+
+        baseline_result = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            baseline,
+            context_provider=build_validation_average_price_context,
+        )
+        varied_result = ValidationHistoricalReplay(self._session()).evaluate_with_context(
+            varied,
+            context_provider=build_validation_average_price_context,
+        )
+
+        self.assertTrue(baseline_result.ok, baseline_result)
+        self.assertTrue(varied_result.ok, varied_result)
+        fields = lambda entry: (
+            entry.evaluation_index,
+            entry.evaluation_side,
+            entry.signal,
+            entry.signal_index,
+            entry.delay_bar,
+        )
+        self.assertEqual(
+            [fields(entry) for entry in baseline_result.snapshot.to_entries()],
+            [fields(entry) for entry in varied_result.snapshot.to_entries()],
+        )
+
+    def test_incremental_virtual_position_context_is_weighted_before_next_sell_evaluation(self) -> None:
+        observed = []
+
+        def evaluator(candles, config, context):
+            side = context["_indicator_follow_evaluate_side"]
+            if side == "SELL":
+                observed.append((
+                    len(candles),
+                    context.get("average_price"),
+                    context.get("validation_trace_context", {}).get("position_quantity"),
+                ))
+                return self._none_signal()
+            if len(candles) <= 2:
+                return RoutineSignal(
+                    "BUY",
+                    "fixture buy",
+                    ["fixture"],
+                    [],
+                    len(candles) - 1,
+                    0,
+                )
+            return self._none_signal()
+
+        rows = []
+        for index, price in reversed(list(enumerate((100.0, 50.0, 70.0)))):
+            rows.append({
+                "체결시간": f"2026091309{index:02d}00",
+                "시가": str(price),
+                "고가": str(price),
+                "저가": str(price),
+                "현재가": str(price),
+                "거래량": "1",
+            })
+        tracker = ValidationVirtualPositionTracker({
+            "repeat_mode": "BUDGET",
+            "budget_ratio": 2.0,
+        })
+        result = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=evaluator,
+        ).evaluate_with_context(
+            self._historical(rows=rows),
+            context_provider=tracker,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual((3, 60.0, 5), observed[-1])
 
     def test_actual_evaluator_trace_contains_existing_three_levels(self) -> None:
         result = ValidationHistoricalReplay(self._session()).evaluate(

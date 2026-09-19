@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 import math
-from typing import Any
+from typing import Any, Mapping
 
 from PyQt5.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QFontMetrics, QPainter, QPen, QPolygonF
@@ -41,6 +41,10 @@ from PyQt5.QtWidgets import (
 from gui_indicator_follow_routine_settings_dialog import (
     IndicatorFollowRoutineSettingsDialog,
 )
+from indicator_follow_signal_validation_execution import (
+    simulate_validation_execution,
+    validation_virtual_fill_price,
+)
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRestorePayload,
@@ -49,11 +53,24 @@ from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
     build_signal_validation_snapshot,
     project_signal_validation_ui_state,
+    project_validation_execution_state,
     require_resolved_buy_bollinger_sign_selection,
     require_expression_aware_sell_price_selections,
 )
 from indicator_follow_signal_validation_presentation import (
     signal_evidence_tooltip,
+)
+from indicator_follow_signal_validation_visualization import (
+    FAMILY_MACD_SIGNAL,
+    FAMILY_OCR_OSC,
+    FAMILY_RSI,
+    LOWER_AXIS,
+    PRICE_AXIS,
+    ValidationFilterDescriptor,
+    ValidationIndicatorSeriesCache,
+    active_filter_identities_for_entry,
+    build_validation_filter_universe,
+    build_validation_indicator_cache,
 )
 from gui_toast import show_toast
 from routines.지표추종매매.routine_validation_contract import (
@@ -76,6 +93,24 @@ _BUY = QColor("#22c55e")
 _SELL = QColor("#f59e0b")
 _SELECTION = QColor(250, 204, 21, 45)
 _SELECTION_LINE = QColor("#fde047")
+_VISUAL_SERIES_COLORS = (
+    QColor("#f59e0b"),
+    QColor("#22d3ee"),
+    QColor("#a78bfa"),
+    QColor("#84cc16"),
+    QColor("#f472b6"),
+    QColor("#38bdf8"),
+    QColor("#facc15"),
+    QColor("#fb7185"),
+)
+_LOWER_SEPARATOR = QColor("#4b5563")
+_LOWER_LABEL = QColor("#9ca3af")
+_INACTIVE_SERIES = QColor(107, 114, 128, 105)
+_UNSUPPORTED_SERIES = QColor(75, 85, 99, 135)
+_ERROR_SERIES = QColor("#ef4444")
+_CROSSHAIR = QColor(203, 213, 225, 175)
+_CROSSHAIR_TEXT = QColor("#e5e7eb")
+_CROSSHAIR_BOX = QColor(17, 24, 39, 205)
 
 
 def _finite_number(value: Any) -> float | None:
@@ -382,6 +417,8 @@ class IndicatorFollowValidationCompletedCycle:
     sell_index: int
     sell_price: float
     estimated_return_percent: float
+    buy_quantity: int = 0
+    buy_cost: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,14 +455,19 @@ def aggregate_completed_cycle_return_percent(
     if not cycles:
         return None
     total_cost = sum(
-        cycle.average_buy_price * cycle.buy_count
+        cycle.buy_cost
+        if math.isfinite(cycle.buy_cost) and cycle.buy_cost > 0
+        else cycle.average_buy_price * cycle.buy_count
         for cycle in cycles
     )
     if not math.isfinite(total_cost) or total_cost <= 0:
         return None
     total_profit = sum(
-        cycle.average_buy_price
-        * cycle.buy_count
+        (
+            cycle.buy_cost
+            if math.isfinite(cycle.buy_cost) and cycle.buy_cost > 0
+            else cycle.average_buy_price * cycle.buy_count
+        )
         * cycle.estimated_return_percent
         / 100.0
         for cycle in cycles
@@ -483,7 +525,7 @@ def completed_validation_cycles(
             and 0 <= index < sell_index
         )
         average_buy = _valid_close(context.get("average_price"))
-        sell_price = _valid_close(candles[sell_index].get("close"))
+        sell_price = validation_virtual_fill_price(candles[sell_index])
         if not normalized_buy_indexes or average_buy is None or sell_price is None:
             continue
         estimated_return = (sell_price - average_buy) / average_buy * 100.0
@@ -501,6 +543,30 @@ def completed_validation_cycles(
             estimated_return_percent=estimated_return,
         ))
     return cycles
+
+
+def validation_execution_cycles(
+    candles: list[dict[str, Any]],
+    entries: list[ValidationReplayEntry],
+    execution_policy: dict[str, Any],
+) -> list[IndicatorFollowValidationCompletedCycle]:
+    simulation = simulate_validation_execution(candles, entries, execution_policy)
+    return [
+        IndicatorFollowValidationCompletedCycle(
+            cycle_number=cycle.cycle_number,
+            buy_indexes=cycle.buy_indexes,
+            buy_start_index=cycle.buy_start_index,
+            buy_end_index=cycle.buy_end_index,
+            buy_count=cycle.buy_count,
+            average_buy_price=cycle.average_buy_price,
+            sell_index=cycle.sell_index,
+            sell_price=cycle.sell_price,
+            estimated_return_percent=cycle.estimated_return_percent,
+            buy_quantity=cycle.buy_quantity,
+            buy_cost=cycle.buy_cost,
+        )
+        for cycle in simulation.cycles
+    ]
 
 
 def _parse_candle_time(value: Any) -> datetime | None:
@@ -652,22 +718,502 @@ def _validation_price_text(value: float) -> str:
 class IndicatorFollowSignalValidationChartCanvas(
     _IndicatorFollowSignalValidationChartCanvasBase
 ):
-    """V2 scroll canvas containing Candle, marker, grid, and real time labels."""
+    """V2 scroll canvas containing Candle, markers, and static filter series."""
 
     _LEFT = 12
     _CANDLE_HORIZONTAL_GAP = 2.0
+    _LOWER_TOTAL_HEIGHT = 180
+    _PRICE_TO_LOWER_GAP = 24
+    _LOWER_FAMILY_ORDER = (FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC)
 
-    def __init__(self, candles, markers, parent=None) -> None:
+    def __init__(
+        self,
+        candles,
+        markers,
+        parent=None,
+        *,
+        visualization_descriptors: tuple[ValidationFilterDescriptor, ...] = (),
+        visualization_cache: ValidationIndicatorSeriesCache | None = None,
+        visualization_active_by_marker: dict[tuple[int, str], tuple[str, ...]] | None = None,
+    ) -> None:
         super().__init__(candles, markers, parent)
         self._active_tooltip = ""
         self._price_minimum: float | None = None
         self._price_maximum: float | None = None
+        self._visualization_descriptors = tuple(visualization_descriptors)
+        self._visualization_cache = visualization_cache
+        self._visualization_active_by_marker = {
+            (int(index), str(side).strip().upper()): tuple(identities)
+            for (index, side), identities in (visualization_active_by_marker or {}).items()
+        }
+        self._hover_marker_key: tuple[int, str] | None = None
+        self._pinned_marker_key: tuple[int, str] | None = None
+        self._crosshair_hover_index: int | None = None
+        self._crosshair_pointer_y: float | None = None
+        self._lower_families = tuple(
+            family
+            for family in self._LOWER_FAMILY_ORDER
+            if any(
+                descriptor.axis == LOWER_AXIS and descriptor.family == family
+                for descriptor in self._visualization_descriptors
+            )
+        )
         self.setMouseTracking(True)
-        self.setMinimumHeight(0)
+        minimum_height = (
+            self._TOP
+            + self._BOTTOM
+            + self._PRICE_TO_LOWER_GAP
+            + self._LOWER_TOTAL_HEIGHT
+            + 80
+            if self._lower_families
+            else 0
+        )
+        self.setMinimumHeight(minimum_height)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def sizeHint(self) -> QSize:
-        return QSize(self._MIN_WIDTH, 160)
+        extra = (
+            self._PRICE_TO_LOWER_GAP + self._LOWER_TOTAL_HEIGHT
+            if self._lower_families
+            else 0
+        )
+        return QSize(self._MIN_WIDTH, 160 + extra)
+
+    @property
+    def indicator_total_height(self) -> int:
+        return self._LOWER_TOTAL_HEIGHT if self._lower_families else 0
+
+    @property
+    def lower_families(self) -> tuple[str, ...]:
+        return tuple(self._lower_families)
+
+    def _price_plot_bottom_margin(self) -> int:
+        if not self._lower_families:
+            return self._BOTTOM
+        return (
+            self._BOTTOM
+            + self._LOWER_TOTAL_HEIGHT
+            + self._PRICE_TO_LOWER_GAP
+        )
+
+    def lower_pane_records(self) -> list[dict[str, Any]]:
+        if not self._lower_families:
+            return []
+        area_top = self.height() - self._BOTTOM - self._LOWER_TOTAL_HEIGHT
+        pane_count = len(self._lower_families)
+        records = []
+        for index, family in enumerate(self._lower_families):
+            top = round(
+                area_top
+                + self._LOWER_TOTAL_HEIGHT * index / pane_count
+            )
+            bottom = round(
+                area_top
+                + self._LOWER_TOTAL_HEIGHT * (index + 1) / pane_count
+            )
+            records.append({
+                "family": family,
+                "top": top,
+                "bottom": bottom,
+                "height": bottom - top,
+                "descriptor_ids": tuple(
+                    descriptor.identity
+                    for descriptor in self._visualization_descriptors
+                    if descriptor.axis == LOWER_AXIS
+                    and descriptor.family == family
+                ),
+            })
+        return records
+
+    def _cached_values(
+        self,
+        descriptor: ValidationFilterDescriptor,
+        channel: str,
+    ) -> tuple[float | None, ...]:
+        cache = self._visualization_cache
+        if cache is None:
+            return ()
+        return cache.values_for(descriptor.identity, channel)
+
+    def _price_data_bounds(self) -> tuple[float | None, float | None]:
+        values = [
+            number
+            for candle in self._candles
+            for field in ("open", "high", "low", "close")
+            if (number := _finite_number(candle.get(field))) is not None
+        ]
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != PRICE_AXIS:
+                continue
+            for channel in descriptor.series_keys:
+                for value in self._cached_values(descriptor, channel):
+                    number = _finite_number(value)
+                    if number is not None:
+                        values.append(number)
+        if not values:
+            return None, None
+        return min(values), max(values)
+
+    def _lower_scale(
+        self,
+        family: str,
+        top: int,
+        bottom: int,
+    ) -> _ValidationPriceScale | None:
+        values: list[float] = []
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != LOWER_AXIS or descriptor.family != family:
+                continue
+            for channel in descriptor.series_keys:
+                values.extend(
+                    number
+                    for value in self._cached_values(descriptor, channel)
+                    if (number := _finite_number(value)) is not None
+                )
+        if family == FAMILY_RSI:
+            minimum, maximum = 0.0, 100.0
+        else:
+            if not values:
+                return None
+            minimum = min(min(values), 0.0)
+            maximum = max(max(values), 0.0)
+            if maximum == minimum:
+                padding = max(abs(maximum) * 0.1, 1.0)
+                minimum -= padding
+                maximum += padding
+            else:
+                padding = (maximum - minimum) * 0.08
+                minimum -= padding
+                maximum += padding
+        plot_top = min(bottom - 2, top + 18)
+        plot_bottom = max(plot_top + 1, bottom - 8)
+        return _ValidationPriceScale(
+            minimum=minimum,
+            maximum=maximum,
+            plot_top=plot_top,
+            plot_bottom=plot_bottom,
+        )
+
+    @staticmethod
+    def _descriptor_caption(
+        descriptor: ValidationFilterDescriptor,
+    ) -> str:
+        parameters = descriptor.parameters
+        if descriptor.family == FAMILY_RSI:
+            return f"RSI({parameters.get('period', 14)})"
+        if descriptor.family in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
+            return (
+                f"{descriptor.label}("
+                f"{parameters.get('fast', 12)},"
+                f"{parameters.get('slow', 26)},"
+                f"{parameters.get('signal', 9)})"
+            )
+        periods = parameters.get("periods")
+        if isinstance(periods, (list, tuple)) and periods:
+            return f"{descriptor.label}({','.join(str(v) for v in periods)})"
+        if "period" in parameters:
+            return f"{descriptor.label}({parameters['period']})"
+        return descriptor.label
+
+    def _descriptor_display_state(
+        self,
+        descriptor: ValidationFilterDescriptor,
+    ) -> str:
+        states = [
+            self._series_state(descriptor, channel)
+            for channel in descriptor.series_keys
+        ]
+        for state in ("ERROR", "ACTIVE", "UNSUPPORTED", "INACTIVE", "NORMAL"):
+            if state in states:
+                return state
+        return "ERROR"
+
+    def _styled_descriptor_caption(
+        self,
+        descriptor: ValidationFilterDescriptor,
+    ) -> str:
+        caption = self._descriptor_caption(descriptor)
+        state = self._descriptor_display_state(descriptor)
+        if state == "ERROR":
+            return f"{caption} [오류]"
+        if state == "UNSUPPORTED":
+            return f"{caption} [미지원]"
+        return caption
+
+    @property
+    def hovered_marker_key(self) -> tuple[int, str] | None:
+        return self._hover_marker_key
+
+    @property
+    def pinned_marker_key(self) -> tuple[int, str] | None:
+        return self._pinned_marker_key
+
+    @property
+    def effective_marker_key(self) -> tuple[int, str] | None:
+        return self._pinned_marker_key or self._hover_marker_key
+
+    @property
+    def crosshair_index(self) -> int | None:
+        marker_key = self.effective_marker_key
+        if marker_key is not None:
+            return marker_key[0]
+        return self._crosshair_hover_index
+
+    def _set_crosshair_pointer(
+        self,
+        index: int | None,
+        y: float | None,
+    ) -> None:
+        if index is not None and (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(self._candles)
+        ):
+            index = None
+        resolved_y = _finite_number(y) if y is not None else None
+        if (
+            index == self._crosshair_hover_index
+            and resolved_y == self._crosshair_pointer_y
+        ):
+            return
+        self._crosshair_hover_index = index
+        self._crosshair_pointer_y = resolved_y
+        self.update()
+
+    def _horizontal_crosshair_record(self) -> dict[str, Any] | None:
+        y = self._crosshair_pointer_y
+        if y is None:
+            return None
+        scale = self.price_scale()
+        if scale is not None and scale.plot_top <= y <= scale.plot_bottom:
+            return {
+                "pane": "PRICE",
+                "y": float(y),
+                "value": scale.price_for_y(y),
+            }
+        for pane in self.lower_pane_records():
+            top = int(pane["top"])
+            bottom = int(pane["bottom"])
+            if not top <= y <= bottom:
+                continue
+            lower_scale = self._lower_scale(
+                str(pane["family"]),
+                top,
+                bottom,
+            )
+            if lower_scale is None:
+                return {
+                    "pane": str(pane["family"]),
+                    "y": float(y),
+                    "value": None,
+                }
+            bounded_y = min(
+                lower_scale.plot_bottom,
+                max(lower_scale.plot_top, float(y)),
+            )
+            return {
+                "pane": str(pane["family"]),
+                "y": bounded_y,
+                "value": lower_scale.price_for_y(bounded_y),
+            }
+        return None
+
+    def crosshair_records(self) -> dict[str, Any]:
+        index = self.crosshair_index
+        visible = bool(
+            index is not None
+            and self._is_index_visible(index)
+        )
+        return {
+            "index": index,
+            "x": (
+                self._x_for_index(index)
+                if visible and index is not None
+                else None
+            ),
+            "visible": visible,
+            "pinned": self._pinned_marker_key is not None,
+            "horizontal": self._horizontal_crosshair_record(),
+        }
+
+    @staticmethod
+    def _crosshair_number_text(value: Any) -> str:
+        number = _finite_number(value)
+        if number is None:
+            return "-"
+        if abs(number) >= 1000:
+            return f"{number:,.2f}".rstrip("0").rstrip(".")
+        return f"{number:.4f}".rstrip("0").rstrip(".")
+
+    def crosshair_value_records(self) -> list[dict[str, Any]]:
+        index = self.crosshair_index
+        if index is None or not 0 <= index < len(self._candles):
+            return []
+        candle = self._candles[index]
+        records: list[dict[str, Any]] = [{
+            "kind": "CANDLE",
+            "label": "OHLC",
+            "state": "NORMAL",
+            "time": str(candle.get("time") or ""),
+            "open": _finite_number(candle.get("open")),
+            "high": _finite_number(candle.get("high")),
+            "low": _finite_number(candle.get("low")),
+            "close": _finite_number(candle.get("close")),
+        }]
+        for descriptor in self._visualization_descriptors:
+            for channel in descriptor.series_keys:
+                state = self._series_state(descriptor, channel)
+                values = self._cached_values(descriptor, channel)
+                value = (
+                    _finite_number(values[index])
+                    if len(values) == len(self._candles)
+                    else None
+                )
+                records.append({
+                    "kind": "FILTER",
+                    "identity": descriptor.identity,
+                    "family": descriptor.family,
+                    "label": self._descriptor_caption(descriptor),
+                    "channel": channel,
+                    "state": state,
+                    "value": value,
+                })
+        return records
+
+    def crosshair_value_lines(self) -> tuple[str, ...]:
+        records = self.crosshair_value_records()
+        if not records:
+            return ()
+        candle = records[0]
+        time_text = _display_time(candle.get("time"))
+        first = (
+            f"{time_text}  "
+            f"O {self._crosshair_number_text(candle.get('open'))}  "
+            f"H {self._crosshair_number_text(candle.get('high'))}  "
+            f"L {self._crosshair_number_text(candle.get('low'))}  "
+            f"C {self._crosshair_number_text(candle.get('close'))}"
+        )
+        values: list[str] = []
+        for record in records[1:]:
+            state = str(record.get("state") or "")
+            channel = str(record.get("channel") or "")
+            if state == "UNSUPPORTED":
+                text = f"{channel} [미지원]"
+            elif state == "ERROR":
+                text = f"{channel} [오류]"
+            else:
+                text = (
+                    f"{channel} "
+                    f"{self._crosshair_number_text(record.get('value'))}"
+                )
+                if state == "ACTIVE":
+                    text += " [유효]"
+                elif state == "INACTIVE":
+                    text += " [비기여]"
+            if text not in values:
+                values.append(text)
+        return (first, "  |  ".join(values)) if values else (first,)
+
+    @staticmethod
+    def _marker_key(marker: Mapping[str, Any]) -> tuple[int, str] | None:
+        index = marker.get("evaluation_index")
+        side = str(marker.get("side") or "").strip().upper()
+        if (
+            isinstance(index, int)
+            and not isinstance(index, bool)
+            and side in {"BUY", "SELL"}
+        ):
+            return (index, side)
+        return None
+
+    def _marker_at(self, x: float, y: float) -> dict[str, Any] | None:
+        scale = self.price_scale()
+        plot_top = self._TOP if scale is None else scale.plot_top
+        plot_bottom = (
+            max(plot_top + 1, self.height() - self._price_plot_bottom_margin())
+            if scale is None
+            else scale.plot_bottom
+        )
+        for marker in reversed(self._markers):
+            key = self._marker_key(marker)
+            if key is None:
+                continue
+            index, side = key
+            if not 0 <= index < len(self._candles):
+                continue
+            if not self._is_index_visible(index):
+                continue
+            marker_y = plot_bottom + 12 if side == "BUY" else plot_top - 12
+            if abs(x - self._x_for_index(index)) <= 7 and abs(y - marker_y) <= 11:
+                return marker
+        return None
+
+    def _series_base_color(
+        self,
+        descriptor: ValidationFilterDescriptor,
+        channel: str,
+    ) -> QColor:
+        token = f"{descriptor.identity}|{channel}"
+        index = sum(ord(character) for character in token) % len(
+            _VISUAL_SERIES_COLORS
+        )
+        return QColor(_VISUAL_SERIES_COLORS[index])
+
+    def _series_state(
+        self,
+        descriptor: ValidationFilterDescriptor,
+        channel: str,
+    ) -> str:
+        values = self._cached_values(descriptor, channel)
+        if len(values) != len(self._candles):
+            return "ERROR"
+
+        marker_key = self.effective_marker_key
+        if marker_key is None:
+            return "NORMAL" if descriptor.supported else "UNSUPPORTED"
+
+        _index, side = marker_key
+        if side in descriptor.unsupported_sides:
+            return "UNSUPPORTED"
+        active = set(self._visualization_active_by_marker.get(marker_key, ()))
+        if descriptor.identity in active:
+            return "ACTIVE"
+        return "INACTIVE"
+
+    def _series_pen(
+        self,
+        descriptor: ValidationFilterDescriptor,
+        channel: str,
+    ) -> QPen:
+        state = self._series_state(descriptor, channel)
+        if state == "ACTIVE":
+            return QPen(self._series_base_color(descriptor, channel), 2)
+        if state == "NORMAL":
+            return QPen(self._series_base_color(descriptor, channel), 1)
+        if state == "INACTIVE":
+            return QPen(_INACTIVE_SERIES, 1)
+        if state == "UNSUPPORTED":
+            return QPen(_UNSUPPORTED_SERIES, 1, Qt.DashLine)
+        return QPen(_ERROR_SERIES, 1, Qt.DotLine)
+
+    def visualization_style_records(self) -> list[dict[str, Any]]:
+        marker_key = self.effective_marker_key
+        records = []
+        for descriptor in self._visualization_descriptors:
+            for channel in descriptor.series_keys:
+                pen = self._series_pen(descriptor, channel)
+                records.append({
+                    "identity": descriptor.identity,
+                    "family": descriptor.family,
+                    "channel": channel,
+                    "state": self._series_state(descriptor, channel),
+                    "marker_key": marker_key,
+                    "pen_width": pen.width(),
+                    "pen_style": int(pen.style()),
+                    "color": pen.color().name(),
+                    "alpha": pen.color().alpha(),
+                })
+        return records
 
     def _candle_body_width(self) -> float:
         slot_width = self.pixels_per_candle
@@ -694,13 +1240,17 @@ class IndicatorFollowSignalValidationChartCanvas(
         return _validation_price_text(value)
 
     def price_scale(self) -> _ValidationPriceScale | None:
+        minimum = self._price_minimum
+        maximum = self._price_maximum
+        if minimum is None or maximum is None:
+            minimum, maximum = self._price_data_bounds()
         return _validation_price_scale(
             self._candles,
             self.height(),
             plot_top=self._TOP,
-            plot_bottom_margin=self._BOTTOM,
-            minimum=self._price_minimum,
-            maximum=self._price_maximum,
+            plot_bottom_margin=self._price_plot_bottom_margin(),
+            minimum=minimum,
+            maximum=maximum,
         )
 
     def set_price_view(self, minimum: float, maximum: float) -> None:
@@ -721,26 +1271,8 @@ class IndicatorFollowSignalValidationChartCanvas(
         return [] if scale is None else scale.tick_records()
 
     def marker_tooltip_at(self, x: float, y: float) -> str:
-        scale = self.price_scale()
-        plot_top = self._TOP if scale is None else scale.plot_top
-        plot_bottom = (
-            max(plot_top + 1, self.height() - self._BOTTOM)
-            if scale is None
-            else scale.plot_bottom
-        )
-        for marker in reversed(self._markers):
-            index = marker.get("evaluation_index")
-            side = marker.get("side")
-            if isinstance(index, bool) or not isinstance(index, int):
-                continue
-            if not 0 <= index < len(self._candles):
-                continue
-            if not self._is_index_visible(index):
-                continue
-            marker_y = plot_bottom + 12 if side == "BUY" else plot_top - 12
-            if abs(x - self._x_for_index(index)) <= 7 and abs(y - marker_y) <= 11:
-                return str(marker.get("tooltip") or "")
-        return ""
+        marker = self._marker_at(x, y)
+        return "" if marker is None else str(marker.get("tooltip") or "")
 
     def candle_tooltip_at(self, x: float, y: float) -> str:
         scale = self.price_scale()
@@ -775,6 +1307,56 @@ class IndicatorFollowSignalValidationChartCanvas(
             f"종가: {value('close')}",
         ))
 
+    def _set_hover_marker_key(
+        self,
+        marker_key: tuple[int, str] | None,
+    ) -> None:
+        if marker_key == self._hover_marker_key:
+            return
+        self._hover_marker_key = marker_key
+        self.update()
+
+    def clear_evidence_pin(self) -> None:
+        if self._pinned_marker_key is None:
+            return
+        self._pinned_marker_key = None
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._drag_press_x is not None:
+            was_drag = self._time_scale_drag_active
+            self._clear_time_scale_drag()
+            if not was_drag:
+                marker = self._marker_at(
+                    float(event.pos().x()),
+                    float(event.pos().y()),
+                )
+                if marker is not None:
+                    marker_key = self._marker_key(marker)
+                    if marker_key is not None:
+                        self._pinned_marker_key = marker_key
+                        self._hover_marker_key = marker_key
+                        self._crosshair_hover_index = marker_key[0]
+                        self._crosshair_pointer_y = float(event.pos().y())
+                        index = marker_key[0]
+                        self.set_selected_index(index)
+                        self.bar_selected.emit(index)
+                        self.update()
+                else:
+                    self._set_hover_marker_key(None)
+                    self.clear_evidence_pin()
+                    index = self._nearest_candle_index(event.pos().x())
+                    self._set_crosshair_pointer(
+                        index,
+                        float(event.pos().y()),
+                    )
+                    if index is not None:
+                        self.set_selected_index(index)
+                        self.bar_selected.emit(index)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
         if self._drag_press_x is not None:
             drag_dx = float(event.pos().x()) - self._drag_press_x
@@ -797,9 +1379,24 @@ class IndicatorFollowSignalValidationChartCanvas(
                     self._drag_anchor_index,
                     self._drag_anchor_ratio,
                 )
+                self._set_hover_marker_key(None)
+                self._set_crosshair_pointer(None, None)
                 event.accept()
                 return
-        tooltip = self.marker_tooltip_at(event.pos().x(), event.pos().y())
+        pointer_x = float(event.pos().x())
+        pointer_y = float(event.pos().y())
+        snapped_index = self._nearest_candle_index(pointer_x)
+        self._set_crosshair_pointer(snapped_index, pointer_y)
+        marker = self._marker_at(
+            pointer_x,
+            pointer_y,
+        )
+        marker_key = None if marker is None else self._marker_key(marker)
+        self._set_hover_marker_key(marker_key)
+        tooltip = self.marker_tooltip_at(
+            float(event.pos().x()),
+            float(event.pos().y()),
+        )
         if not tooltip:
             tooltip = self.candle_tooltip_at(event.pos().x(), event.pos().y())
         if tooltip:
@@ -812,17 +1409,328 @@ class IndicatorFollowSignalValidationChartCanvas(
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self._set_hover_marker_key(None)
+        self._set_crosshair_pointer(None, None)
         self.clear_marker_tooltip()
         super().leaveEvent(event)
 
     def hideEvent(self, event) -> None:
         self._clear_time_scale_drag()
+        self._set_hover_marker_key(None)
+        self._set_crosshair_pointer(None, None)
         self.clear_marker_tooltip()
         super().hideEvent(event)
 
     def clear_marker_tooltip(self) -> None:
         self._active_tooltip = ""
         QToolTip.hideText()
+
+    def visualization_series_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for descriptor in self._visualization_descriptors:
+            for channel in descriptor.series_keys:
+                values = self._cached_values(descriptor, channel)
+                if len(values) != len(self._candles):
+                    continue
+                records.append({
+                    "identity": descriptor.identity,
+                    "family": descriptor.family,
+                    "axis": descriptor.axis,
+                    "channel": channel,
+                    "caption": self._descriptor_caption(descriptor),
+                    "value_count": len(values),
+                })
+        return records
+
+    def _draw_series_line(
+        self,
+        painter: QPainter,
+        values: tuple[float | None, ...],
+        scale: _ValidationPriceScale,
+        pen: QPen,
+    ) -> None:
+        visible_start, visible_end = self._visible_index_bounds()
+        previous: QPointF | None = None
+        painter.setPen(pen)
+        for index in range(visible_start, visible_end):
+            if index >= len(values):
+                break
+            value = _finite_number(values[index])
+            if value is None:
+                previous = None
+                continue
+            point = QPointF(
+                self._x_for_index(index),
+                scale.y_for_price(value),
+            )
+            if previous is not None:
+                painter.drawLine(previous, point)
+            previous = point
+
+    def _combined_series_pen(
+        self,
+        descriptors: list[ValidationFilterDescriptor],
+        channel: str,
+    ) -> QPen:
+        states = [
+            self._series_state(descriptor, channel)
+            for descriptor in descriptors
+        ]
+        if "ACTIVE" in states:
+            owner = next(
+                descriptor
+                for descriptor in descriptors
+                if self._series_state(descriptor, channel) == "ACTIVE"
+            )
+            return QPen(self._series_base_color(owner, channel), 2)
+        if "ERROR" in states:
+            return QPen(_ERROR_SERIES, 1, Qt.DotLine)
+        if "NORMAL" in states:
+            owner = next(
+                descriptor
+                for descriptor in descriptors
+                if self._series_state(descriptor, channel) == "NORMAL"
+            )
+            return QPen(self._series_base_color(owner, channel), 1)
+        if "INACTIVE" in states:
+            return QPen(_INACTIVE_SERIES, 1)
+        return QPen(_UNSUPPORTED_SERIES, 1, Qt.DashLine)
+
+    def _draw_price_overlays(
+        self,
+        painter: QPainter,
+        scale: _ValidationPriceScale,
+    ) -> None:
+        painter.save()
+        painter.setClipRect(QRectF(
+            self.plot_left,
+            scale.plot_top,
+            max(1, self.width() - self._RIGHT - self.plot_left),
+            max(1, scale.plot_bottom - scale.plot_top),
+        ))
+        grouped: dict[
+            tuple[str, tuple[float | None, ...]],
+            list[ValidationFilterDescriptor],
+        ] = {}
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != PRICE_AXIS:
+                continue
+            for channel in descriptor.series_keys:
+                values = self._cached_values(descriptor, channel)
+                if len(values) != len(self._candles):
+                    continue
+                grouped.setdefault((channel, values), []).append(descriptor)
+        for (channel, values), owners in grouped.items():
+            self._draw_series_line(
+                painter,
+                values,
+                scale,
+                self._combined_series_pen(owners, channel),
+            )
+        painter.restore()
+
+    def _draw_price_overlay_legend(
+        self,
+        painter: QPainter,
+        scale: _ValidationPriceScale,
+    ) -> None:
+        captions: list[str] = []
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != PRICE_AXIS:
+                continue
+            caption = self._styled_descriptor_caption(descriptor)
+            if caption not in captions:
+                captions.append(caption)
+        if not captions:
+            return
+        metrics = QFontMetrics(painter.font())
+        available = max(1, int(self._plot_width()) - 8)
+        text = metrics.elidedText(
+            "  |  ".join(captions),
+            Qt.ElideRight,
+            available,
+        )
+        painter.setPen(_LOWER_LABEL)
+        painter.drawText(
+            QRectF(
+                self.plot_left + 4,
+                scale.plot_top + 2,
+                available,
+                metrics.height() + 2,
+            ),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            text,
+        )
+
+    def _draw_lower_panes(self, painter: QPainter) -> None:
+        if not self._lower_families:
+            return
+        for pane in self.lower_pane_records():
+            family = pane["family"]
+            top = int(pane["top"])
+            bottom = int(pane["bottom"])
+            painter.setPen(QPen(_LOWER_SEPARATOR, 1))
+            painter.drawLine(
+                self.plot_left,
+                top,
+                self.width() - self._RIGHT,
+                top,
+            )
+            descriptors = [
+                descriptor
+                for descriptor in self._visualization_descriptors
+                if descriptor.axis == LOWER_AXIS
+                and descriptor.family == family
+            ]
+            caption = " / ".join(
+                self._styled_descriptor_caption(descriptor)
+                for descriptor in descriptors
+            )
+            painter.setPen(_LOWER_LABEL)
+            painter.drawText(
+                QRectF(
+                    self.plot_left + 4,
+                    top + 1,
+                    max(1, self._plot_width() - 8),
+                    16,
+                ),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                caption,
+            )
+            scale = self._lower_scale(family, top, bottom)
+            if scale is None:
+                continue
+            if family in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
+                zero_y = int(scale.y_for_price(0.0))
+                painter.setPen(QPen(_GRID, 1, Qt.DashLine))
+                painter.drawLine(
+                    self.plot_left,
+                    zero_y,
+                    self.width() - self._RIGHT,
+                    zero_y,
+                )
+            painter.save()
+            painter.setClipRect(QRectF(
+                self.plot_left,
+                scale.plot_top,
+                max(1, self.width() - self._RIGHT - self.plot_left),
+                max(1, scale.plot_bottom - scale.plot_top),
+            ))
+            grouped: dict[
+                tuple[str, tuple[float | None, ...]],
+                list[ValidationFilterDescriptor],
+            ] = {}
+            for descriptor in descriptors:
+                for channel in descriptor.series_keys:
+                    values = self._cached_values(descriptor, channel)
+                    if len(values) != len(self._candles):
+                        continue
+                    grouped.setdefault((channel, values), []).append(descriptor)
+            for (channel, values), owners in grouped.items():
+                self._draw_series_line(
+                    painter,
+                    values,
+                    scale,
+                    self._combined_series_pen(owners, channel),
+                )
+            painter.restore()
+
+    def _draw_crosshair(
+        self,
+        painter: QPainter,
+        price_scale: _ValidationPriceScale,
+    ) -> None:
+        record = self.crosshair_records()
+        if not record.get("visible"):
+            return
+        x = record.get("x")
+        if x is None:
+            return
+
+        vertical_bottom = (
+            self.height() - self._BOTTOM
+            if self._lower_families
+            else price_scale.plot_bottom
+        )
+        painter.setPen(QPen(_CROSSHAIR, 1, Qt.DashLine))
+        painter.drawLine(
+            QPointF(float(x), float(price_scale.plot_top)),
+            QPointF(float(x), float(vertical_bottom)),
+        )
+
+        horizontal = record.get("horizontal")
+        if isinstance(horizontal, Mapping):
+            horizontal_y = _finite_number(horizontal.get("y"))
+            if horizontal_y is not None:
+                painter.drawLine(
+                    QPointF(float(self.plot_left), horizontal_y),
+                    QPointF(float(self.width() - self._RIGHT), horizontal_y),
+                )
+                value_text = self._crosshair_number_text(
+                    horizontal.get("value")
+                )
+                if value_text != "-":
+                    metrics = QFontMetrics(painter.font())
+                    label_width = metrics.horizontalAdvance(value_text) + 10
+                    label_height = metrics.height() + 4
+                    label_left = max(
+                        self.plot_left,
+                        self.width() - self._RIGHT - label_width,
+                    )
+                    painter.fillRect(
+                        QRectF(
+                            label_left,
+                            horizontal_y - label_height / 2,
+                            label_width,
+                            label_height,
+                        ),
+                        QBrush(_CROSSHAIR_BOX),
+                    )
+                    painter.setPen(_CROSSHAIR_TEXT)
+                    painter.drawText(
+                        QRectF(
+                            label_left + 4,
+                            horizontal_y - label_height / 2,
+                            label_width - 8,
+                            label_height,
+                        ),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        value_text,
+                    )
+
+        lines = self.crosshair_value_lines()
+        if not lines:
+            return
+        font = painter.font()
+        font.setPointSize(max(7, font.pointSize() - 1))
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        box_left = self.plot_left + 4
+        box_top = price_scale.plot_top + 20
+        box_width = max(1, int(self._plot_width()) - 8)
+        line_height = metrics.height() + 2
+        box_height = line_height * len(lines) + 6
+        painter.fillRect(
+            QRectF(box_left, box_top, box_width, box_height),
+            QBrush(_CROSSHAIR_BOX),
+        )
+        painter.setPen(_CROSSHAIR_TEXT)
+        for line_index, line in enumerate(lines):
+            text = metrics.elidedText(
+                line,
+                Qt.ElideRight,
+                max(1, box_width - 8),
+            )
+            painter.drawText(
+                QRectF(
+                    box_left + 4,
+                    box_top + 3 + line_index * line_height,
+                    box_width - 8,
+                    line_height,
+                ),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                text,
+            )
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -859,6 +1767,8 @@ class IndicatorFollowSignalValidationChartCanvas(
             )
             painter.setPen(QPen(_SELECTION_LINE, 1))
             painter.drawLine(int(selected_x), 0, int(selected_x), self.height())
+
+        self._draw_price_overlays(painter, scale)
 
         visible_start, visible_end = self._visible_index_bounds()
         body_width = self._candle_body_width()
@@ -898,6 +1808,8 @@ class IndicatorFollowSignalValidationChartCanvas(
                 QBrush(color),
             )
 
+        self._draw_price_overlay_legend(painter, scale)
+
         for marker in self._markers:
             index = marker.get("evaluation_index")
             side = marker.get("side")
@@ -929,6 +1841,9 @@ class IndicatorFollowSignalValidationChartCanvas(
             painter.setPen(QPen(color, 1))
             painter.setBrush(QBrush(color))
             painter.drawPolygon(QPolygonF(points))
+
+        self._draw_lower_panes(painter)
+        self._draw_crosshair(painter, scale)
 
         time_axis_records = self.time_axis_records()
         if not time_axis_records:
@@ -1284,6 +2199,10 @@ class IndicatorFollowSignalValidationWindow(
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
         self._result_settings_snapshot: ValidationSettingsSnapshot | None = None
         self._signal_tooltips: dict[tuple[int, str], str] = {}
+        self._visualization_descriptors: tuple[ValidationFilterDescriptor, ...] = ()
+        self._visualization_cache: ValidationIndicatorSeriesCache | None = None
+        self._visualization_active_by_marker: dict[tuple[int, str], tuple[str, ...]] = {}
+        self._visualization_data_error = ""
         self._visible_start_index = 0.0
         self._visible_candle_span = 1.0
         self._time_scale_manually_adjusted = False
@@ -1467,6 +2386,109 @@ class IndicatorFollowSignalValidationWindow(
         self.result_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         root.addWidget(self.result_widget, 1)
 
+
+    def _build_validation_execution_controls(self) -> None:
+        group = QGroupBox("간이 평단관리 검증")
+        group.setObjectName("signalValidationExecutionBox")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        fixed_row = QHBoxLayout()
+        fixed_row.setSpacing(8)
+        fixed_row.addWidget(QLabel("매수 단일호가"))
+        fixed_row.addWidget(QLabel("|"))
+        fixed_row.addWidget(QLabel("첫 BUY 1주"))
+        fixed_row.addWidget(QLabel("|"))
+        fixed_row.addWidget(QLabel("매도 단일호가"))
+        fixed_row.addStretch(1)
+        layout.addLayout(fixed_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        mode_row.addWidget(QLabel("반복 평단관리"))
+        self.validation_repeat_mode_combo = QComboBox()
+        self.validation_repeat_mode_combo.addItems(
+            ["회차증가", "금액증가", "능동매수"]
+        )
+        self.validation_repeat_mode_combo.setFixedWidth(116)
+        mode_row.addWidget(self.validation_repeat_mode_combo)
+
+        self.validation_repeat_stack = QStackedWidget()
+        self.validation_repeat_stack.setFixedHeight(32)
+
+        round_widget = QWidget()
+        round_layout = QHBoxLayout(round_widget)
+        round_layout.setContentsMargins(0, 0, 0, 0)
+        round_layout.setSpacing(4)
+        self.validation_round_operator_combo = QComboBox()
+        self.validation_round_operator_combo.addItems(["+", "x"])
+        self.validation_round_operator_combo.setFixedWidth(54)
+        self.validation_round_budget_line = QLineEdit("0.5")
+        self.validation_round_budget_line.setFixedWidth(54)
+        round_layout.addWidget(QLabel("직전 매수회차"))
+        round_layout.addWidget(self.validation_round_operator_combo)
+        round_layout.addWidget(self.validation_round_budget_line)
+        round_layout.addWidget(QLabel("× 첫회차금액"))
+        round_layout.addStretch(1)
+        self.validation_repeat_stack.addWidget(round_widget)
+
+        budget_widget = QWidget()
+        budget_layout = QHBoxLayout(budget_widget)
+        budget_layout.setContentsMargins(0, 0, 0, 0)
+        budget_layout.setSpacing(4)
+        self.validation_budget_ratio_line = QLineEdit("0.5")
+        self.validation_budget_ratio_line.setFixedWidth(54)
+        budget_layout.addWidget(QLabel("직전 매수금액 ×"))
+        budget_layout.addWidget(self.validation_budget_ratio_line)
+        budget_layout.addStretch(1)
+        self.validation_repeat_stack.addWidget(budget_widget)
+
+        active_widget = QWidget()
+        active_layout = QHBoxLayout(active_widget)
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.setSpacing(4)
+        self.validation_active_direction_combo = QComboBox()
+        self.validation_active_direction_combo.addItems(["상향", "하향", "상하"])
+        self.validation_active_ratio_line = QLineEdit("0.45")
+        self.validation_active_ratio_line.setFixedWidth(54)
+        self.validation_active_compare_combo = QComboBox()
+        self.validation_active_compare_combo.addItems(["이상", "이하", "이내", "이탈"])
+        active_layout.addWidget(QLabel("평단"))
+        active_layout.addWidget(self.validation_active_direction_combo)
+        active_layout.addWidget(self.validation_active_ratio_line)
+        active_layout.addWidget(QLabel("%"))
+        active_layout.addWidget(self.validation_active_compare_combo)
+        active_layout.addStretch(1)
+        self.validation_repeat_stack.addWidget(active_widget)
+
+        mode_row.addWidget(self.validation_repeat_stack, 1)
+        layout.addLayout(mode_row)
+        self.validation_execution_box = group
+        buy_grid = self.buy_detail_widget.layout()
+        buy_grid.addWidget(group, 1, 0, 1, 3)
+
+        def sync_mode(*_args):
+            index = {
+                "회차증가": 0,
+                "금액증가": 1,
+                "능동매수": 2,
+            }.get(self.validation_repeat_mode_combo.currentText(), 0)
+            self.validation_repeat_stack.setCurrentIndex(index)
+
+        def sync_active_pair(*_args):
+            direction = self.validation_active_direction_combo.currentText()
+            compare = self.validation_active_compare_combo.currentText()
+            if direction == "상하" and compare not in {"이내", "이탈"}:
+                self.validation_active_compare_combo.setCurrentText("이내")
+            elif direction in {"상향", "하향"} and compare not in {"이상", "이하"}:
+                self.validation_active_compare_combo.setCurrentText("이상")
+
+        self.validation_repeat_mode_combo.currentTextChanged.connect(sync_mode)
+        self.validation_active_direction_combo.currentTextChanged.connect(sync_active_pair)
+        sync_mode()
+        sync_active_pair()
+
     def _build_signal_validation_control_tab(self) -> None:
         """Build the compact V2 shell while reusing only BUY/SELL signal builders."""
         self.control_tab = QWidget()
@@ -1595,6 +2617,7 @@ class IndicatorFollowSignalValidationWindow(
 
         buy_title = self._build_control_buy_section(page_layout)
         sell_title = self._build_control_sell_section(page_layout)
+        self._build_validation_execution_controls()
         self._normalize_v2_section_geometry()
         self._normalize_v2_header_internal_geometry()
         self._control_section_mode = "summary"
@@ -1850,6 +2873,88 @@ class IndicatorFollowSignalValidationWindow(
         self._price_scale_manually_adjusted = True
         canvas.set_price_view(minimum, maximum)
         self.fixed_price_axis.refresh_scale()
+
+
+    def _collect_validation_execution_state(self) -> dict[str, Any]:
+        repeat_mode = {
+            "회차증가": "ROUND",
+            "금액증가": "BUDGET",
+            "능동매수": "ACTIVE_BUY",
+        }.get(self.validation_repeat_mode_combo.currentText(), "ROUND")
+        round_operator = (
+            "MULTIPLY"
+            if self.validation_round_operator_combo.currentText().lower() == "x"
+            else "ADD"
+        )
+        active_direction = {
+            "상향": "UP",
+            "하향": "DOWN",
+            "상하": "BOTH",
+        }.get(self.validation_active_direction_combo.currentText(), "UP")
+        active_compare = {
+            "이상": ">=",
+            "이하": "<=",
+            "이내": "WITHIN",
+            "이탈": "OUTSIDE",
+        }.get(self.validation_active_compare_combo.currentText(), ">=")
+        return project_validation_execution_state({
+            "validation_execution": {
+                "repeat_mode": repeat_mode,
+                "round_operator": round_operator,
+                "round_budget_value": self.validation_round_budget_line.text(),
+                "budget_ratio": self.validation_budget_ratio_line.text(),
+                "active_direction": active_direction,
+                "active_ratio": self.validation_active_ratio_line.text(),
+                "active_compare": active_compare,
+            }
+        })
+
+    def collect_indicator_follow_ui_state(self):
+        state = super().collect_indicator_follow_ui_state()
+        if hasattr(self, "validation_repeat_mode_combo"):
+            state["validation_execution"] = self._collect_validation_execution_state()
+        return state
+
+    def _apply_projected_signal_validation_ui_state(self, projected):
+        result = super()._apply_projected_signal_validation_ui_state(projected)
+        execution = (
+            projected.get("validation_execution")
+            if isinstance(projected, dict)
+            else None
+        )
+        if not isinstance(execution, dict) or not hasattr(
+            self, "validation_repeat_mode_combo"
+        ):
+            return result
+        policy = project_validation_execution_state({
+            "validation_execution": execution
+        })
+        self.validation_repeat_mode_combo.setCurrentText({
+            "ROUND": "회차증가",
+            "BUDGET": "금액증가",
+            "ACTIVE_BUY": "능동매수",
+        }[policy["repeat_mode"]])
+        self.validation_round_operator_combo.setCurrentText(
+            "x" if policy["round_operator"] == "MULTIPLY" else "+"
+        )
+        self.validation_round_budget_line.setText(
+            str(policy["round_budget_value"])
+        )
+        self.validation_budget_ratio_line.setText(str(policy["budget_ratio"]))
+        self.validation_active_direction_combo.setCurrentText({
+            "UP": "상향",
+            "DOWN": "하향",
+            "BOTH": "상하",
+        }[policy["active_direction"]])
+        self.validation_active_compare_combo.setCurrentText({
+            ">=": "이상",
+            "<=": "이하",
+            "WITHIN": "이내",
+            "OUTSIDE": "이탈",
+        }[policy["active_compare"]])
+        self.validation_active_ratio_line.setText(str(policy["active_ratio"]))
+        result.setdefault("applied", []).append("validation_execution")
+        return result
 
     def load_rules(self) -> None:
         self.rules_data = self._signal_validation_seed.settings_snapshot.to_dict()
@@ -2457,6 +3562,10 @@ class IndicatorFollowSignalValidationWindow(
         self._current_price_maximum = None
         self._price_scale_manually_adjusted = False
         self._signal_tooltips = {}
+        self._visualization_descriptors = ()
+        self._visualization_cache = None
+        self._visualization_active_by_marker = {}
+        self._visualization_data_error = ""
         self._pending_result_settings_snapshot = None
         self._result_settings_snapshot = None
         old_canvas = self.chart_scroll_area.takeWidget()
@@ -2547,6 +3656,7 @@ class IndicatorFollowSignalValidationWindow(
             self._result_settings_snapshot = self._signal_validation_seed.settings_snapshot
         else:
             self._result_settings_snapshot = None
+        self._rebuild_visualization_data()
         self._signal_tooltips = self._build_signal_tooltips()
         markers = _marker_records(
             self._candles,
@@ -2570,7 +3680,13 @@ class IndicatorFollowSignalValidationWindow(
             max(0.0, visible_end - self._visible_candle_span + 1.0),
         )
         self._time_scale_manually_adjusted = False
-        self.canvas = IndicatorFollowSignalValidationChartCanvas(self._candles, markers)
+        self.canvas = IndicatorFollowSignalValidationChartCanvas(
+            self._candles,
+            markers,
+            visualization_descriptors=self._visualization_descriptors,
+            visualization_cache=self._visualization_cache,
+            visualization_active_by_marker=self._visualization_active_by_marker,
+        )
         initial_price_scale = self.canvas.price_scale()
         if initial_price_scale is None:
             self._default_price_minimum = None
@@ -2650,6 +3766,60 @@ class IndicatorFollowSignalValidationWindow(
         self._ensure_candle_visible(index)
         return True
 
+
+    def _rebuild_visualization_data(self) -> None:
+        self._visualization_descriptors = ()
+        self._visualization_cache = None
+        self._visualization_active_by_marker = {}
+        self._visualization_data_error = ""
+        snapshot = self._result_settings_snapshot
+        if not isinstance(snapshot, ValidationSettingsSnapshot):
+            return
+        try:
+            rules = snapshot.to_dict()
+            descriptors = build_validation_filter_universe(rules)
+            cache = build_validation_indicator_cache(
+                self._candles,
+                rules,
+                descriptors,
+                entries=self._entries,
+            )
+            active_by_marker = {}
+            for entry in self._entries:
+                if entry.signal != entry.evaluation_side:
+                    continue
+                active_by_marker[(
+                    entry.evaluation_index,
+                    entry.evaluation_side,
+                )] = active_filter_identities_for_entry(
+                    entry,
+                    rules,
+                    descriptors,
+                )
+            self._visualization_descriptors = descriptors
+            self._visualization_cache = cache
+            self._visualization_active_by_marker = active_by_marker
+        except Exception as exc:
+            self._visualization_data_error = str(exc)
+
+    @property
+    def visualization_descriptors(self) -> tuple[ValidationFilterDescriptor, ...]:
+        return tuple(self._visualization_descriptors)
+
+    @property
+    def visualization_cache(self) -> ValidationIndicatorSeriesCache | None:
+        return self._visualization_cache
+
+    def visualization_active_identities(
+        self,
+        evaluation_index: int,
+        side: str,
+    ) -> tuple[str, ...]:
+        return tuple(self._visualization_active_by_marker.get(
+            (evaluation_index, str(side or "").strip().upper()),
+            (),
+        ))
+
     def _build_signal_tooltips(self) -> dict[tuple[int, str], str]:
         snapshot = self._result_settings_snapshot
         if not isinstance(snapshot, ValidationSettingsSnapshot):
@@ -2701,10 +3871,27 @@ class IndicatorFollowSignalValidationWindow(
 
     def _populate_completed_cycles(self) -> None:
         QToolTip.hideText()
-        self._completed_cycles = completed_validation_cycles(
-            self._candles,
-            self._entries,
+        rules = (
+            self._result_settings_snapshot.to_dict()
+            if isinstance(self._result_settings_snapshot, ValidationSettingsSnapshot)
+            else {}
         )
+        execution_policy = (
+            rules.get("validation_execution")
+            if isinstance(rules, dict)
+            else None
+        )
+        if isinstance(execution_policy, dict):
+            self._completed_cycles = validation_execution_cycles(
+                self._candles,
+                self._entries,
+                execution_policy,
+            )
+        else:
+            self._completed_cycles = completed_validation_cycles(
+                self._candles,
+                self._entries,
+            )
         table = self.completed_cycle_table
         table.clearContents()
         table.setRowCount(len(self._completed_cycles))

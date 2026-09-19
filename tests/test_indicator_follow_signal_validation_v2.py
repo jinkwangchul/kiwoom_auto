@@ -469,6 +469,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         projected = project_signal_validation_rules(source, ui_state=seed.to_ui_state())
         self.assertNotIn("execution", projected["buy"])
         self.assertNotIn("price_compare", projected["buy"]["filters"])
+        self.assertIn(
+            "price_compare",
+            projected["validation_visualization_rules"]["buy"]["filters"],
+        )
         self.assertNotIn("method", projected["sell"])
         self.assertNotIn("profit_rate_sell", projected["sell"]["signals"])
         self.assertEqual({}, projected["sell"]["signals"])
@@ -499,6 +503,189 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.buy_signal_expr_line.setText("B and C")
         self.assertEqual(original_state, ui_state["basic"]["buy_signal_expr_line"])
         self.assertEqual("A or D", window._signal_validation_seed.to_ui_state()["basic"]["buy_signal_expr_line"])
+
+    def test_validation_execution_controls_are_v2_local_and_seeded_from_repeat(self):
+        ui_state = deepcopy(self.ui_state)
+        ui_state["buy_ui"]["repeat"].update({
+            "detail_mode_combo": "예산기준",
+            "budget_ratio_line": "2.5",
+            "round_operator_combo": "+",
+            "round_budget_line": "0.75",
+            "active_direction_combo": "상향",
+            "active_ratio_line": "1.25",
+            "active_compare_combo": "이상",
+        })
+        window = self._window(ui_state)
+
+        self.assertEqual("금액증가", window.validation_repeat_mode_combo.currentText())
+        self.assertEqual("2.5", window.validation_budget_ratio_line.text())
+        projected = window.collect_indicator_follow_ui_state()["validation_execution"]
+        self.assertEqual("BUDGET", projected["repeat_mode"])
+        self.assertEqual(2.5, projected["budget_ratio"])
+        self.assertEqual(1, projected["first_buy_quantity"])
+        self.assertEqual("SINGLE", projected["buy_hoga_mode"])
+        self.assertEqual("SINGLE", projected["sell_hoga_mode"])
+
+        apply_state = IndicatorFollowSignalValidationApplyPayload(
+            window.collect_indicator_follow_ui_state()
+        ).to_ui_state()
+        self.assertNotIn("validation_execution", apply_state)
+
+    def test_validation_execution_change_enters_run_snapshot_and_restore_returns_entry(self):
+        ui_state = deepcopy(self.ui_state)
+        ui_state["buy_ui"]["repeat"].update({
+            "detail_mode_combo": "예산기준",
+            "budget_ratio_line": "2.0",
+            "round_operator_combo": "+",
+            "round_budget_line": "0.5",
+            "active_direction_combo": "상향",
+            "active_ratio_line": "0.45",
+            "active_compare_combo": "이상",
+        })
+        window = self._window(ui_state)
+        entry = window.commit_entry_state()
+
+        window.validation_repeat_mode_combo.setCurrentText("능동매수")
+        window.validation_active_ratio_line.setText("10")
+        run_request = window._request_validation()
+        self.assertIsNotNone(run_request)
+        execution = run_request.settings_snapshot.to_dict()["validation_execution"]
+        self.assertEqual("ACTIVE_BUY", execution["repeat_mode"])
+        self.assertEqual(10.0, execution["active_ratio"])
+
+        result = window.restore_signal_validation_entry_ui_state(entry.to_ui_state())
+        self.assertIn("validation_execution", result["applied"])
+        self.assertEqual("금액증가", window.validation_repeat_mode_combo.currentText())
+        self.assertEqual("2.0", window.validation_budget_ratio_line.text())
+
+    def test_v2_completed_cycle_uses_virtual_quantity_weighted_average(self):
+        window = self._window()
+        rules = window._signal_validation_seed.settings_snapshot.to_dict()
+        rules["validation_execution"] = {
+            "repeat_mode": "BUDGET",
+            "budget_ratio": 2.0,
+            "round_operator": "ADD",
+            "round_budget_value": 0.5,
+            "active_direction": "UP",
+            "active_ratio": 0.45,
+            "active_compare": ">=",
+        }
+        settings = ValidationSettingsSnapshot(rules)
+        candles = [
+            {
+                "time": f"2026091114{index:02d}00",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 1,
+            }
+            for index, price in enumerate((100.0, 100.0, 120.0))
+        ]
+        entries = [
+            self._entry("BUY", 0, "BUY"),
+            self._entry("BUY", 1, "BUY"),
+            self._entry("SELL", 2, "SELL"),
+        ]
+        replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=settings.rules_hash,
+            historical_request_id="VALIDATION-EXECUTION-CYCLE",
+            evaluated_start_index=0,
+            evaluated_end_index=2,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=entries,
+        )
+        window._pending_result_settings_snapshot = settings
+        window.set_replay_snapshot(replay)
+
+        self.assertEqual(1, len(window.completed_cycles))
+        cycle = window.completed_cycles[0]
+        self.assertEqual(2, cycle.buy_count)
+        self.assertEqual(3, cycle.buy_quantity)
+        self.assertEqual(300.0, cycle.buy_cost)
+        self.assertEqual(100.0, cycle.average_buy_price)
+        self.assertEqual(120.0, cycle.sell_price)
+        self.assertAlmostEqual(20.0, cycle.estimated_return_percent)
+        self.assertTrue(window.estimated_return_label.text().endswith("+20.00%"))
+
+    def test_v2_prebuilds_visualization_data_without_paint_side_effects(self):
+        window = self._window()
+        rules = window._signal_validation_seed.settings_snapshot.to_dict()
+        rsi_condition = {
+            "enabled": True,
+            "target": "RSI",
+            "operator": "<=",
+            "value": 45,
+        }
+        rules.setdefault("indicators", {})["rsi"] = {"period": 14}
+        rules.setdefault("buy", {})["filters"] = {
+            "rsi": {
+                "enabled": True,
+                "conditions": [deepcopy(rsi_condition)],
+            },
+        }
+        rules["validation_visualization_rules"] = {
+            "buy": {
+                "filters": {
+                    "rsi": {
+                        "enabled": True,
+                        "conditions": [deepcopy(rsi_condition)],
+                    },
+                },
+                "groups": [],
+            },
+            "sell": {"filters": {}, "signals": {}},
+        }
+        settings = ValidationSettingsSnapshot(rules)
+        candles = [
+            {
+                "time": f"2026091114{index:02d}00",
+                "open": 100.0 + index,
+                "high": 101.0 + index,
+                "low": 99.0 + index,
+                "close": 100.0 + index,
+                "volume": 1,
+            }
+            for index in range(30)
+        ]
+        replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=settings.rules_hash,
+            historical_request_id="VISUALIZATION-DATA",
+            evaluated_start_index=0,
+            evaluated_end_index=29,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=[],
+        )
+        window._pending_result_settings_snapshot = settings
+        window.set_replay_snapshot(replay)
+
+        self.assertEqual("", window._visualization_data_error)
+        self.assertEqual(
+            ["RSI"],
+            [item.family for item in window.visualization_descriptors],
+        )
+        descriptor = window.visualization_descriptors[0]
+        self.assertEqual(
+            30,
+            len(window.visualization_cache.values_for(descriptor.identity, "RSI")),
+        )
+        self.assertEqual({}, window._visualization_active_by_marker)
+        self.assertIsNotNone(window.canvas)
+        self.assertEqual(180, window.canvas.indicator_total_height)
+        self.assertEqual(
+            ["RSI"],
+            [pane["family"] for pane in window.canvas.lower_pane_records()],
+        )
+        self.assertEqual(
+            {"RSI"},
+            {record["channel"] for record in window.canvas.visualization_series_records()},
+        )
 
     def test_v2_snapshot_runs_through_actual_historical_replay_evaluator(self):
         window = self._window()

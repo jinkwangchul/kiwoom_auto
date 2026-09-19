@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import math
 from typing import Any, Callable
 
+from candle_timeframe_aggregation import MARKET_BUCKET_ANCHOR, SEOUL_TIMEZONE
 from engines.signal_result import RoutineSignal
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
@@ -74,10 +75,53 @@ def _normalized_time(value: Any) -> str | None:
     return text
 
 
+_VALIDATION_REGULAR_SESSION_END_MINUTE = 15 * 60 + 30
+
+
+def _latest_candle_is_forming(
+    candle_time: str,
+    timeframe_minutes: int,
+    *,
+    as_of: datetime | None = None,
+) -> bool:
+    """Return True only when the latest row is the current Seoul-time bucket."""
+    try:
+        candle_start = datetime.strptime(candle_time, "%Y%m%d%H%M%S").replace(
+            tzinfo=SEOUL_TIMEZONE
+        )
+    except ValueError:
+        return False
+    current = as_of or datetime.now(SEOUL_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SEOUL_TIMEZONE)
+    else:
+        current = current.astimezone(SEOUL_TIMEZONE)
+    if candle_start.date() != current.date():
+        return False
+
+    current_minute = current.hour * 60 + current.minute
+    anchor_minute = MARKET_BUCKET_ANCHOR.hour * 60 + MARKET_BUCKET_ANCHOR.minute
+    if current_minute < anchor_minute or current_minute >= _VALIDATION_REGULAR_SESSION_END_MINUTE:
+        return False
+
+    elapsed = current_minute - anchor_minute
+    bucket_offset = (elapsed // timeframe_minutes) * timeframe_minutes
+    bucket_start = current.replace(
+        hour=MARKET_BUCKET_ANCHOR.hour,
+        minute=MARKET_BUCKET_ANCHOR.minute,
+        second=0,
+        microsecond=0,
+    ) + timedelta(minutes=bucket_offset)
+    bucket_end = bucket_start + timedelta(minutes=timeframe_minutes)
+    return candle_start == bucket_start and current < bucket_end
+
+
 def project_validation_candles(
     historical_snapshot: ValidationHistoricalSnapshot,
+    *,
+    as_of: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Project detached OPT10080 rows into chronological Validation candles."""
+    """Project detached OPT10080 rows into closed chronological Validation candles."""
     if not isinstance(historical_snapshot, ValidationHistoricalSnapshot):
         raise TypeError("historical_snapshot must be ValidationHistoricalSnapshot")
 
@@ -100,6 +144,12 @@ def project_validation_candles(
         }
 
     candles = [candles_by_time[key] for key in sorted(candles_by_time)]
+    if candles and _latest_candle_is_forming(
+        str(candles[-1].get("time") or ""),
+        historical_snapshot.timeframe_minutes,
+        as_of=as_of,
+    ):
+        candles.pop()
     detached = _fresh_json(_canonical_json(candles))
     return detached, len(raw_rows) - len(detached)
 
@@ -367,6 +417,7 @@ class ValidationHistoricalReplay:
         use_read_only_fast_path = reuse_default_base_series and (
             context_provider is None
             or context_provider is build_validation_average_price_context
+            or getattr(context_provider, "validation_read_only_fast_path", False) is True
         )
         rules_json = None if use_read_only_fast_path else _canonical_json(rules)
         try:

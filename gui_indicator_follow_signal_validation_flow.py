@@ -13,6 +13,7 @@ from gui_toast import show_toast
 from gui_indicator_follow_signal_validation_window import (
     IndicatorFollowSignalValidationWindow,
 )
+from indicator_follow_signal_validation_execution import ValidationVirtualPositionTracker
 from gui_indicator_follow_validation_host import IndicatorFollowValidationHost
 from indicator_follow_signal_validation_recent_stocks import (
     IndicatorFollowSignalValidationRecentStockStore,
@@ -711,9 +712,16 @@ class IndicatorFollowSignalValidationFlow(QObject):
             evaluate_with_context = getattr(replay, "evaluate_with_context", None)
             evaluate = getattr(replay, "evaluate", None)
             if callable(evaluate_with_context):
+                rules = session.request.settings_snapshot.to_dict()
+                execution_policy = rules.get("validation_execution")
+                context_provider = (
+                    ValidationVirtualPositionTracker(execution_policy)
+                    if isinstance(execution_policy, dict)
+                    else build_validation_average_price_context
+                )
                 replay_result = evaluate_with_context(
                     result.snapshot,
-                    context_provider=build_validation_average_price_context,
+                    context_provider=context_provider,
                 )
             elif callable(evaluate):
                 replay_result = evaluate(result.snapshot)

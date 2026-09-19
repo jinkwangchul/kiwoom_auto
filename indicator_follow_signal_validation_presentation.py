@@ -14,6 +14,13 @@ from routines.지표추종매매.routine_validation_replay import ValidationRepl
 
 
 @dataclass(frozen=True, slots=True)
+class SignalValidationEvidenceRecord:
+    label: str
+    actual: str
+    condition_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SignalValidationFilterRow:
     side: str
     condition: str
@@ -572,7 +579,7 @@ def _expression_survivors(
     return passed, tuple(survivors)
 
 
-def _canonical_condition_key(condition: Any) -> str:
+def canonical_validation_condition_key(condition: Any) -> str:
     if not isinstance(condition, Mapping):
         return ""
     detached = {
@@ -587,6 +594,10 @@ def _canonical_condition_key(condition: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _canonical_condition_key(condition: Any) -> str:
+    return canonical_validation_condition_key(condition)
 
 
 def _trace_payloads(entry: ValidationReplayEntry) -> list[Mapping[str, Any]]:
@@ -831,11 +842,11 @@ def _sell_evidence_records(
     return records
 
 
-def signal_evidence_lines_for_entry(
+def signal_evidence_records_for_entry(
     entry: ValidationReplayEntry,
     settings_rules: Mapping[str, Any],
-) -> tuple[str, ...]:
-    """Return only operator-visible evidence for one already-produced signal."""
+) -> tuple[SignalValidationEvidenceRecord, ...]:
+    """Return structured final-decision Evidence without re-evaluating a signal."""
     if not isinstance(entry, ValidationReplayEntry):
         raise TypeError("entry must be ValidationReplayEntry")
     if not isinstance(settings_rules, Mapping):
@@ -847,16 +858,32 @@ def signal_evidence_lines_for_entry(
         if entry.evaluation_side == "BUY"
         else _sell_evidence_records(entry, settings_rules)
     )
-    accepted: list[tuple[str, str, tuple[str, ...]]] = []
+    accepted: list[SignalValidationEvidenceRecord] = []
     seen_evidence: set[tuple[str, str, frozenset[str], str]] = set()
     for label, actual, condition_keys in records:
-        key_set = frozenset(value for value in condition_keys if value)
+        normalized_keys = tuple(value for value in condition_keys if value)
+        key_set = frozenset(normalized_keys)
         evidence_key = (label, actual, key_set, entry.signal_time)
         if evidence_key in seen_evidence:
             continue
         seen_evidence.add(evidence_key)
-        accepted.append((label, actual, condition_keys))
-    return tuple(f"▪ {label} {actual}" for label, actual, _keys in accepted)
+        accepted.append(SignalValidationEvidenceRecord(
+            label=label,
+            actual=actual,
+            condition_keys=normalized_keys,
+        ))
+    return tuple(accepted)
+
+
+def signal_evidence_lines_for_entry(
+    entry: ValidationReplayEntry,
+    settings_rules: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return only operator-visible evidence for one already-produced signal."""
+    return tuple(
+        f"▪ {record.label} {record.actual}"
+        for record in signal_evidence_records_for_entry(entry, settings_rules)
+    )
 
 
 def signal_evidence_tooltip(

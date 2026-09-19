@@ -19,6 +19,17 @@ from gui_indicator_follow_signal_validation_window import (
 )
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
+    validation_virtual_fill_price,
+)
+from indicator_follow_signal_validation_visualization import (
+    FAMILY_MACD_SIGNAL,
+    FAMILY_MOVING_AVERAGE,
+    FAMILY_OCR_OSC,
+    FAMILY_RSI,
+    LOWER_AXIS,
+    PRICE_AXIS,
+    ValidationFilterDescriptor,
+    ValidationIndicatorSeriesCache,
 )
 from routines.지표추종매매.routine_validation_replay import ValidationReplayEntry
 
@@ -58,6 +69,18 @@ def _candles(closes, times=None):
 
 
 class CompletedValidationCycleTest(unittest.TestCase):
+    def test_virtual_fill_price_requires_complete_ohlc(self):
+        self.assertEqual(
+            102.5,
+            validation_virtual_fill_price({
+                "open": 100.0,
+                "high": 110.0,
+                "low": 90.0,
+                "close": 110.0,
+            }),
+        )
+        self.assertIsNone(validation_virtual_fill_price({"close": 110.0}))
+
     @staticmethod
     def _cycle(number, average, buy_count, estimated_return):
         return IndicatorFollowValidationCompletedCycle(
@@ -98,6 +121,38 @@ class CompletedValidationCycleTest(unittest.TestCase):
                 else:
                     self.assertAlmostEqual(expected, actual)
 
+    def test_aggregate_prefers_virtual_buy_cost_over_buy_count_proxy(self):
+        first = IndicatorFollowValidationCompletedCycle(
+            cycle_number=1,
+            buy_indexes=(0,),
+            buy_start_index=0,
+            buy_end_index=0,
+            buy_count=1,
+            average_buy_price=100.0,
+            sell_index=1,
+            sell_price=110.0,
+            estimated_return_percent=10.0,
+            buy_quantity=1,
+            buy_cost=100.0,
+        )
+        second = IndicatorFollowValidationCompletedCycle(
+            cycle_number=2,
+            buy_indexes=(2,),
+            buy_start_index=2,
+            buy_end_index=2,
+            buy_count=1,
+            average_buy_price=100.0,
+            sell_index=3,
+            sell_price=95.0,
+            estimated_return_percent=-5.0,
+            buy_quantity=4,
+            buy_cost=400.0,
+        )
+        self.assertAlmostEqual(
+            -2.0,
+            aggregate_completed_cycle_return_percent((first, second)),
+        )
+
     def test_buy_sell_and_multiple_buys_form_completed_cycles(self):
         candles = _candles([100.0, 110.0, 120.0])
         entries = [
@@ -110,9 +165,14 @@ class CompletedValidationCycleTest(unittest.TestCase):
         self.assertEqual(1, len(cycles))
         self.assertEqual((0, 1), cycles[0].buy_indexes)
         self.assertEqual(2, cycles[0].buy_count)
-        self.assertEqual(105.0, cycles[0].average_buy_price)
-        self.assertEqual(120.0, cycles[0].sell_price)
-        self.assertAlmostEqual((120.0 - 105.0) / 105.0 * 100.0, cycles[0].estimated_return_percent)
+        expected_buy = sum(validation_virtual_fill_price(candles[index]) for index in (0, 1)) / 2
+        expected_sell = validation_virtual_fill_price(candles[2])
+        self.assertEqual(expected_buy, cycles[0].average_buy_price)
+        self.assertEqual(expected_sell, cycles[0].sell_price)
+        self.assertAlmostEqual(
+            (expected_sell - expected_buy) / expected_buy * 100.0,
+            cycles[0].estimated_return_percent,
+        )
 
     def test_leading_sell_and_unfinished_buy_segment_are_ignored(self):
         candles = _candles([90.0, 100.0, 110.0, 120.0])
@@ -127,7 +187,12 @@ class CompletedValidationCycleTest(unittest.TestCase):
         self.assertEqual(1, len(cycles))
         self.assertEqual((1,), cycles[0].buy_indexes)
         self.assertEqual(2, cycles[0].sell_index)
-        self.assertAlmostEqual(10.0, aggregate_completed_cycle_return_percent(cycles))
+        expected_buy = validation_virtual_fill_price(candles[1])
+        expected_sell = validation_virtual_fill_price(candles[2])
+        self.assertAlmostEqual(
+            (expected_sell - expected_buy) / expected_buy * 100.0,
+            aggregate_completed_cycle_return_percent(cycles),
+        )
 
     def test_trailing_sell_does_not_change_aggregate_return(self):
         candles = _candles([100.0, 110.0, 105.0])
@@ -182,7 +247,10 @@ class CompletedValidationCycleTest(unittest.TestCase):
 
         self.assertEqual(1, len(cycles))
         self.assertEqual((0,), cycles[0].buy_indexes)
-        self.assertEqual(100.0, cycles[0].average_buy_price)
+        self.assertEqual(
+            validation_virtual_fill_price(candles[0]),
+            cycles[0].average_buy_price,
+        )
         self.assertEqual(2, cycles[0].sell_index)
 
     def test_cycle_average_matches_existing_average_context(self):
@@ -200,6 +268,138 @@ class CompletedValidationCycleTest(unittest.TestCase):
             context["validation_trace_context"]["contributing_buy_indexes"],
             list(cycle.buy_indexes),
         )
+
+
+class StaticValidationVisualizationGeometryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.widgets = []
+
+    def tearDown(self):
+        for widget in reversed(self.widgets):
+            widget.close()
+            widget.deleteLater()
+        self.app.processEvents()
+
+    @staticmethod
+    def _descriptor(identity, family, axis, channels, parameters):
+        return ValidationFilterDescriptor(
+            identity=identity,
+            family=family,
+            label=family,
+            axis=axis,
+            sides=("BUY",),
+            series_keys=tuple(channels),
+            parameter_json=parameters,
+            evidence_keys=(),
+            supported_sides=("BUY",),
+        )
+
+    def _canvas(self, lower_families=(), *, include_price=True):
+        candles = _candles([100.0 + index for index in range(50)])
+        descriptors = []
+        series = []
+        if include_price:
+            descriptor = self._descriptor(
+                "MA20",
+                FAMILY_MOVING_AVERAGE,
+                PRICE_AXIS,
+                ("MA20",),
+                '{"periods":[20]}',
+            )
+            descriptors.append(descriptor)
+            series.append((
+                descriptor.identity,
+                "MA20",
+                tuple(250.0 for _ in candles),
+            ))
+        for family in lower_families:
+            if family == FAMILY_RSI:
+                channels = ("RSI",)
+                params = '{"period":14}'
+                values = {"RSI": tuple(40.0 + index % 20 for index in range(len(candles)))}
+            elif family == FAMILY_MACD_SIGNAL:
+                channels = ("MACD", "SIGNAL")
+                params = '{"fast":12,"signal":9,"slow":26}'
+                values = {
+                    "MACD": tuple(float(index % 7 - 3) for index in range(len(candles))),
+                    "SIGNAL": tuple(float(index % 5 - 2) for index in range(len(candles))),
+                }
+            else:
+                channels = ("OSC",)
+                params = '{"fast":12,"signal":9,"slow":26}'
+                values = {
+                    "OSC": tuple(float(index % 9 - 4) for index in range(len(candles))),
+                }
+            descriptor = self._descriptor(
+                family,
+                family,
+                LOWER_AXIS,
+                channels,
+                params,
+            )
+            descriptors.append(descriptor)
+            for channel, channel_values in values.items():
+                series.append((descriptor.identity, channel, channel_values))
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            tuple(series),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=tuple(descriptors),
+            visualization_cache=cache,
+        )
+        canvas.resize(800, 500)
+        canvas.set_time_view(0.0, 50.0)
+        self.widgets.append(canvas)
+        return canvas
+
+    def test_lower_h_is_zero_without_lower_filter_and_fixed_for_one_to_three_panes(self):
+        no_lower = self._canvas(())
+        self.assertEqual(0, no_lower.indicator_total_height)
+        self.assertEqual([], no_lower.lower_pane_records())
+        self.assertEqual(452, no_lower.price_scale().plot_bottom)
+
+        expected_heights = {
+            1: [180],
+            2: [90, 90],
+            3: [60, 60, 60],
+        }
+        price_bottoms = []
+        families = (FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC)
+        for count in (1, 2, 3):
+            canvas = self._canvas(families[:count])
+            panes = canvas.lower_pane_records()
+            self.assertEqual(180, canvas.indicator_total_height)
+            self.assertEqual(
+                expected_heights[count],
+                [pane["height"] for pane in panes],
+            )
+            price_bottoms.append(canvas.price_scale().plot_bottom)
+        self.assertEqual([248, 248, 248], price_bottoms)
+
+    def test_price_overlay_expands_price_axis_and_static_series_render(self):
+        canvas = self._canvas((FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC))
+        scale = canvas.price_scale()
+        self.assertIsNotNone(scale)
+        self.assertEqual(250.0, scale.maximum)
+
+        records = canvas.visualization_series_records()
+        self.assertEqual(
+            {"MA20", "RSI", "MACD", "SIGNAL", "OSC"},
+            {record["channel"] for record in records},
+        )
+
+        canvas.show()
+        self.app.processEvents()
+        pixmap = QPixmap(canvas.size())
+        canvas.render(pixmap)
+        self.assertFalse(pixmap.isNull())
 
 
 class FixedValidationPriceAxisTest(unittest.TestCase):
