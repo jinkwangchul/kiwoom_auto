@@ -18,7 +18,6 @@ from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication,
-    QAbstractSpinBox,
     QComboBox,
     QDialog,
     QLabel,
@@ -237,19 +236,13 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertFalse(window.recent_stock_row.isVisible())
         self.assertEqual([], window.compact_stock_display.findChildren(QComboBox))
         self.assertEqual("5", window.basic_signal_interval_combo.currentText())
-        self.assertEqual(100, window.historical_candle_count_spin.value())
-        self.assertEqual(
-            QAbstractSpinBox.NoButtons,
-            window.historical_candle_count_spin.buttonSymbols(),
-        )
-        window.historical_candle_count_spin.lineEdit().setText("500")
-        window.historical_candle_count_spin.interpretText()
-        self.assertEqual(500, window.historical_candle_count_spin.value())
+        self.assertEqual(5_000, window.historical_candle_count)
+        self.assertFalse(hasattr(window, "historical_candle_count_spin"))
         all_labels = " ".join(
             label.text() for label in window.control_tab.findChildren(dialog_module.QLabel)
         )
         self.assertIn("기준봉", all_labels)
-        self.assertIn("봉수", all_labels)
+        self.assertNotIn("봉수", all_labels)
         for forbidden_attribute in (
             "basic_title",
             "registration_mode_label",
@@ -363,6 +356,51 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(user_width, window.width())
         self.assertEqual(user_position, window.pos())
+
+    def test_expanded_sections_grow_window_without_shrinking_chart(self):
+        window = self._window()
+        window._available_signal_validation_geometry = lambda: QRect(
+            0, 0, 2400, 1400
+        )
+        window.show()
+        self.app.processEvents()
+        window._apply_control_section_mode("summary", force=True)
+        window._initial_natural_fit_pending = True
+        window._initial_geometry_committed = False
+        window._fit_signal_validation_window()
+        self.app.processEvents()
+
+        summary_height = window.height()
+        chart_height = window.chart_stack.height()
+        window.move(QPoint(173, 211))
+        self.app.processEvents()
+        position = window.pos()
+
+        window._apply_control_section_mode("sell", force=True)
+        self.app.processEvents()
+        self.assertGreater(window.height(), summary_height)
+        self.assertEqual(chart_height, window.chart_stack.height())
+        self.assertEqual(position, window.pos())
+        self.assertTrue(window.sell_detail_widget.isVisible())
+        self.assertGreaterEqual(
+            window.sell_box.height(),
+            window.sell_box.sizeHint().height(),
+        )
+        sell_height = window.height()
+
+        window._apply_control_section_mode("all", force=True)
+        self.app.processEvents()
+        self.assertGreater(window.height(), sell_height)
+        self.assertEqual(chart_height, window.chart_stack.height())
+        self.assertEqual(position, window.pos())
+        self.assertTrue(window.buy_detail_widget.isVisible())
+        self.assertTrue(window.sell_detail_widget.isVisible())
+
+        window._apply_control_section_mode("summary", force=True)
+        self.app.processEvents()
+        self.assertEqual(summary_height, window.height())
+        self.assertEqual(chart_height, window.chart_stack.height())
+        self.assertEqual(position, window.pos())
 
     def test_initial_center_runs_once_and_section_toggles_preserve_window_position(self):
         window = self._window()
@@ -1143,7 +1181,12 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             ],
             entries=[buy_entry, entry],
         )
+        window.resize(1400, 850)
+        window.show()
+        self.app.processEvents()
         window.set_replay_snapshot(replay)
+        self.app.processEvents()
+        window.canvas.set_price_view(240_000.0, 260_000.0)
         marker_tooltips = {
             marker["side"]: marker["tooltip"]
             for marker in window.canvas.marker_records()
@@ -1159,7 +1202,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ):
             self.assertEqual(tooltip, window.canvas.marker_tooltip_at(
                 window.canvas._x_for_index(1),
-                window.canvas._TOP - 12,
+                window.canvas._marker_y(
+                    1,
+                    "SELL",
+                    window.canvas.price_scale(),
+                ),
             ))
 
     def test_completed_cycle_row_selects_matching_sell_candle(self):
@@ -1195,6 +1242,8 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         )
         window = self._window()
         window.set_replay_snapshot(self._snapshot([first, second]))
+        window._set_validation_range(0, 1)
+        window._refresh_validation_range_results()
         self.assertFalse(hasattr(window, "filter_result_table"))
         self.assertFalse(hasattr(window, "signal_list_table"))
         self.assertEqual(1, window.completed_cycle_table.rowCount())
@@ -1249,6 +1298,8 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             candles=candles,
             entries=entries,
         ))
+        window._set_validation_range(0, candle_count - 1)
+        window._refresh_validation_range_results()
         self.app.processEvents()
         table = window.completed_cycle_table
         self.assertEqual(Qt.ScrollBarAlwaysOn, table.verticalScrollBarPolicy())
@@ -1320,6 +1371,11 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 ))
             window._candles = candles
             window._entries = entries
+            window._validation_range = (
+                (0, len(candles) - 1)
+                if candles
+                else None
+            )
             window._populate_completed_cycles()
             self.app.processEvents()
 
@@ -1371,7 +1427,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ))
         self.assertEqual(0, table.horizontalScrollBar().maximum())
 
-    def test_user_owned_geometry_survives_result_apply_and_all_section_toggles(self):
+    def test_user_owned_geometry_preserves_width_position_and_uses_height_delta_for_sections(self):
         window = self._window()
         window._available_signal_validation_geometry = lambda: QRect(0, 0, 2400, 1400)
         window.show()
@@ -1385,7 +1441,8 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window.resize(user_size)
         window.move(user_position)
         window._user_geometry_owned = True
-        expected_geometry = window.geometry()
+        summary_geometry = window.geometry()
+        chart_height = window.chart_stack.height()
 
         window._request_validation()
         window.set_replay_snapshot(self._snapshot([
@@ -1394,25 +1451,49 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         ]))
         window._request_settings_apply()
         window.show_settings_apply_result("설정 적용 완료", success=True)
+        self.assertEqual(summary_geometry, window.geometry())
+
         for toggle in (
             window._toggle_recent_stock_row,
             window._toggle_recent_stock_row,
-            lambda: window._toggle_control_section_mode("buy"),
-            lambda: window._toggle_control_section_mode("buy"),
-            lambda: window._toggle_control_section_mode("sell"),
-            lambda: window._toggle_control_section_mode("sell"),
         ):
             toggle()
             self.app.processEvents()
-            self.assertEqual(expected_geometry, window.geometry())
+            self.assertEqual(summary_geometry, window.geometry())
 
-    def test_initial_and_changed_candle_counts_drive_requests_but_not_apply(self):
+        window._toggle_control_section_mode("buy")
+        self.app.processEvents()
+        self.assertEqual(summary_geometry.width(), window.width())
+        self.assertEqual(summary_geometry.topLeft(), window.geometry().topLeft())
+        self.assertGreater(window.height(), summary_geometry.height())
+        self.assertEqual(chart_height, window.chart_stack.height())
+
+        window._toggle_control_section_mode("buy")
+        self.app.processEvents()
+        self.assertEqual(summary_geometry, window.geometry())
+        self.assertEqual(chart_height, window.chart_stack.height())
+
+        window._toggle_control_section_mode("sell")
+        self.app.processEvents()
+        self.assertEqual(summary_geometry.width(), window.width())
+        self.assertEqual(summary_geometry.topLeft(), window.geometry().topLeft())
+        self.assertGreater(window.height(), summary_geometry.height())
+        self.assertEqual(chart_height, window.chart_stack.height())
+
+        window._toggle_control_section_mode("sell")
+        self.app.processEvents()
+        self.assertEqual(summary_geometry, window.geometry())
+        self.assertEqual(chart_height, window.chart_stack.height())
+
+    def test_historical_pool_count_is_separate_from_validation_evaluation_count(self):
         window = self._window()
         initial = window.request_initial_validation()
         self.assertEqual(100, initial.candle_count)
-        window.historical_candle_count_spin.setValue(500)
+        self.assertEqual(5_000, window.historical_candle_count)
+        window.set_historical_candle_count(500)
         changed = window._request_validation()
-        self.assertEqual(500, changed.candle_count)
+        self.assertEqual(100, changed.candle_count)
+        self.assertEqual(500, window.historical_candle_count)
         window.set_replay_snapshot(self._snapshot([]))
         payload = window._request_settings_apply()
         self.assertNotIn("candle_count", json.dumps(payload.to_ui_state()))
@@ -1440,10 +1521,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 file_before = rules_path.read_bytes()
 
                 window.basic_signal_interval_combo.setCurrentText("15")
-                window.historical_candle_count_spin.setValue(777)
+                window.set_historical_candle_count(777)
                 window.buy_signal_expr_line.setText("A or D")
                 window.buy_rsi_value_line.setText("39")
-                window.buy_bollinger_direction_combo.setCurrentText("하향")
+                window.buy_bollinger_direction_combo.setCurrentText("하단")
                 window.buy_bollinger_sign_combo.setCurrentText("+")
                 window.buy_bollinger_value_line.setText("0.1")
                 window.buy_bollinger_compare_combo.setCurrentText("이하")
@@ -1457,7 +1538,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.sell_signal_condition_b_price_box_sign_combo.setCurrentText("-")
                 window.sell_signal_condition_b_price_box_value_line.setText("0.1")
                 window.sell_signal_condition_b_price_box_compare_combo.setCurrentText("이상")
-                window.sell_signal_condition_b_bollinger_direction_combo.setCurrentText("상향")
+                window.sell_signal_condition_b_bollinger_direction_combo.setCurrentText("상단")
                 window.sell_signal_condition_b_bollinger_sign_combo.setCurrentText("-")
                 window.sell_signal_condition_b_bollinger_value_line.setText("0.2")
                 window.sell_signal_condition_b_bollinger_compare_combo.setCurrentText("이하")
@@ -1474,7 +1555,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual("A or D", after["basic"]["buy_signal_expr_line"])
                 self.assertEqual("39", after["buy_ui"]["signal_filter"]["buy_rsi_value_line"])
                 bollinger = after["buy_ui"]["signal_filter"]
-                self.assertEqual("하향", bollinger["buy_bollinger_direction_combo"])
+                self.assertEqual("하단", bollinger["buy_bollinger_direction_combo"])
                 self.assertEqual("+", bollinger["buy_bollinger_sign_combo"])
                 self.assertEqual("0.1", bollinger["buy_bollinger_value_line"])
                 self.assertEqual("이하", bollinger["buy_bollinger_compare_combo"])
@@ -1490,7 +1571,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual("-", sell_b["price_box_sign_combo"])
                 self.assertEqual("0.1", sell_b["price_box_value_line"])
                 self.assertEqual("이상", sell_b["price_box_compare_combo"])
-                self.assertEqual("상향", sell_b["bollinger_direction_combo"])
+                self.assertEqual("상단", sell_b["bollinger_direction_combo"])
                 self.assertEqual("-", sell_b["bollinger_sign_combo"])
                 self.assertEqual("0.2", sell_b["bollinger_value_line"])
                 self.assertEqual("이하", sell_b["bollinger_compare_combo"])
@@ -1752,12 +1833,13 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.validation_run_requested.connect(complete_validation)
                 window.settings_apply_requested.connect(apply_candidate)
 
-                window.historical_candle_count_spin.lineEdit().setText("200")
-                window.historical_candle_count_spin.editingFinished.emit()
-                self.assertEqual(200, len(window._candles))
+                self.assertEqual(5_000, window.historical_candle_count)
+                self.assertFalse(hasattr(window, "historical_candle_count_spin"))
                 self.assertEqual([], candidates)
 
                 window.basic_signal_interval_combo.setCurrentText("3")
+                if window.replay_snapshot is None:
+                    window._request_validation()
                 self.assertEqual(3, window.replay_snapshot.timeframe_minutes)
                 self.assertEqual(
                     baseline["basic"]["basic_signal_interval_combo"],

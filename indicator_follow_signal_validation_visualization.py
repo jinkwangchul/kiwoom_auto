@@ -23,6 +23,9 @@ from indicator_follow_signal_validation_execution import (
 )
 from indicator_follow_signal_validation_presentation import (
     canonical_validation_condition_key,
+    chart_compare_mode_label,
+    chart_operand_label,
+    chart_operator_label,
     signal_evidence_records_for_entry,
 )
 
@@ -42,12 +45,12 @@ FAMILY_OCR_OSC = "OCR_OSC"
 _FAMILY_LABELS = {
     FAMILY_MOVING_AVERAGE: "이동평균",
     FAMILY_MA_ARRANGEMENT: "이평배열",
-    FAMILY_BOLLINGER: "Bollinger",
-    FAMILY_PRICE_BOX: "Price Box",
+    FAMILY_BOLLINGER: "볼린저밴드",
+    FAMILY_PRICE_BOX: "가격박스",
     FAMILY_PRICE_COMPARISON: "가격비교",
     FAMILY_RSI: "RSI",
-    FAMILY_MACD_SIGNAL: "MACD / Signal",
-    FAMILY_OCR_OSC: "OCR / OSC",
+    FAMILY_MACD_SIGNAL: "MACD / 시그널선",
+    FAMILY_OCR_OSC: "OCR",
 }
 
 _LOWER_FAMILIES = {
@@ -79,30 +82,203 @@ def _positive_int(value: Any) -> int | None:
     return number if number > 0 else None
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _series_target(condition: Mapping[str, Any], field: str, period_field: str) -> str:
     target = str(condition.get(field) or "").strip().upper()
     if target == "MA":
         period = _positive_int(condition.get(period_field))
+        if period is None and field == "compare_target":
+            period = _positive_int(condition.get("period"))
         return f"MA{period}" if period is not None else "MA"
     return target
+
+
+def _condition_threshold(condition: Mapping[str, Any]) -> float | None:
+    return _safe_float(
+        condition.get("threshold", condition.get("value"))
+    )
+
+
+def _condition_contract(
+    family: str,
+    condition: Mapping[str, Any],
+) -> dict[str, Any]:
+    target = _series_target(condition, "target", "period")
+    compare = _series_target(
+        condition,
+        "compare_target",
+        "compare_period",
+    )
+    if family == FAMILY_RSI and not target:
+        target = "RSI"
+    if family == FAMILY_OCR_OSC and not target:
+        target = "OSC"
+    return {
+        "target": target,
+        "compare_target": compare,
+        "operator": str(condition.get("operator") or "").strip().upper(),
+        "direction": str(condition.get("direction") or "").strip().upper(),
+        "compare_mode": str(condition.get("compare_mode") or "").strip().upper(),
+        "threshold": _condition_threshold(condition),
+        "value": _safe_float(condition.get("value")),
+        "signed_percent_offset": condition.get("signed_percent_offset") is True,
+        "period": _positive_int(condition.get("period")),
+        "compare_period": _positive_int(condition.get("compare_period")),
+    }
+
+
+def _effective_offset_percent(contract: Mapping[str, Any]) -> float | None:
+    value = _safe_float(contract.get("value"))
+    if value is None:
+        return None
+    if contract.get("signed_percent_offset") is True:
+        return value
+    operator = str(contract.get("operator") or "").strip().upper()
+    if operator in {">", ">=", "GT", "GTE", "ABOVE"}:
+        return abs(value)
+    if operator in {"<", "<=", "LT", "LTE", "BELOW"}:
+        return -abs(value)
+    return 0.0
+
+
+def _format_number(value: Any) -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "-"
+    return f"{number:g}"
+
+
+def _compact_chart_operand_label(
+    value: Any,
+    *,
+    omit_current: bool = False,
+) -> str:
+    token = str(value or "").strip().upper()
+    if omit_current and token in {"CLOSE", "CURRENT_PRICE"}:
+        return ""
+    if token == "AVG_PRICE":
+        return "평단"
+    if token == "MACD":
+        return "MACD"
+    if token == "SIGNAL":
+        return "시그널"
+    return chart_operand_label(token) if token else ""
+
+
+def _criterion_label(
+    family: str,
+    parameters: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> str:
+    operator_token = str(contract.get("operator") or "").strip().upper()
+    operator = chart_operator_label(operator_token)
+    threshold = _safe_float(contract.get("threshold"))
+    compare = str(contract.get("compare_target") or "").strip().upper()
+    target = str(contract.get("target") or "").strip().upper()
+    target_label = _compact_chart_operand_label(target, omit_current=True)
+    compare_label = _compact_chart_operand_label(compare)
+
+    if family == FAMILY_RSI:
+        period = _positive_int(parameters.get("period")) or 14
+        return (
+            f"RSI({period}) {_format_number(threshold)} {operator}".strip()
+            if threshold is not None
+            else f"RSI({period})"
+        )
+    if family == FAMILY_BOLLINGER:
+        offset = _effective_offset_percent(contract)
+        suffix = "" if offset in (None, 0.0) else f" {offset:+g}%"
+        basis = compare_label or "볼린저밴드"
+        prefix = f"{target_label} {basis}".strip() if target_label else basis
+        return f"{prefix}{suffix} {operator}".strip()
+    if family == FAMILY_PRICE_BOX:
+        offset = _effective_offset_percent(contract)
+        suffix = "" if offset in (None, 0.0) else f" {offset:+g}%"
+        basis = compare_label or "가격박스"
+        prefix = f"{target_label} {basis}".strip() if target_label else basis
+        return f"{prefix}{suffix} {operator}".strip()
+    if family == FAMILY_OCR_OSC:
+        if threshold is not None and operator_token not in {"TURN_UP", "TURN_DOWN"}:
+            return f"OCR {_format_number(threshold)} {operator}".strip()
+        return f"OCR {operator}".strip()
+    if family == FAMILY_MACD_SIGNAL:
+        left = target_label or "MACD"
+        if compare:
+            return f"{left} {compare_label} {operator}".strip()
+        if threshold is not None:
+            return f"{left} {_format_number(threshold)} {operator}".strip()
+        return left
+    if family == FAMILY_PRICE_COMPARISON:
+        direction = str(contract.get("direction") or "").strip().upper()
+        percent = _safe_float(contract.get("value"))
+        left = target_label
+        right = compare_label
+        operands = f"{left} {right}".strip() if left else right
+        if operator_token == "PERCENT_GAP":
+            signed = ""
+            if percent is not None:
+                if direction == "UP":
+                    signed = f"+{_format_number(abs(percent))}%"
+                elif direction == "DOWN":
+                    signed = f"-{_format_number(abs(percent))}%"
+                elif direction == "BOTH":
+                    signed = f"?{_format_number(abs(percent))}%"
+                else:
+                    signed = f"{_format_number(percent)}%"
+            compare_mode = chart_compare_mode_label(contract.get("compare_mode"))
+            return f"{operands} 대비 {signed} {compare_mode}".strip()
+        offset = _effective_offset_percent(contract)
+        suffix = "" if offset in (None, 0.0) else f" {offset:+g}%"
+        return f"{operands}{suffix} {operator}".strip()
+    if family == FAMILY_MOVING_AVERAGE:
+        right = compare_label or compare
+        operands = f"{target_label} {right}".strip() if target_label else right
+        return f"{operands} {operator}".strip()
+    return _FAMILY_LABELS.get(family, family)
 
 
 def _condition_series_keys(
     family: str,
     condition: Mapping[str, Any],
 ) -> tuple[str, ...]:
-    target = _series_target(condition, "target", "period")
-    compare = _series_target(condition, "compare_target", "compare_period")
-    if family == FAMILY_BOLLINGER:
-        return ("BOLLINGER_LOWER", "BOLLINGER_MIDDLE", "BOLLINGER_UPPER")
-    if family == FAMILY_PRICE_BOX:
-        return ("PRICE_BOX_LOWER", "PRICE_BOX_MIDDLE", "PRICE_BOX_UPPER")
-    if family == FAMILY_MACD_SIGNAL:
-        return ("MACD", "SIGNAL")
-    if family == FAMILY_OCR_OSC:
-        return ("OSC",)
+    contract = _condition_contract(family, condition)
+    target = str(contract.get("target") or "")
+    compare = str(contract.get("compare_target") or "")
+    threshold = _safe_float(contract.get("threshold"))
+    operator = str(contract.get("operator") or "").upper()
+
+    if family in {FAMILY_BOLLINGER, FAMILY_PRICE_BOX}:
+        return ("CRITERION",) if compare else ()
     if family == FAMILY_RSI:
-        return ("RSI",)
+        return (
+            ("RSI", "CRITERION")
+            if threshold is not None
+            else ("RSI",)
+        )
+    if family == FAMILY_MACD_SIGNAL:
+        values = [
+            value
+            for value in (target, compare)
+            if value in {"MACD", "SIGNAL"}
+        ]
+        if not compare and threshold is not None:
+            values.append("CRITERION")
+        return tuple(dict.fromkeys(values))
+    if family == FAMILY_OCR_OSC:
+        return (
+            ("OSC", "CRITERION")
+            if threshold is not None and operator not in {"TURN_UP", "TURN_DOWN"}
+            else ("OSC",)
+        )
     if family in {FAMILY_MOVING_AVERAGE, FAMILY_MA_ARRANGEMENT}:
         values = [
             value
@@ -111,13 +287,19 @@ def _condition_series_keys(
         ]
         return tuple(dict.fromkeys(values))
     if family == FAMILY_PRICE_COMPARISON:
-        values = []
-        for value in (target, compare):
-            if value in {"CLOSE", "AVG_PRICE"}:
-                values.append(value)
-            elif value == "ORDER_PRICE":
-                values.append("VIRTUAL_FILL_PRICE")
-        return tuple(dict.fromkeys(values)) or ("CLOSE", "AVG_PRICE")
+        values: list[str] = []
+        if target == "AVG_PRICE":
+            values.append("AVG_PRICE")
+        elif target == "ORDER_PRICE":
+            values.append("VIRTUAL_FILL_PRICE")
+        if compare:
+            if operator == "PERCENT_GAP" and str(
+                contract.get("direction") or ""
+            ).upper() == "BOTH":
+                values.extend(("CRITERION_LOWER", "CRITERION_UPPER"))
+            else:
+                values.append("CRITERION")
+        return tuple(dict.fromkeys(values))
     return ()
 
 
@@ -167,26 +349,34 @@ def _global_parameters(
     condition: Mapping[str, Any],
 ) -> dict[str, Any]:
     indicators = _mapping(rules.get("indicators"))
+    parameters: dict[str, Any] = {}
+
     if family == FAMILY_RSI:
         config = _mapping(indicators.get("rsi"))
-        return {"period": _positive_int(condition.get("period")) or _positive_int(config.get("period")) or 14}
-    if family in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
+        parameters["period"] = (
+            _positive_int(condition.get("period"))
+            or _positive_int(config.get("period"))
+            or 14
+        )
+    elif family in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
         config = _mapping(indicators.get("macd"))
-        return {
+        parameters.update({
             "fast": _positive_int(config.get("fast")) or 12,
             "slow": _positive_int(config.get("slow")) or 26,
             "signal": _positive_int(config.get("signal")) or 9,
-        }
-    if family == FAMILY_BOLLINGER:
+        })
+    elif family == FAMILY_BOLLINGER:
         config = _mapping(indicators.get("bollinger"))
-        return {
+        parameters.update({
             "period": _positive_int(config.get("period")) or 20,
             "std": float(config.get("std") or 2.0),
-        }
-    if family == FAMILY_PRICE_BOX:
+        })
+    elif family == FAMILY_PRICE_BOX:
         config = _mapping(indicators.get("price_box"))
-        return {"period": _positive_int(config.get("period")) or 24}
-    if family in {FAMILY_MOVING_AVERAGE, FAMILY_MA_ARRANGEMENT}:
+        parameters["period"] = (
+            _positive_int(config.get("period")) or 24
+        )
+    elif family in {FAMILY_MOVING_AVERAGE, FAMILY_MA_ARRANGEMENT}:
         periods = []
         for key in ("period", "compare_period"):
             value = _positive_int(condition.get(key))
@@ -195,21 +385,18 @@ def _global_parameters(
         for key in _condition_series_keys(family, condition):
             if key.startswith("MA") and key[2:].isdigit():
                 periods.append(int(key[2:]))
-        return {"periods": tuple(sorted(set(periods)))}
-    if family == FAMILY_PRICE_COMPARISON:
-        return {
-            key: condition.get(key)
-            for key in (
-                "target",
-                "compare_target",
-                "operator",
-                "direction",
-                "compare_mode",
-                "value",
-            )
-            if condition.get(key) not in (None, "")
-        }
-    return {}
+        parameters["periods"] = tuple(sorted(set(periods)))
+
+    contract = _condition_contract(family, condition)
+    if family == FAMILY_RSI and contract.get("period") is None:
+        contract["period"] = parameters.get("period")
+    parameters["condition"] = contract
+    parameters["criterion_label"] = _criterion_label(
+        family,
+        parameters,
+        contract,
+    )
+    return parameters
 
 
 def _descriptor_identity(
@@ -512,6 +699,52 @@ def _price_box_prefix_series(
     }
 
 
+def _constant_series(
+    value: float | None,
+    count: int,
+) -> tuple[float | None, ...]:
+    return tuple(value for _ in range(count))
+
+
+def _offset_series(
+    values: tuple[float | None, ...],
+    offset_percent: float | None,
+) -> tuple[float | None, ...]:
+    if offset_percent is None:
+        return tuple(values)
+    ratio = 1.0 + offset_percent / 100.0
+    return tuple(
+        None if value is None else value * ratio
+        for value in values
+    )
+
+
+def required_validation_warmup_bars(
+    rules: Mapping[str, Any],
+) -> int:
+    """Return the largest configured indicator lookback used by Validation V2."""
+    descriptors = build_validation_filter_universe(rules)
+    required = 0
+    for descriptor in descriptors:
+        parameters = descriptor.parameters
+        if descriptor.family in {FAMILY_MOVING_AVERAGE, FAMILY_MA_ARRANGEMENT}:
+            periods = parameters.get("periods")
+            if isinstance(periods, (list, tuple)):
+                for value in periods:
+                    period = _positive_int(value)
+                    if period is not None:
+                        required = max(required, period)
+        elif descriptor.family in {FAMILY_RSI, FAMILY_BOLLINGER, FAMILY_PRICE_BOX}:
+            period = _positive_int(parameters.get("period"))
+            if period is not None:
+                required = max(required, period)
+        elif descriptor.family in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
+            slow = _positive_int(parameters.get("slow")) or 26
+            signal = _positive_int(parameters.get("signal")) or 9
+            required = max(required, slow + signal)
+    return required
+
+
 def build_validation_indicator_cache(
     candles: list[dict[str, Any]],
     rules: Mapping[str, Any],
@@ -550,16 +783,28 @@ def build_validation_indicator_cache(
     price_box_cache: dict[int, dict[str, tuple[float | None, ...]]] = {}
 
     average_values: tuple[float | None, ...] = ()
-    if any("AVG_PRICE" in descriptor.series_keys for descriptor in descriptors):
+    needs_average_price = any(
+        "AVG_PRICE" in descriptor.series_keys
+        or str(
+            _mapping(descriptor.parameters.get("condition")).get("target")
+            or ""
+        ).upper() == "AVG_PRICE"
+        or str(
+            _mapping(descriptor.parameters.get("condition")).get("compare_target")
+            or ""
+        ).upper() == "AVG_PRICE"
+        for descriptor in descriptors
+    )
+    if needs_average_price:
         tracker = ValidationVirtualPositionTracker(
             _mapping(rules.get("validation_execution"))
         )
         projected: list[float | None] = []
         for index in range(len(candles)):
-            context = tracker(
+            context = tracker.context_for_fast(
                 index,
                 "SELL",
-                candles[: index + 1],
+                candles,
                 source_entries,
             )
             projected.append(context.get("average_price"))
@@ -577,6 +822,7 @@ def build_validation_indicator_cache(
 
     for descriptor in descriptors:
         parameters = descriptor.parameters
+        condition = _mapping(parameters.get("condition"))
         channels: dict[str, tuple[float | None, ...]] = {}
 
         if descriptor.family in {
@@ -598,6 +844,11 @@ def build_validation_indicator_cache(
             if period not in rsi_cache:
                 rsi_cache[period] = normalized_values(rsi(closes, period))
             channels["RSI"] = rsi_cache[period]
+            if "CRITERION" in descriptor.series_keys:
+                channels["CRITERION"] = _constant_series(
+                    _safe_float(condition.get("threshold")),
+                    len(candles),
+                )
 
         elif descriptor.family in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
             macd_key = (
@@ -620,6 +871,11 @@ def build_validation_indicator_cache(
             for channel in descriptor.series_keys:
                 if channel in macd_cache[macd_key]:
                     channels[channel] = macd_cache[macd_key][channel]
+            if "CRITERION" in descriptor.series_keys:
+                channels["CRITERION"] = _constant_series(
+                    _safe_float(condition.get("threshold")),
+                    len(candles),
+                )
 
         elif descriptor.family == FAMILY_BOLLINGER:
             period = _positive_int(parameters.get("period")) or 20
@@ -639,7 +895,18 @@ def build_validation_indicator_cache(
                     "BOLLINGER_MIDDLE": normalized_values(middle),
                     "BOLLINGER_UPPER": normalized_values(upper),
                 }
-            channels.update(bollinger_cache[bollinger_key])
+            compare_target = str(
+                condition.get("compare_target") or ""
+            ).upper()
+            base_values = bollinger_cache[bollinger_key].get(
+                compare_target,
+                (),
+            )
+            if len(base_values) == len(candles):
+                channels["CRITERION"] = _offset_series(
+                    base_values,
+                    _effective_offset_percent(condition),
+                )
 
         elif descriptor.family == FAMILY_PRICE_BOX:
             period = _positive_int(parameters.get("period")) or 24
@@ -648,16 +915,75 @@ def build_validation_indicator_cache(
                     candles,
                     period,
                 )
-            channels.update(price_box_cache[period])
+            compare_target = str(
+                condition.get("compare_target") or ""
+            ).upper()
+            base_values = price_box_cache[period].get(
+                compare_target,
+                (),
+            )
+            if len(base_values) == len(candles):
+                channels["CRITERION"] = _offset_series(
+                    base_values,
+                    _effective_offset_percent(condition),
+                )
 
         elif descriptor.family == FAMILY_PRICE_COMPARISON:
-            for channel in descriptor.series_keys:
-                if channel == "CLOSE":
-                    channels[channel] = close_values
-                elif channel == "AVG_PRICE":
-                    channels[channel] = average_values
-                elif channel == "VIRTUAL_FILL_PRICE":
-                    channels[channel] = normalized_values(fill_values)
+            target = str(condition.get("target") or "").upper()
+            compare_target = str(
+                condition.get("compare_target") or ""
+            ).upper()
+
+            if target == "AVG_PRICE":
+                channels["AVG_PRICE"] = average_values
+            elif target == "ORDER_PRICE":
+                channels["VIRTUAL_FILL_PRICE"] = normalized_values(
+                    fill_values
+                )
+
+            if compare_target == "AVG_PRICE":
+                base_values = average_values
+            elif compare_target == "ORDER_PRICE":
+                base_values = normalized_values(fill_values)
+            elif compare_target == "CLOSE":
+                base_values = close_values
+            else:
+                base_values = ()
+
+            if len(base_values) == len(candles):
+                operator = str(
+                    condition.get("operator") or ""
+                ).upper()
+                if operator == "PERCENT_GAP":
+                    percent = _safe_float(condition.get("value"))
+                    direction = str(
+                        condition.get("direction") or ""
+                    ).upper()
+                    if percent is not None:
+                        if direction == "BOTH":
+                            channels["CRITERION_LOWER"] = _offset_series(
+                                base_values,
+                                -abs(percent),
+                            )
+                            channels["CRITERION_UPPER"] = _offset_series(
+                                base_values,
+                                abs(percent),
+                            )
+                        elif direction == "UP":
+                            channels["CRITERION"] = _offset_series(
+                                base_values,
+                                abs(percent),
+                            )
+                        elif direction == "DOWN":
+                            channels["CRITERION"] = _offset_series(
+                                base_values,
+                                -abs(percent),
+                            )
+                else:
+                    channels["CRITERION"] = _offset_series(
+                        base_values,
+                        _effective_offset_percent(condition),
+                    )
 
         for channel in descriptor.series_keys:
             values = channels.get(channel, ())

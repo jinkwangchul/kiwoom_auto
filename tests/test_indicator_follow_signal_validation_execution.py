@@ -71,9 +71,62 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
         self.assertAlmostEqual(10.0, cycle.estimated_return_percent)
         self.assertEqual(0, simulation.open_quantity)
 
+    def test_averaging_disabled_buys_exactly_one_share_per_buy_signal(self):
+        candles = _candles([100, 100, 100, 120])
+        simulation = simulate_validation_execution(
+            candles,
+            [
+                _entry("BUY", 0, candles),
+                _entry("BUY", 1, candles),
+                _entry("BUY", 2, candles),
+                _entry("SELL", 3, candles),
+            ],
+            {
+                "enabled": False,
+                "first_buy_quantity": 9,
+                "repeat_mode": "BUDGET",
+                "budget_ratio": 5.0,
+            },
+        )
+
+        self.assertEqual([1, 1, 1], [
+            fill.quantity for fill in simulation.fills if fill.side == "BUY"
+        ])
+        cycle = simulation.cycles[0]
+        self.assertEqual(3, cycle.buy_quantity)
+        self.assertEqual(300.0, cycle.buy_cost)
+        self.assertEqual(100.0, cycle.average_buy_price)
+        self.assertEqual(360.0, cycle.sell_price * cycle.sell_quantity)
+
+    def test_averaging_enabled_uses_starting_quantity_before_repeat_policy(self):
+        candles = _candles([100, 100, 120])
+        simulation = simulate_validation_execution(
+            candles,
+            [
+                _entry("BUY", 0, candles),
+                _entry("BUY", 1, candles),
+                _entry("SELL", 2, candles),
+            ],
+            {
+                "enabled": True,
+                "first_buy_quantity": 2,
+                "repeat_mode": "BUDGET",
+                "budget_ratio": 2.0,
+            },
+        )
+
+        self.assertEqual([2, 4], [
+            fill.quantity for fill in simulation.fills if fill.side == "BUY"
+        ])
+        cycle = simulation.cycles[0]
+        self.assertEqual(6, cycle.buy_quantity)
+        self.assertEqual(600.0, cycle.buy_cost)
+        self.assertEqual(100.0, cycle.average_buy_price)
+
     def test_round_add_reuses_production_budget_formula(self):
         candles = _candles([100, 100, 100, 120])
         policy = {
+            "enabled": True,
             "repeat_mode": "ROUND",
             "round_operator": "ADD",
             "round_budget_value": 0.5,
@@ -101,6 +154,7 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
     def test_budget_mode_compounds_previous_actual_buy_cost(self):
         candles = _candles([100, 100, 100, 110])
         policy = {
+            "enabled": True,
             "repeat_mode": "BUDGET",
             "budget_ratio": 2.0,
         }
@@ -126,6 +180,7 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
     def test_active_buy_uses_position_average_and_virtual_fill_price(self):
         candles = _candles([100, 80, 90])
         policy = {
+            "enabled": True,
             "repeat_mode": "ACTIVE_BUY",
             "active_direction": "UP",
             "active_ratio": 10.0,
@@ -172,6 +227,7 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
             _entry("SELL", 2, candles),
         ]
         tracker = ValidationVirtualPositionTracker({
+            "enabled": True,
             "repeat_mode": "BUDGET",
             "budget_ratio": 2.0,
         })
@@ -193,9 +249,46 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
         self.assertEqual(1, len(simulation.cycles))
         self.assertAlmostEqual(60.0, simulation.cycles[0].average_buy_price)
 
+    def test_policy_normalizes_averaging_enable_and_starting_quantity(self):
+        fresh_policy = normalize_validation_execution_policy(None)
+        self.assertFalse(fresh_policy["enabled"])
+
+        policy = normalize_validation_execution_policy({
+            "enabled": False,
+            "first_buy_quantity": "3",
+        })
+        self.assertFalse(policy["enabled"])
+        self.assertEqual(3, policy["first_buy_quantity"])
+
+        disabled_with_invalid_details = normalize_validation_execution_policy({
+            "enabled": False,
+            "first_buy_quantity": "invalid",
+            "repeat_mode": "invalid",
+            "round_operator": "invalid",
+            "round_budget_value": "invalid",
+            "budget_ratio": "invalid",
+            "active_direction": "invalid",
+            "active_ratio": "invalid",
+            "active_compare": "invalid",
+        })
+        self.assertFalse(disabled_with_invalid_details["enabled"])
+        self.assertEqual(1, disabled_with_invalid_details["first_buy_quantity"])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "VALIDATION_FIRST_BUY_QUANTITY_INVALID",
+        ):
+            normalize_validation_execution_policy({
+                "enabled": True,
+                "first_buy_quantity": "0",
+            })
+
     def test_invalid_repeat_configuration_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "VALIDATION_REPEAT_MODE_INVALID"):
-            normalize_validation_execution_policy({"repeat_mode": "UNKNOWN"})
+            normalize_validation_execution_policy({
+                "enabled": True,
+                "repeat_mode": "UNKNOWN",
+            })
 
 
 if __name__ == "__main__":

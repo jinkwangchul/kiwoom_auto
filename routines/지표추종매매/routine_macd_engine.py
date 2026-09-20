@@ -1489,17 +1489,24 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
     )
     if order_price is not None:
         series_map["ORDER_PRICE"] = [order_price] * length
-    if isinstance(average_price_series, list) and len(average_price_series) == length:
-        normalized_average_series: list[float | None] = []
-        for item in average_price_series:
-            if item is None:
-                normalized_average_series.append(None)
-                continue
-            value = _safe_float(item)
-            normalized_average_series.append(
-                value if value is not None and value > 0 else None
-            )
-        series_map["AVG_PRICE"] = normalized_average_series
+    if isinstance(average_price_series, list) and 0 < len(average_price_series) <= length:
+        if (
+            isinstance(context, dict)
+            and context.get("_indicator_follow_average_price_series_normalized")
+            is True
+        ):
+            series_map["AVG_PRICE"] = average_price_series
+        else:
+            normalized_average_series: list[float | None] = []
+            for item in average_price_series:
+                if item is None:
+                    normalized_average_series.append(None)
+                    continue
+                value = _safe_float(item)
+                normalized_average_series.append(
+                    value if value is not None and value > 0 else None
+                )
+            series_map["AVG_PRICE"] = normalized_average_series
     elif average_price is not None:
         series_map["AVG_PRICE"] = [average_price] * length
 

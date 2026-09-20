@@ -58,6 +58,147 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
                 pass
         self.app.processEvents()
 
+    def test_filter_series_hover_shows_condition_value_and_precedes_candle(self):
+        for target in (
+            "gui_indicator_follow_signal_validation_window.QToolTip.showText",
+            "gui_indicator_follow_signal_validation_window.QToolTip.hideText",
+        ):
+            active_patch = patch(target)
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+
+        candles = _candles(20)
+        ma_descriptor = ValidationFilterDescriptor(
+            identity="HOVER-MA",
+            family=FAMILY_MOVING_AVERAGE,
+            label="MA20",
+            axis=PRICE_AXIS,
+            sides=("BUY",),
+            series_keys=("MA20",),
+            parameter_json=(
+                '{"criterion_label":"현재가 20이평 상향돌파","periods":[20]}'
+            ),
+            evidence_keys=("MA-KEY",),
+            supported_sides=("BUY",),
+        )
+        rsi_descriptor = ValidationFilterDescriptor(
+            identity="HOVER-RSI",
+            family=FAMILY_RSI,
+            label="RSI",
+            axis=LOWER_AXIS,
+            sides=("BUY",),
+            series_keys=("RSI",),
+            parameter_json=(
+                '{"criterion_label":"RSI(14) 45 이하","period":14}'
+            ),
+            evidence_keys=("RSI-KEY",),
+            supported_sides=("BUY",),
+        )
+        osc_descriptor = ValidationFilterDescriptor(
+            identity="HOVER-OSC",
+            family=FAMILY_OCR_OSC,
+            label="OCR / OSC",
+            axis=LOWER_AXIS,
+            sides=("BUY",),
+            series_keys=("OSC",),
+            parameter_json=(
+                '{"criterion_label":"OCR 상승전환","fast":12,"slow":26,"signal":9}'
+            ),
+            evidence_keys=("OSC-KEY",),
+            supported_sides=("BUY",),
+        )
+        ma_values = tuple(100.0 + index for index in range(len(candles)))
+        rsi_values = tuple(45.0 for _ in candles)
+        osc_values = tuple(
+            float((index % 9) - 4)
+            for index in range(len(candles))
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            (
+                (ma_descriptor.identity, "MA20", ma_values),
+                (rsi_descriptor.identity, "RSI", rsi_values),
+                (osc_descriptor.identity, "OSC", osc_values),
+            ),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(
+                ma_descriptor,
+                rsi_descriptor,
+                osc_descriptor,
+            ),
+            visualization_cache=cache,
+        )
+        canvas.resize(900, 520)
+        canvas.set_time_view(0.0, float(len(candles)))
+        canvas.show()
+        self.widgets.append(canvas)
+        self.app.processEvents()
+
+        hover_index = 10
+        hover_x = canvas._x_for_index(hover_index)
+        price_scale = canvas.price_scale()
+        price_y = price_scale.y_for_price(ma_values[hover_index])
+        price_tooltip = canvas.series_tooltip_at(hover_x, price_y)
+        self.assertIn("현재가 20이평 상향돌파", price_tooltip)
+        self.assertIn("20이평:", price_tooltip)
+        self.assertIn("적용: 매수", price_tooltip)
+
+        pane_by_family = {
+            pane["family"]: pane
+            for pane in canvas.lower_pane_records()
+        }
+        rsi_pane = pane_by_family[FAMILY_RSI]
+        rsi_scale = canvas._lower_scale(
+            FAMILY_RSI,
+            rsi_pane["top"],
+            rsi_pane["bottom"],
+        )
+        rsi_tooltip = canvas.series_tooltip_at(
+            hover_x,
+            rsi_scale.y_for_price(45.0),
+        )
+        self.assertIn("RSI(14) 45 이하", rsi_tooltip)
+        self.assertIn("RSI: 45", rsi_tooltip)
+
+        osc_index = 8
+        osc_x = canvas._x_for_index(osc_index)
+        osc_value = osc_values[osc_index]
+        osc_pane = pane_by_family[FAMILY_OCR_OSC]
+        osc_scale = canvas._lower_scale(
+            FAMILY_OCR_OSC,
+            osc_pane["top"],
+            osc_pane["bottom"],
+        )
+        osc_mid_y = (
+            osc_scale.y_for_price(0.0)
+            + osc_scale.y_for_price(osc_value)
+        ) / 2.0
+        osc_tooltip = canvas.series_tooltip_at(osc_x, osc_mid_y)
+        self.assertIn("OCR 상승전환", osc_tooltip)
+        self.assertIn("OCR:", osc_tooltip)
+
+        with patch.object(
+            canvas,
+            "candle_tooltip_at",
+            side_effect=AssertionError(
+                "filter series tooltip must precede candle tooltip"
+            ),
+        ), patch(
+            "gui_indicator_follow_signal_validation_window.QToolTip.showText",
+        ) as show_tooltip:
+            QTest.mouseMove(
+                canvas,
+                QPoint(round(hover_x), round(price_y)),
+            )
+            self.app.processEvents()
+        self.assertIn(
+            "현재가 20이평 상향돌파",
+            show_tooltip.call_args.args[1],
+        )
+
     def test_hover_pin_blank_release_and_visual_states(self):
         for target in (
             "gui_indicator_follow_signal_validation_window.QToolTip.showText",
@@ -180,7 +321,7 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         scale = canvas.price_scale()
         marker_pos = QPoint(
             round(canvas._x_for_index(marker_index)),
-            round(scale.plot_top - 12),
+            round(canvas._marker_y(marker_index, "SELL", scale)),
         )
         QTest.mouseMove(canvas, marker_pos)
         self.app.processEvents()
@@ -230,6 +371,104 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         self.assertEqual("NORMAL", states()["INACTIVE-RSI"])
         self.assertEqual("UNSUPPORTED", states()["UNSUPPORTED-MA"])
         self.assertEqual("ERROR", states()["ERROR-MA"])
+
+    def test_mouse_crosshair_reuses_static_chart_cache_until_view_changes(self):
+        candles = _candles(100)
+        descriptor = ValidationFilterDescriptor(
+            identity="CACHE-MA",
+            family=FAMILY_MOVING_AVERAGE,
+            label="MA20",
+            axis=PRICE_AXIS,
+            sides=("BUY",),
+            series_keys=("MA20",),
+            parameter_json='{"periods":[20]}',
+            evidence_keys=("CACHE-MA",),
+            supported_sides=("BUY",),
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            ((
+                descriptor.identity,
+                "MA20",
+                tuple(100.0 + index for index in range(len(candles))),
+            ),),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(descriptor,),
+            visualization_cache=cache,
+        )
+        canvas.resize(900, 520)
+        canvas.set_time_view(0.0, 100.0)
+        canvas.show()
+        self.widgets.append(canvas)
+        self.app.processEvents()
+
+        with patch.object(
+            canvas,
+            "_paint_static_chart",
+            wraps=canvas._paint_static_chart,
+        ) as static_paint:
+            canvas._static_chart_cache = None
+            canvas._static_chart_cache_key = None
+            canvas.update()
+            self.app.processEvents()
+            initial_calls = static_paint.call_count
+            self.assertGreaterEqual(initial_calls, 1)
+
+            for index in (10, 20, 30, 40):
+                QTest.mouseMove(
+                    canvas,
+                    QPoint(
+                        round(canvas._x_for_index(index)),
+                        round((canvas.price_scale().plot_top + canvas.price_scale().plot_bottom) / 2),
+                    ),
+                )
+                self.app.processEvents()
+            self.assertEqual(initial_calls, static_paint.call_count)
+
+            canvas.set_time_view(10.0, 50.0)
+            self.app.processEvents()
+            self.assertGreater(static_paint.call_count, initial_calls)
+
+    def test_signal_markers_follow_signal_candle_high_and_low(self):
+        candles = _candles(10)
+        marker_index = 5
+        markers = [
+            {
+                "side": "BUY",
+                "evaluation_index": marker_index,
+                "evaluation_time": candles[marker_index]["time"],
+                "tooltip": "BUY evidence",
+            },
+            {
+                "side": "SELL",
+                "evaluation_index": marker_index,
+                "evaluation_time": candles[marker_index]["time"],
+                "tooltip": "SELL evidence",
+            },
+        ]
+        canvas = IndicatorFollowSignalValidationChartCanvas(candles, markers)
+        canvas.resize(700, 420)
+        canvas.show()
+        self.widgets.append(canvas)
+        self.app.processEvents()
+
+        scale = canvas.price_scale()
+        self.assertIsNotNone(scale)
+        sell_y = canvas._marker_y(marker_index, "SELL", scale)
+        buy_y = canvas._marker_y(marker_index, "BUY", scale)
+        self.assertAlmostEqual(
+            scale.y_for_price(candles[marker_index]["high"]) - 12,
+            sell_y,
+        )
+        self.assertAlmostEqual(
+            scale.y_for_price(candles[marker_index]["low"]) + 12,
+            buy_y,
+        )
+        self.assertNotEqual(scale.plot_top - 12, sell_y)
+        self.assertNotEqual(scale.plot_bottom + 12, buy_y)
 
     def test_crosshair_snaps_uses_pane_units_and_pin_reprojects(self):
         for target in (
@@ -391,7 +630,7 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
 
         marker_pos = QPoint(
             round(canvas._x_for_index(marker_index)),
-            round(price_scale.plot_top - 12),
+            round(canvas._marker_y(marker_index, "SELL", price_scale)),
         )
         QTest.mouseClick(canvas, Qt.LeftButton, pos=marker_pos)
         self.app.processEvents()
@@ -409,10 +648,7 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         self.assertEqual("INACTIVE", states["RSI14"])
         self.assertEqual("UNSUPPORTED", states["UNSUPPORTED"])
         self.assertEqual("ERROR", states["ERROR"])
-        joined_lines = "\n".join(canvas.crosshair_value_lines())
-        self.assertIn("[미지원]", joined_lines)
-        self.assertIn("[오류]", joined_lines)
-        self.assertIn("[유효]", joined_lines)
+        self.assertFalse(hasattr(canvas, "crosshair_value_lines"))
 
         x_before = canvas.crosshair_records()["x"]
         canvas.set_time_view(5.0, 20.0)
@@ -498,7 +734,7 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         scale = canvases[0].price_scale()
         marker_pos = QPoint(
             round(canvases[0]._x_for_index(5)),
-            round(scale.plot_top - 12),
+            round(canvases[0]._marker_y(5, "SELL", scale)),
         )
         QTest.mouseClick(canvases[0], Qt.LeftButton, pos=marker_pos)
         self.app.processEvents()

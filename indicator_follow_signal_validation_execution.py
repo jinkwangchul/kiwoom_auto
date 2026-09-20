@@ -12,6 +12,7 @@ from buy_execution_policy import STATUS_READY, evaluate_buy_execution_policy
 
 DEFAULT_VALIDATION_EXECUTION = {
     "schema_version": "1.0",
+    "enabled": False,
     "first_buy_quantity": 1,
     "buy_hoga_mode": "SINGLE",
     "sell_hoga_mode": "SINGLE",
@@ -57,7 +58,24 @@ def normalize_validation_execution_policy(value: Mapping[str, Any] | None) -> di
         if key in source
     })
     policy["schema_version"] = "1.0"
-    policy["first_buy_quantity"] = 1
+    enabled = policy.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("VALIDATION_AVERAGING_ENABLED_INVALID")
+    policy["enabled"] = enabled
+    raw_first_buy_quantity = policy.get("first_buy_quantity", 1)
+    try:
+        first_buy_quantity = (
+            None
+            if isinstance(raw_first_buy_quantity, bool)
+            else int(str(raw_first_buy_quantity).strip())
+        )
+    except (TypeError, ValueError):
+        first_buy_quantity = None
+    if first_buy_quantity is None or first_buy_quantity <= 0:
+        if enabled:
+            raise ValueError("VALIDATION_FIRST_BUY_QUANTITY_INVALID")
+        first_buy_quantity = int(DEFAULT_VALIDATION_EXECUTION["first_buy_quantity"])
+    policy["first_buy_quantity"] = first_buy_quantity
     policy["buy_hoga_mode"] = "SINGLE"
     policy["sell_hoga_mode"] = "SINGLE"
 
@@ -66,23 +84,38 @@ def normalize_validation_execution_policy(value: Mapping[str, Any] | None) -> di
     active_direction = str(policy.get("active_direction") or "").strip().upper()
     active_compare = str(policy.get("active_compare") or "").strip().upper()
     if repeat_mode not in {"ROUND", "BUDGET", "ACTIVE_BUY"}:
-        raise ValueError("VALIDATION_REPEAT_MODE_INVALID")
+        if enabled:
+            raise ValueError("VALIDATION_REPEAT_MODE_INVALID")
+        repeat_mode = str(DEFAULT_VALIDATION_EXECUTION["repeat_mode"])
     if round_operator not in {"ADD", "MULTIPLY"}:
-        raise ValueError("VALIDATION_ROUND_OPERATOR_INVALID")
+        if enabled:
+            raise ValueError("VALIDATION_ROUND_OPERATOR_INVALID")
+        round_operator = str(DEFAULT_VALIDATION_EXECUTION["round_operator"])
     if active_direction not in {"UP", "DOWN", "BOTH"}:
-        raise ValueError("VALIDATION_ACTIVE_DIRECTION_INVALID")
+        if enabled:
+            raise ValueError("VALIDATION_ACTIVE_DIRECTION_INVALID")
+        active_direction = str(DEFAULT_VALIDATION_EXECUTION["active_direction"])
     valid_pair = (
         active_direction in {"UP", "DOWN"} and active_compare in {">=", "<="}
     ) or (
         active_direction == "BOTH" and active_compare in {"WITHIN", "OUTSIDE"}
     )
     if not valid_pair:
-        raise ValueError("VALIDATION_ACTIVE_COMPARATOR_INVALID")
+        if enabled:
+            raise ValueError("VALIDATION_ACTIVE_COMPARATOR_INVALID")
+        active_direction = str(DEFAULT_VALIDATION_EXECUTION["active_direction"])
+        active_compare = str(DEFAULT_VALIDATION_EXECUTION["active_compare"])
 
+    policy["repeat_mode"] = repeat_mode
+    policy["round_operator"] = round_operator
+    policy["active_direction"] = active_direction
+    policy["active_compare"] = active_compare
     for key in ("round_budget_value", "budget_ratio", "active_ratio"):
         number = _number(policy.get(key))
         if number is None or number < 0:
-            raise ValueError(f"{key.upper()}_INVALID")
+            if enabled:
+                raise ValueError(f"{key.upper()}_INVALID")
+            number = float(DEFAULT_VALIDATION_EXECUTION[key])
         policy[key] = number
     return policy
 
@@ -179,7 +212,7 @@ def _repeat_quantity(
         },
         budget_context={
             "starting_budget_type": "QUANTITY",
-            "starting_quantity": 1,
+            "starting_quantity": int(policy["first_buy_quantity"]),
             "base_buy_budget": base_buy_cost,
             "previous_buy_budget": previous_buy_cost,
             "position_quantity": holding_quantity,
@@ -230,6 +263,8 @@ class ValidationVirtualPositionTracker:
         self.quantity_series: list[int] = []
         self.contributor_series: list[list[int]] = []
         self._processed_through = -1
+        self._signals_by_index: dict[int, set[str]] = {}
+        self._indexed_entry_count = 0
 
     @staticmethod
     def _signals_at(
@@ -250,6 +285,52 @@ class ValidationVirtualPositionTracker:
                 signals.add(signal)
         return signals
 
+    @staticmethod
+    def _build_signal_index(
+        candles: list[dict[str, Any]],
+        entries: list[Any],
+    ) -> dict[int, set[str]]:
+        signals_by_index: dict[int, set[str]] = {}
+        for entry in entries:
+            entry_index = getattr(entry, "evaluation_index", None)
+            if (
+                isinstance(entry_index, bool)
+                or not isinstance(entry_index, int)
+                or not 0 <= entry_index < len(candles)
+            ):
+                continue
+            signal = str(getattr(entry, "signal", "") or "").upper()
+            if signal not in {"BUY", "SELL"}:
+                continue
+            expected_time = str(candles[entry_index].get("time") or "")
+            if expected_time != str(getattr(entry, "evaluation_time", "") or ""):
+                continue
+            signals_by_index.setdefault(entry_index, set()).add(signal)
+        return signals_by_index
+
+    def _index_new_entries(
+        self,
+        candles: list[dict[str, Any]],
+        entries: list[Any],
+    ) -> None:
+        start = min(self._indexed_entry_count, len(entries))
+        for entry in entries[start:]:
+            entry_index = getattr(entry, "evaluation_index", None)
+            if (
+                isinstance(entry_index, bool)
+                or not isinstance(entry_index, int)
+                or not 0 <= entry_index < len(candles)
+            ):
+                continue
+            signal = str(getattr(entry, "signal", "") or "").upper()
+            if signal not in {"BUY", "SELL"}:
+                continue
+            expected_time = str(candles[entry_index].get("time") or "")
+            if expected_time != str(getattr(entry, "evaluation_time", "") or ""):
+                continue
+            self._signals_by_index.setdefault(entry_index, set()).add(signal)
+        self._indexed_entry_count = len(entries)
+
     def _record_pre_index_state(self) -> None:
         self.average_price_series.append(self.average_buy_price)
         self.quantity_series.append(self.holding_quantity)
@@ -260,9 +341,15 @@ class ValidationVirtualPositionTracker:
         index: int,
         candles: list[dict[str, Any]],
         entries: list[Any],
+        *,
+        signals_by_index: Mapping[int, set[str]] | None = None,
     ) -> None:
         candle = candles[index]
-        signals = self._signals_at(index, candles, entries)
+        signals = (
+            set(signals_by_index.get(index, ()))
+            if signals_by_index is not None
+            else self._signals_at(index, candles, entries)
+        )
         fill_price = validation_virtual_fill_price(candle)
         if "SELL" in signals:
             if (
@@ -311,9 +398,12 @@ class ValidationVirtualPositionTracker:
             self.skipped.append((index, "VALIDATION_VIRTUAL_FILL_PRICE_UNAVAILABLE"))
             return
 
-        if self.holding_quantity == 0:
+        if self.policy["enabled"] is not True:
             quantity = 1
-            reason = "FIRST_BUY_ONE_SHARE"
+            reason = "AVERAGING_DISABLED_ONE_SHARE"
+        elif self.holding_quantity == 0:
+            quantity = int(self.policy["first_buy_quantity"])
+            reason = "FIRST_BUY_STARTING_QUANTITY"
         else:
             quantity, reason = _repeat_quantity(
                 policy=self.policy,
@@ -355,31 +445,47 @@ class ValidationVirtualPositionTracker:
     ) -> dict[str, Any]:
         return self.context_for(evaluation_index, side, candles, prior_entries)
 
-    def context_for(
+    def _prepare_context(
         self,
         evaluation_index: int,
-        side: str,
         candles: list[dict[str, Any]],
         prior_entries: list[Any],
-    ) -> dict[str, Any]:
+    ) -> None:
         if (
             isinstance(evaluation_index, bool)
             or not isinstance(evaluation_index, int)
             or not 0 <= evaluation_index < len(candles)
         ):
             raise ValueError("evaluation_index is outside candles")
+        self._index_new_entries(candles, prior_entries)
         while self._processed_through < evaluation_index - 1:
             next_index = self._processed_through + 1
             if len(self.average_price_series) <= next_index:
                 self._record_pre_index_state()
-            self._apply_index(next_index, candles, prior_entries)
+            self._apply_index(
+                next_index,
+                candles,
+                prior_entries,
+                signals_by_index=self._signals_by_index,
+            )
             self._processed_through = next_index
         if len(self.average_price_series) <= evaluation_index:
             self._record_pre_index_state()
-        return {
-            "average_price_series": list(
-                self.average_price_series[: evaluation_index + 1]
-            ),
+
+    def _context_payload(
+        self,
+        evaluation_index: int,
+        side: str,
+        *,
+        detached_series: bool,
+    ) -> dict[str, Any]:
+        average_series = (
+            list(self.average_price_series[: evaluation_index + 1])
+            if detached_series
+            else self.average_price_series
+        )
+        payload = {
+            "average_price_series": average_series,
             "average_price": self.average_buy_price,
             "validation_trace_context": {
                 "side": str(side or "").upper(),
@@ -390,6 +496,37 @@ class ValidationVirtualPositionTracker:
                 "average_source": "VALIDATION_VIRTUAL_POSITION_WEIGHTED_OHLC4",
             },
         }
+        if not detached_series:
+            payload["_indicator_follow_average_price_series_normalized"] = True
+        return payload
+
+    def context_for(
+        self,
+        evaluation_index: int,
+        side: str,
+        candles: list[dict[str, Any]],
+        prior_entries: list[Any],
+    ) -> dict[str, Any]:
+        self._prepare_context(evaluation_index, candles, prior_entries)
+        return self._context_payload(
+            evaluation_index,
+            side,
+            detached_series=True,
+        )
+
+    def context_for_fast(
+        self,
+        evaluation_index: int,
+        side: str,
+        candles: list[dict[str, Any]],
+        prior_entries: list[Any],
+    ) -> dict[str, Any]:
+        self._prepare_context(evaluation_index, candles, prior_entries)
+        return self._context_payload(
+            evaluation_index,
+            side,
+            detached_series=False,
+        )
 
     def finalize(
         self,
@@ -397,12 +534,18 @@ class ValidationVirtualPositionTracker:
         entries: list[Any],
     ) -> ValidationExecutionSimulation:
         if candles:
+            signals_by_index = self._build_signal_index(candles, entries)
             last_index = len(candles) - 1
             while self._processed_through < last_index:
                 next_index = self._processed_through + 1
                 if len(self.average_price_series) <= next_index:
                     self._record_pre_index_state()
-                self._apply_index(next_index, candles, entries)
+                self._apply_index(
+                    next_index,
+                    candles,
+                    entries,
+                    signals_by_index=signals_by_index,
+                )
                 self._processed_through = next_index
         return ValidationExecutionSimulation(
             tuple(self.fills),

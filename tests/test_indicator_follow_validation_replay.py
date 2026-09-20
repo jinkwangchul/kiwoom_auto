@@ -141,6 +141,31 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
     def _none_signal() -> RoutineSignal:
         return RoutineSignal(None, "none", [], [], -1, 0)
 
+    def test_display_count_keeps_warmup_candles_outside_result_window(self) -> None:
+        evaluator = Mock(return_value=self._none_signal())
+        result = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=evaluator,
+        ).evaluate(
+            self._historical(closes=(10, 11, 12, 13, 14)),
+            display_count=2,
+        )
+
+        self.assertTrue(result.ok, result)
+        snapshot = result.snapshot
+        self.assertEqual(3, snapshot.evaluated_start_index)
+        self.assertEqual(4, snapshot.evaluated_end_index)
+        self.assertEqual(5, len(snapshot.to_candles()))
+        self.assertEqual(
+            ["20260913090300", "20260913090400"],
+            [candle["time"] for candle in snapshot.to_display_candles()],
+        )
+        self.assertEqual(4, len(snapshot.to_entries()))
+        display_entries = snapshot.to_display_entries()
+        self.assertEqual(4, len(display_entries))
+        self.assertEqual({0, 1}, {entry.evaluation_index for entry in display_entries})
+        self.assertEqual(4, evaluator.call_count)
+
     def test_projection_is_chronological_normalized_and_deterministic(self) -> None:
         rows = [
             {
@@ -412,6 +437,7 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
                 "거래량": "1",
             })
         tracker = ValidationVirtualPositionTracker({
+            "enabled": True,
             "repeat_mode": "BUDGET",
             "budget_ratio": 2.0,
         })
@@ -913,6 +939,79 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
                 getattr(reference.snapshot, field),
                 getattr(optimized.snapshot, field),
             )
+
+    def test_signal_scan_matches_detailed_prefix_replay(self) -> None:
+        historical = self._historical(
+            closes=tuple(10 + (index % 7) for index in range(60))
+        )
+        replay = ValidationHistoricalReplay(self._session())
+        detailed = replay.evaluate(historical)
+        scanned = replay.scan_signal_entries(historical)
+
+        self.assertTrue(detailed.ok, detailed)
+        expected = [
+            entry.to_dict()
+            for entry in detailed.snapshot.to_entries()
+            if entry.signal == entry.evaluation_side
+        ]
+        self.assertEqual(expected, [entry.to_dict() for entry in scanned])
+
+    def test_signal_scan_price_box_is_prefix_equivalent_and_future_invariant(self) -> None:
+        rules = deepcopy(self.rules)
+        rules["indicators"] = {
+            "price_box": {"period": 5},
+            "moving_averages": [5, 20],
+        }
+        rules["buy"]["groups"][0]["conditions"] = [{
+            "enabled": True,
+            "not": False,
+            "target": "CLOSE",
+            "operator": ">=",
+            "compare_target": "PRICE_BOX_LOWER",
+            "value": 0.0,
+        }]
+        settings = ValidationSettingsSnapshot(rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, settings, 3),
+            operation_active_reader=Mock(return_value=False),
+        )
+        closes = tuple(
+            100 + ((index * 7) % 17) - (index % 5)
+            for index in range(70)
+        )
+        historical = self._historical(closes=closes)
+        replay = ValidationHistoricalReplay(session)
+        detailed = replay.evaluate(historical)
+        scanned = replay.scan_signal_entries(historical)
+
+        self.assertTrue(detailed.ok, detailed)
+        def marker_identity(entry):
+            return (
+                entry.evaluation_side,
+                entry.evaluation_index,
+                entry.evaluation_time,
+                entry.signal,
+                entry.signal_index,
+                entry.signal_time,
+                entry.delay_bar,
+            )
+
+        expected = [
+            marker_identity(entry)
+            for entry in detailed.snapshot.to_entries()
+            if entry.signal == entry.evaluation_side
+        ]
+        self.assertEqual(expected, [marker_identity(entry) for entry in scanned])
+
+        extended = self._historical(closes=closes + (1000, 1, 900, 2, 800))
+        extended_scan = replay.scan_signal_entries(extended)
+        cutoff_time = detailed.snapshot.to_candles()[-1]["time"]
+        prefix_entries = [
+            marker_identity(entry)
+            for entry in extended_scan
+            if entry.evaluation_time <= cutoff_time
+        ]
+        self.assertEqual(expected, prefix_entries)
 
     def test_default_replay_builds_base_series_once_per_eligible_prefix(self) -> None:
         historical = self._historical(closes=tuple(range(10, 20)))

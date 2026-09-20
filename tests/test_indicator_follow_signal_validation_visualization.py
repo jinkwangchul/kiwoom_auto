@@ -4,6 +4,8 @@ from __future__ import annotations
 from copy import deepcopy
 import unittest
 
+from engines.condition_engine import evaluate_condition
+from engines.indicator_engine import bollinger_band, close_prices
 from indicator_follow_signal_validation_presentation import (
     signal_evidence_records_for_entry,
 )
@@ -21,6 +23,7 @@ from indicator_follow_signal_validation_visualization import (
     active_filter_identities_for_entry,
     build_validation_filter_universe,
     build_validation_indicator_cache,
+    required_validation_warmup_bars,
 )
 from routines.지표추종매매.routine_validation_replay import ValidationReplayEntry
 
@@ -303,7 +306,84 @@ def _signal_entry():
     )
 
 
+class _ConditionObserver:
+    def __init__(self):
+        self.payloads = []
+
+    def observe_condition(self, payload):
+        self.payloads.append(deepcopy(payload))
+
+
 class ValidationVisualizationDataTest(unittest.TestCase):
+    def test_required_warmup_uses_largest_configured_filter_period(self):
+        rules = _rules()
+        condition = {
+            "enabled": True,
+            "target": "CLOSE",
+            "operator": "CROSS_UP",
+            "compare_target": "MA200",
+        }
+        rules["buy"]["filters"]["moving_average"]["conditions"].append(
+            deepcopy(condition)
+        )
+        rules["validation_visualization_rules"]["buy"]["filters"][
+            "moving_average"
+        ]["conditions"].append(deepcopy(condition))
+
+        self.assertEqual(200, required_validation_warmup_bars(rules))
+
+    def test_operator_visible_labels_do_not_expose_engine_tokens(self):
+        labels = {
+            str(descriptor.parameters.get("criterion_label") or "")
+            for descriptor in build_validation_filter_universe(_rules())
+        }
+        self.assertIn("60이평 상향돌파", labels)
+        self.assertIn("OCR 상승전환", labels)
+        self.assertIn("OCR 하락전환", labels)
+        self.assertIn("MACD 0 이하", labels)
+        self.assertIn("RSI(14) 45 이하", labels)
+        self.assertIn("평단 대비 +0.25% 이상", labels)
+        self.assertIn("가격박스 하단 이상", labels)
+        self.assertIn("볼린저 하단 이상", labels)
+        self.assertIn("평단 주문가 대비 +0.5% 이상", labels)
+        joined = "\n".join(labels)
+        for token in (
+            "CLOSE",
+            "CROSS_UP",
+            "CROSS_DOWN",
+            "TURN_UP",
+            "TURN_DOWN",
+            "AVG_PRICE",
+            "PRICE_BOX",
+            "BOLLINGER_",
+            "OSC ",
+            "SIGNAL",
+        ):
+            self.assertNotIn(token, joined)
+
+    def test_macd_caption_preserves_reversed_operand_direction(self):
+        rules = _rules()
+        actual = rules["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"][0]
+        visual = rules["validation_visualization_rules"]["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"][0]
+        for condition in (actual, visual):
+            condition.update({
+                "target": "SIGNAL",
+                "compare_target": "MACD",
+                "operator": "CROSS_UP",
+            })
+            condition.pop("value", None)
+
+        descriptor = next(
+            item
+            for item in build_validation_filter_universe(rules)
+            if item.family == FAMILY_MACD_SIGNAL
+        )
+
+        self.assertEqual(
+            "시그널 MACD 상향돌파",
+            descriptor.parameters["criterion_label"],
+        )
+
     def test_universe_contains_all_eight_families_and_separate_ma_parameters(self):
         descriptors = build_validation_filter_universe(_rules())
         families = {descriptor.family for descriptor in descriptors}
@@ -343,6 +423,180 @@ class ValidationVisualizationDataTest(unittest.TestCase):
             lower,
         )
 
+    def test_buy_ma_compare_target_uses_engine_period_fallback(self):
+        rules = _rules()
+        condition = {
+            "enabled": True,
+            "target": "CLOSE",
+            "operator": "CROSS_UP",
+            "compare_target": "MA",
+            "period": 20,
+        }
+        rules["validation_visualization_rules"]["buy"]["filters"]["moving_average"]["conditions"] = [
+            deepcopy(condition)
+        ]
+        rules["buy"]["filters"]["moving_average"]["conditions"] = [
+            deepcopy(condition)
+        ]
+        descriptor = next(
+            item
+            for item in build_validation_filter_universe(rules)
+            if item.family == FAMILY_MOVING_AVERAGE and "BUY" in item.sides
+        )
+        self.assertEqual(("MA20",), descriptor.series_keys)
+        candles = _candles(40)
+        cache = build_validation_indicator_cache(
+            candles,
+            rules,
+            (descriptor,),
+        )
+        self.assertEqual(
+            40,
+            len(cache.values_for(descriptor.identity, "MA20")),
+        )
+
+    def test_bollinger_projects_only_the_effective_selected_criterion_line(self):
+        rules = _rules()
+        condition = rules["validation_visualization_rules"]["buy"]["filters"]["bollinger"]["conditions"][0]
+        condition.update({
+            "compare_target": "BOLLINGER_LOWER",
+            "operator": "<=",
+            "value": 0.5,
+            "signed_percent_offset": True,
+        })
+        rules["buy"]["filters"]["bollinger"]["conditions"][0] = deepcopy(condition)
+        descriptors = build_validation_filter_universe(rules)
+        descriptor = next(
+            item for item in descriptors
+            if item.family == FAMILY_BOLLINGER and "BUY" in item.sides
+        )
+        self.assertEqual(("CRITERION",), descriptor.series_keys)
+        self.assertNotIn("BOLLINGER_MIDDLE", descriptor.series_keys)
+        self.assertEqual("BOLLINGER_LOWER", descriptor.parameters["condition"]["compare_target"])
+        self.assertEqual(0.5, descriptor.parameters["condition"]["value"])
+        self.assertEqual(
+            "볼린저 하단 +0.5% 이하",
+            descriptor.parameters["criterion_label"],
+        )
+
+        candles = _candles(40)
+        cache = build_validation_indicator_cache(candles, rules, descriptors)
+        criterion = cache.values_for(descriptor.identity, "CRITERION")
+        self.assertEqual(40, len(criterion))
+
+        lower, _middle, _upper = bollinger_band(close_prices(candles), 20, 2.0)
+        for index, base in enumerate(lower):
+            if base is None:
+                self.assertIsNone(criterion[index])
+            else:
+                self.assertAlmostEqual(base * 1.005, criterion[index])
+
+    def test_bollinger_reference_line_matches_engine_right_operand(self):
+        rules = _rules()
+        condition = {
+            "enabled": True,
+            "target": "CLOSE",
+            "operator": "<=",
+            "compare_target": "BOLLINGER_LOWER",
+            "value": 2.0,
+        }
+        rules["validation_visualization_rules"]["buy"]["filters"]["bollinger"]["conditions"] = [
+            deepcopy(condition)
+        ]
+        rules["buy"]["filters"]["bollinger"]["conditions"] = [
+            deepcopy(condition)
+        ]
+        descriptors = build_validation_filter_universe(rules)
+        descriptor = next(
+            item for item in descriptors
+            if item.family == FAMILY_BOLLINGER and "BUY" in item.sides
+        )
+        candles = _candles(40)
+        cache = build_validation_indicator_cache(
+            candles,
+            rules,
+            descriptors,
+        )
+        criterion = cache.values_for(descriptor.identity, "CRITERION")
+
+        closes = close_prices(candles)
+        lower, _middle, _upper = bollinger_band(closes, 20, 2.0)
+        index = 30
+        observer = _ConditionObserver()
+        evaluate_condition(
+            condition,
+            {
+                "CLOSE": closes,
+                "BOLLINGER_LOWER": lower,
+            },
+            index,
+            observer,
+            "buy.filters.bollinger.conditions[0]",
+        )
+        self.assertEqual(1, len(observer.payloads))
+        engine_right = observer.payloads[0]["right_operand"]["value"]
+        self.assertIsNotNone(engine_right)
+        self.assertAlmostEqual(engine_right, criterion[index])
+        self.assertAlmostEqual(lower[index] * 0.98, criterion[index])
+
+    def test_rsi_thresholds_are_condition_specific_reference_lines(self):
+        rules = _rules()
+        buy_condition = rules["validation_visualization_rules"]["buy"]["filters"]["rsi"]["conditions"][0]
+        buy_condition.update({
+            "target": "RSI",
+            "period": 14,
+            "operator": "<=",
+            "value": 30.0,
+        })
+        rules["buy"]["filters"]["rsi"]["conditions"][0] = deepcopy(buy_condition)
+
+        sell_rsi = next(
+            condition
+            for condition in rules["validation_visualization_rules"]["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"]
+            if condition.get("target") == "RSI"
+        )
+        sell_rsi["period"] = 14
+        sell_rsi["operator"] = ">="
+        sell_rsi["value"] = 70.0
+        actual_sell_rsi = next(
+            condition
+            for condition in rules["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"]
+            if condition.get("target") == "RSI"
+        )
+        actual_sell_rsi.update(deepcopy(sell_rsi))
+
+        descriptors = [
+            item
+            for item in build_validation_filter_universe(rules)
+            if item.family == FAMILY_RSI
+        ]
+        self.assertEqual(2, len(descriptors))
+        self.assertEqual(
+            {30.0, 70.0},
+            {
+                float(item.parameters["condition"]["threshold"])
+                for item in descriptors
+            },
+        )
+        self.assertTrue(all(
+            item.series_keys == ("RSI", "CRITERION")
+            for item in descriptors
+        ))
+
+        candles = _candles(40)
+        cache = build_validation_indicator_cache(
+            candles,
+            rules,
+            tuple(descriptors),
+        )
+        for descriptor in descriptors:
+            threshold = float(descriptor.parameters["condition"]["threshold"])
+            criterion = cache.values_for(descriptor.identity, "CRITERION")
+            self.assertEqual(
+                tuple(threshold for _ in candles),
+                criterion,
+            )
+
     def test_buy_execution_price_compare_is_visible_but_marked_unsupported(self):
         descriptors = build_validation_filter_universe(_rules())
         price_descriptors = [
@@ -351,16 +605,20 @@ class ValidationVisualizationDataTest(unittest.TestCase):
         ]
         buy_only = next(
             item for item in price_descriptors
-            if "BUY" in item.sides and "VIRTUAL_FILL_PRICE" in item.series_keys
+            if "BUY" in item.sides
+            and item.parameters["condition"]["compare_target"] == "ORDER_PRICE"
         )
+        self.assertIn("CRITERION", buy_only.series_keys)
         self.assertIn("BUY", buy_only.unsupported_sides)
         self.assertNotIn("BUY", buy_only.supported_sides)
         self.assertIn("VALIDATION_FILTER_NOT_EVALUATED", buy_only.unavailable_reason)
 
         sell = next(
             item for item in price_descriptors
-            if "SELL" in item.sides and "AVG_PRICE" in item.series_keys
+            if "SELL" in item.sides
+            and item.parameters["condition"]["compare_target"] == "AVG_PRICE"
         )
+        self.assertIn("CRITERION", sell.series_keys)
         self.assertIn("SELL", sell.supported_sides)
 
     def test_structured_evidence_maps_only_surviving_or_branch_to_identity(self):
@@ -438,10 +696,10 @@ class ValidationVisualizationDataTest(unittest.TestCase):
             if item.family == FAMILY_PRICE_COMPARISON
             and "SELL" in item.sides
         )
-        avg = cache.values_for(sell_gap.identity, "AVG_PRICE")
-        self.assertIsNone(avg[30])
-        self.assertIsNotNone(avg[31])
-        self.assertIsNotNone(avg[41])
+        criterion = cache.values_for(sell_gap.identity, "CRITERION")
+        self.assertIsNone(criterion[30])
+        self.assertIsNotNone(criterion[31])
+        self.assertIsNotNone(criterion[41])
 
     def test_price_box_prefix_values_do_not_change_when_future_candles_are_extreme(self):
         rules = _rules()
@@ -463,15 +721,21 @@ class ValidationVisualizationDataTest(unittest.TestCase):
             item for item in descriptors
             if item.family == FAMILY_PRICE_BOX
         )
-        for channel in (
-            "PRICE_BOX_LOWER",
-            "PRICE_BOX_MIDDLE",
-            "PRICE_BOX_UPPER",
-        ):
-            self.assertEqual(
-                base_cache.values_for(price_box_descriptor.identity, channel),
-                extended_cache.values_for(price_box_descriptor.identity, channel)[:50],
-            )
+        self.assertEqual(("CRITERION",), price_box_descriptor.series_keys)
+        base_criterion = base_cache.values_for(
+            price_box_descriptor.identity,
+            "CRITERION",
+        )
+        extended_criterion = extended_cache.values_for(
+            price_box_descriptor.identity,
+            "CRITERION",
+        )
+        self.assertEqual(50, len(base_criterion))
+        self.assertEqual(60, len(extended_criterion))
+        self.assertEqual(
+            base_criterion,
+            extended_criterion[:50],
+        )
 
 
 if __name__ == "__main__":

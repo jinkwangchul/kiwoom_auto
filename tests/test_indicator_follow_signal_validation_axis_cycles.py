@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -383,6 +384,328 @@ class StaticValidationVisualizationGeometryTest(unittest.TestCase):
             price_bottoms.append(canvas.price_scale().plot_bottom)
         self.assertEqual([248, 248, 248], price_bottoms)
 
+    def test_candle_render_is_clipped_to_price_plot_before_lower_panes(self):
+        candles = [{
+            "time": "20260918090000",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 50.0,
+            "close": 99.0,
+            "volume": 1,
+        }]
+        descriptor = self._descriptor(
+            "RSI14",
+            FAMILY_RSI,
+            LOWER_AXIS,
+            ("RSI",),
+            '{"period":14}',
+        )
+        cache = ValidationIndicatorSeriesCache(
+            1,
+            (("RSI14", "RSI", (None,)),),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(descriptor,),
+            visualization_cache=cache,
+        )
+        canvas.resize(800, 500)
+        canvas.set_time_view(0.0, 1.0)
+        canvas.set_price_view(98.0, 102.0)
+        canvas.show()
+        self.widgets.append(canvas)
+        self.app.processEvents()
+
+        scale = canvas.price_scale()
+        pane = canvas.lower_pane_records()[0]
+        self.assertLess(scale.plot_bottom, pane["top"])
+        self.assertGreater(
+            scale.y_for_price(candles[0]["low"]),
+            pane["top"],
+        )
+
+        pixmap = QPixmap(canvas.size())
+        canvas.render(pixmap)
+        image = pixmap.toImage()
+        candle_x = round(canvas._x_for_index(0))
+        lower_y = round((pane["top"] + pane["bottom"]) / 2)
+        reference_x = min(canvas.width() - canvas._RIGHT - 4, candle_x + 40)
+
+        self.assertEqual(
+            image.pixelColor(reference_x, lower_y),
+            image.pixelColor(candle_x, lower_y),
+        )
+
+    def test_offscreen_marker_does_not_paint_or_hit_but_in_bounds_marker_does(self):
+        candles = [
+            {
+                "time": "20260918090000",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 97.0,
+                "close": 99.0,
+                "volume": 1,
+            },
+            {
+                "time": "20260918090100",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 98.25,
+                "close": 100.0,
+                "volume": 1,
+            },
+        ]
+        markers = [
+            {
+                "side": "BUY",
+                "evaluation_index": 0,
+                "evaluation_time": candles[0]["time"],
+                "tooltip": "offscreen BUY",
+            },
+            {
+                "side": "BUY",
+                "evaluation_index": 1,
+                "evaluation_time": candles[1]["time"],
+                "tooltip": "visible BUY",
+            },
+        ]
+        descriptor = self._descriptor(
+            "RSI14",
+            FAMILY_RSI,
+            LOWER_AXIS,
+            ("RSI",),
+            '{"period":14}',
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            (("RSI14", "RSI", (None, None)),),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            markers,
+            visualization_descriptors=(descriptor,),
+            visualization_cache=cache,
+        )
+        canvas.resize(800, 500)
+        canvas.set_time_view(0.0, 2.0)
+        canvas.set_price_view(98.0, 102.0)
+        canvas.show()
+        self.widgets.append(canvas)
+        self.app.processEvents()
+
+        scale = canvas.price_scale()
+        pane = canvas.lower_pane_records()[0]
+        offscreen_x = canvas._x_for_index(0)
+        offscreen_y = canvas._marker_y(0, "BUY", scale)
+        visible_x = canvas._x_for_index(1)
+        visible_y = canvas._marker_y(1, "BUY", scale)
+        self.assertGreater(offscreen_y, scale.plot_bottom)
+        self.assertTrue(pane["top"] <= offscreen_y <= pane["bottom"])
+        self.assertTrue(scale.plot_top <= visible_y <= scale.plot_bottom)
+        self.assertLessEqual(scale.plot_bottom - visible_y, 7)
+
+        pixmap = QPixmap(canvas.size())
+        canvas.render(pixmap)
+        image = pixmap.toImage()
+        reference_x = round((offscreen_x + visible_x) / 2)
+        self.assertEqual(
+            image.pixelColor(reference_x, round(offscreen_y)),
+            image.pixelColor(round(offscreen_x), round(offscreen_y)),
+        )
+        self.assertNotEqual(
+            image.pixelColor(reference_x, round(visible_y)),
+            image.pixelColor(round(visible_x), round(visible_y)),
+        )
+
+        self.assertIsNone(canvas._marker_at(offscreen_x, offscreen_y))
+        self.assertIsNone(canvas._marker_at(visible_x, scale.plot_bottom + 1))
+        self.assertEqual(
+            markers[1],
+            canvas._marker_at(visible_x, visible_y),
+        )
+
+    def test_ocr_osc_uses_histogram_while_other_lower_series_remain_lines(self):
+        canvas = self._canvas(
+            (
+                FAMILY_RSI,
+                FAMILY_MACD_SIGNAL,
+                FAMILY_OCR_OSC,
+            ),
+            include_price=False,
+        )
+        canvas.show()
+        self.app.processEvents()
+        pixmap = QPixmap(canvas.size())
+
+        self.assertTrue(hasattr(canvas, "_draw_series_histogram"))
+        with patch.object(
+            canvas,
+            "_draw_series_histogram",
+            wraps=canvas._draw_series_histogram,
+        ) as histogram, patch.object(
+            canvas,
+            "_draw_series_line",
+            wraps=canvas._draw_series_line,
+        ) as line:
+            canvas._static_chart_cache = None
+            canvas._static_chart_cache_key = None
+            canvas.render(pixmap)
+
+        self.assertEqual(1, histogram.call_count)
+        self.assertEqual(3, line.call_count)
+        self.assertFalse(pixmap.isNull())
+
+        pane = next(
+            item
+            for item in canvas.lower_pane_records()
+            if item["family"] == FAMILY_OCR_OSC
+        )
+        scale = canvas._lower_scale(
+            FAMILY_OCR_OSC,
+            int(pane["top"]),
+            int(pane["bottom"]),
+        )
+        zero_y = scale.y_for_price(0.0)
+        self.assertGreater(scale.y_for_price(-4.0), zero_y)
+        self.assertLess(scale.y_for_price(4.0), zero_y)
+
+        image = pixmap.toImage()
+        half_bar = canvas._candle_body_width() / 2
+        rendered_colors = {}
+        for index, value in ((0, -4.0), (8, 4.0)):
+            x = round(canvas._x_for_index(index))
+            value_y = scale.y_for_price(value)
+            y = round((zero_y + value_y) / 2)
+            outside_x = round(x + half_bar + 1)
+            center_color = image.pixelColor(x, y)
+            rendered_colors[value] = center_color.name()
+            self.assertNotEqual(
+                center_color,
+                image.pixelColor(outside_x, y),
+            )
+        self.assertEqual("#3b82f6", rendered_colors[-4.0])
+        self.assertEqual("#fb7185", rendered_colors[4.0])
+
+    def test_legend_swatches_match_rendered_line_pens_and_exclude_ocr_histogram(self):
+        canvas = self._canvas(
+            (
+                FAMILY_RSI,
+                FAMILY_MACD_SIGNAL,
+                FAMILY_OCR_OSC,
+            )
+        )
+
+        def assert_legend_matches_rendered_series():
+            records = canvas.legend_records()
+            by_family = {record["family"]: record for record in records}
+            style_by_series = {
+                (record["identity"], record["channel"]): record
+                for record in canvas.visualization_style_records()
+            }
+
+            self.assertEqual(("MA20",), tuple(
+                swatch["channel"]
+                for swatch in by_family[FAMILY_MOVING_AVERAGE]["swatches"]
+            ))
+            self.assertEqual(("RSI",), tuple(
+                swatch["channel"]
+                for swatch in by_family[FAMILY_RSI]["swatches"]
+            ))
+            self.assertEqual(("MACD", "SIGNAL"), tuple(
+                swatch["channel"]
+                for swatch in by_family[FAMILY_MACD_SIGNAL]["swatches"]
+            ))
+            self.assertEqual((), by_family[FAMILY_OCR_OSC]["swatches"])
+
+            for record in records:
+                for swatch in record["swatches"]:
+                    style = style_by_series[(record["identity"], swatch["channel"])]
+                    self.assertEqual(style["color"], swatch["color"])
+                    self.assertEqual(style["alpha"], swatch["alpha"])
+                    self.assertEqual(style["pen_width"], swatch["pen_width"])
+                    self.assertEqual(style["pen_style"], swatch["pen_style"])
+
+        assert_legend_matches_rendered_series()
+
+        marker_key = (0, "BUY")
+        canvas._visualization_active_by_marker[marker_key] = tuple(
+            descriptor.identity
+            for descriptor in canvas._visualization_descriptors
+        )
+        canvas._set_hover_marker_key(marker_key)
+        self.assertTrue(all(
+            record["state"] == "ACTIVE"
+            for record in canvas.visualization_style_records()
+        ))
+        assert_legend_matches_rendered_series()
+
+        canvas._visualization_active_by_marker[marker_key] = ()
+        self.assertTrue(all(
+            record["state"] == "INACTIVE"
+            for record in canvas.visualization_style_records()
+        ))
+        assert_legend_matches_rendered_series()
+
+    def test_price_legend_paints_actual_series_color_swatch(self):
+        canvas = self._canvas(())
+        canvas.show()
+        self.app.processEvents()
+
+        record = next(
+            item
+            for item in canvas.legend_records()
+            if item["family"] == FAMILY_MOVING_AVERAGE
+        )
+        expected_color = record["swatches"][0]["color"]
+        scale = canvas.price_scale()
+        pixmap = QPixmap(canvas.size())
+        canvas.render(pixmap)
+        image = pixmap.toImage()
+
+        swatch_left = round(canvas.plot_left + 4)
+        swatch_center_y = round(
+            scale.plot_top + 2 + (QFontMetrics(canvas.font()).height() + 2) / 2
+        )
+        rendered = {
+            image.pixelColor(x, y).name()
+            for x in range(swatch_left, swatch_left + 13)
+            for y in range(swatch_center_y - 2, swatch_center_y + 3)
+        }
+        self.assertIn(expected_color, rendered)
+
+    def test_ocr_criterion_line_gets_only_its_actual_line_swatch(self):
+        candles = _candles([100.0 + index for index in range(10)])
+        descriptor = self._descriptor(
+            "OCR_LIMIT",
+            FAMILY_OCR_OSC,
+            LOWER_AXIS,
+            ("OSC", "CRITERION"),
+            '{"criterion_label":"OCR 0 이상","fast":12,"signal":9,"slow":26}',
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            (
+                (descriptor.identity, "OSC", tuple(float(index - 5) for index in range(10))),
+                (descriptor.identity, "CRITERION", tuple(0.0 for _ in candles)),
+            ),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(descriptor,),
+            visualization_cache=cache,
+        )
+        self.widgets.append(canvas)
+
+        record = canvas.legend_records()[0]
+
+        self.assertEqual("OCR 0 이상", record["caption"])
+        self.assertEqual(
+            ("CRITERION",),
+            tuple(swatch["channel"] for swatch in record["swatches"]),
+        )
+
     def test_price_overlay_expands_price_axis_and_static_series_render(self):
         canvas = self._canvas((FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC))
         scale = canvas.price_scale()
@@ -445,7 +768,7 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
 
         records = axis.price_axis_records()
         self.assertEqual(5, len(records))
-        self.assertEqual("1,519,902", records[0]["label"])
+        self.assertEqual("1,509,902", records[0]["label"])
         widest = max(
             QFontMetrics(axis.font()).horizontalAdvance(record["label"])
             for record in records
@@ -470,6 +793,10 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
         canvas.set_time_view(50.0, 100.0)
         self.app.processEvents()
 
+        self.assertEqual(
+            [record["label"] for record in records],
+            [record["label"] for record in axis.price_axis_records()],
+        )
         self.assertEqual(axis_x_before, axis.mapToGlobal(QPoint(0, 0)).x())
         candle_x_after = canvas.mapToGlobal(
             QPoint(int(canvas._x_for_index(sell_index)), 0)
@@ -489,7 +816,7 @@ class FixedValidationPriceAxisTest(unittest.TestCase):
             markers[0]["tooltip"],
             canvas.marker_tooltip_at(
                 canvas._x_for_index(sell_index),
-                scale.plot_top - 12,
+                canvas._marker_y(sell_index, "SELL", scale),
             ),
         )
         canvas.set_selected_index(sell_index)
