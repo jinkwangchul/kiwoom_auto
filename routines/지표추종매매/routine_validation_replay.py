@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from candle_timeframe_aggregation import MARKET_BUCKET_ANCHOR, SEOUL_TIMEZONE
 from engines.signal_result import RoutineSignal
+from indicator_follow_validation_timeframe import validation_timeframe_for_request, normalize_validation_timeframe
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
 )
@@ -174,9 +175,10 @@ def _latest_candle_is_forming(
     candle_time: str,
     timeframe_minutes: int,
     *,
+    timeframe_key: str | None = None,
     as_of: datetime | None = None,
 ) -> bool:
-    """Return True only when the latest row is the current Seoul-time bucket."""
+    """Return True when the latest row belongs to a still-forming Validation period."""
     try:
         candle_start = datetime.strptime(candle_time, "%Y%m%d%H%M%S").replace(
             tzinfo=SEOUL_TIMEZONE
@@ -188,10 +190,32 @@ def _latest_candle_is_forming(
         current = current.replace(tzinfo=SEOUL_TIMEZONE)
     else:
         current = current.astimezone(SEOUL_TIMEZONE)
+
+    timeframe = normalize_validation_timeframe(
+        timeframe_key or timeframe_minutes,
+        fallback_minutes=timeframe_minutes,
+    )
+    key = str(timeframe["key"])
+    current_minute = current.hour * 60 + current.minute
+
+    if key == "D1":
+        return (
+            candle_start.date() == current.date()
+            and current_minute < _VALIDATION_REGULAR_SESSION_END_MINUTE
+        )
+    if key == "W1":
+        if candle_start.isocalendar()[:2] != current.isocalendar()[:2]:
+            return False
+        weekday = current.weekday()
+        return weekday < 4 or (
+            weekday == 4
+            and current_minute < _VALIDATION_REGULAR_SESSION_END_MINUTE
+        )
+    if key == "Y1":
+        return candle_start.year == current.year
     if candle_start.date() != current.date():
         return False
 
-    current_minute = current.hour * 60 + current.minute
     anchor_minute = MARKET_BUCKET_ANCHOR.hour * 60 + MARKET_BUCKET_ANCHOR.minute
     if current_minute < anchor_minute or current_minute >= _VALIDATION_REGULAR_SESSION_END_MINUTE:
         return False
@@ -213,7 +237,7 @@ def project_validation_candles(
     *,
     as_of: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Project detached OPT10080 rows into closed chronological Validation candles."""
+    """Project detached broker rows into closed chronological Validation candles."""
     if not isinstance(historical_snapshot, ValidationHistoricalSnapshot):
         raise TypeError("historical_snapshot must be ValidationHistoricalSnapshot")
 
@@ -239,6 +263,7 @@ def project_validation_candles(
     if candles and _latest_candle_is_forming(
         str(candles[-1].get("time") or ""),
         historical_snapshot.timeframe_minutes,
+        timeframe_key=historical_snapshot.timeframe_key,
         as_of=as_of,
     ):
         candles.pop()
@@ -353,6 +378,7 @@ class ValidationReplayEntry:
 class ValidationReplaySnapshot:
     stock: ValidationStockRef
     timeframe_minutes: int
+    timeframe_key: str
     settings_hash: str
     historical_request_id: str
     candle_count: int
@@ -367,6 +393,7 @@ class ValidationReplaySnapshot:
         *,
         stock: ValidationStockRef,
         timeframe_minutes: int,
+        timeframe_key: str | None = None,
         settings_hash: str,
         historical_request_id: str,
         evaluated_start_index: int,
@@ -394,8 +421,13 @@ class ValidationReplaySnapshot:
 
         candles_json = _canonical_json(candles)
         copied_entries = tuple(_copy_entry(entry) for entry in entries)
+        resolved_timeframe = normalize_validation_timeframe(
+            timeframe_key or timeframe_minutes,
+            fallback_minutes=timeframe_minutes,
+        )
         object.__setattr__(self, "stock", stock)
         object.__setattr__(self, "timeframe_minutes", timeframe_minutes)
+        object.__setattr__(self, "timeframe_key", str(resolved_timeframe["key"]))
         object.__setattr__(self, "settings_hash", str(settings_hash or ""))
         object.__setattr__(
             self,
@@ -509,9 +541,14 @@ class ValidationHistoricalReplay:
                 False,
                 reason=REASON_INVALID_HISTORICAL_SNAPSHOT,
             )
+        expected_timeframe = validation_timeframe_for_request(
+            request.settings_snapshot.to_dict(),
+            request.timeframe_minutes,
+        )
         if (
             historical_snapshot.stock != request.stock
             or historical_snapshot.timeframe_minutes != request.timeframe_minutes
+            or historical_snapshot.timeframe_key != str(expected_timeframe["key"])
         ):
             return ValidationReplayResult(
                 False,
@@ -667,6 +704,7 @@ class ValidationHistoricalReplay:
             snapshot = ValidationReplaySnapshot(
                 stock=request.stock,
                 timeframe_minutes=request.timeframe_minutes,
+                timeframe_key=historical_snapshot.timeframe_key,
                 settings_hash=request.settings_snapshot.rules_hash,
                 historical_request_id=historical_snapshot.request_id,
                 evaluated_start_index=start_index,
@@ -697,9 +735,14 @@ class ValidationHistoricalReplay:
         request = self.session.request
         if not isinstance(historical_snapshot, ValidationHistoricalSnapshot):
             raise TypeError("historical_snapshot must be ValidationHistoricalSnapshot")
+        expected_timeframe = validation_timeframe_for_request(
+            request.settings_snapshot.to_dict(),
+            request.timeframe_minutes,
+        )
         if (
             historical_snapshot.stock != request.stock
             or historical_snapshot.timeframe_minutes != request.timeframe_minutes
+            or historical_snapshot.timeframe_key != str(expected_timeframe["key"])
         ):
             raise ValueError("historical snapshot identity mismatch")
 

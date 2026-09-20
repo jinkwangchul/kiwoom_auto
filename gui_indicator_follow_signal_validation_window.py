@@ -59,6 +59,10 @@ from indicator_follow_signal_validation_presentation import (
     chart_operand_label,
     signal_evidence_tooltip,
 )
+from indicator_follow_validation_timeframe import (
+    timeframe_display_label,
+)
+from gui_indicator_follow_timeframe_combo import IndicatorFollowTimeframeComboBox
 from indicator_follow_signal_validation_visualization import (
     FAMILY_MACD_SIGNAL,
     FAMILY_OCR_OSC,
@@ -2830,10 +2834,11 @@ class IndicatorFollowSignalValidationWindow(
 
     _V2_SECTION_HEADER_HEIGHT = 44
     _V2_SECTION_VERTICAL_MARGIN = 6
-    _REFERENCE_CANDLE_COUNT = 100.0
+    _REFERENCE_CANDLE_COUNT = 250.0
     _INITIAL_HISTORICAL_CANDLE_COUNT = 5_000
     _INITIAL_EVALUATION_CANDLE_COUNT = 100
     _MIN_VISIBLE_CANDLE_SPAN = 10.0
+    _MAX_VISIBLE_CANDLE_SPAN = 4_000.0
     _TIME_SCROLL_UNITS_PER_CANDLE = 1000
     _TIME_ZOOM_FACTOR = 1.15
     _PRICE_ZOOM_FACTOR = 1.15
@@ -3335,14 +3340,10 @@ class IndicatorFollowSignalValidationWindow(
         self._recent_stock_row_expanded = False
         self.recent_stock_panel.setVisible(False)
         self.compact_stock_display.set_current_stock(self.stock)
-        self.basic_signal_interval_combo = QComboBox()
-        self.basic_signal_interval_combo.addItems(
-            ["1", "3", "5", "10", "15", "30", "60", "120", "240"]
-        )
+        self.basic_signal_interval_combo = IndicatorFollowTimeframeComboBox()
         self.basic_signal_interval_combo.setCurrentText("5")
-        self.basic_signal_interval_combo.setFixedWidth(60)
+        self.basic_signal_interval_combo.setFixedWidth(72)
         self.basic_signal_interval_combo.setFixedHeight(30)
-        self.basic_signal_interval_combo.setLayoutDirection(Qt.RightToLeft)
         header_row.addWidget(self.basic_toggle_button)
         header_row.addWidget(QLabel("|"))
         header_row.addWidget(self.compact_stock_display)
@@ -3485,7 +3486,8 @@ class IndicatorFollowSignalValidationWindow(
         if candle_count <= 0:
             return 1.0
         minimum_span = min(self._MIN_VISIBLE_CANDLE_SPAN, float(candle_count))
-        return min(float(candle_count), max(minimum_span, float(requested_span)))
+        maximum_span = min(self._MAX_VISIBLE_CANDLE_SPAN, float(candle_count))
+        return min(maximum_span, max(minimum_span, float(requested_span)))
 
     def _maximum_visible_start(self, span: float | None = None) -> float:
         effective_span = (
@@ -4645,6 +4647,7 @@ class IndicatorFollowSignalValidationWindow(
             and isinstance(previous_snapshot, ValidationReplaySnapshot)
             and previous_snapshot.stock == replay_snapshot.stock
             and previous_snapshot.timeframe_minutes == replay_snapshot.timeframe_minutes
+            and previous_snapshot.timeframe_key == replay_snapshot.timeframe_key
             and self.canvas is not None
         ):
             preserved_view_state = self._current_chart_view_state()
@@ -4962,6 +4965,13 @@ class IndicatorFollowSignalValidationWindow(
             buy_cost=cycle.buy_cost,
         )
 
+    def _replay_timeframe_display_text(self) -> str:
+        snapshot = self._replay_snapshot
+        if not isinstance(snapshot, ValidationReplaySnapshot):
+            return "-"
+        key = getattr(snapshot, "timeframe_key", f"M{snapshot.timeframe_minutes}")
+        return f"{timeframe_display_label(key)}\ubd09"
+
     def _refresh_validation_range_results(self) -> None:
         if self._replay_snapshot is None or not self._candles:
             return
@@ -4970,8 +4980,7 @@ class IndicatorFollowSignalValidationWindow(
         if bounds is None:
             self.result_summary_label.setText(
                 f"{self.stock.code} {self.stock.name} | "
-                f"{self._replay_snapshot.timeframe_minutes}분봉 | "
-                f"{len(self._candles)}캔들"
+                f"{self._replay_timeframe_display_text()}"
             )
             self.estimated_return_label.setText("")
             return
@@ -4986,7 +4995,7 @@ class IndicatorFollowSignalValidationWindow(
         candle_count = end - start + 1
         self.result_summary_label.setText(
             f"{self.stock.code} {self.stock.name} | "
-            f"{self._replay_snapshot.timeframe_minutes}분봉 | "
+            f"{self._replay_timeframe_display_text()} | "
             f"{candle_count}캔들 | "
             f"매수신호 {buy_count} | 매도신호 {sell_count}"
         )

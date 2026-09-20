@@ -523,12 +523,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(5_000, window.historical_candle_count)
         self.assertEqual(5_000, len(window._candles))
         self.assertEqual(5_000, window.canvas.candle_count)
-        self.assertEqual(100.0, window.visible_candle_span)
-        self.assertEqual((4900, 5_000), window.canvas._visible_index_bounds())
+        self.assertEqual(250.0, window.visible_candle_span)
+        self.assertEqual((4_750, 5_000), window.canvas._visible_index_bounds())
         self.assertGreater(window.canvas.price_scale().minimum, 4_000)
         self.assertIsNotNone(window.visualization_cache)
         self.assertEqual(5_000, window.visualization_cache.candle_count)
         self.assertGreater(len(window.visualization_cache.series), 0)
+        self.assertNotIn("\ucd1d", window.result_summary_label.text())
+        self.assertNotIn("5000", window.result_summary_label.text())
 
     def test_same_pool_same_timeframe_replay_preserves_user_chart_view(self):
         window = self._window()
@@ -587,14 +589,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             expected.selected_evaluation_index,
             window.selected_evaluation_index,
         )
-        self.assertNotEqual(100.0, window.visible_candle_span)
+        self.assertNotEqual(250.0, window.visible_candle_span)
 
         window.set_historical_candle_pool(pool, chart_candle_count=5_000)
         window.set_replay_snapshot(replay("timeframe-changed-hash", 3))
         self.app.processEvents()
 
-        self.assertEqual(100.0, window.visible_candle_span)
-        self.assertEqual(4_900.0, window.visible_start_index)
+        self.assertEqual(250.0, window.visible_candle_span)
+        self.assertEqual(4_750.0, window.visible_start_index)
         self.assertFalse(window.time_scale_manually_adjusted)
         self.assertFalse(window.price_scale_manually_adjusted)
 
@@ -757,8 +759,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
         self.assertEqual([], runs)
         self.assertEqual(5_000, window.historical_candle_count)
-        self.assertGreater(window.visible_candle_span, 3_000.0)
-        self.assertLessEqual(window.visible_candle_span, 5_000.0)
+        self.assertEqual(4_000.0, window.visible_candle_span)
 
     def test_warmup_history_is_hidden_but_first_display_ma_is_continuous(self):
         rules = deepcopy(self.rules)
@@ -1299,7 +1300,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window = self._window()
         emitted = []
         window.validation_run_requested.connect(emitted.append)
-        window.basic_signal_interval_combo.setCurrentText("15")
+        window.basic_signal_interval_combo.setCurrentText("15\ubd84")
         window.set_historical_candle_count(500)
         window.buy_rsi_value_line.setText("33")
         run_request = window._request_validation()
@@ -2253,7 +2254,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.validation_run_requested.connect(runs.append)
         window.settings_apply_requested.connect(applies.append)
 
-        window.basic_signal_interval_combo.setCurrentText("3")
+        window.basic_signal_interval_combo.setCurrentText("3\ubd84")
         self.assertEqual(1, len(runs))
         self.assertEqual(
             3,
@@ -3767,9 +3768,13 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         for timeframe, candle_count in ((3, 300), (15, 500)):
             rules = deepcopy(self.rules)
             rules["bar"]["bar_minutes"] = timeframe
+            current_ui_state = deepcopy(resolved_ui_state)
+            current_ui_state["basic"]["basic_signal_interval_combo"] = (
+                f"{timeframe}분"
+            )
             snapshot = build_signal_validation_snapshot(
                 rules,
-                ui_state=resolved_ui_state,
+                ui_state=current_ui_state,
             )
             warmup = flow_module.required_validation_warmup_bars(
                 snapshot.to_dict()

@@ -24,6 +24,9 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from gui_indicator_follow_timeframe_combo import IndicatorFollowTimeframeComboBox
+
+
 class IndicatorFollowControlTabMixin:
     def _set_registration_identity_stamp(self, text):
         label = self.registration_mode_label
@@ -166,22 +169,20 @@ class IndicatorFollowControlTabMixin:
         basic_title_sep.setStyleSheet("font-size: 13pt; font-weight: bold; color: #000000; padding: 0px 1px;")
         basic_row.addWidget(basic_title_sep)
 
-        basic_signal_basis_label = QLabel("신호검출기준")
+        basic_signal_basis_label = QLabel("기준봉")
         basic_signal_basis_label.setStyleSheet("font-size: 9pt; font-weight: normal; padding: 2px 1px;")
         basic_row.addWidget(basic_signal_basis_label)
 
-        self.basic_signal_interval_combo = QComboBox()
-        self.basic_signal_interval_combo.addItems(["1", "3", "5", "10", "15", "30", "60", "120", "240"])
+        self.basic_signal_interval_combo = IndicatorFollowTimeframeComboBox()
         self.basic_signal_interval_combo.setCurrentText("5")
-        self.basic_signal_interval_combo.setFixedWidth(60)
+        self.basic_signal_interval_combo.setFixedWidth(72)
         self.basic_signal_interval_combo.setFixedHeight(30)
         self.basic_signal_interval_combo.setStyleSheet("font-size: 9pt;")
-        self.basic_signal_interval_combo.setLayoutDirection(Qt.RightToLeft)
         basic_row.addWidget(self.basic_signal_interval_combo)
 
-        minute_label = QLabel("분봉 |")
-        minute_label.setStyleSheet("font-size: 9pt; font-weight: normal; padding: 2px 1px;")
-        basic_row.addWidget(minute_label)
+        timeframe_separator = QLabel("|")
+        timeframe_separator.setStyleSheet("font-size: 9pt; font-weight: normal; padding: 2px 1px;")
+        basic_row.addWidget(timeframe_separator)
 
         duplicate_label = QLabel("중복신호처리")
         duplicate_label.setStyleSheet("font-size: 9pt; font-weight: normal; padding: 2px 1px;")

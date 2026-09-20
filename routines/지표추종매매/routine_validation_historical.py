@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from .routine_validation_contract import ValidationStockRef
 from .routine_validation_session import ValidationSession
+from indicator_follow_validation_timeframe import normalize_validation_timeframe
 
 
 REASON_INVALID_COUNT = "INVALID_COUNT"
@@ -25,6 +26,7 @@ class ValidationHistoricalSnapshot:
 
     stock: ValidationStockRef
     timeframe_minutes: int
+    timeframe_key: str
     requested_count: int
     rows_count: int
     request_id: str
@@ -35,6 +37,7 @@ class ValidationHistoricalSnapshot:
         *,
         stock: ValidationStockRef,
         timeframe_minutes: int,
+        timeframe_key: str | None = None,
         requested_count: int,
         request_id: str,
         rows: list[dict[str, Any]],
@@ -72,8 +75,13 @@ class ValidationHistoricalSnapshot:
         ):
             raise ValueError("canonical rows are invalid")
 
+        resolved_timeframe = normalize_validation_timeframe(
+            timeframe_key or timeframe_minutes,
+            fallback_minutes=timeframe_minutes,
+        )
         object.__setattr__(self, "stock", stock)
         object.__setattr__(self, "timeframe_minutes", timeframe_minutes)
+        object.__setattr__(self, "timeframe_key", str(resolved_timeframe["key"]))
         object.__setattr__(self, "requested_count", requested_count)
         object.__setattr__(self, "rows_count", len(copied_rows))
         object.__setattr__(self, "request_id", clean_request_id)
@@ -111,25 +119,26 @@ class ValidationHistoricalMemoryCache:
 
     def __init__(self) -> None:
         self._snapshots: dict[
-            tuple[str, int, int], ValidationHistoricalSnapshot
+            tuple[str, str, int], ValidationHistoricalSnapshot
         ] = {}
 
     @staticmethod
     def _key(
         stock: ValidationStockRef,
-        timeframe_minutes: int,
+        timeframe_key: object,
         requested_count: int,
-    ) -> tuple[str, int, int]:
-        return (stock.code, timeframe_minutes, requested_count)
+    ) -> tuple[str, str, int]:
+        timeframe = normalize_validation_timeframe(timeframe_key)
+        return (stock.code, str(timeframe["key"]), requested_count)
 
     def get(
         self,
         stock: ValidationStockRef,
-        timeframe_minutes: int,
+        timeframe_key: object,
         requested_count: int,
     ) -> ValidationHistoricalSnapshot | None:
         return self._snapshots.get(
-            self._key(stock, timeframe_minutes, requested_count)
+            self._key(stock, timeframe_key, requested_count)
         )
 
     def put(self, snapshot: ValidationHistoricalSnapshot) -> None:
@@ -138,7 +147,7 @@ class ValidationHistoricalMemoryCache:
         self._snapshots[
             self._key(
                 snapshot.stock,
-                snapshot.timeframe_minutes,
+                snapshot.timeframe_key,
                 snapshot.requested_count,
             )
         ] = snapshot
@@ -188,7 +197,28 @@ class ValidationHistoricalProvider:
                 ValidationHistoricalResult(False, reason=availability.reason),
             )
 
-        requester = getattr(self.requester, "request_minute_candles_read_only", None)
+        request = self.session.request
+        timeframe = normalize_validation_timeframe(
+            request.timeframe_key,
+            fallback_minutes=request.timeframe_minutes,
+        )
+        period_uses_generic_requester = False
+        if timeframe["kind"] == "MINUTE":
+            requester = getattr(self.requester, "request_minute_candles_read_only", None)
+        else:
+            method_name = {
+                "D1": "request_day_candles_read_only",
+                "W1": "request_week_candles_read_only",
+                "Y1": "request_year_candles_read_only",
+            }.get(str(timeframe["key"]), "")
+            requester = getattr(self.requester, method_name, None)
+            if not callable(requester):
+                requester = getattr(
+                    self.requester,
+                    "request_period_candles_read_only",
+                    None,
+                )
+                period_uses_generic_requester = True
         if not callable(requester):
             return self._finish(
                 callback,
@@ -207,15 +237,30 @@ class ValidationHistoricalProvider:
             completed = True
             self._finish(callback, self._process_response(response, count))
 
-        request = self.session.request
         try:
-            requester(
-                request.stock.code,
-                request.stock.name,
-                interval=request.timeframe_minutes,
-                count=count,
-                callback=receive_response,
-            )
+            if timeframe["kind"] == "MINUTE":
+                requester(
+                    request.stock.code,
+                    request.stock.name,
+                    interval=int(timeframe["minutes"]),
+                    count=count,
+                    callback=receive_response,
+                )
+            elif period_uses_generic_requester:
+                requester(
+                    request.stock.code,
+                    request.stock.name,
+                    timeframe_key=str(timeframe["key"]),
+                    count=count,
+                    callback=receive_response,
+                )
+            else:
+                requester(
+                    request.stock.code,
+                    request.stock.name,
+                    count=count,
+                    callback=receive_response,
+                )
         except Exception as exc:
             if completed:
                 return None
@@ -248,16 +293,30 @@ class ValidationHistoricalProvider:
             )
 
         request = self.session.request
+        timeframe = normalize_validation_timeframe(
+            request.timeframe_key,
+            fallback_minutes=request.timeframe_minutes,
+        )
         rows = response.get("rows")
         rows_count = response.get("rows_count")
         interval = response.get("interval")
+        response_timeframe_key = str(response.get("timeframe_key") or "")
         request_id = response.get("request_id")
-        valid_shape = (
-            response.get("type") == "minute_candles"
-            and response.get("code") == request.stock.code
+        minute_shape = (
+            timeframe["kind"] == "MINUTE"
+            and response.get("type") == "minute_candles"
             and isinstance(interval, int)
             and not isinstance(interval, bool)
-            and interval == request.timeframe_minutes
+            and interval == int(timeframe["minutes"])
+        )
+        period_shape = (
+            timeframe["kind"] != "MINUTE"
+            and response.get("type") == "period_candles"
+            and response_timeframe_key == str(timeframe["key"])
+        )
+        valid_shape = (
+            (minute_shape or period_shape)
+            and response.get("code") == request.stock.code
             and isinstance(rows, list)
             and isinstance(rows_count, int)
             and not isinstance(rows_count, bool)
@@ -279,6 +338,7 @@ class ValidationHistoricalProvider:
             snapshot = ValidationHistoricalSnapshot(
                 stock=request.stock,
                 timeframe_minutes=request.timeframe_minutes,
+                timeframe_key=str(timeframe["key"]),
                 requested_count=requested_count,
                 request_id=request_id,
                 rows=rows,

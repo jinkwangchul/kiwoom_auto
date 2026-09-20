@@ -224,6 +224,24 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(preview_bar, {"bar_minutes": 5})
 
+    def test_period_validation_timeframe_preserves_production_bar_minutes(self):
+        for label, key in (("\uc77c", "D1"), ("\uc8fc", "W1"), ("\ub144", "Y1")):
+            with self.subTest(label=label):
+                state = deepcopy(self.ui_state)
+                state["basic"]["basic_signal_interval_combo"] = label
+
+                result = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state,
+                    deepcopy(self.current_rules),
+                )
+
+                self.assertEqual(1, result["preview_rules"]["bar"]["bar_minutes"])
+                self.assertEqual(
+                    {"key": key, "kind": {"D1": "DAY", "W1": "WEEK", "Y1": "YEAR"}[key], "minutes": None, "label": label},
+                    result["preview_rules"]["validation_timeframe"],
+                )
+                self.assertNotIn("bar.bar_minutes", result["mapped_paths"])
+
     def test_preview_namespace_exists(self):
         result = self._build_preview()
         namespace = result["preview_rules"]["indicator_follow_rule_preview"]

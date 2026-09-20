@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from typing import Any, Mapping
+
+from indicator_follow_validation_timeframe import validation_timeframe_for_request
 
 
 def _canonical_rules_json(rules: Mapping[str, Any]) -> str:
@@ -62,6 +64,7 @@ class ValidationRequest:
     stock: ValidationStockRef
     settings_snapshot: ValidationSettingsSnapshot
     timeframe_minutes: int
+    timeframe_key: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.stock, ValidationStockRef):
@@ -74,6 +77,11 @@ class ValidationRequest:
             or self.timeframe_minutes <= 0
         ):
             raise ValueError("timeframe_minutes must be a positive integer")
+        timeframe = validation_timeframe_for_request(
+            self.settings_snapshot.to_dict(),
+            self.timeframe_minutes,
+        )
+        object.__setattr__(self, "timeframe_key", str(timeframe["key"]))
 
 
 @dataclass(frozen=True, slots=True)

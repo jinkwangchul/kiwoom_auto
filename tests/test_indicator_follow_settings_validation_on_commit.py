@@ -1099,7 +1099,7 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
 
             reopened = self._dialog(rules_path, instance_id="instance-id")
             try:
-                self.assertEqual("240", reopened.basic_signal_interval_combo.currentText())
+                self.assertEqual("240\ubd84", reopened.basic_signal_interval_combo.currentText())
                 self.assertEqual(240, reopened.rules_data["bar"]["bar_minutes"])
             finally:
                 reopened.close()

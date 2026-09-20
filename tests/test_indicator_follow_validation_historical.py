@@ -55,9 +55,63 @@ class _FakeBroker:
         self.callback = callback
         return {"ok": True, "status": "REQUESTED"}
 
+    def request_period_candles_read_only(
+        self,
+        code: str,
+        name: str,
+        *,
+        timeframe_key: str,
+        count: int,
+        callback,
+    ) -> dict[str, object]:
+        if self.invocation_error is not None:
+            raise self.invocation_error
+        self.calls.append(
+            {
+                "code": code,
+                "name": name,
+                "timeframe_key": timeframe_key,
+                "count": count,
+                "callback": callback,
+            }
+        )
+        self.callback = callback
+        return {"ok": True, "status": "REQUESTED"}
+
     def complete(self, response: object) -> None:
         if not callable(self.callback):
             raise AssertionError("request callback is unavailable")
+        self.callback(response)
+
+
+class _DedicatedPeriodBroker:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.callback = None
+
+    def _request(self, method: str, code: str, name: str, *, count: int, callback):
+        self.calls.append(
+            {
+                "method": method,
+                "code": code,
+                "name": name,
+                "count": count,
+                "callback": callback,
+            }
+        )
+        self.callback = callback
+        return {"ok": True, "status": "REQUESTED"}
+
+    def request_day_candles_read_only(self, code, name, *, count, callback):
+        return self._request("OPT10081", code, name, count=count, callback=callback)
+
+    def request_week_candles_read_only(self, code, name, *, count, callback):
+        return self._request("OPT10082", code, name, count=count, callback=callback)
+
+    def request_year_candles_read_only(self, code, name, *, count, callback):
+        return self._request("OPT10094", code, name, count=count, callback=callback)
+
+    def complete(self, response: object) -> None:
         self.callback(response)
 
 
@@ -166,6 +220,51 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
         self.assertTrue(results[0].ok)
         self.assertEqual(1, provider.cache.size)
         reader.assert_not_called()
+
+    def test_day_week_year_dispatch_with_explicit_timeframe_identity(self) -> None:
+        for timeframe_key, method in (
+            ("D1", "OPT10081"),
+            ("W1", "OPT10082"),
+            ("Y1", "OPT10094"),
+        ):
+            with self.subTest(timeframe_key=timeframe_key):
+                self.request = ValidationRequest(
+                    self.stock,
+                    ValidationSettingsSnapshot(
+                        {
+                            "bar": {"bar_minutes": 3},
+                            "validation_timeframe": {"key": timeframe_key},
+                        }
+                    ),
+                    3,
+                )
+                broker = _DedicatedPeriodBroker()
+                provider, broker = self._provider(
+                    Mock(return_value=False),
+                    broker=broker,
+                )
+                results = []
+
+                self.assertIsNone(provider.request_latest(2, results.append))
+                self.assertEqual(method, broker.calls[0]["method"])
+                self.assertNotIn("interval", broker.calls[0])
+
+                broker.complete(
+                    {
+                        "ok": True,
+                        "type": "period_candles",
+                        "request_id": f"period-{timeframe_key}",
+                        "code": self.stock.code,
+                        "name": self.stock.name,
+                        "timeframe_key": timeframe_key,
+                        "rows": self.rows,
+                        "rows_count": len(self.rows),
+                    }
+                )
+
+                self.assertTrue(results[0].ok)
+                self.assertEqual(timeframe_key, results[0].snapshot.timeframe_key)
+                self.assertEqual(3, results[0].snapshot.timeframe_minutes)
 
     def test_valid_callback_creates_snapshot_and_caches_once(self) -> None:
         provider, broker = self._provider(Mock(side_effect=(False, False)))

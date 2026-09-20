@@ -17,6 +17,7 @@ from indicator_follow_signal_validation_execution import (
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
 )
+from indicator_follow_validation_timeframe import validation_timeframe_from_rules
 from gui_indicator_follow_sell_controls import (
     SELL_PRICE_COMBO_VALUES,
     require_resolved_sell_price_selections,
@@ -533,6 +534,13 @@ def project_signal_validation_rules(
     projected_ui_state = project_signal_validation_ui_state(
         source_state if isinstance(source_state, Mapping) else {}
     )
+    if ui_state is None and isinstance(source_rules.get("validation_timeframe"), Mapping):
+        projected["validation_timeframe"] = validation_timeframe_from_rules(source_rules)
+    else:
+        projected["validation_timeframe"] = validation_timeframe_from_rules(
+            source_rules,
+            ui_state=projected_ui_state,
+        )
     projected["validation_execution"] = deepcopy(
         projected_ui_state["validation_execution"]
     )

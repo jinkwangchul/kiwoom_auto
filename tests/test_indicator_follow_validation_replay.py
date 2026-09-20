@@ -114,6 +114,7 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         *,
         stock=None,
         timeframe=3,
+        timeframe_key=None,
         rows=None,
     ) -> ValidationHistoricalSnapshot:
         if rows is None:
@@ -132,6 +133,7 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         return ValidationHistoricalSnapshot(
             stock=stock or self.stock,
             timeframe_minutes=timeframe,
+            timeframe_key=timeframe_key,
             requested_count=max(len(rows), 1),
             request_id="OPT10080-REPLAY-1",
             rows=rows,
@@ -246,6 +248,90 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
 
         self.assertEqual(["20260918095500"], [candle["time"] for candle in candles])
         self.assertEqual(1, dropped)
+
+    def test_day_projection_uses_trading_day_instead_of_minute_bucket(self) -> None:
+        historical = self._historical(
+            timeframe=5,
+            timeframe_key="D1",
+            rows=[{
+                "체결시간": "20260918000000",
+                "시가": "100",
+                "고가": "111",
+                "저가": "99",
+                "현재가": "110",
+                "거래량": "20",
+            }],
+        )
+
+        forming, forming_dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 10, 3, 30),
+        )
+        completed, completed_dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 15, 30),
+        )
+
+        self.assertEqual([], forming)
+        self.assertEqual(1, forming_dropped)
+        self.assertEqual(["20260918000000"], [candle["time"] for candle in completed])
+        self.assertEqual(0, completed_dropped)
+
+    def test_week_projection_uses_iso_week_instead_of_minute_bucket(self) -> None:
+        historical = self._historical(
+            timeframe=5,
+            timeframe_key="W1",
+            rows=[{
+                "체결시간": "20260914000000",
+                "시가": "100",
+                "고가": "111",
+                "저가": "99",
+                "현재가": "110",
+                "거래량": "20",
+            }],
+        )
+
+        forming, forming_dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 16, 10, 3, 30),
+        )
+        completed, completed_dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 15, 30),
+        )
+
+        self.assertEqual([], forming)
+        self.assertEqual(1, forming_dropped)
+        self.assertEqual(["20260914000000"], [candle["time"] for candle in completed])
+        self.assertEqual(0, completed_dropped)
+
+    def test_year_projection_uses_calendar_year_instead_of_minute_bucket(self) -> None:
+        historical = self._historical(
+            timeframe=5,
+            timeframe_key="Y1",
+            rows=[{
+                "체결시간": "20260101000000",
+                "시가": "100",
+                "고가": "111",
+                "저가": "99",
+                "현재가": "110",
+                "거래량": "20",
+            }],
+        )
+
+        forming, forming_dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 15, 30),
+        )
+        completed, completed_dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2027, 1, 2, 10, 0),
+        )
+
+        self.assertEqual([], forming)
+        self.assertEqual(1, forming_dropped)
+        self.assertEqual(["20260101000000"], [candle["time"] for candle in completed])
+        self.assertEqual(0, completed_dropped)
 
     def test_projection_keeps_latest_completed_bucket_when_current_bucket_has_no_row(self) -> None:
         historical = self._historical(

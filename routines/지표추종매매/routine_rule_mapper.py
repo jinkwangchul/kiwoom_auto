@@ -20,6 +20,7 @@ from engines.condition_engine import parse_condition_expression
 from indicator_follow_settings_compatibility import (
     legacy_sell_signed_percent_sign,
 )
+from indicator_follow_validation_timeframe import normalize_validation_timeframe
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -2418,15 +2419,25 @@ def build_engine_rules_preview_from_ui_state(
     state = _as_dict(ui_state)
 
     basic = _as_dict(state.get("basic"))
-    bar_minutes = _safe_int(basic.get("basic_signal_interval_combo"))
-    if bar_minutes is None:
-        validation_warnings.append("basic signal interval is not numeric; bar.bar_minutes not mapped")
-    else:
+    source_bar = _as_dict(source_rules.get("bar"))
+    try:
+        fallback_minutes = int(source_bar.get("bar_minutes", 5))
+    except (TypeError, ValueError):
+        fallback_minutes = 5
+    validation_timeframe = normalize_validation_timeframe(
+        basic.get("basic_signal_interval_combo"),
+        fallback_minutes=fallback_minutes,
+    )
+    preview_rules["validation_timeframe"] = deepcopy(validation_timeframe)
+    if validation_timeframe["kind"] == "MINUTE":
+        bar_minutes = int(validation_timeframe["minutes"])
         preview_rules["bar"]["bar_minutes"] = bar_minutes
         preview_candidates["bar"] = {
             "path": BAR_MINUTES_PATH,
             "value": bar_minutes,
         }
+    elif "bar_minutes" in source_bar:
+        preview_rules["bar"]["bar_minutes"] = deepcopy(source_bar["bar_minutes"])
 
     signal_runtime_policy_candidate = _build_signal_runtime_policy_candidate(basic, validation_warnings)
     if signal_runtime_policy_candidate:
@@ -2834,9 +2845,7 @@ def build_engine_rules_preview_from_ui_state(
     if not buy_execution_base_candidate:
         postponed.append("completion policy mapping requires BUY base execution")
 
-    mapped_paths = [
-        BAR_MINUTES_PATH,
-    ]
+    mapped_paths = [BAR_MINUTES_PATH] if "bar" in preview_candidates else []
     if signal_runtime_policy_candidate:
         mapped_paths.append(SIGNAL_RUNTIME_POLICY_PATH)
     if buy_candidate:
@@ -2950,8 +2959,19 @@ def validate_settings_candidate(
             continue
         blocked_reasons.append(text)
 
-    bar_minutes = _safe_int(_as_dict(state.get("basic")).get("basic_signal_interval_combo"))
-    if bar_minutes not in SUPPORTED_BAR_MINUTES:
+    current_bar = _as_dict(current.get("bar"))
+    try:
+        fallback_minutes = int(current_bar.get("bar_minutes", 5))
+    except (TypeError, ValueError):
+        fallback_minutes = 5
+    validation_timeframe = normalize_validation_timeframe(
+        _as_dict(state.get("basic")).get("basic_signal_interval_combo"),
+        fallback_minutes=fallback_minutes,
+    )
+    if (
+        validation_timeframe["kind"] == "MINUTE"
+        and validation_timeframe["minutes"] not in SUPPORTED_BAR_MINUTES
+    ):
         blocked_reasons.append(
             "bar.bar_minutes must be one of 1/3/5/10/15/30/60/120/240"
         )

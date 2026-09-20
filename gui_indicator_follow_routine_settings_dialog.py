@@ -288,6 +288,8 @@ def normalize_buy_situation_ui_state(value):
     return state
 from routine_instance_repository import RoutineInstanceRepository
 from event_journal_production import append_production_event
+from gui_indicator_follow_timeframe_combo import IndicatorFollowTimeframeComboBox
+from indicator_follow_validation_timeframe import MINUTE_VALUES
 
 
 DEFAULT_BUY_SIGNAL_EXPR = "A and B and C and D"
@@ -299,6 +301,10 @@ STATE_AUTHORITY_INSTANCE_BASELINE = "INSTANCE_BASELINE"
 STATE_AUTHORITY_CANONICAL_DEFAULT = "CANONICAL_DEFAULT"
 
 _COMBO_RESTORE_ALIASES = {
+    **{
+        ("basic_signal_interval_combo", str(value)): f"{value}분"
+        for value in MINUTE_VALUES
+    },
     ("buy_price_compare_condition_combo", "=<"): "<=",
 }
 
@@ -3124,6 +3130,8 @@ class IndicatorFollowRoutineSettingsDialog(
             return None
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
+        if isinstance(widget, IndicatorFollowTimeframeComboBox):
+            return widget.validationValue()
         if isinstance(widget, QComboBox):
             if name in SELL_PRICE_COMBO_WIDGET_NAMES:
                 unresolved = widget.property(SELL_PRICE_UNRESOLVED_PROPERTY)

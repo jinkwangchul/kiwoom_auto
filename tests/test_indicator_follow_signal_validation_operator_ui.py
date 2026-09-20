@@ -186,6 +186,66 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.widgets.append(window)
         return window
 
+    def test_timeframe_options_and_legacy_entry_restore_share_one_contract(self):
+        state = deepcopy(self.ui_state)
+        state["basic"]["basic_signal_interval_combo"] = "3"
+
+        window = self._window(state)
+
+        self.assertEqual(
+            [
+                "1\ubd84", "3\ubd84", "5\ubd84", "10\ubd84", "15\ubd84", "30\ubd84",
+                "60\ubd84", "120\ubd84", "240\ubd84", "\uc77c", "\uc8fc", "\ub144",
+            ],
+            [
+                window.basic_signal_interval_combo.itemText(index)
+                for index in range(window.basic_signal_interval_combo.count())
+            ],
+        )
+        self.assertEqual("3\ubd84", window.basic_signal_interval_combo.displayText())
+        self.assertEqual("3", window.basic_signal_interval_combo.validationValue())
+
+    def test_period_change_revalidates_and_apply_round_trips_ui_candidate(self):
+        window = self._window()
+        runs = []
+        applies = []
+        window.validation_run_requested.connect(runs.append)
+        window.settings_apply_requested.connect(applies.append)
+
+        window.basic_signal_interval_combo.setCurrentText("\uc77c")
+
+        self.assertEqual(1, len(runs))
+        rules = runs[0].settings_snapshot.to_dict()
+        self.assertEqual("D1", rules["validation_timeframe"]["key"])
+        self.assertEqual(self.rules["bar"]["bar_minutes"], rules["bar"]["bar_minutes"])
+
+        window.set_replay_snapshot(ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=self.rules["bar"]["bar_minutes"],
+            timeframe_key="D1",
+            settings_hash=runs[0].settings_snapshot.rules_hash,
+            historical_request_id="PERIOD-ROUND-TRIP",
+            evaluated_start_index=0,
+            evaluated_end_index=0,
+            dropped_raw_rows_count=0,
+            candles=[{
+                "time": "20260918000000",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1.0,
+            }],
+            entries=[],
+        ))
+        window.primary_validation_action_button.click()
+
+        self.assertEqual(1, len(applies))
+        self.assertEqual(
+            "\uc77c",
+            applies[0].to_ui_state()["basic"]["basic_signal_interval_combo"],
+        )
+
     @staticmethod
     def _entry(side, index, *, signal=None, trace=None, details=None, reason="fixture"):
         return ValidationReplayEntry(
@@ -235,7 +295,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertEqual("▶ 기본설정", window.compact_header_arrow.text())
         self.assertFalse(window.recent_stock_row.isVisible())
         self.assertEqual([], window.compact_stock_display.findChildren(QComboBox))
-        self.assertEqual("5", window.basic_signal_interval_combo.currentText())
+        self.assertEqual("5\ubd84", window.basic_signal_interval_combo.displayText())
         self.assertEqual(5_000, window.historical_candle_count)
         self.assertFalse(hasattr(window, "historical_candle_count_spin"))
         all_labels = " ".join(
@@ -1609,7 +1669,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 candidate["basic"]["basic_signal_interval_combo"] = interval
                 result = source.apply_signal_validation_candidate_ui_state(candidate)
                 self.assertEqual([], result["skipped"])
-                self.assertEqual(interval, source.basic_signal_interval_combo.currentText())
+                self.assertEqual(f"{interval}\ubd84", source.basic_signal_interval_combo.displayText())
                 self.assertEqual(file_before, rules_path.read_bytes())
 
             registration = source.build_registration_rules_from_current_ui_state()
@@ -1625,7 +1685,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             persistent_reload.assert_not_called()
             self.assertFalse(undo["available"])
             self.assertEqual(dialog_module.STATE_AUTHORITY_CANONICAL_DEFAULT, undo["source"])
-            self.assertEqual("60", source.basic_signal_interval_combo.currentText())
+            self.assertEqual("60\ubd84", source.basic_signal_interval_combo.displayText())
             self.assertEqual(file_before, rules_path.read_bytes())
 
     def test_group_remembered_state_overrides_legacy_template_on_registration_open(self):
@@ -1655,7 +1715,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                     settings_mode="registration",
                 )
             self.widgets.append(source)
-            self.assertEqual("60", source.basic_signal_interval_combo.currentText())
+            self.assertEqual("60\ubd84", source.basic_signal_interval_combo.displayText())
             self.assertEqual("+", source.buy_bollinger_sign_combo.currentText())
             self.assertEqual(
                 dialog_module.STATE_AUTHORITY_GROUP_REMEMBERED,
@@ -1692,7 +1752,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             candidate["basic"]["basic_signal_interval_combo"] = "15"
             result = source.apply_signal_validation_candidate_ui_state(candidate)
             self.assertEqual([], result["skipped"])
-            self.assertEqual("15", source.basic_signal_interval_combo.currentText())
+            self.assertEqual("15\ubd84", source.basic_signal_interval_combo.displayText())
             edit_rules = source.build_rules_with_indicator_follow_ui_state()
             self.assertEqual(
                 "15",
@@ -1843,7 +1903,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 self.assertEqual(3, window.replay_snapshot.timeframe_minutes)
                 self.assertEqual(
                     baseline["basic"]["basic_signal_interval_combo"],
-                    source.basic_signal_interval_combo.currentText(),
+                    source.basic_signal_interval_combo.validationValue(),
                 )
                 self.assertEqual([], candidates)
 
@@ -1858,7 +1918,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                         expression,
                         source.buy_signal_expr_line.text(),
                     )
-                    self.assertEqual("3", source.basic_signal_interval_combo.currentText())
+                    self.assertEqual("3\ubd84", source.basic_signal_interval_combo.displayText())
                     self.assertTrue(window.primary_validation_action_button.isEnabled())
 
                 payload = source.build_registration_rules_from_current_ui_state()
