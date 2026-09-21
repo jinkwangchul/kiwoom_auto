@@ -26,6 +26,13 @@ _ACCEPT_TOKENS = ("접수", "확인", "ACCEPT", "CONFIRM", "OPEN")
 _FILL_TOKENS = ("체결", "FILLED", "FILL")
 
 
+_MARKET_EXCHANGE_BY_CODE = {
+    "0": "INTEGRATED",
+    "1": "KRX",
+    "2": "NXT",
+}
+
+
 def _clean_text(value: Any) -> str:
     if value is None:
         return ""
@@ -86,6 +93,27 @@ def _side(value: Any, warnings: list[str]) -> tuple[str | None, bool]:
         return "SELL", False
     warnings.append("side is unclear")
     return None, True
+
+
+def _market_metadata(fid_values: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    market_exchange_code = _clean_text(_fid(fid_values, "2134")) or None
+    market_exchange = _MARKET_EXCHANGE_BY_CODE.get(market_exchange_code or "")
+    if market_exchange_code and market_exchange is None:
+        warnings.append(f"market_exchange_code is unknown: {market_exchange_code}")
+
+    market_exchange_name = _clean_text(_fid(fid_values, "2135")) or None
+    sor_yn = _upper(_fid(fid_values, "2136")) or None
+    is_sor = {"Y": True, "N": False}.get(sor_yn)
+    if sor_yn and is_sor is None:
+        warnings.append(f"sor_yn is unknown: {sor_yn}")
+
+    return {
+        "market_exchange_code": market_exchange_code,
+        "market_exchange": market_exchange,
+        "market_exchange_name": market_exchange_name,
+        "sor_yn": sor_yn,
+        "is_sor": is_sor,
+    }
 
 
 def _event_type(order_status: str, filled_quantity: int | None, remaining_quantity: int | None) -> tuple[str, bool]:
@@ -213,6 +241,7 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
     name = _clean_text(_fid(fid_values, "302")) or None
     order_status = _clean_text(_fid(fid_values, "913")) or None
     side, side_unresolved = _side(_fid(fid_values, "907"), warnings)
+    market_metadata = _market_metadata(fid_values, warnings)
 
     order_quantity = _parse_int(_fid(fid_values, "900"), "order_quantity", warnings)
     filled_quantity = _parse_int(_fid(fid_values, "911"), "filled_quantity", warnings)
@@ -259,6 +288,7 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
         "order_price": order_price,
         "filled_price": filled_price,
         "broker_execution_no": broker_execution_no,
+        **market_metadata,
         **time_evidence,
         "request_hash": None,
         "lock_id": None,

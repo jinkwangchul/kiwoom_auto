@@ -25,6 +25,7 @@ from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_order_allowed,
 )
 from gui_auto_trade_runtime import parse_stock_folder_name
+from gui_stock_data import stock_nxt_availability
 from gui_operation_environment import read_system_total_budget_for_recalculation
 from runtime_io import read_json_dict
 from operation_policy_gate import read_operation_state
@@ -1696,6 +1697,26 @@ class AutoTradeOrderExecutionBoundary:
             "lock_id": str(record.get("lock_id") or "").strip(),
         }
 
+    @staticmethod
+    def market_route_from_order_provenance(order: dict[str, object]) -> str:
+        """Return only an explicitly persisted source route; legacy defaults to KRX."""
+        execution_request = order.get("execution_request")
+        execution_request_dict = (
+            execution_request if isinstance(execution_request, dict) else {}
+        )
+        request_preview = execution_request_dict.get("request_preview")
+        request_preview_dict = (
+            request_preview if isinstance(request_preview, dict) else {}
+        )
+        route = str(
+            request_preview_dict.get("market_route")
+            or request_preview_dict.get("order_route")
+            or order.get("market_route")
+            or order.get("order_route")
+            or ""
+        ).strip().upper()
+        return "SOR" if route == "SOR" else "KRX"
+
     def build_manual_send_order_call_preview(
         self,
         order: dict[str, object],
@@ -1722,6 +1743,15 @@ class AutoTradeOrderExecutionBoundary:
             request_preview_dict.get("screen_no")
             or project_order_default_screen_no()
         ).strip()
+        code = str(request_preview_dict.get("code") or order.get("code") or "").strip()
+        action = str(
+            request_preview_dict.get("order_action")
+            or request_preview_dict.get("action")
+            or "NEW"
+        ).strip().upper()
+        market_route = (
+            "SOR" if stock_nxt_availability(code) is True else "KRX"
+        ) if action == "NEW" else self.market_route_from_order_provenance(order)
 
         broker_dispatch_preview = {
             "status": "BROKER_DISPATCH_READY",
@@ -1734,8 +1764,9 @@ class AutoTradeOrderExecutionBoundary:
                 "account_no": account_no,
                 "screen_no": screen_no,
                 "side": side,
-                "order_action": str(request_preview_dict.get("order_action") or request_preview_dict.get("action") or "NEW").strip().upper(),
-                "code": str(request_preview_dict.get("code") or order.get("code") or "").strip(),
+                "order_action": action,
+                "market_route": market_route,
+                "code": code,
                 "quantity": quantity,
                 "price": price,
                 "hoga": hoga,
@@ -1751,7 +1782,11 @@ class AutoTradeOrderExecutionBoundary:
             adapter_contract,
             {},
             {"connected": environment.get("kiwoom_connected"), "account_no": account_no},
-            {"manual_kiwoom_send_order_confirmed": operator_confirmed is True, "emergency_stop": False},
+            {
+                "manual_kiwoom_send_order_confirmed": operator_confirmed is True,
+                "emergency_stop": False,
+                "current_market_time": datetime.now().astimezone().strftime("%H:%M"),
+            },
         )
         call_preview = preview_kiwoom_send_order_call(
             safety,
@@ -1909,6 +1944,7 @@ class AutoTradeOrderExecutionBoundary:
         code = _queue_order_code(source_order)
         side = _queue_order_side(source_order)
         remaining_quantity = int(source_order.get("remaining_quantity") or 0)
+        market_route = self.market_route_from_order_provenance(source_order)
         suffix = uuid4().hex[:12]
         order_id = f"{source_order_id}_CANCEL_{suffix}"
         execution_id = f"EXEC_CANCEL_{suffix}"
@@ -1946,6 +1982,7 @@ class AutoTradeOrderExecutionBoundary:
                 "screen_no": project_order_default_screen_no(),
                 "side": side,
                 "order_action": "CANCEL",
+                "market_route": market_route,
                 "code": code,
                 "quantity": remaining_quantity,
                 "price": 0,
@@ -2007,6 +2044,7 @@ class AutoTradeOrderExecutionBoundary:
                 "price": 0,
                 "order_type": "LIMIT",
                 "order_action": "CANCEL",
+                "market_route": market_route,
                 "cancel_source_order_id": source_order_id,
                 **(
                     {"cancel_evidence": deepcopy(cancel_evidence)}
@@ -2578,6 +2616,20 @@ class AutoTradeOrderExecutionBoundary:
         for field in ("code", "quantity", "price", "account_no"):
             if request_preview_dict.get(field) in (None, "") and source.get(field) not in (None, ""):
                 request_preview_dict[field] = source.get(field)
+        if not str(request_preview_dict.get("market_route") or "").strip():
+            source_execution_request = source.get("execution_request")
+            source_request_preview = (
+                source_execution_request.get("request_preview")
+                if isinstance(source_execution_request, dict)
+                and isinstance(source_execution_request.get("request_preview"), dict)
+                else {}
+            )
+            source_route = (
+                source_request_preview.get("market_route")
+                or source.get("market_route")
+            )
+            if source_route:
+                request_preview_dict["market_route"] = source_route
         if request_preview_dict:
             execution_request_dict["request_preview"] = request_preview_dict
             enriched["execution_request"] = execution_request_dict

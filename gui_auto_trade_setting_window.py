@@ -11582,6 +11582,9 @@ class AutoTradeSettingWindow(QDialog):
         account_no = str(source_order.get("account_no") or "").strip()
         code = str(source_order.get("code") or "").strip()
         side = str(source_order.get("side") or "").strip().upper()
+        market_route = AutoTradeOrderExecutionBoundary.market_route_from_order_provenance(
+            source_order
+        )
         suffix = uuid4().hex[:12]
         order_id = f"{source_order_id}_MODIFY_{suffix}"
         execution_id = f"EXEC_MODIFY_{suffix}"
@@ -11614,6 +11617,7 @@ class AutoTradeSettingWindow(QDialog):
                 "screen_no": project_order_default_screen_no(),
                 "side": side,
                 "order_action": "MODIFY",
+                "market_route": market_route,
                 "code": code,
                 "quantity": modify_quantity,
                 "price": modify_price,
@@ -11652,6 +11656,7 @@ class AutoTradeSettingWindow(QDialog):
                 "price": modify_price,
                 "order_type": "LIMIT",
                 "order_action": "MODIFY",
+                "market_route": market_route,
                 "modify_source_order_id": source_order_id,
             },
         }

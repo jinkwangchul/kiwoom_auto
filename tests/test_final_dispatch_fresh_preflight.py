@@ -207,7 +207,11 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
         self._write_queue(record)
         self._write_broker_holding(holding=12, available=10)
 
-        result = self.boundary.send_order_for_order_queued_automatically(record["id"])
+        with mock.patch(
+            "auto_trade_order_execution_boundary.stock_nxt_availability",
+            return_value=False,
+        ):
+            result = self.boundary.send_order_for_order_queued_automatically(record["id"])
 
         self.assertEqual("send_call_result_recorded", result["executor_stage"])
         self.assertEqual(1, len(self.send_order.calls))
@@ -236,7 +240,11 @@ class FinalDispatchFreshPreflightTest(unittest.TestCase):
             "auto_trade_order_execution_boundary.read_system_total_budget_for_recalculation",
             return_value=100_000,
         ):
-            result = self.boundary.send_order_for_order_queued_automatically(record["id"])
+            with mock.patch(
+                "auto_trade_order_execution_boundary.stock_nxt_availability",
+                return_value=False,
+            ):
+                result = self.boundary.send_order_for_order_queued_automatically(record["id"])
 
         self.assertEqual("send_call_result_recorded", result["executor_stage"])
         self.assertEqual(1, len(self.send_order.calls))

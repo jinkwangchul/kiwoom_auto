@@ -172,6 +172,81 @@ class ChejanEventNormalizerTest(unittest.TestCase):
         self.assertEqual("0", result["gubun"])
         self.assertEqual("2026-07-04 10:00:00", result["received_at"])
 
+    def test_integrated_sor_metadata_is_normalized(self) -> None:
+        result = normalize_kiwoom_chejan_event(
+            self._raw(**{"2134": " 0 ", "2135": " 통합 ", "2136": " y "})
+        )
+
+        self.assertEqual("0", result["market_exchange_code"])
+        self.assertEqual("INTEGRATED", result["market_exchange"])
+        self.assertEqual("통합", result["market_exchange_name"])
+        self.assertEqual("Y", result["sor_yn"])
+        self.assertIs(result["is_sor"], True)
+        self.assertEqual("PARTIAL_FILL", result["event_type"])
+        self.assertFalse(result["unresolved"])
+        self.assertEqual([], result["warnings"])
+
+    def test_krx_non_sor_metadata_is_normalized(self) -> None:
+        result = normalize_kiwoom_chejan_event(
+            self._raw(**{"2134": "1", "2135": "KRX", "2136": "N"})
+        )
+
+        self.assertEqual("1", result["market_exchange_code"])
+        self.assertEqual("KRX", result["market_exchange"])
+        self.assertEqual("KRX", result["market_exchange_name"])
+        self.assertEqual("N", result["sor_yn"])
+        self.assertIs(result["is_sor"], False)
+
+    def test_nxt_exchange_metadata_is_normalized(self) -> None:
+        result = normalize_kiwoom_chejan_event(
+            self._raw(**{"2134": "2", "2135": "NXT"})
+        )
+
+        self.assertEqual("2", result["market_exchange_code"])
+        self.assertEqual("NXT", result["market_exchange"])
+        self.assertEqual("NXT", result["market_exchange_name"])
+        self.assertIsNone(result["sor_yn"])
+        self.assertIsNone(result["is_sor"])
+        self.assertEqual([], result["warnings"])
+
+    def test_missing_exchange_and_sor_metadata_preserves_legacy_behavior(self) -> None:
+        result = normalize_kiwoom_chejan_event(self._raw())
+
+        self.assertIsNone(result["market_exchange_code"])
+        self.assertIsNone(result["market_exchange"])
+        self.assertIsNone(result["market_exchange_name"])
+        self.assertIsNone(result["sor_yn"])
+        self.assertIsNone(result["is_sor"])
+        self.assertEqual("PARTIAL_FILL", result["event_type"])
+        self.assertFalse(result["unresolved"])
+        self.assertEqual([], result["warnings"])
+
+    def test_unknown_exchange_and_sor_values_are_metadata_only_warnings(self) -> None:
+        result = normalize_kiwoom_chejan_event(
+            self._raw(**{"2134": " 9 ", "2135": " Other Venue ", "2136": " x "})
+        )
+
+        self.assertEqual("9", result["market_exchange_code"])
+        self.assertIsNone(result["market_exchange"])
+        self.assertEqual("Other Venue", result["market_exchange_name"])
+        self.assertEqual("X", result["sor_yn"])
+        self.assertIsNone(result["is_sor"])
+        self.assertIn("market_exchange_code is unknown: 9", result["warnings"])
+        self.assertIn("sor_yn is unknown: X", result["warnings"])
+        self.assertEqual("PARTIAL_FILL", result["event_type"])
+        self.assertFalse(result["unresolved"])
+
+    def test_exchange_and_sor_fids_are_preserved_in_raw_event(self) -> None:
+        raw = self._raw(**{"2134": "0", "2135": "통합", "2136": "Y"})
+
+        result = normalize_kiwoom_chejan_event(raw)
+
+        self.assertEqual(raw, result["raw_event"])
+        self.assertEqual("0", result["raw_event"]["fid_values"]["2134"])
+        self.assertEqual("통합", result["raw_event"]["fid_values"]["2135"])
+        self.assertEqual("Y", result["raw_event"]["fid_values"]["2136"])
+        self.assertIsNot(raw, result["raw_event"])
+
     def test_request_lock_execution_ids_remain_none(self) -> None:
         result = normalize_kiwoom_chejan_event(self._raw())
 

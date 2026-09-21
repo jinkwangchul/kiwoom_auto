@@ -338,6 +338,37 @@ def observe_send_order_result(order: Any, result: Any) -> dict[str, Any]:
 
 
 @_fail_open_observer
+def observe_live_sor_execution_blocked(order: Any, result: Any) -> dict[str, Any]:
+    """Record the pre-call live-SOR reconciliation gate without changing it."""
+
+    value = _dict(result)
+    reason_code = _text(value.get("reason_code")).upper()
+    if (
+        _text(value.get("status")).upper() != "BLOCKED"
+        or reason_code != "LIVE_SOR_RECONCILIATION_UNVERIFIED"
+    ):
+        return {"appended": False, "skipped": True, "reason": "NOT_LIVE_SOR_RECONCILIATION_BLOCK"}
+    identity = _identity(order, value)
+    stable_id = _first(identity["execution_id"], identity["order_id"], identity["signal_id"])
+    if not stable_id:
+        return {"appended": False, "skipped": True, "reason": "LIVE_SOR_BLOCK_IDENTITY_MISSING"}
+    return _append_once(
+        ("EXECUTION_BLOCKED", stable_id, reason_code),
+        "EXECUTION_BLOCKED",
+        severity="WARNING",
+        result="BLOCKED",
+        source="kiwoom_send_order_executor.execute_claimed_send_order",
+        template_args={"stock_name": identity["stock_name"] or identity["stock_code"]},
+        details={
+            "reason_code": reason_code,
+            "market_route": "SOR",
+            "order_type": value.get("order_type"),
+        },
+        **_target_fields(identity),
+    )
+
+
+@_fail_open_observer
 def observe_broker_chejan_result(record_result: Any, normalized_event: Any) -> dict[str, Any]:
     """Summarize only a newly committed normalized Broker lifecycle event."""
 

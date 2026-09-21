@@ -18,7 +18,7 @@ from execution_queue_writer import (
     record_broker_send_rejected,
     record_broker_send_uncertain,
 )
-from event_journal_trade_observer import observe_send_order_result
+from event_journal_trade_observer import observe_live_sor_execution_blocked, observe_send_order_result
 
 
 STATUS_SENT = "SEND_ORDER_SENT"
@@ -226,6 +226,20 @@ def _merge_writer_result(prefix: str, writer_result: Any) -> dict[str, Any]:
     return {f"{prefix}_result": data}
 
 
+def _market_route_from_send_order_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return ""
+    try:
+        order_type = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if order_type in {1, 2, 3, 4, 5, 6}:
+        return "KRX"
+    if order_type in {11, 12, 13, 15}:
+        return "SOR"
+    return ""
+
+
 def execute_claimed_send_order(
     queue_path: Any,
     identity: Any,
@@ -245,6 +259,25 @@ def execute_claimed_send_order(
         return _blocked_result("send_order_callable", "send_order_callable must be callable")
     if not isinstance(send_order_args, list) or len(send_order_args) != 9:
         return _blocked_result("send_order_args", "send_order_args must contain 9 values")
+    final_market_route = _market_route_from_send_order_type(send_order_args[3])
+    if not final_market_route:
+        return _blocked_result(
+            "send_order_args",
+            "send_order_args order_type has no supported KRX/SOR market route",
+        )
+    if final_market_route == "SOR":
+        blocked = _blocked_result(
+            "live_sor_reconciliation_gate",
+            "LIVE_SOR_RECONCILIATION_UNVERIFIED",
+            reason_code="LIVE_SOR_RECONCILIATION_UNVERIFIED",
+            market_route="SOR",
+            order_type=send_order_args[3],
+        )
+        observe_live_sor_execution_blocked(
+            {**_as_dict(identity), "code": send_order_args[4]},
+            blocked,
+        )
+        return blocked
 
     attempt = mark_send_order_attempted(
         queue_path,
@@ -257,6 +290,7 @@ def execute_claimed_send_order(
         context=ctx,
         expected_revision=expected_revision,
         attempt_id=ctx.get("send_order_attempt_id"),
+        market_route=final_market_route,
     )
     if attempt.get("committed") is not True or attempt.get("post_write_verified") is not True:
         return _blocked_result(

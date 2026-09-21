@@ -13,9 +13,10 @@ STATUS_SAFE = "SEND_ORDER_SAFE"
 STATUS_BLOCKED = "BLOCKED"
 STATUS_INVALID = "INVALID"
 
-VALID_ORDER_TYPES = {1, 2, 3, 4, 5, 6}
-CANCEL_ORDER_TYPES = {3, 4}
-MODIFY_ORDER_TYPES = {5, 6}
+VALID_ORDER_TYPES = {1, 2, 3, 4, 5, 6, 11, 12, 13, 15}
+CANCEL_ORDER_TYPES = {3, 4, 13}
+MODIFY_ORDER_TYPES = {5, 6, 15}
+SOR_NEW_ORDER_TYPES = {11, 12}
 VALID_HOGAS = {"00", "03"}
 
 
@@ -109,6 +110,28 @@ def _has_duplicate_dispatch(snapshot: dict[str, Any], *, dispatch_id: str, order
 
 def _validate_screen_no(screen_no: str) -> bool:
     return len(screen_no) == 4 and screen_no.isdigit()
+
+
+def _sor_market_order_session_issue(
+    params: dict[str, Any],
+    operator: dict[str, Any],
+) -> str | None:
+    if (
+        params.get("order_type") not in SOR_NEW_ORDER_TYPES
+        or _text(params.get("hoga")) != "03"
+    ):
+        return None
+    raw_time = _text(operator.get("current_market_time"))
+    if not raw_time:
+        return "current_market_time is required for SOR market order safety"
+    parts = raw_time.split(":")
+    try:
+        minute_of_day = int(parts[0]) * 60 + int(parts[1])
+    except (IndexError, TypeError, ValueError):
+        return "current_market_time is invalid for SOR market order safety"
+    if not (8 * 60 + 50 <= minute_of_day < 15 * 60 + 40):
+        return "SOR market order is unavailable in the limit-only session"
+    return None
 
 
 def _validate_params(params: dict[str, Any]) -> str | None:
@@ -217,6 +240,10 @@ def evaluate_kiwoom_send_order_safety(
     params_issue = _validate_params(params)
     if params_issue:
         return _result(status=STATUS_INVALID, issues=[params_issue])
+
+    sor_session_issue = _sor_market_order_session_issue(params, operator)
+    if sor_session_issue:
+        return _result(status=STATUS_BLOCKED, issues=[sor_session_issue])
 
     if not _validate_screen_no(screen_no):
         return _result(status=STATUS_BLOCKED, issues=["screen_no is invalid"])

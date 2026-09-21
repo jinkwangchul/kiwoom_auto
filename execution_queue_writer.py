@@ -1763,6 +1763,7 @@ def mark_send_order_attempted(
     context: Any = None,
     expected_revision: int | None = None,
     attempt_id: str | None = None,
+    market_route: str | None = None,
 ) -> dict[str, Any]:
     """Record a durable SEND_ATTEMPTED state without calling SendOrder."""
     normalized_identity, identity_blocked = _dispatch_identity(identity)
@@ -1787,6 +1788,12 @@ def mark_send_order_attempted(
         return _with_queue_metadata(_commit_blocked("send_order_attempt", "send order attempt owner is required"), expected_revision=expected_revision)
     if not source:
         return _with_queue_metadata(_commit_blocked("send_order_attempt", "send order attempt source is required"), expected_revision=expected_revision)
+    normalized_market_route = _clean_text(market_route).upper()
+    if normalized_market_route and normalized_market_route not in {"KRX", "SOR"}:
+        return _with_queue_metadata(
+            _commit_blocked("send_order_attempt", "market_route must be KRX or SOR"),
+            expected_revision=expected_revision,
+        )
 
     normalized_attempt_id = _clean_text(attempt_id) or f"SEND_ATTEMPT_{uuid4().hex}"
     attempted_at = datetime.now()
@@ -1809,6 +1816,15 @@ def mark_send_order_attempted(
         for index, item in enumerate(updated_data["orders"]):
             if _dispatch_identity_matches(_as_dict(item), normalized_identity):
                 updated_record = deepcopy(item)
+                if normalized_market_route:
+                    execution_request = _as_dict(updated_record.get("execution_request"))
+                    request_preview = _as_dict(execution_request.get("request_preview"))
+                    request_preview = deepcopy(request_preview)
+                    request_preview["market_route"] = normalized_market_route
+                    execution_request = deepcopy(execution_request)
+                    execution_request["request_preview"] = request_preview
+                    updated_record["market_route"] = normalized_market_route
+                    updated_record["execution_request"] = execution_request
                 updated_record.update(
                     {
                         "status": "SEND_ATTEMPTED",
@@ -1856,6 +1872,7 @@ def mark_send_order_attempted(
                         "broker_accepted": False,
                         "broker_rejected": False,
                         "automatic_retry_allowed": False,
+                        "market_route": normalized_market_route or None,
                     },
                 }
         return {"blocked": _commit_blocked("send_order_attempt", "send order target disappeared before mutation")}
@@ -1871,6 +1888,13 @@ def mark_send_order_attempted(
             return _commit_blocked("post_send_order_attempt_verify", "send order attempt id mismatch after write")
         if record.get("broker_call_executed") is not False or record.get("broker_api_called") is not False:
             return _commit_blocked("post_send_order_attempt_verify", "send order attempt executed broker call")
+        if normalized_market_route:
+            execution_request = _as_dict(record.get("execution_request"))
+            request_preview = _as_dict(execution_request.get("request_preview"))
+            if _clean_text(record.get("market_route")).upper() != normalized_market_route:
+                return _commit_blocked("post_send_order_attempt_verify", "top-level market_route was not persisted")
+            if _clean_text(request_preview.get("market_route")).upper() != normalized_market_route:
+                return _commit_blocked("post_send_order_attempt_verify", "request preview market_route was not persisted")
         return None
 
     result = mutate_order_queue(

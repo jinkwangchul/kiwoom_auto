@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from kiwoom_screen_allocator import project_order_default_screen_no
+from gui_stock_data import stock_nxt_availability
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -55,6 +56,12 @@ def build_kiwoom_order_request(order: dict[str, Any], guard: dict[str, Any]) -> 
     quantity = order.get("quantity")
     price = order.get("price")
     account_no = str(guard.get("account_no", "") or "").strip()
+    action = _norm(order.get("order_action") or order.get("action") or "NEW")
+    market_route = (
+        "SOR" if stock_nxt_availability(code) is True else "KRX"
+    ) if action == "NEW" else (
+        "SOR" if _norm(order.get("market_route") or order.get("order_route")) == "SOR" else "KRX"
+    )
 
     if side == "BUY":
         order_kind = "신규매수"
@@ -70,6 +77,8 @@ def build_kiwoom_order_request(order: dict[str, Any], guard: dict[str, Any]) -> 
         "screen_no": project_order_default_screen_no(),
         "account_no": account_no,
         "order_kind": order_kind,
+        "order_action": action,
+        "market_route": market_route,
         "code": code,
         "quantity": quantity,
         "price": price,

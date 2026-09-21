@@ -198,6 +198,21 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertEqual(tuple(["0101", "BUY", "12345678", 1, "003550", 10, 85000, "03", ""]), adapter.calls[0])
         self.assertEqual(0, result["send_order_result"]["return_code"])
 
+    def test_preview_executor_still_allows_sor_order_types(self) -> None:
+        for order_type in (11, 12, 13, 15):
+            with self.subTest(order_type=order_type):
+                args = ["0101", "SOR", "12345678", order_type, "003550", 10, 85000, "00", ""]
+                adapter = RecordingAdapter(0)
+
+                result = execute_kiwoom_send_order(
+                    self._call_preview(send_order_args=args),
+                    adapter,
+                    self._context(),
+                )
+
+                self.assertEqual("SEND_ORDER_SENT", result["status"])
+                self.assertEqual([tuple(args)], adapter.calls)
+
     def test_non_zero_return_is_failed(self) -> None:
         adapter = RecordingAdapter(-308)
 
@@ -368,6 +383,110 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertEqual(4, data["revision"])
         self.assertNotIn("CLAIM_TOKEN", json.dumps(data))
         self.assertNotIn("CLAIM_TOKEN", json.dumps(result))
+
+    def test_claimed_sor_order_types_fail_closed_before_attempt_without_fallback(self) -> None:
+        for order_type in (11, 12, 13, 15):
+            with self.subTest(order_type=order_type):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                queue_path = Path(tmp.name) / "order_queue.json"
+                record = self._claimed_record(
+                    market_route="SOR",
+                    execution_request={"request_preview": {"market_route": "SOR"}},
+                )
+                self._write_claimed_queue(queue_path, record)
+                before = queue_path.read_bytes()
+                adapter = ClaimedSendOrderCallable(0)
+                args = ["0101", "SOR", "12345678", order_type, "003550", 10, 85000, "00", ""]
+
+                with mock.patch(
+                    "kiwoom_send_order_executor.observe_live_sor_execution_blocked",
+                    create=True,
+                ) as diagnostic:
+                    result = execute_claimed_send_order(
+                        queue_path,
+                        _claimed_identity(record),
+                        "CLAIM_1",
+                        "CLAIM_TOKEN",
+                        "GUI_MANUAL",
+                        1,
+                        adapter,
+                        args,
+                        {"send_order_attempt_id": f"ATTEMPT_SOR_{order_type}"},
+                    )
+
+                self.assertEqual("BLOCKED", result["status"])
+                self.assertEqual("LIVE_SOR_RECONCILIATION_UNVERIFIED", result["reason_code"])
+                self.assertEqual(["LIVE_SOR_RECONCILIATION_UNVERIFIED"], result["blocked_reasons"])
+                self.assertFalse(result["callable_executed"])
+                self.assertFalse(result["send_order_called"])
+                self.assertFalse(result["broker_call_executed"])
+                self.assertFalse(result["broker_api_called"])
+                self.assertFalse(result["actual_order_sent"])
+                self.assertEqual([], adapter.calls)
+                self.assertEqual(before, queue_path.read_bytes())
+                queued = json.loads(queue_path.read_text(encoding="utf-8"))["orders"][0]
+                self.assertEqual("DISPATCH_CLAIMED", queued["status"])
+                self.assertEqual("SOR", queued["market_route"])
+                self.assertEqual("SOR", queued["execution_request"]["request_preview"]["market_route"])
+                diagnostic.assert_called_once()
+
+    def test_claimed_krx_route_still_invokes_original_order_type(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimed_record(
+            market_route="KRX",
+            execution_request={"request_preview": {"market_route": "KRX"}},
+        )
+        self._write_claimed_queue(queue_path, record)
+        adapter = ClaimedSendOrderCallable(0)
+        args = ["0101", "KRX", "12345678", 1, "003550", 10, 85000, "00", ""]
+
+        result = execute_claimed_send_order(
+            queue_path,
+            _claimed_identity(record),
+            "CLAIM_1",
+            "CLAIM_TOKEN",
+            "GUI_MANUAL",
+            1,
+            adapter,
+            args,
+            {"send_order_attempt_id": "ATTEMPT_KRX_CONTROL"},
+        )
+
+        self.assertEqual("SEND_CALL_ACCEPTED", result["status"])
+        self.assertEqual([tuple(args)], adapter.calls)
+
+    def test_claimed_sor_gate_stays_closed_when_diagnostic_write_fails(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimed_record(market_route="SOR")
+        self._write_claimed_queue(queue_path, record)
+        before = queue_path.read_bytes()
+        adapter = ClaimedSendOrderCallable(0)
+
+        with mock.patch(
+            "event_journal_trade_observer.append_production_event",
+            side_effect=RuntimeError("journal unavailable"),
+        ):
+            result = execute_claimed_send_order(
+                queue_path,
+                _claimed_identity(record),
+                "CLAIM_1",
+                "CLAIM_TOKEN",
+                "GUI_MANUAL",
+                1,
+                adapter,
+                ["0101", "SOR", "12345678", 11, "003550", 10, 85000, "00", ""],
+                {"send_order_attempt_id": "ATTEMPT_SOR_DIAGNOSTIC_FAILURE"},
+            )
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertEqual("LIVE_SOR_RECONCILIATION_UNVERIFIED", result["reason_code"])
+        self.assertEqual([], adapter.calls)
+        self.assertEqual(before, queue_path.read_bytes())
 
     def test_claimed_send_order_non_zero_records_send_call_rejected(self) -> None:
         tmp = tempfile.TemporaryDirectory()

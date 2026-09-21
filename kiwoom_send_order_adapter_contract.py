@@ -33,6 +33,15 @@ ACTION_ORDER_TYPE_MAP = {
     ("BUY", "MODIFY"): 5,
     ("SELL", "MODIFY"): 6,
 }
+SOR_ACTION_ORDER_TYPE_MAP = {
+    ("BUY", "NEW"): 11,
+    ("SELL", "NEW"): 12,
+    ("BUY", "CANCEL"): 13,
+    ("SELL", "CANCEL"): 13,
+    ("BUY", "MODIFY"): 15,
+    ("SELL", "MODIFY"): 15,
+}
+SUPPORTED_MARKET_ROUTES = {"KRX", "SOR"}
 ACTION_ORDER_NAME_MAP = {
     ("BUY", "NEW"): "BUY",
     ("SELL", "NEW"): "SELL",
@@ -187,6 +196,11 @@ def build_kiwoom_send_order_adapter_contract(
     action = _upper(params.get("order_action") or params.get("action") or "NEW")
     if action not in {"NEW", "CANCEL", "MODIFY"}:
         return _result(status=STATUS_INVALID, issues=["order_action mapping failed"])
+    market_route = _upper(
+        params.get("market_route") or params.get("order_route") or "KRX"
+    )
+    if market_route not in SUPPORTED_MARKET_ROUTES:
+        return _result(status=STATUS_INVALID, issues=["market_route mapping failed"])
 
     hoga_key = _upper(params.get("hoga"))
     hoga_code = HOGA_MAP.get(hoga_key, "")
@@ -218,11 +232,17 @@ def build_kiwoom_send_order_adapter_contract(
     if missing:
         return _result(status=STATUS_INVALID, issues=[f"{key} is required" for key in missing])
 
+    order_type_map = (
+        SOR_ACTION_ORDER_TYPE_MAP
+        if market_route == "SOR"
+        else ACTION_ORDER_TYPE_MAP
+    )
     send_order_params = {
         "screen_no": screen_no,
         "order_name": ACTION_ORDER_NAME_MAP[(side, action)],
         "account_no": account_no,
-        "order_type": ACTION_ORDER_TYPE_MAP[(side, action)],
+        "order_type": order_type_map[(side, action)],
+        "market_route": market_route,
         "code": code,
         "quantity": _number(quantity),
         "price": _number(price),
@@ -236,6 +256,7 @@ def build_kiwoom_send_order_adapter_contract(
         "screen_no": screen_no,
         "order_name": send_order_params["order_name"],
         "order_type": send_order_params["order_type"],
+        "market_route": market_route,
         "code": code,
         "quantity": send_order_params["quantity"],
         "price": send_order_params["price"],

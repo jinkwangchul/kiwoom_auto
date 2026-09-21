@@ -74,6 +74,46 @@ class EventJournalBrokerFillCloseConnectionTest(unittest.TestCase):
         self.assertTrue(all(item["category"] == "ORDER" for item in events))
         self.assertNotIn("BROKER_ORDER_ACCEPTED", [item["event_type"] for item in events])
 
+    def test_live_sor_execution_block_has_distinct_fail_open_diagnostic(self) -> None:
+        result = {
+            "status": "BLOCKED",
+            "reason_code": "LIVE_SOR_RECONCILIATION_UNVERIFIED",
+            "market_route": "SOR",
+            "order_type": 11,
+            "queue_result_recorded": False,
+        }
+
+        observed = observer.observe_live_sor_execution_blocked(self.identity(), result)
+        duplicate = observer.observe_live_sor_execution_blocked(self.identity(), result)
+
+        self.assertTrue(observed["appended"])
+        self.assertTrue(duplicate["duplicate"])
+        events = self.events()
+        self.assertEqual(1, len(events))
+        self.assertEqual("EXECUTION_BLOCKED", events[0]["event_type"])
+        self.assertEqual("BLOCKED", events[0]["result"])
+        self.assertEqual("EXEC-1", events[0]["correlation_id"])
+        self.assertEqual(
+            "LIVE_SOR_RECONCILIATION_UNVERIFIED",
+            events[0]["details"]["reason_code"],
+        )
+
+    def test_live_sor_execution_block_diagnostic_write_failure_is_fail_open(self) -> None:
+        with patch.object(observer, "append_production_event", side_effect=RuntimeError("journal unavailable")):
+            observed = observer.observe_live_sor_execution_blocked(
+                self.identity(),
+                {
+                    "status": "BLOCKED",
+                    "reason_code": "LIVE_SOR_RECONCILIATION_UNVERIFIED",
+                    "market_route": "SOR",
+                    "order_type": 11,
+                },
+            )
+
+        self.assertFalse(observed["appended"])
+        self.assertTrue(observed["write_failed"])
+        self.assertEqual([], self.events())
+
     def test_normalized_broker_accept_reject_and_cancel_are_recorded_once(self) -> None:
         cases = (
             ("ORDER_OPEN", "BROKER_ORDER_ACCEPTED", "BROKER-1", "EVENT-A"),
