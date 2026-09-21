@@ -424,9 +424,10 @@ class MockIndicatorFollowContinuationCoordinator:
         self, session_id: str, *, routine_instance_id: str,
         evaluation_cycle_id: str, evaluated_at: datetime,
         market: MockMarketSnapshot | None, trade_fresh: bool,
+        document: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Apply the highest-priority active-plan continuation action, if any."""
-        document = self.repository.read_session(session_id)
+        document = document if isinstance(document, dict) else self.repository.read_session(session_id)
         instance_id = clean_text(routine_instance_id)
         self.validate_integrity(document, instance_id)
         state = self.state(document, instance_id)
@@ -800,9 +801,10 @@ class MockIndicatorFollowContinuationCoordinator:
         self, session_id: str, *, routine_instance_id: str,
         evaluation_cycle_id: str, evaluated_at: datetime,
         market: MockMarketSnapshot | None, trade_fresh: bool,
+        document: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Choose SELL repeat/exit/residual after all current orders are terminal."""
-        document = self.repository.read_session(session_id)
+        document = document if isinstance(document, dict) else self.repository.read_session(session_id)
         instance_id = clean_text(routine_instance_id)
         state = self.state(document, instance_id)
         if evaluation_cycle_id in state["cycles"]:

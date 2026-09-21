@@ -730,6 +730,15 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
         self._start("B")
         self._start("C")
         self._open_order("A", "MO-CRASH-A", "BUY", 2)
+        self.host.session_service.set_instance_position(
+            self.session_id,
+            "A",
+            holding_qty=1,
+            available_qty=1,
+            average_price=100,
+            realized_cost_basis=100,
+            command_id="MC-pre-restart-position-A",
+        )
         self.host.request_instance_early_close(
             "005930", "A", method="MARKET", as_of=self.clock["now"]
         )
@@ -889,6 +898,23 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
         )
 
     def test_restart_manual_start_hold_covers_time_manual_and_ats_for_ten_seconds(self):
+        self.host._operation_policy_provider = lambda: {
+            "regular_market": {
+                "start_time": "09:00:00",
+                "end_time": "15:30:00",
+            },
+            "extra_sessions": [
+                {
+                    "enabled": True,
+                    "start_time": "15:40:00",
+                    "end_time": "19:50:00",
+                }
+            ],
+            "liquidation": {
+                "minutes_before_regular_close": 5,
+                "method": "시장가",
+            },
+        }
         settings = {
             "A": {
                 "operation_mode": "SCHEDULED",
@@ -1547,6 +1573,28 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
         )
 
     def test_validation_stopped_pre_start_uses_next_settings_across_main_menu_and_chart(self):
+        self.host._operation_policy_provider = lambda: {
+            "regular_market": {
+                "start_time": "09:00:00",
+                "end_time": "15:30:00",
+            },
+            "extra_sessions": [
+                {
+                    "enabled": True,
+                    "start_time": "08:00:00",
+                    "end_time": "08:50:00",
+                },
+                {
+                    "enabled": True,
+                    "start_time": "15:40:00",
+                    "end_time": "19:50:00",
+                },
+            ],
+            "liquidation": {
+                "minutes_before_regular_close": 5,
+                "method": "시장가",
+            },
+        }
         self.actions.set_instance_effective_settings(
             "005930",
             "A",
@@ -1576,7 +1624,7 @@ class MockValidationStopAndQuickChartTest(unittest.TestCase):
         frozen_reference = deepcopy(stopped["reference_snapshot"])
         self.assertEqual("VALIDATION_STOPPED", past_operation["state"])
         self.assertEqual("VALIDATION_STOP", past_operation["close_source"])
-        self.assertEqual("ROUTINE", past_operation["close_method"])
+        self.assertEqual("MARKET", past_operation["close_method"])
         self.assertEqual(
             ["extra2"],
             past_operation["operation_policy_snapshot"][

@@ -4,10 +4,17 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
+import json
 import logging
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+
+from candle_timeframe_aggregation import (
+    SEOUL_TIMEZONE,
+    validate_market_bar_projection_request,
+)
 
 from auto_trade_order_execution_boundary import (
     AutoTradeOrderExecutionBoundary,
@@ -381,7 +388,8 @@ class AutoTradeOperationHost(QObject):
         """Sync all current registered Stocks without evaluating operation readiness."""
 
         try:
-            projection = StockRepository().realtime_monitoring_universe()
+            repository = StockRepository()
+            projection = repository.realtime_monitoring_universe()
             initial_snapshot_targets = tuple(
                 getattr(
                     projection,
@@ -389,15 +397,125 @@ class AutoTradeOperationHost(QObject):
                     projection.target_stock_codes,
                 )
             )
+            supported_codes = set(projection.target_stock_codes)
+            standby_requirements: list[dict[str, object]] = []
+            standby_skips: list[dict[str, str]] = []
+            standby_errors: list[dict[str, str]] = []
+            from routine_instance_registry import (
+                routine_definition_by_id,
+                routine_instance_by_id,
+            )
+            from routine_package_contract import EVALUATION_ROLE, load_routine_callable
+
+            seen_codes: set[str] = set()
+            for stock in repository.list_current_registered_stocks():
+                code = str(getattr(stock, "code", "") or "").strip()
+                if not code or code in seen_codes:
+                    continue
+                seen_codes.add(code)
+                if code not in supported_codes:
+                    standby_skips.append({
+                        "stock_code": code,
+                        "reason_code": "BROKER_STOCK_UNSUPPORTED",
+                    })
+                    continue
+                try:
+                    instance_id = str(
+                        getattr(stock, "assigned_routine_instance_id", "") or ""
+                    ).strip()
+                    instance = routine_instance_by_id(instance_id)
+                    if instance is None:
+                        raise ValueError("ROUTINE_INSTANCE_UNAVAILABLE")
+                    definition = routine_definition_by_id(
+                        str(getattr(instance, "definition_id", "") or "").strip()
+                    )
+                    if definition is None:
+                        raise ValueError("ROUTINE_DEFINITION_UNAVAILABLE")
+                    locators = getattr(definition, "locators", None)
+                    evaluation = (
+                        locators.get(EVALUATION_ROLE)
+                        if isinstance(locators, dict)
+                        else None
+                    )
+                    callable_name = (
+                        str(evaluation.get("market_bar_projection_callable") or "").strip()
+                        if isinstance(evaluation, dict)
+                        else ""
+                    )
+                    if not callable_name:
+                        standby_skips.append({
+                            "stock_code": code,
+                            "reason_code": "CANDLE_PROJECTION_NOT_DECLARED",
+                        })
+                        continue
+                    rules_path = getattr(instance, "rules_path", None)
+                    if rules_path is None:
+                        raise ValueError("ROUTINE_RULES_UNAVAILABLE")
+                    rules = json.loads(Path(rules_path).read_text(encoding="utf-8"))
+                    if not isinstance(rules, dict):
+                        raise ValueError("ROUTINE_RULES_INVALID")
+                    request_reader = load_routine_callable(
+                        definition,
+                        EVALUATION_ROLE,
+                        callable_key="market_bar_projection_callable",
+                    )
+                    request = validate_market_bar_projection_request(
+                        request_reader(rules),
+                        require_warmup=True,
+                    )
+                    standby_requirements.append({
+                        "stock_code": code,
+                        "rules": rules,
+                        "projection_request": request,
+                    })
+                except Exception as exc:
+                    standby_errors.append({
+                        "stock_code": code,
+                        "error": str(exc),
+                    })
+            preserve_standby_stock_codes = tuple(
+                sorted(
+                    {
+                        str(item.get("stock_code") or "").strip()
+                        for item in standby_errors
+                        if str(item.get("stock_code") or "").strip()
+                    }
+                )
+            )
+            standby_sync = self._market_data_host.sync_candle_standby_requirements(
+                standby_requirements,
+                preserve_stock_codes=preserve_standby_stock_codes,
+            )
             result = self._market_data_host.sync_monitoring_targets(
                 initial_snapshot_targets
             )
             response = dict(result) if isinstance(result, dict) else {}
+            standby_sync_codes = tuple(
+                standby_sync.get("standby_stock_codes", ())
+                if isinstance(standby_sync, dict)
+                else ()
+            )
+            bootstrap = None
+            if standby_requirements or standby_sync_codes:
+                bootstrap = self._market_data_host.refresh_operation_candles(
+                    datetime.now(SEOUL_TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+                    drain_all=True,
+                )
             response.update(
                 monitoring_target_stock_codes=initial_snapshot_targets,
                 realtime_target_stock_codes=projection.target_stock_codes,
                 unsupported_stock_codes=projection.unsupported_stock_codes,
                 source_record_count=projection.source_record_count,
+                standby_requirement_stock_codes=tuple(
+                    item["stock_code"] for item in standby_requirements
+                ),
+                standby_requirement_skipped_stock_codes=tuple(
+                    item["stock_code"] for item in standby_skips
+                ),
+                standby_requirement_skips=tuple(standby_skips),
+                standby_requirement_errors=tuple(standby_errors),
+                standby_requirement_sync=standby_sync,
+                standby_candle_bootstrap=bootstrap,
             )
             return response
         except Exception as exc:
@@ -424,6 +542,9 @@ class AutoTradeOperationHost(QObject):
 
     def high_resolution_market_state(self, stock_code: str):
         return self._market_data_host.high_resolution_market_state(stock_code)
+
+    def nxt_display_live_price_state(self, stock_code: str):
+        return self._market_data_host.nxt_display_live_price_state(stock_code)
 
     def monitoring_market_information_state(self, stock_code: str):
         return self._market_data_host.monitoring_market_information_state(stock_code)

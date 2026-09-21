@@ -464,7 +464,6 @@ def validate_routine_definition_capabilities(
     # successfully and fail later in the Production caller.
     required_additional_callables = {
         EVALUATION_ROLE: (
-            "market_bar_projection_callable",
             "cycle_projection_callable",
         ),
         SETTINGS_ROLE: ("registration_callable",),

@@ -16,9 +16,40 @@ from typing import Any
 SEOUL_TIMEZONE = timezone(timedelta(hours=9), name="Asia/Seoul")
 MARKET_BUCKET_ANCHOR = time(9, 0)
 SUPPORTED_BAR_MINUTES = frozenset({1, 3, 5, 10, 15, 30, 60, 120, 240})
-WARMUP_MARGIN_RATIO = 0.20
+WARMUP_MARGIN_RATIO = 0.10
 MAXIMUM_MINUTE_CANDLES = 200_000
 TIMESTAMP_ALIASES = ("timestamp", "datetime", "time", "date", "bar_time")
+SUPPORTED_MARKET_BAR_PROJECTIONS = frozenset({
+    "COMPLETED_TIMEFRAME",
+    "FORMING_BASE_BAR",
+})
+
+
+def validate_market_bar_projection_request(
+    projection_request: object,
+    *,
+    require_warmup: bool,
+) -> dict[str, Any]:
+    """Validate one routine-declared projection without coercing its schema."""
+
+    if not isinstance(projection_request, dict):
+        raise ValueError("projection_request must be a mapping")
+    projection = str(projection_request.get("projection") or "").strip().upper()
+    if projection not in SUPPORTED_MARKET_BAR_PROJECTIONS:
+        raise ValueError("projection_request.projection is unsupported")
+    normalized = dict(projection_request)
+    normalized["projection"] = projection
+    if "warmup_bars" not in projection_request:
+        if require_warmup:
+            raise ValueError("projection_request.warmup_bars is required")
+        return normalized
+    warmup_bars = projection_request.get("warmup_bars")
+    if isinstance(warmup_bars, bool) or not isinstance(warmup_bars, int):
+        raise ValueError("projection_request.warmup_bars must be a positive integer")
+    if warmup_bars <= 0:
+        raise ValueError("projection_request.warmup_bars must be a positive integer")
+    normalized["warmup_bars"] = warmup_bars
+    return normalized
 
 
 def read_canonical_bar_minutes(rules: dict[str, Any] | None) -> int:
@@ -299,11 +330,11 @@ def required_minute_candles(
     timeframe_minutes: int,
     warmup_bars: int,
 ) -> dict[str, Any]:
-    """Apply the user-approved 20% margin and 200,000-minute ceiling."""
+    """Apply the Production-owned 10% margin and 200,000-minute ceiling."""
     import math
 
     raw_required = max(int(timeframe_minutes), 1) * max(int(warmup_bars), 1)
-    required = int(math.ceil(raw_required * (1.0 + WARMUP_MARGIN_RATIO)))
+    required = raw_required + int(math.ceil(raw_required * WARMUP_MARGIN_RATIO))
     return {
         "required_minute_candles": required,
         "maximum_minute_candles": MAXIMUM_MINUTE_CANDLES,
@@ -323,11 +354,24 @@ def project_candle_supply(
     completed_projector: Any = None,
 ) -> dict[str, Any]:
     """Project one applied Routine request through the common Main contract."""
-    request = projection_request if isinstance(projection_request, dict) else {}
-    projection = str(request.get("projection") or "").strip().upper()
     interval = read_canonical_bar_minutes(rules)
+    try:
+        request = validate_market_bar_projection_request(
+            projection_request,
+            require_warmup=False,
+        )
+    except ValueError as exc:
+        return {
+            "available": False,
+            "candles": [],
+            "timeframe_minutes": interval,
+            "projection": "",
+            "availability_state": "PROJECTION_INVALID",
+            "reason": str(exc),
+        }
+    projection = request["projection"]
     warmup_declared = "warmup_bars" in request
-    warmup = required_minute_candles(interval, int(request.get("warmup_bars") or 1))
+    warmup = required_minute_candles(interval, request.get("warmup_bars", 1))
     if not warmup_declared:
         warmup = {**warmup, "required_minute_candles": 0}
     base = {
@@ -359,6 +403,7 @@ def project_candle_supply(
         warmup_declared and len(raw) < int(warmup["required_minute_candles"])
     )
     source_rows = list(raw)
+    forming_included = False
     if projection == "FORMING_BASE_BAR":
         forming_minute = forming_minute if isinstance(forming_minute, dict) else embedded_forming
         if warmup_declared and not isinstance(forming_minute, dict):
@@ -370,9 +415,63 @@ def project_candle_supply(
                 "availability_state": "FORMING_SOURCE_UNAVAILABLE",
                 "reason": "봉데이터 부족",
             }
+        forming_bucket_identity = None
         if isinstance(forming_minute, dict):
             source_rows.append(dict(forming_minute))
-        candles = aggregate_minute_candles(source_rows, interval, now=now, session_windows=session_windows)
+            forming_projection = aggregate_minute_candles(
+                [forming_minute],
+                interval,
+                now=now,
+                session_windows=session_windows,
+            )
+            if forming_projection:
+                marker = forming_projection[-1]
+                forming_bucket_identity = (
+                    marker.get("bar_time"),
+                    marker.get("trade_date"),
+                    marker.get("session"),
+                )
+            elif warmup_declared:
+                return {
+                    **base,
+                    "available": False,
+                    "candles": [],
+                    "available_minute_candles": len(raw),
+                    "availability_state": "FORMING_SOURCE_UNAVAILABLE",
+                    "reason": "봉데이터 부족",
+                }
+        aggregated = aggregate_minute_candles(
+            source_rows,
+            interval,
+            now=now,
+            session_windows=session_windows,
+        )
+        candles = [item for item in aggregated if item.get("is_complete") is True]
+        if forming_bucket_identity is not None:
+            forming_bucket = next(
+                (
+                    item
+                    for item in aggregated
+                    if (
+                        item.get("bar_time"),
+                        item.get("trade_date"),
+                        item.get("session"),
+                    )
+                    == forming_bucket_identity
+                ),
+                None,
+            )
+            if (
+                isinstance(forming_bucket, dict)
+                and forming_bucket.get("is_complete") is not True
+                and (
+                    not candles
+                    or str(forming_bucket.get("bar_time") or "")
+                    >= str(candles[-1].get("bar_time") or "")
+                )
+            ):
+                candles.append(forming_bucket)
+                forming_included = True
     elif projection == "COMPLETED_TIMEFRAME":
         projector = completed_projector if callable(completed_projector) else completed_timeframe_candles
         try:
@@ -381,12 +480,16 @@ def project_candle_supply(
             candles = projector(source_rows, rules, now=now)
     else:
         return {**base, "available": False, "candles": [], "availability_state": "PROJECTION_INVALID", "reason": "ROUTINE_MARKET_PROJECTION_REQUEST_INVALID"}
-    if history_insufficient:
+    projected_history_insufficient = bool(
+        warmup_declared and len(candles) < int(request["warmup_bars"])
+    )
+    if history_insufficient or projected_history_insufficient:
         return {
             **base,
             "available": False,
             "candles": [],
             "available_minute_candles": len(raw),
+            "available_timeframe_bars": len(candles),
             "availability_state": "SOURCE_UNAVAILABLE" if not raw else "HISTORY_INSUFFICIENT",
             "reason": "봉데이터 부족",
         }
@@ -400,10 +503,10 @@ def project_candle_supply(
         "availability_state": "AVAILABLE" if candles or not warmup_declared else "HISTORY_INSUFFICIENT",
         "candles": candles,
         "complete": bool(candles and candles[-1].get("is_complete") is True),
-        "forming_included": bool(forming_minute is not None),
+        "forming_included": forming_included,
         "completeness": {
             "completed_only": projection == "COMPLETED_TIMEFRAME",
-            "forming_included": bool(forming_minute is not None),
+            "forming_included": forming_included,
         },
         "freshness": {
             "latest_completed_minute": latest_completed.isoformat(timespec="seconds")
@@ -412,5 +515,6 @@ def project_candle_supply(
             "as_of": now.isoformat(timespec="seconds") if isinstance(now, datetime) else "",
         },
         "available_minute_candles": len(raw),
+        "available_timeframe_bars": len(candles),
         "reason": "" if candles or not warmup_declared else "봉데이터 부족",
     }

@@ -235,7 +235,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
         from mock_validation_indicator_follow_adapter import MockIndicatorFollowRoutineAdapter
         adapter = MockIndicatorFollowRoutineAdapter(
             repository, engine, now_factory=lambda: NOW,
-            evaluator=lambda *_args: next(signals),
+            evaluator=lambda _bars, _rules, context: next(signals) if context["_indicator_follow_evaluate_side"] == "BUY" else {"signal": None},
         )
         first = self.evaluate(adapter, cycle="SP0", market=_market(asks=((110, 100),), sequence=1))
         requested = self.evaluate(adapter, cycle="SP1", at=NOW + timedelta(milliseconds=100), market=_market(now=NOW, asks=((110, 100),), sequence=2))
@@ -258,7 +258,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
         ))
         repository, _, engine, _, _ = self.build({"A": rules})
         from mock_validation_indicator_follow_adapter import MockIndicatorFollowRoutineAdapter
-        adapter = MockIndicatorFollowRoutineAdapter(repository, engine, now_factory=lambda: NOW, evaluator=lambda *_args: next(signals))
+        adapter = MockIndicatorFollowRoutineAdapter(repository, engine, now_factory=lambda: NOW, evaluator=lambda _bars, _rules, context: next(signals) if context["_indicator_follow_evaluate_side"] == "BUY" else {"signal": None})
         self.evaluate(adapter, cycle="SL0", market=_market(asks=((110, 100),), sequence=1))
         ignored = self.evaluate(adapter, cycle="SL1", at=NOW + timedelta(milliseconds=100), market=_market(now=NOW, asks=((110, 100),), sequence=2))
         document = repository.read_session(SESSION_ID)
@@ -275,7 +275,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
         ))
         repository, _, engine, _, _ = self.build({"A": rules})
         from mock_validation_indicator_follow_adapter import MockIndicatorFollowRoutineAdapter
-        adapter = MockIndicatorFollowRoutineAdapter(repository, engine, now_factory=lambda: NOW, evaluator=lambda *_args: next(signals))
+        adapter = MockIndicatorFollowRoutineAdapter(repository, engine, now_factory=lambda: NOW, evaluator=lambda _bars, _rules, context: next(signals) if context["_indicator_follow_evaluate_side"] == "BUY" else {"signal": None})
         self.evaluate(adapter, cycle="SF0", market=_market(asks=((110, 100),), sequence=1))
         production_evaluator = adapter._lifecycle_evaluator
 

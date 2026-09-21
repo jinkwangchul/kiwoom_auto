@@ -31,6 +31,7 @@ BOOTSTRAP_REQUEST_COUNT = 600
 INCREMENTAL_REQUEST_COUNT = 3
 MAX_REQUESTS_PER_CYCLE = 15
 REQUEST_SPACING_MS = 1_000
+BOOTSTRAP_BATCH_PAUSE_MS = 60_000
 
 
 RefreshCompletion = Callable[[dict[str, Any]], None]
@@ -58,6 +59,17 @@ def request_operation_candle_for_stock(
         return result
     callback_called = False
     owned_rqname = ""
+    retention_max_count = DEFAULT_CANDLES_MAX_COUNT
+    required_count_getter = getattr(window, "candle_history_required_count", None)
+    if callable(required_count_getter):
+        try:
+            required_count = int(required_count_getter(code))
+        except (TypeError, ValueError, OverflowError):
+            required_count = DEFAULT_CANDLES_MAX_COUNT
+        retention_max_count = min(
+            DEFAULT_CANDLES_MAX_COUNT,
+            max(1, int(count), required_count),
+        )
 
     def received(result: dict[str, Any]) -> None:
         nonlocal callback_called
@@ -78,7 +90,7 @@ def request_operation_candle_for_stock(
             name,
             interval=1,
             count=count,
-            max_count=DEFAULT_CANDLES_MAX_COUNT,
+            max_count=retention_max_count,
             callback=received,
         )
     except Exception as exc:
@@ -187,6 +199,7 @@ def refresh_operation_candles(
     minute_key: str,
     *,
     on_complete: RefreshCompletion | None = None,
+    drain_all: bool = False,
 ) -> dict[str, Any]:
     """Refresh active stocks serially, then continue the minute signal cycle.
 
@@ -194,6 +207,19 @@ def refresh_operation_candles(
     remains below the OpenAPI+ per-second, per-minute, and per-hour TR limits.
     """
     if getattr(window, "_automatic_candle_refresh_inflight", False):
+        if drain_all:
+            setattr(window, "_automatic_candle_refresh_rerun_requested", True)
+            setattr(
+                window,
+                "_automatic_candle_refresh_rerun_minute_key",
+                str(minute_key or ""),
+            )
+        if callable(on_complete):
+            waiters = getattr(window, "_automatic_candle_refresh_waiters", None)
+            if not isinstance(waiters, list):
+                waiters = []
+                setattr(window, "_automatic_candle_refresh_waiters", waiters)
+            waiters.append(on_complete)
         return {
             "accepted": False,
             "completed": False,
@@ -202,7 +228,12 @@ def refresh_operation_candles(
 
     as_of = parse_market_datetime(minute_key) or datetime.now(SEOUL_TIMEZONE)
     trade_date = as_of.date().isoformat()
-    targets, skipped_by_limit = _rotated_targets(window, _refresh_targets(window))
+    all_targets = _refresh_targets(window)
+    if drain_all:
+        targets = all_targets
+        skipped_by_limit = 0
+    else:
+        targets, skipped_by_limit = _rotated_targets(window, all_targets)
     api = _api_from_host(window)
     request = getattr(api, "request_minute_candles", None)
     available = getattr(api, "is_available", None)
@@ -234,6 +265,8 @@ def refresh_operation_candles(
         "fail_closed": [],
         "max_requests_per_cycle": MAX_REQUESTS_PER_CYCLE,
         "request_spacing_ms": REQUEST_SPACING_MS,
+        "drain_all": bool(drain_all),
+        "bootstrap_batch_pause_ms": BOOTSTRAP_BATCH_PAUSE_MS if drain_all else 0,
     }
 
     if unavailable or not targets:
@@ -250,16 +283,55 @@ def refresh_operation_candles(
         completed_codes = set(completed_codes)
         tracker[trade_date] = completed_codes
 
+    refresh_generation = int(
+        getattr(window, "_automatic_candle_refresh_generation", 0) or 0
+    ) + 1
+    setattr(window, "_automatic_candle_refresh_generation", refresh_generation)
     setattr(window, "_automatic_candle_refresh_inflight", True)
 
+    def refresh_is_current() -> bool:
+        return (
+            int(getattr(window, "_automatic_candle_refresh_generation", 0) or 0)
+            == refresh_generation
+        )
+
     def finish() -> None:
+        if not refresh_is_current():
+            return
+        waiters = getattr(window, "_automatic_candle_refresh_waiters", None)
+        pending_waiters = list(waiters) if isinstance(waiters, list) else []
+        completion_callbacks = (
+            ([on_complete] if callable(on_complete) else []) + pending_waiters
+        )
+        setattr(window, "_automatic_candle_refresh_waiters", [])
         setattr(window, "_automatic_candle_refresh_inflight", False)
         summary["completed"] = True
         summary["reason_code"] = "CANDLE_REFRESH_COMPLETED"
-        if callable(on_complete):
-            on_complete(dict(summary))
+        if getattr(window, "_automatic_candle_refresh_rerun_requested", False):
+            rerun_minute_key = str(
+                getattr(window, "_automatic_candle_refresh_rerun_minute_key", "")
+                or minute_key
+            )
+            setattr(window, "_automatic_candle_refresh_rerun_requested", False)
+            setattr(window, "_automatic_candle_refresh_rerun_minute_key", "")
+
+            def complete_rerun(result: dict[str, Any]) -> None:
+                for callback in completion_callbacks:
+                    callback(dict(result))
+
+            refresh_operation_candles(
+                window,
+                rerun_minute_key,
+                on_complete=complete_rerun if completion_callbacks else None,
+                drain_all=True,
+            )
+            return
+        for callback in completion_callbacks:
+            callback(dict(summary))
 
     def request_next(index: int) -> None:
+        if not refresh_is_current():
+            return
         if index >= len(targets):
             finish()
             return
@@ -301,8 +373,20 @@ def refresh_operation_candles(
             )
             QTimer.singleShot(0, lambda: request_next(index + 1))
             return
-        stored_count = len(load_candles(stock_dir))
+        source_reload_reader = getattr(
+            api,
+            "production_candle_source_requires_reload",
+            None,
+        )
+        source_reload_required = (
+            source_reload_reader(code, name) is True
+            if callable(source_reload_reader)
+            else False
+        )
+        stored_count = 0 if source_reload_required else len(load_candles(stock_dir))
         bootstrap = (
+            source_reload_required
+            or
             stored_count < required_count
             or (code not in completed_codes and not _already_bootstrapped(stock_dir, trade_date, as_of))
         )
@@ -318,6 +402,8 @@ def refresh_operation_candles(
             summary["bootstrap_requested" if bootstrap else "incremental_requested"] += 1
 
         def received(result: dict[str, Any]) -> None:
+            if not refresh_is_current():
+                return
             if isinstance(result, dict) and result.get("ok") is True:
                 summary["succeeded"] += 1
                 if bootstrap and not reconciliation and _has_trade_date_candles(stock_dir, trade_date):
@@ -337,7 +423,15 @@ def refresh_operation_candles(
                         stock_dir,
                         result,
                     )
-            QTimer.singleShot(REQUEST_SPACING_MS, lambda: request_next(index + 1))
+            next_index = index + 1
+            delay_ms = REQUEST_SPACING_MS
+            if (
+                drain_all
+                and next_index < len(targets)
+                and summary["requested"] % MAX_REQUESTS_PER_CYCLE == 0
+            ):
+                delay_ms = BOOTSTRAP_BATCH_PAUSE_MS
+            QTimer.singleShot(delay_ms, lambda: request_next(next_index))
 
         request_operation_candle_for_stock(
             window,

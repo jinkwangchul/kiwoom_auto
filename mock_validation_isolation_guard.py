@@ -16,6 +16,7 @@ FORBIDDEN_IMPORT_ROOTS = {
     "order_queue",
     "operation_policy_gate",
     "execution_enable_service",
+    "gui_market_data_host",
     "execution_queue_writer",
     "execution_queue_commit_executor",
     "execution_queue_commit_service",
@@ -76,13 +77,57 @@ def mock_foundation_module_paths(project_root: str | Path) -> tuple[Path, ...]:
     return tuple(sorted(root.glob("mock_validation_*.py")))
 
 
+def _call_name(node: ast.Call) -> str:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return ""
+
+
+def _literal_text(node: ast.AST | None) -> str:
+    return str(node.value) if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+
+
+def _dynamic_import_name(node: ast.Call) -> str:
+    if _call_name(node) not in {"import_module", "__import__"} or not node.args:
+        return ""
+    return _literal_text(node.args[0]).strip()
+
+
+def _dynamic_routine_sources(source_path: Path, tree: ast.AST) -> tuple[Path, ...]:
+    """Resolve literal routine modules loaded by the Mock adapter without executing them."""
+
+    routine_root = source_path.parent / "routines" / "지표추종매매"
+    discovered: set[Path] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _call_name(node) != "_load_file_module":
+            continue
+        if not node.args:
+            continue
+        filename = _literal_text(node.args[0]).strip()
+        if not filename:
+            continue
+        candidate = (routine_root / filename).resolve()
+        if candidate.is_file():
+            discovered.add(candidate)
+    return tuple(sorted(discovered))
+
+
 def audit_mock_dependency_graph(paths: Iterable[str | Path]) -> dict[str, object]:
     violations: list[dict[str, object]] = []
     checked: list[str] = []
-    for value in paths:
-        path = Path(value)
+    pending = [Path(value) for value in paths]
+    visited: set[Path] = set()
+    while pending:
+        path = pending.pop(0)
+        resolved = path.resolve()
+        if resolved in visited:
+            continue
+        visited.add(resolved)
         checked.append(str(path))
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        pending.extend(_dynamic_routine_sources(path, tree))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -94,13 +139,16 @@ def audit_mock_dependency_graph(paths: Iterable[str | Path]) -> dict[str, object
                 if root in FORBIDDEN_IMPORT_ROOTS:
                     violations.append({"path": str(path), "line": node.lineno, "kind": "IMPORT_FROM", "name": node.module})
             elif isinstance(node, ast.Call):
-                name = ""
-                if isinstance(node.func, ast.Name):
-                    name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    name = node.func.attr
+                name = _call_name(node)
                 if name in FORBIDDEN_CALL_NAMES:
                     violations.append({"path": str(path), "line": node.lineno, "kind": "CALL", "name": name})
+                dynamic_name = _dynamic_import_name(node)
+                root = dynamic_name.split(".", 1)[0] if dynamic_name else ""
+                if root in FORBIDDEN_IMPORT_ROOTS:
+                    violations.append({
+                        "path": str(path), "line": node.lineno,
+                        "kind": "DYNAMIC_IMPORT", "name": dynamic_name,
+                    })
     return {"ok": not violations, "files_checked": tuple(checked), "violations": violations}
 
 

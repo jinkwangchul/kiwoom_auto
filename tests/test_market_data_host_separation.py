@@ -37,6 +37,7 @@ class _Api:
         self.bar_committed = _Signal()
         self.realtime_shadow_bar_completed = _Signal()
         self.realtime_shadow_tick_received = _Signal()
+        self.nxt_display_tick_received = _Signal()
         self.snapshot = SimpleNamespace(
             active=True,
             connection_epoch=7,
@@ -64,6 +65,14 @@ class _Api:
             "snapshot": self.snapshot,
         })
         self.clear_realtime_shadow_registration = Mock(return_value={
+            "ok": True,
+            "active": False,
+        })
+        self.sync_nxt_display_registration = Mock(return_value={
+            "ok": True,
+            "active": True,
+        })
+        self.clear_nxt_display_registration = Mock(return_value={
             "ok": True,
             "active": False,
         })
@@ -117,6 +126,21 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.assertIs(self.owner.kiwoom_api, self.market.kiwoom_api)
         self.assertIs(self.host, self.market.parent())
 
+    def test_session_clear_invalidates_candle_refresh_coordination_state(self) -> None:
+        self.market._automatic_candle_refresh_generation = 7
+        self.market._automatic_candle_refresh_inflight = True
+        self.market._automatic_candle_refresh_waiters = [lambda _result: None]
+        self.market._candle_bootstrap_completed = {"2026-09-22": {"005930"}}
+        self.market._candle_refresh_round_robin_offset = 12
+
+        self.market._clear_session_state()
+
+        self.assertEqual(8, self.market._automatic_candle_refresh_generation)
+        self.assertFalse(self.market._automatic_candle_refresh_inflight)
+        self.assertEqual([], self.market._automatic_candle_refresh_waiters)
+        self.assertEqual({}, self.market._candle_bootstrap_completed)
+        self.assertEqual(0, self.market._candle_refresh_round_robin_offset)
+
     def test_raw_kiwoom_signals_are_bound_exactly_once_by_market_host(self) -> None:
         self.host._bind_bar_committed_signal_once()
         self.host._bind_realtime_shadow_signals_once()
@@ -124,6 +148,7 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.assertEqual(1, self.owner.kiwoom_api.bar_committed.connect_count)
         self.assertEqual(1, self.owner.kiwoom_api.realtime_shadow_bar_completed.connect_count)
         self.assertEqual(1, self.owner.kiwoom_api.realtime_shadow_tick_received.connect_count)
+        self.assertEqual(1, self.owner.kiwoom_api.nxt_display_tick_received.connect_count)
         self.assertEqual(
             1,
             self.market.receivers(self.market.canonical_bar_ready_for_operation),
@@ -153,8 +178,12 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             scheduled.pop(0)()
 
         state = self.market.high_resolution_market_state("005930")
+        diagnostic = self.market.realtime_boundary_diagnostic_snapshot("005930")
         self.assertIsNotNone(state)
         self.assertEqual(100, state.last_receive_sequence)
+        self.assertEqual(1, diagnostic["counts"]["MARKET_HOST_RAW_RECEIVED"])
+        self.assertEqual(1, diagnostic["counts"]["NORMALIZATION_ACCEPTED"])
+        self.assertEqual(1, diagnostic["counts"]["HIGH_RES_STATE_UPDATED"])
 
     def test_raw_tick_fifo_order_is_preserved_without_coalescing(self) -> None:
         self._activate_raw_session()
@@ -199,6 +228,87 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         hynix = self.market.high_resolution_market_state("000660")
         self.assertEqual((70100, 102), (samsung.last_price, samsung.last_receive_sequence))
         self.assertEqual((210000, 101), (hynix.last_price, hynix.last_receive_sequence))
+
+    def test_integrated_tick_identity_survives_primary_host_processing(self) -> None:
+        self._activate_raw_session()
+        payload = self._raw_tick_payload(sequence=100)
+        payload.update(
+            broker_code_identity="005930_AL",
+            market_source="INTEGRATED",
+        )
+
+        self.assertTrue(self.market._process_raw_realtime_tick(payload))
+
+        state = self.market.high_resolution_market_state("005930")
+        self.assertEqual("005930_AL", state.broker_code_identity)
+        self.assertEqual("INTEGRATED", state.market_source)
+
+    def test_registered_integrated_identity_is_not_re_resolved_at_callback_time(self) -> None:
+        self.owner.kiwoom_api.snapshot = SimpleNamespace(
+            active=True,
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            target_stock_codes=("005930_AL",),
+            shadow_target_stock_codes=("005930",),
+        )
+        payload = self._raw_tick_payload(sequence=100)
+        payload.update(
+            broker_code_identity="005930_AL",
+            market_source="INTEGRATED",
+        )
+
+        with patch(
+            "gui_stock_data.stock_nxt_availability",
+            return_value=False,
+        ) as current_eligibility:
+            self.assertTrue(self.market._raw_realtime_tick_minimally_valid(payload))
+
+        current_eligibility.assert_not_called()
+
+    def test_registered_krx_identity_rejects_integrated_callback(self) -> None:
+        self.owner.kiwoom_api.snapshot = SimpleNamespace(
+            active=True,
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            target_stock_codes=("005930",),
+            shadow_target_stock_codes=("005930",),
+        )
+        payload = self._raw_tick_payload(sequence=100)
+        payload.update(
+            broker_code_identity="005930_AL",
+            market_source="INTEGRATED",
+        )
+
+        self.assertFalse(self.market._raw_realtime_tick_minimally_valid(payload))
+
+    def test_realtime_boundary_diagnostic_tracks_host_state_and_reject_transition(self) -> None:
+        self._activate_raw_session()
+        with patch("gui_market_data_host.LOGGER.warning") as warning:
+            self.assertTrue(
+                self.market._process_raw_realtime_tick(
+                    self._raw_tick_payload(sequence=100, price=70000)
+                )
+            )
+            self.assertTrue(
+                self.market._process_raw_realtime_tick(
+                    self._raw_tick_payload(sequence=101, price=70100)
+                )
+            )
+            self.assertFalse(
+                self.market._process_raw_realtime_tick(
+                    self._raw_tick_payload(sequence=100, price=69900)
+                )
+            )
+
+        snapshot = self.market.realtime_boundary_diagnostic_snapshot("005930")
+        self.assertEqual(2, snapshot["counts"]["NORMALIZATION_ACCEPTED"])
+        self.assertEqual(2, snapshot["counts"]["HIGH_RES_STATE_UPDATED"])
+        self.assertEqual(1, snapshot["counts"]["NORMALIZATION_REJECTED"])
+        warning.assert_not_called()
+        self.assertEqual(
+            70100,
+            self.market.high_resolution_market_state("005930").last_price,
+        )
 
     def test_same_session_none_preserves_previous_optional_market_fields(self) -> None:
         self._activate_raw_session()
@@ -979,6 +1089,67 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             self.market.high_resolution_market_state("005930").last_price,
         )
 
+    def test_nxt_display_state_is_source_isolated_from_krx_execution_state(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=10, price=259500)
+            )
+        )
+        self.assertTrue(
+            self.market._process_nxt_display_tick(
+                self._nxt_tick_payload(sequence=20, price=261000)
+            )
+        )
+
+        self.assertEqual(
+            259500,
+            self.market.high_resolution_market_state("005930").last_price,
+        )
+        nxt = self.host.nxt_display_live_price_state("005930")
+        self.assertEqual(261000, nxt.last_price)
+        self.assertEqual("005930", nxt.canonical_stock_code)
+        self.assertEqual("005930_NX", nxt.broker_code_identity)
+        self.assertEqual("NXT", nxt.market_source)
+
+    def test_nxt_display_state_rejects_stale_and_wrong_session_ticks(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(self.market._process_nxt_display_tick(self._nxt_tick_payload(sequence=2)))
+        self.assertFalse(self.market._process_nxt_display_tick(self._nxt_tick_payload(sequence=1)))
+        self.assertFalse(
+            self.market._process_nxt_display_tick(
+                self._nxt_tick_payload(sequence=3, session_id="STALE")
+            )
+        )
+        self.assertEqual(261000, self.market.nxt_display_live_price_state("005930").last_price)
+
+    def test_nxt_display_state_is_cleared_with_login_session_state(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(self.market._process_nxt_display_tick(self._nxt_tick_payload()))
+
+        self.market._clear_session_state()
+
+        self.assertIsNone(self.market.nxt_display_live_price_state("005930"))
+
+    def test_nxt_registration_is_derived_only_from_verified_eligibility(self) -> None:
+        library = SimpleNamespace(
+            state="READY",
+            records=(
+                {"code": "005930", "nxt_available": True},
+                {"code": "006400", "nxt_available": False},
+            ),
+        )
+        with patch("gui_market_data_host.load_stock_library_snapshot", return_value=library):
+            result = self.market.sync_monitoring_targets(("005930", "006400"))
+
+        self.assertTrue(result["nxt_display_sync"]["ok"])
+        self.owner.kiwoom_api.sync_nxt_display_registration.assert_called_once_with(
+            ("005930",)
+        )
+
     def _activate_raw_session(self) -> None:
         self.market._realtime_shadow_session_identity = (7, "SESSION-7")
 
@@ -1004,6 +1175,31 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             "receive_sequence": sequence,
             "market_datetime": "2026-08-20T10:15:01+09:00",
             "minute_key": "2026-08-20 10:15",
+            "connection_epoch": epoch,
+            "login_session_id": session_id,
+        }
+
+    @staticmethod
+    def _nxt_tick_payload(
+        *,
+        sequence: int = 1,
+        price: int = 261000,
+        epoch: int = 7,
+        session_id: str = "SESSION-7",
+    ) -> dict[str, object]:
+        return {
+            "canonical_stock_code": "005930",
+            "broker_code_identity": "005930_NX",
+            "market_source": "NXT",
+            "source_real_type": "ECN주식체결",
+            "execution_time_raw": "180001",
+            "current_price": price,
+            "execution_quantity": 12,
+            "cumulative_volume": 3456,
+            "received_at": "2026-08-20T18:00:01.000001+09:00",
+            "received_monotonic": float(sequence),
+            "receive_sequence": sequence,
+            "market_datetime": "2026-08-20T18:00:01+09:00",
             "connection_epoch": epoch,
             "login_session_id": session_id,
         }
@@ -1037,6 +1233,99 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             self.assertEqual(1, len(ready))
             self.assertEqual("2026-08-20 10:16", ready[0]["evaluation_tick_key"])
             self.assertEqual(stock_dir, ready[0]["stock_dir"])
+
+    def test_tr_deferred_context_survives_terminal_cleanup_for_two_stocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            scheduled, ready = [], []
+            self.market.canonical_bar_ready_for_operation.connect(ready.append)
+            with patch(
+                "gui_market_data_host.QTimer.singleShot",
+                side_effect=lambda _ms, callback: scheduled.append(callback),
+            ), patch.object(self.host, "_process_bar_commit_trigger") as process:
+                for code, kind in (("005930", "NORMAL_TR_REFRESH"),
+                                   ("012210", "REALTIME_RECONCILIATION")):
+                    stock_dir = Path(temp) / (code + "_Test")
+                    commit = commit_candles(stock_dir, [_candle()])
+                    rqname = "rq-" + code
+                    self.market.register_operation_candle_request(
+                        rqname, stock_code=code, stock_name=code,
+                        stock_dir=stock_dir,
+                        operation_cycle_minute_key="2026-08-20 10:16",
+                        request_kind=kind,
+                    )
+                    payload = dict(
+                        self._tr_payload(stock_dir, commit.canonical_content_hash),
+                        stock_code=code, rqname=rqname, commit_identity=code,
+                    )
+                    self.owner.kiwoom_api.bar_committed.emit(payload)
+                    self.owner.kiwoom_api.bar_committed.emit(payload)
+                    # A later mutable-context change must not alter queued provenance.
+                    self.market._operation_candle_requests[rqname][
+                        "operation_cycle_minute_key"
+                    ] = "2099-01-01 00:00"
+                    self.assertTrue(self.market.complete_operation_candle_request(rqname))
+                self.assertEqual({}, self.market._operation_candle_requests)
+                self.assertEqual([], ready)
+                while scheduled:
+                    scheduled.pop(0)()
+                self.assertEqual(2, process.call_count)
+                self.assertEqual(["005930", "012210"],
+                                 [call.args[0]["stock_code"] for call in process.call_args_list])
+            self.assertEqual(["005930", "012210"], [item["stock_code"] for item in ready])
+            self.assertEqual(["NORMAL_TR_REFRESH", "REALTIME_RECONCILIATION"],
+                             [item["request_kind"] for item in ready])
+            self.assertTrue(all(item["evaluation_tick_key"] == "2026-08-20 10:16"
+                                for item in ready))
+            self.assertEqual({}, self.market._operation_candle_requests)
+
+    def test_tr_context_missing_at_receipt_is_not_recovered_by_later_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_Test"
+            commit = commit_candles(stock_dir, [_candle()])
+            scheduled, ready = [], []
+            self.market.canonical_bar_ready_for_operation.connect(ready.append)
+            with patch("gui_market_data_host.QTimer.singleShot",
+                       side_effect=lambda _ms, callback: scheduled.append(callback)):
+                payload = self._tr_payload(stock_dir, commit.canonical_content_hash)
+                payload["_operation_request_context"] = {"stock_code": "005930"}
+                self.owner.kiwoom_api.bar_committed.emit(payload)
+                self.market.register_operation_candle_request(
+                    "manual", stock_code="005930", stock_name="Test",
+                    stock_dir=stock_dir, operation_cycle_minute_key="2026-08-20 10:16",
+                )
+                while scheduled:
+                    scheduled.pop(0)()
+            self.assertEqual([], ready)
+            self.assertTrue(self.market.complete_operation_candle_request("manual"))
+
+    def test_tr_snapshot_keeps_identity_and_hash_checks_and_preserves_reused_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_Test"
+            commit = commit_candles(stock_dir, [_candle()])
+            scheduled, ready = [], []
+            self.market.canonical_bar_ready_for_operation.connect(ready.append)
+            with patch("gui_market_data_host.QTimer.singleShot",
+                       side_effect=lambda _ms, callback: scheduled.append(callback)):
+                self.market.register_operation_candle_request(
+                    "manual", stock_code="005930", stock_name="Test",
+                    stock_dir=stock_dir, operation_cycle_minute_key="2026-08-20 10:16",
+                )
+                payload = self._tr_payload(stock_dir, commit.canonical_content_hash)
+                self.owner.kiwoom_api.bar_committed.emit(dict(payload, stock_code="012210"))
+                self.owner.kiwoom_api.bar_committed.emit(dict(payload, canonical_content_hash="stale"))
+                self.owner.kiwoom_api.bar_committed.emit(payload)
+                self.market.complete_operation_candle_request("manual")
+                self.market.register_operation_candle_request(
+                    "manual", stock_code="005930", stock_name="Test",
+                    stock_dir=stock_dir, operation_cycle_minute_key="2026-08-20 10:17",
+                )
+                while scheduled:
+                    scheduled.pop(0)()
+            self.assertEqual(1, len(ready))
+            self.assertEqual("2026-08-20 10:16", ready[0]["evaluation_tick_key"])
+            self.assertEqual("2026-08-20 10:17",
+                             self.market._operation_candle_requests["manual"]["operation_cycle_minute_key"])
+            self.assertTrue(self.market.complete_operation_candle_request("manual"))
 
     def test_realtime_ready_requires_current_primary_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -90,6 +90,7 @@ from indicator_follow_settings_compatibility import (
     normalize_sell_selected_set_authority,
 )
 from gui_routine_registry import get_routine_records, normalize_routine_name
+from gui_operation_ui_context import sync_auto_trade_monitoring_universe
 from gui_toast import show_toast
 from gui_window_policy import (
     configure_persistent_feature_window,
@@ -306,6 +307,10 @@ _COMBO_RESTORE_ALIASES = {
         for value in MINUTE_VALUES
     },
     ("buy_price_compare_condition_combo", "=<"): "<=",
+    ("buy_bollinger_direction_combo", "상향"): "상단",
+    ("buy_bollinger_direction_combo", "하향"): "하단",
+    ("sell_signal_condition_b_bollinger_direction_combo", "상향"): "상단",
+    ("sell_signal_condition_b_bollinger_direction_combo", "하향"): "하단",
 }
 
 
@@ -420,11 +425,11 @@ def _refresh_routine_assignment_views(owner):
     )
     if callable(refresh_views):
         refresh_views()
-        return
-
-    refresh_all = getattr(refresh_owner, "refresh_all", None)
-    if callable(refresh_all):
-        refresh_all()
+    else:
+        refresh_all = getattr(refresh_owner, "refresh_all", None)
+        if callable(refresh_all):
+            refresh_all()
+    sync_auto_trade_monitoring_universe(refresh_owner or owner)
 
 
 def _remember_successful_registration_state(
@@ -2656,6 +2661,7 @@ class IndicatorFollowRoutineSettingsDialog(
                 "승인한 변경사항을 적용했습니다.",
             )
             self.load_rules()
+            _refresh_routine_assignment_views(self)
         else:
             QMessageBox.warning(
                 self,

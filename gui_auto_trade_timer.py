@@ -837,6 +837,17 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             if (
                 candle_refresh_result.get("accepted") is False
                 and candle_refresh_result.get("completed") is False
+                and candle_refresh_result.get("reason_code")
+                == "CANDLE_REFRESH_ALREADY_RUNNING"
+            ):
+                signal_result = {
+                    "deferred_for_candle_refresh": True,
+                    "reason_code": "CANDLE_REFRESH_ALREADY_RUNNING",
+                }
+                deferred_cycle_completion_pending = True
+            elif (
+                candle_refresh_result.get("accepted") is False
+                and candle_refresh_result.get("completed") is False
             ):
                 signal_result = _process_pending_signal_pipeline(window)
             elif candle_refresh_result.get("completed") is not True:

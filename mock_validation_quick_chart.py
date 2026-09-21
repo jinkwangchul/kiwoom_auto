@@ -18,6 +18,8 @@ from gui_auto_trade_display import (
 )
 from gui_stock_instance_chart_window import StockInstanceChartWindow
 from mock_validation_contract import SESSION_ENDED, clean_text, payload_hash
+from mock_validation_execution_chart_read_model import project_mock_execution_chart
+from mock_validation_repository import MockValidationRepository
 from mock_validation_ui_projection import mock_instance_projection
 from stock_instance_day_projection import (
     chart_candle_projection_request,
@@ -31,11 +33,44 @@ _OPEN_MOCK_INSTANCE_CHARTS: dict[
 ] = {}
 
 
-def _target_document(window: Any, target: Any) -> dict[str, Any] | None:
+def _read_chart_source(cache, key, paths, reader):
+    """Reuse a read-only chart input only while its atomic source files match."""
+    def stamp():
+        try:
+            return tuple(
+                (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                for path in paths
+                for stat in (path.stat(),)
+            )
+        except OSError:
+            return None
+
+    before = stamp()
+    previous = cache.get(key)
+    if before is not None and previous is not None and previous[0] == before:
+        return previous[1]
+    cache.pop(key, None)
+    value = reader()
+    if before is not None and before == stamp():
+        cache[key] = (before, value)
+    return value
+
+
+def _target_document(window: Any, target: Any, *, read_cache=None) -> dict[str, Any] | None:
     host = getattr(window, "mock_validation_host", None)
     if host is None:
         return None
-    document = host.current_session(getattr(target, "stock_code", ""))
+    repository = getattr(host, "repository", None)
+    if read_cache is not None and isinstance(repository, MockValidationRepository):
+        document = _read_chart_source(
+            read_cache,
+            "session",
+            (repository.root / "runtime" / "current_sessions.json",
+             repository._target(repository._session_relative(target.validation_session_id))),
+            lambda: host.current_session(getattr(target, "stock_code", "")),
+        )
+    else:
+        document = host.current_session(getattr(target, "stock_code", ""))
     if not isinstance(document, dict):
         return None
     session = document.get("session")
@@ -144,8 +179,8 @@ def _operation_header_display_from_projection(
     }
 
 
-def _fresh_operation_header_display(window: Any, target: Any) -> dict[str, Any] | None:
-    document = _target_document(window, target)
+def _fresh_operation_header_display(window: Any, target: Any, *, read_cache=None) -> dict[str, Any] | None:
+    document = _target_document(window, target, read_cache=read_cache)
     if document is None:
         return None
     instance_id = clean_text(getattr(target, "routine_instance_id", ""))
@@ -226,8 +261,8 @@ def _signal_markers(
     return buy_markers, sell_markers
 
 
-def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> dict[str, Any]:
-    document = _target_document(window, target)
+def _projection(window: Any, target: Any, stock_code: str, trade_date: str, *, read_cache=None) -> dict[str, Any]:
+    document = _target_document(window, target, read_cache=read_cache)
     if document is None:
         raise RuntimeError("MOCK_CONTEXT_TARGET_STALE")
     instance_id = clean_text(target.routine_instance_id)
@@ -256,12 +291,21 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> d
         ),
     )
     candles = _chart_candles(candle_supply.get("candles"))
+    session_id = document["session"]["validation_session_id"]
+    if read_cache is not None and isinstance(host.repository, MockValidationRepository):
+        events = _read_chart_source(
+            read_cache, "events",
+            (host.repository.root / "events" / f"{session_id}.json",),
+            lambda: host.repository.read_events(session_id),
+        )
+    else:
+        events = host.repository.read_events(session_id)
     buy_markers, sell_markers = _signal_markers(
         document,
         instance_id=instance_id,
         rules=rules,
         trade_date=trade_date,
-        events=host.repository.read_events(document["session"]["validation_session_id"]),
+        events=events,
     )
     position = next(
         item
@@ -290,6 +334,7 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> d
         host.project_root,
     )
     bar_minutes = _bar_minutes(document, instance_id, rules)
+    execution_chart = project_mock_execution_chart(document, instance_id, trade_date)
     return {
         "stock_code": stock_code,
         "stock_name": document["session"].get("stock_name", ""),
@@ -314,8 +359,8 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> d
         "candles": candles,
         "buy_signal_markers": buy_markers,
         "sell_signal_markers": sell_markers,
-        "actual_fill_markers": [],
-        "execution_process_rails": [],
+        "actual_fill_markers": execution_chart["actual_fill_markers"],
+        "execution_process_rails": execution_chart["execution_process_rails"],
         "average_price": position.get("average_price", 0),
         "average_price_visible": holding > 0,
         "cumulative_pnl": net_pnl,
@@ -339,7 +384,7 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str) -> d
             "candle_availability_state": clean_text(
                 candle_supply.get("availability_state")
             ),
-            "issues": [],
+            "issues": execution_chart["diagnostics"],
         },
     }
 
@@ -350,12 +395,13 @@ class MockInstanceQuickChartWindow(StockInstanceChartWindow):
     def __init__(self, window: Any, target: Any) -> None:
         self._mock_owner = window
         self._mock_target = target
+        self._mock_chart_read_cache = {}
         super().__init__(
             target.stock_code,
             trade_date=self._current_trade_date(window, target),
             parent=window,
             projection_provider=lambda code, day: _projection(
-                window, target, code, day
+                window, target, code, day, read_cache=self._mock_chart_read_cache
             ),
         )
 
@@ -388,13 +434,19 @@ class MockInstanceQuickChartWindow(StockInstanceChartWindow):
         return True
 
     def _update_operation_header_info(self) -> None:
-        header = _fresh_operation_header_display(self._mock_owner, self._mock_target)
+        header = _fresh_operation_header_display(
+            self._mock_owner, self._mock_target, read_cache=self._mock_chart_read_cache
+        )
         if header is None:
             header = self.last_projection.get("operation_header_display", {})
         header = header if isinstance(header, dict) else {}
         if isinstance(self.last_projection, dict):
             self.last_projection["operation_header_display"] = deepcopy(header)
         self._apply_mock_operation_header(header)
+
+    def closeEvent(self, event) -> None:
+        self._mock_chart_read_cache.clear()
+        super().closeEvent(event)
 
     def _apply_mock_operation_header(self, header: dict[str, Any]) -> None:
         labels = getattr(self, "operation_info_labels", {})

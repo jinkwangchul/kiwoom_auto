@@ -104,6 +104,13 @@ def _pure_routine_functions() -> tuple[Callable[..., Any], Callable[..., dict[st
 
 
 @lru_cache(maxsize=1)
+def _pure_signal_selection() -> Callable[..., dict[str, Any]]:
+    return _load_file_module(
+        "routine.py", "mock_validation_indicator_follow_signal_selection"
+    ).evaluate_signal_selection
+
+
+@lru_cache(maxsize=1)
 def _pure_lifecycle_evaluator() -> Callable[..., dict[str, Any]]:
     lifecycle_module = _load_file_module(
         "routine_lifecycle.py", "mock_validation_indicator_follow_pure_lifecycle"
@@ -330,19 +337,21 @@ def _market_freshness(
         return False, False, "MOCK_MARKET_UNAVAILABLE"
     book = market.orderbook
     received = _aware(book.received_at)
+    book_reason = ""
     if received is None or evaluated_at.tzinfo is None:
-        return False, False, "MOCK_MARKET_TIME_INVALID"
-    if (
+        book_reason = "MOCK_MARKET_TIME_INVALID"
+    elif (
         book.connection_epoch != int(policy.connection_epoch)
         or book.login_session_id != clean_text(policy.login_session_id)
     ):
-        return False, False, "MOCK_MARKET_SESSION_INVALID"
-    age = (evaluated_at - received).total_seconds()
-    if age < 0 or age > float(policy.max_orderbook_age_seconds):
-        return False, False, "MOCK_ORDERBOOK_STALE"
+        book_reason = "MOCK_MARKET_SESSION_INVALID"
+    else:
+        age = (evaluated_at - received).total_seconds()
+        if age < 0 or age > float(policy.max_orderbook_age_seconds):
+            book_reason = "MOCK_ORDERBOOK_STALE"
     trade = market.trade
     if trade is None:
-        return True, False, "MOCK_TRADE_UNAVAILABLE"
+        return not book_reason, False, book_reason or "MOCK_TRADE_UNAVAILABLE"
     trade_received = _aware(trade.received_at)
     trade_fresh = bool(
         trade_received is not None
@@ -350,7 +359,11 @@ def _market_freshness(
         and trade.login_session_id == clean_text(policy.login_session_id)
         and 0 <= (evaluated_at - trade_received).total_seconds() <= float(policy.max_trade_age_seconds)
     )
-    return True, trade_fresh, "MOCK_MARKET_FRESH" if trade_fresh else "MOCK_TRADE_STALE"
+    return (
+        not book_reason,
+        trade_fresh,
+        book_reason or ("MOCK_MARKET_FRESH" if trade_fresh else "MOCK_TRADE_STALE"),
+    )
 
 
 def _plan_mode(intents: list[dict[str, Any]]) -> str:
@@ -416,6 +429,30 @@ class MockIndicatorFollowRoutineAdapter:
             raise MockValidationError("MOCK_ROUTINE_PROGRESSION_CORRUPTED")
         return adapter
 
+    def _final_routine_signal(self, signal, context):
+        """Apply Routine-owned intent admission once, before recording its signal."""
+        signal = deepcopy(signal)
+        side = clean_text(signal.get("signal")).upper()
+        cycle = context.get("cycle") or {}
+        if side == "BUY" and (
+            str(cycle.get("status") or "").strip().lower() == "unresolved"
+            or cycle.get("buy_phase_completed") is True or cycle.get("buy_exit_evidence")
+        ):
+            signal["signal"] = None
+            signal["reason"] = cycle.get("unresolved_reason") or "BUY_PHASE_COMPLETED"
+            return signal, None
+        if side not in {"BUY", "SELL"}:
+            return signal, None
+        build_result = (
+            self._sell_builder(sell_signal_result=signal, context=context)
+            if side == "SELL"
+            else self._buy_builder(buy_signal_result=signal, context=context)
+        )
+        if build_result.get("status") != "READY":
+            signal["signal"] = None
+            signal["reason"] = clean_text(build_result.get("reason"))
+        return signal, build_result
+
     def _event(
         self,
         document: dict[str, Any],
@@ -466,12 +503,13 @@ class MockIndicatorFollowRoutineAdapter:
         instance_id: str,
         *,
         cleared_at: str,
-    ) -> None:
-        before = self.repository.read_session(session_id)
+        document: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        before = document if isinstance(document, dict) else self.repository.read_session(session_id)
         progression = self._progression(before, instance_id)
         episode = progression.get("normal_block_episode")
         if not isinstance(episode, dict) or episode.get("active") is not True:
-            return
+            return before
 
         def clear(document: dict[str, Any]) -> dict[str, Any]:
             current = self._progression(document, instance_id).get("normal_block_episode")
@@ -479,11 +517,11 @@ class MockIndicatorFollowRoutineAdapter:
                 current.update({"active": False, "cleared_at": cleared_at})
             return document
 
-        self.repository.mutate_session(
+        return self.repository.mutate_session(
             session_id,
             clear,
             expected_revision=before["revision"],
-        )
+        )["document"]
 
     def _normal_block_episode(
         self,
@@ -701,8 +739,9 @@ class MockIndicatorFollowRoutineAdapter:
     def _advance_pending_successor(
         self, session_id: str, instance_id: str, *, cycle_id: str,
         evaluated_at: datetime, rules: dict[str, Any],
+        document: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        document = self.repository.read_session(session_id)
+        document = document if isinstance(document, dict) else self.repository.read_session(session_id)
         pending = self._progression(document, instance_id).get("pending_successor")
         if not isinstance(pending, dict):
             return None, None
@@ -943,6 +982,7 @@ class MockIndicatorFollowRoutineAdapter:
         position = _position(document, instance_id)
         fills = [item for item in document["fills"] if item.get("routine_instance_id") == instance_id]
         cycle = document["cycle_state_by_instance"][instance_id]
+        before_cycle = deepcopy(cycle)
         progression = self._progression(document, instance_id)
         plans = progression["plans"]
         active_scope = clean_text(cycle.get("cycle_identity"))
@@ -1015,7 +1055,6 @@ class MockIndicatorFollowRoutineAdapter:
                     for order in self._active_orders(document, instance_id)
                     if order.get("side") == "BUY"
                 ],
-                "updated_at": timestamp,
             }
         )
         if int(position["holding_qty"]) == 0 and cycle.get("cycle_identity") and not self._active_orders(document, instance_id):
@@ -1028,6 +1067,8 @@ class MockIndicatorFollowRoutineAdapter:
             cycle["base_filled_buy_amount"] = 0
             cycle["last_filled_buy_amount"] = 0
             cycle["filled_buy_amount_by_round"] = {}
+        if cycle != before_cycle:
+            cycle["updated_at"] = timestamp
 
     def _save_plan(
         self,
@@ -1077,8 +1118,15 @@ class MockIndicatorFollowRoutineAdapter:
         result = self.repository.mutate_session(session_id, mutation, expected_revision=before["revision"])
         return result["document"]
 
-    def _refresh_instance_plans(self, session_id: str, instance_id: str, timestamp: str) -> dict[str, Any]:
-        before = self.repository.read_session(session_id)
+    def _refresh_instance_plans(
+        self,
+        session_id: str,
+        instance_id: str,
+        timestamp: str,
+        *,
+        document: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        before = document if isinstance(document, dict) else self.repository.read_session(session_id)
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
             for plan in self._progression(document, instance_id)["plans"]:
@@ -1086,6 +1134,10 @@ class MockIndicatorFollowRoutineAdapter:
             self._sync_cycle(document, instance_id, timestamp)
             return document
 
+        candidate = deepcopy(before)
+        mutation(candidate)
+        if candidate == before:
+            return before
         return self.repository.mutate_session(
             session_id, mutation, expected_revision=before["revision"]
         )["document"]
@@ -1140,9 +1192,10 @@ class MockIndicatorFollowRoutineAdapter:
         return self.repository.mutate_session(session_id, mutation, expected_revision=before["revision"])["document"]
 
     def _resume_paused_source_after_recovery(
-        self, session_id: str, instance_id: str,
+        self, session_id: str, instance_id: str, *,
+        document: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        before = self.repository.read_session(session_id)
+        before = document if isinstance(document, dict) else self.repository.read_session(session_id)
 
         def mutation(document: dict[str, Any]) -> dict[str, Any]:
             plans = self._progression(document, instance_id)["plans"]
@@ -1162,6 +1215,10 @@ class MockIndicatorFollowRoutineAdapter:
                 source["state"] = "ACTIVE"
             return document
 
+        candidate = deepcopy(before)
+        mutation(candidate)
+        if candidate == before:
+            return before
         return self.repository.mutate_session(session_id, mutation, expected_revision=before["revision"])["document"]
 
     def _run_continuation_plan(
@@ -1688,6 +1745,7 @@ class MockIndicatorFollowRoutineAdapter:
         evaluated_at: datetime | None = None,
         new_buy_allowed: bool = True,
         candle_availability: dict[str, Any] | None = None,
+        document: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = self._evaluate_cycle_impl(
             session_id,
@@ -1699,21 +1757,27 @@ class MockIndicatorFollowRoutineAdapter:
             evaluated_at=evaluated_at,
             new_buy_allowed=new_buy_allowed,
             candle_availability=candle_availability,
+            document=document,
         )
+        current_document = result.pop("_document", None)
         normal_block = result.pop("_normal_block_episode", False) is True
         if (
             not normal_block
             and result.get("status") != "INSTANCE_ERROR"
             and result.get("reason") != "MOCK_EVALUATION_IDENTITY_INVALID"
+            and result.get("reason") != "MOCK_EVALUATION_CYCLE_ALREADY_PROCESSED"
         ):
             now = evaluated_at or self._now()
             timestamp = now.isoformat(timespec="microseconds") if now.tzinfo is not None else ""
             if timestamp:
-                self._clear_normal_block_episode(
+                current_document = self._clear_normal_block_episode(
                     session_id,
                     clean_text(routine_instance_id),
                     cleared_at=timestamp,
+                    document=current_document,
                 )
+        if isinstance(current_document, dict):
+            result["document"] = current_document
         return result
 
     def _evaluate_cycle_impl(
@@ -1728,6 +1792,7 @@ class MockIndicatorFollowRoutineAdapter:
         evaluated_at: datetime | None = None,
         new_buy_allowed: bool = True,
         candle_availability: dict[str, Any] | None = None,
+        document: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         instance_id = clean_text(routine_instance_id)
         cycle_id = clean_text(evaluation_cycle_id)
@@ -1736,7 +1801,7 @@ class MockIndicatorFollowRoutineAdapter:
         if not cycle_id or not timestamp:
             return {"status": RESULT_BLOCKED, "reason": "MOCK_EVALUATION_IDENTITY_INVALID", "orders": [], "fills": []}
         try:
-            document = self.repository.read_session(session_id)
+            document = deepcopy(document) if isinstance(document, dict) else self.repository.read_session(session_id)
             if instance_id not in document["instance_execution"]:
                 raise MockValidationError("MOCK_ROUTINE_INSTANCE_NOT_IN_SESSION")
             if document["session"]["state"] != SESSION_RUNNING:
@@ -1771,28 +1836,32 @@ class MockIndicatorFollowRoutineAdapter:
             progression = self._progression(document, instance_id)
             if cycle_id in progression["evaluation_cycles"]:
                 return {"status": RESULT_NOOP, "reason": "MOCK_EVALUATION_CYCLE_ALREADY_PROCESSED", "orders": [], "fills": []}
-            book_fresh, trade_fresh, market_reason = _market_freshness(market, evaluated_at=now, policy=policy)
-            if not book_fresh:
-                return self._normal_block(
-                    document, instance_id=instance_id, cycle_id=cycle_id,
-                    timestamp=timestamp, reason=market_reason, status=RESULT_WAIT,
+            market_matches = bool(
+                market is not None
+                and market.stock_code == document["session"]["stock_code"]
+            )
+            if market is not None and not market_matches:
+                book_fresh, trade_fresh, market_reason = (
+                    False,
+                    False,
+                    "MOCK_MARKET_STOCK_MISMATCH",
                 )
-            if market is None or market.stock_code != document["session"]["stock_code"]:
-                return self._normal_block(
-                    document, instance_id=instance_id, cycle_id=cycle_id,
-                    timestamp=timestamp, reason="MOCK_MARKET_STOCK_MISMATCH", status=RESULT_WAIT,
+            else:
+                book_fresh, trade_fresh, market_reason = _market_freshness(
+                    market, evaluated_at=now, policy=policy
                 )
-            if trade_fresh and market.trade is not None:
-                mark_price = _positive_number(market.trade.current_price)
+            evaluation_market = market if market_matches else None
+            if trade_fresh and evaluation_market is not None and evaluation_market.trade is not None:
+                mark_price = _positive_number(evaluation_market.trade.current_price)
                 if mark_price is not None:
                     marked = self.engine.mark_to_market(
                         session_id,
                         instance_id,
                         current_price=mark_price,
-                        market_identity=market.snapshot_identity,
+                        market_identity=evaluation_market.snapshot_identity,
                         command_id=deterministic_mock_identity(
                             "MC", session_id, instance_id,
-                            market.snapshot_identity, "MARK_TO_MARKET",
+                            evaluation_market.snapshot_identity, "MARK_TO_MARKET",
                         ),
                     )
                     document = marked["document"]
@@ -1812,19 +1881,25 @@ class MockIndicatorFollowRoutineAdapter:
                 evaluation_cycle_id=cycle_id,
                 candles=tuple(deepcopy(list(candles))),
                 evaluated_at=now,
-                market=market,
+                market=evaluation_market,
                 policy=policy,
             )
-            document = self._refresh_instance_plans(session_id, instance_id, timestamp)
-            document = self._resume_paused_source_after_recovery(session_id, instance_id)
+            document = self._refresh_instance_plans(
+                session_id, instance_id, timestamp, document=document,
+            )
+            document = self._resume_paused_source_after_recovery(
+                session_id, instance_id, document=document,
+            )
             progression = self._progression(document, instance_id)
             active_plans = [item for item in progression["plans"] if item.get("state") == "ACTIVE"]
             if len(active_plans) > 1:
                 raise MockValidationError("MOCK_MULTIPLE_ACTIVE_EXECUTION_PLANS")
             position = _position(document, instance_id)
             current_price = (
-                _positive_number(market.trade.current_price)
-                if market is not None and market.trade is not None and trade_fresh
+                _positive_number(evaluation_market.trade.current_price)
+                if evaluation_market is not None
+                and evaluation_market.trade is not None
+                and trade_fresh
                 else None
             )
             reference_price = _reference_price(evaluation.candles)
@@ -1856,14 +1931,71 @@ class MockIndicatorFollowRoutineAdapter:
                 "average_price": position["average_price"],
                 "now": timestamp,
             }
+            context["forming_base_bar_projection"] = (
+                _market_projection_requester()(rules).get("projection") == "FORMING_BASE_BAR"
+            )
             pending_result, pending_signal = self._advance_pending_successor(
                 session_id, instance_id, cycle_id=cycle_id, evaluated_at=now,
-                rules=rules,
+                rules=rules, document=document,
             )
             if pending_result is not None:
                 return pending_result
-            raw_signal = None if pending_signal is not None else self._evaluator(list(evaluation.candles), rules, context)
-            signal = deepcopy(pending_signal) if pending_signal is not None else _signal_payload(raw_signal)
+            signal = deepcopy(pending_signal) if pending_signal is not None else _pure_signal_selection()(
+                list(evaluation.candles), rules, context,
+                evaluator=self._evaluator, converter=_signal_payload,
+            )
+            safety = rules.get("safety") if isinstance(rules.get("safety"), dict) else {}
+            execution_block_reason = (
+                "MOCK_EXECUTION_NOT_ALLOWED"
+                if safety.get("mock_allowed") is False
+                else market_reason if not book_fresh else ""
+            )
+            if execution_block_reason:
+                signal, _build_result = self._final_routine_signal(signal, context)
+                side = clean_text(signal.get("signal")).upper()
+                if side in {"BUY", "SELL"}:
+                    self._event(
+                        document,
+                        instance_id=instance_id,
+                        event_type="ROUTINE_EVALUATED",
+                        identity=cycle_id,
+                        timestamp=timestamp,
+                        payload={
+                            "signal": signal.get("signal"),
+                            "rules_hash": reference["rules_hash"],
+                            "operation_identity": self._operation_identity(document, instance_id),
+                            "evaluation_cycle_id": cycle_id,
+                            **_signal_marker_payload(signal, evaluation.candles),
+                        },
+                    )
+                elif not active_plans and not progression["plans"]:
+                    def no_signal_mark(document_value: dict[str, Any]) -> dict[str, Any]:
+                        self._progression(document_value, instance_id)["evaluation_cycles"][cycle_id] = {
+                            "result": RESULT_NO_SIGNAL, "recorded_at": timestamp,
+                        }
+                        return document_value
+
+                    marked = self.repository.mutate_session(
+                        session_id, no_signal_mark, expected_revision=document["revision"]
+                    )["document"]
+                    return {
+                        "status": RESULT_NO_SIGNAL,
+                        "reason": clean_text(signal.get("reason")),
+                        "orders": [],
+                        "fills": [],
+                        "signal": signal,
+                        "_document": marked,
+                    }
+                blocked = self._normal_block(
+                    document,
+                    instance_id=instance_id,
+                    cycle_id=cycle_id,
+                    timestamp=timestamp,
+                    reason=execution_block_reason,
+                    status=RESULT_WAIT,
+                    evaluation_completed=True,
+                )
+                return {**blocked, "signal": signal}
             if active_plans:
                 arbitration_result, successor = self._arbitrate_active_signal(
                     session_id, instance_id, cycle_id=cycle_id, evaluated_at=now,
@@ -1873,13 +2005,16 @@ class MockIndicatorFollowRoutineAdapter:
                     return arbitration_result
                 if successor is not None:
                     signal = successor
-                    document = self._refresh_instance_plans(session_id, instance_id, timestamp)
+                    document = self._refresh_instance_plans(
+                        session_id, instance_id, timestamp, document=document,
+                    )
                     progression = self._progression(document, instance_id)
                     active_plans = [item for item in progression["plans"] if item.get("state") == "ACTIVE"]
             continuation_result = self.continuation.inspect_active(
                 session_id, routine_instance_id=instance_id,
                 evaluation_cycle_id=cycle_id, evaluated_at=now,
                 market=market, trade_fresh=trade_fresh,
+                document=document,
             )
             if continuation_result is not None:
                 if continuation_result.get("action") in {ACTION_REPLAN, ACTION_RECOVERY} and continuation_result.get("status") == "READY":
@@ -1925,6 +2060,7 @@ class MockIndicatorFollowRoutineAdapter:
                     session_id, routine_instance_id=instance_id,
                     evaluation_cycle_id=cycle_id, evaluated_at=now,
                     market=market, trade_fresh=trade_fresh,
+                    document=document,
                 )
                 if terminal is not None:
                     if terminal.get("status") == "READY":
@@ -1953,32 +2089,41 @@ class MockIndicatorFollowRoutineAdapter:
                     timestamp=timestamp, reason="BUY_EXIT_ACTIVE", status=RESULT_WAIT,
                     evaluation_completed=True,
                 )
-            self._event(
-                document,
-                instance_id=instance_id,
-                event_type="ROUTINE_EVALUATED",
-                identity=cycle_id,
-                timestamp=timestamp,
-                payload={
-                    "signal": signal.get("signal"),
-                    "rules_hash": reference["rules_hash"],
-                    "operation_identity": self._operation_identity(document, instance_id),
-                    "evaluation_cycle_id": cycle_id,
-                    **_signal_marker_payload(signal, evaluation.candles),
-                },
-            )
+            signal, build_result = self._final_routine_signal(signal, context)
             side = clean_text(signal.get("signal")).upper()
+            if side in {"BUY", "SELL"}:
+                self._event(
+                    document,
+                    instance_id=instance_id,
+                    event_type="ROUTINE_EVALUATED",
+                    identity=cycle_id,
+                    timestamp=timestamp,
+                    payload={
+                        "signal": signal.get("signal"),
+                        "rules_hash": reference["rules_hash"],
+                        "operation_identity": self._operation_identity(document, instance_id),
+                        "evaluation_cycle_id": cycle_id,
+                        **_signal_marker_payload(signal, evaluation.candles),
+                    },
+                )
             if side not in {"BUY", "SELL"}:
-                before_mark = self.repository.read_session(session_id)
-
                 def no_signal_mark(document_value: dict[str, Any]) -> dict[str, Any]:
                     self._progression(document_value, instance_id)["evaluation_cycles"][cycle_id] = {
                         "result": RESULT_NO_SIGNAL, "recorded_at": timestamp,
                     }
                     return document_value
 
-                self.repository.mutate_session(session_id, no_signal_mark, expected_revision=before_mark["revision"])
-                return {"status": RESULT_NO_SIGNAL, "reason": clean_text(signal.get("reason")), "orders": [], "fills": [], "signal": signal}
+                marked = self.repository.mutate_session(
+                    session_id, no_signal_mark, expected_revision=document["revision"]
+                )["document"]
+                return {
+                    "status": RESULT_NO_SIGNAL,
+                    "reason": clean_text(signal.get("reason")),
+                    "orders": [],
+                    "fills": [],
+                    "signal": signal,
+                    "_document": marked,
+                }
             if side == "BUY" and new_buy_allowed is not True:
                 return self._normal_block(
                     document,
@@ -2032,11 +2177,6 @@ class MockIndicatorFollowRoutineAdapter:
                 signal=side,
                 signal_id=accepted_signal_id,
                 observed_at=timestamp,
-            )
-            build_result = (
-                self._sell_builder(sell_signal_result=signal, context=context)
-                if side == "SELL"
-                else self._buy_builder(buy_signal_result=signal, context=context)
             )
             if build_result.get("status") != "READY":
                 return self._normal_block(

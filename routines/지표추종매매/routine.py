@@ -305,62 +305,276 @@ def get_routine_info() -> dict[str, Any]:
 
 
 def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any]:
-    """Declare the market/bar primitive required by Indicator Follow.
+    """Declare the active Indicator Follow market-bar requirement.
 
-    OCR 0/N-bar semantics remain routine-owned.  Main only supplies the
-    requested forming-base-bar or completed-timeframe projection.
+    Main owns acquisition and retention.  This routine only describes the
+    forming-bar projection and the number of timeframe bars its current,
+    applied evaluator paths can consume.
     """
     rules = rules if isinstance(rules, dict) else {}
+    indicators = (
+        rules.get("indicators")
+        if isinstance(rules.get("indicators"), dict)
+        else {}
+    )
+
+    def positive_int(value: Any, default: int) -> int:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            return default
+        return result if result > 0 else default
+
+    def nonnegative_int(value: Any, default: int = 0) -> int:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(result, 0)
+
+    macd = indicators.get("macd") if isinstance(indicators.get("macd"), dict) else {}
+    macd_readiness = positive_int(macd.get("slow"), 26) + positive_int(
+        macd.get("signal"), 9
+    )
+    rsi_cfg = indicators.get("rsi") if isinstance(indicators.get("rsi"), dict) else {}
+    bollinger_cfg = (
+        indicators.get("bollinger")
+        if isinstance(indicators.get("bollinger"), dict)
+        else {}
+    )
+    price_box_cfg = (
+        indicators.get("price_box")
+        if isinstance(indicators.get("price_box"), dict)
+        else {}
+    )
+
+    def target_requirement(
+        target: Any,
+        condition: dict[str, Any],
+        *,
+        compare: bool = False,
+        rsi_condition_period: bool = False,
+    ) -> int:
+        name = str(target or "").strip().upper()
+        period_key = "compare_period" if compare else "period"
+        raw_period = condition.get(period_key)
+        if compare and raw_period in (None, ""):
+            raw_period = condition.get("period")
+        if name == "MA" or (name.startswith("MA") and name[2:].isdigit()):
+            suffix = name[2:] if name.startswith("MA") else ""
+            return positive_int(raw_period if raw_period not in (None, "") else suffix, 1)
+        if name in {"MACD", "SIGNAL", "OSC"}:
+            return macd_readiness
+        if name == "RSI":
+            period = (
+                raw_period
+                if rsi_condition_period
+                else rsi_cfg.get("period")
+            )
+            return positive_int(period, 14) + 1
+        if name == "BOLLINGER" or name.startswith("BOLLINGER_"):
+            return positive_int(bollinger_cfg.get("period"), 20)
+        if name == "PRICE_BOX" or name.startswith("PRICE_BOX_"):
+            return positive_int(price_box_cfg.get("period"), 24)
+        return 1
+
+    lookback_by_operator = {
+        "TURN_UP": 2,
+        "TURN_DOWN": 2,
+        "TREND_UP": 1,
+        "TREND_DOWN": 1,
+        "CROSS_UP": 1,
+        "CROSS_DOWN": 1,
+        "ZERO_CROSS_UP": 1,
+        "ZERO_CROSS_DOWN": 1,
+    }
+    candidates: list[int] = [3]
+
+    def add_condition(
+        condition: Any,
+        delay: int,
+        *,
+        rsi_condition_period: bool = False,
+    ) -> None:
+        if not isinstance(condition, dict) or condition.get("enabled", True) is False:
+            return
+        base = target_requirement(
+            condition.get("target", "OSC"),
+            condition,
+            rsi_condition_period=rsi_condition_period,
+        )
+        compare_target = condition.get("compare_target")
+        if str(compare_target or "").strip():
+            base = max(
+                base,
+                target_requirement(compare_target, condition, compare=True),
+            )
+        operator = str(condition.get("operator") or "").strip().upper()
+        candidates.append(
+            base
+            + lookback_by_operator.get(operator, 0)
+            + nonnegative_int(condition.get("bar_offset"))
+            + nonnegative_int(delay)
+        )
+
+    def add_groups(groups: Any, delay: int) -> None:
+        for group in groups if isinstance(groups, list) else ():
+            if not isinstance(group, dict) or group.get("enabled", True) is False:
+                continue
+            for condition in (
+                group.get("conditions")
+                if isinstance(group.get("conditions"), list)
+                else ()
+            ):
+                add_condition(condition, delay)
+
     buy = rules.get("buy") if isinstance(rules.get("buy"), dict) else {}
     filters = buy.get("filters") if isinstance(buy.get("filters"), dict) else {}
     ocr = filters.get("ocr") if isinstance(filters.get("ocr"), dict) else {}
+    buy_delay = nonnegative_int(
+        ocr.get("order_delay_bars")
+        if "order_delay_bars" in ocr
+        else buy.get("delay_bar", 1)
+    )
+    composite = (
+        filters.get("composite")
+        if isinstance(filters.get("composite"), dict)
+        else {}
+    )
+    expression = composite.get("expression") if isinstance(composite.get("expression"), dict) else {}
+    identifier_map = expression.get("identifier_map") if isinstance(expression.get("identifier_map"), dict) else {}
+    identifiers = expression.get("identifiers") if isinstance(expression.get("identifiers"), list) else []
+    expression_filters = {
+        str(identifier_map.get(str(identifier or "").strip().upper()) or "").strip().lower()
+        for identifier in identifiers
+    }
+    expression_mode = False
+    expression_filter_names = {"ocr", "bollinger", "moving_average", "rsi"}
+    if (
+        composite.get("enabled", False)
+        and expression
+        and expression_filters
+        and expression_filters <= expression_filter_names
+    ):
+        try:
+            from engines.condition_engine import evaluate_condition_expression
+
+            expression_mode = bool(
+                evaluate_condition_expression(
+                    expression.get("ast"),
+                    {
+                        str(identifier or "").strip().upper(): True
+                        for identifier in identifiers
+                    },
+                ).get("ok")
+            )
+        except Exception:
+            expression_mode = False
+
+    buy_groups = buy.get("groups") if isinstance(buy.get("groups"), list) else []
+    legacy_filters_reachable = any(
+        isinstance(group, dict)
+        and group.get("enabled", True) is not False
+        and isinstance(group.get("conditions"), list)
+        and bool(group.get("conditions"))
+        for group in buy_groups
+    )
+    if rules.get("enabled", True) is not False and buy.get("enabled", True) is not False:
+        if not expression_mode:
+            add_groups(buy_groups, buy_delay)
+        filter_names = (
+            expression_filters
+            | {
+                name
+                for name in expression_filter_names
+                if isinstance(filters.get(name), dict)
+                and bool(filters.get(name))
+                and bool(filters[name].get("enabled", True))
+            }
+            if expression_mode
+            else (
+                {"rsi", "moving_average", "price_compare", "bollinger", "ocr"}
+                if legacy_filters_reachable
+                else set()
+            )
+        )
+        for name in filter_names:
+            filter_cfg = filters.get(name)
+            if not isinstance(filter_cfg, dict) or not bool(
+                filter_cfg.get("enabled", True)
+            ):
+                continue
+            conditions = filter_cfg.get("conditions")
+            configured_conditions = (
+                [item for item in conditions if isinstance(item, dict)]
+                if isinstance(conditions, list)
+                else []
+            )
+            if name in {"rsi", "moving_average"}:
+                condition = dict(filter_cfg)
+                if configured_conditions:
+                    condition.update(configured_conditions[0])
+                if name == "rsi":
+                    condition.setdefault("target", "RSI")
+                else:
+                    condition.setdefault("target", "CLOSE")
+                    condition.setdefault("compare_target", "MA")
+                    condition.setdefault("period", 60)
+                active_conditions = [condition]
+            elif name == "bollinger":
+                if configured_conditions:
+                    condition = dict(configured_conditions[0])
+                    condition.setdefault("target", "CLOSE")
+                    active_conditions = [condition]
+                else:
+                    active_conditions = []
+            else:
+                active_conditions = configured_conditions or [filter_cfg]
+            for condition in active_conditions:
+                if name == "ocr" and "target" not in condition:
+                    condition = {**condition, "target": "OSC"}
+                add_condition(
+                    condition,
+                    buy_delay,
+                    rsi_condition_period=name == "rsi",
+                )
+
     sell = rules.get("sell") if isinstance(rules.get("sell"), dict) else {}
     signals = sell.get("signals") if isinstance(sell.get("signals"), dict) else {}
-    needs_forming_base_bar = "order_delay_bars" in ocr or any(
+    macd_sell = signals.get("macd_sell") if isinstance(signals.get("macd_sell"), dict) else sell
+    sell_delay = nonnegative_int(macd_sell.get("delay_bar", sell.get("delay_bar", 1)))
+    if rules.get("enabled", True) is not False and sell.get("enabled", True) is not False:
+        if signals:
+            for signal_name, signal in signals.items():
+                if not isinstance(signal, dict) or signal.get("enabled", True) is False:
+                    continue
+                signal_delay = nonnegative_int(
+                    signal.get("order_delay_bars", sell_delay)
+                )
+                if signal_name == "profit_rate_sell":
+                    candidates.append(1 + sell_delay)
+                else:
+                    add_groups(signal.get("groups"), signal_delay)
+        else:
+            add_groups(sell.get("groups"), sell_delay)
+
+    has_ocr_delay_contract = "order_delay_bars" in ocr or any(
         isinstance(signal, dict) and "order_delay_bars" in signal
         for signal in signals.values()
     )
-    indicators = rules.get("indicators") if isinstance(rules.get("indicators"), dict) else {}
-    periods: list[int] = [3]
-
-    def collect_periods(value: Any, key: str = "") -> None:
-        if isinstance(value, dict):
-            for child_key, child in value.items():
-                collect_periods(child, str(child_key))
-        elif isinstance(value, list):
-            for child in value:
-                collect_periods(child, key)
-        elif key in {"period", "fast", "slow", "signal"}:
-            try:
-                period = int(value)
-            except (TypeError, ValueError):
-                return
-            if period > 0:
-                periods.append(period)
-
-    collect_periods(indicators)
-    collect_periods(buy)
-    collect_periods(sell)
-    macd = indicators.get("macd") if isinstance(indicators.get("macd"), dict) else {}
-    try:
-        macd_warmup = int(macd.get("slow", 0) or 0) + int(macd.get("signal", 0) or 0)
-    except (TypeError, ValueError):
-        macd_warmup = 0
-    if macd_warmup > 0:
-        periods.append(macd_warmup)
-    moving_averages = indicators.get("moving_averages")
-    if isinstance(moving_averages, list):
-        for value in moving_averages:
-            try:
-                period = int(value)
-            except (TypeError, ValueError):
-                continue
-            if period > 0:
-                periods.append(period)
     return {
-        "projection": "FORMING_BASE_BAR" if needs_forming_base_bar else "COMPLETED_TIMEFRAME",
-        "ocr_delay_semantics": "ROUTINE_OWNED",
-        "warmup_bars": max(periods),
+        "projection": "FORMING_BASE_BAR",
+        "ocr_delay_semantics": (
+            "COMPLETED_TRANSITION_CONFIRMATION"
+            if has_ocr_delay_contract
+            else "ROUTINE_OWNED"
+        ),
+        "ocr_zero_bar_mode": (
+            "COMPLETED_TRANSITION_CONFIRMATION"
+            if has_ocr_delay_contract
+            else "NOT_CONFIGURED"
+        ),
+        "warmup_bars": max(candidates),
     }
 
 
@@ -413,6 +627,67 @@ def _extract_config(context: dict[str, Any]) -> dict[str, Any] | None:
     return DEFAULT_INDICATOR_FOLLOW_CONFIG if isinstance(DEFAULT_INDICATOR_FOLLOW_CONFIG, dict) else None
 
 
+def evaluate_signal_selection(candles, config, context, *, evaluator=None, converter=None):
+    """Pure dual-side selection and activation projection; no execution or persistence."""
+    evaluator = evaluator or evaluate_indicator_follow_routine
+    converter = converter or signal_to_dict
+    sell_context = dict(context)
+    sell_context["_indicator_follow_evaluate_side"] = "SELL"
+    buy_context = dict(context)
+    buy_context["_indicator_follow_evaluate_side"] = "BUY"
+    sell_result = converter(
+        evaluator(candles, config, sell_context)
+    )
+    buy_result = converter(
+        evaluator(candles, config, buy_context)
+    )
+    sell_true = str(sell_result.get("signal") or "").strip().upper() == "SELL"
+    buy_true = str(buy_result.get("signal") or "").strip().upper() == "BUY"
+    cycle_for_conflict = context.get("cycle") if isinstance(context.get("cycle"), dict) else {}
+    holding_qty = cycle_for_conflict.get("holding_qty", cycle_for_conflict.get("confirmed_holding_quantity", 0))
+    try:
+        has_holding = int(holding_qty or 0) > 0
+    except (TypeError, ValueError):
+        has_holding = False
+    if sell_true and buy_true:
+        result = sell_result if has_holding else buy_result
+        result["signal_conflict_evidence"] = {
+            "conflict": "BUY_AND_SELL_TRUE",
+            "holding_quantity": holding_qty,
+            "fallback": "SELL_WHEN_HOLDING_ELSE_BUY",
+            "selected_side": result.get("signal"),
+            "buy_signal_index": buy_result.get("signal_index"),
+            "sell_signal_index": sell_result.get("signal_index"),
+        }
+    elif sell_true:
+        result = sell_result
+    else:
+        result = buy_result
+    if (
+        str(result.get("signal") or "").strip().upper() in {"BUY", "SELL"}
+        and candles
+    ):
+        source_index = result.get("signal_index")
+        activation_index = len(candles) - 1
+        if (
+            isinstance(source_index, int)
+            and not isinstance(source_index, bool)
+            and 0 <= source_index <= activation_index
+        ):
+            result["signal_source_index"] = source_index
+            result["signal_activation_index"] = activation_index
+            result["signal_index"] = activation_index
+            activation = (
+                candles[activation_index].get("bar_time")
+                if isinstance(candles[activation_index], dict)
+                else None
+            )
+            if activation:
+                result["signal_activation_bar_time"] = activation
+            result["signal_delay_anchor"] = "FOLLOWING_COMPLETED_BASE_BAR_ENTRY"
+    return result
+
+
 def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
     if _IMPORT_ERROR is not None or evaluate_indicator_follow_routine is None or signal_to_dict is None:
         return {
@@ -453,50 +728,7 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
         except Exception:
             pass
 
-    sell_context = dict(context)
-    sell_context["_indicator_follow_evaluate_side"] = "SELL"
-    buy_context = dict(context)
-    buy_context["_indicator_follow_evaluate_side"] = "BUY"
-    sell_result = signal_to_dict(
-        evaluate_indicator_follow_routine(candles, config, sell_context)
-    )
-    buy_result = signal_to_dict(
-        evaluate_indicator_follow_routine(candles, config, buy_context)
-    )
-    sell_true = str(sell_result.get("signal") or "").strip().upper() == "SELL"
-    buy_true = str(buy_result.get("signal") or "").strip().upper() == "BUY"
-    cycle_for_conflict = context.get("cycle") if isinstance(context.get("cycle"), dict) else {}
-    holding_qty = cycle_for_conflict.get("holding_qty", cycle_for_conflict.get("confirmed_holding_quantity", 0))
-    try:
-        has_holding = int(holding_qty or 0) > 0
-    except (TypeError, ValueError):
-        has_holding = False
-    if sell_true and buy_true:
-        result = sell_result if has_holding else buy_result
-        result["signal_conflict_evidence"] = {
-            "conflict": "BUY_AND_SELL_TRUE",
-            "holding_quantity": holding_qty,
-            "fallback": "SELL_WHEN_HOLDING_ELSE_BUY",
-            "selected_side": result.get("signal"),
-            "buy_signal_index": buy_result.get("signal_index"),
-            "sell_signal_index": sell_result.get("signal_index"),
-        }
-    elif sell_true:
-        result = sell_result
-    else:
-        result = buy_result
-    if (
-        context.get("forming_base_bar_projection") is True
-        and str(result.get("signal") or "").strip().upper() in {"BUY", "SELL"}
-        and candles
-    ):
-        result["signal_source_index"] = result.get("signal_index")
-        result["signal_activation_index"] = len(candles) - 1
-        result["signal_index"] = len(candles) - 1
-        activation = candles[-1].get("bar_time") if isinstance(candles[-1], dict) else None
-        if activation:
-            result["signal_activation_bar_time"] = activation
-        result["signal_delay_anchor"] = "FOLLOWING_BASE_BAR_ENTRY"
+    result = evaluate_signal_selection(candles, config, context)
     signal_runtime_policy = config.get("signal_runtime_policy") if isinstance(config, dict) else None
     if isinstance(signal_runtime_policy, dict):
         result["signal_runtime_policy"] = dict(signal_runtime_policy)

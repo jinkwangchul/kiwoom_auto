@@ -144,6 +144,8 @@ def _mock_instance_display_status(
 
     operation_state = clean_text(operation.get("state"))
     if state == "ENDED":
+        if clean_text(operation.get("termination_provenance")).upper() == "ATS_FINAL_NO_TERMINATION":
+            return "감시/대기", False, False, False, {}
         return "운영종료", False, False, False, {}
     if state in {"WAITING", "VALIDATION_STOPPED"}:
         return "감시/대기", False, False, False, {}
@@ -172,7 +174,7 @@ def _mock_instance_display_status(
             "ACTIVE_SESSION",
         }
         display_status = (
-            "운영종료"
+            "감시/대기"
             if projection_phase == "FINAL_END"
             else "매수/매도"
             if activation.get("actual_trading_session_active") is True

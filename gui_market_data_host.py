@@ -6,7 +6,9 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+import logging
 from math import isfinite
+import os
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
@@ -21,8 +23,13 @@ from candle_timeframe_aggregation import (
     project_candle_supply,
     read_canonical_bar_minutes,
     required_minute_candles,
+    validate_market_bar_projection_request,
 )
 from event_journal_production import observe_production_exception
+from gui_stock_data import (
+    STOCK_LIBRARY_READY,
+    load_stock_library_snapshot,
+)
 from kiwoom_market_data_authority import (
     MarketDataAuthority,
     NORMAL_TR_REFRESH,
@@ -42,6 +49,13 @@ from kiwoom_realtime_shadow import (
     compare_shadow_bar_to_canonical,
 )
 from stock_repository import StockRepository
+from stock_code_contract import (
+    canonical_stock_code_from_market_data_identity,
+    market_source_for_identity,
+)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 ExecutionEntryProvider = Callable[[str], object | None]
@@ -68,12 +82,32 @@ class HighResolutionMarketState:
     received_tick_count: int
     processed_tick_count: int
     data_quality: str
+    broker_code_identity: str = ""
+    market_source: str = ""
     open_price: int | float | None = None
     high_price: int | float | None = None
     low_price: int | float | None = None
     change_rate: int | float | None = None
     previous_day_volume_rate: int | float | None = None
     execution_strength: int | float | None = None
+
+
+@dataclass(frozen=True)
+class NxtDisplayLivePriceState:
+    canonical_stock_code: str
+    broker_code_identity: str
+    market_source: str
+    source_real_type: str
+    connection_epoch: int
+    login_session_id: str
+    last_execution_time_raw: str
+    last_market_datetime: str
+    last_price: int | float
+    execution_quantity: int | float | None
+    cumulative_volume: int | float | None
+    receive_sequence: int
+    data_quality: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -175,6 +209,12 @@ class MarketDataHost(QObject):
         self._high_resolution_market_states: dict[
             str, HighResolutionMarketState
         ] = {}
+        self._nxt_display_live_price_states: dict[
+            str, NxtDisplayLivePriceState
+        ] = {}
+        self._nxt_display_tick_queue: deque[dict[str, object]] = deque()
+        self._nxt_display_tick_drain_scheduled = False
+        self._nxt_display_tick_drain_running = False
         self._initial_market_snapshot_states: dict[
             str, InitialMarketSnapshotState
         ] = {}
@@ -184,6 +224,8 @@ class MarketDataHost(QObject):
         self._candle_observation_stock_codes: tuple[str, ...] = ()
         self._candle_execution_required_by_stock: dict[str, int] = {}
         self._candle_observation_required_by_stock: dict[str, int] = {}
+        self._candle_standby_stock_codes: tuple[str, ...] = ()
+        self._candle_standby_required_by_stock: dict[str, int] = {}
         self._last_candle_observation_refresh_minute = ""
         # In-flight only.  A completed request is represented by an actual
         # valid InitialMarketSnapshotState, not by this deduplication marker.
@@ -191,6 +233,9 @@ class MarketDataHost(QObject):
         self._initial_snapshot_request_attempts_by_stock: dict[str, int] = {}
         self._raw_tick_received_count_by_stock: dict[str, int] = {}
         self._raw_tick_processed_count_by_stock: dict[str, int] = {}
+        self._realtime_boundary_diagnostic_counts: dict[str, dict[str, int]] = {}
+        self._realtime_boundary_diagnostic_last: dict[tuple[str, str], dict[str, object]] = {}
+        self._realtime_boundary_diagnostic_transition: dict[tuple[str, str], str] = {}
         self._raw_tick_uncertain_stock_codes: set[str] = set()
         self._raw_tick_received_count = 0
         self._raw_tick_processed_count = 0
@@ -227,6 +272,7 @@ class MarketDataHost(QObject):
         self._bar_committed_signal_bound = False
         self._realtime_shadow_signal_bound = False
         self._raw_realtime_tick_signal_bound = False
+        self._nxt_display_tick_signal_bound = False
         self._bind_kiwoom_signals_once()
 
     def _bind_kiwoom_signals_once(self) -> bool:
@@ -260,6 +306,16 @@ class MarketDataHost(QObject):
                     self._observe_exception(exc, "bind_realtime_tick")
                 else:
                     self._raw_realtime_tick_signal_bound = True
+        if not self._nxt_display_tick_signal_bound:
+            signal = getattr(self.kiwoom_api, "nxt_display_tick_received", None)
+            connect = getattr(signal, "connect", None)
+            if callable(connect):
+                try:
+                    connect(self._on_nxt_display_tick_received)
+                except Exception as exc:
+                    self._observe_exception(exc, "bind_nxt_display_tick")
+                else:
+                    self._nxt_display_tick_signal_bound = True
         return bool(
             self._bar_committed_signal_bound
             and self._realtime_shadow_signal_bound
@@ -280,8 +336,11 @@ class MarketDataHost(QObject):
                     set(self._production_monitoring_stock_codes)
                     | set(self._execution_shadow_stock_codes)
                     | set(self._candle_observation_stock_codes)
+                    | set(getattr(self, "_candle_standby_stock_codes", ()))
                 )
             )
+            for code in set(self._nxt_display_live_price_states).difference(target_codes):
+                self._nxt_display_live_price_states.pop(code, None)
             sync = getattr(self.kiwoom_api, "sync_realtime_shadow_targets", None)
             if not callable(sync):
                 # Compatibility for older test doubles; Production KiwoomApi owns
@@ -312,7 +371,13 @@ class MarketDataHost(QObject):
                         code,
                         "REALTIME_REGISTRATION_INACTIVE",
                     )
-            return dict(result) if isinstance(result, dict) else {
+            if isinstance(result, dict):
+                projection = dict(result)
+                projection["nxt_display_sync"] = self._sync_nxt_display_targets(
+                    target_codes
+                )
+                return projection
+            return {
                 "ok": False,
                 "changed": False,
                 "active": False,
@@ -340,12 +405,17 @@ class MarketDataHost(QObject):
                 code = str(item.get("stock_code") or "").strip()
                 if not code:
                     continue
-                normalized_codes.add(code)
                 try:
                     interval = read_canonical_bar_minutes(item.get("rules"))
-                    request = item.get("projection_request") if isinstance(item.get("projection_request"), dict) else {}
-                    requirement = required_minute_candles(interval, int(request.get("warmup_bars") or 1))
+                    request = validate_market_bar_projection_request(
+                        item.get("projection_request"),
+                        require_warmup=True,
+                    )
+                    requirement = required_minute_candles(interval, request["warmup_bars"])
+                    if not requirement["within_limit"]:
+                        raise ValueError(str(requirement["reason"]))
                     requested[code] = max(requested.get(code, 0), int(requirement["required_minute_candles"]))
+                    normalized_codes.add(code)
                 except (TypeError, ValueError):
                     continue
             else:
@@ -361,6 +431,7 @@ class MarketDataHost(QObject):
                 set(self._production_monitoring_stock_codes)
                 | set(self._execution_shadow_stock_codes)
                 | set(self._candle_observation_stock_codes)
+                | set(getattr(self, "_candle_standby_stock_codes", ()))
             )
         )
         monitoring_result = self.sync_monitoring_targets(
@@ -390,16 +461,88 @@ class MarketDataHost(QObject):
             self._last_candle_observation_refresh_minute = ""
         return result
 
+    def sync_candle_standby_requirements(
+        self,
+        requirements: object,
+        *,
+        preserve_stock_codes: object = (),
+    ) -> dict[str, object]:
+        """Replace Production standby needs, preserving only explicitly failed current Stocks."""
+        candidates = (
+            requirements
+            if isinstance(requirements, (list, tuple, set, frozenset))
+            else ()
+        )
+        previous = dict(getattr(self, "_candle_standby_required_by_stock", {}))
+        preserve_candidates = (
+            preserve_stock_codes
+            if isinstance(preserve_stock_codes, (list, tuple, set, frozenset))
+            else ()
+        )
+        requested: dict[str, int] = {}
+        errors: list[dict[str, str]] = []
+        failed_codes: set[str] = set()
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("stock_code") or "").strip()
+            if not code:
+                continue
+            try:
+                interval = read_canonical_bar_minutes(item.get("rules"))
+                request = validate_market_bar_projection_request(
+                    item.get("projection_request"),
+                    require_warmup=True,
+                )
+                requirement = required_minute_candles(
+                    interval,
+                    request["warmup_bars"],
+                )
+                if not requirement["within_limit"]:
+                    raise ValueError(str(requirement["reason"]))
+                requested[code] = max(
+                    requested.get(code, 0),
+                    int(requirement["required_minute_candles"]),
+                )
+            except (TypeError, ValueError) as exc:
+                failed_codes.add(code)
+                errors.append({"stock_code": code, "error": str(exc)})
+        preserved_codes: list[str] = []
+        preserve_codes = {
+            str(code or "").strip()
+            for code in (*preserve_candidates, *failed_codes)
+            if str(code or "").strip()
+        }
+        for code in sorted(preserve_codes):
+            if code in requested or code not in previous:
+                continue
+            requested[code] = int(previous[code])
+            preserved_codes.append(code)
+        self._candle_standby_required_by_stock = requested
+        self._candle_standby_stock_codes = tuple(sorted(requested))
+        return {
+            "ok": not errors,
+            "standby_stock_codes": self._candle_standby_stock_codes,
+            "standby_requirements": dict(requested),
+            "preserved_stock_codes": tuple(preserved_codes),
+            "errors": tuple(errors),
+        }
+
     def candle_history_required_count(self, stock_code: object) -> int:
         code = str(stock_code or "").strip()
         declared = max(
             int(self._candle_execution_required_by_stock.get(code, 0)),
             int(self._candle_observation_required_by_stock.get(code, 0)),
+            int(getattr(self, "_candle_standby_required_by_stock", {}).get(code, 0)),
         )
         return declared if declared > 0 else 600
 
     def registered_operation_targets(self) -> tuple[tuple[Path, str, str], ...]:
-        codes = tuple(sorted(set(self._execution_shadow_stock_codes) | set(self._candle_observation_stock_codes)))
+        codes = tuple(sorted(
+            set(self._candle_execution_required_by_stock)
+            | set(self._candle_observation_stock_codes)
+            | set(getattr(self, "_candle_standby_stock_codes", ()))
+        ))
         return tuple((StockRepository().resolve_stock_dir(code), code, "") for code in codes)
 
     def project_routine_candles(
@@ -414,11 +557,23 @@ class MarketDataHost(QObject):
     ) -> dict[str, Any]:
         """Supply one Routine Instance from Production-owned Candle facts."""
         code = str(stock_code or "").strip()
-        request = projection_request if isinstance(projection_request, dict) else {}
-        projection = str(request.get("projection") or "").strip().upper()
+        try:
+            request = validate_market_bar_projection_request(
+                projection_request,
+                require_warmup=False,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"available": False, "stock_code": code, "candles": [], "availability_state": "PROJECTION_REQUEST_INVALID", "reason": str(exc)}
+        projection = request["projection"]
+        warmup_declared = "warmup_bars" in request
         try:
             interval = read_canonical_bar_minutes(rules)
-            warmup = required_minute_candles(interval, int(request.get("warmup_bars") or 1))
+            warmup = required_minute_candles(
+                interval,
+                request["warmup_bars"] if warmup_declared else 1,
+            )
+            if not warmup_declared:
+                warmup = {**warmup, "required_minute_candles": 0}
         except (TypeError, ValueError) as exc:
             return {"available": False, "stock_code": code, "candles": [], "availability_state": "INTERVAL_UNSUPPORTED", "reason": str(exc)}
         base = {"stock_code": code, "timeframe_minutes": interval, "projection": projection, **warmup}
@@ -431,7 +586,7 @@ class MarketDataHost(QObject):
             history_requirements = object.__getattribute__(self, requirement_attribute)
         except (AttributeError, RuntimeError):
             history_requirements = None
-        if isinstance(history_requirements, dict):
+        if warmup_declared and isinstance(history_requirements, dict):
             history_requirements[code] = max(
                 int(history_requirements.get(code, 0)),
                 int(warmup["required_minute_candles"]),
@@ -462,6 +617,43 @@ class MarketDataHost(QObject):
             "source_identity": canonical_candle_content_hash(source_rows) if source_rows else source_hash,
         }
 
+    @staticmethod
+    def _nxt_eligible_targets(stock_codes: object) -> tuple[str, ...]:
+        snapshot = load_stock_library_snapshot()
+        if snapshot.state != STOCK_LIBRARY_READY:
+            return ()
+        requested = {
+            str(code or "").strip()
+            for code in (stock_codes or ())
+            if str(code or "").strip()
+        }
+        return tuple(
+            sorted(
+                str(record.get("code") or "").strip()
+                for record in snapshot.records
+                if record.get("nxt_available") is True
+                and str(record.get("code") or "").strip() in requested
+            )
+        )
+
+    def _sync_nxt_display_targets(self, stock_codes: object) -> dict[str, object]:
+        sync = getattr(self.kiwoom_api, "sync_nxt_display_registration", None)
+        if not callable(sync):
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "NXT_DISPLAY_API_UNAVAILABLE",
+            }
+        targets = self._nxt_eligible_targets(stock_codes)
+        result = sync(targets)
+        return dict(result) if isinstance(result, dict) else {
+            "ok": False,
+            "changed": False,
+            "active": False,
+            "reason_code": "NXT_DISPLAY_RESULT_MALFORMED",
+        }
+
     def sync_monitoring_targets(self, stock_codes: object) -> dict[str, object]:
         """Sync the Broker registration set independently of execution readiness."""
 
@@ -484,7 +676,11 @@ class MarketDataHost(QObject):
                 )
             )
             targets = tuple(
-                sorted(set(production_targets) | set(self._candle_observation_stock_codes))
+                sorted(
+                    set(production_targets)
+                    | set(self._candle_observation_stock_codes)
+                    | set(getattr(self, "_candle_standby_stock_codes", ()))
+                )
             )
             previous_targets = set(self._monitoring_target_stock_codes)
             session_getter = getattr(self.kiwoom_api, "broker_session_snapshot", None)
@@ -508,6 +704,7 @@ class MarketDataHost(QObject):
                 self._initial_snapshot_requested_stock_codes.discard(code)
                 self._initial_snapshot_request_attempts_by_stock.pop(code, None)
                 self._high_resolution_market_states.pop(code, None)
+                self._nxt_display_live_price_states.pop(code, None)
                 self._raw_tick_received_count_by_stock.pop(code, None)
                 self._raw_tick_processed_count_by_stock.pop(code, None)
                 self._raw_tick_uncertain_stock_codes.discard(code)
@@ -599,15 +796,19 @@ class MarketDataHost(QObject):
                     "sync_realtime_shadow_targets",
                     None,
                 )
+                observation_targets = tuple(
+                    sorted(
+                        set(self._production_monitoring_stock_codes)
+                        | set(self._execution_shadow_stock_codes)
+                        | set(self._candle_observation_stock_codes)
+                        | set(getattr(self, "_candle_standby_stock_codes", ()))
+                    )
+                )
                 if callable(shadow_sync) and result.get("ok") is True:
-                    projection["shadow_sync"] = shadow_sync(
-                        tuple(
-                            sorted(
-                                set(self._production_monitoring_stock_codes)
-                                | set(self._execution_shadow_stock_codes)
-                                | set(self._candle_observation_stock_codes)
-                            )
-                        )
+                    projection["shadow_sync"] = shadow_sync(observation_targets)
+                if result.get("ok") is True:
+                    projection["nxt_display_sync"] = self._sync_nxt_display_targets(
+                        observation_targets
                     )
                 return projection
             return {
@@ -732,7 +933,11 @@ class MarketDataHost(QObject):
             self._realtime_shadow_session_identity = identity
         execution_codes = tuple(getattr(snapshot, "execution_stock_codes", ()))
         candle_codes = tuple(
-            sorted(set(execution_codes) | set(self._candle_observation_stock_codes))
+            sorted(
+                set(execution_codes)
+                | set(self._candle_observation_stock_codes)
+                | set(getattr(self, "_candle_standby_stock_codes", ()))
+            )
         )
         self._market_data_authority.sync_targets(candle_codes)
         refresh_inflight = bool(getattr(self, "_automatic_candle_refresh_inflight", False))
@@ -766,10 +971,16 @@ class MarketDataHost(QObject):
         minute_key: str,
         *,
         on_complete=None,
+        drain_all: bool = False,
     ) -> dict[str, Any]:
         from auto_candle_refresh import refresh_operation_candles
 
-        return refresh_operation_candles(self, minute_key, on_complete=on_complete)
+        return refresh_operation_candles(
+            self,
+            minute_key,
+            on_complete=on_complete,
+            drain_all=drain_all,
+        )
 
     def market_data_refresh_decision(
         self,
@@ -1229,9 +1440,92 @@ class MarketDataHost(QObject):
             ),
         )
 
+    def nxt_display_live_price_state(
+        self,
+        stock_code: str,
+    ) -> NxtDisplayLivePriceState | None:
+        code = str(stock_code or "").strip()
+        state = self._nxt_display_live_price_states.get(code)
+        if state is None:
+            return None
+        if (
+            state.connection_epoch,
+            state.login_session_id,
+        ) != self._realtime_shadow_session_identity:
+            return None
+        if code not in self._display_observation_target_stock_codes():
+            return None
+        return state
+
+    def _display_observation_target_stock_codes(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                set(self._production_monitoring_stock_codes)
+                | set(self._execution_shadow_stock_codes)
+                | set(self._candle_observation_stock_codes)
+                | set(getattr(self, "_candle_standby_stock_codes", ()))
+            )
+        )
+
+    def _observe_realtime_boundary(
+        self,
+        stage: str,
+        stock_code: object,
+        *,
+        reason: str = "",
+        **details: object,
+    ) -> None:
+        """Keep bounded process-local host evidence and log only transitions."""
+
+        code = str(stock_code or "").strip()
+        stage_text = str(stage or "").strip()
+        if not stage_text:
+            return
+        counts = self._realtime_boundary_diagnostic_counts.setdefault(code, {})
+        counts[stage_text] = counts.get(stage_text, 0) + 1
+        key = (code, stage_text)
+        evidence = {
+            "stage": stage_text,
+            "stock_code": code,
+            "reason": str(reason or "").strip(),
+            **details,
+            "count": counts[stage_text],
+        }
+        self._realtime_boundary_diagnostic_last[key] = evidence
+        transition = evidence["reason"] or stage_text
+        if self._realtime_boundary_diagnostic_transition.get(key) == transition:
+            return
+        self._realtime_boundary_diagnostic_transition[key] = transition
+        scoped_stock = str(
+            os.environ.get("KIWOOM_DIAGNOSTIC_SCOPE_STOCK", "") or ""
+        ).strip()
+        if scoped_stock and scoped_stock != code:
+            return
+
+    def realtime_boundary_diagnostic_snapshot(self, stock_code: object) -> dict[str, object]:
+        """Return read-only process-local queue/state diagnostics for one stock."""
+
+        code = str(stock_code or "").strip()
+        return {
+            "stock_code": code,
+            "counts": dict(self._realtime_boundary_diagnostic_counts.get(code, {})),
+            "last": tuple(
+                dict(evidence)
+                for key, evidence in self._realtime_boundary_diagnostic_last.items()
+                if key[0] == code
+            ),
+        }
+
     def clear(self) -> dict[str, object]:
         clear = getattr(self.kiwoom_api, "clear_realtime_shadow_registration", None)
+        clear_nxt = getattr(self.kiwoom_api, "clear_nxt_display_registration", None)
         self._clear_all_state()
+        nxt_result = None
+        if callable(clear_nxt):
+            try:
+                nxt_result = clear_nxt(reason="MARKET_DATA_HOST_CLEARED")
+            except Exception as exc:
+                self._observe_exception(exc, "clear_nxt_display_registration")
         if not callable(clear):
             return {
                 "ok": True,
@@ -1240,7 +1534,12 @@ class MarketDataHost(QObject):
                 "reason_code": "REALTIME_SHADOW_API_UNAVAILABLE",
             }
         try:
-            return clear(reason="MARKET_DATA_HOST_CLEARED")
+            result = clear(reason="MARKET_DATA_HOST_CLEARED")
+            if isinstance(result, dict):
+                projection = dict(result)
+                projection["nxt_display"] = nxt_result
+                return projection
+            return result
         except Exception as exc:
             self._observe_exception(exc, "clear_registration")
             return {
@@ -1264,13 +1563,25 @@ class MarketDataHost(QObject):
         for stock_code in cleared_stock_codes:
             self._remember_current_session_market_information(stock_code)
         self._operation_candle_requests.clear()
+        self._automatic_candle_refresh_generation = int(
+            getattr(self, "_automatic_candle_refresh_generation", 0) or 0
+        ) + 1
+        self._automatic_candle_refresh_inflight = False
+        self._automatic_candle_refresh_waiters = []
+        self._automatic_candle_refresh_rerun_requested = False
+        self._automatic_candle_refresh_rerun_minute_key = ""
+        self._candle_bootstrap_completed = {}
+        self._candle_refresh_round_robin_offset = 0
         self._canonical_event_queue.clear()
         self._last_ready_commit_identity_by_stock.clear()
         self._raw_tick_queue.clear()
+        self._nxt_display_tick_queue.clear()
         self._high_resolution_market_states.clear()
+        self._nxt_display_live_price_states.clear()
         self._initial_market_snapshot_states.clear()
         self._monitoring_target_stock_codes = ()
         self._production_monitoring_stock_codes = ()
+        self._last_candle_observation_refresh_minute = ""
         self._initial_snapshot_requested_stock_codes.clear()
         self._initial_snapshot_request_attempts_by_stock.clear()
         self._raw_tick_received_count_by_stock.clear()
@@ -1305,8 +1616,7 @@ class MarketDataHost(QObject):
         self._market_data_authority.reset()
         self._realtime_shadow_session_identity = (0, "")
 
-    @staticmethod
-    def _raw_realtime_tick_minimally_valid(payload: dict[str, object]) -> bool:
+    def _raw_realtime_tick_minimally_valid(self, payload: dict[str, object]) -> bool:
         required_text = (
             "stock_code",
             "execution_time_raw",
@@ -1318,6 +1628,46 @@ class MarketDataHost(QObject):
             return False
         if payload.get("current_price") in (None, ""):
             return False
+        broker_identity = str(payload.get("broker_code_identity") or "").strip()
+        if broker_identity:
+            stock_code = str(payload.get("stock_code") or "").strip()
+            if canonical_stock_code_from_market_data_identity(broker_identity) != stock_code:
+                return False
+            if str(payload.get("market_source") or "").strip() != market_source_for_identity(
+                broker_identity
+            ):
+                return False
+            registration_getter = getattr(
+                self.kiwoom_api,
+                "realtime_shadow_registration_snapshot",
+                None,
+            )
+            try:
+                registration = (
+                    registration_getter()
+                    if callable(registration_getter)
+                    else None
+                )
+            except Exception:
+                registration = None
+            registered_identities = (
+                tuple(
+                    str(identity or "").strip()
+                    for identity in tuple(
+                        getattr(registration, "target_stock_codes", ()) or ()
+                    )
+                )
+                if bool(getattr(registration, "active", False))
+                else ()
+            )
+            identity_authorities = tuple(
+                identity
+                for identity in registered_identities
+                if canonical_stock_code_from_market_data_identity(identity)
+                == stock_code
+            )
+            if identity_authorities and broker_identity not in identity_authorities:
+                return False
         try:
             sequence = int(payload.get("receive_sequence"))
             epoch = int(payload.get("connection_epoch"))
@@ -1328,9 +1678,22 @@ class MarketDataHost(QObject):
 
     def _on_realtime_shadow_tick_received(self, payload: object) -> None:
         """Queue one normalized raw tick outside the broker callback stack."""
-        if self._shutting_down or not isinstance(payload, dict):
+        if not isinstance(payload, dict):
+            return
+        stock_code = str(payload.get("stock_code") or "").strip()
+        if self._shutting_down:
+            self._observe_realtime_boundary(
+                "MARKET_HOST_RAW_REJECTED",
+                stock_code,
+                reason="HOST_SHUTTING_DOWN",
+            )
             return
         if not self._raw_realtime_tick_minimally_valid(payload):
+            self._observe_realtime_boundary(
+                "MARKET_HOST_RAW_REJECTED",
+                stock_code,
+                reason="MINIMAL_PAYLOAD_INVALID",
+            )
             return
 
         event = dict(payload)
@@ -1352,12 +1715,28 @@ class MarketDataHost(QObject):
             self._raw_tick_received_count_by_stock[stock_code] = (
                 self._raw_tick_received_count_by_stock.get(stock_code, 0) + 1
             )
+        self._observe_realtime_boundary(
+            "MARKET_HOST_RAW_RECEIVED",
+            stock_code,
+            receive_sequence=sequence,
+            received_at=str(event.get("received_at") or ""),
+            market_datetime=str(event.get("market_datetime") or ""),
+            current_price=event.get("current_price"),
+            connection_epoch=identity[0],
+            login_session_id=identity[1],
+        )
 
         if len(self._raw_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH:
             # Preserve the queued FIFO sequence and reject the newest event explicitly.
             self._raw_tick_overflow_count += 1
             if identity == self._realtime_shadow_session_identity:
                 self._raw_tick_uncertain_stock_codes.add(stock_code)
+            self._observe_realtime_boundary(
+                "MARKET_HOST_RAW_REJECTED",
+                stock_code,
+                reason="RAW_QUEUE_OVERFLOW",
+                receive_sequence=sequence,
+            )
             self._schedule_raw_realtime_tick_drain()
             return
 
@@ -1367,6 +1746,156 @@ class MarketDataHost(QObject):
             len(self._raw_tick_queue),
         )
         self._schedule_raw_realtime_tick_drain()
+
+    def _on_nxt_display_tick_received(self, payload: object) -> None:
+        """Queue a normalized ECN execution without touching KRX consumers."""
+
+        if self._shutting_down or not isinstance(payload, dict):
+            return
+        event = dict(payload)
+        code = str(event.get("canonical_stock_code") or "").strip()
+        broker_identity = str(event.get("broker_code_identity") or "").strip()
+        if (
+            not code
+            or broker_identity != f"{code}_NX"
+            or event.get("market_source") != "NXT"
+            or event.get("source_real_type") != "ECN주식체결"
+        ):
+            self._observe_realtime_boundary(
+                "MARKET_HOST_RAW_REJECTED",
+                code or broker_identity,
+                reason="NXT_DISPLAY_IDENTITY_INVALID",
+                market_source="NXT",
+                broker_code_identity=broker_identity,
+            )
+            return
+        try:
+            sequence = int(event.get("receive_sequence"))
+            epoch = int(event.get("connection_epoch"))
+            price = float(event.get("current_price"))
+        except (TypeError, ValueError):
+            return
+        if sequence <= 0 or epoch < 0 or not isfinite(price) or price <= 0:
+            return
+        self._observe_realtime_boundary(
+            "MARKET_HOST_RAW_RECEIVED",
+            code,
+            market_source="NXT",
+            broker_code_identity=broker_identity,
+            receive_sequence=sequence,
+            market_datetime=str(event.get("market_datetime") or ""),
+            current_price=event.get("current_price"),
+            connection_epoch=epoch,
+            login_session_id=str(event.get("login_session_id") or ""),
+        )
+        if len(self._nxt_display_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH:
+            self._observe_realtime_boundary(
+                "MARKET_HOST_RAW_REJECTED",
+                code,
+                reason="NXT_DISPLAY_QUEUE_OVERFLOW",
+                market_source="NXT",
+                broker_code_identity=broker_identity,
+                receive_sequence=sequence,
+            )
+            return
+        self._nxt_display_tick_queue.append(event)
+        if not self._nxt_display_tick_drain_scheduled:
+            self._nxt_display_tick_drain_scheduled = True
+            QTimer.singleShot(0, self._drain_nxt_display_ticks)
+
+    def _drain_nxt_display_ticks(self) -> None:
+        self._nxt_display_tick_drain_scheduled = False
+        if self._shutting_down or self._nxt_display_tick_drain_running:
+            return
+        self._nxt_display_tick_drain_running = True
+        try:
+            while self._nxt_display_tick_queue and not self._shutting_down:
+                self._process_nxt_display_tick(self._nxt_display_tick_queue.popleft())
+        finally:
+            self._nxt_display_tick_drain_running = False
+            if self._nxt_display_tick_queue and not self._nxt_display_tick_drain_scheduled:
+                self._nxt_display_tick_drain_scheduled = True
+                QTimer.singleShot(0, self._drain_nxt_display_ticks)
+
+    def _process_nxt_display_tick(self, payload: dict[str, object]) -> bool:
+        code = str(payload.get("canonical_stock_code") or "").strip()
+        broker_identity = str(payload.get("broker_code_identity") or "").strip()
+        if (
+            not code
+            or broker_identity != f"{code}_NX"
+            or payload.get("market_source") != "NXT"
+            or payload.get("source_real_type") != "ECN주식체결"
+            or parse_market_datetime(payload.get("market_datetime")) is None
+        ):
+            return False
+        identity = (
+            int(payload.get("connection_epoch") or 0),
+            str(payload.get("login_session_id") or "").strip(),
+        )
+        if identity != self._realtime_shadow_session_identity:
+            self._observe_realtime_boundary(
+                "NORMALIZATION_REJECTED",
+                code,
+                reason="NXT_SESSION_IDENTITY_MISMATCH",
+                market_source="NXT",
+                broker_code_identity=broker_identity,
+            )
+            return False
+        if code not in self._display_observation_target_stock_codes():
+            return False
+        try:
+            price = float(payload.get("current_price"))
+        except (TypeError, ValueError):
+            return False
+        if not isfinite(price) or price <= 0:
+            return False
+        sequence = int(payload.get("receive_sequence") or 0)
+        current = self._nxt_display_live_price_states.get(code)
+        if current is not None and sequence <= current.receive_sequence:
+            self._observe_realtime_boundary(
+                "NORMALIZATION_REJECTED",
+                code,
+                reason="NXT_STALE_OR_OUT_OF_ORDER",
+                market_source="NXT",
+                broker_code_identity=broker_identity,
+                receive_sequence=sequence,
+                last_receive_sequence=current.receive_sequence,
+            )
+            return False
+        self._observe_realtime_boundary(
+            "NORMALIZATION_ACCEPTED",
+            code,
+            market_source="NXT",
+            broker_code_identity=broker_identity,
+            receive_sequence=sequence,
+            market_datetime=str(payload.get("market_datetime") or ""),
+            current_price=payload.get("current_price"),
+        )
+        self._nxt_display_live_price_states[code] = NxtDisplayLivePriceState(
+            canonical_stock_code=code,
+            broker_code_identity=broker_identity,
+            market_source="NXT",
+            source_real_type=str(payload.get("source_real_type") or ""),
+            connection_epoch=identity[0],
+            login_session_id=identity[1],
+            last_execution_time_raw=str(payload.get("execution_time_raw") or ""),
+            last_market_datetime=str(payload.get("market_datetime") or ""),
+            last_price=payload["current_price"],
+            execution_quantity=payload.get("execution_quantity"),
+            cumulative_volume=payload.get("cumulative_volume"),
+            receive_sequence=sequence,
+            data_quality=HIGH_RESOLUTION_DATA_NORMAL,
+            updated_at=str(payload.get("received_at") or ""),
+        )
+        self._observe_realtime_boundary(
+            "NXT_DISPLAY_STATE_UPDATED",
+            code,
+            market_source="NXT",
+            broker_code_identity=broker_identity,
+            receive_sequence=sequence,
+            current_price=payload.get("current_price"),
+        )
+        return True
 
     def _schedule_raw_realtime_tick_drain(self) -> None:
         if self._raw_tick_drain_scheduled or self._raw_tick_drain_running:
@@ -1402,12 +1931,37 @@ class MarketDataHost(QObject):
             str(payload.get("login_session_id") or "").strip(),
         )
         if identity != self._realtime_shadow_session_identity:
+            self._observe_realtime_boundary(
+                "NORMALIZATION_REJECTED",
+                stock_code,
+                reason="SESSION_IDENTITY_MISMATCH",
+                receive_sequence=payload.get("receive_sequence"),
+                event_identity=identity,
+                current_identity=self._realtime_shadow_session_identity,
+            )
             return False
 
         sequence = int(payload.get("receive_sequence") or 0)
         current = self._high_resolution_market_states.get(stock_code)
         if current is not None and sequence <= current.last_receive_sequence:
+            self._observe_realtime_boundary(
+                "NORMALIZATION_REJECTED",
+                stock_code,
+                reason="STALE_OR_OUT_OF_ORDER",
+                receive_sequence=sequence,
+                last_receive_sequence=current.last_receive_sequence,
+            )
             return False
+
+        self._observe_realtime_boundary(
+            "NORMALIZATION_ACCEPTED",
+            stock_code,
+            receive_sequence=sequence,
+            market_datetime=str(payload.get("market_datetime") or ""),
+            current_price=payload.get("current_price"),
+            connection_epoch=identity[0],
+            login_session_id=identity[1],
+        )
 
         self._raw_tick_processed_count += 1
         self._raw_tick_processed_count_by_stock[stock_code] = (
@@ -1418,6 +1972,15 @@ class MarketDataHost(QObject):
         self._raw_tick_last_processed_at = processed_at
         self._high_resolution_market_states[stock_code] = HighResolutionMarketState(
             stock_code=stock_code,
+            broker_code_identity=str(
+                payload.get("broker_code_identity") or stock_code
+            ).strip(),
+            market_source=str(
+                payload.get("market_source")
+                or market_source_for_identity(
+                    payload.get("broker_code_identity") or stock_code
+                )
+            ).strip(),
             connection_epoch=identity[0],
             login_session_id=identity[1],
             last_execution_time_raw=str(payload.get("execution_time_raw") or ""),
@@ -1467,6 +2030,18 @@ class MarketDataHost(QObject):
                 else getattr(current, "execution_strength", None)
             ),
         )
+        state = self._high_resolution_market_states[stock_code]
+        self._observe_realtime_boundary(
+            "HIGH_RES_STATE_UPDATED",
+            stock_code,
+            last_price=state.last_price,
+            last_market_datetime=state.last_market_datetime,
+            data_quality=state.data_quality,
+            connection_epoch=state.connection_epoch,
+            login_session_id=state.login_session_id,
+            receive_sequence=state.last_receive_sequence,
+            updated_at=processed_at,
+        )
         self._remember_current_session_market_information(stock_code)
         processing_latency_ms = max(
             0.0,
@@ -1506,7 +2081,15 @@ class MarketDataHost(QObject):
         timeframe = payload.get("timeframe_minutes")
         if isinstance(timeframe, bool) or timeframe != 1:
             return
-        self._canonical_event_queue.append(dict(payload))
+        event = dict(payload)
+        if event["source"] == "opt10080":
+            rqname = str(event.get("rqname") or "").strip()
+            context = self._operation_candle_requests.get(rqname)
+            # Detach provenance before the terminal callback releases the request.
+            event["_operation_request_context"] = (
+                dict(context) if rqname and isinstance(context, dict) else None
+            )
+        self._canonical_event_queue.append(event)
         self._schedule_canonical_drain()
 
     def _schedule_canonical_drain(self) -> None:
@@ -1562,7 +2145,7 @@ class MarketDataHost(QObject):
         source = str(event.get("source") or "")
         if source == "opt10080":
             rqname = str(event.get("rqname") or "").strip()
-            context = self._operation_candle_requests.get(rqname)
+            context = event.get("_operation_request_context")
             if not rqname or not isinstance(context, dict):
                 return None
             if str(event.get("stock_code") or "") != str(context.get("stock_code") or ""):
@@ -1590,7 +2173,7 @@ class MarketDataHost(QObject):
             != str(event.get("canonical_content_hash") or "")
         ):
             return None
-        if source == "opt10080":
+        if source == "opt10080" and self._operation_candle_requests.get(rqname) == context:
             self._operation_candle_requests.pop(rqname, None)
 
         stock_code = str(event.get("stock_code") or "").strip()

@@ -1040,8 +1040,11 @@ class ExecutionProcessRail(QWidget):
             "PARTIAL": "부분체결",
             "APPROVED": "승인",
             "ORDERED": "주문",
+            "ACTIVE": "진행",
         }.get(status, status)
-        return f"{side_text} | {option} | {status_text} {completed}/{total}"
+        buy_round = _nonnegative_count(process.get("buy_round"), 0)
+        round_text = f" | {buy_round}회차" if side == "BUY" and buy_round > 0 else ""
+        return f"{side_text}{round_text} | {option} | {status_text} {completed}/{total}"
 
     @staticmethod
     def _tooltip_text(process: dict[str, Any]) -> str:
@@ -2433,6 +2436,15 @@ class StockInstanceChartWindow(QDialog):
             time_basis = "Broker 체결시각"
         elif source == "LOCAL_RECEIVED_AT":
             time_basis = "Chejan 수신시각(근사)"
+        elif source == "MOCK_FILL":
+            time_basis = "모의 체결시각"
+            try:
+                mock_time = datetime.fromisoformat(str(marker.get("occurred_at")))
+                if mock_time.tzinfo is not None:
+                    mock_time = mock_time.astimezone(SEOUL_TIMEZONE)
+                occurred_text = mock_time.strftime("%H:%M:%S")
+            except (TypeError, ValueError):
+                occurred_text = "-"
         else:
             time_basis = quality or "시간근거 없음"
         option = str(marker.get("option_summary") or "").strip()
@@ -2441,10 +2453,15 @@ class StockInstanceChartWindow(QDialog):
         child = f"{index}/{total}" if index not in (None, "") and total not in (None, "") else "-"
         order_no = str(marker.get("broker_order_no") or marker.get("order_id") or "-").strip()
         identity = str(marker.get("execution_identity") or marker.get("execution_id") or "-").strip()
+        if source == "MOCK_FILL":
+            order_no = str(marker.get("mock_order_id") or "-")
+            identity = str(marker.get("fill_id") or "-")
+        buy_round = _nonnegative_count(marker.get("buy_round"), 0)
+        round_text = f" · {buy_round}회차" if side == "매수" and buy_round > 0 else ""
         price_text = StockInstanceCloseChart._price_text(price) if price is not None else "-"
         execution_text = f" · 실행 {option} {child}" if option else f" · 실행 {child}"
         return (
-            f"{side} {price_text}원 · {occurred_text} · 수량 {quantity}"
+            f"{side} {price_text}원{round_text} · {occurred_text} · 수량 {quantity}"
             f"{execution_text} · 시간근거 {time_basis} · 주문 {order_no} · 체결 {identity}"
         )
 

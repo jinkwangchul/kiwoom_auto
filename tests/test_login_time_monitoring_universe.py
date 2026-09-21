@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
@@ -102,13 +104,19 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
         market = SimpleNamespace(
             sync_monitoring_targets=Mock(
                 return_value={"ok": True, "changed": True, "active": True}
-            )
+            ),
+            sync_candle_standby_requirements=Mock(return_value={
+                "ok": True,
+                "standby_stock_codes": (),
+            }),
+            refresh_operation_candles=Mock(return_value={"accepted": False}),
         )
         host = SimpleNamespace(_market_data_host=market)
         with patch(
             "gui_auto_trade_operation_host.StockRepository"
         ) as repository_type:
             repository_type.return_value.realtime_monitoring_universe.return_value = projection
+            repository_type.return_value.list_current_registered_stocks.return_value = []
             result = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
 
         market.sync_monitoring_targets.assert_called_once_with(
@@ -123,6 +131,162 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             result["realtime_target_stock_codes"],
         )
         self.assertEqual(("0009K0",), result["unsupported_stock_codes"])
+
+    def test_login_sync_discovers_optional_routine_candle_requirements_and_bootstraps(self) -> None:
+        records = [
+            _record("005930", instance_id="INSTANCE-CANDLE"),
+            _record("000660", instance_id="INSTANCE-FREE"),
+            _record("035420", instance_id="INSTANCE-BROKEN"),
+        ]
+        projection = SimpleNamespace(
+            target_stock_codes=("000660", "005930", "035420"),
+            initial_snapshot_target_stock_codes=("000660", "005930", "035420"),
+            unsupported_stock_codes=(),
+            source_record_count=3,
+        )
+        instances = {
+            "INSTANCE-CANDLE": SimpleNamespace(
+                instance_id="INSTANCE-CANDLE",
+                definition_id="candle",
+                rules_path=Path("candle-rules.json"),
+            ),
+            "INSTANCE-FREE": SimpleNamespace(
+                instance_id="INSTANCE-FREE",
+                definition_id="free",
+                rules_path=Path("free-rules.json"),
+            ),
+            "INSTANCE-BROKEN": SimpleNamespace(
+                instance_id="INSTANCE-BROKEN",
+                definition_id="broken",
+                rules_path=Path("broken-rules.json"),
+            ),
+        }
+        definitions = {
+            "candle": SimpleNamespace(
+                definition_id="candle",
+                locators={"evaluation": {
+                    "market_bar_projection_callable": "declare",
+                }},
+            ),
+            "free": SimpleNamespace(
+                definition_id="free",
+                locators={"evaluation": {"callable": "evaluate"}},
+            ),
+            "broken": SimpleNamespace(
+                definition_id="broken",
+                locators={"evaluation": {
+                    "market_bar_projection_callable": "declare",
+                }},
+            ),
+        }
+        repository = Mock()
+        repository.realtime_monitoring_universe.return_value = projection
+        repository.list_current_registered_stocks.return_value = records
+        market = SimpleNamespace(
+            sync_monitoring_targets=Mock(return_value={"ok": True}),
+            sync_candle_standby_requirements=Mock(return_value={"ok": True}),
+            refresh_operation_candles=Mock(return_value={"accepted": True}),
+        )
+        host = SimpleNamespace(_market_data_host=market)
+
+        def load_callable(definition, _role, *, callable_key):
+            self.assertEqual("market_bar_projection_callable", callable_key)
+            if definition.definition_id == "broken":
+                raise ValueError("bad routine declaration")
+            return lambda _rules: {
+                "projection": "FORMING_BASE_BAR",
+                "warmup_bars": 35,
+            }
+
+        with patch("gui_auto_trade_operation_host.StockRepository", return_value=repository), patch(
+            "routine_instance_registry.routine_instance_by_id",
+            side_effect=lambda instance_id: instances.get(instance_id),
+        ), patch(
+            "routine_instance_registry.routine_definition_by_id",
+            side_effect=lambda definition_id: definitions.get(definition_id),
+        ), patch.object(
+            Path,
+            "read_text",
+            return_value=json.dumps({"bar": {"bar_minutes": 5}}),
+        ), patch(
+            "routine_package_contract.load_routine_callable",
+            side_effect=load_callable,
+        ):
+            result = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
+
+        market.sync_candle_standby_requirements.assert_called_once_with(
+            [{
+                "stock_code": "005930",
+                "rules": {"bar": {"bar_minutes": 5}},
+                "projection_request": {
+                    "projection": "FORMING_BASE_BAR",
+                    "warmup_bars": 35,
+                },
+            }],
+            preserve_stock_codes=("035420",),
+        )
+        market.refresh_operation_candles.assert_called_once()
+        self.assertTrue(market.refresh_operation_candles.call_args.kwargs["drain_all"])
+        self.assertEqual(("005930",), result["standby_requirement_stock_codes"])
+        self.assertEqual(("000660",), result["standby_requirement_skipped_stock_codes"])
+        self.assertEqual("035420", result["standby_requirement_errors"][0]["stock_code"])
+
+    def test_login_sync_bootstraps_when_only_previous_failed_requirement_is_preserved(self) -> None:
+        projection = SimpleNamespace(
+            target_stock_codes=("035420",),
+            initial_snapshot_target_stock_codes=("035420",),
+            unsupported_stock_codes=(),
+            source_record_count=1,
+        )
+        repository = Mock()
+        repository.realtime_monitoring_universe.return_value = projection
+        repository.list_current_registered_stocks.return_value = [
+            _record("035420", instance_id="INSTANCE-BROKEN")
+        ]
+        instance = SimpleNamespace(
+            instance_id="INSTANCE-BROKEN",
+            definition_id="broken",
+            rules_path=Path("broken-rules.json"),
+        )
+        definition = SimpleNamespace(
+            definition_id="broken",
+            locators={"evaluation": {"market_bar_projection_callable": "declare"}},
+        )
+        market = SimpleNamespace(
+            sync_monitoring_targets=Mock(return_value={"ok": True}),
+            sync_candle_standby_requirements=Mock(return_value={
+                "ok": True,
+                "standby_stock_codes": ("035420",),
+                "preserved_stock_codes": ("035420",),
+            }),
+            refresh_operation_candles=Mock(return_value={"accepted": True}),
+        )
+        host = SimpleNamespace(_market_data_host=market)
+
+        with patch("gui_auto_trade_operation_host.StockRepository", return_value=repository), patch(
+            "routine_instance_registry.routine_instance_by_id",
+            return_value=instance,
+        ), patch(
+            "routine_instance_registry.routine_definition_by_id",
+            return_value=definition,
+        ), patch.object(
+            Path,
+            "read_text",
+            return_value=json.dumps({"bar": {"bar_minutes": 5}}),
+        ), patch(
+            "routine_package_contract.load_routine_callable",
+            side_effect=ValueError("bad routine declaration"),
+        ):
+            result = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
+
+        market.sync_candle_standby_requirements.assert_called_once_with(
+            [],
+            preserve_stock_codes=("035420",),
+        )
+        market.refresh_operation_candles.assert_called_once()
+        self.assertTrue(market.refresh_operation_candles.call_args.kwargs["drain_all"])
+        self.assertEqual((), result["standby_requirement_stock_codes"])
+        self.assertEqual("035420", result["standby_requirement_errors"][0]["stock_code"])
 
 
 class LoginTimeMonitoringIntegrationTests(unittest.TestCase):

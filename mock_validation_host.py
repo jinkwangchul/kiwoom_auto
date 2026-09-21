@@ -47,6 +47,10 @@ from mock_validation_contract import (
     normalized_stock_code,
     payload_hash,
 )
+from mock_validation_candle_provider import (
+    is_production_market_data_callback,
+    project_mock_routine_candles,
+)
 from mock_validation_indicator_follow_adapter import MockIndicatorFollowRoutineAdapter
 from mock_validation_market_data import (
     MockMarketSnapshot,
@@ -162,8 +166,19 @@ class MockValidationHost:
         self._now = now_factory or (lambda: datetime.now().astimezone())
         self._projection_changed = projection_changed
         self._operation_policy_provider = operation_policy_provider or self._read_operation_policy
-        self._candles_provider = candles_provider
-        self._candle_observation_updater = candle_observation_updater
+        if is_production_market_data_callback(candles_provider):
+            self._candles_provider = lambda **kwargs: project_mock_routine_candles(
+                project_root=self.project_root,
+                api=self.api,
+                **kwargs,
+            )
+        else:
+            self._candles_provider = candles_provider
+        self._candle_observation_updater = (
+            None
+            if is_production_market_data_callback(candle_observation_updater)
+            else candle_observation_updater
+        )
         self.max_buffered_evidence_per_stock = max(1, int(max_buffered_evidence_per_stock))
         self._program_session_id = clean_text(
             program_session_id or PROGRAM_SESSION_ID

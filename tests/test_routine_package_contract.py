@@ -136,6 +136,31 @@ def final_safety(subject, rules, routine_identity, rules_identity):
         )
         return instance_id
 
+    def test_candle_projection_locator_is_optional_when_routine_does_not_use_candles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_package(root, "dummy_a", side="BUY")
+            metadata_path = root / "routines" / "dummy_a" / "routine.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["locators"]["evaluation"].pop("market_bar_projection_callable")
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            definition = next(
+                item
+                for item in load_routine_definitions(project_root=root)
+                if item.definition_id == "dummy_a"
+            )
+
+            validation = validate_routine_definition_capabilities(definition)
+
+        self.assertTrue(validation["ok"], validation)
+        self.assertNotIn(
+            "evaluation.market_bar_projection_callable",
+            validation["resolved"],
+        )
+
     def test_dummy_a_and_b_resolve_every_generic_capability_independently(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

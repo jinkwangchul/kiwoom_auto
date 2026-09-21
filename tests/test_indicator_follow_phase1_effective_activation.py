@@ -166,13 +166,17 @@ class IndicatorFollowEffectiveActivationTest(unittest.TestCase):
             dialog_module.QMessageBox,
             "question",
             return_value=dialog_module.QMessageBox.Yes,
-        ), mock.patch.object(dialog_module.QMessageBox, "information"):
+        ), mock.patch.object(dialog_module.QMessageBox, "information"), mock.patch.object(
+            dialog_module,
+            "_refresh_routine_assignment_views",
+        ) as refresh:
             result = self.dialog._handle_approved_rule_commit_clicked()
         self.assertEqual(result, expected)
         self.dialog.commit_saved_approved_rule_changes.assert_called_once_with(
             manual_rule_commit_confirmed=True,
         )
         self.dialog.load_rules.assert_called_once_with()
+        refresh.assert_called_once_with(self.dialog)
 
     def test_pending_rejected_and_deferred_do_not_commit(self) -> None:
         for decision in ("PENDING", "REJECTED", "DEFERRED"):

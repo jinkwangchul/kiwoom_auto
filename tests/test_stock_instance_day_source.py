@@ -265,6 +265,82 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             self.assertTrue(all(call["max_count"] == 200_000 for call in calls))
             self.assertEqual(len(completions), 2)
 
+    def test_inflight_refresh_queues_completion_waiter_until_active_refresh_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock_dir(Path(temp))
+            request_callbacks: list[object] = []
+            completions: list[str] = []
+
+            class Api:
+                is_available = staticmethod(lambda: True)
+                is_connected = staticmethod(lambda: True)
+
+                @staticmethod
+                def request_minute_candles(_code, _name, **kwargs):
+                    request_callbacks.append(kwargs["callback"])
+                    return {"ok": True, "rqname": "R1"}
+
+            window = SimpleNamespace(kiwoom_api=Api())
+            with patch.object(auto_candle_refresh, "all_registered_stock_dirs", return_value=[stock_dir]), patch.object(
+                auto_candle_refresh.QTimer,
+                "singleShot",
+                side_effect=lambda _delay, callback: callback(),
+            ):
+                first = auto_candle_refresh.refresh_operation_candles(
+                    window,
+                    "2026-08-10 10:00",
+                    on_complete=lambda _result: completions.append("first"),
+                )
+                second = auto_candle_refresh.refresh_operation_candles(
+                    window,
+                    "2026-08-10 10:00",
+                    on_complete=lambda _result: completions.append("waiter"),
+                )
+                self.assertEqual([], completions)
+                self.assertEqual("CANDLE_REFRESH_ALREADY_RUNNING", second["reason_code"])
+                self.assertEqual(1, len(window._automatic_candle_refresh_waiters))
+                request_callbacks[0]({"ok": True, "rows_count": 1})
+
+            self.assertTrue(first["accepted"])
+            self.assertEqual(["first", "waiter"], completions)
+            self.assertFalse(window._automatic_candle_refresh_inflight)
+            self.assertEqual([], window._automatic_candle_refresh_waiters)
+
+    def test_stale_refresh_callback_is_ignored_after_generation_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock_dir(Path(temp))
+            request_callbacks: list[object] = []
+            completions: list[dict[str, object]] = []
+
+            class Api:
+                is_available = staticmethod(lambda: True)
+                is_connected = staticmethod(lambda: True)
+
+                @staticmethod
+                def request_minute_candles(_code, _name, **kwargs):
+                    request_callbacks.append(kwargs["callback"])
+                    return {"ok": True, "rqname": "OLD"}
+
+            window = SimpleNamespace(kiwoom_api=Api())
+            with patch.object(auto_candle_refresh, "all_registered_stock_dirs", return_value=[stock_dir]), patch.object(
+                auto_candle_refresh.QTimer,
+                "singleShot",
+            ) as timer:
+                auto_candle_refresh.refresh_operation_candles(
+                    window,
+                    "2026-08-10 10:00",
+                    on_complete=completions.append,
+                )
+                old_generation = window._automatic_candle_refresh_generation
+                window._automatic_candle_refresh_generation = old_generation + 1
+                window._automatic_candle_refresh_inflight = False
+                window._automatic_candle_refresh_waiters = []
+                request_callbacks[0]({"ok": True, "rows_count": 1})
+
+            self.assertEqual([], completions)
+            timer.assert_not_called()
+            self.assertEqual(old_generation + 1, window._automatic_candle_refresh_generation)
+
     def test_request_batch_is_bounded_and_round_robin_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dirs = [self._stock_dir(Path(temp), index) for index in range(20)]
@@ -291,6 +367,46 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             self.assertEqual(len(requested), 15)
             self.assertEqual(result["skipped_by_limit"], 5)
             self.assertEqual(result["request_spacing_ms"], 1000)
+
+    def test_drain_all_bootstrap_covers_all_targets_with_conservative_batch_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dirs = [self._stock_dir(Path(temp), index) for index in range(20)]
+            requested: list[str] = []
+            delays: list[int] = []
+
+            class Api:
+                is_available = staticmethod(lambda: True)
+                is_connected = staticmethod(lambda: True)
+
+                @staticmethod
+                def request_minute_candles(code, _name, **kwargs):
+                    requested.append(code)
+                    kwargs["callback"]({"ok": True, "rows_count": 1})
+                    return {"ok": True}
+
+            window = SimpleNamespace(kiwoom_api=Api())
+
+            def run_timer(delay, callback):
+                delays.append(delay)
+                callback()
+
+            with patch.object(auto_candle_refresh, "all_registered_stock_dirs", return_value=stock_dirs), patch.object(
+                auto_candle_refresh.QTimer,
+                "singleShot",
+                side_effect=run_timer,
+            ):
+                result = auto_candle_refresh.refresh_operation_candles(
+                    window,
+                    "2026-08-10 10:00",
+                    drain_all=True,
+                )
+
+            self.assertEqual(20, len(requested))
+            self.assertEqual(20, len(set(requested)))
+            self.assertEqual(0, result["skipped_by_limit"])
+            self.assertTrue(result["drain_all"])
+            self.assertEqual(60_000, result["bootstrap_batch_pause_ms"])
+            self.assertIn(60_000, delays)
 
     def test_warmup_over_limit_fails_closed_without_tr_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -401,6 +517,51 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
         probe.assert_not_called()
         pipeline.assert_called_once_with(host)
         self.assertTrue(result["signal_result"]["deferred_for_candle_refresh"])
+
+    def test_operation_cycle_defers_when_login_bootstrap_refresh_is_already_running(self) -> None:
+        host = Mock()
+        host.startup_recovery_session_ready.return_value = True
+        host._last_time_policy_minute_key = ""
+        host.recalculate_all_status_by_operation_policy.return_value = {"changed": 0, "failed": 0}
+        host.complete_deferred_operation_cycle = Mock()
+        callback_box: dict[str, object] = {}
+        pipeline = Mock(return_value={"processed": True})
+
+        def already_running(_minute_key, *, on_complete):
+            callback_box["callback"] = on_complete
+            return {
+                "accepted": False,
+                "completed": False,
+                "reason_code": "CANDLE_REFRESH_ALREADY_RUNNING",
+            }
+
+        host.market_data_host.return_value = SimpleNamespace(
+            sync_targets=Mock(return_value={}),
+            prepare_operation_cycle=Mock(return_value={}),
+            refresh_operation_candles=already_running,
+        )
+
+        with patch.object(gui_auto_trade_timer, "auto_trade_current_time_policy_minute_key", return_value="2026-08-10 10:00"), patch.object(
+            gui_auto_trade_timer,
+            "auto_trade_continue_pending_close_liquidations",
+            return_value={"processed": 0, "blocked": 0},
+        ), patch.object(
+            gui_auto_trade_timer,
+            "auto_trade_continue_pending_manual_ats_liquidations",
+            return_value={"processed": 0, "failed": 0},
+        ), patch.object(
+            gui_auto_trade_timer,
+            "_process_pending_signal_pipeline",
+            pipeline,
+        ):
+            result = gui_auto_trade_timer.auto_trade_run_operation_cycle(host)
+            pipeline.assert_not_called()
+            callback_box["callback"]({"accepted": True, "completed": True, "failed": 0})
+
+        pipeline.assert_called_once_with(host)
+        self.assertTrue(result["signal_result"]["deferred_for_candle_refresh"])
+        self.assertEqual("CANDLE_REFRESH_ALREADY_RUNNING", result["signal_result"]["reason_code"])
+        host.complete_deferred_operation_cycle.assert_called_once()
 
 
 class SignalMarkerAndDayProjectionTests(unittest.TestCase):

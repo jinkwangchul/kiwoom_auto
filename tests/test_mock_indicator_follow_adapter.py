@@ -30,6 +30,8 @@ from mock_validation_market_data import (
     MockOrderbookSnapshot,
     MockTradeSnapshot,
 )
+from mock_validation_execution_chart_read_model import project_mock_execution_chart
+from mock_validation_quick_chart import _signal_markers
 from mock_validation_repository import MockValidationRepository
 from mock_validation_session_service import MockValidationSessionService
 from mock_validation_virtual_execution import MockExecutionPolicy, MockVirtualExecutionEngine
@@ -559,11 +561,150 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         self.assertEqual(RESULT_WAIT, stopped["status"])
         self.assertEqual([], repository.read_history(SESSION_ID)["session_document"]["orders"])
 
-    def test_stale_market_and_budget_shortage_are_normal_blocks(self):
-        repository, _, _, adapter, _ = self.build({"A": _buy_rules(qty=3, budget=200)})
-        stale = self.evaluate(adapter, market=_market(now=NOW - timedelta(seconds=10)))
-        budget = self.evaluate(adapter, cycle="C2")
+    def test_cycle_snapshot_revision_conflict_remains_fail_closed(self):
+        repository, _, _, adapter, selected = self.build({"A": _buy_rules()})
+        selected["value"] = None
+        stale = repository.read_session(SESSION_ID)
+
+        def external_update(document):
+            document["applied_commands"]["MC-external"] = {
+                "operation": "TEST_EXTERNAL_REVISION",
+                "applied_at": (NOW + timedelta(seconds=1)).isoformat(
+                    timespec="microseconds"
+                ),
+                "entity_id": "A",
+            }
+            return document
+
+        repository.mutate_session(
+            SESSION_ID,
+            external_update,
+            expected_revision=stale["revision"],
+        )
+        result = adapter.evaluate_cycle(
+            SESSION_ID,
+            routine_instance_id="A",
+            candles=[{"close": 100, "volume": 10} for _ in range(5)],
+            market=replace(_market(), trade=None),
+            policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+            evaluation_cycle_id="STALE-CYCLE",
+            evaluated_at=NOW,
+            document=stale,
+        )
+
+        current = repository.read_session(SESSION_ID)
+        self.assertEqual("INSTANCE_ERROR", result["status"])
+        self.assertEqual("MOCK_SESSION_REVISION_CONFLICT", result["reason"])
+        self.assertIn("MC-external", current["applied_commands"])
+        self.assertNotIn(
+            "STALE-CYCLE",
+            current["progression_by_instance"]["A"]
+            .get("indicator_follow_mock_adapter", {})
+            .get("evaluation_cycles", {}),
+        )
+
+    def test_stale_orderbook_preserves_signal_and_blocks_only_virtual_execution(self):
+        rules = _buy_rules(qty=3, budget=200)
+        repository, _, _, adapter, _ = self.build({"A": rules})
+        self.snapshot_instance_settings(
+            repository,
+            "A",
+            repository.read_session(SESSION_ID)["effective_settings_by_instance"]["A"],
+        )
+        adapter._evaluator = lambda *_args: {
+            "signal": "BUY", "reason": "fixture", "signal_index": 0,
+        }
+        stale = adapter.evaluate_cycle(
+            SESSION_ID,
+            routine_instance_id="A",
+            candles=[{
+                "bar_time": NOW.isoformat(),
+                "close": 100,
+                "volume": 10,
+                "timeframe_minutes": 5,
+            }],
+            market=_market(now=NOW - timedelta(seconds=10)),
+            policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+            evaluation_cycle_id="C1",
+            evaluated_at=NOW,
+        )
         self.assertEqual((RESULT_WAIT, "MOCK_ORDERBOOK_STALE"), (stale["status"], stale["reason"]))
+        self.assertEqual("BUY", stale["signal"]["signal"])
+        self.assertEqual([], stale["orders"])
+        self.assertEqual([], stale["fills"])
+        current = repository.read_session(SESSION_ID)
+        events = repository.read_events(SESSION_ID)
+        evaluated = [event for event in events if event["event_type"] == "ROUTINE_EVALUATED"]
+        self.assertEqual(1, len(evaluated))
+        self.assertEqual("BUY", evaluated[0]["payload"]["signal"])
+        buy_markers, sell_markers = _signal_markers(
+            current,
+            instance_id="A",
+            rules=rules,
+            trade_date=NOW.date().isoformat(),
+            events=events,
+        )
+        self.assertEqual((1, 0), (len(buy_markers), len(sell_markers)))
+        execution_chart = project_mock_execution_chart(current, "A", NOW.date().isoformat())
+        self.assertEqual([], execution_chart["actual_fill_markers"])
+        self.assertEqual([], execution_chart["execution_process_rails"])
+
+    def test_missing_orderbook_preserves_signal_and_blocks_only_virtual_execution(self):
+        rules = _buy_rules(qty=1)
+        repository, _, _, adapter, _ = self.build({"A": rules})
+        adapter._evaluator = lambda *_args: {
+            "signal": "BUY", "reason": "fixture", "signal_index": 0,
+        }
+        result = adapter.evaluate_cycle(
+            SESSION_ID,
+            routine_instance_id="A",
+            candles=[{
+                "bar_time": NOW.isoformat(),
+                "close": 100,
+                "volume": 10,
+                "timeframe_minutes": 5,
+            }],
+            market=None,
+            policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+            evaluation_cycle_id="C-MISSING-BOOK",
+            evaluated_at=NOW,
+        )
+        self.assertEqual((RESULT_WAIT, "MOCK_MARKET_UNAVAILABLE"), (result["status"], result["reason"]))
+        self.assertEqual("BUY", result["signal"]["signal"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual([], result["fills"])
+        events = repository.read_events(SESSION_ID)
+        self.assertEqual(1, len([event for event in events if event["event_type"] == "ROUTINE_EVALUATED"]))
+
+    def test_mock_allowed_is_independent_from_production_execution_enabled(self):
+        matrix = (
+            (False, True, RESULT_PROGRESSED, ""),
+            (True, False, RESULT_WAIT, "MOCK_EXECUTION_NOT_ALLOWED"),
+            (False, False, RESULT_WAIT, "MOCK_EXECUTION_NOT_ALLOWED"),
+        )
+        for execution_enabled, mock_allowed, expected_status, expected_reason in matrix:
+            with self.subTest(
+                execution_enabled=execution_enabled,
+                mock_allowed=mock_allowed,
+            ):
+                rules = _buy_rules(qty=1)
+                rules["principle"] = {"execution_enabled": execution_enabled}
+                rules["safety"] = {"mock_allowed": mock_allowed}
+                repository, _, _, adapter, _ = self.build({"A": rules})
+                result = self.evaluate(adapter)
+                self.assertEqual(expected_status, result["status"])
+                if expected_reason:
+                    self.assertEqual(expected_reason, result["reason"])
+                    self.assertEqual([], result["orders"])
+                    self.assertEqual([], result["fills"])
+                    events = repository.read_events(SESSION_ID)
+                    self.assertEqual(1, len([event for event in events if event["event_type"] == "ROUTINE_EVALUATED"]))
+                else:
+                    self.assertEqual(1, len(result["orders"]))
+
+    def test_budget_shortage_remains_a_virtual_execution_block(self):
+        repository, _, _, adapter, _ = self.build({"A": _buy_rules(qty=3, budget=200)})
+        budget = self.evaluate(adapter)
         self.assertEqual("MOCK_EXECUTION_BUDGET_EXCEEDED", budget["reason"])
         self.assertEqual("RUNNING", repository.read_session(SESSION_ID)["session"]["state"])
 
@@ -581,7 +722,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         replay = self.evaluate(adapter, at=NOW.replace(microsecond=999999))
         self.assertEqual(RESULT_NOOP, replay["status"])
         self.assertEqual(
-            1,
+            0,
             len([
                 event
                 for event in repository.read_events(SESSION_ID)
@@ -597,9 +738,9 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         self.assertEqual("SELL", selected["value"])
 
     def test_routine_evaluated_event_binds_operation_and_authoritative_signal_bar(self):
-        repository, _, _, adapter, _ = self.build({"A": _sell_rules()}, signal="SELL")
+        repository, _, _, adapter, _ = self.build({"A": _buy_rules()}, signal="BUY")
         adapter._evaluator = lambda *_args: {
-            "signal": "SELL",
+            "signal": "BUY",
             "reason": "fixture",
             "signal_index": 0,
         }
@@ -619,13 +760,13 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
             evaluation_cycle_id="C-SIGNAL-MARKER",
             evaluated_at=NOW,
         )
-        self.assertEqual("SELL_HOLDING_QUANTITY_INVALID", result["reason"])
+        self.assertEqual(RESULT_PROGRESSED, result["status"])
         event = next(
             item
             for item in repository.read_events(SESSION_ID)
             if item["event_type"] == "ROUTINE_EVALUATED"
         )
-        self.assertEqual("SELL", event["payload"]["signal"])
+        self.assertEqual("BUY", event["payload"]["signal"])
         self.assertEqual("2026-09-03T10:00:00+09:00", event["payload"]["signal_bar_time"])
         self.assertEqual(100, event["payload"]["signal_bar_close"])
         self.assertEqual(5, event["payload"]["signal_timeframe_minutes"])
@@ -654,7 +795,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
 
         def evaluator(_candles, rules, _context):
             observed["rules"] = deepcopy(rules)
-            return {"signal": "", "reason": "fixture"}
+            return {"signal": "BUY", "reason": "fixture", "signal_index": 0}
 
         adapter = MockIndicatorFollowRoutineAdapter(
             repository,
@@ -664,7 +805,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         )
         result = self.evaluate(adapter)
 
-        self.assertEqual(RESULT_NO_SIGNAL, result["status"])
+        self.assertEqual(RESULT_PROGRESSED, result["status"])
         self.assertEqual(7, observed["rules"]["mock_validation"]["stock_config"]["buy_qty"])
         event = next(
             item
@@ -1036,14 +1177,22 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
             result = adapter.evaluate_cycle(
                 SESSION_ID,
                 routine_instance_id="A",
-                candles=[],
+                candles=[{"close": 100, "volume": 10} for _ in range(5)],
                 market=None,
                 policy=policy,
                 evaluation_cycle_id="SAME-SECOND",
                 evaluated_at=NOW.replace(microsecond=microsecond),
             )
-            self.assertEqual(RESULT_WAIT, result["status"])
-            self.assertEqual("MOCK_MARKET_UNAVAILABLE", result["reason"])
+            self.assertEqual(
+                RESULT_WAIT if microsecond == 0 else RESULT_NOOP,
+                result["status"],
+            )
+            self.assertEqual(
+                "MOCK_MARKET_UNAVAILABLE"
+                if microsecond == 0
+                else "MOCK_EVALUATION_CYCLE_ALREADY_PROCESSED",
+                result["reason"],
+            )
 
         blocked = [
             event
@@ -1062,7 +1211,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
             repository,
             engine,
             now_factory=lambda: NOW,
-            evaluator=lambda *_args: {"signal": "", "reason": "fixture"},
+            evaluator=lambda *_args: {"signal": "BUY", "reason": "fixture"},
         )
         before = repository.read_session(SESSION_ID)
 
@@ -1080,10 +1229,10 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         retried = restarted.evaluate_cycle(
             SESSION_ID,
             routine_instance_id="A",
-            candles=[],
+            candles=[{"close": 100, "volume": 10} for _ in range(5)],
             market=None,
             policy=policy,
-            evaluation_cycle_id="SAME-SECOND",
+            evaluation_cycle_id="RETRY-SAME-EPISODE",
             evaluated_at=NOW.replace(microsecond=999999),
         )
         self.assertEqual(RESULT_WAIT, retried["status"])
@@ -1097,7 +1246,8 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         policy = MockExecutionPolicy(1, "LOGIN-1", 2, 2)
 
         adapter.evaluate_cycle(
-            SESSION_ID, routine_instance_id="A", candles=[], market=None,
+            SESSION_ID, routine_instance_id="A",
+            candles=[{"close": 100, "volume": 10} for _ in range(5)], market=None,
             policy=policy, evaluation_cycle_id="BLOCK-1", evaluated_at=NOW,
         )
         selected["value"] = ""
@@ -1110,8 +1260,10 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
             evaluation_cycle_id="RECOVERED",
             evaluated_at=NOW + timedelta(microseconds=10),
         )
+        selected["value"] = "BUY"
         adapter.evaluate_cycle(
-            SESSION_ID, routine_instance_id="A", candles=[], market=None,
+            SESSION_ID, routine_instance_id="A",
+            candles=[{"close": 100, "volume": 10} for _ in range(5)], market=None,
             policy=policy, evaluation_cycle_id="BLOCK-2",
             evaluated_at=NOW + timedelta(seconds=1),
         )
@@ -1126,7 +1278,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
             adapter.evaluate_cycle(
                 SESSION_ID,
                 routine_instance_id="A",
-                candles=[],
+                candles=[{"close": 100, "volume": 10} for _ in range(5)],
                 market=invalid_market,
                 policy=policy,
                 evaluation_cycle_id="DIFFERENT-REASON",
@@ -1155,7 +1307,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
                 adapter.evaluate_cycle(
                     SESSION_ID,
                     routine_instance_id=instance_id,
-                    candles=[],
+                    candles=[{"close": 100, "volume": 10} for _ in range(5)],
                     market=None,
                     policy=policy,
                     evaluation_cycle_id="SAME-SECOND",
@@ -1175,7 +1327,7 @@ class MockIndicatorFollowAdapterTest(unittest.TestCase):
         adapter.evaluate_cycle(
             SESSION_ID,
             routine_instance_id="A",
-            candles=[],
+            candles=[{"close": 100, "volume": 10} for _ in range(5)],
             market=None,
             policy=policy,
             evaluation_cycle_id="NEXT-OPERATION",
