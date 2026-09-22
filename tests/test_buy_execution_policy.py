@@ -223,6 +223,31 @@ class BuyExecutionPolicyTest(unittest.TestCase):
         self.assertIn("ROUND_BUDGET_EXCEEDS_REMAINING_BUDGET", remaining["issues"])
         self.assertIn("TOTAL_BUDGET_EXCEEDED", total["issues"])
 
+    def test_budget_mode_limits_use_actual_whole_share_order_amount(self):
+        repeat = self._rules()["buy"]["execution"]["repeat"]
+        repeat.update(detail_mode="BUDGET", budget_ratio=1.3)
+        result = self._evaluate(
+            signal_context=self._signal(order_price=100, current_price=100),
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(
+                confirmed_current_buy_round=1,
+                confirmed_cumulative_buy_budget=100,
+            ),
+            budget_context=self._budget(
+                previous_buy_budget=130,
+                total_budget=200,
+                remaining_budget=100,
+            ),
+        )
+
+        self.assertEqual(STATUS_READY, result["status"], result)
+        self.assertEqual(169, result["round_budget"])
+        self.assertEqual(1, result["quantity"])
+        self.assertEqual(0, result["remaining_budget_after_candidate"])
+        calculation = result["evidence"]["budget_calculation"]
+        self.assertEqual(100, calculation["effective_order_budget"])
+        self.assertEqual(69, calculation["unspent_budget"])
+
     def test_planning_does_not_change_confirmed_runtime_state(self):
         runtime = self._runtime(confirmed_current_buy_round=1, confirmed_cumulative_buy_budget=100000)
         original = deepcopy(runtime)

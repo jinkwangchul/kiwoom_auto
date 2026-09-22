@@ -24,7 +24,7 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                               'buy_ocr_turn_combo': '상승',
                               'buy_ocr_value_line': '0',
                               'buy_bollinger_compare_combo': '이하',
-                              'buy_bollinger_direction_combo': '하향',
+                              'buy_bollinger_direction_combo': '하단',
                               'buy_bollinger_sign_combo': '+',
                               'buy_bollinger_value_line': '0.5',
                               'buy_ma_compare_combo': '돌파',
@@ -67,7 +67,7 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                        'active_direction_combo': '상향',
                        'active_ratio_line': '0.45',
                        'apply_all_check': True,
-                       'budget_ratio_line': '0.5',
+                       'budget_ratio_line': '2.0',
                        'detail_mode_combo': '회차기준',
                        'round_budget_line': '2',
                        'round_operator_combo': '+'},
@@ -163,7 +163,7 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                                                    'rsi_value_line': '70'},
                                    'condition_b': {'bollinger_check': False,
                                                    'bollinger_compare_combo': '이상',
-                                                   'bollinger_direction_combo': '상향',
+                                                   'bollinger_direction_combo': '상단',
                                                    'bollinger_logic_combo': 'AND',
                                                    'bollinger_sign_combo': '-',
                                                    'bollinger_value_line': '0.2',
@@ -486,6 +486,8 @@ def legacy_buy_bollinger_sign(signal_filter: dict[str, Any]) -> str | None:
     """Return the historical implicit BUY Bollinger sign, if it is knowable."""
     direction = str(signal_filter.get("buy_bollinger_direction_combo") or "").strip()
     return {
+        "하단": "-",
+        "상단": "+",
         "하향": "-",
         "상향": "+",
     }.get(direction)

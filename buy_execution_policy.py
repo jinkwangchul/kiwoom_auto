@@ -416,10 +416,19 @@ def _repeat_budget(
     quantity = math.floor((budget or 0) / current_price)
     if quantity <= 0:
         return None, None, reference, evidence, ["ROUND_BUDGET_BELOW_ONE_SHARE"]
-    effective_budget = current_price * quantity
+    effective_order_budget = current_price * quantity
     evidence["calculated_budget"] = budget
-    evidence["ignored_remainder"] = (budget or 0) - effective_budget
-    return effective_budget, quantity, reference, evidence, []
+    evidence["effective_order_budget"] = effective_order_budget
+    evidence["unspent_budget"] = (budget or 0) - effective_order_budget
+    # BUDGET mode compounds the approved calculation budget itself.  The
+    # integer-share order may spend less, but that difference must not shrink
+    # the next round's budget basis.
+    approved_budget = (
+        budget
+        if detail_mode == "BUDGET"
+        else effective_order_budget
+    )
+    return approved_budget, quantity, reference, evidence, []
 
 
 def _result(
@@ -626,13 +635,25 @@ def evaluate_buy_execution_policy(
     budget_limit_supplied = "remaining_budget" in budget or total_budget is not None
     if budget_limit_supplied and (remaining_budget is None or remaining_budget <= 0):
         issues.append("REMAINING_BUDGET_NOT_POSITIVE")
+
+    # round_budget is the approved calculation budget and, in BUDGET mode,
+    # is intentionally carried forward even when whole-share sizing spends
+    # less. Safety/balance gates use the amount actually orderable this round.
+    candidate_order_budget = _positive_float(
+        budget_evidence.get("effective_order_budget")
+        if isinstance(budget_evidence, dict)
+        else None
+    )
+    if candidate_order_budget is None:
+        candidate_order_budget = round_budget
+
     remaining_after = None
-    if remaining_budget is not None and round_budget is not None:
-        remaining_after = remaining_budget - round_budget
-        if round_budget > remaining_budget:
+    if remaining_budget is not None and candidate_order_budget is not None:
+        remaining_after = remaining_budget - candidate_order_budget
+        if candidate_order_budget > remaining_budget:
             issues.append("ROUND_BUDGET_EXCEEDS_REMAINING_BUDGET")
-    if total_budget is not None and round_budget is not None:
-        if confirmed_cumulative + round_budget > total_budget:
+    if total_budget is not None and candidate_order_budget is not None:
+        if confirmed_cumulative + candidate_order_budget > total_budget:
             issues.append("TOTAL_BUDGET_EXCEEDED")
 
     system_admission: dict[str, Any] = {}
@@ -640,7 +661,7 @@ def evaluate_buy_execution_policy(
         system_admission = project_system_total_budget_buy_admission(
             total_budget=budget.get("system_total_budget"),
             account_consumed_amount=budget.get("account_consumed_amount"),
-            candidate_buy_amount=round_budget,
+            candidate_buy_amount=candidate_order_budget,
         )
         if system_admission.get("available") is not True:
             issues.append("SYSTEM_TOTAL_BUDGET_EVIDENCE_UNAVAILABLE")

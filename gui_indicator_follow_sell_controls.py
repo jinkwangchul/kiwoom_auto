@@ -437,7 +437,7 @@ class IndicatorFollowSellControlsMixin:
         self.sell_signal_condition_b_price_box_compare_combo = price_box_compare_combo
         self.sell_signal_condition_b_price_box_logic_combo = filter_row_entries[-1]["logic"]
 
-        bollinger_direction_combo = make_combo(["상향", "하향"], "하향", 64)
+        bollinger_direction_combo = make_combo(["상단", "하단"], "하단", 64)
         bollinger_sign_combo = make_combo(["-", "+"], "+", 52)
         bollinger_value_line = make_line("0.1", 44)
         bollinger_compare_combo = make_combo(["이상", "이하"], "이상", 66)

@@ -197,6 +197,29 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
         self.assertEqual(2, result["execution_intent"]["quantity"])
         self.assertEqual(200, result["execution_intent"]["budget"])
 
+    def test_budget_repeat_uses_previous_approved_budget_not_previous_fill_amount(self) -> None:
+        rules = self._rules(repeat_mode="BUDGET")
+        rules["buy"]["execution"]["repeat"]["budget_ratio"] = 1.3
+        result = self._build(
+            cycle=self._cycle(
+                1,
+                last_normal_round_approved_budget=130,
+                last_filled_buy_amount=100,
+            ),
+            rules=rules,
+            price=100,
+        )
+
+        self.assertEqual("READY", result["status"], result)
+        self.assertEqual(1, result["execution_intent"]["quantity"])
+        self.assertEqual(169, result["execution_intent"]["budget"])
+        calculation = result["preview"]["execution_policy_result"]["evidence"][
+            "budget_calculation"
+        ]
+        self.assertEqual(169, calculation["calculated_budget"])
+        self.assertEqual(100, calculation["effective_order_budget"])
+        self.assertEqual(69, calculation["unspent_budget"])
+
     def test_live_same_round_is_blocked_and_cancelled_round_can_retry(self) -> None:
         blocked = self._build(cycle=self._cycle(1, pending_buy_rounds=[2]))
         retry = self._build(cycle=self._cycle(1, pending_buy_rounds=[]))

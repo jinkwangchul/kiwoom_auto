@@ -195,7 +195,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertEqual(
             [
                 "1\ubd84", "3\ubd84", "5\ubd84", "10\ubd84", "15\ubd84", "30\ubd84",
-                "60\ubd84", "120\ubd84", "240\ubd84", "\uc77c", "\uc8fc", "\ub144",
+                "60\ubd84", "120\ubd84", "240\ubd84", "", "\uc77c", "\uc8fc", "\uc6d4", "\ub144",
             ],
             [
                 window.basic_signal_interval_combo.itemText(index)
@@ -204,6 +204,80 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         )
         self.assertEqual("3\ubd84", window.basic_signal_interval_combo.displayText())
         self.assertEqual("3", window.basic_signal_interval_combo.validationValue())
+        separator_index = 9
+        combo_model = window.basic_signal_interval_combo.model()
+        self.assertFalse(
+            combo_model.item(separator_index).flags() & Qt.ItemIsSelectable
+        )
+        normal_height = combo_model.data(
+            combo_model.index(0, 0),
+            Qt.SizeHintRole,
+        ).height()
+        separator_height = combo_model.data(
+            combo_model.index(separator_index, 0),
+            Qt.SizeHintRole,
+        ).height()
+        font_height = window.basic_signal_interval_combo.fontMetrics().height()
+        self.assertGreater(normal_height, font_height)
+        self.assertGreaterEqual(separator_height, font_height)
+        self.assertEqual(
+            normal_height,
+            window.basic_signal_interval_combo.view().sizeHintForRow(0),
+        )
+        self.assertEqual(
+            separator_height,
+            window.basic_signal_interval_combo.view().sizeHintForRow(separator_index),
+        )
+        window.basic_signal_interval_combo.setCurrentText("\uc6d4")
+        self.assertEqual("\uc6d4", window.basic_signal_interval_combo.validationValue())
+        self.assertEqual(
+            Qt.ScrollBarAlwaysOff,
+            window.basic_signal_interval_combo.view().verticalScrollBarPolicy(),
+        )
+        self.assertEqual(
+            window.basic_signal_interval_combo.count(),
+            window.basic_signal_interval_combo.maxVisibleItems(),
+        )
+        self.assertGreaterEqual(window.basic_signal_interval_combo.width(), 98)
+
+        combo_index = next(
+            index
+            for index in range(window.basic_header_row.count())
+            if window.basic_header_row.itemAt(index).widget()
+            is window.basic_signal_interval_combo
+        )
+        self.assertEqual(
+            "\uae30\uc900\ubd09",
+            window.basic_header_row.itemAt(combo_index - 1).widget().text(),
+        )
+        self.assertIs(
+            window.validation_execution_separator,
+            window.basic_header_row.itemAt(combo_index + 1).widget(),
+        )
+        self.assertEqual(
+            "|",
+            window.basic_header_row.itemAt(combo_index + 1).widget().text(),
+        )
+        self.assertIs(
+            window.validation_execution_box,
+            window.basic_header_row.itemAt(combo_index + 2).widget(),
+        )
+
+        execution_lines = (
+            window.validation_first_buy_quantity_line,
+            window.validation_round_budget_line,
+            window.validation_budget_ratio_line,
+            window.validation_active_ratio_line,
+        )
+        for line in execution_lines:
+            self.assertFalse(line.hasFrame())
+            self.assertIn("border: none", line.styleSheet())
+            self.assertNotIn("background:", line.styleSheet())
+            self.assertNotIn("border-bottom", line.styleSheet())
+            self.assertEqual(
+                Qt.AlignHCenter,
+                line.alignment() & Qt.AlignHorizontal_Mask,
+            )
 
     def test_period_change_revalidates_and_apply_round_trips_ui_candidate(self):
         window = self._window()
@@ -296,7 +370,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertFalse(window.recent_stock_row.isVisible())
         self.assertEqual([], window.compact_stock_display.findChildren(QComboBox))
         self.assertEqual("5\ubd84", window.basic_signal_interval_combo.displayText())
-        self.assertEqual(5_000, window.historical_candle_count)
+        self.assertEqual(500, window.historical_candle_count)
         self.assertFalse(hasattr(window, "historical_candle_count_spin"))
         all_labels = " ".join(
             label.text() for label in window.control_tab.findChildren(dialog_module.QLabel)
@@ -461,6 +535,28 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertEqual(summary_height, window.height())
         self.assertEqual(chart_height, window.chart_stack.height())
         self.assertEqual(position, window.pos())
+
+    def test_initial_summary_fit_fills_control_width_on_first_frame(self):
+        window = self._window()
+        window._available_signal_validation_geometry = lambda: QRect(
+            0, 0, 2400, 1400
+        )
+        window.show()
+        self.app.processEvents()
+        window._initial_natural_fit_pending = True
+        window._initial_geometry_committed = False
+
+        window._apply_control_section_mode("summary", force=True)
+        self.app.processEvents()
+
+        expected_width = window.control_tab.contentsRect().width()
+        self.assertGreater(expected_width, 0)
+        self.assertLessEqual(
+            abs(window.control_page.width() - expected_width),
+            1,
+        )
+        for box in (window.basic_box, window.buy_box, window.sell_box):
+            self.assertLessEqual(abs(box.width() - expected_width), 1)
 
     def test_initial_center_runs_once_and_section_toggles_preserve_window_position(self):
         window = self._window()
@@ -1381,6 +1477,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             candle_count // 2,
             sum(marker["side"] == "SELL" for marker in window.canvas.marker_records()),
         )
+        window._set_time_view(0.0, 100.0)
         window.select_evaluation_index(0)
         self.app.processEvents()
         scroll_value_before = window.time_navigation_scrollbar.value()
@@ -1549,7 +1646,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window = self._window()
         initial = window.request_initial_validation()
         self.assertEqual(100, initial.candle_count)
-        self.assertEqual(5_000, window.historical_candle_count)
+        self.assertEqual(500, window.historical_candle_count)
         window.set_historical_candle_count(500)
         changed = window._request_validation()
         self.assertEqual(100, changed.candle_count)
@@ -1893,7 +1990,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                 window.validation_run_requested.connect(complete_validation)
                 window.settings_apply_requested.connect(apply_candidate)
 
-                self.assertEqual(5_000, window.historical_candle_count)
+                self.assertEqual(500, window.historical_candle_count)
                 self.assertFalse(hasattr(window, "historical_candle_count_spin"))
                 self.assertEqual([], candidates)
 

@@ -225,7 +225,12 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(preview_bar, {"bar_minutes": 5})
 
     def test_period_validation_timeframe_preserves_production_bar_minutes(self):
-        for label, key in (("\uc77c", "D1"), ("\uc8fc", "W1"), ("\ub144", "Y1")):
+        for label, key in (
+            ("\uc77c", "D1"),
+            ("\uc8fc", "W1"),
+            ("\uc6d4", "MO1"),
+            ("\ub144", "Y1"),
+        ):
             with self.subTest(label=label):
                 state = deepcopy(self.ui_state)
                 state["basic"]["basic_signal_interval_combo"] = label
@@ -237,7 +242,17 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
                 self.assertEqual(1, result["preview_rules"]["bar"]["bar_minutes"])
                 self.assertEqual(
-                    {"key": key, "kind": {"D1": "DAY", "W1": "WEEK", "Y1": "YEAR"}[key], "minutes": None, "label": label},
+                    {
+                        "key": key,
+                        "kind": {
+                            "D1": "DAY",
+                            "W1": "WEEK",
+                            "MO1": "MONTH",
+                            "Y1": "YEAR",
+                        }[key],
+                        "minutes": None,
+                        "label": label,
+                    },
                     result["preview_rules"]["validation_timeframe"],
                 )
                 self.assertNotIn("bar.bar_minutes", result["mapped_paths"])
@@ -614,6 +629,24 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 self.assertEqual(condition["value"], value)
                 self.assertEqual(condition["operator"], operator)
 
+    def test_buy_bollinger_lower_plus_offset_is_signed_independent_of_lte(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"].update({
+            "buy_bollinger_direction_combo": "\ud558\ub2e8",
+            "buy_bollinger_sign_combo": "+",
+            "buy_bollinger_value_line": "0.5",
+            "buy_bollinger_compare_combo": "\uc774\ud558",
+        })
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            deepcopy(self.current_rules),
+        )
+        condition = result["preview_rules"]["buy"]["filters"]["bollinger"]["conditions"][0]
+        self.assertEqual("BOLLINGER_LOWER", condition["compare_target"])
+        self.assertEqual(0.5, condition["value"])
+        self.assertEqual("<=", condition["operator"])
+        self.assertIs(condition["signed_percent_offset"], True)
+
     def test_buy_bollinger_missing_sign_blocks_candidate(self):
         state = deepcopy(self.ui_state)
         state["buy_ui"]["signal_filter"].update({
@@ -800,8 +833,12 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual("buy.filters.ocr", patch_preview["patches"][0]["target_path"])
         self.assertEqual(0, patch_preview["patches"][0]["value"]["order_delay_bars"])
         self.assertEqual(
-            "FOLLOWING_BASE_BAR_ENTRY",
+            "FOLLOWING_COMPLETED_BASE_BAR_ENTRY",
             patch_preview["patches"][0]["value"]["delay_anchor"],
+        )
+        self.assertEqual(
+            "COMPLETED_TRANSITION_CONFIRMATION",
+            patch_preview["patches"][0]["value"]["zero_bar_mode"],
         )
         self.assertTrue(commit_preview["commit_allowed"])
         self.assertEqual(1, len(commit_preview["final_diff"]))
@@ -1407,6 +1444,34 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 self.assertEqual(target, condition["compare_target"])
                 self.assertEqual(value, condition["value"])
                 self.assertEqual(operator, condition["operator"])
+                self.assertIs(condition["signed_percent_offset"], True)
+
+    def test_sell_bollinger_upper_lower_terms_map_to_band_targets(self):
+        for direction, target in (
+            ("\uc0c1\ub2e8", "BOLLINGER_UPPER"),
+            ("\ud558\ub2e8", "BOLLINGER_LOWER"),
+        ):
+            with self.subTest(direction=direction):
+                state = deepcopy(self.ui_state)
+                state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+                state["sell_ui"]["signal_conditions"]["condition_b"] = {
+                    "bollinger_check": True,
+                    "bollinger_direction_combo": direction,
+                    "bollinger_sign_combo": "+",
+                    "bollinger_compare_combo": "\uc774\ud558",
+                    "bollinger_value_line": "0.5",
+                    "bollinger_logic_combo": "AND",
+                }
+                result = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state,
+                    deepcopy(self.current_rules),
+                )
+                condition = result["preview_rules"]["indicator_follow_rule_preview"][
+                    "candidates"
+                ]["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
+                self.assertEqual(target, condition["compare_target"])
+                self.assertEqual(0.5, condition["value"])
+                self.assertEqual("<=", condition["operator"])
                 self.assertIs(condition["signed_percent_offset"], True)
 
     def test_sell_condition_b_bollinger_inactive_does_not_create_candidate(self):

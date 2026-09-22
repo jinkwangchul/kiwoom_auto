@@ -446,6 +446,62 @@ _OPERAND_LABELS = {
 }
 
 
+_CHART_OPERATOR_LABELS = {
+    "TURN_UP": "상승전환",
+    "TURN_DOWN": "하락전환",
+    "CROSS_UP": "상향돌파",
+    "CROSS_DOWN": "하향돌파",
+    ">=": "이상",
+    "GTE": "이상",
+    ">": "초과",
+    "GT": "초과",
+    "<=": "이하",
+    "LTE": "이하",
+    "<": "미만",
+    "LT": "미만",
+    "=": "같음",
+    "==": "같음",
+    "EQ": "같음",
+}
+
+_CHART_OPERAND_LABELS = {
+    "AVG_PRICE": "추정평단",
+    "CLOSE": "현재가",
+    "CURRENT_PRICE": "현재가",
+    "ORDER_PRICE": "주문가",
+    "OSC": "OCR",
+    "OCR": "OCR",
+    "MACD": "MACD선",
+    "SIGNAL": "시그널선",
+    "RSI": "RSI",
+    "BOLLINGER_UPPER": "볼린저 상단",
+    "BOLLINGER_LOWER": "볼린저 하단",
+    "PRICE_BOX_UPPER": "가격박스 상단",
+    "PRICE_BOX_MIDDLE": "가격박스 중단",
+    "PRICE_BOX_LOWER": "가격박스 하단",
+    "VIRTUAL_FILL_PRICE": "가상체결가",
+}
+
+def chart_operator_label(value: Any) -> str:
+    text = str(value or "").strip()
+    return _CHART_OPERATOR_LABELS.get(text.upper(), text.replace("_", " "))
+
+def chart_operand_label(value: Any) -> str:
+    token = str(value or "").strip().upper()
+    if token.startswith("MA") and token[2:].isdigit():
+        return f"{token[2:]}이평"
+    return _CHART_OPERAND_LABELS.get(token, token or "지표")
+
+def chart_compare_mode_label(value: Any) -> str:
+    token = str(value or "").strip().upper()
+    return {
+        "GTE": "이상", ">=": "이상",
+        "LTE": "이하", "<=": "이하",
+        "GT": "초과", ">": "초과",
+        "LT": "미만", "<": "미만",
+    }.get(token, chart_operator_label(token))
+
+
 def _number_text(value: Any) -> str:
     if isinstance(value, bool) or value in (None, ""):
         return "-"

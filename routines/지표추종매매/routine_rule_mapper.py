@@ -482,8 +482,8 @@ def _build_buy_ocr_filter_candidate(signal_filter: dict[str, Any], warnings: lis
             "conditions_logic": "AND",
             "conditions": conditions,
             "order_delay_bars": delay_bars,
-            "delay_anchor": "FOLLOWING_BASE_BAR_ENTRY",
-            "zero_bar_mode": "CURRENT_INCOMPLETE_BASE_BAR",
+            "delay_anchor": "FOLLOWING_COMPLETED_BASE_BAR_ENTRY",
+            "zero_bar_mode": "COMPLETED_TRANSITION_CONFIRMATION",
         },
     }
 
@@ -1428,15 +1428,22 @@ def _build_buy_execution_repeat_candidate(
         "active_ratio": _safe_float(repeat.get("active_ratio_line")),
         "active_compare": _ratio_compare_token(repeat.get("active_compare_combo")),
     }
+    if value["detail_mode"] == "BUDGET":
+        ratio = value["budget_ratio"]
+        if ratio is None:
+            ratio = 2.0
+            value["budget_ratio"] = ratio
+        if not isfinite(ratio) or ratio <= 1.0:
+            warnings.append("buy repeat BUDGET ratio must be greater than 1")
+            return None
     if value["detail_mode"] == "ACTIVE_BUY":
         ratio = value["active_ratio"]
         if (
             ratio is None
             or not isfinite(ratio)
             or ratio < 0
-            or not _is_valid_direction_comparator_pair(
-                value["active_direction"], value["active_compare"]
-            )
+            or value["active_direction"] not in {"UP", "DOWN", "BOTH"}
+            or value["active_compare"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
         ):
             warnings.append("buy repeat ACTIVE_BUY policy is invalid")
             return None
@@ -1527,8 +1534,12 @@ def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warning
 
     direction = str(signal_filter.get("buy_bollinger_direction_combo") or "").strip()
     compare_target = {
+        "상단": "BOLLINGER_UPPER",
+        "하단": "BOLLINGER_LOWER",
         "\uc0c1\ud5a5": "BOLLINGER_UPPER",
         "\ud558\ud5a5": "BOLLINGER_LOWER",
+        "UPPER": "BOLLINGER_UPPER",
+        "LOWER": "BOLLINGER_LOWER",
     }.get(direction)
     if compare_target is None:
         warnings.append(f"buy Bollinger direction is not mapped: {direction!r}")
@@ -1549,6 +1560,7 @@ def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warning
                 "operator": operator,
                 "compare_target": compare_target,
                 "value": signed_threshold,
+                "signed_percent_offset": True,
                 "description": "UI preview: BUY current price / Bollinger filter",
             }],
         },
@@ -2033,8 +2045,8 @@ def _build_sell_condition_a_signal_candidate(condition_a: dict[str, Any], warnin
             "groups_logic": "OR",
             "groups": [group],
             "order_delay_bars": _safe_int(condition_a.get("ocr_convert_line", 0)),
-            "delay_anchor": "FOLLOWING_BASE_BAR_ENTRY",
-            "zero_bar_mode": "CURRENT_INCOMPLETE_BASE_BAR",
+            "delay_anchor": "FOLLOWING_COMPLETED_BASE_BAR_ENTRY",
+            "zero_bar_mode": "COMPLETED_TRANSITION_CONFIRMATION",
         },
     }
 
@@ -2163,6 +2175,8 @@ def _build_sell_condition_b_bollinger_condition(condition_b: dict[str, Any], war
 
     direction = str(condition_b.get("bollinger_direction_combo") or "").strip()
     compare_target = {
+        "상단": "BOLLINGER_UPPER",
+        "하단": "BOLLINGER_LOWER",
         "\uc0c1\ud5a5": "BOLLINGER_UPPER",
         "\ud558\ud5a5": "BOLLINGER_LOWER",
         "UPPER": "BOLLINGER_UPPER",

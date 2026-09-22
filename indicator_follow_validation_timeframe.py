@@ -13,6 +13,7 @@ _MINUTE_SUFFIX = "\ubd84"
 _PERIOD_IDENTITIES = {
     "D1": {"kind": "DAY", "label": "\uc77c"},
     "W1": {"kind": "WEEK", "label": "\uc8fc"},
+    "MO1": {"kind": "MONTH", "label": "\uc6d4"},
     "Y1": {"kind": "YEAR", "label": "\ub144"},
 }
 TIMEFRAME_LABELS = tuple(

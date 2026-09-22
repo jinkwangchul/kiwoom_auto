@@ -19,10 +19,12 @@ DEFAULT_VALIDATION_EXECUTION = {
     "repeat_mode": "ROUND",
     "round_operator": "ADD",
     "round_budget_value": 0.5,
-    "budget_ratio": 0.5,
+    "budget_ratio": 2.0,
     "active_direction": "UP",
     "active_ratio": 0.45,
     "active_compare": ">=",
+    "trading_cost_enabled": False,
+    "trading_cost_percent": 0.2,
 }
 
 
@@ -79,6 +81,23 @@ def normalize_validation_execution_policy(value: Mapping[str, Any] | None) -> di
     policy["buy_hoga_mode"] = "SINGLE"
     policy["sell_hoga_mode"] = "SINGLE"
 
+    trading_cost_enabled = policy.get("trading_cost_enabled", False)
+    if not isinstance(trading_cost_enabled, bool):
+        raise ValueError("VALIDATION_TRADING_COST_ENABLED_INVALID")
+    policy["trading_cost_enabled"] = trading_cost_enabled
+    trading_cost_percent = _number(policy.get("trading_cost_percent"))
+    if (
+        trading_cost_percent is None
+        or trading_cost_percent < 0
+        or trading_cost_percent > 100
+    ):
+        if trading_cost_enabled:
+            raise ValueError("VALIDATION_TRADING_COST_PERCENT_INVALID")
+        trading_cost_percent = float(
+            DEFAULT_VALIDATION_EXECUTION["trading_cost_percent"]
+        )
+    policy["trading_cost_percent"] = trading_cost_percent
+
     repeat_mode = str(policy.get("repeat_mode") or "").strip().upper()
     round_operator = str(policy.get("round_operator") or "").strip().upper()
     active_direction = str(policy.get("active_direction") or "").strip().upper()
@@ -95,15 +114,10 @@ def normalize_validation_execution_policy(value: Mapping[str, Any] | None) -> di
         if enabled:
             raise ValueError("VALIDATION_ACTIVE_DIRECTION_INVALID")
         active_direction = str(DEFAULT_VALIDATION_EXECUTION["active_direction"])
-    valid_pair = (
-        active_direction in {"UP", "DOWN"} and active_compare in {">=", "<="}
-    ) or (
-        active_direction == "BOTH" and active_compare in {"WITHIN", "OUTSIDE"}
-    )
-    if not valid_pair:
-        if enabled:
+    valid_active_compare = active_compare in {">=", "<=", "WITHIN", "OUTSIDE"}
+    if not valid_active_compare:
+        if enabled and repeat_mode == "ACTIVE_BUY":
             raise ValueError("VALIDATION_ACTIVE_COMPARATOR_INVALID")
-        active_direction = str(DEFAULT_VALIDATION_EXECUTION["active_direction"])
         active_compare = str(DEFAULT_VALIDATION_EXECUTION["active_compare"])
 
     policy["repeat_mode"] = repeat_mode
@@ -112,8 +126,11 @@ def normalize_validation_execution_policy(value: Mapping[str, Any] | None) -> di
     policy["active_compare"] = active_compare
     for key in ("round_budget_value", "budget_ratio", "active_ratio"):
         number = _number(policy.get(key))
-        if number is None or number < 0:
-            if enabled:
+        invalid = number is None or number < 0
+        if key == "budget_ratio":
+            invalid = invalid or number <= 1.0
+        if invalid:
+            if enabled and (key != "budget_ratio" or repeat_mode == "BUDGET"):
                 raise ValueError(f"{key.upper()}_INVALID")
             number = float(DEFAULT_VALIDATION_EXECUTION[key])
         policy[key] = number
@@ -146,6 +163,7 @@ class ValidationVirtualCycle:
     sell_price: float
     sell_quantity: int
     estimated_return_percent: float
+    trading_cost_amount: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,13 +210,14 @@ def _repeat_quantity(
     *,
     policy: Mapping[str, Any],
     fill_price: float,
+    active_reference_price: float,
     confirmed_round: int,
     cumulative_buy_cost: float,
     base_buy_cost: float,
-    previous_buy_cost: float,
+    previous_buy_budget: float,
     holding_quantity: int,
     average_buy_price: float,
-) -> tuple[int | None, str]:
+) -> tuple[int | None, str, float | None]:
     result = evaluate_buy_execution_policy(
         signal_context={
             "signal_type": "BUY",
@@ -214,17 +233,21 @@ def _repeat_quantity(
             "starting_budget_type": "QUANTITY",
             "starting_quantity": int(policy["first_buy_quantity"]),
             "base_buy_budget": base_buy_cost,
-            "previous_buy_budget": previous_buy_cost,
+            "previous_buy_budget": previous_buy_budget,
             "position_quantity": holding_quantity,
             "confirmed_average_buy_price": average_buy_price,
-            "active_reference_price": fill_price,
+            "active_reference_price": active_reference_price,
             "actionable_acquisition_price": fill_price,
         },
     )
     if result.get("status") == STATUS_READY:
         quantity = result.get("quantity")
         if isinstance(quantity, int) and not isinstance(quantity, bool) and quantity > 0:
-            return quantity, str(result.get("budget_reference") or "")
+            return (
+                quantity,
+                str(result.get("budget_reference") or ""),
+                _number(result.get("round_budget")),
+            )
     evidence = result.get("evidence")
     budget_calc = evidence.get("budget_calculation") if isinstance(evidence, dict) else None
     active_calc = (
@@ -235,11 +258,11 @@ def _repeat_quantity(
     if isinstance(active_calc, dict):
         reason = str(active_calc.get("reason") or "")
         if reason:
-            return None, reason
+            return None, reason, None
     issues = result.get("issues")
     if isinstance(issues, list) and issues:
-        return None, str(issues[0])
-    return None, "VALIDATION_REPEAT_BUY_SKIPPED"
+        return None, str(issues[0]), None
+    return None, "VALIDATION_REPEAT_BUY_SKIPPED", None
 
 
 class ValidationVirtualPositionTracker:
@@ -257,7 +280,7 @@ class ValidationVirtualPositionTracker:
         self.confirmed_round = 0
         self.cumulative_buy_cost = 0.0
         self.base_buy_cost = 0.0
-        self.previous_buy_cost = 0.0
+        self.previous_buy_budget = 0.0
         self.buy_indexes: list[int] = []
         self.average_price_series: list[float | None] = []
         self.quantity_series: list[int] = []
@@ -359,11 +382,20 @@ class ValidationVirtualPositionTracker:
             ):
                 sell_quantity = self.holding_quantity
                 sell_amount = fill_price * sell_quantity
-                estimated_return = (
+                gross_return_percent = (
                     (fill_price - self.average_buy_price)
                     / self.average_buy_price
                     * 100.0
                 )
+                trading_cost_percent = (
+                    float(self.policy["trading_cost_percent"])
+                    if self.policy["trading_cost_enabled"] is True
+                    else 0.0
+                )
+                trading_cost_amount = (
+                    self.cumulative_buy_cost * trading_cost_percent / 100.0
+                )
+                estimated_return = gross_return_percent - trading_cost_percent
                 self.fills.append(ValidationVirtualFill(
                     "SELL", index, str(candle.get("time") or ""), fill_price,
                     sell_quantity, sell_amount, None, "SINGLE_HOGA",
@@ -381,6 +413,7 @@ class ValidationVirtualPositionTracker:
                     fill_price,
                     sell_quantity,
                     estimated_return,
+                    trading_cost_amount,
                 ))
             if fill_price is not None:
                 self.holding_quantity = 0
@@ -388,7 +421,7 @@ class ValidationVirtualPositionTracker:
                 self.confirmed_round = 0
                 self.cumulative_buy_cost = 0.0
                 self.base_buy_cost = 0.0
-                self.previous_buy_cost = 0.0
+                self.previous_buy_budget = 0.0
                 self.buy_indexes = []
             return
 
@@ -398,6 +431,7 @@ class ValidationVirtualPositionTracker:
             self.skipped.append((index, "VALIDATION_VIRTUAL_FILL_PRICE_UNAVAILABLE"))
             return
 
+        approved_budget_for_next: float | None = None
         if self.policy["enabled"] is not True:
             quantity = 1
             reason = "AVERAGING_DISABLED_ONE_SHARE"
@@ -405,13 +439,17 @@ class ValidationVirtualPositionTracker:
             quantity = int(self.policy["first_buy_quantity"])
             reason = "FIRST_BUY_STARTING_QUANTITY"
         else:
-            quantity, reason = _repeat_quantity(
+            active_reference_price = _number(candle.get("close"))
+            if active_reference_price is None or active_reference_price <= 0:
+                active_reference_price = fill_price
+            quantity, reason, approved_budget_for_next = _repeat_quantity(
                 policy=self.policy,
                 fill_price=fill_price,
+                active_reference_price=active_reference_price,
                 confirmed_round=self.confirmed_round,
                 cumulative_buy_cost=self.cumulative_buy_cost,
                 base_buy_cost=self.base_buy_cost,
-                previous_buy_cost=self.previous_buy_cost,
+                previous_buy_budget=self.previous_buy_budget,
                 holding_quantity=self.holding_quantity,
                 average_buy_price=float(self.average_buy_price),
             )
@@ -429,7 +467,11 @@ class ValidationVirtualPositionTracker:
         self.cumulative_buy_cost += amount
         if self.confirmed_round == 1:
             self.base_buy_cost = amount
-        self.previous_buy_cost = amount
+        self.previous_buy_budget = (
+            approved_budget_for_next
+            if approved_budget_for_next is not None and approved_budget_for_next > 0
+            else amount
+        )
         self.buy_indexes.append(index)
         self.fills.append(ValidationVirtualFill(
             "BUY", index, str(candle.get("time") or ""), fill_price,

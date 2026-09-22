@@ -31,6 +31,8 @@ class ValidationHistoricalSnapshot:
     rows_count: int
     request_id: str
     raw_rows_json: str
+    market_data_identity: str
+    market_source: str
 
     def __init__(
         self,
@@ -41,6 +43,8 @@ class ValidationHistoricalSnapshot:
         requested_count: int,
         request_id: str,
         rows: list[dict[str, Any]],
+        market_data_identity: str | None = None,
+        market_source: str | None = None,
     ) -> None:
         if not isinstance(stock, ValidationStockRef):
             raise TypeError("stock must be ValidationStockRef")
@@ -86,6 +90,12 @@ class ValidationHistoricalSnapshot:
         object.__setattr__(self, "rows_count", len(copied_rows))
         object.__setattr__(self, "request_id", clean_request_id)
         object.__setattr__(self, "raw_rows_json", canonical_rows)
+        object.__setattr__(
+            self,
+            "market_data_identity",
+            str(market_data_identity or "").strip(),
+        )
+        object.__setattr__(self, "market_source", str(market_source or "").strip())
 
     def to_rows(self) -> list[dict[str, Any]]:
         rows = json.loads(self.raw_rows_json)
@@ -209,6 +219,7 @@ class ValidationHistoricalProvider:
             method_name = {
                 "D1": "request_day_candles_read_only",
                 "W1": "request_week_candles_read_only",
+                "MO1": "request_month_candles_read_only",
                 "Y1": "request_year_candles_read_only",
             }.get(str(timeframe["key"]), "")
             requester = getattr(self.requester, method_name, None)
@@ -342,6 +353,8 @@ class ValidationHistoricalProvider:
                 requested_count=requested_count,
                 request_id=request_id,
                 rows=rows,
+                market_data_identity=response.get("market_data_identity"),
+                market_source=response.get("market_source"),
             )
         except (TypeError, ValueError, OverflowError):
             return ValidationHistoricalResult(

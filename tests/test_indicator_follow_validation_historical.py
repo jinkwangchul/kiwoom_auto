@@ -108,6 +108,9 @@ class _DedicatedPeriodBroker:
     def request_week_candles_read_only(self, code, name, *, count, callback):
         return self._request("OPT10082", code, name, count=count, callback=callback)
 
+    def request_month_candles_read_only(self, code, name, *, count, callback):
+        return self._request("OPT10083", code, name, count=count, callback=callback)
+
     def request_year_candles_read_only(self, code, name, *, count, callback):
         return self._request("OPT10094", code, name, count=count, callback=callback)
 
@@ -221,10 +224,11 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
         self.assertEqual(1, provider.cache.size)
         reader.assert_not_called()
 
-    def test_day_week_year_dispatch_with_explicit_timeframe_identity(self) -> None:
+    def test_day_week_month_year_dispatch_with_explicit_timeframe_identity(self) -> None:
         for timeframe_key, method in (
             ("D1", "OPT10081"),
             ("W1", "OPT10082"),
+            ("MO1", "OPT10083"),
             ("Y1", "OPT10094"),
         ):
             with self.subTest(timeframe_key=timeframe_key):
@@ -266,6 +270,39 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
                 self.assertEqual(timeframe_key, results[0].snapshot.timeframe_key)
                 self.assertEqual(3, results[0].snapshot.timeframe_minutes)
 
+    def test_month_dispatch_keeps_generic_period_fallback(self) -> None:
+        self.request = ValidationRequest(
+            self.stock,
+            ValidationSettingsSnapshot(
+                {
+                    "bar": {"bar_minutes": 3},
+                    "validation_timeframe": {"key": "MO1"},
+                }
+            ),
+            3,
+        )
+        provider, broker = self._provider(Mock(return_value=False))
+        results = []
+
+        self.assertIsNone(provider.request_latest(2, results.append))
+        self.assertEqual("MO1", broker.calls[0]["timeframe_key"])
+
+        broker.complete(
+            {
+                "ok": True,
+                "type": "period_candles",
+                "request_id": "period-MO1-generic",
+                "code": self.stock.code,
+                "name": self.stock.name,
+                "timeframe_key": "MO1",
+                "rows": self.rows,
+                "rows_count": len(self.rows),
+            }
+        )
+
+        self.assertTrue(results[0].ok)
+        self.assertEqual("MO1", results[0].snapshot.timeframe_key)
+
     def test_valid_callback_creates_snapshot_and_caches_once(self) -> None:
         provider, broker = self._provider(Mock(side_effect=(False, False)))
         results = []
@@ -286,6 +323,23 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
             result.snapshot,
             provider.cache.get(self.stock, 3, 2),
         )
+
+    def test_snapshot_retains_detached_response_market_provenance(self) -> None:
+        provider, broker = self._provider(Mock(side_effect=(False, False)))
+        results = []
+        response = self._valid_response(
+            market_data_identity="005930_AL",
+            market_source="INTEGRATED",
+        )
+        provider.request_latest(2, results.append)
+
+        broker.complete(response)
+        response["market_data_identity"] = "005930"
+        response["market_source"] = "KRX"
+
+        snapshot = results[0].snapshot
+        self.assertEqual("005930_AL", snapshot.market_data_identity)
+        self.assertEqual("INTEGRATED", snapshot.market_source)
 
     def test_broker_payload_mutation_cannot_change_snapshot_or_cache(self) -> None:
         provider, broker = self._provider(Mock(side_effect=(False, False)))

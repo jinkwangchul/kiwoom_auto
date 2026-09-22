@@ -1641,8 +1641,8 @@ class IndicatorFollowRoutineSettingsDialog(
         }
 
     def apply_signal_validation_candidate_ui_state(self, state):
-        """Apply one final V2 candidate to the in-memory Working UI only."""
-        return self.apply_signal_validation_ui_state(state)
+        """Apply one already-projected V2 candidate to the in-memory Working UI only."""
+        return self._apply_projected_signal_validation_ui_state(state)
 
     def restore_settings_undo_snapshot(self):
         """Restore the context baseline without rereading persistent settings."""
@@ -3534,7 +3534,6 @@ class IndicatorFollowRoutineSettingsDialog(
                 signal_filter.get("buy_composite"),
                 result=result,
             )
-
         sell_ui = projected.get("sell_ui", {})
         signal_conditions = (
             sell_ui.get("signal_conditions", {})

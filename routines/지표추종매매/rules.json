@@ -247,7 +247,7 @@
           "active_direction_combo": "상향",
           "active_ratio_line": "0.45",
           "apply_all_check": false,
-          "budget_ratio_line": "0.5",
+          "budget_ratio_line": "2.0",
           "round_budget_line": "0.5",
           "round_operator_combo": "+"
         },

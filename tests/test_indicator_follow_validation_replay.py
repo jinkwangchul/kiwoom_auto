@@ -7,8 +7,9 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from engines.condition_engine import parse_condition_expression
 from engines.signal_result import RoutineSignal
@@ -218,7 +219,7 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         self.assertEqual(3, dropped)
         self.assertEqual(original_rows, historical.to_rows())
 
-    def test_projection_excludes_only_the_current_forming_bucket(self) -> None:
+    def test_projection_includes_current_forming_bucket(self) -> None:
         historical = self._historical(
             timeframe=5,
             rows=[
@@ -246,8 +247,11 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             as_of=datetime(2026, 9, 18, 10, 3, 30),
         )
 
-        self.assertEqual(["20260918095500"], [candle["time"] for candle in candles])
-        self.assertEqual(1, dropped)
+        self.assertEqual(
+            ["20260918095500", "20260918100000"],
+            [candle["time"] for candle in candles],
+        )
+        self.assertEqual(0, dropped)
 
     def test_day_projection_uses_trading_day_instead_of_minute_bucket(self) -> None:
         historical = self._historical(
@@ -272,8 +276,8 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             as_of=datetime(2026, 9, 18, 15, 30),
         )
 
-        self.assertEqual([], forming)
-        self.assertEqual(1, forming_dropped)
+        self.assertEqual(["20260918000000"], [candle["time"] for candle in forming])
+        self.assertEqual(0, forming_dropped)
         self.assertEqual(["20260918000000"], [candle["time"] for candle in completed])
         self.assertEqual(0, completed_dropped)
 
@@ -300,8 +304,8 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             as_of=datetime(2026, 9, 18, 15, 30),
         )
 
-        self.assertEqual([], forming)
-        self.assertEqual(1, forming_dropped)
+        self.assertEqual(["20260914000000"], [candle["time"] for candle in forming])
+        self.assertEqual(0, forming_dropped)
         self.assertEqual(["20260914000000"], [candle["time"] for candle in completed])
         self.assertEqual(0, completed_dropped)
 
@@ -328,10 +332,45 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             as_of=datetime(2027, 1, 2, 10, 0),
         )
 
-        self.assertEqual([], forming)
-        self.assertEqual(1, forming_dropped)
+        self.assertEqual(["20260101000000"], [candle["time"] for candle in forming])
+        self.assertEqual(0, forming_dropped)
         self.assertEqual(["20260101000000"], [candle["time"] for candle in completed])
         self.assertEqual(0, completed_dropped)
+
+    def test_month_projection_excludes_current_calendar_month_only(self) -> None:
+        historical = self._historical(
+            timeframe=5,
+            timeframe_key="MO1",
+            rows=[
+                {
+                    "체결시간": "20260901000000",
+                    "시가": "110",
+                    "고가": "115",
+                    "저가": "108",
+                    "현재가": "112",
+                    "거래량": "10",
+                },
+                {
+                    "체결시간": "20260801000000",
+                    "시가": "100",
+                    "고가": "111",
+                    "저가": "99",
+                    "현재가": "110",
+                    "거래량": "20",
+                },
+            ],
+        )
+
+        candles, dropped = project_validation_candles(
+            historical,
+            as_of=datetime(2026, 9, 18, 15, 30),
+        )
+
+        self.assertEqual(
+            ["20260801000000", "20260901000000"],
+            [candle["time"] for candle in candles],
+        )
+        self.assertEqual(0, dropped)
 
     def test_projection_keeps_latest_completed_bucket_when_current_bucket_has_no_row(self) -> None:
         historical = self._historical(
@@ -450,6 +489,57 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         self.assertEqual("BUY", by_bar_side[(2, "BUY")].signal)
         self.assertEqual("SELL", by_bar_side[(3, "SELL")].signal)
         self.assertIsNone(by_bar_side[(4, "SELL")].signal)
+
+    def test_current_year_candle_participates_in_filter_and_signal_replay(self) -> None:
+        rules = deepcopy(self.rules)
+        rules["validation_timeframe"] = {"key": "Y1"}
+        settings = ValidationSettingsSnapshot(rules)
+        request = ValidationRequest(self.stock, settings, 3)
+        session = ValidationSession(
+            request,
+            operation_active_reader=Mock(return_value=False),
+        )
+        historical = self._historical(
+            timeframe=3,
+            timeframe_key="Y1",
+            rows=[
+                {
+                    "체결시간": "20260101000000",
+                    "시가": "12",
+                    "고가": "13",
+                    "저가": "11",
+                    "현재가": "12",
+                    "거래량": "100",
+                },
+                {
+                    "체결시간": "20250102000000",
+                    "시가": "11",
+                    "고가": "12",
+                    "저가": "10",
+                    "현재가": "11",
+                    "거래량": "100",
+                },
+                {
+                    "체결시간": "20240102000000",
+                    "시가": "10",
+                    "고가": "11",
+                    "저가": "9",
+                    "현재가": "10",
+                    "거래량": "100",
+                },
+            ],
+        )
+
+        result = ValidationHistoricalReplay(session).evaluate(historical)
+
+        self.assertTrue(result.ok, result)
+        entries = result.snapshot.to_entries()
+        by_bar_side = {(e.evaluation_index, e.evaluation_side): e for e in entries}
+        self.assertEqual("BUY", by_bar_side[(2, "BUY")].signal)
+        self.assertEqual(
+            "20260101000000",
+            by_bar_side[(2, "BUY")].evaluation_time,
+        )
 
     def test_virtual_fill_price_does_not_move_close_only_signal_locations(self) -> None:
         closes = (10.0, 11.0, 12.0, 13.0, 9.0)
@@ -1041,6 +1131,146 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             if entry.signal == entry.evaluation_side
         ]
         self.assertEqual(expected, [entry.to_dict() for entry in scanned])
+
+    def test_signal_scan_uses_supported_batch_result(self) -> None:
+        historical = self._historical(closes=(10, 11, 12, 13))
+        candles = project_validation_candles(historical)[0]
+        signal = RoutineSignal("BUY", "batch", ["group"], ["detail"], 2, 0)
+        record = SimpleNamespace(
+            evaluation_side="BUY",
+            evaluation_index=2,
+            evaluation_time=candles[2]["time"],
+            routine_signal=signal,
+            trace={"conditions": [], "groups": [], "aggregations": []},
+            context={"validation_trace_context": {"source": "batch"}},
+        )
+        batch_result = SimpleNamespace(supported=True, records=(record,))
+
+        with patch(
+            "routines.지표추종매매.routine_validation_batch."
+            "scan_indicator_follow_validation_batch",
+            return_value=batch_result,
+        ) as batch_scan:
+            entries = ValidationHistoricalReplay(self._session()).scan_signal_entries(
+                historical,
+                start_index=1,
+                end_index=2,
+            )
+
+        batch_scan.assert_called_once_with(
+            candles,
+            self.settings.to_dict(),
+            start_index=1,
+            end_index=2,
+            context_provider=None,
+        )
+        self.assertEqual(1, len(entries))
+        self.assertEqual("BUY", entries[0].signal)
+        self.assertEqual(2, entries[0].evaluation_index)
+        self.assertEqual({"source": "batch"}, entries[0].trace["evaluation_context"])
+
+    def test_signal_scan_unsupported_batch_falls_back_byte_equivalent(self) -> None:
+        historical = self._historical(closes=(10, 11, 12, 13, 9))
+
+        def legacy_evaluator(candles, rules, context):
+            return routine_macd_engine.evaluate_indicator_follow_routine(
+                candles,
+                rules,
+                context,
+            )
+
+        expected = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=legacy_evaluator,
+        ).scan_signal_entries(historical)
+        unsupported = SimpleNamespace(supported=False, records=())
+        with patch(
+            "routines.지표추종매매.routine_validation_batch."
+            "scan_indicator_follow_validation_batch",
+            return_value=unsupported,
+        ) as batch_scan:
+            actual = ValidationHistoricalReplay(self._session()).scan_signal_entries(
+                historical
+            )
+
+        batch_scan.assert_called_once()
+        self.assertEqual(
+            json.dumps([entry.to_dict() for entry in expected], sort_keys=True),
+            json.dumps([entry.to_dict() for entry in actual], sort_keys=True),
+        )
+
+    def test_signal_scan_batch_exception_falls_back_to_legacy(self) -> None:
+        historical = self._historical(closes=(10, 11, 12, 13, 9))
+        with patch(
+            "routines.지표추종매매.routine_validation_batch."
+            "scan_indicator_follow_validation_batch",
+            side_effect=RuntimeError("batch unavailable"),
+        ) as batch_scan:
+            entries = ValidationHistoricalReplay(self._session()).scan_signal_entries(
+                historical
+            )
+
+        batch_scan.assert_called_once()
+        self.assertTrue(entries)
+
+    def test_signal_scan_custom_evaluator_bypasses_batch(self) -> None:
+        evaluator = Mock(return_value=self._none_signal())
+        with patch(
+            "routines.지표추종매매.routine_validation_batch."
+            "scan_indicator_follow_validation_batch",
+        ) as batch_scan:
+            entries = ValidationHistoricalReplay(
+                self._session(),
+                evaluator=evaluator,
+            ).scan_signal_entries(self._historical(closes=(10, 11, 12)))
+
+        batch_scan.assert_not_called()
+        self.assertEqual([], entries)
+        self.assertEqual(6, evaluator.call_count)
+
+    def test_signal_scan_unsupported_custom_context_preserves_legacy_contract(self) -> None:
+        historical = self._historical(closes=(10, 11, 12, 13, 9))
+
+        def context_provider(index, side, candles, prior_entries):
+            return {
+                "custom_context": [
+                    index,
+                    side,
+                    len(candles),
+                    len(prior_entries),
+                ]
+            }
+
+        def legacy_evaluator(candles, rules, context):
+            return routine_macd_engine.evaluate_indicator_follow_routine(
+                candles,
+                rules,
+                context,
+            )
+
+        expected = ValidationHistoricalReplay(
+            self._session(),
+            evaluator=legacy_evaluator,
+        ).scan_signal_entries(
+            historical,
+            context_provider=context_provider,
+        )
+        unsupported = SimpleNamespace(supported=False, records=())
+        with patch(
+            "routines.지표추종매매.routine_validation_batch."
+            "scan_indicator_follow_validation_batch",
+            return_value=unsupported,
+        ) as batch_scan:
+            actual = ValidationHistoricalReplay(self._session()).scan_signal_entries(
+                historical,
+                context_provider=context_provider,
+            )
+
+        batch_scan.assert_called_once()
+        self.assertEqual(
+            [entry.to_dict() for entry in expected],
+            [entry.to_dict() for entry in actual],
+        )
 
     def test_signal_scan_price_box_is_prefix_equivalent_and_future_invariant(self) -> None:
         rules = deepcopy(self.rules)

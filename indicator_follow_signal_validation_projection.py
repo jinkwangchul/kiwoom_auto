@@ -55,6 +55,9 @@ _SELL_GROUP_KEYS = {
     "B": "condition_b",
     "C": "condition_c",
 }
+DEFAULT_VALIDATION_MARKET_SCOPE = {
+    "regular_market_only": False,
+}
 
 
 def _referenced_sell_groups(ui_state: Mapping[str, Any]) -> tuple[str, ...]:
@@ -166,6 +169,7 @@ class IndicatorFollowSignalValidationRunRequest:
 
     settings_snapshot: ValidationSettingsSnapshot
     candle_count: int
+    force_historical_refresh: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.settings_snapshot, ValidationSettingsSnapshot):
@@ -176,6 +180,8 @@ class IndicatorFollowSignalValidationRunRequest:
             or self.candle_count <= 0
         ):
             raise ValueError("candle_count must be a positive integer")
+        if not isinstance(self.force_historical_refresh, bool):
+            raise TypeError("force_historical_refresh must be a bool")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -349,6 +355,27 @@ def _validation_token(value: Any, mapping: Mapping[str, str], default: str) -> s
     return mapping.get(text, default)
 
 
+def normalize_validation_market_scope(
+    value: Mapping[str, Any] | None,
+) -> dict[str, bool]:
+    source = dict(value) if isinstance(value, Mapping) else {}
+    regular_market_only = source.get("regular_market_only", False)
+    if not isinstance(regular_market_only, bool):
+        raise ValueError("VALIDATION_REGULAR_MARKET_ONLY_INVALID")
+    return {"regular_market_only": regular_market_only}
+
+
+def project_validation_market_scope(
+    ui_state: Mapping[str, Any],
+) -> dict[str, bool]:
+    if not isinstance(ui_state, Mapping):
+        raise TypeError("ui_state must be a mapping")
+    existing = ui_state.get("validation_market_scope")
+    return normalize_validation_market_scope(
+        existing if isinstance(existing, Mapping) else None
+    )
+
+
 def project_validation_execution_state(
     ui_state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -375,7 +402,7 @@ def project_validation_execution_state(
             "ADD",
         ),
         "round_budget_value": repeat.get("round_budget_line", 0.5),
-        "budget_ratio": repeat.get("budget_ratio_line", 0.5),
+        "budget_ratio": repeat.get("budget_ratio_line", 2.0),
         "active_direction": _validation_token(
             repeat.get("active_direction_combo"),
             _VALIDATION_DIRECTION_TOKENS,
@@ -441,17 +468,23 @@ def project_signal_validation_ui_state(
         "buy_ui": {"signal_filter": safe_signal_filter},
         "sell_ui": {"signal_conditions": safe_conditions},
         "validation_execution": project_validation_execution_state(state),
+        "validation_market_scope": project_validation_market_scope(state),
     }
 
 
 def project_signal_validation_apply_ui_state(
     ui_state: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return only V2-visible values that may be applied back to a source dialog."""
+    """Return V2-visible values approved for source-dialog apply."""
     require_expression_aware_sell_price_selections(ui_state)
     require_resolved_buy_bollinger_sign_selection(dict(ui_state))
     projected = project_signal_validation_ui_state(ui_state)
+    # Validation execution/averaging settings are chart-local.  Applying
+    # validation results back to the routine dialog must not overwrite the
+    # routine's BUY execution policy; only the existing signal/filter
+    # projection crosses this boundary.
     projected.pop("validation_execution", None)
+    projected.pop("validation_market_scope", None)
     signal_filter = projected.get("buy_ui", {}).get("signal_filter")
     if isinstance(signal_filter, dict):
         signal_filter.pop("buy_composite", None)
@@ -544,6 +577,17 @@ def project_signal_validation_rules(
     projected["validation_execution"] = deepcopy(
         projected_ui_state["validation_execution"]
     )
+    if (
+        ui_state is None
+        and isinstance(source_rules.get("validation_market_scope"), Mapping)
+    ):
+        projected["validation_market_scope"] = normalize_validation_market_scope(
+            source_rules.get("validation_market_scope")
+        )
+    else:
+        projected["validation_market_scope"] = deepcopy(
+            projected_ui_state["validation_market_scope"]
+        )
     projected["indicator_follow_ui_state"] = {
         "ui_state_version": "0.1",
         "state": projected_ui_state,

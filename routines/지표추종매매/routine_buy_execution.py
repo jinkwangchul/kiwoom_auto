@@ -832,7 +832,10 @@ def _budget_context(
         "starting_budget_type": mode,
         "sizing_reference_price": sizing_reference_price,
         "base_buy_budget": _positive_float(cycle.get("base_filled_buy_amount")),
-        "previous_buy_budget": _positive_float(cycle.get("last_filled_buy_amount")),
+        "previous_buy_budget": (
+            _positive_float(cycle.get("last_normal_round_approved_budget"))
+            or _positive_float(cycle.get("last_filled_buy_amount"))
+        ),
         "max_buy_rounds": _maximum_rounds(stock_config, rules),
         "position_quantity": cycle.get("holding_qty"),
         "confirmed_average_buy_price": cycle.get("avg_price"),

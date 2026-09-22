@@ -1,4 +1,5 @@
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QDoubleValidator
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -455,7 +456,10 @@ class IndicatorFollowBuyMethodControlsMixin:
         budget_detail_layout = QHBoxLayout(self.buy_base_budget_detail_widget)
         budget_detail_layout.setContentsMargins(0, 0, 0, 0)
         budget_detail_layout.setSpacing(4)
-        self.buy_base_budget_ratio_line = make_line("0.5", 46)
+        self.buy_base_budget_ratio_line = make_line("2.0", 46)
+        self.buy_base_budget_ratio_line.setValidator(
+            QDoubleValidator(1.000001, 999999999.0, 6, self)
+        )
         budget_detail_layout.addWidget(make_label("직전예산", 66))
         budget_detail_layout.addWidget(make_label("x", 14, Qt.AlignCenter))
         budget_detail_layout.addWidget(self.buy_base_budget_ratio_line)
@@ -653,10 +657,14 @@ class IndicatorFollowBuyMethodControlsMixin:
             base_detail_row.update()
 
         def update_base_active_comparator_local(*_args):
-            sync_buy_direction_comparator(
-                base_active_direction_combo,
-                base_active_compare_combo,
-            )
+            # Repeat ACTIVE_BUY deliberately preserves user freedom.  All
+            # direction/comparator combinations remain selectable; runtime
+            # policy evaluation decides whether a chosen combination is
+            # actionable without rewriting the saved setting.
+            for item_text in ["이상", "이하", "이내", "이탈"]:
+                index = base_active_compare_combo.findText(item_text)
+                if index >= 0:
+                    base_active_compare_combo.view().setRowHidden(index, False)
 
         def update_price_mode_local(*_args):
             index = price_mode_combo.currentIndex()

@@ -37,6 +37,7 @@ class IndicatorFollowValidationTimeframeTest(unittest.TestCase):
                 "240\ubd84",
                 "\uc77c",
                 "\uc8fc",
+                "\uc6d4",
                 "\ub144",
             ),
             TIMEFRAME_LABELS,
@@ -60,6 +61,14 @@ class IndicatorFollowValidationTimeframeTest(unittest.TestCase):
         self.assertEqual(
             {"key": "W1", "kind": "WEEK", "minutes": None, "label": "\uc8fc"},
             normalize_validation_timeframe("W1"),
+        )
+        self.assertEqual(
+            {"key": "MO1", "kind": "MONTH", "minutes": None, "label": "\uc6d4"},
+            normalize_validation_timeframe("\uc6d4"),
+        )
+        self.assertEqual(
+            {"key": "MO1", "kind": "MONTH", "minutes": None, "label": "\uc6d4"},
+            normalize_validation_timeframe({"key": "MO1"}),
         )
         self.assertEqual(
             {"key": "Y1", "kind": "YEAR", "minutes": None, "label": "\ub144"},
@@ -127,7 +136,7 @@ class IndicatorFollowValidationTimeframeTest(unittest.TestCase):
 
 
     def test_projection_preserves_explicit_period_without_current_ui(self) -> None:
-        for key in ("D1", "W1", "Y1"):
+        for key in ("D1", "W1", "MO1", "Y1"):
             for embedded in (None, "15"):
                 with self.subTest(key=key, embedded=embedded):
                     rules = {
@@ -148,7 +157,7 @@ class IndicatorFollowValidationTimeframeTest(unittest.TestCase):
                     self.assertEqual(before, rules)
 
     def test_seed_clone_and_entry_request_preserve_explicit_period(self) -> None:
-        for key in ("D1", "W1", "Y1"):
+        for key in ("D1", "W1", "MO1", "Y1"):
             for embedded in (None, "5"):
                 with self.subTest(key=key, embedded=embedded):
                     rules = {
@@ -183,7 +192,7 @@ class IndicatorFollowValidationTimeframeTest(unittest.TestCase):
 
     def test_explicit_current_ui_can_change_snapshot_timeframe(self) -> None:
         rules = {"bar": {"bar_minutes": 5}, "validation_timeframe": {"key": "D1"}}
-        for chosen in ("M15", "W1", "Y1"):
+        for chosen in ("M15", "W1", "MO1", "Y1"):
             with self.subTest(chosen=chosen):
                 state = {"basic": {"basic_signal_interval_combo": chosen}}
                 projected = project_signal_validation_rules(rules, ui_state=state)

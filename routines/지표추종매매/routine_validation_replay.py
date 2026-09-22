@@ -211,6 +211,11 @@ def _latest_candle_is_forming(
             weekday == 4
             and current_minute < _VALIDATION_REGULAR_SESSION_END_MINUTE
         )
+    if key == "MO1":
+        return (
+            candle_start.year == current.year
+            and candle_start.month == current.month
+        )
     if key == "Y1":
         return candle_start.year == current.year
     if candle_start.date() != current.date():
@@ -260,13 +265,6 @@ def project_validation_candles(
         }
 
     candles = [candles_by_time[key] for key in sorted(candles_by_time)]
-    if candles and _latest_candle_is_forming(
-        str(candles[-1].get("time") or ""),
-        historical_snapshot.timeframe_minutes,
-        timeframe_key=historical_snapshot.timeframe_key,
-        as_of=as_of,
-    ):
-        candles.pop()
     detached = _fresh_json(_canonical_json(candles))
     return detached, len(raw_rows) - len(detached)
 
@@ -373,6 +371,39 @@ class ValidationReplayEntry:
             "trace": self.trace,
         }
 
+    def remap_indexes(
+        self,
+        evaluation_index: int,
+        signal_index: int | None,
+    ) -> "ValidationReplayEntry":
+        if (
+            isinstance(evaluation_index, bool)
+            or not isinstance(evaluation_index, int)
+        ):
+            raise TypeError("evaluation_index must be an integer")
+        if self.signal_index is None:
+            if signal_index is not None:
+                raise ValueError("non-signal entry cannot identify a signal bar")
+        elif (
+            isinstance(signal_index, bool)
+            or not isinstance(signal_index, int)
+        ):
+            raise ValueError("signal entry requires its signal bar")
+
+        clone = object.__new__(ValidationReplayEntry)
+        object.__setattr__(clone, "evaluation_side", self.evaluation_side)
+        object.__setattr__(clone, "evaluation_index", evaluation_index)
+        object.__setattr__(clone, "evaluation_time", self.evaluation_time)
+        object.__setattr__(clone, "signal", self.signal)
+        object.__setattr__(clone, "reason", self.reason)
+        object.__setattr__(clone, "signal_index", signal_index)
+        object.__setattr__(clone, "signal_time", self.signal_time)
+        object.__setattr__(clone, "delay_bar", self.delay_bar)
+        object.__setattr__(clone, "_matched_groups_json", self._matched_groups_json)
+        object.__setattr__(clone, "_details_json", self._details_json)
+        object.__setattr__(clone, "_trace_json", self._trace_json)
+        return clone
+
 
 @dataclass(frozen=True, slots=True, init=False)
 class ValidationReplaySnapshot:
@@ -459,40 +490,19 @@ class ValidationReplaySnapshot:
         for entry in self._entries:
             if not self.evaluated_start_index <= entry.evaluation_index <= self.evaluated_end_index:
                 continue
-            projected.append(ValidationReplayEntry(
-                evaluation_side=entry.evaluation_side,
-                evaluation_index=entry.evaluation_index - offset,
-                evaluation_time=entry.evaluation_time,
-                signal=entry.signal,
-                reason=entry.reason,
-                signal_index=(
+            projected.append(entry.remap_indexes(
+                entry.evaluation_index - offset,
+                (
                     None
                     if entry.signal_index is None
                     else entry.signal_index - offset
                 ),
-                signal_time=entry.signal_time,
-                delay_bar=entry.delay_bar,
-                matched_groups=entry.matched_groups,
-                details=entry.details,
-                trace=entry.trace,
             ))
         return projected
 
 
 def _copy_entry(entry: ValidationReplayEntry) -> ValidationReplayEntry:
-    return ValidationReplayEntry(
-        evaluation_side=entry.evaluation_side,
-        evaluation_index=entry.evaluation_index,
-        evaluation_time=entry.evaluation_time,
-        signal=entry.signal,
-        reason=entry.reason,
-        signal_index=entry.signal_index,
-        signal_time=entry.signal_time,
-        delay_bar=entry.delay_bar,
-        matched_groups=entry.matched_groups,
-        details=entry.details,
-        trace=entry.trace,
-    )
+    return entry.remap_indexes(entry.evaluation_index, entry.signal_index)
 
 
 @dataclass(frozen=True, slots=True)
@@ -755,6 +765,37 @@ class ValidationHistoricalReplay:
 
         rules = request.settings_snapshot.to_dict()
         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
+        if reuse_default_base_series:
+            try:
+                from .routine_validation_batch import (
+                    scan_indicator_follow_validation_batch,
+                )
+
+                batch_result = scan_indicator_follow_validation_batch(
+                    candles,
+                    rules,
+                    start_index=start_index,
+                    end_index=final_index,
+                    context_provider=context_provider,
+                )
+            except Exception:
+                batch_result = None
+            if batch_result is not None and batch_result.supported is True:
+                return [
+                    self._entry_from_signal(
+                        record.evaluation_side,
+                        record.evaluation_index,
+                        record.evaluation_time,
+                        candles,
+                        record.routine_signal,
+                        self._trace_with_context(
+                            record.trace,
+                            record.context,
+                            assume_detached=True,
+                        ),
+                    )
+                    for record in batch_result.records
+                ]
         base_series_map = (
             build_indicator_follow_base_series(candles, rules)
             if reuse_default_base_series

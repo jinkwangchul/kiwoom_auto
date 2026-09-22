@@ -162,7 +162,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         add_inline_separator()
 
         # B: 볼린저밴드
-        self.buy_bollinger_direction_combo = make_combo(["상향", "하향"], "하향", 64)
+        self.buy_bollinger_direction_combo = make_combo(["상단", "하단"], "하단", 64)
         self.buy_bollinger_sign_combo = make_combo(["-", "+"], "-", 52)
         self.buy_bollinger_value_line = make_line("0.1", 42)
         self.buy_bollinger_compare_combo = make_combo(["이상", "이하"], "이상", 64)

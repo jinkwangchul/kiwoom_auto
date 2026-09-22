@@ -238,6 +238,7 @@ def _evaluate_buy_rsi_filter(
     buy_cfg: dict[str, Any],
     candles: list[dict[str, Any]],
     evaluation_index: int,
+    series_map: dict[str, list[float | None]] | None = None,
 ) -> tuple[bool, str | None]:
     filter_cfg = _buy_rsi_filter_config(config, buy_cfg)
     if not filter_cfg:
@@ -300,7 +301,17 @@ def _evaluate_buy_rsi_filter(
             evaluation_index=evaluation_index,
         )
 
-    rsi_values = rsi(close_prices(candles), period)
+    precomputed_key = f"_VALIDATION_RSI_{period}"
+    precomputed_values = (
+        series_map.get(precomputed_key)
+        if isinstance(series_map, dict)
+        else None
+    )
+    rsi_values = (
+        precomputed_values
+        if isinstance(precomputed_values, list)
+        else rsi(close_prices(candles), period)
+    )
     evaluated_value = rsi_values[evaluation_index] if 0 <= evaluation_index < len(rsi_values) else None
     if evaluated_value is None:
         return False, _rsi_detail(
@@ -1385,7 +1396,7 @@ def _evaluate_buy_expression_mode(
     details: list[str] = []
 
     rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(
-        cfg, buy_cfg, candles, buy_index
+        cfg, buy_cfg, candles, buy_index, series_map
     )
     if rsi_detail:
         details.append(rsi_detail)
@@ -1870,7 +1881,9 @@ def evaluate_indicator_follow_routine(
             filter_cfgs = _buy_filter_config_map(cfg, buy_cfg)
             filter_results: dict[str, dict[str, Any]] = {}
 
-            rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(cfg, buy_cfg, candles, buy_index)
+            rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(
+                cfg, buy_cfg, candles, buy_index, series_map
+            )
             if rsi_detail:
                 details.append(rsi_detail)
             filter_results["rsi"] = {
@@ -1933,7 +1946,9 @@ def evaluate_indicator_follow_routine(
                 return RoutineSignal(None, "BUY composite filter blocked", matched, details, buy_index, buy_delay)
             return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
-        rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(cfg, buy_cfg, candles, buy_index)
+        rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(
+            cfg, buy_cfg, candles, buy_index, series_map
+        )
         if rsi_detail:
             details.append(rsi_detail)
         if not rsi_passed:

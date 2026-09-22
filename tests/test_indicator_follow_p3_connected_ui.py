@@ -691,6 +691,21 @@ class ConnectedBuyUiTest(unittest.TestCase):
             repeat["active_direction"], repeat["active_ratio"], repeat["active_compare"]
         ))
 
+        # Repeat ACTIVE_BUY keeps all comparator choices visible regardless of
+        # direction and preserves intentionally unusual user combinations.
+        self.dialog.buy_base_active_direction_combo.setCurrentText("상향")
+        for label in ("이상", "이하", "이내", "이탈"):
+            index = self.dialog.buy_base_active_compare_combo.findText(label)
+            self.assertGreaterEqual(index, 0)
+            self.assertFalse(
+                self.dialog.buy_base_active_compare_combo.view().isRowHidden(index)
+            )
+        self.dialog.buy_base_active_compare_combo.setCurrentText("이탈")
+        free_repeat = self._candidate("repeat")["value"]
+        self.assertEqual(("UP", "OUTSIDE"), (
+            free_repeat["active_direction"], free_repeat["active_compare"]
+        ))
+
         helper = buy_helper_module.IndicatorFollowBuyExecutionConnectionTest()
         rules = helper._rules(repeat_mode="ACTIVE_BUY")
         ready = helper._build(rules=rules, cycle=helper._cycle(1), price=100)
