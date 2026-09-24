@@ -627,7 +627,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         self.assertTrue(result["success"], result.get("error"))
         self.assertIn("indicator_follow_ui_state", result["rules"])
         self.assertEqual(
-            dialog.basic_signal_interval_combo.currentText(),
+            dialog.basic_signal_interval_combo.validationValue(),
             str(result["rules"]["bar"]["bar_minutes"]),
         )
         self.assertEqual(before, after)

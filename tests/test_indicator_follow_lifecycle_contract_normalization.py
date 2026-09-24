@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtWidgets import QApplication, QComboBox, QLineEdit
 
-from execution_buy_recovery import inspect_buy_recovery_generations
+from execution_buy_recovery import _recovery_template, inspect_buy_recovery_generations
 from execution_signal_ownership_guard import signal_dispatch_block_reasons
 from execution_unfilled_cancel_eligibility import inspect_unfilled_cancel_eligibility
 import gui_auto_trade_timer
@@ -113,7 +113,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
             warning.assert_not_called()
             critical.assert_not_called()
             toast.assert_not_called()
-        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
+        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("신호가")
         self.assertTrue(self.dialog.buy_situation_response_setting2_enabled_check.isChecked())
         self.assertEqual(1, self.dialog.buy_situation_response_setting2_detail_stack.currentIndex())
         self.dialog.buy_situation_response_setting1_direction_combo.setCurrentText("상하")
@@ -134,7 +134,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
         self.assertTrue(actual["price_enabled_check"])
         self.assertTrue(actual["setting1_enabled_check"])
         self.assertTrue(actual["setting2_enabled_check"])
-        self.assertEqual("주문가", actual["setting2_left_combo"])
+        self.assertEqual("신호가", actual["setting2_left_combo"])
 
         self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("무설정")
         disabled = self._state()["buy_ui"]["situation"]
@@ -168,7 +168,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
                     "unfilled_enabled_check": True,
                     "price_enabled_check": True,
                     "setting1_enabled_check": True,
-                    "setting1_left_combo": "주문가",
+                    "setting1_left_combo": "신호가",
                 }
             }
         })
@@ -187,7 +187,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
             "unfilled_enabled_check": True,
             "price_enabled_check": True,
             "setting1_enabled_check": True,
-            "setting1_left_combo": "주문가",
+            "setting1_left_combo": "신호가",
             "setting1_action_combo": "일괄취소",
         })
 
@@ -222,7 +222,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
                     "setting1_ratio_line": "0.15",
                     "setting1_compare_combo": first_compare,
                     "setting1_action_combo": first_action,
-                    "setting2_left_combo": "주문가",
+                    "setting2_left_combo": "신호가",
                     "setting2_right_combo": "평단가",
                     "setting2_direction_combo": second_direction,
                     "setting2_ratio_line": "0.10",
@@ -238,7 +238,7 @@ class SituationAndExitUiContractTest(unittest.TestCase):
                 self.assertEqual(
                     [
                         ("AVG_PRICE", "CURRENT_PRICE", first_action),
-                        ("ORDER_PRICE", "AVG_PRICE", second_action),
+                        ("SIGNAL_PRICE", "AVG_PRICE", second_action),
                     ],
                     [
                         (
@@ -327,6 +327,50 @@ class SituationAndExitUiContractTest(unittest.TestCase):
 
 
 class RuntimeLifecycleContractTest(unittest.TestCase):
+    def test_recovery_normalizes_legacy_order_price_comparison_sources(self) -> None:
+        template = {
+            "buy_recovery_cycle_policy": {
+                "scope": "SIGNAL_SCOPED_BUY_RECOVERY",
+                "residual_only": True,
+                "order_policy": {
+                    "hoga_mode": "SINGLE",
+                    "order_price_basis": "ORDER_PRICE",
+                },
+                "point_policy": {
+                    "mode": "MULTI_RATIO",
+                    "count": 2,
+                    "left_source": "ORDER_PRICE",
+                    "right_source": "CURRENT_PRICE",
+                    "direction": "UP",
+                    "ratio_percent": 1.0,
+                    "comparator": ">=",
+                },
+                "unfilled_timeout_policy": {"enabled": False},
+                "buy_price_response_policies": [{
+                    "slot": "SETTING1",
+                    "enabled": True,
+                    "left_source": "ORDER_PRICE",
+                    "right_source": "AVG_PRICE",
+                    "direction": "UP",
+                    "threshold_percent": 1.0,
+                    "compare": ">=",
+                    "action": "RESET",
+                }],
+            },
+        }
+
+        recovered = _recovery_template(template, 2, {})
+
+        self.assertEqual("SIGNAL_PRICE", recovered["multi_ratio_plan"]["ratio_left"])
+        self.assertEqual(
+            "SIGNAL_PRICE",
+            recovered["buy_price_response_policies"][0]["left_source"],
+        )
+        self.assertEqual(
+            "SIGNAL_PRICE",
+            recovered["buy_price_reset_policy"]["left_source"],
+        )
+
     def test_signal_ownership_arbitration_precedes_buy_completion_mutation(self) -> None:
         timer_source = inspect.getsource(gui_auto_trade_timer._process_pending_signal_pipeline)
         self.assertIn("evaluate_routine_lifecycle(", timer_source)
@@ -340,7 +384,7 @@ class RuntimeLifecycleContractTest(unittest.TestCase):
         self.assertLess(arbitration_call, completion_call)
         self.assertLess(completion_call, first_lifecycle_inspector)
 
-    def test_ocr_zero_and_n_use_current_base_bar_entry_index(self) -> None:
+    def test_ocr_zero_and_n_use_completed_transition_confirmation_bars(self) -> None:
         engine = _load("lifecycle_engine", "routine_macd_engine.py")
         sys.path.insert(0, str(ROUTINE_DIR))
         try:
@@ -348,15 +392,76 @@ class RuntimeLifecycleContractTest(unittest.TestCase):
         finally:
             sys.path.remove(str(ROUTINE_DIR))
         candles = [{"close": value} for value in range(5)]
+        request = routine.market_bar_projection_request({
+            "buy": {"filters": {"ocr": {"order_delay_bars": 0}}}
+        })
+        self.assertEqual("FORMING_BASE_BAR", request["projection"])
         self.assertEqual(
-            "FORMING_BASE_BAR",
-            routine.market_bar_projection_request({
-                "buy": {"filters": {"ocr": {"order_delay_bars": 0}}}
-            })["projection"],
+            "COMPLETED_TRANSITION_CONFIRMATION",
+            request["ocr_zero_bar_mode"],
         )
         self.assertEqual(4, engine._delay_index(candles, 0))
         self.assertEqual(3, engine._delay_index(candles, 1))
         self.assertEqual(2, engine._delay_index(candles, 2))
+
+    def test_completed_delay_normalizes_source_and_activation_indexes(self) -> None:
+        sys.path.insert(0, str(ROUTINE_DIR))
+        try:
+            routine = _load("lifecycle_activation_routine", "routine.py")
+        finally:
+            sys.path.remove(str(ROUTINE_DIR))
+
+        candles = [
+            {
+                "close": 100 + index,
+                "bar_time": f"2026-09-19T09:0{index}:00+09:00",
+            }
+            for index in range(5)
+        ]
+        for delay in (0, 1, 2):
+            with self.subTest(delay=delay):
+                source_index = len(candles) - 1 - delay
+
+                def evaluator(_candles, _config, context):
+                    side = context["_indicator_follow_evaluate_side"]
+                    if side == "BUY":
+                        return {
+                            "signal": "BUY",
+                            "reason": "fixture",
+                            "matched_groups": [],
+                            "details": [],
+                            "signal_index": source_index,
+                            "delay_bar": delay,
+                        }
+                    return {
+                        "signal": None,
+                        "reason": "fixture",
+                        "matched_groups": [],
+                        "details": [],
+                        "signal_index": source_index,
+                        "delay_bar": delay,
+                    }
+
+                result = routine.evaluate_signal_selection(
+                    candles,
+                    {"enabled": True},
+                    {"forming_base_bar_projection": False},
+                    evaluator=evaluator,
+                    converter=lambda value: dict(value),
+                )
+                self.assertEqual("BUY", result["signal"])
+                self.assertEqual(source_index, result["signal_source_index"])
+                self.assertEqual(4, result["signal_activation_index"])
+                self.assertEqual(4, result["signal_index"])
+                self.assertEqual(delay, result["delay_bar"])
+                self.assertEqual(
+                    "FOLLOWING_COMPLETED_BASE_BAR_ENTRY",
+                    result["signal_delay_anchor"],
+                )
+                self.assertEqual(
+                    candles[-1]["bar_time"],
+                    result["signal_activation_bar_time"],
+                )
 
     def test_same_tick_buy_sell_conflict_uses_latest_holding_fallback(self) -> None:
         sys.path.insert(0, str(ROUTINE_DIR))
@@ -455,7 +560,7 @@ class RuntimeLifecycleContractTest(unittest.TestCase):
                 },
                 "buy_price_response_policies": [{
                     "slot": "SETTING1", "enabled": True,
-                    "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+                    "left_source": "SIGNAL_PRICE", "right_source": "CURRENT_PRICE",
                     "direction": "UP", "threshold_percent": 1.0,
                     "compare": ">=", "action": "CANCEL_BATCH",
                 }],
@@ -485,7 +590,7 @@ class RuntimeLifecycleContractTest(unittest.TestCase):
             _write(holdings, "holdings", [{"account_no": "ACC", "code": "005930", "holding_quantity": 2}])
             _write(signals, "signals", [{
                 "id": "S1", "status": "PREVIEWED", "signal": "BUY", "code": "005930",
-                "signal_timeframe_minutes": 1,
+                "signal_timeframe_minutes": 1, "signal_bar_close": 200,
             }])
             result = inspect_buy_recovery_generations(
                 selected_account_no="ACC", actionable_prices_by_code={"005930": 100},

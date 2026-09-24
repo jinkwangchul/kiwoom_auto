@@ -23,14 +23,14 @@ STATUS_READY = "READY"
 _METHOD_SET_ORDER = ("setting_a", "setting_b", "setting_c")
 _SINGLE_HOGA_TERMS = {"SINGLE", "SINGLE_HOGA", "단일호가"}
 _MULTI_HOGA_TERMS = {"MULTI", "MULTI_HOGA", "다중호가"}
-_ORDER_PRICE_TERMS = {"ORDER_PRICE", "LIMIT", "주문가"}
+_ORDER_PRICE_TERMS = {"ORDER_PRICE", "LIMIT", "신호가", "주문가"}
 _MARKET_TERMS = {"MARKET", "시장가"}
 _NO_SPLIT_TERMS = {"", "NONE", "선택없음"}
 _MULTI_TIME_TERMS = {"MULTI_TIME", "다중시간"}
 _MULTI_RATIO_TERMS = {"MULTI_RATIO", "다중비율"}
-_TIME_ORDER_PRICE_TERMS = {"ORDER_PRICE", "LIMIT", "주문가"}
+_TIME_ORDER_PRICE_TERMS = {"ORDER_PRICE", "LIMIT", "신호가", "주문가"}
 _TIME_CURRENT_PRICE_TERMS = {"CURRENT_PRICE", "현재가"}
-_RATIO_ORDER_PRICE_TERMS = {"ORDER_PRICE", "주문가"}
+_RATIO_SIGNAL_PRICE_TERMS = {"SIGNAL_PRICE", "ORDER_PRICE", "신호가", "주문가"}
 _RATIO_CURRENT_PRICE_TERMS = {"CURRENT_PRICE", "현재가"}
 _RATIO_AVG_PRICE_TERMS = {"AVG_PRICE", "AVERAGE_PRICE", "평단가"}
 _RATIO_UP_TERMS = {"UP", "상향"}
@@ -116,8 +116,8 @@ def _nonnegative_number(value: Any) -> int | float | None:
 
 def _ratio_price_source(value: Any) -> str | None:
     term = _normalized_term(value)
-    if term in _RATIO_ORDER_PRICE_TERMS:
-        return "ORDER_PRICE"
+    if term in _RATIO_SIGNAL_PRICE_TERMS:
+        return "SIGNAL_PRICE"
     if term in _RATIO_CURRENT_PRICE_TERMS:
         return "CURRENT_PRICE"
     if term in _RATIO_AVG_PRICE_TERMS:
@@ -253,19 +253,18 @@ def _price_reset_policy(
     direction = _ratio_direction(setting.get("perform3_price_direction"))
     compare = _ratio_compare(setting.get("perform3_price_compare"), direction or "")
     threshold = _positive_number(setting.get("perform3_price_value"))
-    order_price = _positive_number(
-        context.get("reference_price", context.get("current_price"))
-    )
+    signal_price = _positive_number(context.get("signal_price"))
     if (
         left is None
         or right is None
+        or left == right
         or direction is None
         or compare is None
         or threshold is None
     ):
         return None, "SELL_PRICE_RESET_POLICY_INVALID"
-    if "ORDER_PRICE" in {left, right} and order_price is None:
-        return None, "SELL_PRICE_RESET_ORDER_PRICE_MISSING"
+    if "SIGNAL_PRICE" in {left, right} and signal_price is None:
+        return None, "SELL_PRICE_RESET_SIGNAL_PRICE_MISSING"
     return {
         "policy": "SELL_PRICE_CHANGE_RESET",
         "action": "RESET",
@@ -274,7 +273,7 @@ def _price_reset_policy(
         "direction": direction,
         "compare": compare,
         "threshold_percent": threshold,
-        "order_price": order_price,
+        "signal_price": signal_price,
     }, ""
 
 
@@ -353,6 +352,7 @@ def _repeat_execution_policy(
             or ratio_value is None
             or ratio_left is None
             or ratio_right is None
+            or ratio_left == ratio_right
             or direction is None
             or compare is None
         ):
@@ -469,6 +469,7 @@ def _repeat_execution_policy(
         if (
             left_source is None
             or right_source is None
+            or left_source == right_source
             or direction is None
             or compare is None
             or threshold is None
@@ -579,21 +580,31 @@ def build_indicator_follow_sell_intent(
         return _blocked(method_reason)
     assert method_set is not None and setting is not None
 
+    signal_price = (
+        _positive_number(signal.get("signal_bar_close"))
+        or _positive_number(signal.get("signal_price"))
+        or _positive_number(runtime_context.get("signal_bar_close"))
+        or _positive_number(
+            runtime_context.get("reference_price", runtime_context.get("current_price"))
+        )
+    )
+    policy_context = {**runtime_context, "signal_price": signal_price}
+
     unfilled_timeout_policy, timeout_policy_reason = _unfilled_timeout_policy(
         setting,
-        runtime_context,
+        policy_context,
     )
     if timeout_policy_reason:
         return _blocked(timeout_policy_reason)
     price_reset_policy, price_reset_reason = _price_reset_policy(
         setting,
-        runtime_context,
+        policy_context,
     )
     if price_reset_reason:
         return _blocked(price_reset_reason)
     repeat_policy, repeat_policy_reason = _repeat_execution_policy(
         setting,
-        runtime_context,
+        policy_context,
     )
     if repeat_policy_reason:
         return _blocked(repeat_policy_reason)
@@ -612,6 +623,7 @@ def build_indicator_follow_sell_intent(
         "budget": None,
         "routine_type": "INDICATOR_FOLLOW",
         "routine_instance_id": routine_instance_id,
+        "signal_price": signal_price,
         "source_signal_id": source_signal_id or None,
         "cycle_identity": cycle_identity,
         "sell_method_set": method_set,
@@ -665,6 +677,7 @@ def build_indicator_follow_sell_intent(
             or ratio_value is None
             or ratio_left is None
             or ratio_right is None
+            or ratio_left == ratio_right
             or direction is None
             or compare is None
         ):
@@ -672,8 +685,8 @@ def build_indicator_follow_sell_intent(
         reference_price = _positive_number(
             runtime_context.get("reference_price", runtime_context.get("current_price"))
         )
-        if "ORDER_PRICE" in {ratio_left, ratio_right} and reference_price is None:
-            return _blocked("SELL_MULTI_RATIO_ORDER_PRICE_MISSING")
+        if "SIGNAL_PRICE" in {ratio_left, ratio_right} and signal_price is None:
+            return _blocked("SELL_MULTI_RATIO_SIGNAL_PRICE_MISSING")
         child_count = min(configured_count, holding_qty)
         quantities = _split_quantity(holding_qty, child_count)
         plan = {
@@ -686,6 +699,7 @@ def build_indicator_follow_sell_intent(
             "ratio_value": ratio_value,
             "ratio_compare": compare,
             "ratio_unit": "PERCENT",
+            "signal_price": signal_price,
             "order_price": reference_price,
         }
         intents: list[dict[str, Any]] = []

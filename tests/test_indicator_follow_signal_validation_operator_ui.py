@@ -1403,12 +1403,26 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertFalse(hasattr(window, "filter_result_table"))
         self.assertFalse(hasattr(window, "signal_list_table"))
         self.assertEqual(1, window.completed_cycle_table.rowCount())
-        self.assertEqual("09/13 10:01", window.completed_cycle_table.item(0, 4).text())
+        self.assertEqual("09/13 10:01", window.completed_cycle_table.item(0, 5).text())
         self.assertEqual("second-reason", window._entries[1].reason)
         window.select_evaluation_index(0)
         self.assertEqual(0, window.selected_evaluation_index)
         window._completed_cycle_row_clicked(0, 0)
         self.assertEqual(1, window.selected_evaluation_index)
+        self.assertEqual(1, window.canvas.selected_completed_cycle_number)
+        self.assertTrue(window.completed_cycle_table.selectionModel().hasSelection())
+        self.assertEqual(
+            validation_window_module._SELECTION_LINE,
+            window.canvas._completed_cycle_render_color(1),
+        )
+        QTest.mouseClick(window.basic_toggle_button, Qt.LeftButton)
+        self.app.processEvents()
+        self.assertIsNone(window.canvas.selected_completed_cycle_number)
+        self.assertFalse(window.completed_cycle_table.selectionModel().hasSelection())
+        self.assertEqual(
+            validation_window_module._CYCLE_AVERAGE_LINE,
+            window.canvas._completed_cycle_render_color(1),
+        )
         window.select_evaluation_index(0)
         self.assertEqual(0, window.selected_evaluation_index)
 
@@ -1552,7 +1566,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
 
         window._resize_completed_cycle_columns()
         viewport_width = table.viewport().width()
-        widths = [table.columnWidth(column) for column in range(7)]
+        widths = [table.columnWidth(column) for column in range(9)]
         self.assertEqual(viewport_width, sum(widths))
         for actual, expected_ratio in zip(widths, ratios):
             self.assertLessEqual(abs(actual / viewport_width - expected_ratio), 0.02)
@@ -1562,7 +1576,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.app.processEvents()
         window._resize_completed_cycle_columns()
         resized_viewport_width = table.viewport().width()
-        resized_widths = [table.columnWidth(column) for column in range(7)]
+        resized_widths = [table.columnWidth(column) for column in range(9)]
         self.assertEqual(before_height, table.height())
         self.assertEqual(resized_viewport_width, sum(resized_widths))
         for actual, expected_ratio in zip(resized_widths, ratios):
@@ -1574,7 +1588,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window.resize(round(1366 * 0.85), window.height())
         self.app.processEvents()
         window._resize_completed_cycle_columns()
-        compact_widths = [table.columnWidth(column) for column in range(7)]
+        compact_widths = [table.columnWidth(column) for column in range(9)]
         self.assertTrue(all(
             actual >= minimum
             for actual, minimum in zip(

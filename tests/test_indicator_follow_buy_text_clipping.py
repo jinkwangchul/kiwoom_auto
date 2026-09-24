@@ -65,7 +65,7 @@ class IndicatorFollowBuyTextClippingTest(unittest.TestCase):
         row = self.dialog.buy_last_round_active_row_widget
 
         self.assertEqual("마지막회차 능동매수", check.text())
-        self.assertEqual("설정가에 평단이", label.text())
+        self.assertEqual("신호가 대비 평단가", label.text())
         self.assertGreaterEqual(check.minimumWidth(), _checkbox_width(check))
         self.assertGreaterEqual(
             label.minimumWidth(),
@@ -112,9 +112,11 @@ class IndicatorFollowBuyTextClippingTest(unittest.TestCase):
             if child.text()
         ]
         self.assertEqual(
-            {"매수가", "대비", "평단가", "%"},
+            {"신호가", "대비", "평단가", "%"},
             {label.text() for label in labels},
         )
+        self.assertNotIn("매수가", {label.text() for label in labels})
+        self.assertNotIn("주문가", {label.text() for label in labels})
         for label in labels:
             with self.subTest(text=label.text()):
                 self.assertGreaterEqual(label.width(), _text_width(label, label.text()))

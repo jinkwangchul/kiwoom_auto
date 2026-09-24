@@ -607,7 +607,7 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
             pane["family"]: pane
             for pane in canvas.lower_pane_records()
         }
-        for family in (FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC):
+        for family in (FAMILY_RSI, FAMILY_OCR_OSC):
             pane = pane_by_family[family]
             pane_y = round((pane["top"] + pane["bottom"]) / 2)
             QTest.mouseMove(canvas, QPoint(hover_x, pane_y))
@@ -615,6 +615,7 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
             horizontal = canvas.crosshair_records()["horizontal"]
             self.assertEqual(family, horizontal["pane"])
             self.assertIsInstance(horizontal["value"], float)
+        self.assertNotIn(FAMILY_MACD_SIGNAL, pane_by_family)
 
         rsi_pane = pane_by_family[FAMILY_RSI]
         rsi_scale = canvas._lower_scale(

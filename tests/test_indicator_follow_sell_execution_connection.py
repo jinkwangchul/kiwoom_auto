@@ -376,7 +376,7 @@ class IndicatorFollowSellExecutionConnectionTest(unittest.TestCase):
         self.assertEqual({"RATIO_SLICE"}, {item["child_kind"] for item in intents})
         self.assertEqual([1, 2, 3], [item["child_sequence_index"] for item in intents])
         self.assertEqual({3}, {item["child_sequence_total"] for item in intents})
-        self.assertEqual({"ORDER_PRICE"}, {item["ratio_left"] for item in intents})
+        self.assertEqual({"SIGNAL_PRICE"}, {item["ratio_left"] for item in intents})
         self.assertEqual({"CURRENT_PRICE"}, {item["ratio_right"] for item in intents})
         self.assertEqual({0.15}, {item["ratio_value"] for item in intents})
 
@@ -399,7 +399,7 @@ class IndicatorFollowSellExecutionConnectionTest(unittest.TestCase):
         self.assertEqual("READY", result["status"], result)
         policy = result["execution_intent"]["sell_price_reset_policy"]
         self.assertEqual("SELL_PRICE_CHANGE_RESET", policy["policy"])
-        self.assertEqual("ORDER_PRICE", policy["left_source"])
+        self.assertEqual("SIGNAL_PRICE", policy["left_source"])
         self.assertEqual("CURRENT_PRICE", policy["right_source"])
         self.assertEqual("UP", policy["direction"])
         self.assertEqual(">=", policy["compare"])

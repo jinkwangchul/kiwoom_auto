@@ -113,6 +113,11 @@ def _recovery_template(template: dict[str, Any], quantity: int, signal: dict[str
     price_responses = policy.get("buy_price_response_policies")
     if not isinstance(price_responses, list) or any(not isinstance(item, dict) for item in price_responses):
         raise ValueError("BUY_RECOVERY_PRICE_RESPONSE_POLICY_INVALID")
+    price_responses = deepcopy(price_responses)
+    for response in price_responses:
+        for source_key in ("left_source", "right_source"):
+            if _text(response.get(source_key)).upper() == "ORDER_PRICE":
+                response[source_key] = "SIGNAL_PRICE"
     value = deepcopy(template)
     value["hoga_mode"] = order.get("hoga_mode")
     value["price_basis"] = order.get("order_price_basis")
@@ -160,8 +165,8 @@ def _recovery_template(template: dict[str, Any], quantity: int, signal: dict[str
     for response in price_responses:
         if (
             response.get("enabled") is not True
-            or _text(response.get("left_source")).upper() not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-            or _text(response.get("right_source")).upper() not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or _text(response.get("left_source")).upper() not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or _text(response.get("right_source")).upper() not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
             or _text(response.get("direction")).upper() not in {"UP", "DOWN", "BOTH"}
             or _text(response.get("action")).upper() not in {"RESET", "CANCEL_BATCH"}
         ):
@@ -208,11 +213,17 @@ def _recovery_template(template: dict[str, Any], quantity: int, signal: dict[str
         if count <= 0:
             raise ValueError("BUY_RECOVERY_RATIO_POLICY_INVALID")
         value["execution_mode"] = "MULTI_RATIO"
+        left_source = _text(point.get("left_source")).upper()
+        right_source = _text(point.get("right_source")).upper()
+        if left_source == "ORDER_PRICE":
+            left_source = "SIGNAL_PRICE"
+        if right_source == "ORDER_PRICE":
+            right_source = "SIGNAL_PRICE"
         value["multi_ratio_plan"] = {
             "configured_child_count": count,
             "planned_child_count": count,
-            "ratio_left": point.get("left_source"),
-            "ratio_right": point.get("right_source"),
+            "ratio_left": left_source,
+            "ratio_right": right_source,
             "ratio_direction": point.get("direction"),
             "ratio_value": point.get("ratio_percent"),
             "ratio_compare": point.get("comparator"),

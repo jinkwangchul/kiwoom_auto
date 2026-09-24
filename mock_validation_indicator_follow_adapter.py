@@ -1461,17 +1461,20 @@ class MockIndicatorFollowRoutineAdapter:
         if "AVG_PRICE" in {left_source, right_source} and average_price is None:
             return None, "RATIO_AVERAGE_PRICE_UNAVAILABLE", {}
         order_price = _positive_number(ratio.get("order_price"))
+        signal_price = _positive_number(ratio.get("signal_price"))
         left = resolve_price_source(
             left_source,
             order_price=float(order_price) if order_price is not None else None,
             current_price=float(current_price) if current_price is not None else None,
             average_price=float(average_price) if average_price is not None else None,
+            signal_price=float(signal_price) if signal_price is not None else None,
         )
         right = resolve_price_source(
             right_source,
             order_price=float(order_price) if order_price is not None else None,
             current_price=float(current_price) if current_price is not None else None,
             average_price=float(average_price) if average_price is not None else None,
+            signal_price=float(signal_price) if signal_price is not None else None,
         )
         threshold = _positive_number(ratio.get("ratio_value"))
         if left is None or right is None or threshold is None:

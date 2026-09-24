@@ -98,7 +98,7 @@ def _rules():
             "enabled": True,
             "target": "AVG_PRICE",
             "operator": "PERCENT_GAP",
-            "compare_target": "ORDER_PRICE",
+            "compare_target": "SIGNAL_PRICE",
             "direction": "UP",
             "compare_mode": "GTE",
             "value": 0.5,
@@ -345,7 +345,7 @@ class ValidationVisualizationDataTest(unittest.TestCase):
         self.assertIn("평단 대비 +0.25% 이상", labels)
         self.assertIn("가격박스 하단 이상", labels)
         self.assertIn("볼린저 하단 이상", labels)
-        self.assertIn("평단 주문가 대비 +0.5% 이상", labels)
+        self.assertIn("평단 신호가 대비 +0.5% 이상", labels)
         joined = "\n".join(labels)
         for token in (
             "CLOSE",
@@ -383,6 +383,40 @@ class ValidationVisualizationDataTest(unittest.TestCase):
             "시그널 MACD 상향돌파",
             descriptor.parameters["criterion_label"],
         )
+
+    def test_macd_visualization_always_projects_both_macd_and_signal_lines(self):
+        for target in ("MACD", "SIGNAL"):
+            with self.subTest(target=target):
+                rules = _rules()
+                actual = rules["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"][0]
+                visual = rules["validation_visualization_rules"]["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"][0]
+                for condition in (actual, visual):
+                    condition.update({
+                        "target": target,
+                        "operator": "<=",
+                        "value": 0,
+                    })
+                    condition.pop("compare_target", None)
+
+                descriptor = next(
+                    item
+                    for item in build_validation_filter_universe(rules)
+                    if item.family == FAMILY_MACD_SIGNAL
+                )
+                self.assertEqual(
+                    ("MACD", "SIGNAL", "CRITERION"),
+                    descriptor.series_keys,
+                )
+
+                cache = build_validation_indicator_cache(
+                    _candles(70),
+                    rules,
+                    (descriptor,),
+                )
+                self.assertEqual(
+                    ("MACD", "SIGNAL", "CRITERION"),
+                    cache.channels_for(descriptor.identity),
+                )
 
     def test_universe_contains_all_eight_families_and_separate_ma_parameters(self):
         descriptors = build_validation_filter_universe(_rules())
@@ -606,7 +640,7 @@ class ValidationVisualizationDataTest(unittest.TestCase):
         buy_only = next(
             item for item in price_descriptors
             if "BUY" in item.sides
-            and item.parameters["condition"]["compare_target"] == "ORDER_PRICE"
+            and item.parameters["condition"]["compare_target"] == "SIGNAL_PRICE"
         )
         self.assertIn("CRITERION", buy_only.series_keys)
         self.assertIn("BUY", buy_only.unsupported_sides)

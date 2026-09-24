@@ -56,8 +56,14 @@ def inspect_buy_execution_support(*, subject: dict[str, Any], rules: dict[str, A
         ):
             return "BUY_ADDITIONAL_POLICY_INVALID"
         if price_skip.get("enabled") is True and (
-            price_skip.get("reference_source") != "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
-            or price_skip.get("current_source") != "ACTIONABLE_ORDER_PRICE"
+            price_skip.get("reference_source") not in {
+                "PREVIOUS_CONFIRMED_BUY_SIGNAL_PRICE",
+                "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
+            }
+            or price_skip.get("current_source") not in {
+                "CURRENT_SIGNAL_PRICE",
+                "ACTIONABLE_ORDER_PRICE",
+            }
             or price_skip.get("action") != "SKIP_CURRENT_GENERATION"
             or price_skip.get("skipped_round_increment") is not False
             or price_skip.get("direction") not in {"UP", "DOWN", "BOTH"}
@@ -79,7 +85,14 @@ def inspect_buy_execution_support(*, subject: dict[str, Any], rules: dict[str, A
                 active_condition = _as_dict(last_plus_one.get("active_condition"))
                 if (
                     active_condition.get("direction") not in {"UP", "DOWN", "BOTH"}
-                    or active_condition.get("comparator") not in {">=", "<=", "WITHIN", "OUTSIDE"}
+                    or (
+                        active_condition.get("direction") in {"UP", "DOWN"}
+                        and active_condition.get("comparator") != "<="
+                    )
+                    or (
+                        active_condition.get("direction") == "BOTH"
+                        and active_condition.get("comparator") != "WITHIN"
+                    )
                     or not nonnegative_number(active_condition.get("ratio_percent"))
                 ):
                     return "BUY_ADDITIONAL_POLICY_INVALID"
@@ -120,9 +133,16 @@ def inspect_buy_execution_support(*, subject: dict[str, Any], rules: dict[str, A
                 or active.get("budget_policy_override") != "NONE"
                 or active.get("purpose") != "BUY_METHOD_SPECIAL_ACTION"
                 or active.get("subject") != "AVERAGE_PRICE"
-                or active.get("reference") != "MULTI_POINT_SET_PRICE"
+                or active.get("reference") not in {"SIGNAL_PRICE", "MULTI_POINT_SET_PRICE"}
                 or active.get("direction") not in {"UP", "DOWN", "BOTH"}
-                or active.get("comparator") not in {">=", "<=", "WITHIN", "OUTSIDE"}
+                or (
+                    active.get("direction") in {"UP", "DOWN"}
+                    and active.get("comparator") != "<="
+                )
+                or (
+                    active.get("direction") == "BOTH"
+                    and active.get("comparator") != "WITHIN"
+                )
                 or not nonnegative_number(active.get("ratio_percent"))
             ):
                 return "BUY_LAST_ROUND_ACTIVE_POLICY_INVALID"
@@ -132,15 +152,14 @@ def inspect_buy_execution_support(*, subject: dict[str, Any], rules: dict[str, A
             if repeat.get("detail_mode") == "ACTIVE_BUY":
                 if (
                     repeat.get("active_direction") not in {"UP", "DOWN", "BOTH"}
-                    or repeat.get("active_compare") not in {">=", "<=", "WITHIN", "OUTSIDE"}
                     or not nonnegative_number(repeat.get("active_ratio"))
                     or (
                         repeat.get("active_direction") in {"UP", "DOWN"}
-                        and repeat.get("active_compare") not in {">=", "<="}
+                        and repeat.get("active_compare") != "<="
                     )
                     or (
                         repeat.get("active_direction") == "BOTH"
-                        and repeat.get("active_compare") not in {"WITHIN", "OUTSIDE"}
+                        and repeat.get("active_compare") != "WITHIN"
                     )
                 ):
                     return "ACTIVE_BUY_POLICY_INVALID"
@@ -464,18 +483,21 @@ def _previous_price_skip_result(
     *,
     policy: dict[str, Any],
     cycle: dict[str, Any],
-    actionable_order_price: float | None,
+    signal_price: float | None,
 ) -> dict[str, Any] | None:
     if policy.get("enabled") is not True or cycle.get("confirmed_buy_round") == 0:
         return None
-    previous = _positive_float(cycle.get("last_confirmed_buy_order_price"))
+    previous = (
+        _positive_float(cycle.get("last_confirmed_buy_signal_price"))
+        or _positive_float(cycle.get("last_confirmed_buy_order_price"))
+    )
     if previous is None:
-        return _blocked("PREVIOUS_ROUND_PRICE_UNAVAILABLE")
-    if actionable_order_price is None:
-        return _blocked("PRICE_EVIDENCE_STALE")
+        return _blocked("PREVIOUS_ROUND_SIGNAL_PRICE_UNAVAILABLE")
+    if signal_price is None:
+        return _blocked("SIGNAL_PRICE_EVIDENCE_UNAVAILABLE")
     matched, observed = _evaluate_canonical_comparison(
         left=previous,
-        right=actionable_order_price,
+        right=signal_price,
         direction=policy.get("direction"),
         comparator=policy.get("comparator"),
         threshold=policy.get("ratio_percent"),
@@ -487,8 +509,8 @@ def _previous_price_skip_result(
     result = _blocked("BUY_GENERATION_SKIPPED_BY_PREVIOUS_ROUND_PRICE")
     result["decision"] = {
         "action": "SKIP_CURRENT_GENERATION",
-        "previous_confirmed_order_price": previous,
-        "actionable_order_price": actionable_order_price,
+        "previous_confirmed_signal_price": previous,
+        "current_signal_price": signal_price,
         "observed_percent": observed,
         "round_increment": False,
     }
@@ -567,6 +589,8 @@ def _apply_last_round_active_buy(
     result: dict[str, Any],
     policy: dict[str, Any],
     average_price: float | None,
+    holding_quantity: int | None,
+    signal_price: float | None,
 ) -> dict[str, Any]:
     if policy.get("enabled") is not True:
         return result
@@ -577,28 +601,88 @@ def _apply_last_round_active_buy(
         return _blocked("BUY_LAST_ROUND_ACTIVE_REQUIRES_MULTI_POINT")
     if average_price is None:
         return _blocked("BUY_LAST_ROUND_ACTIVE_AVERAGE_PRICE_UNAVAILABLE")
-    last = intents[-1]
-    set_price = _positive_float(last.get("price"))
-    if set_price is None:
-        return _blocked("BUY_LAST_ROUND_ACTIVE_SET_PRICE_UNAVAILABLE")
-    matched, observed = _evaluate_canonical_comparison(
-        left=set_price,
-        right=average_price,
+    if holding_quantity is None or holding_quantity <= 0:
+        return _blocked("BUY_LAST_ROUND_ACTIVE_HOLDING_QUANTITY_UNAVAILABLE")
+    if signal_price is None:
+        return _blocked("BUY_LAST_ROUND_ACTIVE_SIGNAL_PRICE_UNAVAILABLE")
+
+    # This option controls only the terminal child. Earlier children remain the
+    # normal split-buy plan, so estimate the position immediately before the
+    # terminal child from the existing position plus those earlier children.
+    projected_quantity = holding_quantity
+    projected_cost = average_price * holding_quantity
+    for child in intents[:-1]:
+        child_price = _positive_float(child.get("price"))
+        child_quantity = _positive_int(child.get("quantity"))
+        if child_price is None or child_quantity is None:
+            return _blocked("BUY_LAST_ROUND_ACTIVE_CHILD_EVIDENCE_UNAVAILABLE")
+        projected_cost += child_price * child_quantity
+        projected_quantity += child_quantity
+    pre_last_average = projected_cost / projected_quantity
+
+    target_satisfied, observed = _evaluate_canonical_comparison(
+        left=signal_price,
+        right=pre_last_average,
         direction=policy.get("direction"),
         comparator=policy.get("comparator"),
         threshold=policy.get("ratio_percent"),
     )
-    if matched is None:
+    if target_satisfied is None:
         return _blocked("BUY_LAST_ROUND_ACTIVE_POLICY_INVALID")
+
+    last = intents[-1]
+    child_price = _positive_float(last.get("price"))
+    child_quantity = _positive_int(last.get("quantity"))
+    if child_price is None or child_quantity is None:
+        return _blocked("BUY_LAST_ROUND_ACTIVE_CHILD_EVIDENCE_UNAVAILABLE")
+    post_last_average = (
+        pre_last_average * projected_quantity + child_price * child_quantity
+    ) / (projected_quantity + child_quantity)
+
+    tolerance = max(abs(signal_price), 1.0) * 1e-12
+    if pre_last_average > signal_price:
+        signal_boundary_crossed = post_last_average < signal_price - tolerance
+    elif pre_last_average < signal_price:
+        signal_boundary_crossed = post_last_average > signal_price + tolerance
+    else:
+        signal_boundary_crossed = False
+    improves_toward_signal = (
+        abs(post_last_average - signal_price) + tolerance
+        < abs(pre_last_average - signal_price)
+    )
+    execute_last_child = (
+        not target_satisfied
+        and improves_toward_signal
+        and not signal_boundary_crossed
+    )
+
+    if target_satisfied:
+        reason = "ACTIVE_BUY_NOT_REQUIRED"
+    elif signal_boundary_crossed:
+        reason = "ACTIVE_BUY_SIGNAL_BOUNDARY_WOULD_CROSS"
+    elif not improves_toward_signal:
+        reason = "ACTIVE_BUY_CHILD_DOES_NOT_IMPROVE_AVERAGE"
+    else:
+        reason = "ACTIVE_BUY_REQUIRED"
+
     decision = {
         "policy": "LAST_MULTI_POINT_CHILD",
-        "matched": matched,
-        "set_price": set_price,
-        "average_price": average_price,
+        "matched": execute_last_child,
+        "reason": reason,
+        "reference": "SIGNAL_PRICE",
+        "signal_price": signal_price,
+        "starting_average_price": average_price,
+        "pre_last_average": pre_last_average,
+        "projected_average": post_last_average,
         "observed_percent": observed,
+        "target_satisfied": target_satisfied,
+        "improves_toward_signal": improves_toward_signal,
+        "signal_boundary_crossed": signal_boundary_crossed,
+        "child_price": child_price,
+        "child_quantity": child_quantity,
         "budget_policy_override": "NONE",
     }
-    if matched:
+    if execute_last_child:
         intents[-1]["last_round_active_decision"] = decision
     else:
         intents = intents[:-1]
@@ -724,10 +808,14 @@ def _buy_ratio_intent_issue(intent: dict[str, Any]) -> bool:
             or plan.get("price_basis") != intent.get("price_basis")
             or (intent.get("price_basis") == "ORDER_PRICE" and price != order_price)):
         return True
+    normalized_options = dict(options)
+    for key in ("ratio_left", "ratio_right"):
+        if normalized_options.get(key) == "ORDER_PRICE":
+            normalized_options[key] = "SIGNAL_PRICE"
     for key in ("ratio_left", "ratio_right", "ratio_direction", "ratio_value", "ratio_compare"):
-        if plan.get(key) != options.get(key):
+        if plan.get(key) != normalized_options.get(key):
             return True
-    if not {plan.get("ratio_left"), plan.get("ratio_right")} <= {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}:
+    if not {plan.get("ratio_left"), plan.get("ratio_right")} <= {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}:
         return True
     return evaluate_percent_comparison(left=100, right=100, direction=plan.get("ratio_direction"),
         compare=plan.get("ratio_compare"), threshold=threshold)[0] is None
@@ -773,8 +861,10 @@ def _multi_ratio_execution_intents(intent: dict[str, Any], context: dict[str, An
     price = _positive_float(intent.get("price"))
     budget = _positive_float(intent.get("budget"))
     threshold = _positive_float(base.get("ratio_value"))
-    sources = {base.get("ratio_left"), base.get("ratio_right")}
-    if (not sources <= {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+    ratio_left = "SIGNAL_PRICE" if base.get("ratio_left") == "ORDER_PRICE" else base.get("ratio_left")
+    ratio_right = "SIGNAL_PRICE" if base.get("ratio_right") == "ORDER_PRICE" else base.get("ratio_right")
+    sources = {ratio_left, ratio_right}
+    if (not sources <= {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
             or threshold is None or not isfinite(threshold)):
         return _blocked("BUY_MULTI_RATIO_TRIGGER_INVALID")
     eligible, _ = evaluate_percent_comparison(left=100, right=100,
@@ -788,7 +878,11 @@ def _multi_ratio_execution_intents(intent: dict[str, Any], context: dict[str, An
         "planned_total_quantity": quantity, "approved_round_budget": budget,
         "planned_total_budget": quantity * price, "price_basis": price_basis,
         "buy_round": intent.get("buy_round"), "order_price": price,
-        **{key: base[key] for key in ("ratio_left", "ratio_right", "ratio_direction", "ratio_compare")},
+        "signal_price": _positive_float(intent.get("signal_price")),
+        "ratio_left": ratio_left,
+        "ratio_right": ratio_right,
+        "ratio_direction": base.get("ratio_direction"),
+        "ratio_compare": base.get("ratio_compare"),
         "ratio_value": threshold,
     }
     budget_contract = _deferred_budget_contract(intent, budget)
@@ -877,7 +971,7 @@ def _buy_price_compare_branch_planning_rules(
     rules: dict[str, Any],
     confirmed_round: int,
     average_price: Any,
-    actionable_order_price: Any,
+    signal_price: Any,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
     """Apply an approved price-compare branch to the existing repeat budget policy."""
     if confirmed_round <= 0:
@@ -905,16 +999,16 @@ def _buy_price_compare_branch_planning_rules(
         return rules, None, "BUY_PRICE_COMPARE_BRANCH_BOUNDARY_INVALID"
 
     average = _positive_float(average_price)
-    order_price = _positive_float(actionable_order_price)
-    if average is None or order_price is None:
+    fixed_signal_price = _positive_float(signal_price)
+    if average is None or fixed_signal_price is None:
         return rules, None, "BUY_PRICE_COMPARE_BRANCH_EVIDENCE_UNAVAILABLE"
 
     def matches(operator: str) -> bool:
         return {
-            "<=": average <= order_price,
-            "<": average < order_price,
-            ">": average > order_price,
-            ">=": average >= order_price,
+            "<=": average <= fixed_signal_price,
+            "<": average < fixed_signal_price,
+            ">": average > fixed_signal_price,
+            ">=": average >= fixed_signal_price,
         }.get(operator, False)
 
     matched = [condition for condition in branch_conditions if matches(str(condition.get("operator") or ""))]
@@ -941,7 +1035,7 @@ def _buy_price_compare_branch_planning_rules(
     evidence = {
         "branch_id": selected.get("branch_id"),
         "average_price": average,
-        "actionable_order_price": order_price,
+        "signal_price": fixed_signal_price,
         "operator": selected.get("operator"),
         "policy": deepcopy(policy),
     }
@@ -1015,6 +1109,12 @@ def build_indicator_follow_buy_intent(
     reference_price = _positive_float(
         runtime_context.get("reference_price", runtime_context.get("current_price"))
     )
+    signal_price = (
+        _positive_float(signal.get("signal_bar_close"))
+        or _positive_float(signal.get("signal_price"))
+        or _positive_float(runtime_context.get("signal_bar_close"))
+        or reference_price
+    )
     actionable_price = _positive_float(runtime_context.get("actionable_current_price"))
     sizing_reference_price = (
         actionable_price if price_basis == "CURRENT_PRICE" else reference_price
@@ -1036,7 +1136,7 @@ def build_indicator_follow_buy_intent(
             rules=planning_rules,
             confirmed_round=confirmed_round,
             average_price=cycle.get("avg_price"),
-            actionable_order_price=actionable_order_price,
+            signal_price=signal_price,
         )
         if branch_reason:
             return _blocked(branch_reason)
@@ -1048,19 +1148,19 @@ def build_indicator_follow_buy_intent(
     price_skip = _previous_price_skip_result(
         policy=previous_price_policy,
         cycle=cycle,
-        actionable_order_price=actionable_order_price,
+        signal_price=signal_price,
     )
     if price_skip is not None:
         return price_skip
 
     if last_plus_one and last_plus_one_policy.get("method") == "ACTIVE":
         average_price = _positive_float(cycle.get("avg_price"))
-        if actionable_price is None:
-            return _blocked("PRICE_EVIDENCE_STALE")
+        if signal_price is None:
+            return _blocked("SIGNAL_PRICE_EVIDENCE_UNAVAILABLE")
         if average_price is None:
             return _blocked("LAST_PLUS_ONE_AVERAGE_PRICE_UNAVAILABLE")
         matched, observed = _evaluate_canonical_comparison(
-            left=actionable_price,
+            left=signal_price,
             right=average_price,
             direction=_as_dict(last_plus_one_policy.get("active_condition")).get("direction"),
             comparator=_as_dict(last_plus_one_policy.get("active_condition")).get("comparator"),
@@ -1068,9 +1168,14 @@ def build_indicator_follow_buy_intent(
         )
         if matched is None:
             return _blocked("LAST_PLUS_ONE_ACTIVE_CONDITION_INVALID")
-        if not matched:
-            blocked = _blocked("LAST_PLUS_ONE_ACTIVE_CONDITION_NOT_MET")
-            blocked["decision"] = {"matched": False, "observed_percent": observed, "occurrence_consumed": False}
+        if matched:
+            blocked = _blocked("LAST_PLUS_ONE_ACTIVE_BUY_NOT_REQUIRED")
+            blocked["decision"] = {
+                "matched": False,
+                "target_satisfied": True,
+                "observed_percent": observed,
+                "occurrence_consumed": False,
+            }
             return blocked
 
     cycle_identity = indicator_follow_cycle_identity(
@@ -1083,6 +1188,7 @@ def build_indicator_follow_buy_intent(
         "routine_instance_id": runtime_context.get("routine_instance_id"),
         "cycle_identity": cycle_identity,
         "confirmed_previous_round": confirmed_round,
+        "signal_price": signal_price,
     })
     if not cycle_identity:
         signal.update({
@@ -1099,7 +1205,7 @@ def build_indicator_follow_buy_intent(
         rules=planning_rules,
         cycle=cycle,
         sizing_reference_price=sizing_reference_price,
-        active_reference_price=reference_price,
+        active_reference_price=signal_price,
         actionable_acquisition_price=actionable_order_price,
     )
     if last_plus_one:
@@ -1139,8 +1245,68 @@ def build_indicator_follow_buy_intent(
         return {"status": "BLOCKED", "reason": reason, "execution_intent": None, "preview": preview}
 
     intent = deepcopy(_as_dict(preview.get("execution_intent")))
+    if last_plus_one and last_plus_one_policy.get("method") == "ACTIVE":
+        average_price = _positive_float(cycle.get("avg_price"))
+        holding_quantity = _positive_int(cycle.get("holding_qty"))
+        planned_quantity = _positive_int(intent.get("quantity"))
+        planned_price = _positive_float(intent.get("price"))
+        if (
+            average_price is None
+            or holding_quantity is None
+            or planned_quantity is None
+            or planned_price is None
+            or signal_price is None
+        ):
+            return _blocked("LAST_PLUS_ONE_ACTIVE_PROJECTION_EVIDENCE_UNAVAILABLE")
+        projected_average = (
+            average_price * holding_quantity + planned_price * planned_quantity
+        ) / (holding_quantity + planned_quantity)
+        tolerance = max(abs(signal_price), 1.0) * 1e-12
+        improves_toward_signal = (
+            abs(projected_average - signal_price) + tolerance
+            < abs(average_price - signal_price)
+        )
+        if average_price > signal_price:
+            signal_boundary_crossed = projected_average < signal_price - tolerance
+        elif average_price < signal_price:
+            signal_boundary_crossed = projected_average > signal_price + tolerance
+        else:
+            signal_boundary_crossed = False
+        if signal_boundary_crossed or not improves_toward_signal:
+            reason = (
+                "LAST_PLUS_ONE_ACTIVE_SIGNAL_BOUNDARY_WOULD_CROSS"
+                if signal_boundary_crossed
+                else "LAST_PLUS_ONE_ACTIVE_DOES_NOT_IMPROVE_AVERAGE"
+            )
+            blocked = _blocked(reason)
+            blocked["decision"] = {
+                "matched": False,
+                "target_satisfied": False,
+                "starting_average_price": average_price,
+                "projected_average": projected_average,
+                "signal_price": signal_price,
+                "planned_price": planned_price,
+                "planned_quantity": planned_quantity,
+                "improves_toward_signal": improves_toward_signal,
+                "signal_boundary_crossed": signal_boundary_crossed,
+                "occurrence_consumed": False,
+            }
+            return blocked
+        intent["last_plus_one_active_decision"] = {
+            "matched": True,
+            "target_satisfied": False,
+            "starting_average_price": average_price,
+            "projected_average": projected_average,
+            "signal_price": signal_price,
+            "planned_price": planned_price,
+            "planned_quantity": planned_quantity,
+            "improves_toward_signal": True,
+            "signal_boundary_crossed": False,
+            "occurrence_consumed": False,
+        }
     intent["confirmed_previous_round"] = confirmed_round
     intent["actionable_order_price"] = actionable_order_price
+    intent["signal_price"] = signal_price
     intent["cycle_identity"] = cycle_identity
     if not cycle_identity:
         intent.update({
@@ -1168,7 +1334,7 @@ def build_indicator_follow_buy_intent(
             "direction": repeat_rule.get("active_direction"),
             "ratio_percent": repeat_rule.get("active_ratio"),
             "comparator": repeat_rule.get("active_compare"),
-            "reference_price": reference_price,
+            "signal_price": signal_price,
         }
         intent["active_buy_calculation"] = deepcopy(calculation)
         intent["active_buy_required_quantity"] = calculation.get("required_quantity")
@@ -1220,8 +1386,8 @@ def build_indicator_follow_buy_intent(
     if reset_policy.get("enabled") is True:
         if (reset_policy.get("policy") != "BUY_PRICE_CHANGE_RESET"
                 or reset_policy.get("action") != "RESET"
-                or reset_policy.get("left_source") not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-                or reset_policy.get("right_source") not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                or reset_policy.get("left_source") not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                or reset_policy.get("right_source") not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
                 or reset_policy.get("direction") not in {"UP", "DOWN", "BOTH"}
                 or reset_policy.get("compare") not in {">=", "<=", "WITHIN", "OUTSIDE"}
                 or not isinstance(reset_policy.get("threshold_percent"), (int, float))
@@ -1268,6 +1434,8 @@ def build_indicator_follow_buy_intent(
             result=result,
             policy=_as_dict(original_base.get("last_round_active_buy")),
             average_price=_positive_float(cycle.get("avg_price")),
+            holding_quantity=_positive_int(cycle.get("holding_qty")),
+            signal_price=signal_price,
         )
     result["preview"] = preview
     return result

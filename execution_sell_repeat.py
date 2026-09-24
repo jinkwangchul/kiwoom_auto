@@ -257,6 +257,7 @@ def _evaluate_exit_policy(
     order_price: float | None,
     current_price: float | None,
     average_price: float | None,
+    signal_price: float | None,
     now: datetime,
 ) -> dict[str, Any]:
     conditions = policy.get("conditions")
@@ -306,7 +307,11 @@ def _evaluate_exit_policy(
         elif condition_type == "PRICE":
             left_source = _text(condition.get("left_source")).upper()
             right_source = _text(condition.get("right_source")).upper()
-            if "CURRENT_PRICE" in {left_source, right_source} and current_price is None:
+            if left_source == right_source:
+                reason = "SELL_REPEAT_EXIT_PRICE_POLICY_INVALID"
+                result.update({"status": "INVALID", "reason": reason})
+                waiting_reasons.append(reason)
+            elif "CURRENT_PRICE" in {left_source, right_source} and current_price is None:
                 result.update({"status": "WAITING", "reason": "SELL_REPEAT_EXIT_CURRENT_PRICE_UNAVAILABLE"})
                 waiting_reasons.append("SELL_REPEAT_EXIT_CURRENT_PRICE_UNAVAILABLE")
             else:
@@ -315,12 +320,14 @@ def _evaluate_exit_policy(
                     order_price=order_price,
                     current_price=current_price,
                     average_price=average_price,
+                    signal_price=signal_price,
                 )
                 right_value = resolve_price_source(
                     right_source,
                     order_price=order_price,
                     current_price=current_price,
                     average_price=average_price,
+                    signal_price=signal_price,
                 )
                 if left_value is None or right_value is None:
                     reason = "SELL_REPEAT_EXIT_PRICE_SOURCE_UNAVAILABLE"
@@ -328,8 +335,8 @@ def _evaluate_exit_policy(
                     waiting_reasons.append(reason)
                 else:
                     matched, observed = evaluate_percent_comparison(
-                        left=right_value,
-                        right=left_value,
+                        left=left_value,
+                        right=right_value,
                         direction=_text(condition.get("direction")).upper(),
                         compare=_text(condition.get("compare")).upper(),
                         threshold=condition.get("threshold_percent"),
@@ -477,6 +484,7 @@ def _template_for_generation(
             "ratio_value": configured.get("ratio_value"),
             "ratio_compare": configured.get("ratio_compare"),
             "ratio_unit": "PERCENT",
+            "signal_price": _positive_price(template.get("signal_price")),
             "order_price": current_price,
         }
     elif mode not in {"SINGLE_ORDER", "SINGLE"}:
@@ -945,6 +953,7 @@ def inspect_sell_repeat_generations(
             order_price=_generation_order_price(template, latest_orders),
             current_price=prices.get(code),
             average_price=_positive_price(position.get("average_price")),
+            signal_price=_positive_price(template.get("signal_price")),
             now=current_at,
         )
         if exit_evaluation.get("triggered") is True:

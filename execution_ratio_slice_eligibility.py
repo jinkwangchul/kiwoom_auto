@@ -71,12 +71,14 @@ def _source_price(
     order_price: float | None,
     current_price: float | None,
     average_price: float | None,
+    signal_price: float | None,
 ) -> float | None:
     return resolve_price_source(
         source,
         order_price=order_price,
         current_price=current_price,
         average_price=average_price,
+        signal_price=signal_price,
     )
 
 
@@ -361,7 +363,13 @@ def inspect_eligible_ratio_slices(
         compare = _text(plan.get("ratio_compare")).upper()
         threshold = _positive_number(plan.get("ratio_value"))
         order_price = _positive_number(plan.get("order_price"))
+        signal_price = _positive_number(
+            plan.get("signal_price", signal.get("signal_bar_close"))
+        )
         current_price = prices.get(code)
+        if left_source == right_source:
+            reviews.append(_review(signal, process_id, ["RATIO_TRIGGER_POLICY_INVALID"]))
+            continue
         if "CURRENT_PRICE" in {left_source, right_source} and current_price is None:
             waiting.append({"source_signal_id": signal_id, "code": code, "reason": "RATIO_CURRENT_PRICE_UNAVAILABLE"})
             continue
@@ -373,12 +381,14 @@ def inspect_eligible_ratio_slices(
             order_price=order_price,
             current_price=current_price,
             average_price=average_price,
+            signal_price=signal_price,
         )
         right_price = _source_price(
             right_source,
             order_price=order_price,
             current_price=current_price,
             average_price=average_price,
+            signal_price=signal_price,
         )
         if left_price is None or right_price is None or threshold is None:
             reviews.append(_review(signal, process_id, ["RATIO_TRIGGER_SOURCE_INVALID"]))

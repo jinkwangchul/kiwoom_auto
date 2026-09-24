@@ -814,6 +814,7 @@ def inspect_buy_price_resets(
                 reasons.append(f"BUY_PRICE_RESET_RUNTIME_IDENTITY_MISMATCH:{execution_id}")
         current_price = prices.get(code)
         order_price = _record_order_price(representative)
+        signal_price = positive_price(_intent(representative).get("signal_price"))
         position_matches = [item for item in loaded["positions"]
                             if _text(item.get("account_no")) == account_no and _text(item.get("code")) == code]
         average_price = positive_price(position_matches[0].get("average_price")) if len(position_matches) == 1 else None
@@ -825,6 +826,12 @@ def inspect_buy_price_resets(
             if position_qty is not None and holding_qty is not None and position_qty != holding_qty:
                 reasons.append("BUY_PRICE_RESET_POSITION_BROKER_MISMATCH")
         if any(
+            _text(item.get("left_source")).upper()
+            == _text(item.get("right_source")).upper()
+            for item in policies
+        ):
+            reasons.append("BUY_PRICE_RESPONSE_TRIGGER_POLICY_INVALID")
+        if not reasons and any(
             "CURRENT_PRICE" in {
                 _text(item.get("left_source")).upper(),
                 _text(item.get("right_source")).upper(),
@@ -842,17 +849,24 @@ def inspect_buy_price_resets(
         triggered_policies: list[tuple[dict[str, Any], float, float, float, float]] = []
         if not reasons:
             for candidate in policies:
+                candidate_left_source = _text(candidate.get("left_source")).upper()
+                candidate_right_source = _text(candidate.get("right_source")).upper()
+                if candidate_left_source == candidate_right_source:
+                    reasons.append("BUY_PRICE_RESPONSE_TRIGGER_POLICY_INVALID")
+                    break
                 candidate_left = resolve_price_source(
-                    _text(candidate.get("left_source")).upper(),
+                    candidate_left_source,
                     order_price=positive_price(candidate.get("order_price")) or order_price,
                     current_price=current_price,
                     average_price=average_price,
+                    signal_price=signal_price,
                 )
                 candidate_right = resolve_price_source(
-                    _text(candidate.get("right_source")).upper(),
+                    candidate_right_source,
                     order_price=positive_price(candidate.get("order_price")) or order_price,
                     current_price=current_price,
                     average_price=average_price,
+                    signal_price=signal_price,
                 )
                 candidate_threshold = positive_price(candidate.get("threshold_percent"))
                 if candidate_left is None or candidate_right is None or candidate_threshold is None:
@@ -1356,22 +1370,36 @@ def inspect_sell_price_resets(
         current_price = prices.get(code)
         left_source = _text(policy.get("left_source")).upper()
         right_source = _text(policy.get("right_source")).upper()
-        if "CURRENT_PRICE" in {left_source, right_source} and current_price is None and not frozen_hashes:
+        if left_source == right_source and not frozen_hashes:
+            reasons.append("SELL_PRICE_RESET_TRIGGER_POLICY_INVALID")
+        if (
+            not reasons
+            and "CURRENT_PRICE" in {left_source, right_source}
+            and current_price is None
+            and not frozen_hashes
+        ):
             waiting.append({"execution_process_id": process_id, "code": code, "reason": "SELL_PRICE_RESET_CURRENT_PRICE_UNAVAILABLE"})
             continue
-        if "AVG_PRICE" in {left_source, right_source} and average_price is None and not frozen_hashes:
+        if (
+            not reasons
+            and "AVG_PRICE" in {left_source, right_source}
+            and average_price is None
+            and not frozen_hashes
+        ):
             reasons.append("SELL_PRICE_RESET_AVERAGE_PRICE_UNAVAILABLE")
         left_price = resolve_price_source(
             left_source,
             order_price=positive_price(policy.get("order_price")),
             current_price=current_price,
             average_price=average_price,
+            signal_price=positive_price(policy.get("signal_price")),
         )
         right_price = resolve_price_source(
             right_source,
             order_price=positive_price(policy.get("order_price")),
             current_price=current_price,
             average_price=average_price,
+            signal_price=positive_price(policy.get("signal_price")),
         )
         threshold = positive_price(policy.get("threshold_percent"))
         triggered: bool | None = None

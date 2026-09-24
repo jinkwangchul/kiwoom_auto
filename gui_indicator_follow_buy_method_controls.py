@@ -26,6 +26,53 @@ def sync_buy_direction_comparator(direction_combo, compare_combo):
         compare_combo.setCurrentText("이내" if direction == "상하" else "이상")
 
 
+def sync_active_buy_direction_comparator(direction_combo, compare_combo):
+    """ACTIVE_BUY only exposes corrective signal-to-average conditions."""
+    direction = direction_combo.currentText().strip()
+    visible_items = ["이내"] if direction == "상하" else ["이하"]
+    for item_text in ["이상", "이하", "이내", "이탈"]:
+        index = compare_combo.findText(item_text)
+        if index >= 0:
+            compare_combo.view().setRowHidden(index, item_text not in visible_items)
+    if compare_combo.currentText() not in visible_items:
+        compare_combo.setCurrentText(visible_items[0])
+
+
+def bind_distinct_buy_price_combos(left_combo, right_combo):
+    """Keep strategy price-comparison operands distinct."""
+    syncing = False
+
+    def sync(changed_combo, other_combo):
+        nonlocal syncing
+        if syncing:
+            return
+        value = str(changed_combo.currentText() or "").strip()
+        if not value or value == "무설정":
+            return
+        if str(other_combo.currentText() or "").strip() != value:
+            return
+        replacement = next(
+            (
+                other_combo.itemText(index)
+                for index in range(other_combo.count())
+                if str(other_combo.itemText(index) or "").strip()
+                not in {"", "무설정", value}
+            ),
+            "",
+        )
+        if not replacement:
+            return
+        syncing = True
+        try:
+            other_combo.setCurrentText(replacement)
+        finally:
+            syncing = False
+
+    left_combo.currentTextChanged.connect(lambda _text: sync(left_combo, right_combo))
+    right_combo.currentTextChanged.connect(lambda _text: sync(right_combo, left_combo))
+    sync(left_combo, right_combo)
+
+
 def set_buy_combo_item_enabled(combo, item_text, enabled, tooltip=""):
     index = combo.findText(item_text)
     model = combo.model()
@@ -196,7 +243,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         single_layout = QHBoxLayout(self.buy_base_single_widget)
         single_layout.setContentsMargins(0, 0, 0, 0)
         single_layout.setSpacing(4)
-        self.buy_base_order_combo = make_combo(["주문가", "시장가"], "주문가", 100)
+        self.buy_base_order_combo = make_combo(["신호가", "시장가"], "신호가", 100)
         single_layout.addWidget(self.buy_base_order_combo)
         single_layout.addStretch(1)
         self.buy_base_hoga_stack.addWidget(self.buy_base_single_widget)
@@ -274,7 +321,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_base_time_unit_combo = make_combo(["분", "초", "봉"], "초", 60)
         self.buy_base_time_range_combo = make_combo(["이내", "간격"], "이내", 76)
         self.buy_base_time_count_line = make_line("3", 30)
-        self.buy_base_time_order_combo = make_combo(["주문가", "현재가"], "주문가", 92)
+        self.buy_base_time_order_combo = make_combo(["신호가", "현재가"], "신호가", 92)
         time_detail_layout.addWidget(self.buy_base_time_value_line)
         time_detail_layout.addWidget(self.buy_base_time_unit_combo)
         time_detail_layout.addWidget(self.buy_base_time_range_combo)
@@ -288,8 +335,12 @@ class IndicatorFollowBuyMethodControlsMixin:
         ratio_layout = QHBoxLayout(self.buy_base_ratio_widget)
         ratio_layout.setContentsMargins(0, 0, 0, 0)
         ratio_layout.setSpacing(4)
-        self.buy_base_ratio_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-        self.buy_base_ratio_right_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
+        self.buy_base_ratio_left_combo = make_combo(["신호가", "현재가", "평단가"], "신호가", 92)
+        self.buy_base_ratio_right_combo = make_combo(["신호가", "현재가", "평단가"], "현재가", 92)
+        bind_distinct_buy_price_combos(
+            self.buy_base_ratio_left_combo,
+            self.buy_base_ratio_right_combo,
+        )
         self.buy_base_ratio_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         self.buy_base_ratio_value_line = make_line("0.15", 46)
         self.buy_base_ratio_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
@@ -325,7 +376,7 @@ class IndicatorFollowBuyMethodControlsMixin:
             self.buy_last_round_active_check,
             baseline=138,
         )
-        self.buy_last_round_active_set_price_label = make_label("설정가에 평단이")
+        self.buy_last_round_active_set_price_label = make_label("신호가 대비 평단가")
         _set_label_text_minimum_width(
             self.buy_last_round_active_set_price_label,
             baseline=102,
@@ -362,7 +413,7 @@ class IndicatorFollowBuyMethodControlsMixin:
             details_enabled = prerequisite and last_round_active_check.isChecked()
             for widget in last_round_active_details:
                 widget.setEnabled(details_enabled)
-            sync_buy_direction_comparator(
+            sync_active_buy_direction_comparator(
                 last_round_active_direction_combo,
                 last_round_active_compare_combo,
             )
@@ -473,7 +524,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_base_active_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         self.buy_base_active_ratio_line = make_line("0.45", 46)
         self.buy_base_active_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
-        active_detail_layout.addWidget(make_label("매수가", 48))
+        active_detail_layout.addWidget(make_label("신호가", 48))
         active_detail_layout.addWidget(make_label("대비", 36))
         active_detail_layout.addWidget(make_label("평단가", 48))
         active_detail_layout.addWidget(self.buy_base_active_direction_combo)
@@ -504,7 +555,7 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         self.buy_price_compare_left_label = make_label("평단가", 48)
         self.buy_price_compare_condition_combo = make_combo(["<=", "<"], "<=", 54)
-        self.buy_price_compare_right_label = make_label("주문가", 48)
+        self.buy_price_compare_right_label = make_label("신호가", 48)
         self.buy_price_compare_mode_combo = make_combo(
             ["회차기준", "예산기준"], "회차기준", 116, ModeSwitchComboBox
         )
@@ -552,7 +603,7 @@ class IndicatorFollowBuyMethodControlsMixin:
 
         self.buy_price_compare_above_left_label = make_label("평단가", 48)
         self.buy_price_compare_above_condition_combo = make_combo([">", ">="], ">", 54)
-        self.buy_price_compare_above_right_label = make_label("주문가", 48)
+        self.buy_price_compare_above_right_label = make_label("신호가", 48)
         self.buy_price_compare_above_mode_combo = make_combo(
             ["회차기준", "예산기준", "능동매수"], "회차기준", 116, ModeSwitchComboBox
         )
@@ -604,7 +655,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_price_compare_above_active_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         self.buy_price_compare_above_active_ratio_line = make_line("0.45", 46)
         self.buy_price_compare_above_active_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
-        price_above_active_layout.addWidget(make_label("매수가", 48))
+        price_above_active_layout.addWidget(make_label("신호가", 48))
         price_above_active_layout.addWidget(make_label("대비", 36))
         price_above_active_layout.addWidget(make_label("평단가", 48))
         price_above_active_layout.addWidget(self.buy_price_compare_above_active_direction_combo)
@@ -639,6 +690,8 @@ class IndicatorFollowBuyMethodControlsMixin:
         price_above_condition_combo = self.buy_price_compare_above_condition_combo
         price_above_mode_combo = self.buy_price_compare_above_mode_combo
         price_above_detail_stack = self.buy_price_compare_above_detail_stack
+        price_above_active_direction_combo = self.buy_price_compare_above_active_direction_combo
+        price_above_active_compare_combo = self.buy_price_compare_above_active_compare_combo
 
         syncing = {"active": False}
         boundary_syncing = {"active": False}
@@ -657,14 +710,10 @@ class IndicatorFollowBuyMethodControlsMixin:
             base_detail_row.update()
 
         def update_base_active_comparator_local(*_args):
-            # Repeat ACTIVE_BUY deliberately preserves user freedom.  All
-            # direction/comparator combinations remain selectable; runtime
-            # policy evaluation decides whether a chosen combination is
-            # actionable without rewriting the saved setting.
-            for item_text in ["이상", "이하", "이내", "이탈"]:
-                index = base_active_compare_combo.findText(item_text)
-                if index >= 0:
-                    base_active_compare_combo.view().setRowHidden(index, False)
+            sync_active_buy_direction_comparator(
+                base_active_direction_combo,
+                base_active_compare_combo,
+            )
 
         def update_price_mode_local(*_args):
             index = price_mode_combo.currentIndex()
@@ -675,6 +724,10 @@ class IndicatorFollowBuyMethodControlsMixin:
         def update_price_above_mode_local(*_args):
             index = price_above_mode_combo.currentIndex()
             price_above_detail_stack.setCurrentIndex(index if index >= 0 else 0)
+            sync_active_buy_direction_comparator(
+                price_above_active_direction_combo,
+                price_above_active_compare_combo,
+            )
             price_above_row.updateGeometry()
             price_above_row.update()
 
@@ -761,6 +814,9 @@ class IndicatorFollowBuyMethodControlsMixin:
         )
         price_mode_combo.currentIndexChanged.connect(update_price_mode_local)
         price_above_mode_combo.currentIndexChanged.connect(update_price_above_mode_local)
+        price_above_active_direction_combo.currentTextChanged.connect(
+            update_price_above_mode_local
+        )
         price_condition_combo.currentIndexChanged.connect(lambda *_args: update_price_compare_boundary_local("top"))
         price_above_condition_combo.currentIndexChanged.connect(lambda *_args: update_price_compare_boundary_local("bottom"))
 
@@ -788,7 +844,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         price_compare_skip_row.setSpacing(4)
         layout.addWidget(self.buy_price_compare_skip_row_widget)
 
-        self.buy_price_compare_skip_check = QCheckBox("직전회차주문가 대비 현재주문가")
+        self.buy_price_compare_skip_check = QCheckBox("직전회차신호가 대비 현재신호가")
         self.buy_price_compare_skip_check.setFixedHeight(30)
         self.buy_price_compare_skip_check.setStyleSheet("font-size: 8pt;")
         _set_checkbox_text_minimum_width(self.buy_price_compare_skip_check)
@@ -831,7 +887,7 @@ class IndicatorFollowBuyMethodControlsMixin:
         self.buy_additional_active_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         self.buy_additional_active_ratio_line = make_line("0.45", 46)
         self.buy_additional_active_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
-        self.buy_additional_active_price_label = make_label("매수가", 48)
+        self.buy_additional_active_price_label = make_label("신호가", 48)
         self.buy_additional_active_vs_label = make_label("대비", 36)
         self.buy_additional_active_avg_label = make_label("평단가", 48)
         self.buy_additional_active_percent_label = make_label("%", 14)
@@ -858,6 +914,8 @@ class IndicatorFollowBuyMethodControlsMixin:
         # 마지막+1 회차 활성화는 반드시 생성 시점의 로컬 위젯 참조에 묶는다.
         additional_active_check = self.buy_additional_active_check
         additional_active_method_combo = self.buy_additional_active_method_combo
+        additional_active_direction_combo = self.buy_additional_active_direction_combo
+        additional_active_compare_combo = self.buy_additional_active_compare_combo
         additional_active_detail_row_widget = self.buy_additional_active_detail_row_widget
         additional_active_detail_widgets = self._buy_additional_active_detail_widgets
         price_compare_skip_check = self.buy_price_compare_skip_check
@@ -890,6 +948,16 @@ class IndicatorFollowBuyMethodControlsMixin:
         price_compare_skip_check.toggled.connect(update_additional_active_state_local)
         additional_active_check.toggled.connect(update_additional_active_state_local)
         additional_active_method_combo.currentIndexChanged.connect(update_additional_active_state_local)
+        additional_active_direction_combo.currentTextChanged.connect(
+            lambda *_args: sync_active_buy_direction_comparator(
+                additional_active_direction_combo,
+                additional_active_compare_combo,
+            )
+        )
+        sync_active_buy_direction_comparator(
+            additional_active_direction_combo,
+            additional_active_compare_combo,
+        )
 
         if not hasattr(self, "_buy_additional_active_state_updaters"):
             self._buy_additional_active_state_updaters = []
@@ -954,10 +1022,11 @@ class IndicatorFollowBuyMethodControlsMixin:
             slot_enabled_check = QCheckBox(row_widget)
             slot_enabled_check.setVisible(False)
             slot_enabled_check.setChecked(not optional)
-            left_items = ["무설정", "주문가", "현재가", "평단가"] if optional else ["주문가", "현재가", "평단가"]
-            left_combo = make_combo(left_items, "무설정" if optional else "주문가", 82)
+            left_items = ["무설정", "신호가", "현재가", "평단가"] if optional else ["신호가", "현재가", "평단가"]
+            left_combo = make_combo(left_items, "무설정" if optional else "신호가", 82)
             left_combo_base_style = left_combo.styleSheet()
-            right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 82)
+            right_combo = make_combo(["신호가", "현재가", "평단가"], "현재가", 82)
+            bind_distinct_buy_price_combos(left_combo, right_combo)
             direction_combo = make_combo(["상향", "하향", "상하"], default_direction, 66)
             ratio_line = make_line("0.15", 46)
             compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 66)

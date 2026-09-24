@@ -174,6 +174,74 @@ def make_sell_price_combo(current, width, height):
     combo.currentIndexChanged.connect(clear_when_selected)
     return combo
 
+
+def bind_distinct_sell_price_combos(left_combo, right_combo):
+    """Keep SELL price-comparison operands distinct in every shared UI."""
+    syncing = False
+
+    def opposite(value):
+        return "평단가" if value == "현재가" else "현재가"
+
+    def sync(changed_combo, other_combo):
+        nonlocal syncing
+        if syncing:
+            return
+        value = str(changed_combo.currentText() or "").strip()
+        if value not in SELL_PRICE_COMBO_VALUES:
+            return
+        if str(other_combo.currentText() or "").strip() != value:
+            return
+        syncing = True
+        try:
+            other_combo.setCurrentText(opposite(value))
+        finally:
+            syncing = False
+
+    left_combo.currentTextChanged.connect(
+        lambda _text: sync(left_combo, right_combo)
+    )
+    right_combo.currentTextChanged.connect(
+        lambda _text: sync(right_combo, left_combo)
+    )
+    sync(left_combo, right_combo)
+
+def bind_distinct_sell_execution_price_combos(left_combo, right_combo):
+    """Keep execution price-comparison operands distinct across 3 price axes."""
+    syncing = False
+
+    def sync(changed_combo, other_combo):
+        nonlocal syncing
+        if syncing:
+            return
+        value = str(changed_combo.currentText() or "").strip()
+        if not value or str(other_combo.currentText() or "").strip() != value:
+            return
+        replacement = next(
+            (
+                other_combo.itemText(index)
+                for index in range(other_combo.count())
+                if str(other_combo.itemText(index) or "").strip()
+                not in {"", value}
+            ),
+            "",
+        )
+        if not replacement:
+            return
+        syncing = True
+        try:
+            other_combo.setCurrentText(replacement)
+        finally:
+            syncing = False
+
+    left_combo.currentTextChanged.connect(
+        lambda _text: sync(left_combo, right_combo)
+    )
+    right_combo.currentTextChanged.connect(
+        lambda _text: sync(right_combo, left_combo)
+    )
+    sync(left_combo, right_combo)
+
+
 class IndicatorFollowSellControlsMixin:
     def _make_sell_signal_condition_1_overview_controls(self):
         box = QGroupBox("적용필터")
@@ -300,6 +368,7 @@ class IndicatorFollowSellControlsMixin:
 
         gap_left_combo = make_sell_price_combo("평단가", 78, 30)
         gap_right_combo = make_sell_price_combo("현재가", 78, 30)
+        bind_distinct_sell_price_combos(gap_left_combo, gap_right_combo)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
             gap_left_combo,
@@ -474,6 +543,7 @@ class IndicatorFollowSellControlsMixin:
         sync_gap_compare_combo()
         gap_left_combo = make_sell_price_combo("평단가", 78, 32)
         gap_right_combo = make_sell_price_combo("현재가", 78, 32)
+        bind_distinct_sell_price_combos(gap_left_combo, gap_right_combo)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
             gap_left_combo,
@@ -592,6 +662,7 @@ class IndicatorFollowSellControlsMixin:
         sync_gap_compare_combo()
         gap_left_combo = make_sell_price_combo("평단가", 78, 32)
         gap_right_combo = make_sell_price_combo("현재가", 78, 32)
+        bind_distinct_sell_price_combos(gap_left_combo, gap_right_combo)
         gap_value_line = make_line("0.25", 44)
         gap_check = add_filter_row([
             gap_left_combo,
@@ -758,7 +829,7 @@ class IndicatorFollowSellControlsMixin:
             single_layout = QHBoxLayout(single_widget)
             single_layout.setContentsMargins(0, 0, 0, 0)
             single_layout.setSpacing(4)
-            single_combo = make_combo(["주문가", "시장가"], "주문가", 100)
+            single_combo = make_combo(["신호가", "시장가"], "신호가", 100)
             single_layout.addWidget(single_combo)
             single_layout.addStretch(1)
             row.addWidget(single_widget)
@@ -772,7 +843,7 @@ class IndicatorFollowSellControlsMixin:
             total_label = make_label("| 4호가", 70)
             multi_layout.addWidget(make_label("상향", 42))
             multi_layout.addWidget(up_line)
-            multi_layout.addWidget(make_label("/ 주문가 1 / 하향", 132))
+            multi_layout.addWidget(make_label("/ 신호가 1 / 하향", 132))
             multi_layout.addWidget(down_line)
             multi_layout.addWidget(total_label)
             multi_layout.addStretch(1)
@@ -819,7 +890,7 @@ class IndicatorFollowSellControlsMixin:
             time_unit = make_combo(["분", "초", "봉"], "초", 60)
             time_range = make_combo(["이내", "간격"], "이내", 76)
             time_count = make_line("3", 30)
-            time_order = make_combo(["주문가", "현재가"], "주문가", 92)
+            time_order = make_combo(["신호가", "현재가"], "신호가", 92)
             time_layout.addWidget(time_value)
             time_layout.addWidget(time_unit)
             time_layout.addWidget(time_range)
@@ -833,8 +904,9 @@ class IndicatorFollowSellControlsMixin:
             ratio_layout = QHBoxLayout(ratio_widget)
             ratio_layout.setContentsMargins(0, 0, 0, 0)
             ratio_layout.setSpacing(4)
-            left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-            right_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
+            left_combo = make_combo(["신호가", "현재가", "평단가"], "신호가", 92)
+            right_combo = make_combo(["신호가", "현재가", "평단가"], "현재가", 92)
+            bind_distinct_sell_execution_price_combos(left_combo, right_combo)
             direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
             value_line = make_line("0.15", 46)
             compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
@@ -910,8 +982,9 @@ class IndicatorFollowSellControlsMixin:
             price_layout = QHBoxLayout(price_widget)
             price_layout.setContentsMargins(0, 0, 0, 0)
             price_layout.setSpacing(4)
-            price_left = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-            price_right = make_combo(["주문가", "현재가", "평단가"], "현재가", 92)
+            price_left = make_combo(["신호가", "현재가", "평단가"], "신호가", 92)
+            price_right = make_combo(["신호가", "현재가", "평단가"], "현재가", 92)
+            bind_distinct_sell_execution_price_combos(price_left, price_right)
             price_direction = make_combo(["상향", "하향", "상하"], "상향", 76)
             price_value = make_line("0.15", 46)
             price_compare = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
@@ -973,8 +1046,9 @@ class IndicatorFollowSellControlsMixin:
                 row.addWidget(title_label)
                 row.addWidget(make_label("|", 8, Qt.AlignCenter))
 
-                left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-                right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 92)
+                left_combo = make_combo(["신호가", "현재가", "평단가"], "신호가", 92)
+                right_combo = make_combo(["신호가", "현재가", "평단가"], "현재가", 92)
+                bind_distinct_sell_execution_price_combos(left_combo, right_combo)
                 direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
                 value_line = make_line("0.15", 46)
                 compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)

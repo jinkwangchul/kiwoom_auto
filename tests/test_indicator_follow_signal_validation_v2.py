@@ -134,6 +134,7 @@ class _FakeWindow(QDialog):
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
     recent_stock_selected = pyqtSignal(object)
+    recent_stock_remove_requested = pyqtSignal(object)
 
     def __init__(self, stock, seed, parent=None):
         super().__init__(parent)
@@ -150,6 +151,7 @@ class _FakeWindow(QDialog):
         self.entry_commit_count = 0
         self.pool_installs = []
         self.signal_marker_batches = []
+        self.discarded_stock_codes = []
 
     def set_historical_candle_count(self, count):
         self.historical_candle_count = count
@@ -185,6 +187,15 @@ class _FakeWindow(QDialog):
         if stock == self.stock:
             return False
         self.stock = stock
+        self.snapshots.clear()
+        return True
+
+    def discard_validation_stock_if_matches(self, stock_code):
+        code = str(stock_code or "").strip()
+        if self.stock is None or self.stock.code != code:
+            return False
+        self.discarded_stock_codes.append(code)
+        self.stock = None
         self.snapshots.clear()
         return True
 
@@ -227,7 +238,16 @@ class _MemoryRecentStockStore:
         updated = (stock,) + tuple(
             candidate for candidate in self._stocks if candidate.code != stock.code
         )
-        updated = updated[:15]
+        updated = updated[:20]
+        if updated == self._stocks:
+            return False
+        self._stocks = updated
+        self.write_count += 1
+        return True
+
+    def remove(self, stock):
+        code = stock.code if isinstance(stock, ValidationStockRef) else str(stock or "")
+        updated = tuple(candidate for candidate in self._stocks if candidate.code != code)
         if updated == self._stocks:
             return False
         self._stocks = updated
@@ -1696,6 +1716,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertAlmostEqual(59.4, profit)
         self.assertEqual(100.0, average)
         self.assertEqual(120.0, sell_price)
+        self.assertEqual("300원", window.completed_cycle_table.item(0, 3).text())
+        self.assertEqual("+59원", window.completed_cycle_table.item(0, 7).text())
+        self.assertEqual("+19.80%", window.completed_cycle_table.item(0, 8).text())
         self.assertIn("+19.80%", window.estimated_return_label.text())
 
     def test_v2_averaging_disabled_uses_one_share_buys_and_simple_summary(self):
@@ -3758,6 +3781,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             entry_view.current_price_minimum,
             entry_view.current_price_maximum,
         )
+        entry_pane_heights = entry_view.lower_pane_heights
 
         expanded_replay = ValidationReplaySnapshot(
             stock=self.stock,
@@ -3782,6 +3806,16 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.set_historical_candle_count(777)
         window._set_time_view(120.0, 240.0, manually_adjusted=True)
         window._pan_chart_view(0.0, 80.0)
+        if window.canvas.lower_boundary_records():
+            first_boundary = window.canvas.lower_boundary_records()[0]
+            window.canvas._resize_lower_boundary_to(
+                0,
+                first_boundary["y"] - 24.0,
+            )
+            self.assertNotEqual(
+                entry_pane_heights,
+                window.canvas.lower_pane_heights,
+            )
         changed_bounds = window.current_price_bounds
         self.assertNotEqual(
             (entry_view.current_price_minimum, entry_view.current_price_maximum),
@@ -3818,6 +3852,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             entry_view.price_scale_manually_adjusted,
             window.price_scale_manually_adjusted,
         )
+        self.assertEqual(entry_pane_heights, window.canvas.lower_pane_heights)
 
     def test_chart_reset_keeps_existing_result_and_clears_transient_chart_selection(self):
         window = self._window()
@@ -4470,15 +4505,35 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertFalse(hasattr(window, "filter_result_table"))
         self.assertEqual(1, window.completed_cycle_table.rowCount())
         self.assertEqual(
-            ["회차", "매수구간", "매수횟수", "추정평단", "매도시각", "매도가", "추정수익률"],
+            [
+                "회차",
+                "매수구간",
+                "매수횟수",
+                "매수총액",
+                "평단",
+                "매도시각",
+                "매도가",
+                "손익",
+                "수익률",
+            ],
             [
                 window.completed_cycle_table.horizontalHeaderItem(column).text()
                 for column in range(window.completed_cycle_table.columnCount())
             ],
         )
         self.assertEqual(
-            ["1", "09/11 14:00", "1", "100", "09/11 14:02", "150", "+50.00%"],
-            [window.completed_cycle_table.item(0, column).text() for column in range(7)],
+            [
+                "1",
+                "09/11 14:00",
+                "1",
+                "100원",
+                "100",
+                "09/11 14:02",
+                "150",
+                "+50원",
+                "+50.00%",
+            ],
+            [window.completed_cycle_table.item(0, column).text() for column in range(9)],
         )
         self.assertIn("+50.00%", window.estimated_return_label.text())
 
@@ -4670,7 +4725,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual(1, len(callbacks))
             callbacks.pop()()
             self.assertEqual(1, second.initial_requests)
-            self.assertEqual((self.stock,), second.recent_stock_projections[-1])
+            self.assertEqual((), second.recent_stock_projections[-1])
             second.snapshots.append("window2-result")
 
             first.recent_stock_selected.emit(other)
@@ -4680,8 +4735,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual(other, flow.last_selected_stock)
             self.assertEqual((other, self.stock), flow.recent_stocks)
             self.assertEqual(2, recent_store.write_count)
-            self.assertEqual((other, self.stock), first.recent_stock_projections[-1])
-            self.assertEqual((other, self.stock), second.recent_stock_projections[-1])
+            self.assertEqual((self.stock,), first.recent_stock_projections[-1])
+            self.assertEqual((other,), second.recent_stock_projections[-1])
             self.assertEqual(0, second.validation_requests)
 
             changed_generation = flow._request_generation[id(first)]
@@ -4698,111 +4753,69 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual(other, third.stock)
             self.assertEqual(1, len(callbacks))
 
-    def test_recent_fit_confirmed_cache_delete_evicts_shared_and_window_pools(self):
-        first = self.stock
-        removed = ValidationStockRef("000660", "SK하이닉스")
-
-        class RetainStore(_MemoryRecentStockStore):
-            def retain_prefix(_self, stocks):
-                retained = tuple(stocks)
-                if retained == _self._stocks:
-                    return False
-                _self._stocks = retained
-                _self.write_count += 1
-                return True
-
-        cache = SimpleNamespace(delete_stock=Mock(return_value={
-            "ok": True,
-            "deleted_count": 2,
-        }))
+    def test_twenty_first_stock_purges_only_oldest_cache_and_pools(self):
+        newest = self.stock
+        oldest = ValidationStockRef("000001", "가장오래된종목")
+        recent = (newest,) + tuple(
+            ValidationStockRef(f"{index:06d}", f"종목{index}")
+            for index in range(2, 20)
+        ) + (oldest,)
+        incoming = ValidationStockRef("000021", "새종목")
+        cache = SimpleNamespace(delete_stock=Mock(return_value={"ok": True, "deleted_count": 2}))
         broker = _FakeBroker(True)
-        store = RetainStore((first, removed))
+        store = _MemoryRecentStockStore(recent)
         flow = IndicatorFollowSignalValidationFlow(
             broker,
-            host=_FakeHost(first),
+            host=_FakeHost(newest),
             recent_stock_store=store,
             historical_cache=cache,
         )
-        window = _FakeWindow(first, self._seed())
+        window = _FakeWindow(oldest, self._seed())
         self.widgets.append(window)
         key = id(window)
         flow._open_windows[key] = window
-        flow._historical_pools[key] = {"stock": removed, "candles": [{}]}
+        flow._historical_pools[key] = {"stock": oldest, "candles": [{}]}
         flow._validation_sessions[key] = object()
         flow._request_generation[key] = 4
         flow._active_providers[(key, 4)] = object()
-        shared_key = (id(broker), removed.code, "M1", "000660")
+        shared_key = (id(broker), oldest.code, "M1", "000001")
         flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[shared_key] = {
-            "stock": removed,
-            "candles": [{}],
+            "stock": oldest, "candles": [{}]
         }
 
-        with patch.object(
-            flow_module.QMessageBox,
-            "question",
-            return_value=flow_module.QMessageBox.Yes,
-        ) as question, patch.object(flow_module.QTimer, "singleShot"):
-            flow._retain_recent_stock_projection(window, (first,))
+        self.assertTrue(flow._remember_stock(incoming))
 
-        self.assertIn("000660 SK하이닉스", question.call_args.args[2])
-        cache.delete_stock.assert_called_once_with("000660")
+        self.assertEqual(20, len(store.recent_stocks))
+        self.assertEqual(incoming, store.recent_stocks[0])
+        self.assertNotIn(oldest, store.recent_stocks)
+        self.assertIn(newest, store.recent_stocks)
+        cache.delete_stock.assert_called_once_with(oldest.code)
         self.assertNotIn(key, flow._historical_pools)
-        self.assertNotIn(
-            shared_key,
-            flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS,
-        )
+        self.assertNotIn(shared_key, flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS)
         self.assertNotIn(key, flow._validation_sessions)
         self.assertNotIn((key, 4), flow._active_providers)
+        self.assertEqual([oldest.code], window.discarded_stock_codes)
         self.assertEqual(5, flow._request_generation[key])
 
-    def test_recent_fit_declined_cache_delete_preserves_cache_and_memory(self):
-        first = self.stock
-        removed = ValidationStockRef("000660", "SK하이닉스")
-
-        class RetainStore(_MemoryRecentStockStore):
-            def retain_prefix(_self, stocks):
-                retained = tuple(stocks)
-                if retained == _self._stocks:
-                    return False
-                _self._stocks = retained
-                return True
-
-        cache = SimpleNamespace(delete_stock=Mock())
-        broker = _FakeBroker(True)
+    def test_restored_overflow_purges_evicted_stock_cache(self):
+        cache = SimpleNamespace(delete_stock=Mock(return_value={"ok": True}))
+        store = _MemoryRecentStockStore((self.stock,))
+        store.startup_evicted_codes = ("000001",)
         flow = IndicatorFollowSignalValidationFlow(
-            broker,
-            host=_FakeHost(first),
-            recent_stock_store=RetainStore((first, removed)),
-            historical_cache=cache,
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            recent_stock_store=store, historical_cache=cache,
         )
-        window = _FakeWindow(first, self._seed())
-        self.widgets.append(window)
-        key = id(window)
-        flow._open_windows[key] = window
-        flow._historical_pools[key] = {"stock": removed, "candles": [{}]}
 
-        with patch.object(
-            flow_module.QMessageBox,
-            "question",
-            return_value=flow_module.QMessageBox.No,
-        ), patch.object(flow_module.QTimer, "singleShot"):
-            flow._retain_recent_stock_projection(window, (first,))
+        self.assertEqual((self.stock,), flow.recent_stocks)
+        cache.delete_stock.assert_called_once_with("000001")
 
-        cache.delete_stock.assert_not_called()
-        self.assertIn(key, flow._historical_pools)
-
-    def test_recent_fit_failed_cache_delete_preserves_memory(self):
+    def test_twenty_first_stock_purges_memory_when_persistent_delete_fails(self):
         first = self.stock
-        removed = ValidationStockRef("000660", "SK????")
-
-        class RetainStore(_MemoryRecentStockStore):
-            def retain_prefix(_self, stocks):
-                retained = tuple(stocks)
-                if retained == _self._stocks:
-                    return False
-                _self._stocks = retained
-                return True
-
+        removed = ValidationStockRef("000001", "가장오래된종목")
+        recent = (first,) + tuple(
+            ValidationStockRef(f"{index:06d}", f"종목{index}")
+            for index in range(2, 20)
+        ) + (removed,)
         cache = SimpleNamespace(delete_stock=Mock(return_value={
             "ok": False,
             "deleted_count": 0,
@@ -4812,7 +4825,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         flow = IndicatorFollowSignalValidationFlow(
             broker,
             host=_FakeHost(first),
-            recent_stock_store=RetainStore((first, removed)),
+            recent_stock_store=_MemoryRecentStockStore(recent),
             historical_cache=cache,
         )
         window = _FakeWindow(first, self._seed())
@@ -4820,95 +4833,74 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         key = id(window)
         flow._open_windows[key] = window
         flow._historical_pools[key] = {"stock": removed, "candles": [{}]}
+        shared_key = (id(broker), removed.code, "M1", "000001")
+        flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[shared_key] = {
+            "stock": removed,
+            "candles": [{}],
+        }
+
+        flow._remember_stock(ValidationStockRef("000021", "새종목"))
+
+        cache.delete_stock.assert_called_once_with("000001")
+        self.assertNotIn(key, flow._historical_pools)
+        self.assertNotIn(shared_key, flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS)
+
+    def test_recent_manual_remove_immediately_purges_current_stock(self):
+        retained = self.stock
+        removed = ValidationStockRef("000660", "SK\ud558\uc774\ub2c9\uc2a4")
+        cache = SimpleNamespace(delete_stock=Mock(return_value={"ok": True, "deleted_count": 2}))
+        broker = _FakeBroker(True)
+        store = _MemoryRecentStockStore((removed, retained))
+        flow = IndicatorFollowSignalValidationFlow(
+            broker,
+            host=_FakeHost(removed),
+            recent_stock_store=store,
+            historical_cache=cache,
+        )
+        window = _FakeWindow(removed, self._seed())
+        self.widgets.append(window)
+        key = id(window)
+        flow._open_windows[key] = window
+        flow._request_generation[key] = 2
+        flow._historical_pools[key] = {"stock": removed, "candles": [{}]}
         shared_key = (id(broker), removed.code, "M1", "000660")
         flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[shared_key] = {
             "stock": removed,
             "candles": [{}],
         }
 
-        with patch.object(
-            flow_module.QMessageBox,
-            "question",
-            return_value=flow_module.QMessageBox.Yes,
-        ), patch.object(flow_module.QTimer, "singleShot"):
-            flow._retain_recent_stock_projection(window, (first,))
+        with patch.object(flow_module.QTimer, "singleShot"):
+            flow._remove_recent_stock_for_window(window, removed)
 
+        self.assertEqual((retained,), store.recent_stocks)
         cache.delete_stock.assert_called_once_with("000660")
-        self.assertIn(key, flow._historical_pools)
-        self.assertIn(
-            shared_key,
-            flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS,
-        )
+        self.assertIsNone(window.stock)
+        self.assertEqual(["000660"], window.discarded_stock_codes)
+        self.assertNotIn(key, flow._historical_pools)
+        self.assertNotIn(shared_key, flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS)
+        self.assertEqual(retained, flow.last_selected_stock)
 
-    def test_recent_fit_lets_operator_choose_removed_cache_per_stock(self):
+    def test_current_stock_is_hidden_only_from_each_window_projection(self):
         first = self.stock
-        remove_yes = ValidationStockRef("000660", "\u0053\u004b\ud558\uc774\ub2c9\uc2a4")
-        remove_no = ValidationStockRef("035420", "NAVER")
-
-        class RetainStore(_MemoryRecentStockStore):
-            def retain_prefix(_self, stocks):
-                retained = tuple(stocks)
-                if retained == _self._stocks:
-                    return False
-                _self._stocks = retained
-                return True
-
-        cache = SimpleNamespace(delete_stock=Mock(return_value={
-            "ok": True,
-            "deleted_count": 1,
-        }))
-        broker = _FakeBroker(True)
+        second = ValidationStockRef("000660", "SK하이닉스")
+        third = ValidationStockRef("035420", "NAVER")
+        store = _MemoryRecentStockStore((first, second, third))
+        cache = SimpleNamespace(delete_stock=Mock())
         flow = IndicatorFollowSignalValidationFlow(
-            broker,
-            host=_FakeHost(first),
-            recent_stock_store=RetainStore((first, remove_yes, remove_no)),
-            historical_cache=cache,
+            _FakeBroker(True), host=_FakeHost(first),
+            recent_stock_store=store, historical_cache=cache,
         )
-        window = _FakeWindow(first, self._seed())
-        self.widgets.append(window)
-        yes_key = id(window)
-        no_key = yes_key + 1
-        flow._open_windows[yes_key] = window
-        flow._historical_pools[yes_key] = {"stock": remove_yes, "candles": [{}]}
-        flow._historical_pools[no_key] = {"stock": remove_no, "candles": [{}]}
-        shared_yes = (id(broker), remove_yes.code, "M1", "000660")
-        shared_no = (id(broker), remove_no.code, "M1", "035420")
-        flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[shared_yes] = {
-            "stock": remove_yes,
-            "candles": [{}],
-        }
-        flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[shared_no] = {
-            "stock": remove_no,
-            "candles": [{}],
-        }
+        first_window = _FakeWindow(first, self._seed())
+        second_window = _FakeWindow(second, self._seed())
+        self.widgets.extend((first_window, second_window))
+        flow._open_windows[id(first_window)] = first_window
+        flow._open_windows[id(second_window)] = second_window
 
-        with patch.object(
-            flow_module.QMessageBox,
-            "question",
-            side_effect=[
-                flow_module.QMessageBox.Yes,
-                flow_module.QMessageBox.No,
-            ],
-        ) as question, patch.object(flow_module.QTimer, "singleShot"):
-            flow._retain_recent_stock_projection(window, (first,))
-
-        self.assertEqual(2, question.call_count)
-        self.assertTrue(
-            all("삭제" in call.args[2] for call in question.call_args_list)
-        )
-        self.assertIn("000660 SK\ud558\uc774\ub2c9\uc2a4", question.call_args_list[0].args[2])
-        self.assertIn("035420 NAVER", question.call_args_list[1].args[2])
-        cache.delete_stock.assert_called_once_with("000660")
-        self.assertNotIn(yes_key, flow._historical_pools)
-        self.assertIn(no_key, flow._historical_pools)
-        self.assertNotIn(
-            shared_yes,
-            flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS,
-        )
-        self.assertIn(
-            shared_no,
-            flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS,
-        )
+        flow._refresh_open_window_stock_projections()
+        self.assertEqual((second, third), first_window.recent_stock_projections[-1])
+        self.assertEqual((first, third), second_window.recent_stock_projections[-1])
+        self.assertEqual((first, second, third), store.recent_stocks)
+        cache.delete_stock.assert_not_called()
 
     def test_selected_stock_snapshot_merges_static_metadata_and_rejects_stale_result(self):
         first = self.stock

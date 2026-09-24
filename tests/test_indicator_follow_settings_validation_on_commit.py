@@ -876,8 +876,8 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 dialog.buy_situation_response_setting1_ratio_line.setText("0.15")
                 dialog.buy_situation_response_setting1_compare_combo.setCurrentText("이상")
                 dialog.buy_situation_response_setting1_action_combo.setCurrentText("일괄취소")
-                dialog.buy_situation_response_setting2_left_combo.setCurrentText("평단가")
-                dialog.buy_situation_response_setting2_right_combo.setCurrentText("현재가")
+                dialog.buy_situation_response_setting2_left_combo.setCurrentText("신호가")
+                dialog.buy_situation_response_setting2_right_combo.setCurrentText("평단가")
                 dialog.buy_situation_response_setting2_direction_combo.setCurrentText("하향")
                 dialog.buy_situation_response_setting2_ratio_line.setText("0.10")
                 dialog.buy_situation_response_setting2_compare_combo.setCurrentText("이하")
@@ -907,8 +907,8 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                     {
                         "slot": "SETTING2",
                         "enabled": True,
-                        "left_source": "AVG_PRICE",
-                        "right_source": "CURRENT_PRICE",
+                        "left_source": "SIGNAL_PRICE",
+                        "right_source": "AVG_PRICE",
                         "direction": "DOWN",
                         "threshold_percent": 0.10,
                         "compare": "<=",
@@ -928,8 +928,8 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                         "setting1_ratio_line": "0.15",
                         "setting1_compare_combo": "이상",
                         "setting1_action_combo": "일괄취소",
-                        "setting2_left_combo": "평단가",
-                        "setting2_right_combo": "현재가",
+                        "setting2_left_combo": "신호가",
+                        "setting2_right_combo": "평단가",
                         "setting2_direction_combo": "하향",
                         "setting2_ratio_line": "0.10",
                         "setting2_compare_combo": "이하",

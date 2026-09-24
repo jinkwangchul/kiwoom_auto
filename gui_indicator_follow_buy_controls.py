@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
 
 from gui_indicator_follow_buy_method_controls import (
     IndicatorFollowBuyMethodControlsMixin,
+    bind_distinct_buy_price_combos,
     sync_buy_direction_comparator,
 )
 from indicator_follow_settings_compatibility import legacy_buy_bollinger_sign
@@ -464,7 +465,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         single_hoga_layout = QHBoxLayout(single_hoga_widget)
         single_hoga_layout.setContentsMargins(0, 0, 0, 0)
         single_hoga_layout.setSpacing(4)
-        cycle_order_combo = make_combo(["주문가", "현재가", "시장가"], "주문가", 92)
+        cycle_order_combo = make_combo(["신호가", "현재가", "시장가"], "신호가", 92)
         single_hoga_layout.addWidget(cycle_order_combo)
         single_hoga_layout.addStretch(1)
         hoga_stack.addWidget(single_hoga_widget)
@@ -529,7 +530,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         cycle_time_unit_combo = make_combo(["분", "초", "봉"], "초", 60)
         cycle_time_range_combo = make_combo(["이내", "간격"], "이내", 76)
         cycle_time_count_line = make_line("3", 30)
-        cycle_time_order_combo = make_combo(["주문가", "현재가"], "현재가", 92)
+        cycle_time_order_combo = make_combo(["신호가", "현재가"], "현재가", 92)
         cycle_multi_time_layout.addWidget(cycle_time_value_line)
         cycle_multi_time_layout.addWidget(cycle_time_unit_combo)
         cycle_multi_time_layout.addWidget(cycle_time_range_combo)
@@ -543,8 +544,9 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         cycle_ratio_layout = QHBoxLayout(cycle_ratio_widget)
         cycle_ratio_layout.setContentsMargins(0, 0, 0, 0)
         cycle_ratio_layout.setSpacing(4)
-        cycle_ratio_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-        cycle_ratio_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 92)
+        cycle_ratio_left_combo = make_combo(["신호가", "현재가", "평단가"], "신호가", 92)
+        cycle_ratio_right_combo = make_combo(["신호가", "현재가", "평단가"], "현재가", 92)
+        bind_distinct_buy_price_combos(cycle_ratio_left_combo, cycle_ratio_right_combo)
         cycle_ratio_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         cycle_ratio_value_line = make_line("0.15", 46)
         cycle_ratio_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)
@@ -617,8 +619,9 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         exit_price_row.addWidget(exit_price_check)
         exit_price_row.addWidget(make_label("가격비교", 92))
         exit_price_row.addWidget(make_label("|", 8, Qt.AlignCenter))
-        exit_price_left_combo = make_combo(["주문가", "현재가", "평단가"], "주문가", 92)
-        exit_price_right_combo = make_combo(["주문가", "현재가", "평단가"], "현재가", 92)
+        exit_price_left_combo = make_combo(["신호가", "현재가", "평단가"], "신호가", 92)
+        exit_price_right_combo = make_combo(["신호가", "현재가", "평단가"], "현재가", 92)
+        bind_distinct_buy_price_combos(exit_price_left_combo, exit_price_right_combo)
         exit_price_direction_combo = make_combo(["상향", "하향", "상하"], "상향", 76)
         exit_price_value_line = make_line("0.15", 46)
         exit_price_compare_combo = make_combo(["이상", "이하", "이내", "이탈"], "이상", 76)

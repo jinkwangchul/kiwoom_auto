@@ -36,9 +36,9 @@ def _entry(side, index, candles):
 
 
 class ValidationVirtualExecutionTest(unittest.TestCase):
-    def test_virtual_fill_price_requires_complete_positive_ohlc(self):
+    def test_virtual_fill_price_uses_positive_close_only(self):
         self.assertEqual(
-            102.5,
+            110.0,
             validation_virtual_fill_price({
                 "open": 100,
                 "high": 110,
@@ -46,10 +46,11 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
                 "close": 110,
             }),
         )
-        self.assertIsNone(validation_virtual_fill_price({"close": 100}))
-        self.assertIsNone(validation_virtual_fill_price({
+        self.assertEqual(100.0, validation_virtual_fill_price({"close": 100}))
+        self.assertEqual(105.0, validation_virtual_fill_price({
             "open": 100, "high": 110, "low": 0, "close": 105,
         }))
+        self.assertIsNone(validation_virtual_fill_price({"close": -1}))
 
     def test_first_buy_is_one_share_and_single_sell_closes_all(self):
         candles = _candles([100, 110])
@@ -205,7 +206,7 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
         self.assertAlmostEqual((100 + 80 * 2) / 3, simulation.cycles[0].average_buy_price)
         self.assertEqual(3, simulation.cycles[0].buy_quantity)
 
-    def test_active_buy_target_uses_candle_close_not_virtual_fill_price(self):
+    def test_active_buy_target_and_fill_use_same_candle_close_price(self):
         candles = [
             {
                 "time": "20260918090000",
@@ -249,10 +250,10 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
         )
 
         buys = [fill for fill in simulation.fills if fill.side == "BUY"]
-        self.assertEqual([1, 2], [fill.quantity for fill in buys])
-        self.assertEqual(92.5, buys[1].price)
+        self.assertEqual([1, 3], [fill.quantity for fill in buys])
+        self.assertEqual(110.0, buys[1].price)
         self.assertAlmostEqual(
-            (150.0 + 92.5 * 2) / 3,
+            (150.0 + 110.0 * 3) / 4,
             simulation.cycles[0].average_buy_price,
         )
 

@@ -17,8 +17,8 @@ def _additional(*, skip: bool = False, last: bool = False, method: str = "MARKET
     return {
         "previous_round_price_skip": {
             "enabled": skip,
-            "reference_source": "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
-            "current_source": "ACTIONABLE_ORDER_PRICE",
+            "reference_source": "PREVIOUS_CONFIRMED_BUY_SIGNAL_PRICE",
+            "current_source": "CURRENT_SIGNAL_PRICE",
             "direction": "UP",
             "ratio_percent": 5.0,
             "comparator": ">=",
@@ -32,11 +32,11 @@ def _additional(*, skip: bool = False, last: bool = False, method: str = "MARKET
             "max_occurrences": 1,
             "method": method,
             "active_condition": {
-                "lhs_source": "ACTIONABLE_ORDER_PRICE",
+                "lhs_source": "SIGNAL_PRICE",
                 "rhs_source": "AVERAGE_PRICE",
                 "direction": "DOWN",
                 "ratio_percent": 5.0,
-                "comparator": ">=",
+                "comparator": "<=",
             },
             "budget_basis": "LAST_NORMAL_ROUND_APPROVED_BUDGET",
             "terminal_after_completed_fill": True,
@@ -52,7 +52,7 @@ def _cycle_policy(*, hoga: str = "SINGLE", point: str = "NONE", situation: str =
         point_policy.update(value=1, unit="SECOND", range="INTERVAL", count=3, order_price_basis="CURRENT_PRICE")
     elif point == "MULTI_RATIO":
         point_policy.update(
-            left_source="ORDER_PRICE", right_source="CURRENT_PRICE", direction="UP",
+            left_source="SIGNAL_PRICE", right_source="CURRENT_PRICE", direction="UP",
             ratio_percent=0.5, comparator=">=", count=3,
         )
     unfilled = {
@@ -64,14 +64,14 @@ def _cycle_policy(*, hoga: str = "SINGLE", point: str = "NONE", situation: str =
     if situation == "RESET":
         unfilled = {"policy": "CANCEL_PENDING_ORDER", "enabled": False}
         price_responses = [{
-            "slot": "SETTING1", "enabled": True, "left_source": "ORDER_PRICE",
+            "slot": "SETTING1", "enabled": True, "left_source": "SIGNAL_PRICE",
             "right_source": "CURRENT_PRICE", "direction": "UP",
             "threshold_percent": 1.0, "compare": ">=", "action": "RESET",
         }]
     elif situation == "CANCEL_BATCH":
         unfilled = {"policy": "CANCEL_PENDING_ORDER", "enabled": False}
         price_responses = [{
-            "slot": "SETTING1", "enabled": True, "left_source": "ORDER_PRICE",
+            "slot": "SETTING1", "enabled": True, "left_source": "SIGNAL_PRICE",
             "right_source": "CURRENT_PRICE", "direction": "UP",
             "threshold_percent": 1.0, "compare": ">=", "action": "CANCEL_BATCH",
         }]
@@ -143,32 +143,36 @@ class PreviousRoundPriceSkipConsumerTest(unittest.TestCase):
         self.assertEqual("READY", self.helper._build(rules=self.rules(), price=110)["status"])
 
     def test_match_skips_only_current_generation_without_round_effect(self) -> None:
-        cycle = self.helper._cycle(1, last_confirmed_buy_order_price=100)
+        cycle = self.helper._cycle(1, last_confirmed_buy_signal_price=100)
         result = self.helper._build(rules=self.rules(), cycle=cycle, price=110)
         self.assertEqual("BUY_GENERATION_SKIPPED_BY_PREVIOUS_ROUND_PRICE", result["reason"])
         self.assertEqual([], result["execution_intents"])
         self.assertFalse(result["decision"]["round_increment"])
 
     def test_non_match_and_new_price_re_evaluate(self) -> None:
-        cycle = self.helper._cycle(1, last_confirmed_buy_order_price=100)
+        cycle = self.helper._cycle(1, last_confirmed_buy_signal_price=100)
         self.assertEqual("READY", self.helper._build(rules=self.rules(), cycle=cycle, price=102)["status"])
         self.assertEqual(
             "BUY_GENERATION_SKIPPED_BY_PREVIOUS_ROUND_PRICE",
             self.helper._build(rules=self.rules(), cycle=cycle, price=110)["reason"],
         )
 
-    def test_missing_previous_or_market_actionable_price_fails_closed(self) -> None:
+    def test_missing_previous_fails_closed_and_signal_compare_needs_no_actionable_price(self) -> None:
         self.assertEqual(
-            "PREVIOUS_ROUND_PRICE_UNAVAILABLE",
+            "PREVIOUS_ROUND_SIGNAL_PRICE_UNAVAILABLE",
             self.helper._build(rules=self.rules(), cycle=self.helper._cycle(1), price=110)["reason"],
         )
         market = self.helper._rules(price_basis="MARKET")
         market["buy"]["execution"]["additional"] = _additional(skip=True)
-        self.assertEqual(
-            "PRICE_EVIDENCE_STALE",
-            self.helper._build(rules=market, cycle=self.helper._cycle(1, last_confirmed_buy_order_price=100),
-                               price=110, actionable_price=None)["reason"],
+        result = self.helper._build(
+            rules=market,
+            cycle=self.helper._cycle(1, last_confirmed_buy_signal_price=100),
+            price=110,
+            actionable_price=None,
         )
+        self.assertEqual("BUY_GENERATION_SKIPPED_BY_PREVIOUS_ROUND_PRICE", result["reason"])
+        self.assertEqual(100, result["decision"]["previous_confirmed_signal_price"])
+        self.assertEqual(110, result["decision"]["current_signal_price"])
 
 
 class LastPlusOneConsumerTest(unittest.TestCase):
@@ -212,12 +216,40 @@ class LastPlusOneConsumerTest(unittest.TestCase):
             self.assertEqual(3, intent["quantity"])
             self.assertEqual("LAST_NORMAL_ROUND_APPROVED_BUDGET", intent["budget_reference"])
 
-    def test_active_condition_does_not_consume_occurrence_when_false(self) -> None:
-        passed = self.helper._build(rules=self.rules("ACTIVE"), cycle=self.cycle(), price=100)
-        failed = self.helper._build(rules=self.rules("ACTIVE"), cycle=self.cycle(avg_price=110), price=100)
-        self.assertEqual("READY", passed["status"])
-        self.assertEqual("LAST_PLUS_ONE_ACTIVE_CONDITION_NOT_MET", failed["reason"])
-        self.assertFalse(failed["decision"]["occurrence_consumed"])
+    def test_active_condition_buys_only_when_correction_is_needed(self) -> None:
+        required = self.helper._build(rules=self.rules("ACTIVE"), cycle=self.cycle(), price=100)
+        not_required = self.helper._build(
+            rules=self.rules("ACTIVE"),
+            cycle=self.cycle(avg_price=110),
+            price=100,
+        )
+        self.assertEqual("READY", required["status"], required)
+        decision = required["execution_intent"]["last_plus_one_active_decision"]
+        self.assertTrue(decision["improves_toward_signal"])
+        self.assertFalse(decision["signal_boundary_crossed"])
+        self.assertGreater(decision["projected_average"], 90)
+        self.assertLessEqual(decision["projected_average"], 100)
+        self.assertEqual("LAST_PLUS_ONE_ACTIVE_BUY_NOT_REQUIRED", not_required["reason"])
+        self.assertTrue(not_required["decision"]["target_satisfied"])
+        self.assertFalse(not_required["decision"]["occurrence_consumed"])
+
+    def test_active_condition_blocks_worsening_or_signal_boundary_crossing(self) -> None:
+        worsening = self.helper._build(
+            rules=self.rules("ACTIVE"),
+            cycle=self.cycle(),
+            price=100,
+            actionable_price=80,
+        )
+        crossing = self.helper._build(
+            rules=self.rules("ACTIVE"),
+            cycle=self.cycle(),
+            price=100,
+            actionable_price=120,
+        )
+        self.assertEqual("LAST_PLUS_ONE_ACTIVE_DOES_NOT_IMPROVE_AVERAGE", worsening["reason"])
+        self.assertFalse(worsening["decision"]["improves_toward_signal"])
+        self.assertEqual("LAST_PLUS_ONE_ACTIVE_SIGNAL_BOUNDARY_WOULD_CROSS", crossing["reason"])
+        self.assertTrue(crossing["decision"]["signal_boundary_crossed"])
 
     def test_pending_and_completed_are_duplicate_safe(self) -> None:
         pending = self.helper._build(rules=self.rules("MARKET"), cycle=self.cycle(last_plus_one_pending=True), price=100)
@@ -245,13 +277,13 @@ class LastRoundActiveConsumerTest(unittest.TestCase):
         base["last_round_active_buy"] = {
             "enabled": True, "applies_to": "LAST_MULTI_POINT_CHILD", "budget_policy_override": "NONE",
             "purpose": "BUY_METHOD_SPECIAL_ACTION", "subject": "AVERAGE_PRICE",
-            "reference": "MULTI_POINT_SET_PRICE", "direction": "UP", "ratio_percent": 5, "comparator": ">=",
+            "reference": "SIGNAL_PRICE", "direction": "UP", "ratio_percent": 0.5, "comparator": "<=",
         }
         if mode == "MULTI_TIME":
             base.update(point_mode=mode, point_count=3, point_value=1, point_unit="SECOND",
                         point_range="INTERVAL", time_order_price_basis="CURRENT_PRICE")
         else:
-            base.update(point_mode=mode, ratio_count=3, ratio_left="ORDER_PRICE", ratio_right="CURRENT_PRICE",
+            base.update(point_mode=mode, ratio_count=3, ratio_left="SIGNAL_PRICE", ratio_right="CURRENT_PRICE",
                         ratio_direction="UP", ratio_value=0.5, ratio_compare=">=")
         return rules
 
@@ -277,6 +309,35 @@ class LastRoundActiveConsumerTest(unittest.TestCase):
                     sum(item["budget"] for item in skipped["execution_intents"]),
                     skipped["execution_intents"][0]["multi_time_plan" if mode == "MULTI_TIME" else "multi_ratio_plan"]["planned_total_budget"],
                 )
+
+    def test_last_child_never_pushes_projected_average_through_signal_price(self) -> None:
+        rules = self.rules("MULTI_TIME")
+        rules["buy"]["execution"]["base"]["last_round_active_buy"].update(
+            ratio_percent=0.05,
+        )
+        result = self.helper._build(
+            rules=rules,
+            cycle=self.helper._cycle(
+                1,
+                holding_qty=10,
+                avg_price=101,
+                base_filled_buy_amount=300,
+                last_filled_buy_amount=300,
+                cumulative_filled_buy_amount=300,
+            ),
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 6},
+            price=100,
+            actionable_price=98,
+        )
+
+        self.assertEqual("READY", result["status"], result)
+        self.assertEqual(2, len(result["execution_intents"]))
+        decision = result["last_round_active_decision"]
+        self.assertFalse(decision["matched"])
+        self.assertEqual("ACTIVE_BUY_SIGNAL_BOUNDARY_WOULD_CROSS", decision["reason"])
+        self.assertGreater(decision["pre_last_average"], 100)
+        self.assertLess(decision["projected_average"], 100)
+        self.assertTrue(decision["signal_boundary_crossed"])
 
     def test_missing_average_and_non_multi_fail_closed(self) -> None:
         self.assertEqual(

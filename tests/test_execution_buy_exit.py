@@ -280,15 +280,41 @@ class BuyRepeatExitPolicyUnitTest(unittest.TestCase):
         result = evaluate_buy_exit_policy(
             policy=_policy(
                 {"condition_type": "COUNT", "target_repeat_generations": 1},
-                {"condition_type": "PRICE", "left_source": "ORDER_PRICE",
+                {"condition_type": "PRICE", "left_source": "SIGNAL_PRICE",
                  "right_source": "CURRENT_PRICE", "direction": "UP", "compare": ">=",
                  "threshold_percent": 1},
             ),
             completed_repeat_count=1, repeat_started_at=None, order_price=100,
-            current_price=None, average_price=None, now=datetime(2026, 9, 3, 10, 0),
+            current_price=None, average_price=None, signal_price=100,
+            now=datetime(2026, 9, 3, 10, 0),
         )
         self.assertTrue(result["triggered"])
         self.assertIn("BUY_REPEAT_EXIT_CURRENT_PRICE_UNAVAILABLE", result["waiting_reasons"])
+
+    def test_same_price_axis_is_rejected_as_invalid_policy(self) -> None:
+        result = evaluate_buy_exit_policy(
+            policy=_policy({
+                "condition_type": "PRICE",
+                "left_source": "SIGNAL_PRICE",
+                "right_source": "SIGNAL_PRICE",
+                "direction": "UP",
+                "compare": ">=",
+                "threshold_percent": 1,
+            }),
+            completed_repeat_count=0,
+            repeat_started_at=None,
+            order_price=100,
+            current_price=None,
+            average_price=95,
+            signal_price=100,
+            now=datetime(2026, 9, 3, 10, 0),
+        )
+
+        self.assertFalse(result["triggered"])
+        self.assertIn(
+            "BUY_REPEAT_EXIT_PRICE_POLICY_INVALID",
+            result["waiting_reasons"],
+        )
 
     def test_operation_cycle_runs_exit_before_reset_and_passes_process_block(self) -> None:
         from tests.indicator_follow_assigned_timer_fixture import (

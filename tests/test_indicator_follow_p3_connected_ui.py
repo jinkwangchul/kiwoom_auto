@@ -143,7 +143,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.assertTrue(hidden(self.dialog.buy_last_round_active_compare_combo.findText("이상")))
         self.assertFalse(hidden(self.dialog.buy_last_round_active_compare_combo.findText("이내")))
         self.dialog.buy_last_round_active_direction_combo.setCurrentText("하향")
-        self.assertEqual("이상", self.dialog.buy_last_round_active_compare_combo.currentText())
+        self.assertEqual("이하", self.dialog.buy_last_round_active_compare_combo.currentText())
 
     def test_base_multi_ratio_direction_uses_common_comparator_rule(self) -> None:
         direction = self.dialog.buy_base_ratio_direction_combo
@@ -320,7 +320,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.assertEqual(">", bottom.currentText())
 
     def test_situation_response_direction_uses_common_comparator_rule(self) -> None:
-        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
+        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("신호가")
         for slot in ("setting1", "setting2"):
             direction = getattr(self.dialog, f"buy_situation_response_{slot}_direction_combo")
             comparator = getattr(self.dialog, f"buy_situation_response_{slot}_compare_combo")
@@ -347,7 +347,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.assertFalse(self.dialog.buy_situation_response_price_enabled_check.isChecked())
         self.dialog.buy_situation_response_price_enabled_check.setChecked(True)
         self.assertFalse(self.dialog.buy_situation_response_unfilled_enabled_check.isChecked())
-        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("주문가")
+        self.dialog.buy_situation_response_setting2_left_combo.setCurrentText("신호가")
         self.dialog.buy_situation_response_setting1_direction_combo.setCurrentText("상하")
         self.dialog.buy_situation_response_setting1_compare_combo.setCurrentText("이탈")
         self.dialog.buy_situation_response_setting1_action_combo.setCurrentText("매수리셋")
@@ -590,7 +590,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
             rules=rules,
             cycle=helper._cycle(
                 1,
-                avg_price=110,
+                avg_price=90,
                 base_filled_buy_amount=300,
                 last_filled_buy_amount=300,
                 cumulative_filled_buy_amount=300,
@@ -684,32 +684,69 @@ class ConnectedBuyUiTest(unittest.TestCase):
         self.dialog.buy_base_detail_mode_combo.setCurrentText("능동매수")
         self.dialog.buy_base_active_direction_combo.setCurrentText("상하")
         self.dialog.buy_base_active_ratio_line.setText("1.25")
-        self.dialog.buy_base_active_compare_combo.setCurrentText("이탈")
+        self.assertEqual("이내", self.dialog.buy_base_active_compare_combo.currentText())
         repeat = self._candidate("repeat")["value"]
         self.assertEqual("ACTIVE_BUY", repeat["detail_mode"])
-        self.assertEqual(("BOTH", 1.25, "OUTSIDE"), (
+        self.assertEqual(("BOTH", 1.25, "WITHIN"), (
             repeat["active_direction"], repeat["active_ratio"], repeat["active_compare"]
         ))
 
-        # Repeat ACTIVE_BUY keeps all comparator choices visible regardless of
-        # direction and preserves intentionally unusual user combinations.
+        # ACTIVE_BUY is corrective: one-sided directions only allow "이하",
+        # while BOTH only allows "이내". Non-corrective comparators stay hidden.
         self.dialog.buy_base_active_direction_combo.setCurrentText("상향")
-        for label in ("이상", "이하", "이내", "이탈"):
-            index = self.dialog.buy_base_active_compare_combo.findText(label)
-            self.assertGreaterEqual(index, 0)
-            self.assertFalse(
-                self.dialog.buy_base_active_compare_combo.view().isRowHidden(index)
+        self.assertEqual("이하", self.dialog.buy_base_active_compare_combo.currentText())
+        visible = {
+            label: not self.dialog.buy_base_active_compare_combo.view().isRowHidden(
+                self.dialog.buy_base_active_compare_combo.findText(label)
             )
-        self.dialog.buy_base_active_compare_combo.setCurrentText("이탈")
-        free_repeat = self._candidate("repeat")["value"]
-        self.assertEqual(("UP", "OUTSIDE"), (
-            free_repeat["active_direction"], free_repeat["active_compare"]
+            for label in ("이상", "이하", "이내", "이탈")
+        }
+        self.assertEqual(
+            {"이상": False, "이하": True, "이내": False, "이탈": False},
+            visible,
+        )
+        corrective_repeat = self._candidate("repeat")["value"]
+        self.assertEqual(("UP", "<="), (
+            corrective_repeat["active_direction"], corrective_repeat["active_compare"]
         ))
 
         helper = buy_helper_module.IndicatorFollowBuyExecutionConnectionTest()
         rules = helper._rules(repeat_mode="ACTIVE_BUY")
         ready = helper._build(rules=rules, cycle=helper._cycle(1), price=100)
         self.assertEqual("READY", ready["status"], ready)
+
+    def test_repeat_active_commit_validator_rejects_non_corrective_comparator(self) -> None:
+        rules = deepcopy(self.base_rules)
+        rules["buy"]["execution"] = {
+            "repeat": {
+                "buy_phase": "REPEAT",
+                "starts_from_round": 2,
+                "apply_all": True,
+                "detail_mode": "ACTIVE_BUY",
+                "round_operator": "ADD",
+                "round_budget_value": 1.0,
+                "budget_ratio": 2.0,
+                "active_direction": "UP",
+                "active_ratio": 0.2,
+                "active_compare": ">=",
+            }
+        }
+        invalid = self.validator.validate_committed_rules(
+            deepcopy(rules), rules, [], {}
+        )
+        invalid_checks = {
+            item["name"]: item["ok"] for item in invalid["checks"]
+        }
+        self.assertFalse(invalid_checks["buy_repeat_active_policy_valid"])
+
+        rules["buy"]["execution"]["repeat"]["active_compare"] = "<="
+        valid = self.validator.validate_committed_rules(
+            deepcopy(rules), rules, [], {}
+        )
+        valid_checks = {
+            item["name"]: item["ok"] for item in valid["checks"]
+        }
+        self.assertTrue(valid_checks["buy_repeat_active_policy_valid"])
 
     def test_ui_policies_reach_p2_consumers_without_generic_downgrade(self) -> None:
         helper = buy_helper_module.IndicatorFollowBuyExecutionConnectionTest()
@@ -782,7 +819,7 @@ class ConnectedBuyUiTest(unittest.TestCase):
         advanced_text = self.dialog.advanced_tab.findChild(
             dialog_module.QTextEdit
         ).toPlainText()
-        self.assertIn("직전회차주문가 대비 현재주문가", advanced_text)
+        self.assertIn("직전회차신호가 대비 현재신호가", advanced_text)
         self.assertIn("ACTIVE_BUY_NOT_IMPLEMENTED", advanced_text)
         self.assertIn("순환 가격비교 일괄취소", advanced_text)
         self.assertNotIn("CYCLE_OPTION_EXECUTION_NOT_CONNECTED", advanced_text)

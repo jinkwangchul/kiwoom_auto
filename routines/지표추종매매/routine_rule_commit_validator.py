@@ -188,9 +188,16 @@ def validate_committed_rules(
                 and not isinstance(active_ratio, bool)
                 and isfinite(active_ratio)
                 and active_ratio >= 0
-                and _is_valid_direction_comparator_pair(
-                    repeat_policy.get("active_direction"),
-                    repeat_policy.get("active_compare"),
+                and repeat_policy.get("active_direction") in {"UP", "DOWN", "BOTH"}
+                and (
+                    (
+                        repeat_policy.get("active_direction") in {"UP", "DOWN"}
+                        and repeat_policy.get("active_compare") == "<="
+                    )
+                    or (
+                        repeat_policy.get("active_direction") == "BOTH"
+                        and repeat_policy.get("active_compare") == "WITHIN"
+                    )
                 )
             )
         add_check("buy_repeat_active_policy_valid", repeat_active_valid)
@@ -224,8 +231,9 @@ def validate_committed_rules(
             valid = (
                 policy.get("policy") == "BUY_PRICE_CHANGE_RESET"
                 and policy.get("action") == "RESET"
-                and policy.get("left_source") in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-                and policy.get("right_source") in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                and policy.get("left_source") in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                and policy.get("right_source") in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+                and policy.get("left_source") != policy.get("right_source")
                 and policy.get("direction") in {"UP", "DOWN", "BOTH"}
                 and policy.get("compare") in {">=", "<=", "WITHIN", "OUTSIDE"}
                 and direction_comparator_valid
@@ -249,8 +257,9 @@ def validate_committed_rules(
             and item.get("slot") in {"SETTING1", "SETTING2"}
             and item.get("enabled") is True
             and item.get("direction") in {"UP", "DOWN", "BOTH"}
-            and item.get("left_source") in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-            and item.get("right_source") in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            and item.get("left_source") in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            and item.get("right_source") in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            and item.get("left_source") != item.get("right_source")
             and _is_valid_direction_comparator_pair(item.get("direction"), item.get("compare"))
             and item.get("action") in {"RESET", "CANCEL_BATCH"}
             and isinstance(item.get("threshold_percent"), (int, float))
@@ -310,11 +319,20 @@ def validate_committed_rules(
                 and policy.get("budget_policy_override") == "NONE"
                 and policy.get("purpose") == "BUY_METHOD_SPECIAL_ACTION"
                 and policy.get("subject") == "AVERAGE_PRICE"
-                and policy.get("reference") == "MULTI_POINT_SET_PRICE"
+                and policy.get("reference") in {"SIGNAL_PRICE", "MULTI_POINT_SET_PRICE"}
                 and policy.get("direction") in {"UP", "DOWN", "BOTH"}
                 and isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
                 and isfinite(ratio) and ratio >= 0
-                and policy.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+                and (
+                    (
+                        policy.get("direction") in {"UP", "DOWN"}
+                        and policy.get("comparator") == "<="
+                    )
+                    or (
+                        policy.get("direction") == "BOTH"
+                        and policy.get("comparator") == "WITHIN"
+                    )
+                )
             )
         add_check("buy_last_round_active_policy_valid", valid)
         add_check("buy_last_round_active_execution_connected", valid)
@@ -340,8 +358,8 @@ def validate_committed_rules(
         )
         if valid and price_enabled:
             valid = (
-                price.get("reference_source") == "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE"
-                and price.get("current_source") == "ACTIONABLE_ORDER_PRICE"
+                price.get("reference_source") == "PREVIOUS_CONFIRMED_BUY_SIGNAL_PRICE"
+                and price.get("current_source") == "CURRENT_SIGNAL_PRICE"
                 and price.get("action") == "SKIP_CURRENT_GENERATION"
                 and price.get("skipped_round_increment") is False
                 and price.get("direction") in {"UP", "DOWN", "BOTH"}
@@ -361,10 +379,21 @@ def validate_committed_rules(
         if valid and last_enabled and last.get("method") == "ACTIVE":
             valid = (
                 isinstance(active, dict)
+                and active.get("lhs_source") == "SIGNAL_PRICE"
+                and active.get("rhs_source") == "AVERAGE_PRICE"
                 and active.get("direction") in {"UP", "DOWN", "BOTH"}
                 and isinstance(active_ratio, (int, float)) and not isinstance(active_ratio, bool)
                 and isfinite(active_ratio) and active_ratio >= 0
-                and active.get("comparator") in {">=", "<=", "WITHIN", "OUTSIDE"}
+                and (
+                    (
+                        active.get("direction") in {"UP", "DOWN"}
+                        and active.get("comparator") == "<="
+                    )
+                    or (
+                        active.get("direction") == "BOTH"
+                        and active.get("comparator") == "WITHIN"
+                    )
+                )
             )
         execution_connected = policy.get("execution_connected") is True
         add_check("buy_additional_policy_valid", valid)

@@ -39,16 +39,13 @@ def _number(value: Any) -> float | None:
 
 
 def validation_virtual_fill_price(candle: Mapping[str, Any]) -> float | None:
-    """Return the approved OHLC/4 Validation-only representative fill price."""
+    """Return the Validation-only signal/evaluation price (CLOSE)."""
     if not isinstance(candle, Mapping):
         return None
-    values: list[float] = []
-    for key in ("open", "high", "low", "close"):
-        number = _number(candle.get(key))
-        if number is None or number <= 0:
-            return None
-        values.append(number)
-    return sum(values) / 4.0
+    close = _number(candle.get("close"))
+    if close is None or close <= 0:
+        return None
+    return close
 
 
 def normalize_validation_execution_policy(value: Mapping[str, Any] | None) -> dict[str, Any]:

@@ -90,47 +90,65 @@ def calculate_active_buy_requirement(
     upper = reference * (1.0 + ratio / 100.0)
     base.update({"lower_price": lower, "upper_price": upper})
 
-    def satisfied(value: float) -> bool:
-        if direction_token == "UP":
-            return value >= upper if comparator_token == ">=" else value <= upper
-        if direction_token == "DOWN":
-            return value >= lower if comparator_token == ">=" else value <= lower
-        if comparator_token == "WITHIN":
-            return lower <= value <= upper
-        return value < lower or value > upper
-
-    if satisfied(average):
+    # ACTIVE_BUY is corrective. Direction describes where the confirmed
+    # average is located relative to the fixed signal price:
+    #   UP   = average above signal, pull it downward toward signal.
+    #   DOWN = average below signal, pull it upward toward signal.
+    #   BOTH = either side, pull it into the configured band.
+    # "이상"/"이탈" describe a state to preserve/observe; buying must never be
+    # used to manufacture a larger gap.
+    if comparator_token in {">=", "OUTSIDE"}:
         return {
             **base,
             "status": "NO_BUY",
-            "reason": "ACTIVE_BUY_NOT_REQUIRED",
+            "reason": "ACTIVE_BUY_NON_CORRECTIVE_CONDITION",
             "required_quantity": 0,
             "required_cost": 0.0,
             "projected_average": average,
         }
 
-    strict = direction_token == "BOTH" and comparator_token == "OUTSIDE"
     target: float
     desired: str
     if direction_token == "UP":
-        target = upper
-        desired = "ABOVE" if comparator_token == ">=" else "BELOW"
+        if average <= reference or average <= upper:
+            return {
+                **base,
+                "status": "NO_BUY",
+                "reason": "ACTIVE_BUY_NOT_REQUIRED",
+                "required_quantity": 0,
+                "required_cost": 0.0,
+                "projected_average": average,
+            }
+        target, desired = upper, "BELOW"
     elif direction_token == "DOWN":
-        target = lower
-        desired = "ABOVE" if comparator_token == ">=" else "BELOW"
-    elif comparator_token == "WITHIN":
+        if average >= reference or average >= lower:
+            return {
+                **base,
+                "status": "NO_BUY",
+                "reason": "ACTIVE_BUY_NOT_REQUIRED",
+                "required_quantity": 0,
+                "required_cost": 0.0,
+                "projected_average": average,
+            }
+        target, desired = lower, "ABOVE"
+    else:  # BOTH + WITHIN
+        if lower <= average <= upper:
+            return {
+                **base,
+                "status": "NO_BUY",
+                "reason": "ACTIVE_BUY_NOT_REQUIRED",
+                "required_quantity": 0,
+                "required_cost": 0.0,
+                "projected_average": average,
+            }
         if average > upper:
             target, desired = upper, "BELOW"
         else:
             target, desired = lower, "ABOVE"
-    else:
-        if price < lower:
-            target, desired = lower, "BELOW"
-        elif price > upper:
-            target, desired = upper, "ABOVE"
-        else:
-            return {**base, "status": "WAIT", "reason": "ACTIVE_BUY_WAIT_PRICE"}
 
+    # A weighted average can move toward the acquisition price only. If the
+    # actionable price is not beyond the target in the required direction, no
+    # finite whole-share BUY can reach the corrective target.
     if (desired == "ABOVE" and price <= target) or (
         desired == "BELOW" and price >= target
     ):
@@ -150,29 +168,45 @@ def calculate_active_buy_requirement(
             "reason": "ACTIVE_BUY_WAIT_PRICE",
             "target_price": target,
         }
-    required = math.floor(continuous) + 1 if strict else math.ceil(continuous)
-    required = max(1, required)
+    required = max(1, math.ceil(continuous))
 
     def projected(extra: int) -> float:
         return (average * q + price * extra) / (q + extra)
 
+    def target_satisfied(value: float) -> bool:
+        return value <= target if desired == "BELOW" else value >= target
+
     projected_average = projected(required)
-    if not satisfied(projected_average):
-        # For inclusive one-sided conditions the next whole share can be the
-        # first valid integer after floating-point rounding. A zero-width
-        # WITHIN band, however, may have no integer solution at all.
+    if not target_satisfied(projected_average):
         required += 1
         projected_average = projected(required)
-    if not satisfied(projected_average):
+    if not target_satisfied(projected_average):
         return {
             **base,
             "status": "WAIT",
             "reason": "ACTIVE_BUY_WAIT_INTEGER_SOLUTION",
             "target_price": target,
         }
-    while required > 1 and satisfied(projected(required - 1)):
+    while required > 1 and target_satisfied(projected(required - 1)):
         required -= 1
         projected_average = projected(required)
+
+    # The new average must remain between the original average and the fixed
+    # signal price. Whole-share rounding or a price beyond the signal must not
+    # push the position through that boundary.
+    tolerance = max(abs(reference), 1.0) * 1e-12
+    low_bound = min(average, reference) - tolerance
+    high_bound = max(average, reference) + tolerance
+    if not low_bound <= projected_average <= high_bound:
+        return {
+            **base,
+            "status": "NO_BUY",
+            "reason": "ACTIVE_BUY_SIGNAL_BOUNDARY_WOULD_CROSS",
+            "target_price": target,
+            "required_quantity": 0,
+            "required_cost": 0.0,
+            "projected_average": average,
+        }
     return {
         **base,
         "status": "READY",
@@ -182,7 +216,7 @@ def calculate_active_buy_requirement(
         "required_cost": required * price,
         "projected_average": projected_average,
         "continuous_quantity": continuous,
-        "strict_boundary": strict,
+        "strict_boundary": False,
     }
 
 

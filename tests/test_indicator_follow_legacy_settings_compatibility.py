@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 import unittest
 
@@ -18,6 +19,7 @@ from indicator_follow_settings_compatibility import (
     get_canonical_fresh_defaults,
     legacy_buy_bollinger_sign,
     legacy_sell_signed_percent_sign,
+    normalize_legacy_signal_price_ui_state,
     normalize_sell_selected_set_authority,
 )
 
@@ -258,6 +260,165 @@ class IndicatorFollowLegacySettingsCompatibilityTest(unittest.TestCase):
             "A",
             get_canonical_fresh_defaults("indicator_follow")["basic"]["buy_signal_expr_line"],
         )
+
+    def test_fresh_defaults_use_distinct_strategy_price_operands(self) -> None:
+        state = get_canonical_fresh_defaults("indicator_follow")
+        self.assertIsInstance(state, dict)
+
+        pairs = [
+            (state["buy_ui"]["base"], "ratio_left_combo", "ratio_right_combo"),
+            (state["buy_ui"]["cycle"], "buy_cycle_ratio_left_combo", "buy_cycle_ratio_right_combo"),
+            (state["buy_ui"]["situation"], "setting1_left_combo", "setting1_right_combo"),
+            (state["buy_ui"]["situation"], "setting2_left_combo", "setting2_right_combo"),
+            (state["buy_ui"]["exit"], "buy_exit_price_left_combo", "buy_exit_price_right_combo"),
+        ]
+        for setting in ("setting_a", "setting_b", "setting_c"):
+            execution = state["sell_ui"][setting]
+            pairs.extend([
+                (execution, "perform2_ratio_left", "perform2_ratio_right"),
+                (execution, "perform3_price_left", "perform3_price_right"),
+                (execution, "repeat_perform2_ratio_left", "repeat_perform2_ratio_right"),
+                (execution, "repeat_perform3_price_left", "repeat_perform3_price_right"),
+                (execution, "exit_price_left", "exit_price_right"),
+            ])
+
+        allowed = {"신호가", "현재가", "평단가"}
+        for container, left_key, right_key in pairs:
+            self.assertIn(container[left_key], allowed)
+            self.assertIn(container[right_key], allowed)
+            self.assertNotEqual(container[left_key], container[right_key])
+
+    def test_authoritative_ui_defaults_store_signal_price_labels(self) -> None:
+        rules = json.loads(self.rules_path.read_text(encoding="utf-8"))
+        state = rules["indicator_follow_ui_state"]["state"]
+
+        def legacy_paths(value, path=""):
+            if isinstance(value, dict):
+                return [
+                    found
+                    for key, item in value.items()
+                    for found in legacy_paths(item, f"{path}.{key}" if path else key)
+                ]
+            if isinstance(value, list):
+                return [
+                    found
+                    for index, item in enumerate(value)
+                    for found in legacy_paths(item, f"{path}[{index}]")
+                ]
+            return [path] if value == "주문가" else []
+
+        checked = {
+            "buy_ui": state["buy_ui"],
+            "sell_setting_a": state["sell_ui"]["setting_a"],
+            "sell_setting_b": state["sell_ui"]["setting_b"],
+            "sell_setting_c": state["sell_ui"]["setting_c"],
+        }
+        self.assertEqual([], legacy_paths(checked))
+
+    def test_legacy_buy_order_price_becomes_signal_price_without_rewriting_sell_signal_filter(self) -> None:
+        state = {
+            "buy_ui": {
+                "base": {
+                    "order_combo": "주문가",
+                    "ratio_left_combo": "주문가",
+                    "ratio_right_combo": "평단가",
+                },
+                "situation": {
+                    "setting1_left_combo": "주문가",
+                    "setting1_right_combo": "현재가",
+                },
+            },
+            "sell_ui": {
+                "signal_conditions": {
+                    "condition_a": {
+                        "gap_left_combo": "주문가",
+                        "gap_right_combo": "현재가",
+                    }
+                },
+                "setting_a": {
+                    "perform1_single_combo": "주문가",
+                    "perform2_ratio_left": "주문가",
+                    "perform2_ratio_right": "현재가",
+                },
+            },
+        }
+
+        normalized = normalize_legacy_signal_price_ui_state(state)
+
+        self.assertEqual("신호가", normalized["buy_ui"]["base"]["order_combo"])
+        self.assertEqual("신호가", normalized["buy_ui"]["base"]["ratio_left_combo"])
+        self.assertEqual("신호가", normalized["buy_ui"]["situation"]["setting1_left_combo"])
+        self.assertEqual(
+            "주문가",
+            normalized["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"],
+        )
+        self.assertEqual("신호가", normalized["sell_ui"]["setting_a"]["perform1_single_combo"])
+        self.assertEqual("신호가", normalized["sell_ui"]["setting_a"]["perform2_ratio_left"])
+
+    def test_legacy_normalization_does_not_rewrite_non_price_text(self) -> None:
+        state = {
+            "buy_ui": {
+                "base": {
+                    "order_combo": "주문가",
+                    "ratio_left_combo": "주문가",
+                    "ratio_right_combo": "현재가",
+                },
+                "operator_note": "주문가",
+            },
+            "sell_ui": {
+                "setting_a": {
+                    "perform1_single_combo": "주문가",
+                    "operator_note": "주문가",
+                },
+                "signal_conditions": {
+                    "condition_a": {
+                        "gap_left_combo": "주문가",
+                        "operator_note": "주문가",
+                    },
+                },
+            },
+        }
+
+        normalized = normalize_legacy_signal_price_ui_state(state)
+
+        self.assertEqual("신호가", normalized["buy_ui"]["base"]["order_combo"])
+        self.assertEqual("신호가", normalized["sell_ui"]["setting_a"]["perform1_single_combo"])
+        self.assertEqual("주문가", normalized["buy_ui"]["operator_note"])
+        self.assertEqual("주문가", normalized["sell_ui"]["setting_a"]["operator_note"])
+        self.assertEqual(
+            "주문가",
+            normalized["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"],
+        )
+        self.assertEqual(
+            "주문가",
+            normalized["sell_ui"]["signal_conditions"]["condition_a"]["operator_note"],
+        )
+
+    def test_legacy_buy_order_price_token_restores_as_visible_signal_price(self) -> None:
+        dialog = self._dialog(mode="edit")
+        try:
+            result = dialog.apply_indicator_follow_ui_state({
+                "buy_ui": {
+                    "base": {
+                        "order_combo": "ORDER_PRICE",
+                        "ratio_left_combo": "ORDER_PRICE",
+                        "ratio_right_combo": "현재가",
+                    },
+                    "cycle": {
+                        "buy_cycle_order_combo": "ORDER_PRICE",
+                        "buy_cycle_ratio_left_combo": "ORDER_PRICE",
+                        "buy_cycle_ratio_right_combo": "평단가",
+                    },
+                },
+            }, source=STATE_AUTHORITY_INSTANCE_CURRENT)
+
+            self.assertEqual([], result["sync_errors"])
+            self.assertEqual("신호가", dialog.buy_base_order_combo.currentText())
+            self.assertEqual("신호가", dialog.buy_base_ratio_left_combo.currentText())
+            self.assertEqual("신호가", dialog.buy_cycle_order_combo.currentText())
+            self.assertEqual("신호가", dialog.buy_cycle_ratio_left_combo.currentText())
+        finally:
+            dialog.close()
 
     def test_registration_collect_matches_canonical_defaults(self) -> None:
         dialog = self._dialog()

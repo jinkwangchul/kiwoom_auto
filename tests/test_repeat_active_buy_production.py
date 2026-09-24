@@ -40,10 +40,12 @@ class ActiveBuyMathTest(unittest.TestCase):
         values.update(overrides)
         return calculate_active_buy_requirement(**values)
 
-    def test_canonical_851_and_56_examples(self) -> None:
+    def test_canonical_851_example_and_zero_percent_signal_boundary(self) -> None:
         self.assertEqual(851, self.calc()["required_quantity"])
         second = self.calc(reference_price=14_900, ratio_percent=0)
-        self.assertEqual(56, second["required_quantity"])
+        self.assertEqual("NO_BUY", second["status"])
+        self.assertEqual("ACTIVE_BUY_SIGNAL_BOUNDARY_WOULD_CROSS", second["reason"])
+        self.assertEqual(0, second["required_quantity"])
 
     def test_no_buy_wait_and_invalid(self) -> None:
         self.assertEqual("NO_BUY", self.calc(average_price=13_100)["status"])
@@ -53,20 +55,22 @@ class ActiveBuyMathTest(unittest.TestCase):
         self.assertEqual("INVALID", self.calc(average_price=float("nan"))["status"])
         self.assertEqual("INVALID", self.calc(actionable_price=float("inf"))["status"])
 
-    def test_average_can_move_up_or_down(self) -> None:
+    def test_average_can_be_corrected_toward_signal_from_either_side(self) -> None:
         down = self.calc()
         up = self.calc(
             average_price=90,
             reference_price=100,
             actionable_price=120,
-            direction="UP",
+            direction="DOWN",
             ratio_percent=5,
-            comparator=">=",
+            comparator="<=",
         )
         self.assertEqual("READY", down["status"])
         self.assertEqual("READY", up["status"])
+        self.assertGreaterEqual(up["projected_average"], 90)
+        self.assertLessEqual(up["projected_average"], 100)
 
-    def test_both_within_and_outside_strictness(self) -> None:
+    def test_both_within_is_corrective_and_outside_never_triggers_buy(self) -> None:
         within_high = self.calc(reference_price=100, average_price=130, actionable_price=90,
                                 direction="BOTH", ratio_percent=5, comparator="WITHIN")
         within_low = self.calc(reference_price=100, average_price=70, actionable_price=110,
@@ -77,17 +81,13 @@ class ActiveBuyMathTest(unittest.TestCase):
                                 direction="BOTH", ratio_percent=5, comparator="OUTSIDE")
         outside_high = self.calc(reference_price=100, average_price=100, actionable_price=120,
                                  direction="BOTH", ratio_percent=5, comparator="OUTSIDE")
-        outside_wait = self.calc(reference_price=100, average_price=100, actionable_price=102,
-                                 direction="BOTH", ratio_percent=5, comparator="OUTSIDE")
-        for result in (within_high, within_low, outside_low, outside_high):
+        for result in (within_high, within_low):
             self.assertEqual("READY", result["status"], result)
         self.assertEqual("NO_BUY", already["status"])
-        self.assertEqual("WAIT", outside_wait["status"])
-        self.assertTrue(outside_low["projected_average"] < outside_low["lower_price"])
-        previous = (100 * 3 + 80 * (outside_low["required_quantity"] - 1)) / (
-            3 + outside_low["required_quantity"] - 1
-        )
-        self.assertGreaterEqual(previous, outside_low["lower_price"])
+        for result in (outside_low, outside_high):
+            self.assertEqual("NO_BUY", result["status"], result)
+            self.assertEqual("ACTIVE_BUY_NON_CORRECTIVE_CONDITION", result["reason"])
+            self.assertEqual(0, result["required_quantity"])
 
     def test_dynamic_price_changes_full_required_quantity_without_truncation(self) -> None:
         first = self.calc(actionable_price=13_000)
@@ -135,7 +135,7 @@ class ActiveBuyLifecycleTest(unittest.TestCase):
             },
             "active_buy_policy": {
                 "policy": "REPEAT_ACTIVE_BUY", "direction": "UP",
-                "ratio_percent": 1, "comparator": "<=", "reference_price": 13_000,
+                "ratio_percent": 1, "comparator": "<=", "signal_price": 13_000,
             },
             "active_buy_calculation": deepcopy(self.initial),
             "active_buy_required_quantity": self.initial["required_quantity"],

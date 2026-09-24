@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from execution_price_comparison import evaluate_percent_comparison
+from execution_price_comparison import evaluate_percent_comparison, resolve_price_source
 from execution_price_reset import inspect_sell_price_resets
 from execution_provenance_contract import materialize_execution_intent_children
 import routine_signal_consumer
@@ -24,6 +24,23 @@ PROCESS = "PROCESS-RESET-1"
 
 
 class ExecutionPriceResetTest(unittest.TestCase):
+    def test_price_sources_keep_live_current_fixed_signal_and_position_average_distinct(self) -> None:
+        values = {
+            source: resolve_price_source(
+                source,
+                order_price=91,
+                current_price=103,
+                average_price=97,
+                signal_price=101,
+            )
+            for source in ("CURRENT_PRICE", "SIGNAL_PRICE", "AVG_PRICE")
+        }
+
+        self.assertEqual(
+            {"CURRENT_PRICE": 103, "SIGNAL_PRICE": 101, "AVG_PRICE": 97},
+            values,
+        )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -46,12 +63,13 @@ class ExecutionPriceResetTest(unittest.TestCase):
         return {
             "policy": "SELL_PRICE_CHANGE_RESET",
             "action": "RESET",
-            "left_source": "ORDER_PRICE",
+            "left_source": "SIGNAL_PRICE",
             "right_source": "CURRENT_PRICE",
             "direction": "UP",
             "compare": ">=",
             "threshold_percent": 5,
             "order_price": 100,
+            "signal_price": 100,
         }
 
     def _intents(self, mode: str = "SINGLE_ORDER", *, quantity: int = 10) -> list[dict[str, object]]:
@@ -65,6 +83,7 @@ class ExecutionPriceResetTest(unittest.TestCase):
             "option_snapshot_hash": "OPTION-HASH",
             "plan_generation": 0,
             "planned_total_quantity": quantity,
+            "signal_price": 100,
             "sell_price_reset_policy": self._policy(),
         }
         if mode == "MULTI_HOGA":
@@ -93,7 +112,7 @@ class ExecutionPriceResetTest(unittest.TestCase):
                 })
         elif mode == "MULTI_RATIO":
             values = []
-            plan = {"configured_child_count": 3, "planned_child_count": 3, "planned_total_quantity": quantity, "ratio_left": "ORDER_PRICE", "ratio_right": "CURRENT_PRICE", "ratio_direction": "UP", "ratio_compare": ">=", "ratio_value": 1, "order_price": 100}
+            plan = {"configured_child_count": 3, "planned_child_count": 3, "planned_total_quantity": quantity, "ratio_left": "SIGNAL_PRICE", "ratio_right": "CURRENT_PRICE", "ratio_direction": "UP", "ratio_compare": ">=", "ratio_value": 1, "order_price": 100, "signal_price": 100}
             for index, child_quantity in enumerate([4, 3, 3], start=1):
                 values.append({
                     **deepcopy(common), "execution_mode": mode, "quantity": child_quantity,

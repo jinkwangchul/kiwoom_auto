@@ -18,6 +18,7 @@ from routines.지표추종매매.routine_validation_contract import ValidationSt
 
 
 RECENT_STOCKS_SETTINGS_KEY = "ui/signal_validation_v2/recent_stocks"
+MAX_RECENT_STOCKS = 20
 
 
 def _default_settings() -> QSettings:
@@ -56,7 +57,13 @@ class IndicatorFollowSignalValidationRecentStockStore:
             snapshot_loader,
             None if project_root is None else Path(project_root),
         )
-        self._recent_stocks = self._load_recent_stocks()
+        restored = self._load_recent_stocks()
+        self._recent_stocks = restored[:MAX_RECENT_STOCKS]
+        self._startup_evicted_codes = tuple(
+            stock.code for stock in restored[MAX_RECENT_STOCKS:]
+        )
+        if self._startup_evicted_codes:
+            self._write_recent_stocks()
 
     @staticmethod
     def _load_records(
@@ -119,6 +126,15 @@ class IndicatorFollowSignalValidationRecentStockStore:
             for stock in self._recent_stocks
         )
 
+    @property
+    def startup_evicted_codes(self) -> tuple[str, ...]:
+        return self._startup_evicted_codes
+
+    def take_startup_evicted_codes(self) -> tuple[str, ...]:
+        codes = self._startup_evicted_codes
+        self._startup_evicted_codes = ()
+        return codes
+
     def metadata_for(self, stock: object) -> dict[str, object] | None:
         if not isinstance(stock, ValidationStockRef) or not stock.code:
             return None
@@ -140,23 +156,26 @@ class IndicatorFollowSignalValidationRecentStockStore:
             for candidate in self._recent_stocks
             if candidate.code != selected.code
         )
-        normalized = tuple(updated)
+        normalized = tuple(updated[:MAX_RECENT_STOCKS])
         if normalized == self._recent_stocks:
             return False
         self._recent_stocks = normalized
         self._write_recent_stocks()
         return True
 
-    def retain_prefix(self, stocks: object) -> bool:
-        source = stocks if isinstance(stocks, (list, tuple)) else ()
-        retained: list[ValidationStockRef] = []
-        for stock in source:
-            if not isinstance(stock, ValidationStockRef):
-                return False
-            retained.append(ValidationStockRef(stock.code, stock.name))
-        normalized = tuple(retained)
-        if normalized != self._recent_stocks[:len(normalized)]:
+    def remove(self, stock: object) -> bool:
+        code = (
+            str(stock.code).strip().upper()
+            if isinstance(stock, ValidationStockRef)
+            else str(stock or "").strip().upper()
+        )
+        if not code:
             return False
+        normalized = tuple(
+            candidate
+            for candidate in self._recent_stocks
+            if candidate.code != code
+        )
         if normalized == self._recent_stocks:
             return False
         self._recent_stocks = normalized

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from indicator_follow_signal_validation_historical_cache import (
     IndicatorFollowSignalValidationHistoricalCache,
@@ -180,6 +181,11 @@ class SignalValidationHistoricalCacheTest(unittest.TestCase):
                     candles=candles,
                 ))
                 path = cache.path_for("005930", timeframe, count, key)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["signal_entries_by_settings_hash"] = {
+                    "settings-a": [{"signal": "BUY"}]
+                }
+                path.write_text(json.dumps(payload), encoding="utf-8")
                 path.with_name(f"{path.name}.market-source.json").write_text(
                     "{}", encoding="utf-8"
                 )
@@ -202,6 +208,114 @@ class SignalValidationHistoricalCacheTest(unittest.TestCase):
             self.assertTrue(survivor.exists())
             self.assertTrue(same_prefix_non_cache.exists())
             self.assertTrue(unrelated.exists())
+
+    def test_delete_failure_persistently_blocks_all_stale_stock_reads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
+            candles = [_candle(index) for index in range(5)]
+            for count in (2, 5):
+                self.assertTrue(cache.store(
+                    stock_code="005930",
+                    stock_name="Samsung",
+                    timeframe_minutes=1,
+                    requested_count=count,
+                    candles=candles[-count:],
+                ))
+                self.assertTrue(cache.store_signal_entries(
+                    stock_code="005930",
+                    timeframe_minutes=1,
+                    requested_count=count,
+                    settings_hash="settings-a",
+                    entries=[{"signal": "BUY", "requested_count": count}],
+                ))
+            stale_paths = {
+                cache.path_for("005930", 1, count).resolve()
+                for count in (2, 5)
+            }
+            original_unlink = Path.unlink
+            states_seen_before_unlink = []
+
+            def locked_stock_artifact(path, *args, **kwargs):
+                if path.resolve() in stale_paths:
+                    states_seen_before_unlink.append(json.loads(
+                        cache.state_path_for("005930").read_text(encoding="utf-8")
+                    )["state"])
+                    raise PermissionError("simulated cache file lock")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", locked_stock_artifact):
+                result = cache.delete_stock("005930")
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["invalidated"])
+            self.assertEqual(2, len(result["failed_paths"]))
+            self.assertEqual(["INVALIDATED", "INVALIDATED"], states_seen_before_unlink)
+            self.assertTrue(all(path.exists() for path in stale_paths))
+
+            restarted = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
+            self.assertIsNone(restarted.load("005930", 1, 2))
+            self.assertIsNone(restarted.load_covering("005930", 1, 1))
+            self.assertIsNone(restarted.load_signal_entries(
+                "005930", 1, 2, "settings-a"
+            ))
+
+    def test_fresh_store_reactivates_only_its_generation_after_failed_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
+            stale_candles = [_candle(index) for index in range(5)]
+            for count in (2, 5):
+                self.assertTrue(cache.store(
+                    stock_code="005930",
+                    stock_name="Old Samsung",
+                    timeframe_minutes=1,
+                    requested_count=count,
+                    candles=stale_candles[-count:],
+                ))
+            self.assertTrue(cache.store_signal_entries(
+                stock_code="005930",
+                timeframe_minutes=1,
+                requested_count=2,
+                settings_hash="old-settings",
+                entries=[{"signal": "SELL"}],
+            ))
+            stale_paths = {
+                cache.path_for("005930", 1, count).resolve()
+                for count in (2, 5)
+            }
+            original_unlink = Path.unlink
+
+            def locked_stock_artifact(path, *args, **kwargs):
+                if path.resolve() in stale_paths:
+                    raise PermissionError("simulated cache file lock")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", locked_stock_artifact):
+                self.assertFalse(cache.delete_stock("005930")["ok"])
+
+            fresh_candles = [
+                _candle(3, close=103.0),
+                _candle(4, close=104.0),
+            ]
+            self.assertTrue(cache.store(
+                stock_code="005930",
+                stock_name="Fresh Samsung",
+                timeframe_minutes=1,
+                requested_count=2,
+                candles=fresh_candles,
+            ))
+
+            restarted = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
+            fresh = restarted.load("005930", 1, 2)
+            self.assertIsNotNone(fresh)
+            self.assertEqual("Fresh Samsung", fresh.stock_name)
+            self.assertEqual((103.0, 104.0), tuple(
+                candle["close"] for candle in fresh.candles
+            ))
+            self.assertIsNone(restarted.load("005930", 1, 5))
+            self.assertIsNone(restarted.load_covering("005930", 1, 3))
+            self.assertIsNone(restarted.load_signal_entries(
+                "005930", 1, 2, "old-settings"
+            ))
 
 
     def test_signal_entries_round_trip_by_settings_hash_and_history_rewrite_invalidates(self):

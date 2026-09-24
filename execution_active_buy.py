@@ -398,7 +398,10 @@ def inspect_active_buy_lifecycle(
         calculation = calculate_active_buy_requirement(
             quantity=quantity,
             average_price=average,
-            reference_price=policy.get("reference_price"),
+            reference_price=(
+                policy.get("signal_price")
+                or policy.get("reference_price")
+            ),
             actionable_price=price,
             direction=policy.get("direction"),
             ratio_percent=policy.get("ratio_percent"),

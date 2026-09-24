@@ -564,7 +564,7 @@ def _evaluate_buy_price_compare_filter(
         target = condition.get("target")
         compare_target = condition.get("compare_target")
         operator = condition.get("operator")
-        if target not in {"CLOSE", "ORDER_PRICE", "AVG_PRICE"} or compare_target not in {"CLOSE", "ORDER_PRICE", "AVG_PRICE"}:
+        if target not in {"CLOSE", "SIGNAL_PRICE", "ORDER_PRICE", "AVG_PRICE"} or compare_target not in {"CLOSE", "SIGNAL_PRICE", "ORDER_PRICE", "AVG_PRICE"}:
             return False, _price_compare_detail(
                 enabled=True,
                 target=target,
@@ -1498,7 +1498,15 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
     average_price_series = (
         context.get("average_price_series") if isinstance(context, dict) else None
     )
+    # During source-signal evaluation, SIGNAL_PRICE is the price at the
+    # candidate signal point. Once the signal is emitted, the same value is
+    # persisted as signal_bar_close/signal_price by the execution boundary.
+    if isinstance(close_series, list):
+        series_map["SIGNAL_PRICE"] = list(close_series)
     if order_price is not None:
+        # Legacy strategy rules may still contain ORDER_PRICE. Keep their
+        # historical execution-context interpretation for read compatibility;
+        # new strategy comparison rules are written as SIGNAL_PRICE.
         series_map["ORDER_PRICE"] = [order_price] * length
     if isinstance(average_price_series, list) and 0 < len(average_price_series) <= length:
         if (

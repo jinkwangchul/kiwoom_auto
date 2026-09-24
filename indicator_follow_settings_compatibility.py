@@ -12,6 +12,40 @@ _SELL_SELECTED_SET_WIDGET_FIELDS = {
     "c": "sell_method_select_c_check",
 }
 
+_BUY_PRICE_SOURCE_FIELDS = {
+    "order_combo",
+    "time_order_combo",
+    "ratio_left_combo",
+    "ratio_right_combo",
+    "buy_cycle_order_combo",
+    "buy_cycle_time_order_combo",
+    "buy_cycle_ratio_left_combo",
+    "buy_cycle_ratio_right_combo",
+    "buy_exit_price_left_combo",
+    "buy_exit_price_right_combo",
+    "setting1_left_combo",
+    "setting1_right_combo",
+    "setting2_left_combo",
+    "setting2_right_combo",
+}
+
+_SELL_EXECUTION_PRICE_SOURCE_FIELDS = {
+    "perform1_single_combo",
+    "perform2_time_order",
+    "perform2_ratio_left",
+    "perform2_ratio_right",
+    "perform3_price_left",
+    "perform3_price_right",
+    "repeat_perform1_single_combo",
+    "repeat_perform2_time_order",
+    "repeat_perform2_ratio_left",
+    "repeat_perform2_ratio_right",
+    "repeat_perform3_price_left",
+    "repeat_perform3_price_right",
+    "exit_price_left",
+    "exit_price_right",
+}
+
 
 _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_signal_interval_combo': '3',
            'basic_duplicate_signal_combo': '선행신호 우선',
@@ -44,12 +78,12 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                                                             'filters': []}]}},
             'base': {'down_line': '2',
                      'hoga_combo': '단일호가',
-                     'order_combo': '주문가',
+                     'order_combo': '신호가',
                      'ratio_compare_combo': '이상',
                      'ratio_count_line': '3',
                      'ratio_direction_combo': '상향',
-                     'ratio_left_combo': '주문가',
-                     'ratio_right_combo': '주문가',
+                     'ratio_left_combo': '신호가',
+                     'ratio_right_combo': '현재가',
                      'ratio_value_line': '0.15',
                      'time_count_line': '3',
                      'time_mode_combo': '선택없음',
@@ -117,11 +151,11 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
             'cycle': {'buy_cycle_hoga_down_line': '2',
                       'buy_cycle_hoga_mode_combo': '단일호가',
                       'buy_cycle_hoga_up_line': '0',
-                      'buy_cycle_order_combo': '주문가',
+                      'buy_cycle_order_combo': '신호가',
                       'buy_cycle_ratio_compare_combo': '이상',
                       'buy_cycle_ratio_count_line': '3',
                       'buy_cycle_ratio_direction_combo': '상향',
-                      'buy_cycle_ratio_left_combo': '주문가',
+                      'buy_cycle_ratio_left_combo': '신호가',
                       'buy_cycle_ratio_right_combo': '현재가',
                       'buy_cycle_ratio_value_line': '0.15',
                       'buy_cycle_time_count_line': '3',
@@ -214,16 +248,16 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                            'exit_time_unit': '분',
                            'perform1_multi_down_line': '0',
                            'perform1_multi_up_line': '2',
-                           'perform1_single_combo': '주문가',
+                           'perform1_single_combo': '신호가',
                            'perform1_title_combo': '단일호가',
                            'perform2_ratio_compare': '이상',
                            'perform2_ratio_count': '3',
                            'perform2_ratio_direction': '상향',
-                           'perform2_ratio_left': '주문가',
-                           'perform2_ratio_right': '주문가',
+                           'perform2_ratio_left': '신호가',
+                           'perform2_ratio_right': '현재가',
                            'perform2_ratio_value': '0.15',
                            'perform2_time_count': '3',
-                           'perform2_time_order': '주문가',
+                           'perform2_time_order': '신호가',
                            'perform2_time_range': '이내',
                            'perform2_time_unit': '초',
                            'perform2_time_value': '30',
@@ -240,13 +274,13 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                            'perform3_title_combo': '미체결',
                            'repeat_perform1_multi_down_line': '0',
                            'repeat_perform1_multi_up_line': '3',
-                           'repeat_perform1_single_combo': '주문가',
+                           'repeat_perform1_single_combo': '신호가',
                            'repeat_perform1_title_combo': '단일호가',
                            'repeat_perform2_ratio_compare': '이상',
                            'repeat_perform2_ratio_count': '3',
                            'repeat_perform2_ratio_direction': '상향',
-                           'repeat_perform2_ratio_left': '주문가',
-                           'repeat_perform2_ratio_right': '주문가',
+                           'repeat_perform2_ratio_left': '신호가',
+                           'repeat_perform2_ratio_right': '현재가',
                            'repeat_perform2_ratio_value': '0.15',
                            'repeat_perform2_time_count': '3',
                            'repeat_perform2_time_order': '현재가',
@@ -279,16 +313,16 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                            'exit_time_unit': '분',
                            'perform1_multi_down_line': '0',
                            'perform1_multi_up_line': '2',
-                           'perform1_single_combo': '주문가',
+                           'perform1_single_combo': '신호가',
                            'perform1_title_combo': '단일호가',
                            'perform2_ratio_compare': '이상',
                            'perform2_ratio_count': '3',
                            'perform2_ratio_direction': '상향',
-                           'perform2_ratio_left': '주문가',
-                           'perform2_ratio_right': '주문가',
+                           'perform2_ratio_left': '신호가',
+                           'perform2_ratio_right': '현재가',
                            'perform2_ratio_value': '0.15',
                            'perform2_time_count': '3',
-                           'perform2_time_order': '주문가',
+                           'perform2_time_order': '신호가',
                            'perform2_time_range': '이내',
                            'perform2_time_unit': '초',
                            'perform2_time_value': '30',
@@ -305,13 +339,13 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                            'perform3_title_combo': '미체결',
                            'repeat_perform1_multi_down_line': '0',
                            'repeat_perform1_multi_up_line': '3',
-                           'repeat_perform1_single_combo': '주문가',
+                           'repeat_perform1_single_combo': '신호가',
                            'repeat_perform1_title_combo': '단일호가',
                            'repeat_perform2_ratio_compare': '이상',
                            'repeat_perform2_ratio_count': '3',
                            'repeat_perform2_ratio_direction': '상향',
-                           'repeat_perform2_ratio_left': '주문가',
-                           'repeat_perform2_ratio_right': '주문가',
+                           'repeat_perform2_ratio_left': '신호가',
+                           'repeat_perform2_ratio_right': '현재가',
                            'repeat_perform2_ratio_value': '0.15',
                            'repeat_perform2_time_count': '3',
                            'repeat_perform2_time_order': '현재가',
@@ -344,16 +378,16 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                            'exit_time_unit': '분',
                            'perform1_multi_down_line': '0',
                            'perform1_multi_up_line': '2',
-                           'perform1_single_combo': '주문가',
+                           'perform1_single_combo': '신호가',
                            'perform1_title_combo': '단일호가',
                            'perform2_ratio_compare': '이상',
                            'perform2_ratio_count': '3',
                            'perform2_ratio_direction': '상향',
-                           'perform2_ratio_left': '주문가',
-                           'perform2_ratio_right': '주문가',
+                           'perform2_ratio_left': '신호가',
+                           'perform2_ratio_right': '현재가',
                            'perform2_ratio_value': '0.15',
                            'perform2_time_count': '3',
-                           'perform2_time_order': '주문가',
+                           'perform2_time_order': '신호가',
                            'perform2_time_range': '이내',
                            'perform2_time_unit': '초',
                            'perform2_time_value': '30',
@@ -370,13 +404,13 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
                            'perform3_title_combo': '미체결',
                            'repeat_perform1_multi_down_line': '0',
                            'repeat_perform1_multi_up_line': '3',
-                           'repeat_perform1_single_combo': '주문가',
+                           'repeat_perform1_single_combo': '신호가',
                            'repeat_perform1_title_combo': '단일호가',
                            'repeat_perform2_ratio_compare': '이상',
                            'repeat_perform2_ratio_count': '3',
                            'repeat_perform2_ratio_direction': '상향',
-                           'repeat_perform2_ratio_left': '주문가',
-                           'repeat_perform2_ratio_right': '주문가',
+                           'repeat_perform2_ratio_left': '신호가',
+                           'repeat_perform2_ratio_right': '현재가',
                            'repeat_perform2_ratio_value': '0.15',
                            'repeat_perform2_time_count': '3',
                            'repeat_perform2_time_order': '현재가',
@@ -400,11 +434,105 @@ _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS: dict[str, Any] = {'basic': {'basic_s
  'complete_ui': {}}
 
 
+def normalize_legacy_signal_price_ui_state(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize legacy strategy/UI '주문가' labels to the fixed signal-price axis.
+
+    BUY settings use signal price as the fixed strategy/reference price.
+    SELL execution/settings do the same, but SELL signal-condition price
+    comparison intentionally keeps its separate legacy re-selection policy.
+    """
+    normalized = deepcopy(state) if isinstance(state, dict) else state
+    if not isinstance(normalized, dict):
+        return normalized
+
+    def replace_price_source_labels(value: Any, source_fields: set[str]) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "신호가"
+                    if key in source_fields and _is_legacy_order_price(item)
+                    else replace_price_source_labels(item, source_fields)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [replace_price_source_labels(item, source_fields) for item in value]
+        return value
+
+    def _is_legacy_order_price(value: Any) -> bool:
+        return value == "주문가" or (
+            isinstance(value, str) and value.strip().upper() == "ORDER_PRICE"
+        )
+
+    buy_ui = normalized.get("buy_ui")
+    if isinstance(buy_ui, dict):
+        buy_ui = replace_price_source_labels(buy_ui, _BUY_PRICE_SOURCE_FIELDS)
+        normalized["buy_ui"] = buy_ui
+
+        base = buy_ui.get("base")
+        if isinstance(base, dict) and (
+            base.get("ratio_left_combo") == base.get("ratio_right_combo")
+        ):
+            # Historical defaults used 주문가 on both sides. The modern
+            # strategy comparison grammar requires distinct operands.
+            base["ratio_left_combo"] = "현재가"
+            base["ratio_right_combo"] = "신호가"
+
+        def normalize_active_comparator(container: Any, direction_key: str, compare_key: str) -> None:
+            if not isinstance(container, dict):
+                return
+            direction = str(container.get(direction_key) or "").strip()
+            if direction == "상하":
+                container[compare_key] = "이내"
+            elif direction in {"상향", "하향"}:
+                container[compare_key] = "이하"
+
+        normalize_active_comparator(
+            buy_ui.get("repeat"),
+            "active_direction_combo",
+            "active_compare_combo",
+        )
+        price_compare = buy_ui.get("price_compare")
+        normalize_active_comparator(
+            price_compare,
+            "above_active_direction_combo",
+            "above_active_compare_combo",
+        )
+        additional = buy_ui.get("additional")
+        if isinstance(additional, dict):
+            normalize_active_comparator(
+                additional.get("last_plus_one"),
+                "direction_combo",
+                "compare_combo",
+            )
+        if isinstance(base, dict):
+            normalize_active_comparator(
+                base.get("last_round_active_buy"),
+                "direction_combo",
+                "compare_combo",
+            )
+
+    sell_ui = normalized.get("sell_ui")
+    if isinstance(sell_ui, dict):
+        for key, value in list(sell_ui.items()):
+            if key == "signal_conditions":
+                continue
+            sell_ui[key] = replace_price_source_labels(
+                value,
+                _SELL_EXECUTION_PRICE_SOURCE_FIELDS,
+            )
+    return normalized
+
+
 def get_canonical_fresh_defaults(definition_id: str) -> dict[str, Any] | None:
     """Return the user-approved fresh-registration defaults for this routine."""
     if str(definition_id or "").strip() != "indicator_follow":
         return None
-    return deepcopy(_INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS)
+    return normalize_legacy_signal_price_ui_state(
+        _INDICATOR_FOLLOW_CANONICAL_FRESH_DEFAULTS
+    )
 
 
 def normalize_sell_selected_set_authority(
@@ -466,7 +594,8 @@ def canonical_indicator_follow_ui_state(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """Return the stable state shape used by exact round-trip comparisons."""
-    normalized = normalize_sell_selected_set_authority(state)
+    normalized = normalize_legacy_signal_price_ui_state(state)
+    normalized = normalize_sell_selected_set_authority(normalized)
     if not isinstance(normalized, dict):
         return normalized
     price_compare = (

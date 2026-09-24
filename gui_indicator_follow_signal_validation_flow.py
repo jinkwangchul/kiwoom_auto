@@ -14,7 +14,7 @@ from threading import Thread
 import weakref
 
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QDialog, QMessageBox, QWidget
+from PyQt5.QtWidgets import QDialog, QWidget
 
 from gui_toast import show_toast
 from gui_indicator_follow_signal_validation_window import (
@@ -164,6 +164,13 @@ class IndicatorFollowSignalValidationFlow(QObject):
         self._history_extension_inflight: dict[int, dict[str, object]] = {}
         self._last_run_requests: dict[int, IndicatorFollowSignalValidationRunRequest] = {}
         self._now_factory = lambda: datetime.now(SEOUL_TIMEZONE)
+        take_evicted = getattr(self._recent_stock_store, "take_startup_evicted_codes", None)
+        startup_evicted = (
+            take_evicted() if callable(take_evicted)
+            else getattr(self._recent_stock_store, "startup_evicted_codes", ())
+        )
+        for code in tuple(startup_evicted):
+            self._purge_validation_history_for_stock(code)
         self.signal_scan_completed.connect(self._on_signal_scan_completed)
         self._host.validation_blocked.connect(self._forward_host_failure)
 
@@ -360,12 +367,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     stock,
                 )
             )
-            fitted_signal = getattr(window, "recent_stocks_fitted", None)
-            if callable(getattr(fitted_signal, "connect", None)):
-                fitted_signal.connect(
-                    lambda stocks, ref=window_ref: self._retain_recent_stock_projection(
+            remove_signal = getattr(window, "recent_stock_remove_requested", None)
+            if callable(getattr(remove_signal, "connect", None)):
+                remove_signal.connect(
+                    lambda stock, ref=window_ref: self._remove_recent_stock_for_window(
                         ref(),
-                        stocks,
+                        stock,
                     )
                 )
             if callable(getattr(window, "setAttribute", None)):
@@ -457,11 +464,16 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if not callable(activate):
             self._last_selected_stock = ValidationStockRef(stock.code, stock.name)
             return False
+        previous = self._read_recent_stocks()
         try:
             changed = activate(stock) is True
         except Exception:
             changed = False
         recent = self._read_recent_stocks()
+        retained_codes = {candidate.code for candidate in recent}
+        for candidate in previous:
+            if candidate.code not in retained_codes:
+                self._purge_validation_history_for_stock(candidate.code)
         self._last_selected_stock = (
             recent[0] if recent else ValidationStockRef(stock.code, stock.name)
         )
@@ -470,7 +482,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
     def _sync_window_stock_projection(self, window: object) -> None:
         set_recent = getattr(window, "set_recent_stocks", None)
         if callable(set_recent):
-            set_recent(self._read_recent_stocks())
+            current = getattr(window, "stock", None)
+            current_code = current.code if isinstance(current, ValidationStockRef) else ""
+            set_recent(tuple(
+                stock for stock in self._read_recent_stocks()
+                if stock.code != current_code
+            ))
         set_metadata = getattr(window, "set_stock_metadata", None)
         if callable(set_metadata):
             stock = getattr(window, "stock", None)
@@ -545,49 +562,34 @@ class IndicatorFollowSignalValidationFlow(QObject):
         for window in tuple(self._open_windows.values()):
             self._sync_window_stock_projection(window)
 
-    def _retain_recent_stock_projection(self, window: object, stocks: object) -> None:
+    def _purge_validation_history_for_stock(self, stock_code: object) -> None:
+        code = str(stock_code or "").strip().upper()
+        if not code:
+            return
+        delete_stock = getattr(self._historical_cache, "delete_stock", None)
+        if callable(delete_stock):
+            try:
+                delete_stock(code)
+            except Exception:
+                pass
+        self._evict_validation_history_for_stock(code)
+
+    def _remove_recent_stock_for_window(self, window: object, stock: object) -> None:
         if id(window) not in self._open_windows:
             return
-        retain_prefix = getattr(self._recent_stock_store, "retain_prefix", None)
-        if not callable(retain_prefix):
+        if not isinstance(stock, ValidationStockRef) or not stock.code:
             return
-        previous = self._read_recent_stocks()
+        remove = getattr(self._recent_stock_store, "remove", None)
+        if not callable(remove):
+            return
         try:
-            changed = retain_prefix(stocks) is True
+            changed = remove(stock) is True
         except Exception:
             changed = False
         if not changed:
             return
+        self._purge_validation_history_for_stock(stock.code)
         recent = self._read_recent_stocks()
-        retained_codes = {stock.code for stock in recent}
-        removed = tuple(
-            stock for stock in previous if stock.code not in retained_codes
-        )
-        delete_stock = getattr(self._historical_cache, "delete_stock", None)
-        for stock in removed:
-            answer = QMessageBox.question(
-                window,
-                "\uac80\uc99d\ucc28\ud2b8 \uce94\ub4e4 \uce90\uc2dc \uc0ad\uc81c",
-                f"{stock.code} {stock.name}\n\n"
-                "\uc774 \uc885\ubaa9\uc740 \uac80\uc99d\ucc28\ud2b8 \ub4f1\ub85d \ubaa9\ub85d\uc5d0\uc11c \uc81c\uc678\ub418\uc5c8\uc2b5\ub2c8\ub2e4.\n"
-                "\uc800\uc7a5\ub41c \uac80\uc99d\ucc28\ud2b8 \uce94\ub4e4 \uc815\ubcf4\ub97c \uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                continue
-            delete_result = None
-            if callable(delete_stock):
-                try:
-                    delete_result = delete_stock(stock.code)
-                except Exception:
-                    delete_result = None
-            if (
-                not isinstance(delete_result, dict)
-                or delete_result.get("ok") is not True
-            ):
-                continue
-            self._evict_validation_history_for_stock(stock.code)
         self._last_selected_stock = recent[0] if recent else None
         QTimer.singleShot(0, self._refresh_open_window_stock_projections)
 
@@ -613,8 +615,16 @@ class IndicatorFollowSignalValidationFlow(QObject):
             stock = getattr(window, "stock", None)
             if isinstance(stock, ValidationStockRef) and stock.code == code:
                 affected_window_keys.add(window_key)
+                discard = getattr(window, "discard_validation_stock_if_matches", None)
+                if callable(discard):
+                    try:
+                        discard(code)
+                    except Exception:
+                        pass
         for window_key in affected_window_keys:
             self._validation_sessions.pop(window_key, None)
+            self._history_extension_inflight.pop(window_key, None)
+            self._last_run_requests.pop(window_key, None)
             self._invalidate_window_requests(window_key)
             for request_key in tuple(self._active_providers):
                 if request_key[0] == window_key:

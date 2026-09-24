@@ -394,6 +394,8 @@ def _series_target(text: Any) -> str | None:
         "CURRENT": "CLOSE",
         "CURRENT_PRICE": "CLOSE",
         "CLOSE": "CLOSE",
+        "\uc2e0\ud638\uac00": "SIGNAL_PRICE",
+        "SIGNAL_PRICE": "SIGNAL_PRICE",
         "\uc8fc\ubb38\uac00": "ORDER_PRICE",
         "ORDER": "ORDER_PRICE",
         "ORDER_PRICE": "ORDER_PRICE",
@@ -817,11 +819,25 @@ def _choice_token(value: Any, mapping: dict[str, str], default: str | None = Non
 
 
 def _price_basis_token(value: Any) -> str | None:
+    """Execution-price basis. SIGNAL_PRICE UI still executes at the signal reference."""
     return _choice_token(value, {
+        "\uc2e0\ud638\uac00": "ORDER_PRICE",
         "\uc8fc\ubb38\uac00": "ORDER_PRICE",
         "\ud604\uc7ac\uac00": "CURRENT_PRICE",
         "\uc885\uac00": "CLOSE",
         "\uc2dc\uc7a5\uac00": "MARKET",
+        "\ud3c9\ub2e8\uac00": "AVG_PRICE",
+    })
+
+
+def _comparison_price_basis_token(value: Any) -> str | None:
+    """Strategy comparison sources: live/current, fixed signal, or position average."""
+    text = str(value or "").strip()
+    normalized = text.upper()
+    if text in {"\uc2e0\ud638\uac00", "\uc8fc\ubb38\uac00"} or normalized in {"SIGNAL_PRICE", "ORDER_PRICE"}:
+        return "SIGNAL_PRICE"
+    return _choice_token(value, {
+        "\ud604\uc7ac\uac00": "CURRENT_PRICE",
         "\ud3c9\ub2e8\uac00": "AVG_PRICE",
     })
 
@@ -992,7 +1008,7 @@ def _build_last_round_active_buy_policy(
         "budget_policy_override": "NONE",
         "purpose": "BUY_METHOD_SPECIAL_ACTION",
         "subject": "AVERAGE_PRICE",
-        "reference": "MULTI_POINT_SET_PRICE",
+        "reference": "SIGNAL_PRICE",
         "direction": _direction_token(source.get("direction", source.get("direction_combo", "상향"))),
         "ratio_percent": _nonnegative_float(source.get("ratio_percent", source.get("ratio_line", "0.45"))),
         "comparator": _ratio_compare_token(source.get("comparator", source.get("compare_combo", "이상"))),
@@ -1003,7 +1019,10 @@ def _build_last_round_active_buy_policy(
     if policy["ratio_percent"] is None:
         warnings.append("buy last-round active ratio is invalid")
         return None, False
-    if policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}:
+    if (
+        (policy["direction"] in {"UP", "DOWN"} and policy["comparator"] != "<=")
+        or (policy["direction"] == "BOTH" and policy["comparator"] != "WITHIN")
+    ):
         warnings.append("buy last-round active comparator is invalid")
         return None, False
     if enabled and point_mode not in {"MULTI_TIME", "MULTI_RATIO"}:
@@ -1030,8 +1049,8 @@ def _build_buy_execution_additional_candidate(
     if price_enabled:
         price_policy = {
             "enabled": True,
-            "reference_source": "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
-            "current_source": "ACTIONABLE_ORDER_PRICE",
+            "reference_source": "PREVIOUS_CONFIRMED_BUY_SIGNAL_PRICE",
+            "current_source": "CURRENT_SIGNAL_PRICE",
             "direction": _direction_token(price.get("direction_combo")),
             "ratio_percent": _nonnegative_float(price.get("ratio_line")),
             "comparator": _ratio_compare_token(price.get("compare_combo")),
@@ -1064,7 +1083,7 @@ def _build_buy_execution_additional_candidate(
         }
         if method == "ACTIVE":
             active_condition = {
-                "lhs_source": "ACTIONABLE_ORDER_PRICE",
+                "lhs_source": "SIGNAL_PRICE",
                 "rhs_source": "AVERAGE_PRICE",
                 "direction": _direction_token(last.get("direction_combo")),
                 "ratio_percent": _nonnegative_float(last.get("ratio_line")),
@@ -1073,7 +1092,14 @@ def _build_buy_execution_additional_candidate(
             if (
                 active_condition["direction"] not in {"UP", "DOWN", "BOTH"}
                 or active_condition["ratio_percent"] is None
-                or active_condition["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+                or (
+                    active_condition["direction"] in {"UP", "DOWN"}
+                    and active_condition["comparator"] != "<="
+                )
+                or (
+                    active_condition["direction"] == "BOTH"
+                    and active_condition["comparator"] != "WITHIN"
+                )
             ):
                 warnings.append("buy last+1 active condition is invalid")
                 return None
@@ -1142,16 +1168,17 @@ def _build_buy_execution_cycle_candidate(
             return None
     elif point_mode == "MULTI_RATIO":
         point_policy.update({
-            "left_source": _price_basis_token(cycle.get("buy_cycle_ratio_left_combo")),
-            "right_source": _price_basis_token(cycle.get("buy_cycle_ratio_right_combo")),
+            "left_source": _comparison_price_basis_token(cycle.get("buy_cycle_ratio_left_combo")),
+            "right_source": _comparison_price_basis_token(cycle.get("buy_cycle_ratio_right_combo")),
             "direction": _direction_token(cycle.get("buy_cycle_ratio_direction_combo")),
             "ratio_percent": _nonnegative_float(cycle.get("buy_cycle_ratio_value_line")),
             "comparator": _ratio_compare_token(cycle.get("buy_cycle_ratio_compare_combo")),
             "count": _safe_int(cycle.get("buy_cycle_ratio_count_line")),
         })
         if (
-            point_policy["left_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-            or point_policy["right_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            point_policy["left_source"] not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or point_policy["right_source"] not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or point_policy["left_source"] == point_policy["right_source"]
             or point_policy["direction"] not in {"UP", "DOWN", "BOTH"}
             or point_policy["ratio_percent"] is None
             or point_policy["comparator"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
@@ -1237,8 +1264,8 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
         "point_range": _range_token(base.get("time_range_combo")),
         "point_count": _safe_int(base.get("time_count_line")),
         "time_order_price_basis": _price_basis_token(base.get("time_order_combo")),
-        "ratio_left": _price_basis_token(base.get("ratio_left_combo") or base.get("time_order_combo")),
-        "ratio_right": _price_basis_token(base.get("ratio_right_combo")),
+        "ratio_left": _comparison_price_basis_token(base.get("ratio_left_combo") or base.get("time_order_combo")),
+        "ratio_right": _comparison_price_basis_token(base.get("ratio_right_combo")),
         "ratio_direction": _direction_token(base.get("ratio_direction_combo")),
         "ratio_value": _safe_float(base.get("ratio_value_line")),
         "ratio_compare": _ratio_compare_token(base.get("ratio_compare_combo")),
@@ -1246,9 +1273,14 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
     }
     if (
         value["point_mode"] == "MULTI_RATIO"
-        and not _is_valid_direction_comparator_pair(
-            value["ratio_direction"],
-            value["ratio_compare"],
+        and (
+            value["ratio_left"] not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or value["ratio_right"] not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or value["ratio_left"] == value["ratio_right"]
+            or not _is_valid_direction_comparator_pair(
+                value["ratio_direction"],
+                value["ratio_compare"],
+            )
         )
     ):
         warnings.append("buy base MULTI_RATIO direction/comparator pair is invalid")
@@ -1292,8 +1324,8 @@ def _build_buy_price_response_policies(
         policy = {
             "slot": slot.upper(),
             "enabled": True,
-            "left_source": _price_basis_token(situation.get(f"{slot}_left_combo")),
-            "right_source": _price_basis_token(situation.get(f"{slot}_right_combo")),
+            "left_source": _comparison_price_basis_token(situation.get(f"{slot}_left_combo")),
+            "right_source": _comparison_price_basis_token(situation.get(f"{slot}_right_combo")),
             "direction": direction,
             "threshold_percent": _nonnegative_float(situation.get(f"{slot}_ratio_line")),
             "compare": _ratio_compare_token(situation.get(f"{slot}_compare_combo")),
@@ -1302,8 +1334,9 @@ def _build_buy_price_response_policies(
             ),
         }
         if (
-            policy["left_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
-            or policy["right_source"] not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            policy["left_source"] not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or policy["right_source"] not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"}
+            or policy["left_source"] == policy["right_source"]
             or policy["threshold_percent"] is None
             or policy["threshold_percent"] <= 0
             or policy["direction"] not in {"UP", "DOWN", "BOTH"}
@@ -1363,13 +1396,14 @@ def _build_buy_exit_policy(exit_state: dict[str, Any], warnings: list[str]) -> d
             if condition:
                 conditions.append(condition)
     if _truthy_ui(exit_state.get("buy_exit_price_check")):
-        left = _price_basis_token(exit_state.get("buy_exit_price_left_combo"))
-        right = _price_basis_token(exit_state.get("buy_exit_price_right_combo"))
+        left = _comparison_price_basis_token(exit_state.get("buy_exit_price_left_combo"))
+        right = _comparison_price_basis_token(exit_state.get("buy_exit_price_right_combo"))
         direction = _direction_token(exit_state.get("buy_exit_price_direction_combo"))
         compare = _ratio_compare_token(exit_state.get("buy_exit_price_compare_combo"))
         threshold = _safe_float(exit_state.get("buy_exit_price_value_line"))
-        if left not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"} \
-                or right not in {"ORDER_PRICE", "CURRENT_PRICE", "AVG_PRICE"} \
+        if left not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"} \
+                or right not in {"SIGNAL_PRICE", "CURRENT_PRICE", "AVG_PRICE"} \
+                or left == right \
                 or direction not in {"UP", "DOWN", "BOTH"} \
                 or compare not in {"WITHIN", "OUTSIDE", ">=", "<=", "==", "!=", ">", "<"} \
                 or threshold is None or threshold <= 0:
@@ -1443,7 +1477,14 @@ def _build_buy_execution_repeat_candidate(
             or not isfinite(ratio)
             or ratio < 0
             or value["active_direction"] not in {"UP", "DOWN", "BOTH"}
-            or value["active_compare"] not in {">=", "<=", "WITHIN", "OUTSIDE"}
+            or (
+                value["active_direction"] in {"UP", "DOWN"}
+                and value["active_compare"] != "<="
+            )
+            or (
+                value["active_direction"] == "BOTH"
+                and value["active_compare"] != "WITHIN"
+            )
         ):
             warnings.append("buy repeat ACTIVE_BUY policy is invalid")
             return None
@@ -1662,7 +1703,7 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
         below_condition = _price_compare_condition(
             target="AVG_PRICE",
             operator=below_operator,
-            compare_target="ORDER_PRICE",
+            compare_target="SIGNAL_PRICE",
             description="UI preview: BUY price compare below-branch filter condition",
         )
         if below_policy is not None:
@@ -1671,7 +1712,7 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
         above_condition = _price_compare_condition(
             target="AVG_PRICE",
             operator=above_operator,
-            compare_target="ORDER_PRICE",
+            compare_target="SIGNAL_PRICE",
             description="UI preview: BUY price compare above-branch filter condition",
         )
         if above_policy is not None:
@@ -1825,6 +1866,9 @@ def _build_sell_gap_condition(source: dict[str, Any], warnings: list[str], label
     value = _safe_float(source.get("gap_value_line"))
     if left not in {"CLOSE", "AVG_PRICE"} or right not in {"CLOSE", "AVG_PRICE"}:
         warnings.append(f"{label} GAP 가격 기준 재선택 필요")
+        return None
+    if left == right:
+        warnings.append(f"{label} GAP 동일 가격 기준 비교는 허용되지 않음")
         return None
     if direction is None or compare_mode is None or value is None or value < 0:
         warnings.append(f"{label} GAP policy is invalid")

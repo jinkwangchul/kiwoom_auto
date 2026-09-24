@@ -101,7 +101,7 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         self.app.processEvents()
         return selector
 
-    def test_mru_order_dedup_width_trim_and_restart_restore(self):
+    def test_mru_order_dedup_and_restart_restore(self):
         records = [_record(index) for index in range(1, 18)]
         with tempfile.TemporaryDirectory() as temp_dir:
             ini_path = str(Path(temp_dir) / "v2-recent.ini")
@@ -127,14 +127,9 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
                 store.activate(ValidationStockRef(f"{index:06d}", f"종목{index}"))
             self.assertEqual(17, len(store.recent_stocks))
             self.assertEqual("000017", store.recent_stocks[0].code)
-            retained = store.recent_stocks[:4]
-            self.assertTrue(store.retain_prefix(retained))
-            self.assertFalse(store.retain_prefix(retained))
-            self.assertFalse(store.retain_prefix(store.recent_stocks[1:]))
-            self.assertEqual(retained, store.recent_stocks)
             payload = json.loads(settings.value(RECENT_STOCKS_SETTINGS_KEY))
             self.assertEqual(
-                [stock.code for stock in retained],
+                [stock.code for stock in store.recent_stocks],
                 [item["code"] for item in payload],
             )
 
@@ -148,6 +143,43 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
                 recent_stock_store=restored,
             )
             self.assertEqual(restored.recent_stocks[0], flow.last_selected_stock)
+
+    def test_twenty_first_activation_evicts_only_oldest_and_persists_twenty(self):
+        settings = _FakeSettings("")
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings,
+            snapshot_loader=_loader([_record(index) for index in range(1, 22)]),
+        )
+        for index in range(1, 21):
+            self.assertTrue(store.activate(ValidationStockRef(f"{index:06d}", f"종목{index}")))
+        self.assertEqual(20, len(store.recent_stocks))
+        self.assertEqual("000001", store.recent_stocks[-1].code)
+
+        self.assertTrue(store.activate(ValidationStockRef("000021", "종목21")))
+        self.assertEqual(20, len(store.recent_stocks))
+        self.assertEqual("000021", store.recent_stocks[0].code)
+        self.assertEqual("000002", store.recent_stocks[-1].code)
+        self.assertNotIn("000001", [stock.code for stock in store.recent_stocks])
+        self.assertEqual(20, len(json.loads(settings.stored_value)))
+
+    def test_oversized_restored_history_keeps_newest_twenty(self):
+        payload = [
+            {"code": f"{index:06d}", "name": f"종목{index}"}
+            for index in range(21, 0, -1)
+        ]
+        settings = _FakeSettings(json.dumps(payload, ensure_ascii=False))
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings,
+            snapshot_loader=_loader([_record(index) for index in range(1, 22)]),
+        )
+
+        self.assertEqual(20, len(store.recent_stocks))
+        self.assertEqual("000021", store.recent_stocks[0].code)
+        self.assertEqual("000002", store.recent_stocks[-1].code)
+        self.assertEqual(("000001",), store.startup_evicted_codes)
+        self.assertEqual(20, len(json.loads(settings.stored_value)))
+        self.assertEqual(("000001",), store.take_startup_evicted_codes())
+        self.assertEqual((), store.take_startup_evicted_codes())
 
     def test_bad_preferences_and_unverified_library_fail_empty_without_rewrite(self):
         records = [_record(1), _record(2)]
@@ -201,6 +233,24 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         payload = json.loads(settings.stored_value)
         self.assertEqual(["000001", "000002"], [item["code"] for item in payload])
 
+    def test_remove_deletes_exact_recent_stock_without_confirmation_contract(self):
+        settings = _FakeSettings("")
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings,
+            snapshot_loader=_loader([_record(1), _record(2), _record(3)]),
+        )
+        for index in range(1, 4):
+            store.activate(ValidationStockRef(f"{index:06d}", f"종목{index}"))
+        before_writes = len(settings.set_calls)
+
+        self.assertTrue(store.remove(ValidationStockRef("000002", "종목2")))
+        self.assertEqual(
+            ("000003", "000001"),
+            tuple(stock.code for stock in store.recent_stocks),
+        )
+        self.assertEqual(before_writes + 1, len(settings.set_calls))
+        self.assertFalse(store.remove("000002"))
+
     def test_plain_stock_label_click_contract(self):
         selector = self._selector()
         selections = []
@@ -222,27 +272,38 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             for index in range(1, 6)
         )
         selected = []
-        projections = []
+        removed = []
         row.stock_activated.connect(selected.append)
-        row.projection_fitted.connect(projections.append)
+        row.stock_remove_requested.connect(removed.append)
         row.set_recent_stocks(stocks)
         metrics = row.fontMetrics()
         separator_width = metrics.horizontalAdvance(row._SEPARATOR_TEXT)
+        remove_width = (
+            metrics.horizontalAdvance("X") + row._REMOVE_HORIZONTAL_PADDING * 2
+        )
         item_widths = [
-            metrics.horizontalAdvance(f"{stock.code} {stock.name}")
+            remove_width
+            + metrics.horizontalAdvance(f"{stock.code} {stock.name}")
             + row._ITEM_HORIZONTAL_PADDING * 2
             for stock in stocks
         ]
         wide_width = sum(item_widths) + separator_width * (len(stocks) - 1)
-        narrow_width = sum(item_widths[:3]) + separator_width * 2
+        narrow_width = (
+            sum(item_widths[:3]) + separator_width * 2
+            + row._NAVIGATION_WIDTH * 2
+        )
         row.set_available_width(wide_width)
         self.assertEqual(stocks, row.recent_stocks)
         self.assertEqual(5, len(row.stock_buttons))
+        self.assertFalse(row.previous_button.isVisibleTo(row))
+        self.assertFalse(row.next_button.isVisibleTo(row))
         self.assertEqual(row.minimumHeight(), row.maximumHeight())
 
         row.set_available_width(narrow_width)
         self.assertEqual(stocks[:3], row.recent_stocks)
         self.assertEqual(3, len(row.stock_buttons))
+        self.assertEqual(3, len(row.remove_buttons))
+        self.assertEqual(["X", "X", "X"], [button.text() for button in row.remove_buttons])
         self.assertEqual(
             [f"{stock.code} {stock.name}" for stock in stocks[:3]],
             [button.text() for button in row.stock_buttons],
@@ -253,9 +314,13 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         QTest.mouseClick(row.stock_buttons[1], Qt.LeftButton)
         self.app.processEvents()
         self.assertEqual([stocks[1]], selected)
-        self.assertEqual(stocks[:3], projections[-1])
+        QTest.mouseClick(row.remove_buttons[1], Qt.LeftButton)
+        self.app.processEvents()
+        self.assertEqual([stocks[1]], removed)
+        self.assertEqual([stocks[1]], selected)
+        self.assertEqual(stocks[:3], row.recent_stocks)
 
-    def test_width_fitted_projection_removes_hidden_stocks_from_qsettings(self):
+    def test_width_projection_and_navigation_preserve_qsettings_and_full_items(self):
         records = [_record(index) for index in range(1, 6)]
         settings = _FakeSettings("")
         store = IndicatorFollowSignalValidationRecentStockStore(
@@ -267,12 +332,15 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
 
         row = IndicatorFollowSignalValidationRecentStockRow()
         self.widgets.append(row)
-        row.projection_fitted.connect(store.retain_prefix)
         stocks = store.recent_stocks
         row.set_recent_stocks(stocks)
         metrics = row.fontMetrics()
+        remove_width = (
+            metrics.horizontalAdvance("X") + row._REMOVE_HORIZONTAL_PADDING * 2
+        )
         item_widths = [
-            metrics.horizontalAdvance(f"{stock.code} {stock.name}")
+            remove_width
+            + metrics.horizontalAdvance(f"{stock.code} {stock.name}")
             + row._ITEM_HORIZONTAL_PADDING * 2
             for stock in stocks
         ]
@@ -282,12 +350,65 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
         )
         row.set_available_width(available_width)
 
-        self.assertEqual(stocks[:3], store.recent_stocks)
+        self.assertEqual(stocks, store.recent_stocks)
+        self.assertTrue(row.previous_button.isVisibleTo(row))
+        self.assertTrue(row.next_button.isVisibleTo(row))
+        self.assertFalse(row.previous_button.isEnabled())
+        self.assertEqual(stocks[0], row.recent_stocks[0])
+        before_settings = settings.stored_value
+        QTest.mouseClick(row.next_button, Qt.LeftButton)
+        self.assertEqual(stocks[1], row.recent_stocks[0])
+        self.assertTrue(row.previous_button.isEnabled())
+        self.assertEqual(before_settings, settings.stored_value)
+        self.assertEqual(5, len(store.recent_stocks))
         payload = json.loads(settings.stored_value)
         self.assertEqual(
-            [stock.code for stock in stocks[:3]],
+            [stock.code for stock in stocks],
             [item["code"] for item in payload],
         )
+
+    def test_overflow_navigation_reaches_all_twenty_without_partial_stock(self):
+        row = IndicatorFollowSignalValidationRecentStockRow()
+        self.widgets.append(row)
+        stocks = tuple(
+            ValidationStockRef(f"{index:06d}", f"종목{index}")
+            for index in range(1, 21)
+        )
+        row.set_recent_stocks(stocks)
+        row.resize(320, row.height())
+        row.set_available_width(320)
+        row.show()
+        self.app.processEvents()
+
+        seen = {stock.code for stock in row.recent_stocks}
+        for _ in range(20):
+            if not row.next_button.isEnabled():
+                break
+            previous_start = row._visible_start_index
+            QTest.mouseClick(row.next_button, Qt.LeftButton)
+            self.app.processEvents()
+            self.assertGreater(row._visible_start_index, previous_start)
+            seen.update(stock.code for stock in row.recent_stocks)
+            self.assertTrue(all(button.text() == f"{stock.code} {stock.name}"
+                for button, stock in zip(row.stock_buttons, row.recent_stocks)))
+            self.assertTrue(all(
+                button.mapTo(row, button.rect().topRight()).x()
+                <= row.width() - row._NAVIGATION_WIDTH
+                for button in row.stock_buttons
+            ))
+        self.assertEqual({stock.code for stock in stocks}, seen)
+        self.assertFalse(row.next_button.isEnabled())
+        self.assertTrue(row.previous_button.isEnabled())
+        final_start = row._visible_start_index
+        row.set_recent_stocks(stocks)
+        self.assertEqual(final_start, row._visible_start_index)
+        for _ in range(20):
+            if not row.previous_button.isEnabled():
+                break
+            previous_start = row._visible_start_index
+            QTest.mouseClick(row.previous_button, Qt.LeftButton)
+            self.assertLess(row._visible_start_index, previous_start)
+        self.assertEqual(stocks[0], row.recent_stocks[0])
 
     def test_tooltip_uses_only_loaded_static_metadata_and_hides_on_boundaries(self):
         selector = self._selector()
@@ -379,7 +500,6 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
             (self.project_root / "indicator_follow_signal_validation_recent_stocks.py").read_text(encoding="utf-8"),
         ))
         for forbidden in (
-            "MAX_RECENT_STOCKS",
             "IndicatorFollowSignalValidationRecentStockPopup",
             "Qt.Popup",
             "QListWidget",

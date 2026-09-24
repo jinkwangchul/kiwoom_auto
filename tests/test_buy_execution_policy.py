@@ -196,6 +196,136 @@ class BuyExecutionPolicyTest(unittest.TestCase):
         self.assertEqual(851, limited["quantity"])
         self.assertIn("ROUND_BUDGET_EXCEEDS_REMAINING_BUDGET", limited["issues"])
 
+    def test_active_buy_non_corrective_condition_does_not_buy(self):
+        repeat = self._rules()["buy"]["execution"]["repeat"]
+        repeat.update(
+            detail_mode="ACTIVE_BUY",
+            active_direction="UP",
+            active_ratio=1,
+            active_compare=">=",
+        )
+        result = self._evaluate(
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=10,
+                confirmed_average_buy_price=120,
+                active_reference_price=100,
+                actionable_acquisition_price=100,
+            ),
+        )
+
+        self.assertEqual(STATUS_BLOCKED, result["status"])
+        calculation = result["evidence"]["budget_calculation"]["active_buy_calculation"]
+        self.assertEqual("NO_BUY", calculation["status"])
+        self.assertEqual("ACTIVE_BUY_NON_CORRECTIVE_CONDITION", calculation["reason"])
+        self.assertEqual(0, calculation["required_quantity"])
+
+    def test_active_buy_downward_gap_corrects_toward_signal_without_crossing(self):
+        repeat = self._rules()["buy"]["execution"]["repeat"]
+        repeat.update(
+            detail_mode="ACTIVE_BUY",
+            active_direction="DOWN",
+            active_ratio=2,
+            active_compare="<=",
+        )
+        result = self._evaluate(
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=10,
+                confirmed_average_buy_price=90,
+                active_reference_price=100,
+                actionable_acquisition_price=100,
+                total_budget=100000,
+                remaining_budget=100000,
+            ),
+        )
+
+        self.assertEqual(STATUS_READY, result["status"], result)
+        calculation = result["evidence"]["budget_calculation"]["active_buy_calculation"]
+        self.assertEqual(40, calculation["required_quantity"])
+        self.assertEqual(98.0, calculation["projected_average"])
+        self.assertGreaterEqual(calculation["projected_average"], 90.0)
+        self.assertLessEqual(calculation["projected_average"], 100.0)
+
+    def test_active_buy_both_within_corrects_without_crossing_signal_price(self):
+        repeat = self._rules()["buy"]["execution"]["repeat"]
+        repeat.update(
+            detail_mode="ACTIVE_BUY",
+            active_direction="BOTH",
+            active_ratio=2,
+            active_compare="WITHIN",
+        )
+        result = self._evaluate(
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=10,
+                confirmed_average_buy_price=120,
+                active_reference_price=100,
+                actionable_acquisition_price=90,
+                total_budget=100000,
+                remaining_budget=100000,
+            ),
+        )
+
+        self.assertEqual(STATUS_READY, result["status"], result)
+        calculation = result["evidence"]["budget_calculation"]["active_buy_calculation"]
+        self.assertEqual(102.0, calculation["projected_average"])
+        self.assertGreaterEqual(calculation["projected_average"], 100.0)
+        self.assertLessEqual(calculation["projected_average"], 120.0)
+
+    def test_active_buy_both_outside_does_not_buy(self):
+        repeat = self._rules()["buy"]["execution"]["repeat"]
+        repeat.update(
+            detail_mode="ACTIVE_BUY",
+            active_direction="BOTH",
+            active_ratio=2,
+            active_compare="OUTSIDE",
+        )
+        result = self._evaluate(
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=10,
+                confirmed_average_buy_price=120,
+                active_reference_price=100,
+                actionable_acquisition_price=90,
+            ),
+        )
+
+        self.assertEqual(STATUS_BLOCKED, result["status"])
+        calculation = result["evidence"]["budget_calculation"]["active_buy_calculation"]
+        self.assertEqual("NO_BUY", calculation["status"])
+        self.assertEqual("ACTIVE_BUY_NON_CORRECTIVE_CONDITION", calculation["reason"])
+        self.assertEqual(0, calculation["required_quantity"])
+
+    def test_active_buy_rejects_whole_share_result_that_crosses_signal_price(self):
+        repeat = self._rules()["buy"]["execution"]["repeat"]
+        repeat.update(
+            detail_mode="ACTIVE_BUY",
+            active_direction="UP",
+            active_ratio=0.2,
+            active_compare="<=",
+        )
+        result = self._evaluate(
+            approved_rules=self._rules(repeat=repeat),
+            runtime_state_snapshot=self._runtime(confirmed_current_buy_round=1),
+            budget_context=self._budget(
+                position_quantity=1,
+                confirmed_average_buy_price=101,
+                active_reference_price=100,
+                actionable_acquisition_price=90,
+            ),
+        )
+
+        self.assertEqual(STATUS_BLOCKED, result["status"])
+        calculation = result["evidence"]["budget_calculation"]["active_buy_calculation"]
+        self.assertEqual("NO_BUY", calculation["status"])
+        self.assertEqual("ACTIVE_BUY_SIGNAL_BOUNDARY_WOULD_CROSS", calculation["reason"])
+        self.assertEqual(0, calculation["required_quantity"])
+
     def test_only_explicit_max_rounds_limits_buy_round(self):
         result = self._evaluate(
             runtime_state_snapshot=self._runtime(confirmed_current_buy_round=2),

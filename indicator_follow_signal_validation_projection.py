@@ -319,7 +319,7 @@ def build_validation_average_price_context(
             "evaluation_index": evaluation_index,
             "estimated_average_price": current_average,
             "contributing_buy_indexes": contributor_series[evaluation_index],
-            "average_source": "VALIDATION_BUY_OHLC4_VIRTUAL_FILL_SEGMENT",
+            "average_source": "VALIDATION_BUY_CLOSE_SIGNAL_PRICE_SEGMENT",
         },
     }
 

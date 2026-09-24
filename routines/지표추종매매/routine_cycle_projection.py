@@ -64,6 +64,7 @@ def _unresolved(reason: str, *, holding_qty: int = 0, avg_price: float = 0.0) ->
         "approved_buy_budget_by_round": {},
         "last_normal_round_approved_budget": None,
         "last_confirmed_buy_order_price": None,
+        "last_confirmed_buy_signal_price": None,
         "last_plus_one_pending": False,
         "last_plus_one_completed": False,
         "pending_buy_rounds": [],
@@ -86,6 +87,7 @@ def _resolved(
     filled_buy_amount_by_round: dict[int, float],
     approved_buy_budget_by_round: dict[int, float],
     confirmed_order_price_by_round: dict[int, float],
+    confirmed_signal_price_by_round: dict[int, float],
     last_plus_one_pending: bool,
     last_plus_one_completed: bool,
     pending_buy_rounds: list[int],
@@ -108,6 +110,7 @@ def _resolved(
         "approved_buy_budget_by_round": dict(approved_buy_budget_by_round),
         "last_normal_round_approved_budget": approved_buy_budget_by_round.get(confirmed_round),
         "last_confirmed_buy_order_price": confirmed_order_price_by_round.get(confirmed_round),
+        "last_confirmed_buy_signal_price": confirmed_signal_price_by_round.get(confirmed_round),
         "last_plus_one_pending": last_plus_one_pending,
         "last_plus_one_completed": last_plus_one_completed,
         "pending_buy_rounds": list(pending_buy_rounds),
@@ -356,6 +359,7 @@ def project_indicator_follow_cycle(
     filled_buy_amount_by_round: dict[int, float] = {}
     approved_buy_budget_by_round: dict[int, float] = {}
     confirmed_order_price_by_round: dict[int, float] = {}
+    confirmed_signal_price_by_round: dict[int, float] = {}
     last_buy_identity: str | None = None
     cycle_identity: str | None = None
     partial_sell = False
@@ -429,6 +433,7 @@ def project_indicator_follow_cycle(
                         filled_buy_amount_by_round = {}
                         approved_buy_budget_by_round = {}
                         confirmed_order_price_by_round = {}
+                        confirmed_signal_price_by_round = {}
                         last_buy_identity = None
                         cycle_identity = _clean(intent.get("cycle_identity")) or order_key
                         partial_sell = False
@@ -458,10 +463,13 @@ def project_indicator_follow_cycle(
                     last_buy_identity = order_key
                     approved_budget = _approved_round_budget(intent)
                     confirmed_price = _canonical_order_basis_price(intent)
+                    confirmed_signal_price = _number(intent.get("signal_price"))
                     if approved_budget is not None:
                         approved_buy_budget_by_round[planned_round] = approved_budget
                     if confirmed_price is not None:
                         confirmed_order_price_by_round[planned_round] = confirmed_price
+                    if confirmed_signal_price is not None and confirmed_signal_price > 0:
+                        confirmed_signal_price_by_round[planned_round] = confirmed_signal_price
                     if cycle_identity is None:
                         cycle_identity = _clean(intent.get("cycle_identity")) or order_key
                 filled_amount = delta * price
@@ -485,6 +493,7 @@ def project_indicator_follow_cycle(
                     filled_buy_amount_by_round = {}
                     approved_buy_budget_by_round = {}
                     confirmed_order_price_by_round = {}
+                    confirmed_signal_price_by_round = {}
                     last_buy_identity = None
                     cycle_identity = None
                     partial_sell = False
@@ -534,6 +543,7 @@ def project_indicator_follow_cycle(
         filled_buy_amount_by_round=filled_buy_amount_by_round,
         approved_buy_budget_by_round=approved_buy_budget_by_round,
         confirmed_order_price_by_round=confirmed_order_price_by_round,
+        confirmed_signal_price_by_round=confirmed_signal_price_by_round,
         last_plus_one_pending=last_plus_one_pending,
         last_plus_one_completed=last_plus_one_completed,
         pending_buy_rounds=sorted(pending_buy_rounds),

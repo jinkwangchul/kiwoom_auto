@@ -44,7 +44,7 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
     def _intents(
         self,
         *,
-        left: str = "ORDER_PRICE",
+        left: str = "SIGNAL_PRICE",
         right: str = "CURRENT_PRICE",
         direction: str = "UP",
         compare: str = ">=",
@@ -61,6 +61,7 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
             "ratio_compare": compare,
             "ratio_unit": "PERCENT",
             "order_price": 10_000,
+            "signal_price": 10_000,
         }
         values: list[dict[str, object]] = []
         for index, quantity in enumerate((4, 3, 3), start=1):
@@ -244,6 +245,18 @@ class ExecutionRatioSliceEligibilityTest(unittest.TestCase):
         self._fixture(intents=avg_intents, average_price=10_000)
         eligible = self._inspect(current_price=10_100)
         self.assertEqual(1, eligible["proposals"][0]["child_sequence_index"])
+
+    def test_same_price_axis_is_rejected_before_ratio_evaluation(self) -> None:
+        intents = self._intents(left="SIGNAL_PRICE", right="SIGNAL_PRICE")
+        self._fixture(intents=intents)
+
+        result = self._inspect(current_price=None)
+
+        self.assertEqual([], result["proposals"])
+        self.assertIn(
+            "RATIO_TRIGGER_POLICY_INVALID",
+            result["reviews"][0]["review_reasons"],
+        )
 
     def test_existing_child_progresses_once_and_pending_child_waits(self) -> None:
         first = self._order(1)

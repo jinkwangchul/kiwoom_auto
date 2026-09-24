@@ -100,6 +100,7 @@ _SELECTION = QColor(250, 204, 21, 45)
 _SELECTION_LINE = QColor("#fde047")
 _VALIDATION_RANGE_SELECTION = QColor(96, 165, 250, 34)
 _VALIDATION_RANGE_LINE = QColor("#60a5fa")
+_CYCLE_AVERAGE_LINE = QColor("#d1d5db")
 _VISUAL_SERIES_COLORS = (
     QColor("#f59e0b"),
     QColor("#22d3ee"),
@@ -614,6 +615,7 @@ class _ValidationChartViewState:
     time_scale_manually_adjusted: bool
     price_scale_manually_adjusted: bool
     selected_evaluation_index: int | None
+    lower_pane_heights: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -797,6 +799,64 @@ def _format_summary_return_percent(value: float | None) -> str:
     if number is None:
         number = 0.0
     return f"{number:+.2f}%" if number != 0 else "0.00%"
+
+
+def _completed_cycle_invested_amount(
+    cycle: IndicatorFollowValidationCompletedCycle,
+) -> float | None:
+    quantity = (
+        cycle.buy_quantity
+        if isinstance(cycle.buy_quantity, int)
+        and not isinstance(cycle.buy_quantity, bool)
+        and cycle.buy_quantity > 0
+        else cycle.buy_count
+    )
+    if quantity <= 0:
+        return None
+    invested = (
+        cycle.buy_cost
+        if math.isfinite(cycle.buy_cost) and cycle.buy_cost > 0
+        else cycle.average_buy_price * quantity
+    )
+    return invested if math.isfinite(invested) and invested > 0 else None
+
+
+def _completed_cycle_profit_amount(
+    cycle: IndicatorFollowValidationCompletedCycle,
+) -> float | None:
+    invested = _completed_cycle_invested_amount(cycle)
+    if invested is None:
+        return None
+    quantity = (
+        cycle.buy_quantity
+        if isinstance(cycle.buy_quantity, int)
+        and not isinstance(cycle.buy_quantity, bool)
+        and cycle.buy_quantity > 0
+        else cycle.buy_count
+    )
+    sell_amount = cycle.sell_price * quantity
+    trading_cost = (
+        cycle.trading_cost_amount
+        if math.isfinite(cycle.trading_cost_amount)
+        and cycle.trading_cost_amount > 0
+        else 0.0
+    )
+    profit = sell_amount - invested - trading_cost
+    return profit if math.isfinite(profit) else None
+
+
+def _average_completed_cycle_invested_amount(
+    cycles: list[IndicatorFollowValidationCompletedCycle]
+    | tuple[IndicatorFollowValidationCompletedCycle, ...],
+) -> float:
+    invested_values = [
+        invested
+        for cycle in cycles
+        if (invested := _completed_cycle_invested_amount(cycle)) is not None
+    ]
+    if not invested_values:
+        return 0.0
+    return sum(invested_values) / len(invested_values)
 
 
 def _completed_cycle_financial_summary(
@@ -1102,8 +1162,17 @@ class IndicatorFollowSignalValidationChartCanvas(
     _CANDLE_HORIZONTAL_GAP = 2.0
     _LOWER_TOTAL_HEIGHT = 180
     _PRICE_TO_LOWER_GAP = 24
-    _LOWER_FAMILY_ORDER = (FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC)
+    _LOWER_FAMILY_ORDER = (FAMILY_RSI, FAMILY_OCR_OSC)
+    _MIN_LOWER_PANE_HEIGHT = 48.0
+    _MIN_PRICE_PLOT_HEIGHT = 100.0
+    _LOWER_BOUNDARY_HIT_TOLERANCE = 6.0
     _SERIES_HIT_TOLERANCE = 6.0
+
+    pane_layout_changed = pyqtSignal()
+
+    @staticmethod
+    def _display_lower_family(family: str) -> str:
+        return FAMILY_OCR_OSC if family == FAMILY_MACD_SIGNAL else family
 
     def __init__(
         self,
@@ -1137,6 +1206,10 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._hover_marker_key: tuple[int, str] | None = None
         self._pinned_marker_key: tuple[int, str] | None = None
         self._validation_range: tuple[int, int] | None = None
+        self._completed_cycle_average_lines: tuple[
+            IndicatorFollowValidationCompletedCycle, ...
+        ] = ()
+        self._selected_completed_cycle_number: int | None = None
         self._crosshair_hover_index: int | None = None
         self._crosshair_pointer_y: float | None = None
         self._static_chart_cache: QPixmap | None = None
@@ -1145,10 +1218,14 @@ class IndicatorFollowSignalValidationChartCanvas(
             family
             for family in self._LOWER_FAMILY_ORDER
             if any(
-                descriptor.axis == LOWER_AXIS and descriptor.family == family
+                descriptor.axis == LOWER_AXIS
+                and self._display_lower_family(descriptor.family) == family
                 for descriptor in self._visualization_descriptors
             )
         )
+        self._lower_pane_heights: dict[str, float] = {}
+        self._lower_boundary_drag_index: int | None = None
+        self._reset_lower_pane_layout_state()
         self._price_series_groups = self._build_series_groups(PRICE_AXIS)
         self._lower_series_groups = {
             family: self._build_series_groups(LOWER_AXIS, family=family)
@@ -1222,25 +1299,115 @@ class IndicatorFollowSignalValidationChartCanvas(
             (int(index), str(side).strip().upper()): tuple(identities)
             for (index, side), identities in active_by_marker.items()
         }
+        previous_lower_families = tuple(self._lower_families)
         self._lower_families = tuple(
             family
             for family in self._LOWER_FAMILY_ORDER
             if any(
-                descriptor.axis == LOWER_AXIS and descriptor.family == family
+                descriptor.axis == LOWER_AXIS
+                and self._display_lower_family(descriptor.family) == family
                 for descriptor in self._visualization_descriptors
             )
         )
+        if self._lower_families != previous_lower_families:
+            self._reset_lower_pane_layout_state()
         self._price_series_groups = self._build_series_groups(PRICE_AXIS)
         self._lower_series_groups = {
             family: self._build_series_groups(LOWER_AXIS, family=family)
             for family in self._lower_families
         }
         self._refresh_visible_data_bounds()
+        if self._lower_families != previous_lower_families:
+            self.pane_layout_changed.emit()
         self.update()
+
+    def _default_lower_pane_heights(self) -> dict[str, float]:
+        if not self._lower_families:
+            return {}
+        height = float(self._LOWER_TOTAL_HEIGHT) / len(self._lower_families)
+        return {family: height for family in self._lower_families}
+
+    def _reset_lower_pane_layout_state(self) -> None:
+        self._lower_pane_heights = self._default_lower_pane_heights()
+
+    def _lower_total_height(self) -> float:
+        return sum(
+            float(self._lower_pane_heights.get(family, 0.0))
+            for family in self._lower_families
+        )
+
+    def _maximum_lower_total_height(self) -> float:
+        if not self._lower_families:
+            return 0.0
+        minimum_total = self._MIN_LOWER_PANE_HEIGHT * len(self._lower_families)
+        available = (
+            float(self.height())
+            - self._BOTTOM
+            - self._PRICE_TO_LOWER_GAP
+            - self._TOP
+            - self._MIN_PRICE_PLOT_HEIGHT
+        )
+        return max(minimum_total, available)
+
+    @property
+    def lower_pane_heights(self) -> tuple[tuple[str, float], ...]:
+        return tuple(
+            (family, float(self._lower_pane_heights.get(family, 0.0)))
+            for family in self._lower_families
+        )
+
+    def set_lower_pane_heights(
+        self,
+        heights: tuple[tuple[str, float], ...] | list[tuple[str, float]],
+    ) -> None:
+        if not self._lower_families:
+            if self._lower_pane_heights:
+                self._lower_pane_heights = {}
+                self._static_chart_cache = None
+                self._static_chart_cache_key = None
+                self.update()
+                self.pane_layout_changed.emit()
+            return
+        supplied = {
+            str(family): float(height)
+            for family, height in heights
+            if _finite_number(height) is not None
+        }
+        defaults = self._default_lower_pane_heights()
+        normalized = {
+            family: max(
+                self._MIN_LOWER_PANE_HEIGHT,
+                supplied.get(family, defaults[family]),
+            )
+            for family in self._lower_families
+        }
+        maximum_total = self._maximum_lower_total_height()
+        excess = max(0.0, sum(normalized.values()) - maximum_total)
+        if excess:
+            for family in self._lower_families:
+                reducible = max(
+                    0.0,
+                    normalized[family] - self._MIN_LOWER_PANE_HEIGHT,
+                )
+                reduction = min(excess, reducible)
+                normalized[family] -= reduction
+                excess -= reduction
+                if excess <= 1e-9:
+                    break
+        if normalized == self._lower_pane_heights:
+            return
+        self._lower_pane_heights = normalized
+        self._static_chart_cache = None
+        self._static_chart_cache_key = None
+        self.update()
+        self.pane_layout_changed.emit()
+
+    def reset_lower_pane_layout(self) -> None:
+        self.set_lower_pane_heights(tuple(self._default_lower_pane_heights().items()))
 
     @property
     def indicator_total_height(self) -> int:
-        return self._LOWER_TOTAL_HEIGHT if self._lower_families else 0
+        return round(self._lower_total_height()) if self._lower_families else 0
 
     @property
     def lower_families(self) -> tuple[str, ...]:
@@ -1273,29 +1440,357 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._validation_range = (start, end)
         self.update()
 
+    def set_completed_cycle_average_lines(
+        self,
+        cycles: tuple[IndicatorFollowValidationCompletedCycle, ...],
+    ) -> None:
+        normalized = tuple(
+            cycle
+            for cycle in cycles
+            if isinstance(cycle, IndicatorFollowValidationCompletedCycle)
+            and 0 <= cycle.buy_start_index <= cycle.sell_index < len(self._candles)
+            and math.isfinite(float(cycle.average_buy_price))
+            and float(cycle.average_buy_price) > 0
+        )
+        if normalized == self._completed_cycle_average_lines:
+            return
+        self._completed_cycle_average_lines = normalized
+        if self._selected_completed_cycle_number not in {
+            cycle.cycle_number for cycle in normalized
+        }:
+            self._selected_completed_cycle_number = None
+        self._static_chart_cache = None
+        self._static_chart_cache_key = None
+        self.update()
+
+    @property
+    def selected_completed_cycle_number(self) -> int | None:
+        return self._selected_completed_cycle_number
+
+    def set_selected_completed_cycle_number(self, cycle_number: int | None) -> None:
+        if cycle_number is not None:
+            if isinstance(cycle_number, bool) or not isinstance(cycle_number, int):
+                return
+            if cycle_number not in {
+                cycle.cycle_number for cycle in self._completed_cycle_average_lines
+            }:
+                return
+        if cycle_number == self._selected_completed_cycle_number:
+            return
+        self._selected_completed_cycle_number = cycle_number
+        self._static_chart_cache = None
+        self._static_chart_cache_key = None
+        self.update()
+
+    def _completed_cycle_render_color(self, cycle_number: int) -> QColor:
+        return (
+            _SELECTION_LINE
+            if cycle_number == self._selected_completed_cycle_number
+            else _CYCLE_AVERAGE_LINE
+        )
+
+    def completed_cycle_average_line_records(
+        self,
+        scale: _ValidationPriceScale | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._validation_range is None or not self._completed_cycle_average_lines:
+            return []
+        resolved_scale = scale if scale is not None else self.price_scale()
+        if resolved_scale is None:
+            return []
+
+        plot_left = float(self.plot_left)
+        plot_right = float(self.width() - self._RIGHT)
+        records: list[dict[str, Any]] = []
+        for cycle in self._completed_cycle_average_lines:
+            start_x = self._x_for_index(cycle.buy_start_index)
+            end_x = self._x_for_index(cycle.sell_index)
+            left = max(plot_left, min(start_x, end_x))
+            right = min(plot_right, max(start_x, end_x))
+            if right < left:
+                continue
+            price = float(cycle.average_buy_price)
+            profit_amount = _completed_cycle_profit_amount(cycle)
+            records.append({
+                "cycle_number": cycle.cycle_number,
+                "buy_start_index": cycle.buy_start_index,
+                "sell_index": cycle.sell_index,
+                "average_buy_price": price,
+                "sell_price": float(cycle.sell_price),
+                "estimated_return_percent": float(cycle.estimated_return_percent),
+                "profit_amount": profit_amount if profit_amount is not None else 0.0,
+                "x1": left,
+                "x2": right,
+                "y": resolved_scale.y_for_price(price),
+            })
+        return records
+
+    def _completed_cycle_label_blockers(
+        self,
+        scale: _ValidationPriceScale,
+    ) -> list[QRectF]:
+        blockers: list[QRectF] = []
+        visible_start, visible_end = self._visible_index_bounds()
+        half_width = max(2.0, self._candle_body_width() / 2.0)
+
+        for index in range(visible_start, visible_end):
+            candle = self._candles[index]
+            high = _finite_number(candle.get("high"))
+            low = _finite_number(candle.get("low"))
+            close = _finite_number(candle.get("close"))
+            if high is None or low is None:
+                high = close
+                low = close
+            if high is None or low is None:
+                continue
+            x = self._x_for_index(index)
+            y1 = scale.y_for_price(high)
+            y2 = scale.y_for_price(low)
+            top = min(y1, y2)
+            bottom = max(y1, y2)
+            blockers.append(QRectF(
+                x - half_width - 4.0,
+                top - 5.0,
+                half_width * 2.0 + 8.0,
+                max(10.0, bottom - top + 10.0),
+            ))
+
+        for marker in self._visible_marker_records():
+            index = marker.get("evaluation_index")
+            side = str(marker.get("side") or "").strip().upper()
+            if isinstance(index, bool) or not isinstance(index, int):
+                continue
+            y = self._marker_y(index, side, scale)
+            if y is None:
+                continue
+            x = self._x_for_index(index)
+            blockers.append(QRectF(x - 10.0, y - 12.0, 20.0, 24.0))
+
+        if self._legend_entries(PRICE_AXIS):
+            metrics = QFontMetrics(self.font())
+            blockers.append(QRectF(
+                float(self.plot_left),
+                float(scale.plot_top),
+                float(max(1, self.width() - self._RIGHT - self.plot_left)),
+                float(metrics.height() + 8),
+            ))
+        return blockers
+
+    @staticmethod
+    def _rect_overlap_area(rect: QRectF, blocker: QRectF) -> float:
+        intersection = rect.intersected(blocker)
+        if intersection.isEmpty():
+            return 0.0
+        return max(0.0, intersection.width()) * max(
+            0.0,
+            intersection.height(),
+        )
+
+    def completed_cycle_average_label_records(
+        self,
+        scale: _ValidationPriceScale | None = None,
+    ) -> list[dict[str, Any]]:
+        resolved_scale = scale if scale is not None else self.price_scale()
+        if resolved_scale is None:
+            return []
+        line_records = self.completed_cycle_average_line_records(resolved_scale)
+        if not line_records:
+            return []
+
+        metrics = QFontMetrics(self.font())
+        line_height = max(14, metrics.height() + 1)
+        block_height = float(line_height * 3)
+        plot_left = float(self.plot_left) + 4.0
+        plot_right = float(self.width() - self._RIGHT) - 4.0
+        plot_top = float(resolved_scale.plot_top) + 4.0
+        plot_bottom = float(resolved_scale.plot_bottom) - 4.0
+        blockers = self._completed_cycle_label_blockers(resolved_scale)
+        labels: list[dict[str, Any]] = []
+
+        for record in sorted(
+            line_records,
+            key=lambda item: (float(item["x2"]), int(item["cycle_number"])),
+        ):
+            texts = (
+                f"평단 {_validation_price_text(record['average_buy_price'])}",
+                f"매도 {_validation_price_text(record['sell_price'])}",
+                (
+                    f"손익 {_format_summary_return_percent(record['estimated_return_percent'])}/"
+                    f"{_format_summary_amount(record['profit_amount'], signed=True)}"
+                ),
+            )
+            label_width = float(
+                max(metrics.horizontalAdvance(text) for text in texts) + 4
+            )
+            max_left = plot_right - label_width
+            max_top = plot_bottom - block_height
+            if max_left < plot_left or max_top < plot_top:
+                continue
+
+            anchor_x = float(record["x2"])
+            anchor_y = float(record["y"])
+            preferred_left = anchor_x + 16.0
+
+            x_candidates: list[float] = []
+            if preferred_left <= max_left:
+                x_candidates.append(preferred_left)
+                grid_start = max(preferred_left, plot_left)
+            else:
+                grid_start = plot_left
+            x_candidates.extend((max_left, plot_left))
+            x_step = max(36.0, min(90.0, label_width * 0.45))
+            cursor_x = grid_start
+            while cursor_x <= max_left + 0.5:
+                x_candidates.append(cursor_x)
+                cursor_x += x_step
+
+            if preferred_left <= max_left:
+                x_candidates = [
+                    value for value in x_candidates
+                    if value >= preferred_left - 0.5
+                ]
+            if not x_candidates:
+                x_candidates = [plot_left, max_left]
+
+            y_candidates: list[float] = [
+                min(max(plot_top, anchor_y - block_height / 2.0), max_top),
+                plot_top,
+                max_top,
+            ]
+            y_step = max(12.0, float(line_height))
+            cursor_y = plot_top
+            while cursor_y <= max_top + 0.5:
+                y_candidates.append(cursor_y)
+                cursor_y += y_step
+
+            x_candidates = list(dict.fromkeys(round(v, 3) for v in x_candidates))
+            y_candidates = list(dict.fromkeys(round(v, 3) for v in y_candidates))
+
+            best: tuple[tuple[float, ...], QRectF] | None = None
+            for label_left in x_candidates:
+                for label_top in y_candidates:
+                    rect = QRectF(
+                        float(label_left),
+                        float(label_top),
+                        label_width,
+                        block_height,
+                    )
+                    expanded = rect.adjusted(-4.0, -4.0, 4.0, 4.0)
+                    overlaps = [
+                        self._rect_overlap_area(expanded, blocker)
+                        for blocker in blockers
+                    ]
+                    collision_count = float(sum(area > 0.0 for area in overlaps))
+                    overlap_area = float(sum(overlaps))
+                    center = rect.center()
+                    distance = math.hypot(
+                        float(center.x()) - anchor_x,
+                        float(center.y()) - anchor_y,
+                    )
+                    right_penalty = (
+                        0.0 if rect.left() >= anchor_x + 8.0 else 120.0
+                    )
+                    score = (
+                        1.0 if collision_count else 0.0,
+                        overlap_area,
+                        collision_count,
+                        distance + right_penalty,
+                    )
+                    if best is None or score < best[0]:
+                        best = (score, rect)
+
+            if best is None:
+                continue
+            label_rect = best[1]
+            blockers.append(label_rect.adjusted(-6.0, -6.0, 6.0, 6.0))
+
+            label_left = float(label_rect.left())
+            label_top = float(label_rect.top())
+            if label_left >= anchor_x:
+                leader_end_x = label_left - 4.0
+            else:
+                leader_end_x = float(label_rect.right()) + 4.0
+            leader_end_y = label_top + line_height / 2.0
+            placement = "TOP" if label_rect.center().y() < anchor_y else "BOTTOM"
+
+            labels.append({
+                **record,
+                "texts": texts,
+                "label_left": label_left,
+                "label_top": label_top,
+                "label_width": label_width,
+                "label_height": block_height,
+                "line_height": float(line_height),
+                "placement": placement,
+                "collision_count": int(best[0][2]),
+                "overlap_area": float(best[0][1]),
+                "leader_x1": anchor_x,
+                "leader_y1": anchor_y,
+                "leader_x2": leader_end_x,
+                "leader_y2": leader_end_y,
+            })
+        return labels
+
+    def _draw_completed_cycle_average_labels(
+        self,
+        painter: QPainter,
+        scale: _ValidationPriceScale,
+    ) -> None:
+        records = self.completed_cycle_average_label_records(scale)
+        if not records:
+            return
+        painter.save()
+        painter.setClipRect(self._price_plot_rect(scale))
+        for record in records:
+            color = self._completed_cycle_render_color(record["cycle_number"])
+            painter.setPen(QPen(color, 1.5, Qt.SolidLine))
+            painter.drawLine(
+                QPointF(
+                    float(record["leader_x1"]),
+                    float(record["leader_y1"]),
+                ),
+                QPointF(
+                    float(record["leader_x2"]),
+                    float(record["leader_y2"]),
+                ),
+            )
+            painter.setPen(color)
+            for line_index, text in enumerate(record["texts"]):
+                painter.drawText(
+                    QRectF(
+                        float(record["label_left"]),
+                        float(record["label_top"])
+                        + line_index * float(record["line_height"]),
+                        float(record["label_width"]),
+                        float(record["line_height"]),
+                    ),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    str(text),
+                )
+        painter.restore()
+
     def _price_plot_bottom_margin(self) -> int:
         if not self._lower_families:
             return self._BOTTOM
-        return (
+        return round(
             self._BOTTOM
-            + self._LOWER_TOTAL_HEIGHT
+            + self._lower_total_height()
             + self._PRICE_TO_LOWER_GAP
         )
 
     def lower_pane_records(self) -> list[dict[str, Any]]:
         if not self._lower_families:
             return []
-        area_top = self.height() - self._BOTTOM - self._LOWER_TOTAL_HEIGHT
-        pane_count = len(self._lower_families)
+        area_top = float(self.height() - self._BOTTOM) - self._lower_total_height()
+        cursor = area_top
         records = []
         for index, family in enumerate(self._lower_families):
-            top = round(
-                area_top
-                + self._LOWER_TOTAL_HEIGHT * index / pane_count
-            )
-            bottom = round(
-                area_top
-                + self._LOWER_TOTAL_HEIGHT * (index + 1) / pane_count
+            top = round(cursor)
+            cursor += float(self._lower_pane_heights.get(family, 0.0))
+            bottom = (
+                self.height() - self._BOTTOM
+                if index == len(self._lower_families) - 1
+                else round(cursor)
             )
             records.append({
                 "family": family,
@@ -1306,10 +1801,80 @@ class IndicatorFollowSignalValidationChartCanvas(
                     descriptor.identity
                     for descriptor in self._visualization_descriptors
                     if descriptor.axis == LOWER_AXIS
-                    and descriptor.family == family
+                    and self._display_lower_family(descriptor.family) == family
                 ),
             })
         return records
+
+    def lower_boundary_records(self) -> list[dict[str, Any]]:
+        panes = self.lower_pane_records()
+        return [
+            {
+                "index": index,
+                "y": float(pane["top"]),
+                "upper": "PRICE" if index == 0 else panes[index - 1]["family"],
+                "lower": pane["family"],
+            }
+            for index, pane in enumerate(panes)
+        ]
+
+    def _lower_boundary_at(self, y: float) -> int | None:
+        pointer_y = float(y)
+        for record in self.lower_boundary_records():
+            if abs(pointer_y - float(record["y"])) <= self._LOWER_BOUNDARY_HIT_TOLERANCE:
+                return int(record["index"])
+        return None
+
+    def _resize_lower_boundary_to(self, boundary_index: int, y: float) -> bool:
+        if not 0 <= boundary_index < len(self._lower_families):
+            return False
+        heights = [
+            float(self._lower_pane_heights[family])
+            for family in self._lower_families
+        ]
+        fixed_bottom = float(self.height() - self._BOTTOM)
+        area_top = fixed_bottom - sum(heights)
+        requested_y = float(y)
+
+        if boundary_index == 0:
+            first_bottom = area_top + heights[0]
+            minimum_boundary_y = (
+                self._TOP
+                + self._MIN_PRICE_PLOT_HEIGHT
+                + self._PRICE_TO_LOWER_GAP
+            )
+            maximum_boundary_y = first_bottom - self._MIN_LOWER_PANE_HEIGHT
+            if maximum_boundary_y < minimum_boundary_y:
+                return False
+            boundary_y = min(
+                maximum_boundary_y,
+                max(float(minimum_boundary_y), requested_y),
+            )
+            heights[0] = first_bottom - boundary_y
+        else:
+            previous_top = area_top + sum(heights[: boundary_index - 1])
+            pair_bottom = area_top + sum(heights[: boundary_index + 1])
+            minimum_boundary_y = previous_top + self._MIN_LOWER_PANE_HEIGHT
+            maximum_boundary_y = pair_bottom - self._MIN_LOWER_PANE_HEIGHT
+            boundary_y = min(
+                maximum_boundary_y,
+                max(minimum_boundary_y, requested_y),
+            )
+            heights[boundary_index - 1] = boundary_y - previous_top
+            heights[boundary_index] = pair_bottom - boundary_y
+
+        updated = {
+            family: height
+            for family, height in zip(self._lower_families, heights)
+        }
+        if updated == self._lower_pane_heights:
+            return False
+        self._lower_pane_heights = updated
+        self._static_chart_cache = None
+        self._static_chart_cache_key = None
+        self.update()
+        self.pane_layout_changed.emit()
+        return True
 
     def _cached_values(
         self,
@@ -1344,8 +1909,14 @@ class IndicatorFollowSignalValidationChartCanvas(
         for descriptor in self._visualization_descriptors:
             if descriptor.axis != axis:
                 continue
-            if family is not None and descriptor.family != family:
-                continue
+            if family is not None:
+                descriptor_family = (
+                    self._display_lower_family(descriptor.family)
+                    if axis == LOWER_AXIS
+                    else descriptor.family
+                )
+                if descriptor_family != family:
+                    continue
             for channel in descriptor.series_keys:
                 values = self._cached_values(descriptor, channel)
                 if len(values) != len(self._candles):
@@ -1480,7 +2051,10 @@ class IndicatorFollowSignalValidationChartCanvas(
         groups = (
             self._price_series_groups
             if descriptor.axis == PRICE_AXIS
-            else self._lower_series_groups.get(descriptor.family, ())
+            else self._lower_series_groups.get(
+                self._display_lower_family(descriptor.family),
+                (),
+            )
         )
         result: list[tuple[str, QPen]] = []
         for channel, _values, owners in groups:
@@ -1527,8 +2101,14 @@ class IndicatorFollowSignalValidationChartCanvas(
         for descriptor in self._visualization_descriptors:
             if descriptor.axis != axis:
                 continue
-            if family is not None and descriptor.family != family:
-                continue
+            if family is not None:
+                descriptor_family = (
+                    self._display_lower_family(descriptor.family)
+                    if axis == LOWER_AXIS
+                    else descriptor.family
+                )
+                if descriptor_family != family:
+                    continue
             caption = self._styled_descriptor_caption(descriptor)
             if caption not in grouped:
                 grouped[caption] = []
@@ -2259,7 +2839,36 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._pinned_marker_key = None
         self.update()
 
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            boundary_index = self._lower_boundary_at(float(event.pos().y()))
+            if boundary_index is not None:
+                self._clear_pan_drag()
+                self._lower_boundary_drag_index = boundary_index
+                self.setCursor(Qt.SizeVerCursor)
+                self._set_hover_marker_key(None)
+                self._set_crosshair_pointer(None, None)
+                self.clear_marker_tooltip()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self._lower_boundary_drag_index is not None
+        ):
+            boundary_index = self._lower_boundary_drag_index
+            self._resize_lower_boundary_to(
+                boundary_index,
+                float(event.pos().y()),
+            )
+            self._lower_boundary_drag_index = None
+            if self._lower_boundary_at(float(event.pos().y())) is None:
+                self.unsetCursor()
+            event.accept()
+            return
+
         if (
             event.button() == Qt.LeftButton
             and self._validation_range_drag_start_index is not None
@@ -2340,6 +2949,12 @@ class IndicatorFollowSignalValidationChartCanvas(
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self._lower_boundary_at(float(event.pos().y())) is not None
+        ):
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             # Double-click is reserved for range-drag start. It always
             # hides the yellow single-click position indicator.
@@ -2361,6 +2976,24 @@ class IndicatorFollowSignalValidationChartCanvas(
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._lower_boundary_drag_index is not None:
+            self._resize_lower_boundary_to(
+                self._lower_boundary_drag_index,
+                float(event.pos().y()),
+            )
+            self._set_hover_marker_key(None)
+            self._set_crosshair_pointer(None, None)
+            self.clear_marker_tooltip()
+            self.setCursor(Qt.SizeVerCursor)
+            event.accept()
+            return
+
+        if self._drag_press_x is None:
+            if self._lower_boundary_at(float(event.pos().y())) is not None:
+                self.setCursor(Qt.SizeVerCursor)
+            else:
+                self.unsetCursor()
+
         if self._validation_range_drag_start_index is not None:
             start = self._validation_range_drag_start_index
             index = self._nearest_candle_index(event.pos().x())
@@ -2448,9 +3081,13 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._set_hover_marker_key(None)
         self._set_crosshair_pointer(None, None)
         self.clear_marker_tooltip()
+        if self._lower_boundary_drag_index is None:
+            self.unsetCursor()
         super().leaveEvent(event)
 
     def hideEvent(self, event) -> None:
+        self._lower_boundary_drag_index = None
+        self.unsetCursor()
         if self._validation_range_drag_start_index is not None:
             self._clear_validation_range_drag()
             self.set_validation_range(None, None)
@@ -2628,6 +3265,101 @@ class IndicatorFollowSignalValidationChartCanvas(
             ),
             separator="  |  ",
         )
+
+    @staticmethod
+    def _reference_side_label(side: str) -> str:
+        return {
+            "BUY": "매수",
+            "SELL": "매도",
+        }.get(str(side or "").strip().upper(), str(side or "").strip())
+
+    def lower_reference_line_records(
+        self,
+        family: str,
+        scale: _ValidationPriceScale,
+    ) -> list[dict[str, Any]]:
+        grouped: dict[float, set[str]] = {}
+        visible_start, visible_end = self._visible_index_bounds()
+
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != LOWER_AXIS:
+                continue
+            if self._display_lower_family(descriptor.family) != family:
+                continue
+
+            values_to_record: list[float] = []
+            for channel in descriptor.series_keys:
+                if not str(channel).upper().startswith("CRITERION"):
+                    continue
+                values = self._cached_values(descriptor, channel)
+                if len(values) != len(self._candles):
+                    continue
+                value = next(
+                    (
+                        number
+                        for raw in values[visible_start:visible_end]
+                        if (number := _finite_number(raw)) is not None
+                    ),
+                    None,
+                )
+                if value is not None:
+                    values_to_record.append(value)
+
+            if descriptor.family == FAMILY_OCR_OSC:
+                condition = descriptor.parameters.get("condition")
+                if isinstance(condition, Mapping) and str(
+                    condition.get("operator") or ""
+                ).strip().upper() in {"TURN_UP", "TURN_DOWN"}:
+                    values_to_record.append(0.0)
+
+            for value in values_to_record:
+                key = round(float(value), 12)
+                grouped.setdefault(key, set()).update(
+                    str(side).strip().upper()
+                    for side in descriptor.sides
+                    if str(side).strip()
+                )
+
+        if family == FAMILY_OCR_OSC:
+            grouped.setdefault(0.0, set())
+
+        records: list[dict[str, Any]] = []
+        for value in sorted(grouped):
+            sides = tuple(
+                side
+                for side in ("BUY", "SELL")
+                if side in grouped[value]
+            ) + tuple(
+                sorted(grouped[value] - {"BUY", "SELL"})
+            )
+            value_text = self._crosshair_number_text(value)
+            labels = [
+                f"{self._reference_side_label(side)} {value_text}"
+                for side in sides
+                if self._reference_side_label(side)
+            ]
+            records.append({
+                "family": family,
+                "value": float(value),
+                "y": scale.y_for_price(float(value)),
+                "sides": sides,
+                "text": " / ".join(labels) if labels else value_text,
+            })
+        return records
+
+    def lower_reference_axis_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for pane in self.lower_pane_records():
+            family = str(pane["family"])
+            scale = self._lower_scale(
+                family,
+                int(pane["top"]),
+                int(pane["bottom"]),
+            )
+            if scale is None:
+                continue
+            records.extend(self.lower_reference_line_records(family, scale))
+        return records
 
     def _draw_lower_panes(self, painter: QPainter) -> None:
         if not self._lower_families:
@@ -2879,6 +3611,17 @@ class IndicatorFollowSignalValidationChartCanvas(
             )
         painter.restore()
 
+        painter.save()
+        painter.setClipRect(price_plot_rect)
+        for record in self.completed_cycle_average_line_records(scale):
+            color = self._completed_cycle_render_color(record["cycle_number"])
+            painter.setPen(QPen(color, 2.0, Qt.DashLine))
+            painter.drawLine(
+                QPointF(float(record["x1"]), float(record["y"])),
+                QPointF(float(record["x2"]), float(record["y"])),
+            )
+        painter.restore()
+
         self._draw_price_overlay_legend(painter, scale)
 
         painter.save()
@@ -2914,6 +3657,8 @@ class IndicatorFollowSignalValidationChartCanvas(
             painter.setBrush(QBrush(color))
             painter.drawPolygon(QPolygonF(points))
         painter.restore()
+
+        self._draw_completed_cycle_average_labels(painter, scale)
 
         self._draw_lower_panes(painter)
 
@@ -3029,6 +3774,9 @@ class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
         return [
             _validation_price_text(record["price"])
             for record in self._canvas.grid_line_records()
+        ] + [
+            str(record["text"])
+            for record in self._canvas.lower_reference_axis_records()
         ]
 
     def _sync_width(self) -> None:
@@ -3052,6 +3800,18 @@ class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
                 "y": viewport_top + record["y"],
             }
             for record in self._canvas.grid_line_records()
+        ]
+
+    def lower_reference_axis_records(self) -> list[dict[str, Any]]:
+        if self._canvas is None:
+            return []
+        viewport_top = self._scroll_area.viewport().geometry().top()
+        return [
+            {
+                **record,
+                "y": viewport_top + float(record["y"]),
+            }
+            for record in self._canvas.lower_reference_axis_records()
         ]
 
     def wheelEvent(self, event) -> None:
@@ -3084,6 +3844,25 @@ class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
                 ),
                 Qt.AlignRight | Qt.AlignVCenter,
                 record["label"],
+            )
+        for record in self.lower_reference_axis_records():
+            sides = tuple(record.get("sides") or ())
+            painter.setPen(
+                _BUY
+                if sides == ("BUY",)
+                else _SELL
+                if sides == ("SELL",)
+                else _CROSSHAIR_TEXT
+            )
+            painter.drawText(
+                QRectF(
+                    self._HORIZONTAL_PADDING,
+                    float(record["y"]) - metrics.height() / 2,
+                    max(1, self.width() - self._HORIZONTAL_PADDING * 2),
+                    metrics.height(),
+                ),
+                Qt.AlignRight | Qt.AlignVCenter,
+                str(record["text"]),
             )
 
 
@@ -3158,26 +3937,45 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
 
 
 class IndicatorFollowSignalValidationRecentStockRow(QWidget):
-    """Single-line width-fitted projection of the V2 recent-stock MRU."""
+    """Single-line, stock-by-stock view of the retained V2 recent-stock MRU."""
 
     stock_activated = pyqtSignal(object)
-    projection_fitted = pyqtSignal(object)
+    stock_remove_requested = pyqtSignal(object)
 
     _ITEM_HORIZONTAL_PADDING = 8
+    _REMOVE_HORIZONTAL_PADDING = 4
     _SEPARATOR_TEXT = " | "
+    _NAVIGATION_WIDTH = 22
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._source_stocks: tuple[ValidationStockRef, ...] = ()
         self._fitted_stocks: tuple[ValidationStockRef, ...] = ()
         self._available_width = 0
+        self._visible_start_index = 0
         self.stock_buttons: list[QPushButton] = []
+        self.remove_buttons: list[QPushButton] = []
         self._row_layout = QHBoxLayout(self)
         self._row_layout.setContentsMargins(0, 0, 0, 0)
         self._row_layout.setSpacing(0)
         row_height = max(26, QFontMetrics(self.font()).height() + 8)
         self.setFixedHeight(row_height)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.previous_button = QPushButton("◁")
+        self.next_button = QPushButton("▷")
+        for button in (self.previous_button, self.next_button):
+            button.setFixedSize(self._NAVIGATION_WIDTH, row_height)
+            button.setCursor(Qt.PointingHandCursor)
+            button.hide()
+        self.previous_button.clicked.connect(self._show_previous_stock)
+        self.next_button.clicked.connect(self._show_next_stock)
+        self._items_container = QWidget(self)
+        self._items_layout = QHBoxLayout(self._items_container)
+        self._items_layout.setContentsMargins(0, 0, 0, 0)
+        self._items_layout.setSpacing(0)
+        self._row_layout.addWidget(self.previous_button)
+        self._row_layout.addWidget(self._items_container, 1)
+        self._row_layout.addWidget(self.next_button)
 
     @property
     def recent_stocks(self) -> tuple[ValidationStockRef, ...]:
@@ -3197,7 +3995,10 @@ class IndicatorFollowSignalValidationRecentStockRow(QWidget):
                 continue
             normalized.append(ValidationStockRef(stock.code, stock.name))
             seen_codes.add(stock.code)
-        self._source_stocks = tuple(normalized)
+        updated = tuple(normalized)
+        if updated != self._source_stocks:
+            self._visible_start_index = 0
+        self._source_stocks = updated
         self._refresh_projection()
 
     def set_available_width(self, width: int) -> None:
@@ -3214,13 +4015,36 @@ class IndicatorFollowSignalValidationRecentStockRow(QWidget):
         available = max(0, int(available_width))
         if available <= 0:
             return ()
+        overflow = self._total_stocks_width() > available
+        if overflow:
+            available = max(0, available - self._NAVIGATION_WIDTH * 2)
+        return self._fitted_stocks_from(self._visible_start_index, available)
+
+    def _stock_width(self, stock: ValidationStockRef, metrics: QFontMetrics) -> int:
+        return (
+            metrics.horizontalAdvance("X")
+            + self._REMOVE_HORIZONTAL_PADDING * 2
+            + metrics.horizontalAdvance(f"{stock.code} {stock.name}")
+            + self._ITEM_HORIZONTAL_PADDING * 2
+        )
+
+    def _total_stocks_width(self) -> int:
+        metrics = QFontMetrics(self.font())
+        return (
+            sum(self._stock_width(stock, metrics) for stock in self._source_stocks)
+            + max(0, len(self._source_stocks) - 1)
+            * metrics.horizontalAdvance(self._SEPARATOR_TEXT)
+        )
+
+    def _fitted_stocks_from(
+        self, start_index: int, available: int
+    ) -> tuple[ValidationStockRef, ...]:
         metrics = QFontMetrics(self.font())
         separator_width = metrics.horizontalAdvance(self._SEPARATOR_TEXT)
         used_width = 0
         fitted: list[ValidationStockRef] = []
-        for stock in self._source_stocks:
-            text_width = metrics.horizontalAdvance(f"{stock.code} {stock.name}")
-            required_width = text_width + self._ITEM_HORIZONTAL_PADDING * 2
+        for stock in self._source_stocks[start_index:]:
+            required_width = self._stock_width(stock, metrics)
             if fitted:
                 required_width += separator_width
             if used_width + required_width > available:
@@ -3232,19 +4056,54 @@ class IndicatorFollowSignalValidationRecentStockRow(QWidget):
     def _refresh_projection(self) -> None:
         if self._available_width <= 0:
             return
+        overflow = self._total_stocks_width() > self._available_width
+        if not overflow:
+            self._visible_start_index = 0
+        elif self._source_stocks:
+            self._visible_start_index = min(
+                self._visible_start_index, len(self._source_stocks) - 1
+            )
         fitted = self.fitting_stocks_for_width(self._available_width)
-        if fitted == self._fitted_stocks and len(self.stock_buttons) == len(fitted):
+        self.previous_button.setVisible(overflow)
+        self.next_button.setVisible(overflow)
+        self.previous_button.setEnabled(self._visible_start_index > 0)
+        self.next_button.setEnabled(
+            self._visible_start_index < len(self._source_stocks) - 1
+            and self._visible_start_index + len(fitted) < len(self._source_stocks)
+        )
+        if (
+            fitted == self._fitted_stocks
+            and len(self.stock_buttons) == len(fitted)
+            and len(self.remove_buttons) == len(fitted)
+        ):
             return
-        changed = fitted != self._fitted_stocks
         self._fitted_stocks = fitted
         self._clear_row()
         metrics = QFontMetrics(self.font())
+        remove_width = (
+            metrics.horizontalAdvance("X") + self._REMOVE_HORIZONTAL_PADDING * 2
+        )
         for index, stock in enumerate(fitted):
             if index:
                 separator = QLabel(self._SEPARATOR_TEXT)
                 separator.setFixedWidth(metrics.horizontalAdvance(self._SEPARATOR_TEXT))
                 separator.setAlignment(Qt.AlignCenter)
-                self._row_layout.addWidget(separator)
+                self._items_layout.addWidget(separator)
+            remove_button = QPushButton("X")
+            remove_button.setFlat(True)
+            remove_button.setCursor(Qt.PointingHandCursor)
+            remove_button.setFixedHeight(self.height())
+            remove_button.setFixedWidth(remove_width)
+            remove_button.setStyleSheet(
+                "QPushButton { border: none; background: transparent; padding: 0 4px; }"
+                "QPushButton:hover { font-weight: bold; }"
+            )
+            remove_button.clicked.connect(
+                lambda _checked=False, selected=stock: self.stock_remove_requested.emit(selected)
+            )
+            self.remove_buttons.append(remove_button)
+            self._items_layout.addWidget(remove_button)
+
             text = f"{stock.code} {stock.name}"
             button = QPushButton(text)
             button.setFlat(True)
@@ -3261,15 +4120,28 @@ class IndicatorFollowSignalValidationRecentStockRow(QWidget):
                 lambda _checked=False, selected=stock: self.stock_activated.emit(selected)
             )
             self.stock_buttons.append(button)
-            self._row_layout.addWidget(button)
-        self._row_layout.addStretch(1)
-        if changed:
-            self.projection_fitted.emit(tuple(fitted))
+            self._items_layout.addWidget(button)
+        self._items_layout.addStretch(1)
+
+    def _show_previous_stock(self) -> None:
+        if self._visible_start_index > 0:
+            self._visible_start_index -= 1
+            self._refresh_projection()
+
+    def _show_next_stock(self) -> None:
+        if (
+            self._visible_start_index < len(self._source_stocks) - 1
+            and self._visible_start_index + len(self._fitted_stocks)
+            < len(self._source_stocks)
+        ):
+            self._visible_start_index += 1
+            self._refresh_projection()
 
     def _clear_row(self) -> None:
         self.stock_buttons = []
-        while self._row_layout.count():
-            item = self._row_layout.takeAt(0)
+        self.remove_buttons = []
+        while self._items_layout.count():
+            item = self._items_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
@@ -3308,7 +4180,17 @@ class IndicatorFollowSignalValidationWindow(
         + 80
     )
     _CYCLE_TABLE_VISIBLE_ROWS = 5
-    _CYCLE_TABLE_COLUMN_RATIOS = (0.06, 0.22, 0.09, 0.15, 0.20, 0.13, 0.15)
+    _CYCLE_TABLE_COLUMN_RATIOS = (
+        0.055,
+        0.18,
+        0.075,
+        0.13,
+        0.11,
+        0.16,
+        0.10,
+        0.10,
+        0.09,
+    )
 
     validation_run_requested = pyqtSignal(object)
     validation_range_evaluation_requested = pyqtSignal(int, int)
@@ -3316,7 +4198,7 @@ class IndicatorFollowSignalValidationWindow(
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
     recent_stock_selected = pyqtSignal(object)
-    recent_stocks_fitted = pyqtSignal(object)
+    recent_stock_remove_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -3534,16 +4416,18 @@ class IndicatorFollowSignalValidationWindow(
         self.chart_stack.setMinimumHeight(self._MIN_FIXED_CHART_HEIGHT)
         result_layout.addWidget(self.chart_stack, 1)
 
-        self.completed_cycle_table = QTableWidget(0, 7)
+        self.completed_cycle_table = QTableWidget(0, 9)
         self.completed_cycle_table.setObjectName("signalValidationCompletedCycleTable")
         self.completed_cycle_table.setHorizontalHeaderLabels([
             "회차",
             "매수구간",
             "매수횟수",
-            "추정평단",
+            "매수총액",
+            "평단",
             "매도시각",
             "매도가",
-            "추정수익률",
+            "손익",
+            "수익률",
         ])
         self.completed_cycle_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.completed_cycle_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -3942,8 +4826,8 @@ class IndicatorFollowSignalValidationWindow(
         self.recent_stock_row.stock_activated.connect(
             self.recent_stock_selected.emit
         )
-        self.recent_stock_row.projection_fitted.connect(
-            self.recent_stocks_fitted.emit
+        self.recent_stock_row.stock_remove_requested.connect(
+            self.recent_stock_remove_requested.emit
         )
         self.recent_stock_panel = QWidget()
         self.recent_stock_panel_layout = QHBoxLayout(self.recent_stock_panel)
@@ -4106,6 +4990,20 @@ class IndicatorFollowSignalValidationWindow(
             setattr(self, f"{name}_header_separator", separator)
 
     def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.LeftButton
+        ):
+            cycle_table = getattr(self, "completed_cycle_table", None)
+            cycle_viewport = (
+                cycle_table.viewport() if cycle_table is not None else None
+            )
+            if watched is cycle_viewport:
+                if not cycle_table.indexAt(event.pos()).isValid():
+                    self._clear_completed_cycle_selection()
+            else:
+                self._clear_completed_cycle_selection()
+
         if (
             getattr(self, "_validation_execution_locked", False)
             and watched in getattr(self, "_validation_execution_combos", ())
@@ -5047,6 +5945,22 @@ class IndicatorFollowSignalValidationWindow(
         self._clear_validation_result("새 종목 검증 준비 중")
         return True
 
+    def discard_validation_stock_if_matches(self, stock_code: object) -> bool:
+        code = str(stock_code or "").strip().upper()
+        current = self.stock
+        if (
+            not code
+            or not isinstance(current, ValidationStockRef)
+            or str(current.code).strip().upper() != code
+        ):
+            return False
+        self._signal_validation_stock = None
+        self.compact_stock_display.set_current_stock(None)
+        self._entry_chart_view_state = None
+        self._entry_chart_view_anchor = None
+        self._clear_validation_result("검증 종목을 선택하세요.")
+        return True
+
     def set_recent_stocks(self, stocks: object) -> None:
         self.recent_stock_row.set_recent_stocks(stocks)
         QTimer.singleShot(0, self._sync_recent_stock_row_width)
@@ -5207,6 +6121,11 @@ class IndicatorFollowSignalValidationWindow(
             time_scale_manually_adjusted=self._time_scale_manually_adjusted,
             price_scale_manually_adjusted=self._price_scale_manually_adjusted,
             selected_evaluation_index=self._selected_index,
+            lower_pane_heights=(
+                self.canvas.lower_pane_heights
+                if self.canvas is not None
+                else ()
+            ),
         )
 
     def _capture_entry_chart_view_state(self) -> None:
@@ -5256,6 +6175,7 @@ class IndicatorFollowSignalValidationWindow(
         self._default_price_maximum = state.default_price_maximum
         self._current_price_minimum = state.current_price_minimum
         self._current_price_maximum = state.current_price_maximum
+        canvas.set_lower_pane_heights(list(state.lower_pane_heights))
         if (
             state.current_price_minimum is not None
             and state.current_price_maximum is not None
@@ -5331,6 +6251,7 @@ class IndicatorFollowSignalValidationWindow(
             time_scale_manually_adjusted=state.time_scale_manually_adjusted,
             price_scale_manually_adjusted=state.price_scale_manually_adjusted,
             selected_evaluation_index=selected_index,
+            lower_pane_heights=state.lower_pane_heights,
         )
         self._restore_chart_view_state(restored)
 
@@ -5392,6 +6313,7 @@ class IndicatorFollowSignalValidationWindow(
             time_scale_manually_adjusted=state.time_scale_manually_adjusted,
             price_scale_manually_adjusted=state.price_scale_manually_adjusted,
             selected_evaluation_index=selected_index,
+            lower_pane_heights=state.lower_pane_heights,
         )
         self._restore_chart_view_state(restored)
 
@@ -5734,6 +6656,9 @@ class IndicatorFollowSignalValidationWindow(
         self.chart_scroll_area.setWidget(self.canvas)
         self._sync_time_navigation_scrollbar()
         self.fixed_price_axis.set_canvas(self.canvas)
+        self.canvas.pane_layout_changed.connect(
+            self.fixed_price_axis.refresh_scale
+        )
         self.chart_stack.setCurrentWidget(self.chart_view)
         self._restore_validation_range_from_times()
         if self._validation_range is not None:
@@ -6354,17 +7279,36 @@ class IndicatorFollowSignalValidationWindow(
             self._offset_completed_cycle(cycle, range_offset)
             for cycle in local_cycles
         ]
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.set_completed_cycle_average_lines(
+                tuple(self._completed_cycles)
+                if self._effective_validation_range() is not None
+                else ()
+            )
         table = self.completed_cycle_table
         table.clearContents()
         table.setRowCount(len(self._completed_cycles))
         for row, cycle in enumerate(self._completed_cycles):
+            invested_amount = _completed_cycle_invested_amount(cycle)
+            profit_amount = _completed_cycle_profit_amount(cycle)
             values = (
                 str(cycle.cycle_number),
                 self._cycle_buy_range(cycle),
                 str(cycle.buy_count),
+                (
+                    _format_summary_amount(invested_amount)
+                    if invested_amount is not None
+                    else "-"
+                ),
                 _validation_price_text(cycle.average_buy_price),
                 self._cycle_time(self._candles[cycle.sell_index].get("time")),
                 _validation_price_text(cycle.sell_price),
+                (
+                    _format_summary_amount(profit_amount, signed=True)
+                    if profit_amount is not None
+                    else "-"
+                ),
                 f"{cycle.estimated_return_percent:+.2f}%",
             )
             for column, value in enumerate(values):
@@ -6451,10 +7395,24 @@ class IndicatorFollowSignalValidationWindow(
         for column, width in enumerate(widths):
             header.resizeSection(column, width)
 
+    def _clear_completed_cycle_selection(self) -> None:
+        table = getattr(self, "completed_cycle_table", None)
+        if table is not None:
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.set_selected_completed_cycle_number(None)
+
     def _completed_cycle_row_clicked(self, row: int, _column: int) -> None:
         item = self.completed_cycle_table.item(row, 0)
-        if item is None:
+        if item is None or not 0 <= row < len(self._completed_cycles):
             return
+        cycle = self._completed_cycles[row]
+        self.completed_cycle_table.selectRow(row)
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.set_selected_completed_cycle_number(cycle.cycle_number)
         index = item.data(Qt.UserRole)
         if isinstance(index, int) and not isinstance(index, bool):
             self.select_evaluation_index(index)

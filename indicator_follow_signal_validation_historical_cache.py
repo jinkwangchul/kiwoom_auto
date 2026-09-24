@@ -12,11 +12,13 @@ from pathlib import Path
 import re
 import tempfile
 from threading import RLock
+import uuid
 
 from indicator_follow_validation_timeframe import normalize_validation_timeframe
 
 
 SCHEMA_VERSION = 1
+CACHE_STATE_SCHEMA_VERSION = 1
 DEFAULT_CACHE_ROOT = (
     Path(__file__).resolve().parent
     / "runtime"
@@ -24,6 +26,8 @@ DEFAULT_CACHE_ROOT = (
 )
 _CANDLE_FIELDS = ("time", "open", "high", "low", "close", "volume")
 _CACHE_WRITE_LOCK = RLock()
+_CACHE_STATE_ACTIVE = "ACTIVE"
+_CACHE_STATE_INVALIDATED = "INVALIDATED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +114,108 @@ class IndicatorFollowSignalValidationHistoricalCache:
         token = str(timeframe) if key == f"M{timeframe}" else key
         return self.root / f"{safe_code}_{token}_{count}.json"
 
+    def state_path_for(self, stock_code: object) -> Path:
+        code = str(stock_code or "").strip()
+        if not code:
+            raise ValueError("stock_code is required")
+        safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code).strip("_") or "stock"
+        return self.root / f".{safe_code}.cache-state.json"
+
+    def _read_cache_state_unlocked(self, stock_code: str) -> dict[str, str] | None:
+        path = self.state_path_for(stock_code)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {"state": _CACHE_STATE_INVALIDATED, "generation": ""}
+        if not isinstance(payload, dict):
+            return {"state": _CACHE_STATE_INVALIDATED, "generation": ""}
+        state = str(payload.get("state") or "").strip()
+        generation = str(payload.get("generation") or "").strip()
+        if (
+            payload.get("schema_version") != CACHE_STATE_SCHEMA_VERSION
+            or str(payload.get("stock_code") or "").strip() != stock_code
+            or state not in {_CACHE_STATE_ACTIVE, _CACHE_STATE_INVALIDATED}
+            or not generation
+        ):
+            return {"state": _CACHE_STATE_INVALIDATED, "generation": ""}
+        return {"state": state, "generation": generation}
+
+    def _write_cache_state_unlocked(
+        self,
+        stock_code: str,
+        *,
+        state: str,
+        generation: str,
+    ) -> bool:
+        if state not in {_CACHE_STATE_ACTIVE, _CACHE_STATE_INVALIDATED}:
+            return False
+        clean_generation = str(generation or "").strip()
+        if not clean_generation:
+            return False
+        path = self.state_path_for(stock_code)
+        temp_path: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            serialized = json.dumps(
+                {
+                    "schema_version": CACHE_STATE_SCHEMA_VERSION,
+                    "stock_code": stock_code,
+                    "state": state,
+                    "generation": clean_generation,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=str(path.parent),
+            )
+            temp_path = Path(temp_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            return (
+                isinstance(persisted, dict)
+                and persisted.get("schema_version") == CACHE_STATE_SCHEMA_VERSION
+                and persisted.get("stock_code") == stock_code
+                and persisted.get("state") == state
+                and persisted.get("generation") == clean_generation
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _payload_is_current_unlocked(
+        self,
+        stock_code: str,
+        payload: object,
+    ) -> bool:
+        state = self._read_cache_state_unlocked(stock_code)
+        if state is None:
+            return True
+        return (
+            state["state"] == _CACHE_STATE_ACTIVE
+            and bool(state["generation"])
+            and isinstance(payload, dict)
+            and str(payload.get("cache_generation") or "").strip()
+            == state["generation"]
+        )
+
     def delete_stock(self, stock_code: object) -> dict[str, object]:
         """Delete every Validation cache artifact owned by one exact safe code."""
         code = str(stock_code or "").strip()
@@ -120,12 +226,19 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 "deleted_count": 0,
                 "deleted_paths": (),
                 "failed_paths": (),
+                "invalidated": False,
                 "reason_code": "STOCK_CODE_REQUIRED",
             }
         safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code).strip("_") or "stock"
         deleted: list[str] = []
         failed: list[str] = []
         with _CACHE_WRITE_LOCK:
+            generation = uuid.uuid4().hex
+            invalidated = self._write_cache_state_unlocked(
+                code,
+                state=_CACHE_STATE_INVALIDATED,
+                generation=generation,
+            )
             try:
                 root = self.root.resolve()
             except OSError:
@@ -137,6 +250,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
                     "deleted_count": 0,
                     "deleted_paths": (),
                     "failed_paths": (),
+                    "invalidated": invalidated,
                     "reason_code": "NO_CACHE_ARTIFACTS",
                 }
             artifact_pattern = re.compile(
@@ -162,6 +276,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
             "deleted_count": len(deleted),
             "deleted_paths": tuple(deleted),
             "failed_paths": tuple(failed),
+            "invalidated": invalidated,
             "reason_code": "CACHE_DELETE_FAILED" if failed else (
                 "CACHE_DELETED" if deleted else "NO_CACHE_ARTIFACTS"
             ),
@@ -174,21 +289,24 @@ class IndicatorFollowSignalValidationHistoricalCache:
         requested_count: object,
         timeframe_key: object | None = None,
     ) -> ValidationHistoricalCacheEntry | None:
-        try:
-            code, timeframe, key, count = self._identity(
-                stock_code,
-                timeframe_minutes,
-                requested_count,
-                timeframe_key,
-            )
-            path = self.path_for(code, timeframe, count, key)
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return self._entry_from_payload(
-                payload,
-                expected_identity=(code, timeframe, key, count),
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return None
+        with _CACHE_WRITE_LOCK:
+            try:
+                code, timeframe, key, count = self._identity(
+                    stock_code,
+                    timeframe_minutes,
+                    requested_count,
+                    timeframe_key,
+                )
+                path = self.path_for(code, timeframe, count, key)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not self._payload_is_current_unlocked(code, payload):
+                    return None
+                return self._entry_from_payload(
+                    payload,
+                    expected_identity=(code, timeframe, key, count),
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return None
 
     def load_covering(
         self,
@@ -198,44 +316,54 @@ class IndicatorFollowSignalValidationHistoricalCache:
         timeframe_key: object | None = None,
     ) -> ValidationHistoricalCacheEntry | None:
         """Return the smallest valid cache entry that covers minimum_count."""
-        try:
-            code, timeframe, key, count = self._identity(
-                stock_code,
-                timeframe_minutes,
-                minimum_count,
-                timeframe_key,
-            )
-            exact = self.load(code, timeframe, count, key)
-            if exact is not None:
-                return exact
-            safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code).strip("_") or "stock"
-            token = str(timeframe) if key == f"M{timeframe}" else key
-            pattern = re.compile(
-                rf"{re.escape(safe_code)}_{re.escape(token)}_([1-9][0-9]*)\.json"
-            )
-            candidates: list[tuple[int, Path]] = []
-            if not self.root.exists():
+        with _CACHE_WRITE_LOCK:
+            try:
+                code, timeframe, key, count = self._identity(
+                    stock_code,
+                    timeframe_minutes,
+                    minimum_count,
+                    timeframe_key,
+                )
+                exact = self.load(code, timeframe, count, key)
+                if exact is not None:
+                    return exact
+                safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code).strip("_") or "stock"
+                token = str(timeframe) if key == f"M{timeframe}" else key
+                pattern = re.compile(
+                    rf"{re.escape(safe_code)}_{re.escape(token)}_([1-9][0-9]*)\.json"
+                )
+                candidates: list[tuple[int, Path]] = []
+                if not self.root.exists():
+                    return None
+                for path in self.root.glob(f"{safe_code}_{token}_*.json"):
+                    match = pattern.fullmatch(path.name)
+                    if match is None:
+                        continue
+                    candidate_count = int(match.group(1))
+                    if candidate_count >= count:
+                        candidates.append((candidate_count, path))
+                for candidate_count, path in sorted(candidates):
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                        entry = (
+                            self._entry_from_payload(
+                                payload,
+                                expected_identity=(
+                                    code,
+                                    timeframe,
+                                    key,
+                                    candidate_count,
+                                ),
+                            )
+                            if self._payload_is_current_unlocked(code, payload)
+                            else None
+                        )
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                        entry = None
+                    if entry is not None:
+                        return entry
+            except (OSError, TypeError, ValueError):
                 return None
-            for path in self.root.glob(f"{safe_code}_{token}_*.json"):
-                match = pattern.fullmatch(path.name)
-                if match is None:
-                    continue
-                candidate_count = int(match.group(1))
-                if candidate_count >= count:
-                    candidates.append((candidate_count, path))
-            for candidate_count, path in sorted(candidates):
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    entry = self._entry_from_payload(
-                        payload,
-                        expected_identity=(code, timeframe, key, candidate_count),
-                    )
-                except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                    entry = None
-                if entry is not None:
-                    return entry
-        except (OSError, TypeError, ValueError):
-            return None
         return None
 
     def store(
@@ -285,6 +413,18 @@ class IndicatorFollowSignalValidationHistoricalCache:
             normalized = merge_validation_candles([], candles, count)
             if not normalized:
                 return False
+            state = self._read_cache_state_unlocked(code)
+            generation = ""
+            activate_after_store = False
+            if state is not None:
+                generation = state["generation"] or uuid.uuid4().hex
+                activate_after_store = state["state"] != _CACHE_STATE_ACTIVE
+                if activate_after_store and not self._write_cache_state_unlocked(
+                    code,
+                    state=_CACHE_STATE_INVALIDATED,
+                    generation=generation,
+                ):
+                    return False
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "stock": {
@@ -300,6 +440,8 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 "signal_entries_by_settings_hash": {},
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+            if generation:
+                payload["cache_generation"] = generation
             path = self.path_for(code, timeframe, count, key)
             path.parent.mkdir(parents=True, exist_ok=True)
             serialized = json.dumps(
@@ -321,8 +463,24 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 os.fsync(stream.fileno())
             os.replace(temp_path, path)
             temp_path = None
-            persisted = self.load(code, timeframe, count, key)
-            return persisted is not None and list(persisted.candles) == normalized
+            persisted_payload = json.loads(path.read_text(encoding="utf-8"))
+            persisted = self._entry_from_payload(
+                persisted_payload,
+                expected_identity=(code, timeframe, key, count),
+            )
+            if persisted is None or list(persisted.candles) != normalized:
+                return False
+            if generation and str(
+                persisted_payload.get("cache_generation") or ""
+            ).strip() != generation:
+                return False
+            if activate_after_store and not self._write_cache_state_unlocked(
+                code,
+                state=_CACHE_STATE_ACTIVE,
+                generation=generation,
+            ):
+                return False
+            return self.load(code, timeframe, count, key) is not None
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
         finally:
@@ -340,40 +498,43 @@ class IndicatorFollowSignalValidationHistoricalCache:
         settings_hash: object,
         timeframe_key: object | None = None,
     ) -> list[dict[str, object]] | None:
-        try:
-            code, timeframe, key, count = self._identity(
-                stock_code,
-                timeframe_minutes,
-                requested_count,
-                timeframe_key,
-            )
-            clean_hash = str(settings_hash or "").strip()
-            if not clean_hash:
+        with _CACHE_WRITE_LOCK:
+            try:
+                code, timeframe, key, count = self._identity(
+                    stock_code,
+                    timeframe_minutes,
+                    requested_count,
+                    timeframe_key,
+                )
+                clean_hash = str(settings_hash or "").strip()
+                if not clean_hash:
+                    return None
+                path = self.path_for(code, timeframe, count, key)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not self._payload_is_current_unlocked(code, payload):
+                    return None
+                if self._entry_from_payload(
+                    payload,
+                    expected_identity=(code, timeframe, key, count),
+                ) is None:
+                    return None
+                by_hash = payload.get("signal_entries_by_settings_hash")
+                if not isinstance(by_hash, dict):
+                    return None
+                entries = by_hash.get(clean_hash)
+                if not isinstance(entries, list) or any(
+                    not isinstance(entry, dict) for entry in entries
+                ):
+                    return None
+                return json.loads(json.dumps(
+                    entries,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 return None
-            path = self.path_for(code, timeframe, count, key)
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if self._entry_from_payload(
-                payload,
-                expected_identity=(code, timeframe, key, count),
-            ) is None:
-                return None
-            by_hash = payload.get("signal_entries_by_settings_hash")
-            if not isinstance(by_hash, dict):
-                return None
-            entries = by_hash.get(clean_hash)
-            if not isinstance(entries, list) or any(
-                not isinstance(entry, dict) for entry in entries
-            ):
-                return None
-            return json.loads(json.dumps(
-                entries,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return None
 
     def store_signal_entries(
         self,
@@ -429,6 +590,8 @@ class IndicatorFollowSignalValidationHistoricalCache:
             ))
             path = self.path_for(code, timeframe, count, key)
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if not self._payload_is_current_unlocked(code, payload):
+                return False
             if self._entry_from_payload(
                 payload,
                 expected_identity=(code, timeframe, key, count),

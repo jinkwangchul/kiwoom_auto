@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QPoint
+from PyQt5.QtCore import QPoint, QRectF
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtWidgets import QApplication, QHBoxLayout, QScrollArea, QWidget
 
@@ -70,9 +70,9 @@ def _candles(closes, times=None):
 
 
 class CompletedValidationCycleTest(unittest.TestCase):
-    def test_virtual_fill_price_requires_complete_ohlc(self):
+    def test_virtual_fill_price_uses_signal_close_price(self):
         self.assertEqual(
-            102.5,
+            110.0,
             validation_virtual_fill_price({
                 "open": 100.0,
                 "high": 110.0,
@@ -80,7 +80,8 @@ class CompletedValidationCycleTest(unittest.TestCase):
                 "close": 110.0,
             }),
         )
-        self.assertIsNone(validation_virtual_fill_price({"close": 110.0}))
+        self.assertEqual(110.0, validation_virtual_fill_price({"close": 110.0}))
+        self.assertIsNone(validation_virtual_fill_price({"close": 0.0}))
 
     @staticmethod
     def _cycle(number, average, buy_count, estimated_return):
@@ -360,29 +361,159 @@ class StaticValidationVisualizationGeometryTest(unittest.TestCase):
         self.widgets.append(canvas)
         return canvas
 
-    def test_lower_h_is_zero_without_lower_filter_and_fixed_for_one_to_three_panes(self):
+    def test_completed_cycle_average_line_requires_selected_range_and_closed_cycle(self):
+        candles = _candles([100.0, 110.0, 120.0, 130.0])
+        entries = [
+            _entry("BUY", 0, candles[0]["time"]),
+            _entry("BUY", 1, candles[1]["time"]),
+            _entry("SELL", 2, candles[2]["time"]),
+            # Open trailing cycle: must never produce an average line.
+            _entry("BUY", 3, candles[3]["time"]),
+        ]
+        cycles = completed_validation_cycles(candles, entries)
+        self.assertEqual(1, len(cycles))
+
+        canvas = IndicatorFollowSignalValidationChartCanvas(candles, [])
+        canvas.resize(800, 500)
+        canvas.set_time_view(0.0, 4.0)
+        self.widgets.append(canvas)
+        canvas.set_completed_cycle_average_lines(tuple(cycles))
+
+        self.assertEqual([], canvas.completed_cycle_average_line_records())
+
+        canvas.set_validation_range(0, 3)
+        records = canvas.completed_cycle_average_line_records()
+        self.assertEqual(1, len(records))
+        self.assertEqual(0, records[0]["buy_start_index"])
+        self.assertEqual(2, records[0]["sell_index"])
+        self.assertEqual(
+            cycles[0].average_buy_price,
+            records[0]["average_buy_price"],
+        )
+        self.assertAlmostEqual(canvas._x_for_index(0), records[0]["x1"])
+        self.assertAlmostEqual(canvas._x_for_index(2), records[0]["x2"])
+        self.assertAlmostEqual(
+            canvas.price_scale().y_for_price(cycles[0].average_buy_price),
+            records[0]["y"],
+        )
+
+        labels = canvas.completed_cycle_average_label_records()
+        self.assertEqual(1, len(labels))
+        self.assertIn(labels[0]["placement"], {"TOP", "BOTTOM"})
+        self.assertEqual(0, labels[0]["collision_count"])
+        self.assertEqual(0.0, labels[0]["overlap_area"])
+        self.assertTrue(labels[0]["texts"][0].startswith("평단 "))
+        self.assertTrue(labels[0]["texts"][1].startswith("매도 "))
+        self.assertTrue(labels[0]["texts"][2].startswith("손익 "))
+        self.assertEqual(labels[0]["leader_x1"], records[0]["x2"])
+        self.assertEqual(labels[0]["leader_y1"], records[0]["y"])
+
+        label_rect = QRectF(
+            labels[0]["label_left"],
+            labels[0]["label_top"],
+            labels[0]["label_width"],
+            labels[0]["label_height"],
+        ).adjusted(-4.0, -4.0, 4.0, 4.0)
+        self.assertFalse(any(
+            label_rect.intersects(blocker)
+            for blocker in canvas._completed_cycle_label_blockers(
+                canvas.price_scale()
+            )
+        ))
+
+        canvas.set_validation_range(None, None)
+        self.assertEqual([], canvas.completed_cycle_average_line_records())
+        self.assertEqual([], canvas.completed_cycle_average_label_records())
+
+    def test_lower_h_merges_macd_into_existing_oscillator_pane(self):
         no_lower = self._canvas(())
         self.assertEqual(0, no_lower.indicator_total_height)
         self.assertEqual([], no_lower.lower_pane_records())
         self.assertEqual(452, no_lower.price_scale().plot_bottom)
 
-        expected_heights = {
-            1: [180],
-            2: [90, 90],
-            3: [60, 60, 60],
-        }
-        price_bottoms = []
-        families = (FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC)
-        for count in (1, 2, 3):
-            canvas = self._canvas(families[:count])
-            panes = canvas.lower_pane_records()
-            self.assertEqual(180, canvas.indicator_total_height)
-            self.assertEqual(
-                expected_heights[count],
-                [pane["height"] for pane in panes],
+        rsi_only = self._canvas((FAMILY_RSI,))
+        self.assertEqual(
+            [FAMILY_RSI],
+            [pane["family"] for pane in rsi_only.lower_pane_records()],
+        )
+        self.assertEqual([180], [pane["height"] for pane in rsi_only.lower_pane_records()])
+
+        macd_only = self._canvas((FAMILY_MACD_SIGNAL,))
+        self.assertEqual(
+            [FAMILY_OCR_OSC],
+            [pane["family"] for pane in macd_only.lower_pane_records()],
+        )
+        self.assertEqual([180], [pane["height"] for pane in macd_only.lower_pane_records()])
+
+        merged = self._canvas((FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC))
+        panes = merged.lower_pane_records()
+        self.assertEqual(
+            [FAMILY_RSI, FAMILY_OCR_OSC],
+            [pane["family"] for pane in panes],
+        )
+        self.assertEqual([90, 90], [pane["height"] for pane in panes])
+        oscillator_pane = next(
+            pane for pane in panes if pane["family"] == FAMILY_OCR_OSC
+        )
+        self.assertEqual(
+            {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC},
+            set(oscillator_pane["descriptor_ids"]),
+        )
+        self.assertEqual(248, rsi_only.price_scale().plot_bottom)
+        self.assertEqual(248, macd_only.price_scale().plot_bottom)
+        self.assertEqual(248, merged.price_scale().plot_bottom)
+
+    def test_lower_pane_boundaries_resize_inside_fixed_canvas_and_reset(self):
+        canvas = self._canvas((FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC))
+        initial_size = canvas.size()
+        initial_scale = canvas.price_scale()
+        initial_bounds = (initial_scale.minimum, initial_scale.maximum)
+        self.assertEqual(
+            ((FAMILY_RSI, 90.0), (FAMILY_OCR_OSC, 90.0)),
+            canvas.lower_pane_heights,
+        )
+        initial_boundaries = canvas.lower_boundary_records()
+        self.assertEqual(2, len(initial_boundaries))
+
+        self.assertTrue(
+            canvas._resize_lower_boundary_to(
+                0,
+                initial_boundaries[0]["y"] - 30.0,
             )
-            price_bottoms.append(canvas.price_scale().plot_bottom)
-        self.assertEqual([248, 248, 248], price_bottoms)
+        )
+        self.assertEqual(initial_size, canvas.size())
+        self.assertEqual(
+            initial_bounds,
+            (canvas.price_scale().minimum, canvas.price_scale().maximum),
+        )
+        self.assertEqual(
+            ((FAMILY_RSI, 120.0), (FAMILY_OCR_OSC, 90.0)),
+            canvas.lower_pane_heights,
+        )
+        price_bottom_after_outer = canvas.price_scale().plot_bottom
+
+        internal_boundary = canvas.lower_boundary_records()[1]
+        self.assertTrue(
+            canvas._resize_lower_boundary_to(
+                1,
+                internal_boundary["y"] + 20.0,
+            )
+        )
+        self.assertEqual(initial_size, canvas.size())
+        self.assertEqual(price_bottom_after_outer, canvas.price_scale().plot_bottom)
+        self.assertEqual(
+            ((FAMILY_RSI, 140.0), (FAMILY_OCR_OSC, 70.0)),
+            canvas.lower_pane_heights,
+        )
+
+        canvas.reset_lower_pane_layout()
+        self.assertEqual(initial_size, canvas.size())
+        self.assertEqual(
+            ((FAMILY_RSI, 90.0), (FAMILY_OCR_OSC, 90.0)),
+            canvas.lower_pane_heights,
+        )
+        self.assertEqual(248, canvas.price_scale().plot_bottom)
+
 
     def test_candle_render_is_clipped_to_price_plot_before_lower_panes(self):
         candles = [{

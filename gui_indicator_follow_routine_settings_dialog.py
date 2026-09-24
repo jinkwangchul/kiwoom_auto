@@ -87,6 +87,7 @@ from gui_indicator_follow_sell_controls import (
 from indicator_follow_settings_compatibility import (
     canonical_indicator_follow_ui_state,
     get_canonical_fresh_defaults,
+    normalize_legacy_signal_price_ui_state,
     normalize_sell_selected_set_authority,
 )
 from gui_routine_registry import get_routine_records, normalize_routine_name
@@ -270,9 +271,9 @@ def normalize_buy_situation_ui_state(value):
         }
         common["direction_combo"] = state.get("direction_combo")
         state.update({f"setting1_{key}": item for key, item in common.items()})
-        state.update({f"setting2_{key}": item for key, item in common.items()})
         state["setting1_enabled_check"] = True
         state["setting2_enabled_check"] = False
+        state["setting2_left_combo"] = "무설정"
     if has_new_slots or "price_enabled_check" in state:
         if "setting1_enabled_check" not in state:
             state["setting1_enabled_check"] = True
@@ -280,7 +281,7 @@ def normalize_buy_situation_ui_state(value):
             state.get("setting2_enabled_check") is True
             and "setting2_left_combo" not in state
         ):
-            state["setting2_left_combo"] = "주문가"
+            state["setting2_left_combo"] = "신호가"
     for key in (
         "left_combo", "right_combo", "direction_combo", "ratio_line",
         "compare_combo", "action_combo", "detail_stack", "type_combo",
@@ -911,7 +912,7 @@ class IndicatorFollowRoutineSettingsDialog(
         text.setPlainText(
             "고급/확장 설정\n\n"
             "연결 완료:\n"
-            "- 직전회차주문가 대비 현재주문가\n"
+            "- 직전회차신호가 대비 현재신호가\n"
             "- 마지막+1 회차\n"
             "- 다중지점 마지막회차 능동매수\n"
             "- 반복매수 평단관리 능동매수\n"
@@ -3567,6 +3568,7 @@ class IndicatorFollowRoutineSettingsDialog(
 
         if source == STATE_AUTHORITY_LEGACY_TEMPLATE_FALLBACK:
             state = self._without_retired_sell_price_template_operands(state)
+        state = normalize_legacy_signal_price_ui_state(state)
         state = self._prepare_buy_bollinger_sign_ui_state_for_load(
             state,
             source=source,

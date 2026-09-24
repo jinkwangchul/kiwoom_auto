@@ -265,14 +265,10 @@ def _condition_series_keys(
             else ("RSI",)
         )
     if family == FAMILY_MACD_SIGNAL:
-        values = [
-            value
-            for value in (target, compare)
-            if value in {"MACD", "SIGNAL"}
-        ]
+        values = ["MACD", "SIGNAL"]
         if not compare and threshold is not None:
             values.append("CRITERION")
-        return tuple(dict.fromkeys(values))
+        return tuple(values)
     if family == FAMILY_OCR_OSC:
         return (
             ("OSC", "CRITERION")
@@ -290,8 +286,8 @@ def _condition_series_keys(
         values: list[str] = []
         if target == "AVG_PRICE":
             values.append("AVG_PRICE")
-        elif target == "ORDER_PRICE":
-            values.append("VIRTUAL_FILL_PRICE")
+        elif target in {"SIGNAL_PRICE", "ORDER_PRICE"}:
+            values.append("SIGNAL_PRICE")
         if compare:
             if operator == "PERCENT_GAP" and str(
                 contract.get("direction") or ""
@@ -936,15 +932,13 @@ def build_validation_indicator_cache(
 
             if target == "AVG_PRICE":
                 channels["AVG_PRICE"] = average_values
-            elif target == "ORDER_PRICE":
-                channels["VIRTUAL_FILL_PRICE"] = normalized_values(
-                    fill_values
-                )
+            elif target in {"SIGNAL_PRICE", "ORDER_PRICE"}:
+                channels["SIGNAL_PRICE"] = close_values
 
             if compare_target == "AVG_PRICE":
                 base_values = average_values
-            elif compare_target == "ORDER_PRICE":
-                base_values = normalized_values(fill_values)
+            elif compare_target in {"SIGNAL_PRICE", "ORDER_PRICE"}:
+                base_values = close_values
             elif compare_target == "CLOSE":
                 base_values = close_values
             else:

@@ -304,6 +304,76 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
             )
         self.assertIsNotNone(window.request_initial_validation())
 
+    def test_sell_price_combos_keep_operands_distinct_in_registration_edit_and_v2(self):
+        for mode in ("registration", "edit"):
+            with self.subTest(mode=mode):
+                dialog, _path = self._dialog(mode)
+                for group_name in "abc":
+                    left = getattr(
+                        dialog,
+                        f"sell_signal_condition_{group_name}_gap_left_combo",
+                    )
+                    right = getattr(
+                        dialog,
+                        f"sell_signal_condition_{group_name}_gap_right_combo",
+                    )
+                    left.setCurrentText("평단가")
+                    right.setCurrentText("평단가")
+                    self.assertEqual("현재가", left.currentText())
+                    self.assertEqual("평단가", right.currentText())
+
+                    left.setCurrentText("평단가")
+                    self.assertEqual("평단가", left.currentText())
+                    self.assertEqual("현재가", right.currentText())
+
+        resolved = self._resolved_state(
+            self.rules["indicator_follow_ui_state"]["state"]
+        )
+        seed = IndicatorFollowSignalValidationSeed(
+            ValidationSettingsSnapshot(self.rules),
+            resolved,
+        )
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            window = IndicatorFollowSignalValidationWindow(self.stock, seed)
+        self.widgets.append(window)
+        window.sell_signal_condition_a_gap_right_combo.setCurrentText("평단가")
+        self.assertEqual(
+            "현재가",
+            window.sell_signal_condition_a_gap_left_combo.currentText(),
+        )
+        self.assertEqual(
+            "평단가",
+            window.sell_signal_condition_a_gap_right_combo.currentText(),
+        )
+
+    def test_mapper_rejects_same_sell_price_operand_pair(self):
+        state = self._resolved_state(
+            self.rules["indicator_follow_ui_state"]["state"]
+        )
+        conditions = state["sell_ui"]["signal_conditions"]
+        for group in conditions.values():
+            for key in tuple(group):
+                if key.endswith("_check"):
+                    group[key] = False
+        conditions["condition_a"].update({
+            "gap_check": True,
+            "gap_left_combo": "평단가",
+            "gap_right_combo": "평단가",
+            "gap_direction_combo": "상향",
+            "gap_value_line": "0.25",
+            "gap_compare_combo": "이상",
+        })
+        state["basic"]["sell_signal_expr_line"] = "A"
+
+        preview = mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            self.rules,
+        )
+        self.assertTrue(any(
+            "동일 가격 기준" in str(item)
+            for item in preview["validation_warnings"]
+        ))
+
     def test_v2_entry_only_ignores_reselection_warning_not_other_sell_errors(self):
         dialog, _path = self._dialog()
 

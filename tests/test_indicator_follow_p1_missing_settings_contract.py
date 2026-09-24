@@ -53,7 +53,7 @@ class AdditionalNamespaceContractTest(unittest.TestCase):
         self.dialog.buy_additional_active_method_combo.setCurrentText("능동")
         self.dialog.buy_additional_active_direction_combo.setCurrentText("상하")
         self.dialog.buy_additional_active_ratio_line.setText("0.77")
-        self.dialog.buy_additional_active_compare_combo.setCurrentText("이탈")
+        self.dialog.buy_additional_active_compare_combo.setCurrentText("이내")
 
         additional = self.dialog.collect_indicator_follow_ui_state()["buy_ui"]["additional"]
 
@@ -74,7 +74,7 @@ class AdditionalNamespaceContractTest(unittest.TestCase):
             },
             "last_plus_one": {
                 "check": True, "method_combo": "능동", "direction_combo": "상하",
-                "ratio_line": "0.33", "compare_combo": "이탈",
+                "ratio_line": "0.33", "compare_combo": "이내",
             },
         }
         result = self.dialog.apply_indicator_follow_ui_state({"buy_ui": {"additional": additional}})
@@ -171,7 +171,7 @@ class MapperContractTest(unittest.TestCase):
             },
             "last_plus_one": {
                 "check": last, "method_combo": method, "direction_combo": "상하",
-                "ratio_line": "0.45", "compare_combo": "이상",
+                "ratio_line": "0.45", "compare_combo": "이내",
             },
         }
 
@@ -180,11 +180,11 @@ class MapperContractTest(unittest.TestCase):
             "hoga_combo": "단일호가", "order_combo": "현재가", "up_line": "0", "down_line": "0",
             "time_mode_combo": point, "time_value_line": "30", "time_unit_combo": "초",
             "time_range_combo": "간격", "time_count_line": "3", "time_order_combo": "현재가",
-            "ratio_left_combo": "주문가", "ratio_right_combo": "현재가",
+            "ratio_left_combo": "신호가", "ratio_right_combo": "현재가",
             "ratio_direction_combo": "상향", "ratio_value_line": "0.15",
             "ratio_compare_combo": "이상", "ratio_count_line": "3",
             "last_round_active_buy": {
-                "enabled": active, "direction": "상향", "ratio_percent": "0.45", "comparator": "이상",
+                "enabled": active, "direction": "상향", "ratio_percent": "0.45", "comparator": "이하",
             },
         }
 
@@ -200,7 +200,7 @@ class MapperContractTest(unittest.TestCase):
             "buy_cycle_time_range_combo": "이내",
             "buy_cycle_time_count_line": "3",
             "buy_cycle_time_order_combo": "현재가",
-            "buy_cycle_ratio_left_combo": "주문가",
+            "buy_cycle_ratio_left_combo": "신호가",
             "buy_cycle_ratio_right_combo": "현재가",
             "buy_cycle_ratio_direction_combo": "상향",
             "buy_cycle_ratio_value_line": "0.15",
@@ -216,11 +216,58 @@ class MapperContractTest(unittest.TestCase):
         candidate = self._execution_candidate(preview, "additional")
         policy = candidate["value"]["previous_round_price_skip"]
 
-        self.assertEqual("PREVIOUS_CONFIRMED_BUY_ORDER_PRICE", policy["reference_source"])
-        self.assertEqual("ACTIONABLE_ORDER_PRICE", policy["current_source"])
+        self.assertEqual("PREVIOUS_CONFIRMED_BUY_SIGNAL_PRICE", policy["reference_source"])
+        self.assertEqual("CURRENT_SIGNAL_PRICE", policy["current_source"])
         self.assertEqual("SKIP_CURRENT_GENERATION", policy["action"])
         self.assertFalse(policy["skipped_round_increment"])
         self.assertTrue(candidate["execution_connected"])
+
+    def test_commit_validator_rejects_legacy_previous_round_order_price_sources(self) -> None:
+        preview = self._preview({"additional": self._additional(price=True)})
+        value = deepcopy(self._execution_candidate(preview, "additional")["value"])
+        value["previous_round_price_skip"].update({
+            "reference_source": "PREVIOUS_CONFIRMED_BUY_ORDER_PRICE",
+            "current_source": "ACTIONABLE_ORDER_PRICE",
+        })
+        post = deepcopy(self.rules)
+        post["buy"].setdefault("execution", {})["additional"] = value
+
+        validated = self.validator.validate_committed_rules(
+            self.rules,
+            post,
+            [{"operation": "set_execution_policy", "path": "buy.execution.additional", "value": value}],
+            {"rules_json_write": False, "engine_connected": False, "buy_groups_replace": False, "macd_sell_replace": False},
+        )
+
+        checks = {item["name"]: item["ok"] for item in validated["checks"]}
+        self.assertFalse(checks["buy_additional_policy_valid"], validated)
+
+    def test_commit_validator_rejects_order_price_as_strategy_comparison_source(self) -> None:
+        preview = self._preview({"base": self._base()})
+        value = deepcopy(self._execution_candidate(preview, "base")["value"])
+        value["buy_price_reset_policy"] = {
+            "policy": "BUY_PRICE_CHANGE_RESET",
+            "enabled": True,
+            "slot": "SETTING1",
+            "action": "RESET",
+            "left_source": "ORDER_PRICE",
+            "right_source": "CURRENT_PRICE",
+            "direction": "UP",
+            "compare": ">=",
+            "threshold_percent": 1.0,
+        }
+        post = deepcopy(self.rules)
+        post["buy"].setdefault("execution", {})["base"] = value
+
+        validated = self.validator.validate_committed_rules(
+            self.rules,
+            post,
+            [{"operation": "set_execution_policy", "path": "buy.execution.base", "value": value}],
+            {"rules_json_write": False, "engine_connected": False, "buy_groups_replace": False, "macd_sell_replace": False},
+        )
+
+        checks = {item["name"]: item["ok"] for item in validated["checks"]}
+        self.assertFalse(checks["buy_price_reset_policy_valid"], validated)
 
     def test_last_plus_one_three_methods_and_active_detail(self) -> None:
         for text, token in (("시장가", "MARKET"), ("현재가", "CURRENT_PRICE"), ("능동", "ACTIVE")):
@@ -303,7 +350,7 @@ class MapperContractTest(unittest.TestCase):
         self.assertEqual("LAST_MULTI_POINT_CHILD", policy["applies_to"])
         self.assertEqual("BUY_METHOD_SPECIAL_ACTION", policy["purpose"])
         self.assertEqual("AVERAGE_PRICE", policy["subject"])
-        self.assertEqual("MULTI_POINT_SET_PRICE", policy["reference"])
+        self.assertEqual("SIGNAL_PRICE", policy["reference"])
         self.assertTrue(candidate["execution_connected"])
         self.assertNotIn("last_round_active_buy", candidate["value"].get("repeat", {}))
 

@@ -235,6 +235,7 @@ def evaluate_buy_exit_policy(
     repeat_started_at: datetime | None, order_price: float | None,
     current_price: float | None, average_price: float | None,
     now: datetime, timeframe_minutes: int | None = None,
+    signal_price: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate enabled BUY exit conditions using OR semantics."""
     evaluated: list[dict[str, Any]] = []
@@ -280,13 +281,28 @@ def evaluate_buy_exit_policy(
         elif kind == "PRICE":
             left_source = _text(condition.get("left_source")).upper()
             right_source = _text(condition.get("right_source")).upper()
-            if "CURRENT_PRICE" in {left_source, right_source} and current_price is None:
+            if left_source == right_source:
+                result.update(status="INVALID", reason="BUY_REPEAT_EXIT_PRICE_POLICY_INVALID")
+                waiting.append("BUY_REPEAT_EXIT_PRICE_POLICY_INVALID")
+            elif "CURRENT_PRICE" in {left_source, right_source} and current_price is None:
                 result.update(status="WAITING", reason="BUY_REPEAT_EXIT_CURRENT_PRICE_UNAVAILABLE")
                 waiting.append("BUY_REPEAT_EXIT_CURRENT_PRICE_UNAVAILABLE")
             else:
-                left = resolve_price_source(left_source, order_price=order_price, current_price=current_price, average_price=average_price)
-                right = resolve_price_source(right_source, order_price=order_price, current_price=current_price, average_price=average_price)
-                hit, observed = evaluate_percent_comparison(left=right, right=left,
+                left = resolve_price_source(
+                    left_source,
+                    order_price=order_price,
+                    current_price=current_price,
+                    average_price=average_price,
+                    signal_price=signal_price,
+                )
+                right = resolve_price_source(
+                    right_source,
+                    order_price=order_price,
+                    current_price=current_price,
+                    average_price=average_price,
+                    signal_price=signal_price,
+                )
+                hit, observed = evaluate_percent_comparison(left=left, right=right,
                     direction=_text(condition.get("direction")).upper(), compare=_text(condition.get("compare")).upper(),
                     threshold=condition.get("threshold_percent")) if left is not None and right is not None else (None, None)
                 if hit is None or observed is None:
@@ -304,6 +320,7 @@ def evaluate_buy_exit_policy(
     payload = {"logic": "OR", "completed_recovery_generations": completed_repeat_count,
                "recovery_started_at": repeat_started_at.isoformat(timespec="milliseconds") if repeat_started_at else None,
                "order_price": order_price, "current_price": current_price, "average_price": average_price,
+               "signal_price": signal_price,
                "conditions": evaluated, "matched_condition_types": matched}
     return {**payload, "active": bool(evaluated), "triggered": bool(matched),
             "waiting_reasons": sorted(set(waiting)), "snapshot_hash": stable_hash(payload)}
@@ -621,6 +638,7 @@ def inspect_buy_repeat_exits(*, selected_account_no: str, actionable_prices_by_c
             average_price=_price(position.get("average_price")),
             now=current_at,
             timeframe_minutes=_int(signal.get("signal_timeframe_minutes")),
+            signal_price=_price(signal.get("signal_bar_close")),
         )
         if not evaluation.get("triggered"):
             if evaluation.get("waiting_reasons"): result["waiting"].append({"execution_process_id": process_id, "code": code, "reason": "BUY_REPEAT_EXIT_EVIDENCE_PENDING", "waiting_reasons": evaluation["waiting_reasons"]})

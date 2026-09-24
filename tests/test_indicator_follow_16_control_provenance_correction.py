@@ -297,7 +297,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             rules=rules,
             confirmed_round=1,
             average_price=90,
-            actionable_order_price=100,
+            signal_price=100,
         )
         self.assertEqual(reason, "")
         self.assertEqual(evidence_below["branch_id"], "BELOW_OR_EQUAL")
@@ -316,7 +316,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             rules=rules,
             confirmed_round=1,
             average_price=110,
-            actionable_order_price=100,
+            signal_price=100,
         )
         self.assertEqual(reason, "")
         self.assertEqual(evidence_above["branch_id"], "ABOVE")
@@ -334,7 +334,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             rules=rules,
             confirmed_round=1,
             average_price=100,
-            actionable_order_price=100,
+            signal_price=100,
         )
         self.assertEqual(reason, "")
         self.assertEqual(evidence_equal["branch_id"], "ABOVE")
@@ -386,7 +386,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
                     rules=execution_rules,
                     confirmed_round=1,
                     average_price=90,
-                    actionable_order_price=100,
+                    signal_price=100,
                 )
                 self.assertEqual("", reason)
                 self.assertEqual("BELOW_OR_EQUAL", evidence["branch_id"])
@@ -396,7 +396,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
                         rules=execution_rules,
                         confirmed_round=1,
                         average_price=100,
-                        actionable_order_price=100,
+                        signal_price=100,
                     )
                     self.assertIsNone(evidence)
                     self.assertEqual("BUY_PRICE_COMPARE_BRANCH_NOT_DETERMINISTIC", reason)

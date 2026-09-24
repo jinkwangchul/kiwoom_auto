@@ -68,7 +68,7 @@ class ExecutionSellRepeatTest(unittest.TestCase):
                 "hoga": "LIMIT",
                 "price_basis": "ORDER_PRICE",
                 "configured_child_count": 3,
-                "ratio_left": "ORDER_PRICE",
+                "ratio_left": "SIGNAL_PRICE",
                 "ratio_right": "CURRENT_PRICE",
                 "ratio_direction": "UP",
                 "ratio_value": 1,
@@ -92,12 +92,12 @@ class ExecutionSellRepeatTest(unittest.TestCase):
             "sell_price_reset_policy": {
                 "policy": "SELL_PRICE_CHANGE_RESET",
                 "action": "RESET",
-                "left_source": "ORDER_PRICE",
+                "left_source": "SIGNAL_PRICE",
                 "right_source": "CURRENT_PRICE",
                 "direction": "UP",
                 "compare": ">=",
                 "threshold_percent": 5,
-                "order_price": None,
+                "signal_price": 100,
             },
             "exit_policy_snapshot": {"exit_price_check": True},
             "exit_policy": {
@@ -122,6 +122,7 @@ class ExecutionSellRepeatTest(unittest.TestCase):
             "routine_type": "INDICATOR_FOLLOW",
             "routine_instance_id": "INSTANCE-1",
             "source_signal_id": SIGNAL,
+            "signal_price": 100,
             "execution_process_id": PROCESS,
             "option_snapshot_hash": "OPTION-HASH",
             "plan_generation": 0,
@@ -176,12 +177,12 @@ class ExecutionSellRepeatTest(unittest.TestCase):
                 "configured_child_count": 3,
                 "planned_child_count": 3,
                 "planned_total_quantity": quantity,
-                "ratio_left": "ORDER_PRICE",
+                "ratio_left": "SIGNAL_PRICE",
                 "ratio_right": "CURRENT_PRICE",
                 "ratio_direction": "UP",
                 "ratio_value": 1,
                 "ratio_compare": ">=",
-                "order_price": 100,
+                "signal_price": 100,
             }
             values = [
                 {
@@ -352,12 +353,12 @@ class ExecutionSellRepeatTest(unittest.TestCase):
                     intent["sell_price_reset_policy"] = {
                         "policy": "SELL_PRICE_CHANGE_RESET",
                         "action": "RESET",
-                        "left_source": "ORDER_PRICE",
+                        "left_source": "SIGNAL_PRICE",
                         "right_source": "CURRENT_PRICE",
                         "direction": "UP",
                         "compare": ">=",
                         "threshold_percent": threshold,
-                        "order_price": 100,
+                        "signal_price": 100,
                     }
             path.write_text(json.dumps(root), encoding="utf-8")
 
@@ -407,8 +408,8 @@ class ExecutionSellRepeatTest(unittest.TestCase):
                 self._fixture(status="FILLED", holding=3, current_price=105)
                 self._set_exit_conditions([{
                     "condition_type": "PRICE",
-                    "left_source": "CURRENT_PRICE",
-                    "right_source": "ORDER_PRICE",
+                    "left_source": "SIGNAL_PRICE",
+                    "right_source": "CURRENT_PRICE",
                     "direction": "UP",
                     "compare": ">=",
                     "threshold_percent": exit_threshold,
@@ -553,8 +554,8 @@ class ExecutionSellRepeatTest(unittest.TestCase):
         self._fixture()
         self._set_exit_conditions([{
             "condition_type": "PRICE",
-            "left_source": "CURRENT_PRICE",
-            "right_source": "ORDER_PRICE",
+            "left_source": "SIGNAL_PRICE",
+            "right_source": "CURRENT_PRICE",
             "direction": "UP",
             "compare": ">=",
             "threshold_percent": 5,
@@ -668,8 +669,8 @@ class ExecutionSellRepeatTest(unittest.TestCase):
         self._fixture()
         self._set_exit_conditions([{
             "condition_type": "PRICE",
-            "left_source": "CURRENT_PRICE",
-            "right_source": "ORDER_PRICE",
+            "left_source": "SIGNAL_PRICE",
+            "right_source": "CURRENT_PRICE",
             "direction": "UP",
             "compare": ">=",
             "threshold_percent": 5,

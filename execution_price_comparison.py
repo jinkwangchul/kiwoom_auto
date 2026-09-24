@@ -22,8 +22,11 @@ def resolve_price_source(
     order_price: float | None,
     current_price: float | None,
     average_price: float | None,
+    signal_price: float | None = None,
 ) -> float | None:
     normalized = str(source or "").strip().upper()
+    if normalized == "SIGNAL_PRICE":
+        return signal_price
     if normalized == "ORDER_PRICE":
         return order_price
     if normalized == "CURRENT_PRICE":

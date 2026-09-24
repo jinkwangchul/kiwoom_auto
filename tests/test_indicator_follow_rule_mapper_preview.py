@@ -693,7 +693,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                     "not": False,
                     "target": "AVG_PRICE",
                     "operator": "<=",
-                    "compare_target": "ORDER_PRICE",
+                    "compare_target": "SIGNAL_PRICE",
                     "description": "UI preview: BUY price compare below-branch filter condition",
                 },
                 {
@@ -701,7 +701,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                     "not": False,
                     "target": "AVG_PRICE",
                     "operator": ">",
-                    "compare_target": "ORDER_PRICE",
+                    "compare_target": "SIGNAL_PRICE",
                     "description": "UI preview: BUY price compare above-branch filter condition",
                 },
             ],
@@ -3790,7 +3790,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "point_range": "WITHIN",
             "point_count": 4,
             "time_order_price_basis": "CURRENT_PRICE",
-            "ratio_left": "ORDER_PRICE",
+            "ratio_left": "SIGNAL_PRICE",
             "ratio_right": "AVG_PRICE",
             "ratio_direction": "UP",
             "ratio_value": 1.5,
@@ -3836,7 +3836,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 state = deepcopy(self.ui_state)
                 state["buy_ui"]["base"] = {
                     "hoga_combo": "단일호가",
-                    "order_combo": "주문가",
+                    "order_combo": "신호가",
                 }
                 state["buy_ui"]["repeat"] = {
                     "apply_all_check": True,

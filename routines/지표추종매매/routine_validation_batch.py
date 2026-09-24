@@ -208,7 +208,7 @@ class _IncrementalAverageContext:
                 "evaluation_index": evaluation_index,
                 "estimated_average_price": average,
                 "contributing_buy_indexes": list(self._buy_indexes),
-                "average_source": "VALIDATION_BUY_OHLC4_VIRTUAL_FILL_SEGMENT",
+                "average_source": "VALIDATION_BUY_CLOSE_SIGNAL_PRICE_SEGMENT",
             },
             "_indicator_follow_average_price_series_normalized": True,
         }
