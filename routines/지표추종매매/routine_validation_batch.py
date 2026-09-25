@@ -375,7 +375,10 @@ def _condition_bool(condition: dict[str, Any], series_map: dict[str, list[float 
         return False
     target = _series_key(condition)
     operator = str(condition.get("operator") or "").strip().upper()
-    series = series_map.get(target)
+    series_lookup_key = str(
+        condition.get("_series_key_override") or target
+    ).strip().upper()
+    series = series_map.get(series_lookup_key)
     base_index = len(series) + index if series and index < 0 else index
     effective = base_index - bar_offset
     current, previous, previous2 = _at(series, effective), _at(series, effective - 1), _at(series, effective - 2)
@@ -458,7 +461,10 @@ def _validate_condition(condition: dict[str, Any], base_series: dict[str, list[f
     if operator not in _SUPPORTED_CONDITION_OPERATORS:
         raise _Unsupported("BATCH_CONDITION_UNSUPPORTED")
     target = _series_key(condition)
-    if target not in base_series and target not in _DYNAMIC_SERIES:
+    target_lookup = str(
+        condition.get("_series_key_override") or target
+    ).strip().upper()
+    if target_lookup not in base_series and target_lookup not in _DYNAMIC_SERIES:
         raise _Unsupported("BATCH_CONDITION_UNSUPPORTED")
     if operator in {"CROSS_UP", "CROSS_DOWN", "PERCENT_GAP"} or condition.get("compare_target"):
         compare = _series_key(condition, "compare_target")

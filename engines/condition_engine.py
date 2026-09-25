@@ -409,7 +409,10 @@ def evaluate_condition(
     target_key = _series_key(condition)
     operator = _norm(condition.get("operator"))
     use_not = bool(condition.get("not", False))
-    series = series_map.get(target_key)
+    # Routine-specific evaluators may bind a semantic indicator target to a
+    # precomputed runtime series without changing the persisted/UI target.
+    series_lookup_key = _norm(condition.get("_series_key_override")) or target_key
+    series = series_map.get(series_lookup_key)
     base_index = (len(series) + index) if series and index < 0 else index
     effective_index = base_index - bar_offset
 

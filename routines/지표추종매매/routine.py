@@ -368,7 +368,7 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
         if name == "RSI":
             period = (
                 raw_period
-                if rsi_condition_period
+                if rsi_condition_period and raw_period not in (None, "")
                 else rsi_cfg.get("period")
             )
             return positive_int(period, 14) + 1
@@ -417,7 +417,12 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
             + nonnegative_int(delay)
         )
 
-    def add_groups(groups: Any, delay: int) -> None:
+    def add_groups(
+        groups: Any,
+        delay: int,
+        *,
+        rsi_condition_period: bool = False,
+    ) -> None:
         for group in groups if isinstance(groups, list) else ():
             if not isinstance(group, dict) or group.get("enabled", True) is False:
                 continue
@@ -426,7 +431,11 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
                 if isinstance(group.get("conditions"), list)
                 else ()
             ):
-                add_condition(condition, delay)
+                add_condition(
+                    condition,
+                    delay,
+                    rsi_condition_period=rsi_condition_period,
+                )
 
     buy = rules.get("buy") if isinstance(rules.get("buy"), dict) else {}
     filters = buy.get("filters") if isinstance(buy.get("filters"), dict) else {}
@@ -554,9 +563,17 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
                 if signal_name == "profit_rate_sell":
                     candidates.append(1 + sell_delay)
                 else:
-                    add_groups(signal.get("groups"), signal_delay)
+                    add_groups(
+                        signal.get("groups"),
+                        signal_delay,
+                        rsi_condition_period=True,
+                    )
         else:
-            add_groups(sell.get("groups"), sell_delay)
+            add_groups(
+                sell.get("groups"),
+                sell_delay,
+                rsi_condition_period=True,
+            )
 
     has_ocr_delay_contract = "order_delay_bars" in ocr or any(
         isinstance(signal, dict) and "order_delay_bars" in signal

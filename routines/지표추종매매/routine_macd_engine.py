@@ -111,8 +111,12 @@ def _profit_rate_sell_section(sell_cfg: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _normalize_strategy_price_compare_groups(groups: Any) -> list[dict[str, Any]]:
-    """Normalize legacy SELL strategy-price operands without touching indicator CLOSE."""
+def _rsi_runtime_series_key(period: int) -> str:
+    return f"_INDICATOR_FOLLOW_RSI_{period}"
+
+
+def _normalize_sell_runtime_groups(groups: Any) -> list[dict[str, Any]]:
+    """Bind SELL strategy-price and condition-period semantics at runtime only."""
     if not isinstance(groups, list):
         return []
     normalized = deepcopy(groups)
@@ -125,16 +129,23 @@ def _normalize_strategy_price_compare_groups(groups: Any) -> list[dict[str, Any]
         for condition in conditions:
             if not isinstance(condition, dict):
                 continue
-            if str(condition.get("operator") or "").strip().upper() != "PERCENT_GAP":
-                continue
+            operator = str(condition.get("operator") or "").strip().upper()
             target = str(condition.get("target") or "").strip().upper()
             compare = str(condition.get("compare_target") or "").strip().upper()
-            if {target, compare} != {"CLOSE", "AVG_PRICE"}:
-                continue
-            if target == "CLOSE":
-                condition["target"] = "CURRENT_PRICE"
-            if compare == "CLOSE":
-                condition["compare_target"] = "CURRENT_PRICE"
+            if operator == "PERCENT_GAP" and {target, compare} == {"CLOSE", "AVG_PRICE"}:
+                if target == "CLOSE":
+                    condition["target"] = "CURRENT_PRICE"
+                if compare == "CLOSE":
+                    condition["compare_target"] = "CURRENT_PRICE"
+            if str(condition.get("target") or "").strip().upper() == "RSI":
+                raw_period = condition.get("period")
+                if raw_period not in (None, ""):
+                    period = _safe_int(raw_period)
+                    condition["_series_key_override"] = (
+                        _rsi_runtime_series_key(period)
+                        if period is not None and period > 0
+                        else "_INDICATOR_FOLLOW_RSI_INVALID"
+                    )
     return normalized
 
 
@@ -147,14 +158,14 @@ def _condition_sell_signals(sell_cfg: dict[str, Any]) -> dict[str, dict[str, Any
                 continue
             if isinstance(signal_cfg.get("groups"), list):
                 normalized = deepcopy(signal_cfg)
-                normalized["groups"] = _normalize_strategy_price_compare_groups(
+                normalized["groups"] = _normalize_sell_runtime_groups(
                     signal_cfg["groups"]
                 )
                 result[str(name)] = normalized
         return result
     if isinstance(sell_cfg.get("groups"), list):
         normalized = deepcopy(sell_cfg)
-        normalized["groups"] = _normalize_strategy_price_compare_groups(
+        normalized["groups"] = _normalize_sell_runtime_groups(
             sell_cfg["groups"]
         )
         return {"sell": normalized}
@@ -1692,13 +1703,39 @@ def _evaluate_profit_rate_sell(
     return passed, "profit_rate_sell", [("PASS " if passed else "FAIL ") + detail]
 
 
+def _configured_sell_rsi_periods(config: dict[str, Any]) -> tuple[int, ...]:
+    sell_cfg = _section(config, "sell")
+    periods: set[int] = set()
+    for signal_cfg in _condition_sell_signals(sell_cfg).values():
+        groups = signal_cfg.get("groups")
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            conditions = group.get("conditions") if isinstance(group, dict) else None
+            if not isinstance(conditions, list):
+                continue
+            for condition in conditions:
+                if not isinstance(condition, dict):
+                    continue
+                if str(condition.get("target") or "").strip().upper() != "RSI":
+                    continue
+                period = _safe_int(condition.get("period"))
+                if period is not None and period > 0:
+                    periods.add(period)
+    return tuple(sorted(periods))
+
+
 def build_indicator_follow_base_series(
     candles: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
 ) -> dict[str, list[float | None]]:
     """Build context-independent indicator series for one candle prefix."""
     cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
-    return build_indicator_series(candles, cfg)
+    series_map = build_indicator_series(candles, cfg)
+    closes = close_prices(candles)
+    for period in _configured_sell_rsi_periods(cfg):
+        series_map[_rsi_runtime_series_key(period)] = rsi(closes, period)
+    return series_map
 
 
 def evaluate_indicator_follow_routine(
