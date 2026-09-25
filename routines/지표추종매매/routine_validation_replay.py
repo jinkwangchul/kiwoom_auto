@@ -538,6 +538,8 @@ class ValidationHistoricalReplay:
                         "decision_trace_observer": observer,
                         "_indicator_follow_evaluate_side": side,
                     }
+                    if reuse_default_base_series:
+                        context["_indicator_follow_validation_current_price"] = prefix[-1].get("close")
                     if context_provider is not None:
                         fast_context = getattr(
                             context_provider,
@@ -729,6 +731,8 @@ class ValidationHistoricalReplay:
                     "decision_trace_observer": observer,
                     "_indicator_follow_evaluate_side": side,
                 }
+                if reuse_default_base_series:
+                    context["_indicator_follow_validation_current_price"] = prefix[-1].get("close")
                 if context_provider is not None:
                     fast_context = getattr(
                         context_provider,

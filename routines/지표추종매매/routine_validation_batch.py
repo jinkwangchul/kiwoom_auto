@@ -41,7 +41,7 @@ _SUPPORTED_CONDITION_OPERATORS = {
     "PERCENT_GAP", ">", ">=", "<", "<=", "=", "==",
     "GT", "GTE", "LT", "LTE", "EQ", "ABOVE", "BELOW",
 }
-_DYNAMIC_SERIES = {"AVG_PRICE", "ORDER_PRICE"}
+_DYNAMIC_SERIES = {"AVG_PRICE", "ORDER_PRICE", "CURRENT_PRICE"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -825,14 +825,17 @@ def _composite_bool(cfg: dict[str, Any], results: dict[str, dict[str, Any]]) -> 
 
 def _context_for(context_provider: Any, evaluation_index: int, side: str, prefix: list[dict[str, Any]], entries: list[Any]) -> dict[str, Any]:
     context: dict[str, Any] = {"_indicator_follow_evaluate_side": side}
-    if context_provider is None:
-        return context
-    supplied = context_provider.context_for_fast(evaluation_index, side, prefix, entries)
-    if not isinstance(supplied, dict):
-        raise _Unsupported("BATCH_CONTEXT_RESULT_UNSUPPORTED")
-    supplied.pop("decision_trace_observer", None)
-    supplied.pop("_indicator_follow_evaluate_side", None)
-    context.update(supplied)
+    if context_provider is not None:
+        supplied = context_provider.context_for_fast(evaluation_index, side, prefix, entries)
+        if not isinstance(supplied, dict):
+            raise _Unsupported("BATCH_CONTEXT_RESULT_UNSUPPORTED")
+        supplied.pop("decision_trace_observer", None)
+        supplied.pop("_indicator_follow_evaluate_side", None)
+        context.update(supplied)
+    # Validation CURRENT_PRICE is the CLOSE of the candle being evaluated.
+    # Keep it distinct from any delayed signal-bar index.
+    if prefix:
+        context["_indicator_follow_validation_current_price"] = prefix[-1].get("close")
     return context
 
 

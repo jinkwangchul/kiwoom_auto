@@ -941,7 +941,7 @@ def build_validation_indicator_cache(
                 base_values = average_values
             elif compare_target in {"SIGNAL_PRICE", "ORDER_PRICE"}:
                 base_values = close_values
-            elif compare_target == "CLOSE":
+            elif compare_target in {"CLOSE", "CURRENT_PRICE"}:
                 base_values = close_values
             else:
                 base_values = ()

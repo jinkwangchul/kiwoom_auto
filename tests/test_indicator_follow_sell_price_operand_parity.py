@@ -186,6 +186,264 @@ class SellPriceOperandParityTest(unittest.TestCase):
             ),
         )
 
+    def test_delayed_sell_gap_uses_evaluation_time_current_price_and_average(self):
+        from routines.지표추종매매.routine_macd_engine import (
+            evaluate_indicator_follow_routine,
+        )
+
+        for target in ("CURRENT_PRICE", "CLOSE"):
+            with self.subTest(target=target):
+                rules = {
+                    "enabled": True,
+                    "buy": {"enabled": False},
+                    "sell": {
+                        "enabled": True,
+                        "signals": {
+                            "ui_condition_a": {
+                                "enabled": True,
+                                "order_delay_bars": 1,
+                                "signal_expression": {
+                                    "source": "A",
+                                    "ast": {"type": "identifier", "name": "A"},
+                                    "identifiers": ["A"],
+                                    "identifier_map": {"A": "ui_condition_a"},
+                                },
+                                "groups": [{
+                                    "enabled": True,
+                                    "conditions": [{
+                                        "enabled": True,
+                                        "expression_id": "GAP_0",
+                                        "target": target,
+                                        "operator": "PERCENT_GAP",
+                                        "compare_target": "AVG_PRICE",
+                                        "direction": "UP",
+                                        "compare_mode": "GTE",
+                                        "value": 10.0,
+                                    }],
+                                }],
+                            },
+                        },
+                    },
+                }
+                result = evaluate_indicator_follow_routine(
+                    [{"close": 90.0}, {"close": 100.0}, {"close": 120.0}],
+                    rules,
+                    {
+                        "_indicator_follow_evaluate_side": "SELL",
+                        "actionable_current_price": 120.0,
+                        "cycle": {"avg_price": 100.0},
+                    },
+                )
+
+                self.assertEqual("SELL", result.signal)
+                self.assertEqual(1, result.signal_index)
+                self.assertEqual(1, result.delay_bar)
+
+        legacy_rules = {
+            "enabled": True,
+            "buy": {"enabled": False},
+            "sell": {
+                "enabled": True,
+                "signals": {
+                    "price_sell": {
+                        "enabled": True,
+                        "order_delay_bars": 1,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions": [{
+                                "enabled": True,
+                                "target": "CLOSE",
+                                "operator": "PERCENT_GAP",
+                                "compare_target": "AVG_PRICE",
+                                "direction": "UP",
+                                "compare_mode": "GTE",
+                                "value": 10.0,
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+        blocked = evaluate_indicator_follow_routine(
+            [{"close": 90.0}, {"close": 100.0}, {"close": 120.0}],
+            legacy_rules,
+            {
+                "_indicator_follow_evaluate_side": "SELL",
+                "cycle": {"avg_price": 100.0},
+            },
+        )
+        self.assertIsNone(blocked.signal)
+
+    def test_validation_delayed_sell_gap_uses_evaluation_candle_close(self):
+        from routines.지표추종매매.routine_validation_contract import (
+            ValidationRequest,
+        )
+        from routines.지표추종매매.routine_validation_historical import (
+            ValidationHistoricalSnapshot,
+        )
+        from routines.지표추종매매.routine_validation_replay import (
+            ValidationHistoricalReplay,
+        )
+        from routines.지표추종매매.routine_validation_session import (
+            ValidationSession,
+        )
+
+        rules = {
+            "enabled": True,
+            "bar": {"bar_minutes": 5},
+            "buy": {"enabled": False},
+            "sell": {
+                "enabled": True,
+                "signals": {
+                    "price_sell": {
+                        "enabled": True,
+                        "order_delay_bars": 1,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions": [{
+                                "enabled": True,
+                                "target": "CURRENT_PRICE",
+                                "operator": "PERCENT_GAP",
+                                "compare_target": "AVG_PRICE",
+                                "direction": "UP",
+                                "compare_mode": "GTE",
+                                "value": 10.0,
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+        settings = ValidationSettingsSnapshot(rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, settings, 5),
+            operation_active_reader=lambda: False,
+        )
+        closes = (90.0, 100.0, 120.0)
+        historical = ValidationHistoricalSnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            requested_count=len(closes),
+            request_id="CURRENT-PRICE-DELAY-PARITY",
+            rows=[
+                {
+                    "체결시간": f"2026092509{index:02d}00",
+                    "시가": str(close),
+                    "고가": str(close),
+                    "저가": str(close),
+                    "현재가": str(close),
+                    "거래량": "1",
+                }
+                for index, close in reversed(list(enumerate(closes)))
+            ],
+        )
+
+        def context_provider(_index, _side, _prefix, _entries):
+            return {"average_price": 100.0}
+
+        result = ValidationHistoricalReplay(session).evaluate(
+            historical,
+            start_index=2,
+            end_index=2,
+            context_provider=context_provider,
+        )
+        self.assertTrue(result.ok, result)
+        sell = next(
+            entry
+            for entry in result.snapshot.to_entries()
+            if entry.evaluation_side == "SELL" and entry.signal == "SELL"
+        )
+        self.assertEqual(2, sell.evaluation_index)
+        self.assertEqual(1, sell.signal_index)
+        gap = next(
+            item
+            for item in sell.trace["conditions"]
+            if item["operator"] == "PERCENT_GAP"
+        )
+        self.assertEqual("CURRENT_PRICE", gap["left_operand"]["key"])
+        self.assertEqual(120.0, gap["left_operand"]["value"])
+        self.assertEqual("AVG_PRICE", gap["right_operand"]["key"])
+        self.assertEqual(100.0, gap["right_operand"]["value"])
+
+    def test_validation_batch_delayed_sell_uses_evaluation_current_price(self):
+        from routines.지표추종매매.routine_validation_batch import (
+            _IncrementalAverageContext,
+            scan_indicator_follow_validation_batch,
+        )
+
+        rules = {
+            "enabled": True,
+            "buy": {
+                "enabled": True,
+                "delay_bar": 0,
+                "groups": [{
+                    "enabled": True,
+                    "conditions": [{
+                        "enabled": True,
+                        "target": "CLOSE",
+                        "operator": ">",
+                        "value": 0,
+                    }],
+                }],
+            },
+            "sell": {
+                "enabled": True,
+                "signals": {
+                    "price_sell": {
+                        "enabled": True,
+                        "order_delay_bars": 1,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions": [{
+                                "enabled": True,
+                                "target": "CURRENT_PRICE",
+                                "operator": "PERCENT_GAP",
+                                "compare_target": "AVG_PRICE",
+                                "direction": "UP",
+                                "compare_mode": "GTE",
+                                "value": 10.0,
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+        candles = [
+            {"time": f"2026092509{index:02d}00", "close": close}
+            for index, close in enumerate((100.0, 100.0, 100.0, 120.0))
+        ]
+        result = scan_indicator_follow_validation_batch(
+            candles,
+            rules,
+            start_index=2,
+            end_index=3,
+            context_provider=_IncrementalAverageContext(),
+        )
+
+        self.assertTrue(result.supported, result)
+        self.assertTrue(any(
+            record.evaluation_side == "BUY"
+            and record.evaluation_index == 2
+            and record.signal == "BUY"
+            for record in result.records
+        ))
+        sell = next(
+            record
+            for record in result.records
+            if record.evaluation_side == "SELL"
+            and record.evaluation_index == 3
+            and record.signal == "SELL"
+        )
+        self.assertEqual(2, sell.routine_signal.signal_index)
+        gap = next(
+            item
+            for item in sell.trace["conditions"]
+            if item["operator"] == "PERCENT_GAP"
+        )
+        self.assertEqual("CURRENT_PRICE", gap["left_operand"]["key"])
+        self.assertEqual(120.0, gap["left_operand"]["value"])
+        self.assertEqual(100.0, gap["right_operand"]["value"])
+
 
 if __name__ == "__main__":
     unittest.main()

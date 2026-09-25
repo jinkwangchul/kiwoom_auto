@@ -440,7 +440,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         projected = project_signal_validation_rules(preview["preview_rules"], ui_state=state)
         signal = projected["sell"]["signals"]["ui_condition_a"]
         gap = signal["groups"][0]["conditions"][0]
-        self.assertEqual("CLOSE", gap["target"])
+        self.assertEqual("CURRENT_PRICE", gap["target"])
         self.assertEqual("AVG_PRICE", gap["compare_target"])
 
         from routines.지표추종매매.routine_macd_engine import (
@@ -454,6 +454,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                 projected,
                 {
                     "_indicator_follow_evaluate_side": "SELL",
+                    "_indicator_follow_validation_current_price": close,
                     "average_price_series": [10000.0, 10000.0, 10000.0],
                     "average_price": 10000.0,
                     "decision_trace_observer": observer,

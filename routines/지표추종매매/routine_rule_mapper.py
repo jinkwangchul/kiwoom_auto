@@ -1861,10 +1861,15 @@ def _build_sell_gap_condition(source: dict[str, Any], warnings: list[str], label
         return None
     left = _series_target(source.get("gap_left_combo"))
     right = _series_target(source.get("gap_right_combo"))
+    # SELL GAP is a strategy price comparison, not a candle-close indicator.
+    # Historical mapper output used CLOSE for UI "현재가"; normalize both that
+    # legacy token and the current UI token to the canonical CURRENT_PRICE axis.
+    left = "CURRENT_PRICE" if left == "CLOSE" else left
+    right = "CURRENT_PRICE" if right == "CLOSE" else right
     direction = {"상향": "UP", "하향": "DOWN", "상하": "BOTH", "UP": "UP", "DOWN": "DOWN", "BOTH": "BOTH"}.get(str(source.get("gap_direction_combo") or "").strip())
     compare_mode = {"이상": "GTE", "이하": "LTE", "이내": "WITHIN", "이탈": "OUTSIDE", "GTE": "GTE", "LTE": "LTE", "WITHIN": "WITHIN", "OUTSIDE": "OUTSIDE"}.get(str(source.get("gap_compare_combo") or "").strip())
     value = _safe_float(source.get("gap_value_line"))
-    if left not in {"CLOSE", "AVG_PRICE"} or right not in {"CLOSE", "AVG_PRICE"}:
+    if left not in {"CURRENT_PRICE", "AVG_PRICE"} or right not in {"CURRENT_PRICE", "AVG_PRICE"}:
         warnings.append(f"{label} GAP 가격 기준 재선택 필요")
         return None
     if left == right:

@@ -1233,7 +1233,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         condition = candidates["sell"]["add_signal_candidate"]["value"]["groups"][0]["conditions"][0]
         self.assertEqual(condition["operator"], "PERCENT_GAP")
-        self.assertEqual("CLOSE", condition["target"])
+        self.assertEqual("CURRENT_PRICE", condition["target"])
         self.assertEqual("AVG_PRICE", condition["compare_target"])
         self.assertIn("sell.signals.ui_preview_condition_a", result["mapped_paths"])
 
@@ -1545,6 +1545,13 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
                 group = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]["value"]["groups"][0]
                 self.assertEqual(group["condition_expression"]["operator"], logic)
+                gap = next(
+                    condition
+                    for condition in group["conditions"]
+                    if condition["operator"] == "PERCENT_GAP"
+                )
+                self.assertEqual("AVG_PRICE", gap["target"])
+                self.assertEqual("CURRENT_PRICE", gap["compare_target"])
 
     def test_sell_condition_b_approval_apply_and_commit_preview(self):
         state = deepcopy(self.ui_state)

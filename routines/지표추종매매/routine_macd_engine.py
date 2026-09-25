@@ -111,6 +111,33 @@ def _profit_rate_sell_section(sell_cfg: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _normalize_strategy_price_compare_groups(groups: Any) -> list[dict[str, Any]]:
+    """Normalize legacy SELL strategy-price operands without touching indicator CLOSE."""
+    if not isinstance(groups, list):
+        return []
+    normalized = deepcopy(groups)
+    for group in normalized:
+        if not isinstance(group, dict):
+            continue
+        conditions = group.get("conditions")
+        if not isinstance(conditions, list):
+            continue
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            if str(condition.get("operator") or "").strip().upper() != "PERCENT_GAP":
+                continue
+            target = str(condition.get("target") or "").strip().upper()
+            compare = str(condition.get("compare_target") or "").strip().upper()
+            if {target, compare} != {"CLOSE", "AVG_PRICE"}:
+                continue
+            if target == "CLOSE":
+                condition["target"] = "CURRENT_PRICE"
+            if compare == "CLOSE":
+                condition["compare_target"] = "CURRENT_PRICE"
+    return normalized
+
+
 def _condition_sell_signals(sell_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     signals = sell_cfg.get("signals")
     if isinstance(signals, dict):
@@ -119,10 +146,18 @@ def _condition_sell_signals(sell_cfg: dict[str, Any]) -> dict[str, dict[str, Any
             if name == "profit_rate_sell" or not isinstance(signal_cfg, dict):
                 continue
             if isinstance(signal_cfg.get("groups"), list):
-                result[str(name)] = signal_cfg
+                normalized = deepcopy(signal_cfg)
+                normalized["groups"] = _normalize_strategy_price_compare_groups(
+                    signal_cfg["groups"]
+                )
+                result[str(name)] = normalized
         return result
     if isinstance(sell_cfg.get("groups"), list):
-        return {"sell": sell_cfg}
+        normalized = deepcopy(sell_cfg)
+        normalized["groups"] = _normalize_strategy_price_compare_groups(
+            sell_cfg["groups"]
+        )
+        return {"sell": normalized}
     return {}
 
 
@@ -1490,10 +1525,43 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
         ("order_price", "buy_order_price", "planned_order_price", "mock_order_price"),
         (("order", "price"), ("planned_order", "price"), ("buy", "order_price")),
     )
+    current_price = _context_float(
+        context,
+        (
+            "_indicator_follow_validation_current_price",
+            "actionable_current_price",
+            "current_price",
+        ),
+    )
     average_price = _context_float(
         context,
         ("average_price", "avg_price", "position_average_price", "mock_average_price"),
-        (("position", "average_price"), ("position", "avg_price"), ("holding", "average_price"), ("holding", "avg_price")),
+        (
+            ("cycle", "avg_price"),
+            ("cycle", "average_price"),
+            ("position", "average_price"),
+            ("position", "avg_price"),
+            ("holding", "average_price"),
+            ("holding", "avg_price"),
+        ),
+    )
+    average_price_declared = bool(
+        isinstance(context, dict)
+        and (
+            any(
+                key in context
+                for key in (
+                    "average_price",
+                    "avg_price",
+                    "position_average_price",
+                    "mock_average_price",
+                )
+            )
+            or (
+                isinstance(context.get("cycle"), dict)
+                and any(key in context["cycle"] for key in ("avg_price", "average_price"))
+            )
+        )
     )
     average_price_series = (
         context.get("average_price_series") if isinstance(context, dict) else None
@@ -1508,7 +1576,27 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
         # historical execution-context interpretation for read compatibility;
         # new strategy comparison rules are written as SIGNAL_PRICE.
         series_map["ORDER_PRICE"] = [order_price] * length
-    if isinstance(average_price_series, list) and 0 < len(average_price_series) <= length:
+    # CURRENT_PRICE is an evaluation-time strategy axis. It must remain the
+    # same fresh value even when a condition belongs to a delayed signal bar.
+    # Keep the axis present with None when fresh evidence is unavailable so
+    # legacy CLOSE<->AVG_PRICE strategy rules fail closed instead of falling
+    # back to a stale candle CLOSE.
+    normalized_current = (
+        current_price
+        if current_price is not None and current_price > 0
+        else None
+    )
+    series_map["CURRENT_PRICE"] = [normalized_current] * length
+    if average_price_declared:
+        # AVG_PRICE is the confirmed position average at the evaluation point,
+        # not a historical value selected by the signal-delay index.
+        normalized_average = (
+            average_price
+            if average_price is not None and average_price > 0
+            else None
+        )
+        series_map["AVG_PRICE"] = [normalized_average] * length
+    elif isinstance(average_price_series, list) and 0 < len(average_price_series) <= length:
         if (
             isinstance(context, dict)
             and context.get("_indicator_follow_average_price_series_normalized")
@@ -1526,8 +1614,6 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
                     value if value is not None and value > 0 else None
                 )
             series_map["AVG_PRICE"] = normalized_average_series
-    elif average_price is not None:
-        series_map["AVG_PRICE"] = [average_price] * length
 
 
 def _context_holding_qty(context: dict[str, Any] | None) -> float | None:
