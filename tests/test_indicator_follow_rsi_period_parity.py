@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from engines.condition_engine import evaluate_condition
 from engines.indicator_engine import rsi
 from indicator_follow_signal_validation_visualization import (
     FAMILY_RSI,
@@ -72,6 +73,15 @@ class IndicatorFollowRsiPeriodParityTest(unittest.TestCase):
                 },
             },
         }
+
+    def test_rsi_series_uses_wilder_initial_average_and_recursive_smoothing(self):
+        values = [100.0, 102.0, 101.0, 104.0, 103.0]
+        actual = rsi(values, 3)
+
+        self.assertEqual([None, None, None], actual[:3])
+        self.assertAlmostEqual(83.33333333333333, actual[3])
+        self.assertAlmostEqual(66.66666666666666, actual[4])
+
     def test_production_sell_uses_condition_period_not_global_period(self):
         observer = ValidationTraceObserver()
         result = evaluate_indicator_follow_routine(
@@ -104,6 +114,33 @@ class IndicatorFollowRsiPeriodParityTest(unittest.TestCase):
             {"_indicator_follow_evaluate_side": "SELL"},
         )
         self.assertIsNone(result.signal)
+
+    def test_forged_private_series_override_is_rejected(self):
+        condition = {
+            "target": "RSI",
+            "period": 2,
+            "operator": "<=",
+            "value": 20.0,
+            "_series_key_override": "CLOSE",
+        }
+        series_map = {
+            "RSI": [50.0, 50.0],
+            "CLOSE": [10.0, 10.0],
+            "_INDICATOR_FOLLOW_RSI_2": [12.0, 12.0],
+        }
+        result = evaluate_condition(condition, series_map, 1)
+        self.assertFalse(result.passed)
+
+    def test_persisted_private_override_is_discarded_and_rederived(self):
+        rules = self.rules()
+        condition = rules["sell"]["signals"]["rsi_sell"]["groups"][0]["conditions"][0]
+        condition["_series_key_override"] = "_INDICATOR_FOLLOW_RSI_14"
+        result = evaluate_indicator_follow_routine(
+            self.candles(),
+            rules,
+            {"_indicator_follow_evaluate_side": "SELL"},
+        )
+        self.assertEqual("SELL", result.signal)
 
     def test_sell_condition_period_controls_warmup(self):
         projection = market_bar_projection_request(self.rules(period=30, threshold=30))

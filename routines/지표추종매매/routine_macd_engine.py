@@ -129,6 +129,9 @@ def _normalize_sell_runtime_groups(groups: Any) -> list[dict[str, Any]]:
         for condition in conditions:
             if not isinstance(condition, dict):
                 continue
+            # Runtime bindings are derived from canonical condition fields.
+            # Never trust or preserve a persisted private override.
+            condition.pop("_series_key_override", None)
             operator = str(condition.get("operator") or "").strip().upper()
             target = str(condition.get("target") or "").strip().upper()
             compare = str(condition.get("compare_target") or "").strip().upper()

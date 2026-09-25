@@ -375,9 +375,26 @@ def _condition_bool(condition: dict[str, Any], series_map: dict[str, list[float 
         return False
     target = _series_key(condition)
     operator = str(condition.get("operator") or "").strip().upper()
-    series_lookup_key = str(
-        condition.get("_series_key_override") or target
+    runtime_override = str(
+        condition.get("_series_key_override") or ""
     ).strip().upper()
+    if runtime_override:
+        try:
+            rsi_period = int(float(condition.get("period")))
+        except (TypeError, ValueError):
+            rsi_period = 0
+        expected_override = (
+            f"_INDICATOR_FOLLOW_RSI_{rsi_period}"
+            if target == "RSI" and rsi_period > 0
+            else "_INDICATOR_FOLLOW_RSI_INVALID"
+        )
+        series_lookup_key = (
+            runtime_override
+            if runtime_override == expected_override
+            else "_INVALID_RUNTIME_SERIES_OVERRIDE"
+        )
+    else:
+        series_lookup_key = target
     series = series_map.get(series_lookup_key)
     base_index = len(series) + index if series and index < 0 else index
     effective = base_index - bar_offset
@@ -461,9 +478,26 @@ def _validate_condition(condition: dict[str, Any], base_series: dict[str, list[f
     if operator not in _SUPPORTED_CONDITION_OPERATORS:
         raise _Unsupported("BATCH_CONDITION_UNSUPPORTED")
     target = _series_key(condition)
-    target_lookup = str(
-        condition.get("_series_key_override") or target
+    runtime_override = str(
+        condition.get("_series_key_override") or ""
     ).strip().upper()
+    if runtime_override:
+        try:
+            rsi_period = int(float(condition.get("period")))
+        except (TypeError, ValueError):
+            rsi_period = 0
+        expected_override = (
+            f"_INDICATOR_FOLLOW_RSI_{rsi_period}"
+            if target == "RSI" and rsi_period > 0
+            else "_INDICATOR_FOLLOW_RSI_INVALID"
+        )
+        target_lookup = (
+            runtime_override
+            if runtime_override == expected_override
+            else "_INVALID_RUNTIME_SERIES_OVERRIDE"
+        )
+    else:
+        target_lookup = target
     if target_lookup not in base_series and target_lookup not in _DYNAMIC_SERIES:
         raise _Unsupported("BATCH_CONDITION_UNSUPPORTED")
     if operator in {"CROSS_UP", "CROSS_DOWN", "PERCENT_GAP"} or condition.get("compare_target"):

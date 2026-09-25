@@ -409,9 +409,27 @@ def evaluate_condition(
     target_key = _series_key(condition)
     operator = _norm(condition.get("operator"))
     use_not = bool(condition.get("not", False))
-    # Routine-specific evaluators may bind a semantic indicator target to a
-    # precomputed runtime series without changing the persisted/UI target.
-    series_lookup_key = _norm(condition.get("_series_key_override")) or target_key
+    # Routine-specific evaluators may bind a semantic RSI target to a
+    # precomputed period series without changing the persisted/UI target.
+    # Only the exact key derived from the canonical RSI period is accepted.
+    runtime_override = _norm(condition.get("_series_key_override"))
+    if runtime_override:
+        try:
+            rsi_period = int(float(condition.get("period")))
+        except (TypeError, ValueError):
+            rsi_period = 0
+        expected_override = (
+            f"_INDICATOR_FOLLOW_RSI_{rsi_period}"
+            if target_key == "RSI" and rsi_period > 0
+            else "_INDICATOR_FOLLOW_RSI_INVALID"
+        )
+        series_lookup_key = (
+            runtime_override
+            if runtime_override == expected_override
+            else "_INVALID_RUNTIME_SERIES_OVERRIDE"
+        )
+    else:
+        series_lookup_key = target_key
     series = series_map.get(series_lookup_key)
     base_index = (len(series) + index) if series and index < 0 else index
     effective_index = base_index - bar_offset
