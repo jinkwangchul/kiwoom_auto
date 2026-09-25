@@ -20,6 +20,9 @@ from .routine_macd_engine import (
     build_indicator_follow_base_series,
     evaluate_indicator_follow_routine,
 )
+from .routine_validation_batch import (
+    _evaluation_prefix_series_map,
+)
 from .routine_validation_contract import ValidationStockRef
 from .routine_validation_historical import ValidationHistoricalSnapshot
 from .routine_validation_session import ValidationSession
@@ -32,98 +35,6 @@ REASON_NO_VALID_CANDLES = "NO_VALID_CANDLES"
 REASON_INVALID_EVALUATION_RANGE = "INVALID_EVALUATION_RANGE"
 REASON_EVALUATOR_ERROR = "EVALUATOR_ERROR"
 REASON_INVALID_ROUTINE_SIGNAL = "INVALID_ROUTINE_SIGNAL"
-
-
-class _PriceBoxPrefixSeries(list):
-    """List-compatible Price Box view for one historical prefix."""
-
-    def __init__(
-        self,
-        middle: list[float | None],
-        offset: float | None,
-        length: int,
-    ) -> None:
-        super().__init__()
-        self._middle = middle
-        self._offset = offset
-        self._length = max(0, min(int(length), len(middle)))
-
-    def __len__(self) -> int:
-        return self._length
-
-    def __bool__(self) -> bool:
-        return self._length > 0
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            start, stop, step = index.indices(self._length)
-            return [self[position] for position in range(start, stop, step)]
-        position = int(index)
-        if position < 0:
-            position += self._length
-        if not 0 <= position < self._length:
-            raise IndexError(position)
-        middle_value = self._middle[position]
-        if middle_value is None or self._offset is None:
-            return None
-        return float(middle_value) + self._offset
-
-
-def _price_box_prefix_offsets(
-    series_map: dict[str, list[float | None]],
-) -> tuple[list[float | None], list[float | None]]:
-    """Return prefix-equivalent lower/upper offsets for each evaluation index."""
-    closes = series_map.get("CLOSE")
-    middle = series_map.get("PRICE_BOX_MIDDLE")
-    if not isinstance(closes, list) or not isinstance(middle, list):
-        return [], []
-    if len(closes) != len(middle):
-        return [], []
-
-    positive_count = 0
-    positive_sum = 0.0
-    positive_sum_sq = 0.0
-    negative_count = 0
-    negative_sum = 0.0
-    negative_sum_sq = 0.0
-    lower_offsets: list[float | None] = []
-    upper_offsets: list[float | None] = []
-
-    for close_value, middle_value in zip(closes, middle):
-        close_number = _normalized_number(close_value)
-        middle_number = _normalized_number(middle_value)
-        if close_number is not None and middle_number is not None:
-            deviation = close_number - middle_number
-            if deviation > 0:
-                positive_count += 1
-                positive_sum += deviation
-                positive_sum_sq += deviation * deviation
-            elif deviation < 0:
-                negative_count += 1
-                negative_sum += deviation
-                negative_sum_sq += deviation * deviation
-
-        if positive_count:
-            mean = positive_sum / positive_count
-            variance = max(
-                0.0,
-                positive_sum_sq / positive_count - mean * mean,
-            )
-            upper_offsets.append(mean + 2.0 * math.sqrt(variance))
-        else:
-            upper_offsets.append(None)
-
-        if negative_count:
-            mean = negative_sum / negative_count
-            variance = max(
-                0.0,
-                negative_sum_sq / negative_count - mean * mean,
-            )
-            lower_offsets.append(mean - 2.0 * math.sqrt(variance))
-        else:
-            lower_offsets.append(None)
-
-    return lower_offsets, upper_offsets
 
 
 def _canonical_json(value: Any) -> str:
@@ -801,37 +712,17 @@ class ValidationHistoricalReplay:
             if reuse_default_base_series
             else None
         )
-        price_box_lower_offsets, price_box_upper_offsets = (
-            _price_box_prefix_offsets(base_series_map)
-            if base_series_map is not None
-            else ([], [])
-        )
-        price_box_middle = (
-            base_series_map.get("PRICE_BOX_MIDDLE")
-            if base_series_map is not None
-            else None
-        )
         entries: list[ValidationReplayEntry] = []
         for evaluation_index in range(start_index, final_index + 1):
             prefix = candles[: evaluation_index + 1]
-            evaluation_series_map = base_series_map
-            if (
-                base_series_map is not None
-                and isinstance(price_box_middle, list)
-                and evaluation_index < len(price_box_lower_offsets)
-                and evaluation_index < len(price_box_upper_offsets)
-            ):
-                evaluation_series_map = dict(base_series_map)
-                evaluation_series_map["PRICE_BOX_LOWER"] = _PriceBoxPrefixSeries(
-                    price_box_middle,
-                    price_box_lower_offsets[evaluation_index],
+            evaluation_series_map = (
+                _evaluation_prefix_series_map(
+                    base_series_map,
                     evaluation_index + 1,
                 )
-                evaluation_series_map["PRICE_BOX_UPPER"] = _PriceBoxPrefixSeries(
-                    price_box_middle,
-                    price_box_upper_offsets[evaluation_index],
-                    evaluation_index + 1,
-                )
+                if base_series_map is not None
+                else None
+            )
             for side in ("SELL", "BUY"):
                 observer = ValidationTraceObserver()
                 context = {

@@ -592,16 +592,13 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             self.assertNotIn("bar_offset", conditions[0])
             self.assertNotIn("bar_offset", conditions[1])
 
-    def test_price_box_formula_caller_cutoff_and_upper_lower_mapper(self):
+    def test_price_box_formula_is_causal_and_upper_lower_mapper_is_preserved(self):
         closes = [100.0 + index + (((index % 7) - 3) * 4.0) for index in range(40)]
         lower, middle, upper = price_box(closes, 24)
         prefix_lower, prefix_middle, prefix_upper = price_box(closes[:30], 24)
-        self.assertNotEqual(upper[:30], prefix_upper)
+        self.assertEqual(lower[:30], prefix_lower)
         self.assertEqual(middle[:30], prefix_middle)
-        self.assertEqual(
-            price_box(closes[:30], 24),
-            (prefix_lower, prefix_middle, prefix_upper),
-        )
+        self.assertEqual(upper[:30], prefix_upper)
         self.assertEqual(len(lower), len(closes))
         series = build_indicator_series([{"close": value, "volume": 1} for value in closes])
         self.assertIn("PRICE_BOX_UPPER", series)
@@ -670,32 +667,53 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         self.assertTrue(upper_result.passed)
         self.assertTrue(lower_result.passed)
 
-    def test_price_box_uses_full_dataset_avgif_and_population_stdevif(self):
+    def test_price_box_uses_exact_period_three_window_and_evicts_oldest_close(self):
         closes = [10.0, 12.0, 8.0, 15.0, 7.0, 18.0]
         lower, middle, upper = price_box(closes, 3)
-        deviations = [
-            closes[index] - middle[index]
-            for index in range(2, len(closes))
+        self.assertEqual([None, None], lower[:2])
+        self.assertEqual([None, None], middle[:2])
+        self.assertEqual([None, None], upper[:2])
+        for actual, expected in zip(middle[2:], (10.0, 35.0 / 3.0, 10.0, 40.0 / 3.0)):
+            self.assertAlmostEqual(expected, actual)
+        for actual, expected in zip(lower[2:], (8.0, 8.0, 6.5, 7.0)):
+            self.assertAlmostEqual(expected, actual)
+        for actual, expected in zip(upper[2:], (12.0, 16.5, 15.0, 19.5)):
+            self.assertAlmostEqual(expected, actual)
+
+    def test_price_box_period_five_uses_the_same_rolling_contract(self):
+        lower, middle, upper = price_box([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 5)
+
+        self.assertEqual([None] * 4, lower[:4])
+        self.assertEqual([None] * 4, middle[:4])
+        self.assertEqual([None] * 4, upper[:4])
+        self.assertEqual([3.0, 4.0], middle[4:])
+        self.assertEqual([0.5, 1.5], lower[4:])
+        self.assertEqual([5.5, 6.5], upper[4:])
+
+    def test_price_box_returns_none_for_missing_center_or_empty_sign_group(self):
+        lower, middle, upper = price_box([5.0, 5.0, None, 5.0, 5.0, 5.0], 3)
+
+        self.assertEqual([None, None, None, None, None, 5.0], middle)
+        self.assertEqual([None] * 6, lower)
+        self.assertEqual([None] * 6, upper)
+
+    def test_build_indicator_series_normalizes_invalid_price_box_period_to_default(self):
+        candles = [
+            {"close": float(value), "volume": 1}
+            for value in range(100, 130)
         ]
-        positive = [value for value in deviations if value > 0]
-        negative = [value for value in deviations if value < 0]
-        positive_mean = sum(positive) / len(positive)
-        positive_std = (
-            sum((value - positive_mean) ** 2 for value in positive) / len(positive)
-        ) ** 0.5
-        negative_mean = sum(negative) / len(negative)
-        negative_std = (
-            sum((value - negative_mean) ** 2 for value in negative) / len(negative)
-        ) ** 0.5
-        for index in range(2, len(closes)):
-            self.assertAlmostEqual(
-                upper[index],
-                middle[index] + positive_mean + (2 * positive_std),
-            )
-            self.assertAlmostEqual(
-                lower[index],
-                middle[index] + negative_mean - (2 * negative_std),
-            )
+        expected = build_indicator_series(
+            candles,
+            {"indicators": {"price_box": {"period": 24}}},
+        )["PRICE_BOX_LOWER"]
+
+        for invalid_period in (-1, "bad"):
+            with self.subTest(period=invalid_period):
+                actual = build_indicator_series(
+                    candles,
+                    {"indicators": {"price_box": {"period": invalid_period}}},
+                )["PRICE_BOX_LOWER"]
+                self.assertEqual(expected, actual)
 
     def test_signal_runtime_policy_survives_approval_apply_and_commit_preview(self):
         current = self._rules()

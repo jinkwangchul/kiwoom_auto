@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 import unittest
+from unittest import mock
 
 from engines.condition_engine import evaluate_condition
-from engines.indicator_engine import bollinger_band, close_prices
+from engines.indicator_engine import build_indicator_series, bollinger_band, close_prices, price_box
 from indicator_follow_signal_validation_presentation import (
     signal_evidence_records_for_entry,
 )
@@ -20,6 +21,7 @@ from indicator_follow_signal_validation_visualization import (
     FAMILY_RSI,
     LOWER_AXIS,
     PRICE_AXIS,
+    ValidationFilterDescriptor,
     active_filter_identities_for_entry,
     build_validation_filter_universe,
     build_validation_indicator_cache,
@@ -766,9 +768,105 @@ class ValidationVisualizationDataTest(unittest.TestCase):
         )
         self.assertEqual(50, len(base_criterion))
         self.assertEqual(60, len(extended_criterion))
+        canonical = build_indicator_series(base_candles, rules)[
+            "PRICE_BOX_LOWER"
+        ]
+        self.assertEqual(tuple(canonical), base_criterion)
         self.assertEqual(
             base_criterion,
             extended_criterion[:50],
+        )
+
+    def test_price_box_known_values_match_engine_production_and_validation_cache(self):
+        closes = [10.0, 12.0, 8.0, 15.0, 7.0, 18.0]
+        candles = [
+            {"time": f"2025-01-01T09:{index:02d}:00", "close": close, "volume": 1}
+            for index, close in enumerate(closes)
+        ]
+        expected_lower = [None, None, 8.0, 8.0, 6.5, 7.0]
+        expected_middle = [None, None, 10.0, 35.0 / 3.0, 10.0, 40.0 / 3.0]
+        expected_upper = [None, None, 12.0, 16.5, 15.0, 19.5]
+
+        lower, middle, upper = price_box(closes, 3)
+        production = build_indicator_series(
+            candles,
+            {"indicators": {"price_box": {"period": 3}}},
+        )
+        descriptor = ValidationFilterDescriptor(
+            identity="PRICE_BOX:known-values",
+            family=FAMILY_PRICE_BOX,
+            label="가격박스 하단",
+            axis=PRICE_AXIS,
+            sides=("SELL",),
+            series_keys=("CRITERION",),
+            parameter_json=(
+                '{"condition":{"compare_target":"PRICE_BOX_LOWER"},'
+                '"period":3}'
+            ),
+            evidence_keys=("PRICE_BOX_LOWER",),
+        )
+        validation = build_validation_indicator_cache(
+            candles,
+            {"indicators": {"price_box": {"period": 3}}},
+            (descriptor,),
+        ).values_for(descriptor.identity, "CRITERION")
+
+        for actual, expected in (
+            (lower, expected_lower),
+            (middle, expected_middle),
+            (upper, expected_upper),
+            (production["PRICE_BOX_LOWER"], expected_lower),
+            (production["PRICE_BOX_MIDDLE"], expected_middle),
+            (production["PRICE_BOX_UPPER"], expected_upper),
+            (list(validation), expected_lower),
+        ):
+            self.assertEqual(len(expected), len(actual))
+            for actual_value, expected_value in zip(actual, expected):
+                if expected_value is None:
+                    self.assertIsNone(actual_value)
+                else:
+                    self.assertAlmostEqual(expected_value, actual_value)
+
+    def test_price_box_cache_consumes_canonical_indicator_series(self):
+        rules = {"indicators": {"price_box": {"period": 24}}}
+        descriptor = ValidationFilterDescriptor(
+            identity="PRICE_BOX:canonical-source-test",
+            family=FAMILY_PRICE_BOX,
+            label="가격박스 하단",
+            axis=PRICE_AXIS,
+            sides=("SELL",),
+            series_keys=("CRITERION",),
+            parameter_json=(
+                '{"condition":{"compare_target":"PRICE_BOX_LOWER"},'
+                '"period":24}'
+            ),
+            evidence_keys=("PRICE_BOX_LOWER",),
+        )
+        candles = [
+            {"time": f"2025-01-01T09:{index:02d}:00", "close": 100 + index}
+            for index in range(30)
+        ]
+        canonical_lower = [None] * 23 + [9000.0 + index for index in range(7)]
+        canonical_series = {
+            "PRICE_BOX_LOWER": canonical_lower,
+            "PRICE_BOX_MIDDLE": [None] * len(candles),
+            "PRICE_BOX_UPPER": [None] * len(candles),
+        }
+
+        with mock.patch(
+            "indicator_follow_signal_validation_visualization.price_box",
+            create=True,
+            return_value=(canonical_series["PRICE_BOX_LOWER"], canonical_series["PRICE_BOX_MIDDLE"], canonical_series["PRICE_BOX_UPPER"]),
+        ):
+            cache = build_validation_indicator_cache(
+                candles,
+                rules,
+                (descriptor,),
+            )
+
+        self.assertEqual(
+            tuple(canonical_lower),
+            cache.values_for(descriptor.identity, "CRITERION"),
         )
 
 

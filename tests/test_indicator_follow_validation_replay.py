@@ -1329,6 +1329,178 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         ]
         self.assertEqual(expected, prefix_entries)
 
+    def test_price_box_replay_and_batch_use_canonical_delay_offset_operand(self) -> None:
+        from routines.지표추종매매.routine_validation_batch import (
+            scan_indicator_follow_validation_batch,
+        )
+
+        rules = deepcopy(self.rules)
+        rules["indicators"] = {
+            "price_box": {"period": 5},
+            "moving_averages": [5, 20],
+        }
+        rules["buy"]["delay_bar"] = 2
+        rules["buy"]["groups"][0]["conditions"] = [{
+            "enabled": True,
+            "not": False,
+            "target": "CLOSE",
+            "operator": ">=",
+            "compare_target": "PRICE_BOX_LOWER",
+            "value": 0.5,
+            "signed_percent_offset": True,
+            "bar_offset": 1,
+        }]
+        settings = ValidationSettingsSnapshot(rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, settings, 3),
+            operation_active_reader=Mock(return_value=False),
+        )
+        closes = tuple(
+            100 + ((index * 7) % 17) - (index % 5)
+            for index in range(30)
+        )
+        historical = self._historical(closes=closes)
+        candles = project_validation_candles(historical)[0]
+        canonical = routine_macd_engine.build_indicator_follow_base_series(
+            candles,
+            rules,
+        )["PRICE_BOX_LOWER"]
+        valid_start_index = 2 + 1
+        replay = ValidationHistoricalReplay(session)
+        detailed = replay.evaluate(historical, start_index=valid_start_index)
+        batch = scan_indicator_follow_validation_batch(
+            candles,
+            rules,
+            start_index=valid_start_index,
+        )
+        scanned = replay.scan_signal_entries(
+            historical,
+            start_index=valid_start_index,
+        )
+
+        self.assertTrue(detailed.ok, detailed)
+        self.assertTrue(batch.supported, batch)
+        detailed_buy = {
+            entry.evaluation_index: entry
+            for entry in detailed.snapshot.to_entries()
+            if entry.evaluation_side == "BUY" and entry.signal == "BUY"
+        }
+        scanned_buy = {
+            entry.evaluation_index: entry
+            for entry in scanned
+            if entry.evaluation_side == "BUY" and entry.signal == "BUY"
+        }
+        batch_buy = {
+            record.evaluation_index: record
+            for record in batch.records
+            if record.evaluation_side == "BUY" and record.signal == "BUY"
+        }
+        self.assertTrue(detailed_buy)
+        self.assertEqual(set(detailed_buy), set(batch_buy))
+        self.assertEqual(set(detailed_buy), set(scanned_buy))
+
+        for evaluation_index, detailed_entry in detailed_buy.items():
+            operand_index = evaluation_index - 2 - 1
+            self.assertGreaterEqual(operand_index, 0)
+            base_value = canonical[operand_index]
+            self.assertIsNotNone(base_value)
+            expected_value = base_value * 1.005
+            batch_record = batch_buy[evaluation_index]
+            scanned_entry = scanned_buy[evaluation_index]
+            self.assertEqual(
+                detailed_entry.signal_index,
+                batch_record.routine_signal.signal_index,
+            )
+            self.assertEqual(
+                detailed_entry.signal_index,
+                scanned_entry.signal_index,
+            )
+            self.assertEqual(
+                detailed_entry.delay_bar,
+                batch_record.routine_signal.delay_bar,
+            )
+            self.assertEqual(
+                detailed_entry.delay_bar,
+                scanned_entry.delay_bar,
+            )
+            for trace in (
+                detailed_entry.trace,
+                batch_record.trace,
+                scanned_entry.trace,
+            ):
+                condition = next(
+                    item
+                    for item in trace["conditions"]
+                    if item["right_operand"]["key"] == "PRICE_BOX_LOWER"
+                )
+                self.assertEqual("CLOSE", condition["left_operand"]["key"])
+                self.assertEqual(operand_index, condition["left_operand"]["index"])
+                self.assertEqual(operand_index, condition["right_operand"]["index"])
+                self.assertAlmostEqual(
+                    candles[operand_index]["close"],
+                    condition["left_operand"]["value"],
+                )
+                self.assertAlmostEqual(
+                    expected_value,
+                    condition["right_operand"]["value"],
+                )
+
+    def test_batch_evaluation_prefix_limits_every_base_series_consistently(self) -> None:
+        from routines.지표추종매매.routine_validation_batch import (
+            _evaluation_series_maps,
+        )
+
+        base_series = {
+            "CLOSE": [10.0, 11.0, 12.0, 13.0],
+            "MACD": [None, 1.0, 2.0, 3.0],
+            "PRICE_BOX_LOWER": [None, 9.0, 9.5, 10.0],
+            "PRICE_BOX_MIDDLE": [10.0, 10.5, 11.0, 11.5],
+            "PRICE_BOX_UPPER": [None, 12.0, 12.5, 13.0],
+        }
+        prefix = _evaluation_series_maps(base_series)[1]
+
+        self.assertEqual(set(base_series), set(prefix))
+        for key in ("CLOSE", "MACD"):
+            self.assertIs(base_series[key], prefix[key], key)
+        for key in ("PRICE_BOX_LOWER", "PRICE_BOX_MIDDLE", "PRICE_BOX_UPPER"):
+            source = base_series[key]
+            with self.subTest(key=key):
+                self.assertIsInstance(prefix[key], list)
+                self.assertEqual(2, len(prefix[key]))
+                self.assertEqual(source[:2], list(prefix[key]))
+                self.assertEqual(source[:2], prefix[key])
+                with self.assertRaises(TypeError):
+                    prefix[key].append(999.0)
+
+    def test_evaluation_prefix_map_is_directly_evaluator_compatible(self) -> None:
+        from routines.지표추종매매.routine_validation_batch import (
+            _evaluation_series_maps,
+        )
+
+        rules = deepcopy(self.rules)
+        rules["indicators"] = {
+            "price_box": {"period": 3},
+            "moving_averages": [5, 20],
+        }
+        candles = project_validation_candles(
+            self._historical(closes=(10, 12, 9, 13, 11, 14)),
+        )[0]
+        base_series = routine_macd_engine.build_indicator_follow_base_series(
+            candles,
+            rules,
+        )
+        evaluation_index = 3
+        prefix = _evaluation_series_maps(base_series)[evaluation_index]
+
+        signal = routine_macd_engine.evaluate_indicator_follow_routine(
+            candles[: evaluation_index + 1],
+            rules,
+            {},
+            _base_series_map=prefix,
+        )
+
+        self.assertIsInstance(signal, RoutineSignal)
+
     def test_default_replay_builds_base_series_once_per_eligible_prefix(self) -> None:
         historical = self._historical(closes=tuple(range(10, 20)))
         original = routine_macd_engine.build_indicator_series

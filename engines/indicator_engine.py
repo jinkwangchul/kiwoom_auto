@@ -122,16 +122,10 @@ def price_box(
     values: list[float | None],
     period: int = 24,
 ) -> tuple[list[float | None], list[float | None], list[float | None]]:
-    """Calculate Kiwoom's Price Box over the supplied chart dataset.
-
-    ``A`` is the rolling simple MA series.  AvgIf/StdevIf select matching
-    ``price - A`` deviations from the full dataset supplied by the caller;
-    historical cutoffs therefore belong at the caller/input boundary.
-
-    KIWOOM_STDEVIF_DIVISOR_EXACT_PARITY_NOT_OFFICIALLY_EXPOSED: the
-    project-standard population variance divisor is intentionally reused.
-    """
-    middle = simple_ma(values, period)
+    """Calculate a causal Price Box from each exact rolling close window."""
+    if period <= 0:
+        empty = [None for _ in values]
+        return list(empty), list(empty), list(empty)
 
     def filtered_stats(items: list[float]) -> tuple[float, float] | None:
         if not items:
@@ -140,27 +134,27 @@ def price_box(
         variance = sum((item - mean) ** 2 for item in items) / len(items)
         return mean, math.sqrt(variance)
 
-    deviations = [
-        price - average
-        for price, average in zip(values, middle)
-        if price is not None and average is not None
-    ]
-    positive_stats = filtered_stats([value for value in deviations if value > 0])
-    negative_stats = filtered_stats([value for value in deviations if value < 0])
-
-    lower: list[float | None] = []
-    upper: list[float | None] = []
-    for average in middle:
-        upper.append(
-            None
-            if average is None or positive_stats is None
-            else average + positive_stats[0] + (2.0 * positive_stats[1])
-        )
-        lower.append(
-            None
-            if average is None or negative_stats is None
-            else average + negative_stats[0] - (2.0 * negative_stats[1])
-        )
+    lower: list[float | None] = [None for _ in values]
+    middle: list[float | None] = [None for _ in values]
+    upper: list[float | None] = [None for _ in values]
+    for index in range(period - 1, len(values)):
+        window = values[index - period + 1:index + 1]
+        if any(value is None for value in window):
+            continue
+        closes = [float(value) for value in window if value is not None]
+        average = sum(closes) / period
+        middle[index] = average
+        deviations = [price - average for price in closes]
+        positive_stats = filtered_stats([
+            value for value in deviations if value > 0
+        ])
+        negative_stats = filtered_stats([
+            value for value in deviations if value < 0
+        ])
+        if positive_stats is not None:
+            upper[index] = average + positive_stats[0] + (2.0 * positive_stats[1])
+        if negative_stats is not None:
+            lower[index] = average + negative_stats[0] - (2.0 * negative_stats[1])
     return lower, middle, upper
 
 
@@ -265,7 +259,12 @@ def build_indicator_series(
     )
 
     price_box_cfg = indicator_cfg.get("price_box", {}) if isinstance(indicator_cfg.get("price_box"), dict) else {}
-    price_box_period = int(price_box_cfg.get("period", 24) or 24)
+    try:
+        price_box_period = int(price_box_cfg.get("period", 24) or 24)
+    except (TypeError, ValueError):
+        price_box_period = 24
+    if price_box_period <= 0:
+        price_box_period = 24
     price_box_lower, price_box_middle, price_box_upper = price_box(closes, price_box_period)
 
     series_map: dict[str, list[float | None]] = {

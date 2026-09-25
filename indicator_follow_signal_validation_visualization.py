@@ -907,10 +907,12 @@ def build_validation_indicator_cache(
         elif descriptor.family == FAMILY_PRICE_BOX:
             period = _positive_int(parameters.get("period")) or 24
             if period not in price_box_cache:
-                price_box_cache[period] = _price_box_prefix_series(
-                    candles,
-                    period,
-                )
+                lower, middle, upper = price_box(closes, period)
+                price_box_cache[period] = {
+                    "PRICE_BOX_LOWER": normalized_values(lower),
+                    "PRICE_BOX_MIDDLE": normalized_values(middle),
+                    "PRICE_BOX_UPPER": normalized_values(upper),
+                }
             compare_target = str(
                 condition.get("compare_target") or ""
             ).upper()

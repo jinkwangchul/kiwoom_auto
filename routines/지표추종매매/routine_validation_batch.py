@@ -9,7 +9,6 @@ the canonical RoutineSignal and decision trace remain the source of truth.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Any, Callable, Iterator, Mapping
 
 from engines.condition_engine import _series_key
@@ -125,12 +124,13 @@ class _CandlePrefixView(list):
         return self._source[position]
 
 
-class _PriceBoxPrefixSeries(list):
-    def __init__(self, middle: list[float | None], offset: float | None, length: int) -> None:
+class _SeriesPrefixView(list):
+    """List-compatible immutable view of one canonical series prefix."""
+
+    def __init__(self, source: list[Any], length: int) -> None:
         super().__init__()
-        self._middle = middle
-        self._offset = offset
-        self._length = max(0, min(int(length), len(middle)))
+        self._source = source
+        self._length = max(0, min(int(length), len(source)))
 
     def __len__(self) -> int:
         return self._length
@@ -138,17 +138,98 @@ class _PriceBoxPrefixSeries(list):
     def __bool__(self) -> bool:
         return self._length > 0
 
+    def __iter__(self) -> Iterator[Any]:
+        for index in range(self._length):
+            yield self._source[index]
+
     def __getitem__(self, index):
         if isinstance(index, slice):
             start, stop, step = index.indices(self._length)
-            return [self[position] for position in range(start, stop, step)]
+            return [self._source[position] for position in range(start, stop, step)]
         position = int(index)
         if position < 0:
             position += self._length
         if not 0 <= position < self._length:
             raise IndexError(position)
-        middle = self._middle[position]
-        return None if middle is None or self._offset is None else float(middle) + self._offset
+        return self._source[position]
+
+    def _materialized(self) -> list[Any]:
+        return [self._source[index] for index in range(self._length)]
+
+    def __repr__(self) -> str:
+        return repr(self._materialized())
+
+    def __contains__(self, value: object) -> bool:
+        return any(item == value for item in self)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, list) and self._materialized() == list(other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self == other
+
+    def __add__(self, other):
+        return self._materialized() + other
+
+    def __radd__(self, other):
+        return other + self._materialized()
+
+    def __mul__(self, count):
+        return self._materialized() * count
+
+    def __rmul__(self, count):
+        return count * self._materialized()
+
+    def __reversed__(self):
+        return reversed(self._materialized())
+
+    def copy(self) -> list[Any]:
+        return self._materialized()
+
+    def count(self, value: object) -> int:
+        return self._materialized().count(value)
+
+    def index(self, value: object, start: int = 0, stop: int | None = None) -> int:
+        materialized = self._materialized()
+        return (
+            materialized.index(value, start)
+            if stop is None
+            else materialized.index(value, start, stop)
+        )
+
+    @staticmethod
+    def _read_only(*_args, **_kwargs):
+        raise TypeError("_SeriesPrefixView is read-only")
+
+    __setitem__ = _read_only
+    __delitem__ = _read_only
+    __iadd__ = _read_only
+    __imul__ = _read_only
+    append = _read_only
+    clear = _read_only
+    extend = _read_only
+    insert = _read_only
+    pop = _read_only
+    remove = _read_only
+    reverse = _read_only
+    sort = _read_only
+
+
+def _evaluation_prefix_series_map(
+    base_series: dict[str, Any],
+    prefix_length: int,
+) -> dict[str, Any]:
+    price_box_keys = {
+        "PRICE_BOX_LOWER",
+        "PRICE_BOX_MIDDLE",
+        "PRICE_BOX_UPPER",
+    }
+    return {
+        key: _SeriesPrefixView(values, prefix_length)
+        if key in price_box_keys and isinstance(values, list)
+        else values
+        for key, values in base_series.items()
+    }
 
 
 class _IncrementalAverageContext:
@@ -243,63 +324,12 @@ class _CompiledSellSignal:
     expression: Any
 
 
-def _number(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return abs(float(str(value).strip().replace(",", "")))
-    except (TypeError, ValueError):
-        return None
-
-
-def _price_box_prefix_offsets(series_map: Mapping[str, list[float | None]]) -> tuple[list[float | None], list[float | None]]:
-    closes = series_map.get("CLOSE")
-    middle = series_map.get("PRICE_BOX_MIDDLE")
-    if not isinstance(closes, list) or not isinstance(middle, list) or len(closes) != len(middle):
-        return [], []
-    positive_count = negative_count = 0
-    positive_sum = positive_sum_sq = negative_sum = negative_sum_sq = 0.0
-    lower: list[float | None] = []
-    upper: list[float | None] = []
-    for close_value, middle_value in zip(closes, middle):
-        close_number, middle_number = _number(close_value), _number(middle_value)
-        if close_number is not None and middle_number is not None:
-            deviation = close_number - middle_number
-            if deviation > 0:
-                positive_count += 1
-                positive_sum += deviation
-                positive_sum_sq += deviation * deviation
-            elif deviation < 0:
-                negative_count += 1
-                negative_sum += deviation
-                negative_sum_sq += deviation * deviation
-        if positive_count:
-            mean = positive_sum / positive_count
-            upper.append(mean + 2.0 * math.sqrt(max(0.0, positive_sum_sq / positive_count - mean * mean)))
-        else:
-            upper.append(None)
-        if negative_count:
-            mean = negative_sum / negative_count
-            lower.append(mean - 2.0 * math.sqrt(max(0.0, negative_sum_sq / negative_count - mean * mean)))
-        else:
-            lower.append(None)
-    return lower, upper
-
-
-def _evaluation_series_maps(base_series: dict[str, list[float | None]]) -> tuple[dict[str, list[float | None]], ...]:
+def _evaluation_series_maps(base_series: dict[str, list[float | None]]) -> tuple[dict[str, Any], ...]:
     length = len(base_series.get("CLOSE", []))
-    lower, upper = _price_box_prefix_offsets(base_series)
-    middle = base_series.get("PRICE_BOX_MIDDLE")
-    result: list[dict[str, list[float | None]]] = []
-    for index in range(length):
-        if isinstance(middle, list) and index < len(lower) and index < len(upper):
-            current = dict(base_series)
-            current["PRICE_BOX_LOWER"] = _PriceBoxPrefixSeries(middle, lower[index], index + 1)
-            current["PRICE_BOX_UPPER"] = _PriceBoxPrefixSeries(middle, upper[index], index + 1)
-            result.append(current)
-        else:
-            result.append(base_series)
-    return tuple(result)
+    return tuple(
+        _evaluation_prefix_series_map(base_series, evaluation_index + 1)
+        for evaluation_index in range(length)
+    )
 
 
 def _condition_is_dynamic(condition: dict[str, Any]) -> bool:
