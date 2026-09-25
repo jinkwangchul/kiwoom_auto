@@ -290,6 +290,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(candidate["value"]["conditions"][1]["target"], "OSC")
         self.assertEqual(candidate["value"]["conditions"][1]["operator"], "<=")
         self.assertEqual(candidate["value"]["conditions"][1]["value"], -91.0)
+        self.assertEqual(candidate["value"]["conditions"][1]["bar_offset"], 1)
 
     def test_rsi_indicator_candidate_uses_existing_indicator_shape(self):
         result = self._build_preview()

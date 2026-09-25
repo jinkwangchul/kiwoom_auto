@@ -446,14 +446,20 @@ def _build_buy_osc_conditions(signal_filter: dict[str, Any], warnings: list[str]
         raw_threshold,
     )
     if compare_operator and threshold is not None:
-        conditions.append({
+        threshold_condition = {
             "enabled": True,
             "not": False,
             "target": "OSC",
             "operator": compare_operator,
             "value": threshold,
             "description": "UI preview: buy OCR/OSC threshold condition",
-        })
+        }
+        if any(
+            condition.get("operator") in {"TURN_UP", "TURN_DOWN"}
+            for condition in conditions
+        ):
+            threshold_condition["bar_offset"] = 1
+        conditions.append(threshold_condition)
     elif signal_filter.get("buy_ocr_value_line") not in (None, ""):
         warnings.append("buy OCR threshold is not fully mapped")
 
@@ -2014,14 +2020,20 @@ def _build_sell_condition_a_ocr_conditions(condition_a: dict[str, Any], warnings
         if threshold is None:
             warnings.append("sell condition A OCR threshold is not numeric")
             return None
-        conditions.append({
+        threshold_condition = {
             "enabled": True,
             "not": False,
             "target": "OSC",
             "operator": compare_operator,
             "value": threshold,
             "description": "UI preview: sell condition A OCR/OSC threshold condition",
-        })
+        }
+        if any(
+            condition.get("operator") in {"TURN_UP", "TURN_DOWN"}
+            for condition in conditions
+        ):
+            threshold_condition["bar_offset"] = 1
+        conditions.append(threshold_condition)
 
     return conditions
 

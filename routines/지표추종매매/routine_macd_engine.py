@@ -115,6 +115,42 @@ def _rsi_runtime_series_key(period: int) -> str:
     return f"_INDICATOR_FOLLOW_RSI_{period}"
 
 
+_OCR_THRESHOLD_OPERATORS = {
+    ">", ">=", "<", "<=", "=", "==",
+    "GT", "GTE", "LT", "LTE", "EQ", "ABOVE", "BELOW",
+}
+
+
+def _normalize_ocr_transition_threshold_conditions(
+    conditions: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(conditions, list):
+        return []
+    normalized = deepcopy(conditions)
+    has_transition = any(
+        isinstance(condition, dict)
+        and condition.get("enabled", True) is not False
+        and str(condition.get("target") or "OSC").strip().upper() == "OSC"
+        and str(condition.get("operator") or "").strip().upper()
+        in {"TURN_UP", "TURN_DOWN"}
+        for condition in normalized
+    )
+    if not has_transition:
+        return normalized
+    for condition in normalized:
+        if not isinstance(condition, dict):
+            continue
+        if str(condition.get("target") or "OSC").strip().upper() != "OSC":
+            continue
+        if (
+            str(condition.get("operator") or "").strip().upper()
+            in _OCR_THRESHOLD_OPERATORS
+            and not str(condition.get("compare_target") or "").strip()
+        ):
+            condition["bar_offset"] = 1
+    return normalized
+
+
 def _normalize_sell_runtime_groups(groups: Any) -> list[dict[str, Any]]:
     """Bind SELL strategy-price and condition-period semantics at runtime only."""
     if not isinstance(groups, list):
@@ -126,7 +162,10 @@ def _normalize_sell_runtime_groups(groups: Any) -> list[dict[str, Any]]:
         conditions = group.get("conditions")
         if not isinstance(conditions, list):
             continue
-        for condition in conditions:
+        group["conditions"] = _normalize_ocr_transition_threshold_conditions(
+            conditions
+        )
+        for condition in group["conditions"]:
             if not isinstance(condition, dict):
                 continue
             # Runtime bindings are derived from canonical condition fields.
@@ -886,7 +925,13 @@ def _evaluate_buy_bollinger_filter(
 def _buy_ocr_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
     filters = buy_cfg.get("filters")
     if isinstance(filters, dict) and isinstance(filters.get("ocr"), dict):
-        return filters["ocr"]
+        normalized = deepcopy(filters["ocr"])
+        conditions = normalized.get("conditions")
+        if isinstance(conditions, list):
+            normalized["conditions"] = _normalize_ocr_transition_threshold_conditions(
+                conditions
+            )
+        return normalized
     return {}
 
 
@@ -923,11 +968,15 @@ def _ocr_condition_data_available(
         return False
 
     operator = str(condition.get("operator", "") or "").strip().upper()
-    required_indexes = [evaluation_index]
+    bar_offset = _safe_int(condition.get("bar_offset", 0))
+    if bar_offset is None or bar_offset < 0:
+        return False
+    effective_index = evaluation_index - bar_offset
+    required_indexes = [effective_index]
     if operator in {"TURN_UP", "TURN_DOWN"}:
-        required_indexes.extend([evaluation_index - 1, evaluation_index - 2])
+        required_indexes.extend([effective_index - 1, effective_index - 2])
     elif operator in {"TREND_UP", "TREND_DOWN", "CROSS_UP", "CROSS_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN"}:
-        required_indexes.append(evaluation_index - 1)
+        required_indexes.append(effective_index - 1)
 
     for index in required_indexes:
         if index < 0:
@@ -949,9 +998,9 @@ def _ocr_condition_data_available(
         compare_series = series_map.get(compare_key)
         if not isinstance(compare_series, list):
             return False
-        compare_indexes = [evaluation_index]
+        compare_indexes = [effective_index]
         if operator in {"CROSS_UP", "CROSS_DOWN"}:
-            compare_indexes.append(evaluation_index - 1)
+            compare_indexes.append(effective_index - 1)
         for index in compare_indexes:
             if index < 0:
                 return False

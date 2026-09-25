@@ -481,7 +481,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         self.assertEqual(signal_a["order_delay_bars"], 7)
         self.assertEqual(signal_a["delay_anchor"], "FOLLOWING_BASE_BAR_ENTRY")
         self.assertNotIn("bar_offset", group_a["conditions"][0])
-        self.assertNotIn("bar_offset", group_a["conditions"][1])
+        self.assertEqual(1, group_a["conditions"][1]["bar_offset"])
         self.assertEqual(group_a["condition_expression"]["operator"], "OR")
         group_c = candidates["sell.signals.ui_preview_condition_c"]["value"]["groups"][0]
         self.assertEqual(group_c["conditions"][0]["target"], "SIGNAL")
@@ -590,7 +590,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             self.assertEqual(signal["order_delay_bars"], offset)
             self.assertEqual(signal["delay_anchor"], "FOLLOWING_BASE_BAR_ENTRY")
             self.assertNotIn("bar_offset", conditions[0])
-            self.assertNotIn("bar_offset", conditions[1])
+            self.assertEqual(1, conditions[1]["bar_offset"])
 
     def test_price_box_formula_is_causal_and_upper_lower_mapper_is_preserved(self):
         closes = [100.0 + index + (((index % 7) - 3) * 4.0) for index in range(40)]

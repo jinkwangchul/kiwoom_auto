@@ -223,6 +223,65 @@ class IndicatorFollowValidationBatchTest(unittest.TestCase):
                 rules["buy"]["filters"] = filters
                 self.assertParity(rules)
 
+    def test_ocr_transition_threshold_uses_turning_point_in_batch(self):
+        closes = [100, 101, 102, 101, 103, 104, 102, 105, 106, 104, 107, 108]
+        candles = [
+            {
+                "time": f"20260925{90000 + index * 100:06d}",
+                "close": float(close),
+            }
+            for index, close in enumerate(closes)
+        ]
+        rules = {
+            "enabled": True,
+            "indicators": {"macd": {"fast": 3, "slow": 5, "signal": 2}},
+            "buy": {"enabled": False},
+            "sell": {
+                "enabled": True,
+                "signal_logic": "OR",
+                "signals": {
+                    "ocr_sell": {
+                        "enabled": True,
+                        "order_delay_bars": 0,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions_logic": "AND",
+                            "conditions": [
+                                {"target": "OSC", "operator": "TURN_DOWN"},
+                                {"target": "OSC", "operator": ">=", "value": 0.0},
+                            ],
+                        }],
+                    },
+                },
+            },
+        }
+        batch = scan_indicator_follow_validation_batch(
+            candles,
+            rules,
+            start_index=9,
+            end_index=9,
+        )
+        self.assertTrue(batch.supported, batch)
+        sell = next(
+            record
+            for record in batch.records
+            if record.evaluation_side == "SELL" and record.signal == "SELL"
+        )
+        threshold = next(
+            item
+            for item in sell.trace["conditions"]
+            if item["operator"] == ">="
+        )
+        turn = next(
+            item
+            for item in sell.trace["conditions"]
+            if item["operator"] == "TURN_DOWN"
+        )
+        self.assertEqual(8, threshold["left_operand"]["index"])
+        self.assertGreater(threshold["left_operand"]["value"], 0.0)
+        self.assertEqual(9, turn["left_operand"]["index"])
+        self.assertLess(turn["left_operand"]["value"], 0.0)
+
     def test_and_or_not_and_delay_parity(self):
         rules = _rules()
         rules["buy"]["delay_bar"] = 2

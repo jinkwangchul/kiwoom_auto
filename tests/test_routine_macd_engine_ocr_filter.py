@@ -241,6 +241,87 @@ class RoutineMacdOcrFilterTest(unittest.TestCase):
         self.assertEqual("BUY", signal.signal)
         self.assertIn("filter_type=OCR", self._ocr_detail(signal))
 
+    def test_transition_threshold_uses_turning_point_for_legacy_buy_rules(self):
+        cases = (
+            (
+                {"OSC": [70.0, 80.0, 60.0]},
+                {"target": "OSC", "operator": "TURN_DOWN"},
+                {"target": "OSC", "operator": ">=", "value": 73.0},
+            ),
+            (
+                {"OSC": [-70.0, -80.0, -60.0]},
+                {"target": "OSC", "operator": "TURN_UP"},
+                {"target": "OSC", "operator": "<=", "value": -73.0},
+            ),
+        )
+        for series_map, turn, threshold in cases:
+            with self.subTest(turn=turn["operator"]):
+                filter_cfg = {
+                    "enabled": True,
+                    "conditions_logic": "AND",
+                    "conditions": [turn, threshold],
+                }
+                passed, detail = self.engine._evaluate_buy_ocr_filter(
+                    self.default_config,
+                    self._buy_cfg(filter_cfg),
+                    series_map,
+                    2,
+                )
+                self.assertTrue(passed, detail)
+
+    def test_transition_threshold_runtime_normalization_does_not_mutate_rules(self):
+        filter_cfg = {
+            "enabled": True,
+            "conditions_logic": "AND",
+            "conditions": [
+                {"target": "OSC", "operator": "TURN_DOWN"},
+                {"target": "OSC", "operator": ">=", "value": 73.0},
+            ],
+        }
+        original = deepcopy(filter_cfg)
+        self.engine._evaluate_buy_ocr_filter(
+            self.default_config,
+            self._buy_cfg(filter_cfg),
+            {"OSC": [70.0, 80.0, 60.0]},
+            2,
+        )
+        self.assertEqual(original, filter_cfg)
+
+    def test_sell_transition_threshold_uses_turning_point_for_legacy_rules(self):
+        rules = {
+            "enabled": True,
+            "buy": {"enabled": False},
+            "sell": {
+                "enabled": True,
+                "signal_logic": "OR",
+                "signals": {
+                    "ocr_sell": {
+                        "enabled": True,
+                        "order_delay_bars": 0,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions_logic": "AND",
+                            "conditions": [
+                                {"target": "OSC", "operator": "TURN_DOWN"},
+                                {"target": "OSC", "operator": ">=", "value": 73.0},
+                            ],
+                        }],
+                    },
+                },
+            },
+        }
+        result = self.engine.evaluate_indicator_follow_routine(
+            [{"close": 1.0}, {"close": 1.0}, {"close": 1.0}],
+            rules,
+            {"_indicator_follow_evaluate_side": "SELL"},
+            _base_series_map={
+                "CLOSE": [1.0, 1.0, 1.0],
+                "OSC": [70.0, 80.0, 60.0],
+            },
+        )
+        self.assertEqual("SELL", result.signal)
+        self.assertEqual(2, result.signal_index)
+
 
 if __name__ == "__main__":
     unittest.main()

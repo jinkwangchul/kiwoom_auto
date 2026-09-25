@@ -479,6 +479,65 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
             )
         )
 
+    def test_ocr_transition_threshold_uses_turning_point_in_replay(self) -> None:
+        closes = (100, 101, 102, 101, 103, 104, 102, 105, 106, 104, 107, 108)
+        rules = {
+            "enabled": True,
+            "indicators": {"macd": {"fast": 3, "slow": 5, "signal": 2}},
+            "buy": {"enabled": False},
+            "sell": {
+                "enabled": True,
+                "signal_logic": "OR",
+                "signals": {
+                    "ocr_sell": {
+                        "enabled": True,
+                        "order_delay_bars": 0,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions_logic": "AND",
+                            "conditions": [
+                                {"target": "OSC", "operator": "TURN_DOWN"},
+                                {"target": "OSC", "operator": ">=", "value": 0.0},
+                            ],
+                        }],
+                    },
+                },
+            },
+        }
+        session = ValidationSession(
+            ValidationRequest(
+                self.stock,
+                ValidationSettingsSnapshot(rules),
+                3,
+            ),
+            operation_active_reader=lambda: False,
+        )
+        result = ValidationHistoricalReplay(session).evaluate(
+            self._historical(closes=closes),
+            start_index=9,
+            end_index=9,
+        )
+        self.assertTrue(result.ok, result)
+        sell = next(
+            entry
+            for entry in result.snapshot.to_entries()
+            if entry.evaluation_side == "SELL" and entry.signal == "SELL"
+        )
+        threshold = next(
+            item
+            for item in sell.trace["conditions"]
+            if item["operator"] == ">="
+        )
+        turn = next(
+            item
+            for item in sell.trace["conditions"]
+            if item["operator"] == "TURN_DOWN"
+        )
+        self.assertEqual(8, threshold["left_operand"]["index"])
+        self.assertGreater(threshold["left_operand"]["value"], 0.0)
+        self.assertEqual(9, turn["left_operand"]["index"])
+        self.assertLess(turn["left_operand"]["value"], 0.0)
+
     def test_actual_evaluator_replays_buy_sell_and_none(self) -> None:
         result = ValidationHistoricalReplay(self._session()).evaluate(self._historical())
 
