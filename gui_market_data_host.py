@@ -19,6 +19,7 @@ from candle_manager import canonical_candle_content_hash, load_candles
 from candle_timeframe_aggregation import (
     SEOUL_TIMEZONE,
     candle_market_datetime,
+    effective_history_target_minute_candles,
     parse_market_datetime,
     project_candle_supply,
     read_canonical_bar_minutes,
@@ -411,18 +412,19 @@ class MarketDataHost(QObject):
                         item.get("projection_request"),
                         require_warmup=True,
                     )
-                    retention_bars = int(
-                        request.get(
-                            "history_target_bars",
-                            request["warmup_bars"],
-                        )
-                    )
-                    requirement = required_minute_candles(
+                    warmup_requirement = required_minute_candles(
                         interval,
-                        retention_bars,
+                        int(request["warmup_bars"]),
                     )
-                    if not requirement["within_limit"]:
-                        raise ValueError(str(requirement["reason"]))
+                    if not warmup_requirement["within_limit"]:
+                        raise ValueError(str(warmup_requirement["reason"]))
+                    if "history_target_bars" in request:
+                        requirement = effective_history_target_minute_candles(
+                            interval,
+                            int(request["history_target_bars"]),
+                        )
+                    else:
+                        requirement = warmup_requirement
                     requested[code] = max(
                         requested.get(code, 0),
                         int(requirement["required_minute_candles"]),
@@ -506,18 +508,19 @@ class MarketDataHost(QObject):
                     item.get("projection_request"),
                     require_warmup=True,
                 )
-                retention_bars = int(
-                    request.get(
-                        "history_target_bars",
-                        request["warmup_bars"],
-                    )
-                )
-                requirement = required_minute_candles(
+                warmup_requirement = required_minute_candles(
                     interval,
-                    retention_bars,
+                    int(request["warmup_bars"]),
                 )
-                if not requirement["within_limit"]:
-                    raise ValueError(str(requirement["reason"]))
+                if not warmup_requirement["within_limit"]:
+                    raise ValueError(str(warmup_requirement["reason"]))
+                if "history_target_bars" in request:
+                    requirement = effective_history_target_minute_candles(
+                        interval,
+                        int(request["history_target_bars"]),
+                    )
+                else:
+                    requirement = warmup_requirement
                 requested[code] = max(
                     requested.get(code, 0),
                     int(requirement["required_minute_candles"]),
@@ -592,7 +595,7 @@ class MarketDataHost(QObject):
                 request.get("history_target_bars", warmup_bars)
             )
             warmup = required_minute_candles(interval, warmup_bars)
-            history_target = required_minute_candles(
+            history_target = effective_history_target_minute_candles(
                 interval,
                 history_target_bars,
             )
@@ -611,6 +614,16 @@ class MarketDataHost(QObject):
                 int(history_target["required_minute_candles"])
                 if history_target_declared
                 else 0
+            ),
+            "history_target_requested_minute_candles": (
+                int(history_target["requested_minute_candles"])
+                if history_target_declared
+                else 0
+            ),
+            "history_target_capped": (
+                bool(history_target["capped"])
+                if history_target_declared
+                else False
             ),
             **warmup,
         }
@@ -635,8 +648,6 @@ class MarketDataHost(QObject):
             )
         if not warmup["within_limit"]:
             return {**base, "available": False, "candles": [], "availability_state": "WARMUP_LIMIT_EXCEEDED"}
-        if history_target_declared and not history_target["within_limit"]:
-            return {**base, "available": False, "candles": [], "availability_state": "HISTORY_TARGET_LIMIT_EXCEEDED", "reason": str(history_target["reason"])}
         raw = load_candles(StockRepository().resolve_stock_dir(code))
         source_hash = canonical_candle_content_hash(raw) if raw else ""
         forming = None

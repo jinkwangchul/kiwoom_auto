@@ -10,8 +10,8 @@ import math
 from typing import Any, Mapping
 
 from engines.indicator_engine import (
-    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
     bollinger_band,
+    indicator_history_target_bars_from_rules,
     price_box,
     close_prices,
     macd_series_causal_history,
@@ -755,6 +755,7 @@ def build_validation_indicator_cache(
     if not isinstance(rules, Mapping):
         raise TypeError("rules must be a mapping")
     closes = close_prices(candles)
+    history_window = indicator_history_target_bars_from_rules(rules)
     source_entries = list(entries or [])
 
     def normalized_values(values: Any) -> tuple[float | None, ...]:
@@ -843,7 +844,7 @@ def build_validation_indicator_cache(
                     rsi_causal_history(
                         closes,
                         period,
-                        DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+                        history_window,
                     )
                 )
             channels["RSI"] = rsi_cache[period]
@@ -865,7 +866,7 @@ def build_validation_indicator_cache(
                     macd_key[0],
                     macd_key[1],
                     macd_key[2],
-                    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+                    history_window,
                 )
                 macd_cache[macd_key] = {
                     "MACD": normalized_values(macd_values),
@@ -915,7 +916,11 @@ def build_validation_indicator_cache(
         elif descriptor.family == FAMILY_PRICE_BOX:
             period = _positive_int(parameters.get("period")) or 24
             if period not in price_box_cache:
-                lower, middle, upper = price_box(closes, period)
+                lower, middle, upper = price_box(
+                    closes,
+                    period,
+                    history_window=history_window,
+                )
                 price_box_cache[period] = {
                     "PRICE_BOX_LOWER": normalized_values(lower),
                     "PRICE_BOX_MIDDLE": normalized_values(middle),

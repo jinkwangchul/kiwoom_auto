@@ -20,7 +20,7 @@ from typing import Any
 import json
 from pathlib import Path
 
-from engines.indicator_engine import DEFAULT_INDICATOR_HISTORY_TARGET_BARS
+from engines.indicator_engine import indicator_history_target_bars_from_rules
 
 try:
     from routine_cycle_projection import project_indicator_follow_cycle  # type: ignore
@@ -596,7 +596,7 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
         ),
         "warmup_bars": warmup_bars,
         "history_target_bars": max(
-            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+            indicator_history_target_bars_from_rules(rules),
             warmup_bars,
         ),
     }

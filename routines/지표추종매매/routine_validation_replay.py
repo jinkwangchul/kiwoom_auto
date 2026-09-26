@@ -10,7 +10,6 @@ import math
 from typing import Any, Callable
 
 from candle_timeframe_aggregation import MARKET_BUCKET_ANCHOR, SEOUL_TIMEZONE
-from engines.indicator_engine import DEFAULT_INDICATOR_HISTORY_TARGET_BARS
 from engines.signal_result import RoutineSignal
 from indicator_follow_validation_timeframe import validation_timeframe_for_request, normalize_validation_timeframe
 from indicator_follow_signal_validation_projection import (
@@ -52,14 +51,27 @@ def _fresh_json(value_json: str) -> Any:
     return json.loads(value_json)
 
 
+def _required_validation_history_context_bars(
+    rules: dict[str, Any],
+) -> int:
+    # Local import avoids presentation -> replay -> history_contract ->
+    # visualization -> presentation import recursion.
+    from indicator_follow_validation_history_contract import (
+        required_validation_history_context_bars,
+    )
+
+    return required_validation_history_context_bars(rules)
+
+
 def _indicator_history_prefix(
     candles: list[dict[str, Any]],
     evaluation_index: int,
+    history_target_bars: int,
 ) -> tuple[list[dict[str, Any]], int]:
     full_prefix = candles[: evaluation_index + 1]
     start = max(
         0,
-        len(full_prefix) - DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+        len(full_prefix) - max(int(history_target_bars), 1),
     )
     return full_prefix[start:], start
 
@@ -550,6 +562,7 @@ class ValidationHistoricalReplay:
             )
 
         rules = request.settings_snapshot.to_dict()
+        history_target_bars = _required_validation_history_context_bars(rules)
         entries: list[ValidationReplayEntry] = []
         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
         use_read_only_fast_path = reuse_default_base_series and (
@@ -565,6 +578,7 @@ class ValidationHistoricalReplay:
                     prefix, history_index_offset = _indicator_history_prefix(
                         candles,
                         evaluation_index,
+                        history_target_bars,
                     )
                 else:
                     prefix = context_prefix
@@ -735,6 +749,7 @@ class ValidationHistoricalReplay:
             raise ValueError("signal scan range is invalid")
 
         rules = request.settings_snapshot.to_dict()
+        history_target_bars = _required_validation_history_context_bars(rules)
         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
         if reuse_default_base_series:
             try:
@@ -779,6 +794,7 @@ class ValidationHistoricalReplay:
                 prefix, history_index_offset = _indicator_history_prefix(
                     candles,
                     evaluation_index,
+                    history_target_bars,
                 )
             else:
                 prefix = context_prefix

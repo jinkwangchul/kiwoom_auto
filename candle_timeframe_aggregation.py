@@ -355,6 +355,22 @@ def required_minute_candles(
     }
 
 
+def effective_history_target_minute_candles(
+    timeframe_minutes: int,
+    history_target_bars: int,
+) -> dict[str, Any]:
+    """Cap desired retained history without weakening the minimum warmup gate."""
+    requested = required_minute_candles(timeframe_minutes, history_target_bars)
+    requested_count = int(requested["required_minute_candles"])
+    effective_count = min(requested_count, MAXIMUM_MINUTE_CANDLES)
+    return {
+        "required_minute_candles": effective_count,
+        "requested_minute_candles": requested_count,
+        "maximum_minute_candles": MAXIMUM_MINUTE_CANDLES,
+        "capped": effective_count < requested_count,
+    }
+
+
 def project_candle_supply(
     raw_candles: Any,
     rules: dict[str, Any] | None,
@@ -389,7 +405,7 @@ def project_candle_supply(
         request.get("history_target_bars", warmup_bars)
     )
     warmup = required_minute_candles(interval, warmup_bars)
-    history_target = required_minute_candles(
+    history_target = effective_history_target_minute_candles(
         interval,
         history_target_bars,
     )
@@ -406,14 +422,22 @@ def project_candle_supply(
             if history_target_declared
             else 0
         ),
+        "history_target_requested_minute_candles": (
+            int(history_target["requested_minute_candles"])
+            if history_target_declared
+            else 0
+        ),
+        "history_target_capped": (
+            bool(history_target["capped"])
+            if history_target_declared
+            else False
+        ),
         "completeness": {},
         "freshness": {},
         **warmup,
     }
     if not warmup["within_limit"]:
         return {**base, "available": False, "candles": [], "availability_state": "WARMUP_LIMIT_EXCEEDED"}
-    if history_target_declared and not history_target["within_limit"]:
-        return {**base, "available": False, "candles": [], "availability_state": "HISTORY_TARGET_LIMIT_EXCEEDED", "reason": str(history_target["reason"])}
     normalized_sessions = normalize_candle_sessions(session_windows)
     supplied_session_count = len(session_windows) if isinstance(session_windows, (list, tuple)) else 0
     if supplied_session_count and len(normalized_sessions) != supplied_session_count:

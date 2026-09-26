@@ -537,6 +537,40 @@ class ProductionCandleProviderTest(unittest.TestCase):
         self.assertEqual(("005930",), synced[-1])
         self.assertEqual({}, host._candle_observation_required_by_stock)
 
+    def test_observation_history_target_caps_without_dropping_target(self) -> None:
+        synced: list[tuple[str, ...]] = []
+        host = SimpleNamespace(
+            kiwoom_api=SimpleNamespace(
+                sync_realtime_shadow_targets=lambda codes: synced.append(tuple(codes)) or {"ok": True}
+            ),
+            _execution_shadow_stock_codes=(),
+            _production_monitoring_stock_codes=(),
+            _candle_observation_stock_codes=(),
+            _candle_observation_required_by_stock={},
+            sync_monitoring_targets=lambda _codes: {"ok": True},
+        )
+        requirement = {
+            "stock_code": "005930",
+            "rules": {"bar": {"bar_minutes": 240}},
+            "projection_request": {
+                "projection": "FORMING_BASE_BAR",
+                "warmup_bars": 35,
+                "history_target_bars": 900,
+            },
+        }
+        with patch("gui_market_data_host.QTimer.singleShot"):
+            result = MarketDataHost.sync_candle_observation_targets(
+                host,
+                [requirement],
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            200_000,
+            host._candle_observation_required_by_stock["005930"],
+        )
+        self.assertEqual(("005930",), host._candle_observation_stock_codes)
+        self.assertEqual(("005930",), synced[-1])
+
     def test_production_standby_requirements_are_separate_and_feed_refresh_contract(self) -> None:
         host = SimpleNamespace(
             _candle_execution_required_by_stock={"005930": 7},

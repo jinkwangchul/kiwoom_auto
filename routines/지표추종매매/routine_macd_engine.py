@@ -21,8 +21,8 @@ from engines.condition_engine import (
     evaluate_groups_or,
 )
 from engines.indicator_engine import (
-    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
     build_indicator_series,
+    indicator_history_target_bars_from_rules,
     close_prices,
     macd_series_causal_history,
     rsi_causal_history,
@@ -407,7 +407,7 @@ def _evaluate_buy_rsi_filter(
         else rsi_causal_history(
             close_prices(candles),
             period,
-            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+            indicator_history_target_bars_from_rules(config),
         )
     )
     evaluated_value = rsi_values[evaluation_index] if 0 <= evaluation_index < len(rsi_values) else None
@@ -1793,6 +1793,7 @@ def build_indicator_follow_base_series(
 ) -> dict[str, list[float | None]]:
     """Build context-independent indicator series for one candle prefix."""
     cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
+    history_window = indicator_history_target_bars_from_rules(cfg)
     series_map = build_indicator_series(candles, cfg)
     closes = close_prices(candles)
     indicator_cfg = (
@@ -1810,7 +1811,7 @@ def build_indicator_follow_base_series(
     series_map["RSI"] = rsi_causal_history(
         closes,
         rsi_period,
-        DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+        history_window,
     )
 
     macd_cfg = (
@@ -1826,7 +1827,7 @@ def build_indicator_follow_base_series(
         fast,
         slow,
         signal_period,
-        DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+        history_window,
     )
     series_map["MACD"] = macd_line
     series_map["SIGNAL"] = signal_line
@@ -1836,7 +1837,7 @@ def build_indicator_follow_base_series(
         series_map[_rsi_runtime_series_key(period)] = rsi_causal_history(
             closes,
             period,
-            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+            history_window,
         )
     return series_map
 

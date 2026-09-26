@@ -9,11 +9,84 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 import math
 
 
 DEFAULT_INDICATOR_HISTORY_TARGET_BARS = 600
+INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND = {
+    "MINUTE": 900,
+    "DAY": 600,
+    "WEEK": 300,
+    "MONTH": 120,
+    "YEAR": 120,
+}
+INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KEY = {
+    "D1": 600,
+    "W1": 300,
+    "MO1": 120,
+    "Y1": 120,
+}
+
+
+def indicator_history_target_bars(timeframe: Any) -> int:
+    """Return the Hero4-style retained history target for one timeframe."""
+    if isinstance(timeframe, Mapping):
+        key = str(timeframe.get("key") or "").strip().upper()
+        if key in INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KEY:
+            return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KEY[key]
+        kind = str(timeframe.get("kind") or "").strip().upper()
+        if kind in INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND:
+            return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND[kind]
+        minutes = timeframe.get("minutes")
+        if minutes is not None:
+            return indicator_history_target_bars(minutes)
+
+    if isinstance(timeframe, bool):
+        return DEFAULT_INDICATOR_HISTORY_TARGET_BARS
+    if isinstance(timeframe, (int, float)):
+        return (
+            INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["MINUTE"]
+            if int(timeframe) > 0
+            else DEFAULT_INDICATOR_HISTORY_TARGET_BARS
+        )
+
+    text = str(timeframe or "").strip().upper()
+    if text in INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KEY:
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KEY[text]
+    if text in INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND:
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND[text]
+    if text in {"일", "DAY"}:
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["DAY"]
+    if text in {"주", "WEEK"}:
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["WEEK"]
+    if text in {"월", "MONTH"}:
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["MONTH"]
+    if text in {"년", "YEAR"}:
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["YEAR"]
+    if text.startswith("M") and text[1:].isdigit():
+        return INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["MINUTE"]
+    try:
+        return (
+            INDICATOR_HISTORY_TARGET_BARS_BY_TIMEFRAME_KIND["MINUTE"]
+            if int(float(text)) > 0
+            else DEFAULT_INDICATOR_HISTORY_TARGET_BARS
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_INDICATOR_HISTORY_TARGET_BARS
+
+
+def indicator_history_target_bars_from_rules(
+    rules: Mapping[str, Any] | None,
+) -> int:
+    """Resolve Validation timeframe first, otherwise the applied minute bar."""
+    source = rules if isinstance(rules, Mapping) else {}
+    validation_timeframe = source.get("validation_timeframe")
+    if validation_timeframe not in (None, ""):
+        return indicator_history_target_bars(validation_timeframe)
+    bar = source.get("bar") if isinstance(source.get("bar"), Mapping) else {}
+    raw_minutes = bar.get("bar_minutes", source.get("bar_minutes", 1))
+    return indicator_history_target_bars(raw_minutes)
 
 
 def safe_float(value: Any) -> float | None:
@@ -480,7 +553,12 @@ def build_indicator_series(
         price_box_period = 24
     if price_box_period <= 0:
         price_box_period = 24
-    price_box_lower, price_box_middle, price_box_upper = price_box(closes, price_box_period)
+    history_window = indicator_history_target_bars_from_rules(cfg)
+    price_box_lower, price_box_middle, price_box_upper = price_box(
+        closes,
+        price_box_period,
+        history_window=history_window,
+    )
 
     series_map: dict[str, list[float | None]] = {
         "CLOSE": closes,

@@ -10,8 +10,8 @@ from candle_timeframe_aggregation import (
     validate_market_bar_projection_request,
 )
 from engines.indicator_engine import (
-    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
     ema,
+    indicator_history_target_bars,
     macd_series,
     macd_series_causal_history,
     price_box,
@@ -83,6 +83,53 @@ def _reference_price_box(
 
 
 class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
+    def test_hero4_timeframe_history_targets_are_explicit(self):
+        self.assertEqual(900, indicator_history_target_bars("M3"))
+        self.assertEqual(900, indicator_history_target_bars({"kind": "MINUTE", "minutes": 240}))
+        self.assertEqual(600, indicator_history_target_bars("D1"))
+        self.assertEqual(300, indicator_history_target_bars("W1"))
+        self.assertEqual(120, indicator_history_target_bars("MO1"))
+        self.assertEqual(120, indicator_history_target_bars("Y1"))
+
+    def test_validation_hidden_history_uses_selected_timeframe_target(self):
+        minute_rules = {"bar": {"bar_minutes": 3}}
+        week_rules = {
+            "validation_timeframe": {
+                "key": "W1",
+                "kind": "WEEK",
+                "minutes": None,
+                "label": "주",
+            }
+        }
+        self.assertEqual(900, required_validation_history_context_bars(minute_rules))
+        self.assertEqual(300, required_validation_history_context_bars(week_rules))
+
+        week_large_warmup_rules = {
+            **week_rules,
+            "indicators": {"price_box": {"period": 400}},
+            "buy": {"enabled": False},
+            "sell": {
+                "enabled": True,
+                "signals": {
+                    "box": {
+                        "enabled": True,
+                        "groups": [{
+                            "enabled": True,
+                            "conditions": [{
+                                "target": "CLOSE",
+                                "operator": ">=",
+                                "compare_target": "PRICE_BOX_UPPER",
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+        self.assertEqual(
+            400,
+            required_validation_history_context_bars(week_large_warmup_rules),
+        )
+
     def test_hero4_eavg_seed_and_warm_prefix_match_direct_engine_evidence(self):
         self.assertEqual(
             [0.0, 0.0, 0.0, 0.0],
@@ -193,7 +240,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 },
                 require_warmup=True,
             )
-    def test_indicator_follow_declares_minimum_warmup_and_600_history_target(self):
+    def test_indicator_follow_declares_minimum_warmup_and_900_minute_history_target(self):
         request = market_bar_projection_request(
             {
                 "indicators": {"rsi": {"period": 14}},
@@ -219,10 +266,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             }
         )
         self.assertEqual(15, request["warmup_bars"])
-        self.assertEqual(
-            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
-            request["history_target_bars"],
-        )
+        self.assertEqual(900, request["history_target_bars"])
     def test_history_target_does_not_turn_into_availability_requirement(self):
         raw = [{"close": float(index)} for index in range(20)]
         result = project_candle_supply(
@@ -269,17 +313,17 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 "projection_request": {
                     "projection": "FORMING_BASE_BAR",
                     "warmup_bars": 35,
-                    "history_target_bars": 600,
+                    "history_target_bars": 900,
                 },
             }],
         )
         self.assertTrue(result["ok"], result)
         self.assertEqual(
-            3300,
+            4950,
             host._candle_standby_required_by_stock["005930"],
         )
 
-    def test_240_minute_600_bar_history_target_stays_within_global_limit(self):
+    def test_240_minute_900_bar_history_target_caps_at_global_limit(self):
         host = SimpleNamespace(
             _candle_standby_required_by_stock={},
             _candle_standby_stock_codes=(),
@@ -292,15 +336,35 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 "projection_request": {
                     "projection": "FORMING_BASE_BAR",
                     "warmup_bars": 35,
-                    "history_target_bars": 600,
+                    "history_target_bars": 900,
                 },
             }],
         )
         self.assertTrue(result["ok"], result)
         self.assertEqual(
-            158400,
+            200000,
             host._candle_standby_required_by_stock["005930"],
         )
+
+    def test_240_minute_history_target_cap_is_not_an_availability_failure(self):
+        raw = [{"close": float(index)} for index in range(300)]
+        result = project_candle_supply(
+            raw,
+            {"bar": {"bar_minutes": 240}},
+            {
+                "projection": "COMPLETED_TIMEFRAME",
+                "warmup_bars": 1,
+                "history_target_bars": 900,
+            },
+            completed_projector=lambda rows, _rules, **_kwargs: list(rows),
+        )
+        self.assertTrue(result["available"], result)
+        self.assertEqual(200000, result["history_target_minute_candles"])
+        self.assertEqual(
+            237600,
+            result["history_target_requested_minute_candles"],
+        )
+        self.assertTrue(result["history_target_capped"])
 
     def test_validation_keeps_minimum_warmup_separate_from_hidden_history(self):
         rules = {
@@ -325,7 +389,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
         }
         self.assertEqual(24, required_validation_warmup_bars(rules))
         self.assertEqual(
-            600,
+            900,
             required_validation_history_context_bars(rules),
         )
     def test_price_box_matches_causal_trailing_loaded_history_reference(self):
@@ -384,7 +448,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
         for full_series, prefix_series in zip(full, prefix):
             self.assertEqual(prefix_series, full_series[:640])
 
-    def test_recursive_indicator_series_match_trailing_600_window(self):
+    def test_recursive_indicator_series_match_trailing_900_minute_window(self):
         from routines.지표추종매매.routine_macd_engine import (
             build_indicator_follow_base_series,
         )
@@ -396,9 +460,10 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 + math.sin(index / 13.0) * 5000.0,
                 "volume": 1,
             }
-            for index in range(650)
+            for index in range(950)
         ]
         rules = {
+            "bar": {"bar_minutes": 1},
             "indicators": {
                 "rsi": {"period": 14},
                 "macd": {"fast": 12, "slow": 26, "signal": 9},
@@ -407,7 +472,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             "sell": {"enabled": False, "signals": {}},
         }
         full = build_indicator_follow_base_series(candles, rules)
-        trailing = build_indicator_follow_base_series(candles[-600:], rules)
+        trailing = build_indicator_follow_base_series(candles[-900:], rules)
         for key in ("RSI", "MACD", "SIGNAL", "OSC"):
             self.assertAlmostEqual(
                 trailing[key][-1],
@@ -415,7 +480,44 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 places=10,
             )
 
-    def test_visualization_recursive_series_match_trailing_600_window(self):
+    def test_recursive_indicator_series_match_trailing_300_week_window(self):
+        from routines.지표추종매매.routine_macd_engine import (
+            build_indicator_follow_base_series,
+        )
+
+        candles = [
+            {
+                "close": 200000.0
+                + (index * 7.0)
+                + math.sin(index / 9.0) * 3000.0,
+                "volume": 1,
+            }
+            for index in range(350)
+        ]
+        rules = {
+            "validation_timeframe": {
+                "key": "W1",
+                "kind": "WEEK",
+                "minutes": None,
+                "label": "주",
+            },
+            "indicators": {
+                "rsi": {"period": 14},
+                "macd": {"fast": 12, "slow": 26, "signal": 9},
+            },
+            "buy": {"enabled": False},
+            "sell": {"enabled": False, "signals": {}},
+        }
+        full = build_indicator_follow_base_series(candles, rules)
+        trailing = build_indicator_follow_base_series(candles[-300:], rules)
+        for key in ("RSI", "MACD", "SIGNAL", "OSC"):
+            self.assertAlmostEqual(
+                trailing[key][-1],
+                full[key][-1],
+                places=10,
+            )
+
+    def test_visualization_recursive_series_match_trailing_900_minute_window(self):
         candles = [
             {
                 "close": 100000.0
@@ -423,9 +525,10 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 + math.sin(index / 13.0) * 5000.0,
                 "volume": 1,
             }
-            for index in range(650)
+            for index in range(950)
         ]
         rules = {
+            "bar": {"bar_minutes": 1},
             "indicators": {
                 "rsi": {"period": 14},
                 "macd": {"fast": 12, "slow": 26, "signal": 9},
@@ -469,7 +572,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             descriptors,
         )
         trailing = build_validation_indicator_cache(
-            candles[-600:],
+            candles[-900:],
             rules,
             descriptors,
         )
@@ -485,14 +588,14 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 places=10,
             )
 
-    def test_batch_fast_path_supports_history_over_600_bars(self):
+    def test_batch_fast_path_supports_history_over_900_bars(self):
         from routines.지표추종매매.routine_validation_batch import (
             scan_indicator_follow_validation_batch,
         )
 
         candles = [
             {"time": f"20260925{index:06d}", "close": float(index + 1)}
-            for index in range(601)
+            for index in range(901)
         ]
         result = scan_indicator_follow_validation_batch(
             candles,
@@ -538,7 +641,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
         )
         rows = []
         start = datetime(2026, 9, 1, 9, 0)
-        for index in reversed(range(651)):
+        for index in reversed(range(951)):
             close = float(1000 + index)
             rows.append({
                 "체결시간": (
@@ -554,14 +657,14 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             stock=stock,
             timeframe_minutes=1,
             requested_count=len(rows),
-            request_id="HISTORY-600-REMAP",
+            request_id="HISTORY-900-REMAP",
             rows=rows,
         )
 
         result = ValidationHistoricalReplay(session).evaluate(
             historical,
-            start_index=650,
-            end_index=650,
+            start_index=950,
+            end_index=950,
         )
         self.assertTrue(result.ok, result)
         sell = next(
@@ -570,25 +673,25 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             if entry.evaluation_side == "SELL"
             and entry.signal == "SELL"
         )
-        self.assertEqual(650, sell.evaluation_index)
-        self.assertEqual(649, sell.signal_index)
+        self.assertEqual(950, sell.evaluation_index)
+        self.assertEqual(949, sell.signal_index)
         condition = next(
             item
             for item in sell.trace["conditions"]
             if item["left_operand"]["key"] == "CLOSE"
         )
-        self.assertEqual(649, condition["left_operand"]["index"])
+        self.assertEqual(949, condition["left_operand"]["index"])
         self.assertEqual(
-            1649.0,
+            1949.0,
             condition["left_operand"]["value"],
         )
         snapshot = condition["indicator_snapshots"][0]
-        self.assertEqual(649, snapshot["index"])
+        self.assertEqual(949, snapshot["index"])
 
         scanned = ValidationHistoricalReplay(session).scan_signal_entries(
             historical,
-            start_index=650,
-            end_index=650,
+            start_index=950,
+            end_index=950,
         )
         scanned_sell = next(
             entry
@@ -596,15 +699,15 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             if entry.evaluation_side == "SELL"
             and entry.signal == "SELL"
         )
-        self.assertEqual(650, scanned_sell.evaluation_index)
-        self.assertEqual(649, scanned_sell.signal_index)
+        self.assertEqual(950, scanned_sell.evaluation_index)
+        self.assertEqual(949, scanned_sell.signal_index)
         scanned_condition = next(
             item
             for item in scanned_sell.trace["conditions"]
             if item["left_operand"]["key"] == "CLOSE"
         )
         self.assertEqual(
-            649,
+            949,
             scanned_condition["left_operand"]["index"],
         )
 

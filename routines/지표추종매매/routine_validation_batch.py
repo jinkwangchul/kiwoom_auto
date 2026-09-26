@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
 from engines.condition_engine import _series_key
-from engines.indicator_engine import close_prices, rsi
+from engines.indicator_engine import (
+    close_prices,
+    indicator_history_target_bars_from_rules,
+    rsi_causal_history,
+)
 from engines.signal_result import RoutineSignal
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
@@ -1014,7 +1018,11 @@ def scan_indicator_follow_validation_batch(candles: list[dict[str, Any]], rules:
         base_series = build_indicator_follow_base_series(candles, rules)
         rsi_period = _buy_rsi_period(rules)
         if rsi_period is not None:
-            base_series[f"_VALIDATION_RSI_{rsi_period}"] = rsi(close_prices(candles), rsi_period)
+            base_series[f"_VALIDATION_RSI_{rsi_period}"] = rsi_causal_history(
+                close_prices(candles),
+                rsi_period,
+                indicator_history_target_bars_from_rules(rules),
+            )
         evaluation_maps = _evaluation_series_maps(base_series)
         buy_cfg = rules.get("buy") if isinstance(rules.get("buy"), dict) else {}
         sell_cfg = rules.get("sell") if isinstance(rules.get("sell"), dict) else {}
