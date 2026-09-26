@@ -39,16 +39,28 @@ def validate_market_bar_projection_request(
         raise ValueError("projection_request.projection is unsupported")
     normalized = dict(projection_request)
     normalized["projection"] = projection
-    if "warmup_bars" not in projection_request:
-        if require_warmup:
-            raise ValueError("projection_request.warmup_bars is required")
-        return normalized
-    warmup_bars = projection_request.get("warmup_bars")
-    if isinstance(warmup_bars, bool) or not isinstance(warmup_bars, int):
-        raise ValueError("projection_request.warmup_bars must be a positive integer")
-    if warmup_bars <= 0:
-        raise ValueError("projection_request.warmup_bars must be a positive integer")
-    normalized["warmup_bars"] = warmup_bars
+
+    warmup_bars: int | None = None
+    if "warmup_bars" in projection_request:
+        raw_warmup = projection_request.get("warmup_bars")
+        if isinstance(raw_warmup, bool) or not isinstance(raw_warmup, int):
+            raise ValueError("projection_request.warmup_bars must be a positive integer")
+        if raw_warmup <= 0:
+            raise ValueError("projection_request.warmup_bars must be a positive integer")
+        warmup_bars = raw_warmup
+        normalized["warmup_bars"] = warmup_bars
+    elif require_warmup:
+        raise ValueError("projection_request.warmup_bars is required")
+
+    if "history_target_bars" in projection_request:
+        raw_target = projection_request.get("history_target_bars")
+        if isinstance(raw_target, bool) or not isinstance(raw_target, int):
+            raise ValueError("projection_request.history_target_bars must be a positive integer")
+        if raw_target <= 0:
+            raise ValueError("projection_request.history_target_bars must be a positive integer")
+        if warmup_bars is not None and raw_target < warmup_bars:
+            raise ValueError("projection_request.history_target_bars must be >= warmup_bars")
+        normalized["history_target_bars"] = raw_target
     return normalized
 
 
@@ -371,18 +383,37 @@ def project_candle_supply(
         }
     projection = request["projection"]
     warmup_declared = "warmup_bars" in request
-    warmup = required_minute_candles(interval, request.get("warmup_bars", 1))
+    history_target_declared = "history_target_bars" in request
+    warmup_bars = int(request.get("warmup_bars", 1))
+    history_target_bars = int(
+        request.get("history_target_bars", warmup_bars)
+    )
+    warmup = required_minute_candles(interval, warmup_bars)
+    history_target = required_minute_candles(
+        interval,
+        history_target_bars,
+    )
     if not warmup_declared:
         warmup = {**warmup, "required_minute_candles": 0}
     base = {
         "timeframe_minutes": interval,
         "projection": projection,
+        "history_target_bars": (
+            history_target_bars if history_target_declared else 0
+        ),
+        "history_target_minute_candles": (
+            int(history_target["required_minute_candles"])
+            if history_target_declared
+            else 0
+        ),
         "completeness": {},
         "freshness": {},
         **warmup,
     }
     if not warmup["within_limit"]:
         return {**base, "available": False, "candles": [], "availability_state": "WARMUP_LIMIT_EXCEEDED"}
+    if history_target_declared and not history_target["within_limit"]:
+        return {**base, "available": False, "candles": [], "availability_state": "HISTORY_TARGET_LIMIT_EXCEEDED", "reason": str(history_target["reason"])}
     normalized_sessions = normalize_candle_sessions(session_windows)
     supplied_session_count = len(session_windows) if isinstance(session_windows, (list, tuple)) else 0
     if supplied_session_count and len(normalized_sessions) != supplied_session_count:
@@ -480,6 +511,10 @@ def project_candle_supply(
             candles = projector(source_rows, rules, now=now)
     else:
         return {**base, "available": False, "candles": [], "availability_state": "PROJECTION_INVALID", "reason": "ROUTINE_MARKET_PROJECTION_REQUEST_INVALID"}
+
+    if history_target_declared and len(candles) > history_target_bars:
+        candles = candles[-history_target_bars:]
+
     projected_history_insufficient = bool(
         warmup_declared and len(candles) < int(request["warmup_bars"])
     )

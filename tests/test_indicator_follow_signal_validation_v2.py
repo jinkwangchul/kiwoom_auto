@@ -5147,7 +5147,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             requested_count=5_060,
             request_id="LARGE-COVERING-CACHE",
         )
-        target_count = 500 + flow_module.required_validation_warmup_bars(rules)
+        target_count = 500 + flow_module.required_validation_history_context_bars(rules)
 
         active = flow._validation_pool_for_session(
             session,
@@ -5303,7 +5303,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window = created[0]
         request = IndicatorFollowSignalValidationRunRequest(seed.settings_snapshot, 100)
         window.validation_run_requested.emit(request)
-        warmup = flow_module.required_validation_warmup_bars(
+        warmup = flow_module.required_validation_history_context_bars(
             seed.settings_snapshot.to_dict()
         )
         self.assertEqual([500 + warmup], requested_counts)
@@ -5321,7 +5321,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             changed_rules,
             ui_state=changed_ui_state,
         )
-        changed_warmup = flow_module.required_validation_warmup_bars(
+        changed_warmup = flow_module.required_validation_history_context_bars(
             changed_snapshot.to_dict()
         )
         window.validation_run_requested.emit(
@@ -5426,7 +5426,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 rules,
                 ui_state=current_ui_state,
             )
-            warmup = flow_module.required_validation_warmup_bars(
+            warmup = flow_module.required_validation_history_context_bars(
                 snapshot.to_dict()
             )
             expected_counts.append(
@@ -5625,7 +5625,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             seed.settings_snapshot,
             100,
         )
-        warmup = flow_module.required_validation_warmup_bars(
+        warmup = flow_module.required_validation_history_context_bars(
             seed.settings_snapshot.to_dict()
         )
 
@@ -5701,11 +5701,16 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         requested_counts = []
         seed = self._seed()
         timeframe = seed.settings_snapshot.to_dict()["bar"]["bar_minutes"]
+        timeframe_key = ValidationRequest(
+            self.stock,
+            seed.settings_snapshot,
+            timeframe,
+        ).timeframe_key
         request = IndicatorFollowSignalValidationRunRequest(
             seed.settings_snapshot,
             2,
         )
-        warmup = flow_module.required_validation_warmup_bars(
+        warmup = flow_module.required_validation_history_context_bars(
             seed.settings_snapshot.to_dict()
         )
         fetch_count = 8 + warmup
@@ -5738,6 +5743,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                     snapshot=ValidationHistoricalSnapshot(
                         stock=_self.session.request.stock,
                         timeframe_minutes=timeframe,
+                        timeframe_key=_self.session.request.timeframe_key,
                         requested_count=count,
                         request_id=f"REQ-{len(requested_counts)}",
                         rows=rows,
@@ -5780,7 +5786,14 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         first_flow._request_generation[id(first_window)] = 0
         first_flow._run_validation(first_window, request)
         self.assertEqual([fetch_count], requested_counts)
-        self.assertIsNotNone(cache.load(self.stock.code, timeframe, fetch_count))
+        self.assertIsNotNone(
+            cache.load(
+                self.stock.code,
+                timeframe,
+                fetch_count,
+                timeframe_key,
+            )
+        )
 
         flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS.clear()
         second_flow = IndicatorFollowSignalValidationFlow(
@@ -5823,7 +5836,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         timeframe_key = str(
             flow_module.validation_timeframe_from_rules(seed_rules)["key"]
         )
-        warmup = flow_module.required_validation_warmup_bars(
+        warmup = flow_module.required_validation_history_context_bars(
             seed_rules
         )
         fetch_count = 6 + warmup

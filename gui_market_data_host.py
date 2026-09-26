@@ -411,10 +411,22 @@ class MarketDataHost(QObject):
                         item.get("projection_request"),
                         require_warmup=True,
                     )
-                    requirement = required_minute_candles(interval, request["warmup_bars"])
+                    retention_bars = int(
+                        request.get(
+                            "history_target_bars",
+                            request["warmup_bars"],
+                        )
+                    )
+                    requirement = required_minute_candles(
+                        interval,
+                        retention_bars,
+                    )
                     if not requirement["within_limit"]:
                         raise ValueError(str(requirement["reason"]))
-                    requested[code] = max(requested.get(code, 0), int(requirement["required_minute_candles"]))
+                    requested[code] = max(
+                        requested.get(code, 0),
+                        int(requirement["required_minute_candles"]),
+                    )
                     normalized_codes.add(code)
                 except (TypeError, ValueError):
                     continue
@@ -494,9 +506,15 @@ class MarketDataHost(QObject):
                     item.get("projection_request"),
                     require_warmup=True,
                 )
+                retention_bars = int(
+                    request.get(
+                        "history_target_bars",
+                        request["warmup_bars"],
+                    )
+                )
                 requirement = required_minute_candles(
                     interval,
-                    request["warmup_bars"],
+                    retention_bars,
                 )
                 if not requirement["within_limit"]:
                     raise ValueError(str(requirement["reason"]))
@@ -566,17 +584,36 @@ class MarketDataHost(QObject):
             return {"available": False, "stock_code": code, "candles": [], "availability_state": "PROJECTION_REQUEST_INVALID", "reason": str(exc)}
         projection = request["projection"]
         warmup_declared = "warmup_bars" in request
+        history_target_declared = "history_target_bars" in request
         try:
             interval = read_canonical_bar_minutes(rules)
-            warmup = required_minute_candles(
+            warmup_bars = int(request["warmup_bars"] if warmup_declared else 1)
+            history_target_bars = int(
+                request.get("history_target_bars", warmup_bars)
+            )
+            warmup = required_minute_candles(interval, warmup_bars)
+            history_target = required_minute_candles(
                 interval,
-                request["warmup_bars"] if warmup_declared else 1,
+                history_target_bars,
             )
             if not warmup_declared:
                 warmup = {**warmup, "required_minute_candles": 0}
         except (TypeError, ValueError) as exc:
             return {"available": False, "stock_code": code, "candles": [], "availability_state": "INTERVAL_UNSUPPORTED", "reason": str(exc)}
-        base = {"stock_code": code, "timeframe_minutes": interval, "projection": projection, **warmup}
+        base = {
+            "stock_code": code,
+            "timeframe_minutes": interval,
+            "projection": projection,
+            "history_target_bars": (
+                history_target_bars if history_target_declared else 0
+            ),
+            "history_target_minute_candles": (
+                int(history_target["required_minute_candles"])
+                if history_target_declared
+                else 0
+            ),
+            **warmup,
+        }
         requirement_attribute = (
             "_candle_observation_required_by_stock"
             if str(consumer_scope or "").strip().upper() == "MOCK"
@@ -587,12 +624,19 @@ class MarketDataHost(QObject):
         except (AttributeError, RuntimeError):
             history_requirements = None
         if warmup_declared and isinstance(history_requirements, dict):
+            retention_requirement = (
+                history_target
+                if history_target_declared
+                else warmup
+            )
             history_requirements[code] = max(
                 int(history_requirements.get(code, 0)),
-                int(warmup["required_minute_candles"]),
+                int(retention_requirement["required_minute_candles"]),
             )
         if not warmup["within_limit"]:
             return {**base, "available": False, "candles": [], "availability_state": "WARMUP_LIMIT_EXCEEDED"}
+        if history_target_declared and not history_target["within_limit"]:
+            return {**base, "available": False, "candles": [], "availability_state": "HISTORY_TARGET_LIMIT_EXCEEDED", "reason": str(history_target["reason"])}
         raw = load_candles(StockRepository().resolve_stock_dir(code))
         source_hash = canonical_candle_content_hash(raw) if raw else ""
         forming = None

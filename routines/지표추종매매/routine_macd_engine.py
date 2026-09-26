@@ -20,7 +20,13 @@ from engines.condition_engine import (
     evaluate_condition_expression,
     evaluate_groups_or,
 )
-from engines.indicator_engine import build_indicator_series, close_prices, rsi
+from engines.indicator_engine import (
+    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+    build_indicator_series,
+    close_prices,
+    macd_series_causal_history,
+    rsi_causal_history,
+)
 from engines.signal_result import RoutineSignal, signal_to_dict
 
 
@@ -398,7 +404,11 @@ def _evaluate_buy_rsi_filter(
     rsi_values = (
         precomputed_values
         if isinstance(precomputed_values, list)
-        else rsi(close_prices(candles), period)
+        else rsi_causal_history(
+            close_prices(candles),
+            period,
+            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+        )
     )
     evaluated_value = rsi_values[evaluation_index] if 0 <= evaluation_index < len(rsi_values) else None
     if evaluated_value is None:
@@ -1785,8 +1795,49 @@ def build_indicator_follow_base_series(
     cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
     series_map = build_indicator_series(candles, cfg)
     closes = close_prices(candles)
+    indicator_cfg = (
+        cfg.get("indicators")
+        if isinstance(cfg.get("indicators"), dict)
+        else cfg
+    )
+
+    rsi_cfg = (
+        indicator_cfg.get("rsi")
+        if isinstance(indicator_cfg.get("rsi"), dict)
+        else {}
+    )
+    rsi_period = _safe_int(rsi_cfg.get("period")) or 14
+    series_map["RSI"] = rsi_causal_history(
+        closes,
+        rsi_period,
+        DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+    )
+
+    macd_cfg = (
+        indicator_cfg.get("macd")
+        if isinstance(indicator_cfg.get("macd"), dict)
+        else {}
+    )
+    fast = _safe_int(macd_cfg.get("fast")) or 12
+    slow = _safe_int(macd_cfg.get("slow")) or 26
+    signal_period = _safe_int(macd_cfg.get("signal")) or 9
+    macd_line, signal_line, osc = macd_series_causal_history(
+        closes,
+        fast,
+        slow,
+        signal_period,
+        DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+    )
+    series_map["MACD"] = macd_line
+    series_map["SIGNAL"] = signal_line
+    series_map["OSC"] = osc
+
     for period in _configured_sell_rsi_periods(cfg):
-        series_map[_rsi_runtime_series_key(period)] = rsi(closes, period)
+        series_map[_rsi_runtime_series_key(period)] = rsi_causal_history(
+            closes,
+            period,
+            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+        )
     return series_map
 
 

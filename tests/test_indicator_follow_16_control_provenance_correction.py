@@ -667,7 +667,7 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         self.assertTrue(upper_result.passed)
         self.assertTrue(lower_result.passed)
 
-    def test_price_box_uses_exact_period_three_window_and_evicts_oldest_close(self):
+    def test_price_box_period_three_uses_causal_history_stats_around_rolling_center(self):
         closes = [10.0, 12.0, 8.0, 15.0, 7.0, 18.0]
         lower, middle, upper = price_box(closes, 3)
         self.assertEqual([None, None], lower[:2])
@@ -675,20 +675,29 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         self.assertEqual([None, None], upper[:2])
         for actual, expected in zip(middle[2:], (10.0, 35.0 / 3.0, 10.0, 40.0 / 3.0)):
             self.assertAlmostEqual(expected, actual)
-        for actual, expected in zip(lower[2:], (8.0, 8.0, 6.5, 7.0)):
+        for actual, expected in zip(
+            lower[2:],
+            (8.0, 29.0 / 3.0, 6.5, 59.0 / 6.0),
+        ):
             self.assertAlmostEqual(expected, actual)
-        for actual, expected in zip(upper[2:], (12.0, 16.5, 15.0, 19.5)):
-            self.assertAlmostEqual(expected, actual)
+        for actual, expected in zip(
+            upper[2:],
+            (None, 15.0, 40.0 / 3.0, 56.0 / 3.0),
+        ):
+            if expected is None:
+                self.assertIsNone(actual)
+            else:
+                self.assertAlmostEqual(expected, actual)
 
-    def test_price_box_period_five_uses_the_same_rolling_contract(self):
+    def test_price_box_period_five_accumulates_valid_loaded_history_stats(self):
         lower, middle, upper = price_box([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 5)
 
         self.assertEqual([None] * 4, lower[:4])
         self.assertEqual([None] * 4, middle[:4])
         self.assertEqual([None] * 4, upper[:4])
         self.assertEqual([3.0, 4.0], middle[4:])
-        self.assertEqual([0.5, 1.5], lower[4:])
-        self.assertEqual([5.5, 6.5], upper[4:])
+        self.assertEqual([None, None], lower[4:])
+        self.assertEqual([5.0, 6.0], upper[4:])
 
     def test_price_box_returns_none_for_missing_center_or_empty_sign_group(self):
         lower, middle, upper = price_box([5.0, 5.0, None, 5.0, 5.0, 5.0], 3)

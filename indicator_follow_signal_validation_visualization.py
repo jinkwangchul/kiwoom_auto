@@ -10,11 +10,12 @@ import math
 from typing import Any, Mapping
 
 from engines.indicator_engine import (
+    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
     bollinger_band,
-    close_prices,
-    macd_series,
     price_box,
-    rsi,
+    close_prices,
+    macd_series_causal_history,
+    rsi_causal_history,
     simple_ma,
 )
 from indicator_follow_signal_validation_execution import (
@@ -838,7 +839,13 @@ def build_validation_indicator_cache(
         elif descriptor.family == FAMILY_RSI:
             period = _positive_int(parameters.get("period")) or 14
             if period not in rsi_cache:
-                rsi_cache[period] = normalized_values(rsi(closes, period))
+                rsi_cache[period] = normalized_values(
+                    rsi_causal_history(
+                        closes,
+                        period,
+                        DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+                    )
+                )
             channels["RSI"] = rsi_cache[period]
             if "CRITERION" in descriptor.series_keys:
                 channels["CRITERION"] = _constant_series(
@@ -853,11 +860,12 @@ def build_validation_indicator_cache(
                 _positive_int(parameters.get("signal")) or 9,
             )
             if macd_key not in macd_cache:
-                macd_values, signal_values, osc_values = macd_series(
+                macd_values, signal_values, osc_values = macd_series_causal_history(
                     closes,
                     macd_key[0],
                     macd_key[1],
                     macd_key[2],
+                    DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
                 )
                 macd_cache[macd_key] = {
                     "MACD": normalized_values(macd_values),

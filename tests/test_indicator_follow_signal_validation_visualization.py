@@ -783,9 +783,23 @@ class ValidationVisualizationDataTest(unittest.TestCase):
             {"time": f"2025-01-01T09:{index:02d}:00", "close": close, "volume": 1}
             for index, close in enumerate(closes)
         ]
-        expected_lower = [None, None, 8.0, 8.0, 6.5, 7.0]
+        expected_lower = [
+            None,
+            None,
+            8.0,
+            29.0 / 3.0,
+            6.5,
+            59.0 / 6.0,
+        ]
         expected_middle = [None, None, 10.0, 35.0 / 3.0, 10.0, 40.0 / 3.0]
-        expected_upper = [None, None, 12.0, 16.5, 15.0, 19.5]
+        expected_upper = [
+            None,
+            None,
+            None,
+            15.0,
+            40.0 / 3.0,
+            56.0 / 3.0,
+        ]
 
         lower, middle, upper = price_box(closes, 3)
         production = build_indicator_series(

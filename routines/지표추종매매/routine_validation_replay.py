@@ -10,6 +10,7 @@ import math
 from typing import Any, Callable
 
 from candle_timeframe_aggregation import MARKET_BUCKET_ANCHOR, SEOUL_TIMEZONE
+from engines.indicator_engine import DEFAULT_INDICATOR_HISTORY_TARGET_BARS
 from engines.signal_result import RoutineSignal
 from indicator_follow_validation_timeframe import validation_timeframe_for_request, normalize_validation_timeframe
 from indicator_follow_signal_validation_projection import (
@@ -49,6 +50,49 @@ def _canonical_json(value: Any) -> str:
 
 def _fresh_json(value_json: str) -> Any:
     return json.loads(value_json)
+
+
+def _indicator_history_prefix(
+    candles: list[dict[str, Any]],
+    evaluation_index: int,
+) -> tuple[list[dict[str, Any]], int]:
+    full_prefix = candles[: evaluation_index + 1]
+    start = max(
+        0,
+        len(full_prefix) - DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+    )
+    return full_prefix[start:], start
+
+
+def _remap_trace_indexes(
+    trace: dict[str, Any],
+    offset: int,
+) -> dict[str, Any]:
+    if offset <= 0:
+        return trace
+    remapped = _fresh_json(_canonical_json(trace))
+    conditions = remapped.get("conditions")
+    if not isinstance(conditions, list):
+        return remapped
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            continue
+        for operand_key in ("left_operand", "right_operand"):
+            operand = condition.get(operand_key)
+            if not isinstance(operand, dict):
+                continue
+            index = operand.get("index")
+            if isinstance(index, int) and not isinstance(index, bool):
+                operand["index"] = index + offset
+        snapshots = condition.get("indicator_snapshots")
+        if isinstance(snapshots, list):
+            for snapshot in snapshots:
+                if not isinstance(snapshot, dict):
+                    continue
+                index = snapshot.get("index")
+                if isinstance(index, int) and not isinstance(index, bool):
+                    snapshot["index"] = index + offset
+    return remapped
 
 
 def _normalized_number(value: Any) -> float | None:
@@ -516,7 +560,15 @@ class ValidationHistoricalReplay:
         rules_json = None if use_read_only_fast_path else _canonical_json(rules)
         try:
             for evaluation_index in range(start_index, final_index + 1):
-                prefix = candles[: evaluation_index + 1]
+                context_prefix = candles[: evaluation_index + 1]
+                if reuse_default_base_series:
+                    prefix, history_index_offset = _indicator_history_prefix(
+                        candles,
+                        evaluation_index,
+                    )
+                else:
+                    prefix = context_prefix
+                    history_index_offset = 0
                 prefix_json = (
                     None if use_read_only_fast_path else _canonical_json(prefix)
                 )
@@ -539,7 +591,7 @@ class ValidationHistoricalReplay:
                         "_indicator_follow_evaluate_side": side,
                     }
                     if reuse_default_base_series:
-                        context["_indicator_follow_validation_current_price"] = prefix[-1].get("close")
+                        context["_indicator_follow_validation_current_price"] = context_prefix[-1].get("close")
                     if context_provider is not None:
                         fast_context = getattr(
                             context_provider,
@@ -550,16 +602,18 @@ class ValidationHistoricalReplay:
                             fast_context(
                                 evaluation_index,
                                 side,
-                                prefix,
+                                context_prefix,
                                 entries,
                             )
                             if use_read_only_fast_path and callable(fast_context)
                             else context_provider(
                                 evaluation_index,
                                 side,
-                                prefix
+                                context_prefix
                                 if use_read_only_fast_path
-                                else _fresh_json(prefix_json),
+                                else _fresh_json(
+                                    _canonical_json(context_prefix)
+                                ),
                                 entries
                                 if use_read_only_fast_path
                                 else list(entries),
@@ -605,10 +659,14 @@ class ValidationHistoricalReplay:
                             else _fresh_json(prefix_json),
                             signal,
                             self._trace_with_context(
-                                observer.snapshot(),
+                                _remap_trace_indexes(
+                                    observer.snapshot(),
+                                    history_index_offset,
+                                ),
                                 context,
                                 assume_detached=use_read_only_fast_path,
                             ),
+                            signal_index_offset=history_index_offset,
                         )
                     )
         except Exception as exc:
@@ -716,15 +774,27 @@ class ValidationHistoricalReplay:
         )
         entries: list[ValidationReplayEntry] = []
         for evaluation_index in range(start_index, final_index + 1):
-            prefix = candles[: evaluation_index + 1]
-            evaluation_series_map = (
-                _evaluation_prefix_series_map(
+            context_prefix = candles[: evaluation_index + 1]
+            if reuse_default_base_series:
+                prefix, history_index_offset = _indicator_history_prefix(
+                    candles,
+                    evaluation_index,
+                )
+            else:
+                prefix = context_prefix
+                history_index_offset = 0
+            if base_series_map is not None:
+                evaluation_series_map = _evaluation_prefix_series_map(
                     base_series_map,
                     evaluation_index + 1,
                 )
-                if base_series_map is not None
-                else None
-            )
+            elif reuse_default_base_series and evaluation_index >= 2:
+                evaluation_series_map = build_indicator_follow_base_series(
+                    prefix,
+                    rules,
+                )
+            else:
+                evaluation_series_map = None
             for side in ("SELL", "BUY"):
                 observer = ValidationTraceObserver()
                 context = {
@@ -732,7 +802,7 @@ class ValidationHistoricalReplay:
                     "_indicator_follow_evaluate_side": side,
                 }
                 if reuse_default_base_series:
-                    context["_indicator_follow_validation_current_price"] = prefix[-1].get("close")
+                    context["_indicator_follow_validation_current_price"] = context_prefix[-1].get("close")
                 if context_provider is not None:
                     fast_context = getattr(
                         context_provider,
@@ -743,14 +813,14 @@ class ValidationHistoricalReplay:
                         fast_context(
                             evaluation_index,
                             side,
-                            prefix,
+                            context_prefix,
                             entries,
                         )
                         if callable(fast_context)
                         else context_provider(
                             evaluation_index,
                             side,
-                            prefix,
+                            context_prefix,
                             entries,
                         )
                     )
@@ -780,10 +850,14 @@ class ValidationHistoricalReplay:
                         prefix,
                         signal,
                         self._trace_with_context(
-                            observer.snapshot(),
+                            _remap_trace_indexes(
+                                observer.snapshot(),
+                                history_index_offset,
+                            ),
                             context,
                             assume_detached=True,
                         ),
+                        signal_index_offset=history_index_offset,
                     )
                 )
         return entries
@@ -846,6 +920,8 @@ class ValidationHistoricalReplay:
         prefix: list[dict[str, Any]],
         signal: RoutineSignal,
         trace: dict[str, Any],
+        *,
+        signal_index_offset: int = 0,
     ) -> ValidationReplayEntry:
         if not isinstance(signal, RoutineSignal):
             raise TypeError("evaluator must return RoutineSignal")
@@ -879,8 +955,9 @@ class ValidationHistoricalReplay:
                 or not 0 <= signal.signal_index < len(prefix)
             ):
                 raise ValueError("evaluator returned an invalid signal_index")
-            signal_index = signal.signal_index
-            signal_time = str(prefix[signal_index]["time"])
+            local_signal_index = signal.signal_index
+            signal_index = local_signal_index + signal_index_offset
+            signal_time = str(prefix[local_signal_index]["time"])
 
         return ValidationReplayEntry(
             evaluation_side=side,

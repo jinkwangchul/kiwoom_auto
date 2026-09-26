@@ -20,6 +20,8 @@ from typing import Any
 import json
 from pathlib import Path
 
+from engines.indicator_engine import DEFAULT_INDICATOR_HISTORY_TARGET_BARS
+
 try:
     from routine_cycle_projection import project_indicator_follow_cycle  # type: ignore
 except Exception:  # pragma: no cover
@@ -579,6 +581,7 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
         isinstance(signal, dict) and "order_delay_bars" in signal
         for signal in signals.values()
     )
+    warmup_bars = max(candidates)
     return {
         "projection": "FORMING_BASE_BAR",
         "ocr_delay_semantics": (
@@ -591,7 +594,11 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
             if has_ocr_delay_contract
             else "NOT_CONFIGURED"
         ),
-        "warmup_bars": max(candidates),
+        "warmup_bars": warmup_bars,
+        "history_target_bars": max(
+            DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+            warmup_bars,
+        ),
     }
 
 

@@ -39,6 +39,9 @@ from indicator_follow_validation_regular_market import (
 from indicator_follow_signal_validation_visualization import (
     required_validation_warmup_bars,
 )
+from indicator_follow_validation_history_contract import (
+    required_validation_history_context_bars,
+)
 from candle_timeframe_aggregation import SEOUL_TIMEZONE
 from candle_manager import DEFAULT_CANDLES_MAX_COUNT
 from gui_indicator_follow_validation_host import IndicatorFollowValidationHost
@@ -713,7 +716,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if window_key in self._history_extension_inflight:
             return
         try:
-            warmup_bars = required_validation_warmup_bars(
+            warmup_bars = required_validation_history_context_bars(
                 run_request.settings_snapshot.to_dict()
             )
         except Exception:
@@ -1164,7 +1167,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         ):
             target_count = (
                 self._historical_count
-                + required_validation_warmup_bars(rules)
+                + required_validation_history_context_bars(rules)
             )
         timeframe = normalize_validation_timeframe(
             session.request.timeframe_key,
@@ -1283,7 +1286,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             pool,
             target_count=(
                 chart_candle_count
-                + required_validation_warmup_bars(
+                + required_validation_history_context_bars(
                     session.request.settings_snapshot.to_dict()
                 )
             ),
@@ -1342,7 +1345,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if not isinstance(pool, dict):
             raise ValueError("HISTORICAL_POOL_UNAVAILABLE")
         rules = session.request.settings_snapshot.to_dict()
-        warmup_bars = required_validation_warmup_bars(rules)
+        warmup_bars = required_validation_history_context_bars(rules)
         active_pool = self._validation_pool_for_session(
             session,
             pool,
@@ -1435,7 +1438,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             pool,
             target_count=(
                 history_target
-                + required_validation_warmup_bars(
+                + required_validation_history_context_bars(
                     session.request.settings_snapshot.to_dict()
                 )
             ),
@@ -1514,7 +1517,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     evaluation_count=evaluation_count,
                 )
                 rules = session.request.settings_snapshot.to_dict()
-                warmup_bars = required_validation_warmup_bars(rules)
+                warmup_bars = required_validation_history_context_bars(rules)
                 active_pool = self._validation_pool_for_session(
                     session,
                     pool,
@@ -1734,7 +1737,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 return
             snapshot_rules = snapshot.to_dict()
             target_timeframe_minutes = snapshot_rules["bar"]["bar_minutes"]
-            warmup_bars = required_validation_warmup_bars(snapshot_rules)
+            warmup_bars = required_validation_history_context_bars(snapshot_rules)
             historical_target = self._history_targets.get(
                 window_key,
                 self._historical_count,
@@ -2101,7 +2104,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             pool,
             target_count=(
                 history_target
-                + required_validation_warmup_bars(
+                + required_validation_history_context_bars(
                     session.request.settings_snapshot.to_dict()
                 )
             ),
@@ -2136,7 +2139,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             count = end - start + 1
 
         rules = session.request.settings_snapshot.to_dict()
-        warmup_bars = required_validation_warmup_bars(rules)
+        warmup_bars = required_validation_history_context_bars(rules)
         slice_start = max(0, evaluation_start - warmup_bars)
         replay_candles = [
             dict(candle)

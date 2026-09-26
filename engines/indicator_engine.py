@@ -13,6 +13,9 @@ from typing import Any
 import math
 
 
+DEFAULT_INDICATOR_HISTORY_TARGET_BARS = 600
+
+
 def safe_float(value: Any) -> float | None:
     try:
         if value is None or value == "":
@@ -121,18 +124,20 @@ def bollinger_band(
 def price_box(
     values: list[float | None],
     period: int = 24,
+    history_window: int = DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
 ) -> tuple[list[float | None], list[float | None], list[float | None]]:
-    """Calculate a causal Price Box from each exact rolling close window."""
-    if period <= 0:
+    """Calculate a causal Kiwoom-style Price Box.
+
+    The center line is the rolling period-bar close average. The upper and
+    lower offsets use AvgIf/StdevIf semantics over the valid deviation series
+    inside the trailing history window. Recomputing the valid deviation series
+    from each local history window excludes its first period-1 bars, matching
+    the HTS loaded-window behavior while remaining causal for replay.
+    """
+    if period <= 0 or history_window <= 0:
         empty = [None for _ in values]
         return list(empty), list(empty), list(empty)
-
-    def filtered_stats(items: list[float]) -> tuple[float, float] | None:
-        if not items:
-            return None
-        mean = sum(items) / len(items)
-        variance = sum((item - mean) ** 2 for item in items) / len(items)
-        return mean, math.sqrt(variance)
+    history_window = max(int(history_window), int(period))
 
     lower: list[float | None] = [None for _ in values]
     middle: list[float | None] = [None for _ in values]
@@ -141,16 +146,83 @@ def price_box(
         window = values[index - period + 1:index + 1]
         if any(value is None for value in window):
             continue
-        closes = [float(value) for value in window if value is not None]
-        average = sum(closes) / period
-        middle[index] = average
-        deviations = [price - average for price in closes]
-        positive_stats = filtered_stats([
-            value for value in deviations if value > 0
-        ])
-        negative_stats = filtered_stats([
-            value for value in deviations if value < 0
-        ])
+        middle[index] = sum(float(value) for value in window) / period
+
+    deviations: list[float | None] = [None for _ in values]
+    for index, average in enumerate(middle):
+        value = values[index] if index < len(values) else None
+        if average is not None and value is not None:
+            deviations[index] = float(value) - float(average)
+
+    positive_rows: list[tuple[int, float]] = []
+    negative_rows: list[tuple[int, float]] = []
+    positive_sum = 0.0
+    positive_sumsq = 0.0
+    negative_sum = 0.0
+    negative_sumsq = 0.0
+    positive_head = 0
+    negative_head = 0
+
+    def stats(
+        rows: list[tuple[int, float]],
+        head: int,
+        total: float,
+        total_sq: float,
+    ) -> tuple[float, float] | None:
+        count = len(rows) - head
+        if count <= 0:
+            return None
+        mean = total / count
+        variance = max((total_sq / count) - (mean * mean), 0.0)
+        return mean, math.sqrt(variance)
+
+    for index in range(period - 1, len(values)):
+        deviation = deviations[index]
+        if deviation is not None:
+            if deviation > 0:
+                positive_rows.append((index, deviation))
+                positive_sum += deviation
+                positive_sumsq += deviation * deviation
+            elif deviation < 0:
+                negative_rows.append((index, deviation))
+                negative_sum += deviation
+                negative_sumsq += deviation * deviation
+
+        local_start = max(0, index - history_window + 1)
+        first_valid_deviation = local_start + period - 1
+
+        while (
+            positive_head < len(positive_rows)
+            and positive_rows[positive_head][0] < first_valid_deviation
+        ):
+            old = positive_rows[positive_head][1]
+            positive_sum -= old
+            positive_sumsq -= old * old
+            positive_head += 1
+        while (
+            negative_head < len(negative_rows)
+            and negative_rows[negative_head][0] < first_valid_deviation
+        ):
+            old = negative_rows[negative_head][1]
+            negative_sum -= old
+            negative_sumsq -= old * old
+            negative_head += 1
+
+        average = middle[index]
+        if average is None:
+            continue
+        positive_stats = stats(
+            positive_rows,
+            positive_head,
+            positive_sum,
+            positive_sumsq,
+        )
+        negative_stats = stats(
+            negative_rows,
+            negative_head,
+            negative_sum,
+            negative_sumsq,
+        )
         if positive_stats is not None:
             upper[index] = average + positive_stats[0] + (2.0 * positive_stats[1])
         if negative_stats is not None:
@@ -203,6 +275,26 @@ def rsi(values: list[float | None], period: int = 14) -> list[float | None]:
     return result
 
 
+def rsi_causal_history(
+    values: list[float | None],
+    period: int = 14,
+    history_window: int = DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+) -> list[float | None]:
+    """Return RSI as if each point were evaluated from at most history_window bars."""
+    if history_window <= 0:
+        return [None for _ in values]
+    history_window = max(int(history_window), int(period) + 1)
+    if len(values) <= history_window:
+        return rsi(values, period)
+
+    result = rsi(values[:history_window], period)
+    for index in range(history_window, len(values)):
+        start = index - history_window + 1
+        local = rsi(values[start:index + 1], period)
+        result.append(local[-1] if local else None)
+    return result
+
+
 def macd_series(
     closes: list[float | None],
     fast: int = 12,
@@ -229,6 +321,47 @@ def macd_series(
             osc.append(macd_value - signal_value)
 
     return macd_line, signal_line, osc
+
+
+def macd_series_causal_history(
+    closes: list[float | None],
+    fast: int = 12,
+    slow: int = 26,
+    signal_period: int = 9,
+    history_window: int = DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Return MACD family values from at most history_window bars per point."""
+    if history_window <= 0:
+        empty = [None for _ in closes]
+        return list(empty), list(empty), list(empty)
+    history_window = max(
+        int(history_window),
+        int(slow) + int(signal_period),
+    )
+    if len(closes) <= history_window:
+        return macd_series(closes, fast, slow, signal_period)
+
+    initial_macd, initial_signal, initial_osc = macd_series(
+        closes[:history_window],
+        fast,
+        slow,
+        signal_period,
+    )
+    macd_values = list(initial_macd)
+    signal_values = list(initial_signal)
+    osc_values = list(initial_osc)
+    for index in range(history_window, len(closes)):
+        start = index - history_window + 1
+        local_macd, local_signal, local_osc = macd_series(
+            closes[start:index + 1],
+            fast,
+            slow,
+            signal_period,
+        )
+        macd_values.append(local_macd[-1] if local_macd else None)
+        signal_values.append(local_signal[-1] if local_signal else None)
+        osc_values.append(local_osc[-1] if local_osc else None)
+    return macd_values, signal_values, osc_values
 
 
 def build_indicator_series(
