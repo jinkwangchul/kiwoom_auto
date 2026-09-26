@@ -36,8 +36,34 @@ def volumes(candles: list[dict[str, Any]]) -> list[float | None]:
 def ema(values: list[float | None], period: int) -> list[float | None]:
     if period <= 0:
         return [None for _ in values]
-    result: list[float | None] = []
+
     multiplier = 2 / (period + 1)
+
+    # Hero4 EAVG exposes a period-warmed prefix for ordinary numeric vectors:
+    # the recursive core starts from the first value, but the first period
+    # output slots are backfilled with the EMA at the period-th observation.
+    # A shorter vector is returned as zeroes. Keep the legacy sparse/None
+    # behavior below because Hero4's missing-value semantics are not proven.
+    if all(value is not None for value in values):
+        numeric_values = [float(value) for value in values]
+        if len(numeric_values) < period:
+            return [0.0 for _ in numeric_values]
+        if not numeric_values:
+            return []
+
+        numeric_result: list[float] = [numeric_values[0]]
+        previous_numeric = numeric_values[0]
+        for value in numeric_values[1:]:
+            previous_numeric = (
+                (value - previous_numeric) * multiplier
+                + previous_numeric
+            )
+            numeric_result.append(previous_numeric)
+        warmed_value = numeric_result[period - 1]
+        numeric_result[:period] = [warmed_value] * period
+        return numeric_result
+
+    result: list[float | None] = []
     previous: float | None = None
     for value in values:
         if value is None:
@@ -266,7 +292,9 @@ def rsi(values: list[float | None], period: int = 14) -> list[float | None]:
             avg_gain = ((avg_gain * (period - 1)) + gain) / period
             avg_loss = ((avg_loss * (period - 1)) + loss) / period
 
-        if avg_loss == 0:
+        if avg_gain == 0 and avg_loss == 0:
+            result.append(0.0)
+        elif avg_loss == 0:
             result.append(100.0)
         else:
             rs = avg_gain / avg_loss
@@ -338,18 +366,72 @@ def macd_series_causal_history(
         int(history_window),
         int(slow) + int(signal_period),
     )
-    if len(closes) <= history_window:
-        return macd_series(closes, fast, slow, signal_period)
 
-    initial_macd, initial_signal, initial_osc = macd_series(
-        closes[:history_window],
-        fast,
-        slow,
-        signal_period,
+    # Hero4 EAVG backfills its initial period slots from the period-th EMA.
+    # Replaying a whole future-known vector would therefore leak that backfill
+    # into earlier evaluations. Preserve prefix causality while avoiding a
+    # quadratic recomputation inside the initial retained-history window.
+    macd_values: list[float | None] = []
+    signal_values: list[float | None] = []
+    osc_values: list[float | None] = []
+
+    initial_end = min(len(closes), history_window)
+    stable_count = max(int(fast), int(slow), int(signal_period))
+    can_stream_initial = (
+        fast > 0
+        and slow > 0
+        and signal_period > 0
+        and all(value is not None for value in closes[:initial_end])
     )
-    macd_values = list(initial_macd)
-    signal_values = list(initial_signal)
-    osc_values = list(initial_osc)
+    prefix_end = (
+        min(initial_end, stable_count)
+        if can_stream_initial
+        else initial_end
+    )
+
+    for index in range(prefix_end):
+        local_macd, local_signal, local_osc = macd_series(
+            closes[: index + 1],
+            fast,
+            slow,
+            signal_period,
+        )
+        macd_values.append(local_macd[-1] if local_macd else None)
+        signal_values.append(local_signal[-1] if local_signal else None)
+        osc_values.append(local_osc[-1] if local_osc else None)
+
+    if can_stream_initial and initial_end > stable_count:
+        seed_closes = closes[:stable_count]
+        fast_state = ema(seed_closes, fast)[-1]
+        slow_state = ema(seed_closes, slow)[-1]
+        signal_state = signal_values[-1]
+        fast_multiplier = 2 / (fast + 1)
+        slow_multiplier = 2 / (slow + 1)
+        signal_multiplier = 2 / (signal_period + 1)
+        assert fast_state is not None
+        assert slow_state is not None
+        assert signal_state is not None
+
+        for index in range(stable_count, initial_end):
+            close = closes[index]
+            assert close is not None
+            fast_state = (
+                (float(close) - fast_state) * fast_multiplier
+                + fast_state
+            )
+            slow_state = (
+                (float(close) - slow_state) * slow_multiplier
+                + slow_state
+            )
+            macd_value = fast_state - slow_state
+            signal_state = (
+                (macd_value - signal_state) * signal_multiplier
+                + signal_state
+            )
+            macd_values.append(macd_value)
+            signal_values.append(signal_state)
+            osc_values.append(macd_value - signal_state)
+
     for index in range(history_window, len(closes)):
         start = index - history_window + 1
         local_macd, local_signal, local_osc = macd_series(

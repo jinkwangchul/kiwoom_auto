@@ -11,7 +11,11 @@ from candle_timeframe_aggregation import (
 )
 from engines.indicator_engine import (
     DEFAULT_INDICATOR_HISTORY_TARGET_BARS,
+    ema,
+    macd_series,
+    macd_series_causal_history,
     price_box,
+    rsi,
 )
 from gui_market_data_host import MarketDataHost
 from indicator_follow_signal_validation_visualization import (
@@ -79,6 +83,95 @@ def _reference_price_box(
 
 
 class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
+    def test_hero4_eavg_seed_and_warm_prefix_match_direct_engine_evidence(self):
+        self.assertEqual(
+            [0.0, 0.0, 0.0, 0.0],
+            ema([1.0, 2.0, 3.0, 4.0], 5),
+        )
+        actual = ema([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], 5)
+        expected = [
+            3.3950617283950617,
+            3.3950617283950617,
+            3.3950617283950617,
+            3.3950617283950617,
+            3.3950617283950617,
+            4.263374485596708,
+            5.175582990397805,
+        ]
+        for actual_value, expected_value in zip(actual, expected):
+            self.assertAlmostEqual(expected_value, actual_value, places=12)
+
+    def test_hero4_rsi_flat_zero_division_is_zero_but_up_only_is_hundred(self):
+        flat = [100.0] * 30
+        rising = [float(value) for value in range(1, 31)]
+
+        self.assertEqual(0.0, rsi(flat, 14)[-1])
+        self.assertEqual(100.0, rsi(rising, 14)[-1])
+
+    def test_macd_causal_history_uses_only_each_available_prefix(self):
+        closes = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        causal = macd_series_causal_history(
+            closes,
+            fast=3,
+            slow=6,
+            signal_period=3,
+            history_window=600,
+        )
+        for index in range(len(closes)):
+            prefix = macd_series(
+                closes[: index + 1],
+                fast=3,
+                slow=6,
+                signal_period=3,
+            )
+            for causal_series, prefix_series in zip(causal, prefix):
+                self.assertAlmostEqual(
+                    prefix_series[-1],
+                    causal_series[index],
+                    places=12,
+                )
+
+    def test_macd_early_series_uses_hero4_eavg_prefix_semantics(self):
+        macd, signal, osc = macd_series(
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            fast=3,
+            slow=5,
+            signal_period=2,
+        )
+        expected_macd = [
+            -1.1450617283950617,
+            -1.1450617283950617,
+            -1.1450617283950617,
+            -0.2700617283950617,
+            0.6674382716049383,
+            0.7678755144032925,
+            0.840042009602195,
+        ]
+        expected_signal = [
+            -1.1450617283950617,
+            -1.1450617283950617,
+            -1.1450617283950617,
+            -0.5617283950617284,
+            0.257716049382716,
+            0.5978223593964336,
+            0.7593021262002745,
+        ]
+        expected_osc = [
+            0.0,
+            0.0,
+            0.0,
+            0.29166666666666674,
+            0.4097222222222223,
+            0.1700531550068589,
+            0.08073988340192051,
+        ]
+        for actual_series, expected_series in (
+            (macd, expected_macd),
+            (signal, expected_signal),
+            (osc, expected_osc),
+        ):
+            for actual_value, expected_value in zip(actual_series, expected_series):
+                self.assertAlmostEqual(expected_value, actual_value, places=12)
     def test_projection_schema_separates_warmup_and_history_target(self):
         request = validate_market_bar_projection_request(
             {
