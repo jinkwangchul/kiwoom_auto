@@ -1638,6 +1638,114 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertNotIn("추정평단", summary)
         self.assertNotIn("추정매도가격", summary)
 
+    def test_range_replay_reprojects_only_avg_price_visualization_series(self):
+        import gui_indicator_follow_signal_validation_window as validation_window_module
+        from indicator_follow_signal_validation_visualization import (
+            FAMILY_PRICE_COMPARISON,
+            FAMILY_RSI,
+            LOWER_AXIS,
+            PRICE_AXIS,
+            ValidationFilterDescriptor,
+            ValidationIndicatorSeriesCache,
+        )
+
+        window = self._window()
+        window._result_settings_snapshot = (
+            window._signal_validation_seed.settings_snapshot
+        )
+        candles = [
+            {
+                "time": f"20260911140{index}00",
+                "open": 100 + index,
+                "high": 101 + index,
+                "low": 99 + index,
+                "close": 100 + index,
+                "volume": 1,
+            }
+            for index in range(4)
+        ]
+        window._calculation_candles = list(candles)
+        window._candles = list(candles)
+        window._chart_calculation_indexes = (0, 1, 2, 3)
+        window._entries = []
+        window._calculation_entries = []
+        window._validation_range = (1, 2)
+        window._range_replay_entries_available = True
+
+        avg_descriptor = ValidationFilterDescriptor(
+            identity="AVG",
+            family=FAMILY_PRICE_COMPARISON,
+            label="AVG",
+            axis=PRICE_AXIS,
+            sides=("SELL",),
+            series_keys=("AVG_PRICE",),
+            parameter_json=json.dumps({
+                "condition": {
+                    "target": "CLOSE",
+                    "compare_target": "AVG_PRICE",
+                }
+            }),
+            evidence_keys=(),
+        )
+        fixed_descriptor = ValidationFilterDescriptor(
+            identity="FIX",
+            family=FAMILY_RSI,
+            label="RSI",
+            axis=LOWER_AXIS,
+            sides=("BUY",),
+            series_keys=("RSI",),
+            parameter_json=json.dumps({
+                "period": 14,
+                "condition": {"target": "RSI"},
+            }),
+            evidence_keys=(),
+        )
+        calls = []
+
+        def cache_builder(candles_arg, _rules, descriptors_arg, *, entries=None):
+            calls.append((
+                len(candles_arg),
+                tuple(descriptor.identity for descriptor in descriptors_arg),
+            ))
+            if len(calls) == 1:
+                return ValidationIndicatorSeriesCache(
+                    candle_count=4,
+                    series=(
+                        ("AVG", "AVG_PRICE", (10.0, 20.0, 30.0, 40.0)),
+                        ("FIX", "RSI", (1.0, 2.0, 3.0, 4.0)),
+                    ),
+                )
+            return ValidationIndicatorSeriesCache(
+                candle_count=2,
+                series=(("AVG", "AVG_PRICE", (200.0, 300.0)),),
+            )
+
+        with patch.object(
+            validation_window_module,
+            "build_validation_filter_universe",
+            return_value=(avg_descriptor, fixed_descriptor),
+        ), patch.object(
+            validation_window_module,
+            "build_validation_indicator_cache",
+            side_effect=cache_builder,
+        ):
+            window._rebuild_visualization_data()
+
+        cache = window._visualization_cache
+        self.assertIsNotNone(cache)
+        self.assertEqual(
+            (10.0, 200.0, 300.0, 40.0),
+            cache.values_for("AVG", "AVG_PRICE"),
+        )
+        self.assertEqual(
+            (1.0, 2.0, 3.0, 4.0),
+            cache.values_for("FIX", "RSI"),
+        )
+        self.assertEqual(
+            [(4, ("AVG", "FIX")), (2, ("AVG",))],
+            calls,
+        )
+
     def _replay_snapshot(
         self,
         entries,

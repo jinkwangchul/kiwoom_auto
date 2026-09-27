@@ -7803,6 +7803,66 @@ class IndicatorFollowSignalValidationWindow(
                 descriptors,
                 entries=calculation_entries,
             )
+
+            bounds = self._effective_validation_range()
+            if self._range_replay_entries_available and bounds is not None:
+                range_candles, range_entries, _range_offset = (
+                    self._validation_range_projection()
+                )
+                average_descriptors = []
+                for descriptor in descriptors:
+                    parameters = descriptor.parameters
+                    condition = (
+                        parameters.get("condition")
+                        if isinstance(parameters, Mapping)
+                        else None
+                    )
+                    condition = condition if isinstance(condition, Mapping) else {}
+                    if (
+                        "AVG_PRICE" in descriptor.series_keys
+                        or str(condition.get("target") or "").upper() == "AVG_PRICE"
+                        or str(condition.get("compare_target") or "").upper()
+                        == "AVG_PRICE"
+                    ):
+                        average_descriptors.append(descriptor)
+
+                if range_candles and average_descriptors:
+                    range_cache = build_validation_indicator_cache(
+                        range_candles,
+                        rules,
+                        tuple(average_descriptors),
+                        entries=range_entries,
+                    )
+                    range_series = {
+                        (identity, channel): values
+                        for identity, channel, values in range_cache.series
+                    }
+                    range_indexes = self._chart_calculation_indexes[
+                        bounds[0] : bounds[1] + 1
+                    ]
+                    average_ids = {
+                        descriptor.identity for descriptor in average_descriptors
+                    }
+                    merged_series = []
+                    for identity, channel, values in full_cache.series:
+                        local_values = range_series.get((identity, channel))
+                        if (
+                            identity in average_ids
+                            and local_values is not None
+                            and len(local_values) == len(range_indexes)
+                        ):
+                            merged_values = list(values)
+                            for calculation_index, local_value in zip(
+                                range_indexes, local_values
+                            ):
+                                merged_values[calculation_index] = local_value
+                            values = tuple(merged_values)
+                        merged_series.append((identity, channel, values))
+                    full_cache = ValidationIndicatorSeriesCache(
+                        candle_count=full_cache.candle_count,
+                        series=tuple(merged_series),
+                    )
+
             cache = ValidationIndicatorSeriesCache(
                 candle_count=len(self._candles),
                 series=tuple(
