@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -1187,7 +1187,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                             "condition_expression": a_ast,
                             "conditions": [
                                 {"expression_id": "OCR_0", "target": "OSC", "operator": "TURN_DOWN"},
-                                {"expression_id": "GAP_0", "target": "CLOSE", "operator": "PERCENT_GAP", "compare_target": "AVG_PRICE"},
+                                {"expression_id": "GAP_0", "target": "CLOSE", "operator": "PERCENT_GAP", "compare_target": "AVG_PRICE", "direction": "UP", "value": 0.5, "compare_mode": "GTE"},
                             ],
                         }],
                     },
@@ -1205,7 +1205,7 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
                         "signal_expression": signal_expression,
                         "groups": [{
                             "conditions": [
-                                {"expression_id": "GAP_0", "target": "CLOSE", "operator": "PERCENT_GAP", "compare_target": "AVG_PRICE"},
+                                {"expression_id": "GAP_0", "target": "CLOSE", "operator": "PERCENT_GAP", "compare_target": "AVG_PRICE", "direction": "UP", "value": 0.5, "compare_mode": "GTE"},
                             ],
                         }],
                     },
@@ -1311,13 +1311,19 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("▪ 가격비교 ") for line in lines))
         self.assertTrue(any(line.startswith("▪ MACD ") for line in lines))
         self.assertTrue(any(line.startswith("▪ RSI ") for line in lines))
-        self.assertIn("추정평단 250,000 / 종가 252,500 / +1.00%", tooltip)
-        self.assertIn("현재 -709.65 / 이전 -700 / 이전2 -720", tooltip)
-        self.assertIn("▪ MACD -709.65", tooltip)
+        self.assertIn(
+            "▪ OCR 하락전환 / 현재 -709.65 / 이전 -700 / 이전2 -720",
+            tooltip,
+        )
+        self.assertIn(
+            "▪ 가격비교 평단가 대비 현재가 상향 0.5% 이상 / "
+            "추정평단 250,000.0 / 종가 252,500 / +1.00%",
+            tooltip,
+        )
+        self.assertIn("▪ MACD 0 이하 / -709.65", tooltip)
+        self.assertIn("▪ RSI 45 이하 / 42", tooltip)
         self.assertNotIn("240,000", tooltip)
         self.assertNotIn("통과", tooltip)
-        self.assertNotIn("하락전환", tooltip)
-        self.assertNotIn("이하", tooltip)
         self.assertNotIn("sell.signals", tooltip)
         self.assertNotIn("A·", tooltip)
         self.assertEqual("SELL · 09/13 10:01", tooltip.splitlines()[0])

@@ -2731,18 +2731,40 @@ class IndicatorFollowSignalValidationChartCanvas(
         value: float,
     ) -> str:
         captions: list[str] = []
-        sides: list[str] = []
+        side_support: dict[str, bool] = {}
+        side_order: list[str] = []
         for descriptor in descriptors:
             caption = self._descriptor_caption(descriptor)
             if caption not in captions:
                 captions.append(caption)
+            normalized_supported = {
+                str(side or "").strip().upper()
+                for side in descriptor.supported_sides
+                if str(side or "").strip()
+            }
+            normalized_unsupported = {
+                str(side or "").strip().upper()
+                for side in descriptor.unsupported_sides
+                if str(side or "").strip()
+            }
             for side in descriptor.sides:
-                side_label = {
-                    "BUY": "매수",
-                    "SELL": "매도",
-                }.get(str(side).upper(), str(side))
-                if side_label and side_label not in sides:
-                    sides.append(side_label)
+                normalized_side = str(side or "").strip().upper()
+                if not normalized_side:
+                    continue
+                if normalized_side not in side_order:
+                    side_order.append(normalized_side)
+                is_supported = (
+                    normalized_side in normalized_supported
+                    or (
+                        not normalized_supported
+                        and descriptor.supported
+                        and normalized_side not in normalized_unsupported
+                    )
+                )
+                side_support[normalized_side] = (
+                    side_support.get(normalized_side, False)
+                    or is_supported
+                )
 
         lines = [
             f"▪ {' / '.join(captions) if captions else '지표'}",
@@ -2751,21 +2773,17 @@ class IndicatorFollowSignalValidationChartCanvas(
                 f"{self._crosshair_number_text(value)}"
             ),
         ]
-        if sides:
-            lines.append(f"적용: {' / '.join(sides)}")
-
-        states = {
-            self._series_state(descriptor, channel)
-            for descriptor in descriptors
-        }
-        if "ACTIVE" in states:
-            lines.append("상태: 신호 기여")
-        elif "INACTIVE" in states:
-            lines.append("상태: 현재 신호 비기여")
-        elif "UNSUPPORTED" in states:
-            lines.append("상태: 검증 비평가")
-        elif "ERROR" in states:
-            lines.append("상태: 표시 오류")
+        if side_order:
+            side_labels = []
+            for side in side_order:
+                side_label = {
+                    "BUY": "매수",
+                    "SELL": "매도",
+                }.get(side, side)
+                if not side_support.get(side, False):
+                    side_label = f"{side_label}(NA)"
+                side_labels.append(side_label)
+            lines.append(" / ".join(side_labels))
         return "\n".join(lines)
 
     def series_tooltip_at(self, x: float, y: float) -> str:

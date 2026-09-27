@@ -137,10 +137,6 @@ def _buy_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def _enabled_text(enabled: Any, text: str) -> str:
-    return text if enabled is True else f"{text} (미사용)"
-
-
 def _sell_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
     groups = _state(ui_state, "sell_ui", "signal_conditions")
     a = _state(groups, "condition_a")
@@ -500,7 +496,113 @@ def chart_compare_mode_label(value: Any) -> str:
         "LTE": "이하", "<=": "이하",
         "GT": "초과", ">": "초과",
         "LT": "미만", "<": "미만",
+        "WITHIN": "이내",
+        "OUTSIDE": "이탈",
     }.get(token, chart_operator_label(token))
+
+
+def _condition_operand_label(value: Any) -> str:
+    token = str(value or "").strip().upper()
+    if token == "AVG_PRICE":
+        return "평단가"
+    if token in {"CLOSE", "CURRENT_PRICE"}:
+        return "현재가"
+    if token in {"SIGNAL_PRICE", "ORDER_PRICE"}:
+        return "신호가"
+    return chart_operand_label(token)
+
+
+def _sell_condition_setting_text(
+    condition: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    rules: Mapping[str, Any],
+) -> str:
+    operator_token = str(
+        condition.get("operator") or payload.get("operator") or ""
+    ).strip().upper()
+    target = str(condition.get("target") or "").strip().upper()
+    compare_target = str(
+        condition.get("compare_target") or ""
+    ).strip().upper()
+
+    if operator_token == "PERCENT_GAP":
+        basis = _condition_operand_label(compare_target)
+        comparison = _condition_operand_label(target)
+        direction = {
+            "UP": "상향",
+            "DOWN": "하향",
+            "BOTH": "상하",
+        }.get(str(condition.get("direction") or "").strip().upper(), "")
+        value = condition.get("value")
+        value_text = (
+            f"{_number_text(value)}%"
+            if value not in (None, "")
+            else ""
+        )
+        compare_mode = chart_compare_mode_label(condition.get("compare_mode"))
+        detail = " ".join(
+            part for part in (direction, value_text, compare_mode) if part
+        )
+        base = f"가격비교 {basis} 대비 {comparison}".strip()
+        return f"{base} {detail}".strip()
+
+    target_label = _condition_operand_label(target)
+    operator_label = chart_operator_label(operator_token)
+    if operator_token in {
+        "TURN_UP",
+        "TURN_DOWN",
+        "CROSS_UP",
+        "CROSS_DOWN",
+        "TREND_UP",
+        "TREND_DOWN",
+        "ZERO_CROSS_UP",
+        "ZERO_CROSS_DOWN",
+    }:
+        compare_label = (
+            _condition_operand_label(compare_target)
+            if compare_target
+            else ""
+        )
+        operands = " ".join(
+            part for part in (target_label, compare_label) if part
+        )
+        return f"{operands} {operator_label}".strip()
+
+    threshold = condition.get("value")
+    if threshold in (None, ""):
+        threshold = condition.get("threshold")
+    if threshold in (None, ""):
+        right_operand = payload.get("right_operand")
+        if isinstance(right_operand, Mapping):
+            right_source = str(
+                right_operand.get("source") or ""
+            ).strip().lower()
+            right_key = str(
+                right_operand.get("key") or ""
+            ).strip().lower()
+            if right_source in {"literal", "value"} or right_key == "value":
+                threshold = right_operand.get("value")
+
+    if target == "RSI":
+        period = condition.get("period")
+        if period in (None, ""):
+            indicators = rules.get("indicators")
+            if isinstance(indicators, Mapping):
+                rsi = indicators.get("rsi")
+                if isinstance(rsi, Mapping):
+                    period = rsi.get("period")
+        prefix = f"RSI({_number_text(period)})" if period not in (None, "") else "RSI"
+    elif target in {"MACD", "SIGNAL"}:
+        prefix = "MACD" if target == "MACD" else "시그널선"
+    else:
+        prefix = target_label
+
+    if compare_target:
+        compare_label = _condition_operand_label(compare_target)
+        return f"{prefix} {compare_label} {operator_label}".strip()
+    if threshold not in (None, ""):
+        return f"{prefix} {_number_text(threshold)} {operator_label}".strip()
+    return f"{prefix} {operator_label}".strip()
 
 
 def _number_text(value: Any) -> str:
@@ -552,8 +654,21 @@ def _condition_actual_evidence(payload: Mapping[str, Any]) -> str:
                 percent_text = f"{(comparison - basis) / basis * 100.0:+.2f}%"
         except (TypeError, ValueError):
             pass
+
+        left_display = left_value
+        right_display = right_value
+        if left_label == "추정평단":
+            try:
+                left_display = f"{float(str(left_value).replace(',', '')):,.1f}"
+            except (TypeError, ValueError):
+                pass
+        if right_label == "추정평단":
+            try:
+                right_display = f"{float(str(right_value).replace(',', '')):,.1f}"
+            except (TypeError, ValueError):
+                pass
         return (
-            f"{right_label} {right_value} / {left_label} {left_value} / {percent_text}"
+            f"{right_label} {right_display} / {left_label} {left_display} / {percent_text}"
         )
 
     if operator in {"TURN_UP", "TURN_DOWN"} and snapshots:
@@ -877,7 +992,22 @@ def _sell_evidence_records(
                 if isinstance(condition, Mapping)
             }
             for prefix, payloads in selected_by_prefix.items():
-                label = _SELL_EVIDENCE_FILTERS.get(prefix, prefix or "조건")
+                base_label = _SELL_EVIDENCE_FILTERS.get(prefix, prefix or "조건")
+                criterion_labels: list[str] = []
+                for payload in payloads:
+                    expression_id = str(
+                        payload.get("expression_id") or ""
+                    ).strip().upper()
+                    condition = rule_conditions.get(expression_id, {})
+                    criterion = _sell_condition_setting_text(
+                        condition if isinstance(condition, Mapping) else {},
+                        payload,
+                        rules,
+                    )
+                    if criterion and criterion not in criterion_labels:
+                        criterion_labels.append(criterion)
+                label = " + ".join(criterion_labels) if criterion_labels else base_label
+
                 if prefix == "GAP":
                     actual = _condition_actual_evidence(payloads[0])
                 elif prefix == "OCR":
@@ -937,9 +1067,15 @@ def signal_evidence_lines_for_entry(
     settings_rules: Mapping[str, Any],
 ) -> tuple[str, ...]:
     """Return only operator-visible evidence for one already-produced signal."""
+    records = signal_evidence_records_for_entry(entry, settings_rules)
+    if entry.evaluation_side == "SELL":
+        return tuple(
+            f"▪ {record.label} / {record.actual}"
+            for record in records
+        )
     return tuple(
         f"▪ {record.label} {record.actual}"
-        for record in signal_evidence_records_for_entry(entry, settings_rules)
+        for record in records
     )
 
 

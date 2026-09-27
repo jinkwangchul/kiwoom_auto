@@ -144,7 +144,9 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         price_tooltip = canvas.series_tooltip_at(hover_x, price_y)
         self.assertIn("현재가 20이평 상향돌파", price_tooltip)
         self.assertIn("20이평:", price_tooltip)
-        self.assertIn("적용: 매수", price_tooltip)
+        self.assertIn("매수", price_tooltip)
+        self.assertNotIn("적용:", price_tooltip)
+        self.assertNotIn("상태:", price_tooltip)
 
         pane_by_family = {
             pane["family"]: pane
@@ -347,6 +349,22 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         )
         self.assertEqual(
             canvas._descriptor_caption(error_descriptor),
+            canvas._styled_descriptor_caption(error_descriptor),
+        )
+        unsupported_tooltip = canvas._series_tooltip_text(
+            [unsupported_descriptor],
+            "MA30",
+            123.0,
+        )
+        self.assertIn("매도(NA)", unsupported_tooltip)
+        self.assertNotIn("상태:", unsupported_tooltip)
+        self.assertNotIn("적용:", unsupported_tooltip)
+        self.assertNotIn(
+            "[",
+            canvas._styled_descriptor_caption(unsupported_descriptor),
+        )
+        self.assertNotIn(
+            "[",
             canvas._styled_descriptor_caption(error_descriptor),
         )
 

@@ -664,7 +664,7 @@ class ValidationVisualizationDataTest(unittest.TestCase):
 
         records = signal_evidence_records_for_entry(entry, rules)
         self.assertEqual(1, len(records))
-        self.assertEqual("MACD", records[0].label)
+        self.assertEqual("MACD 0 이하", records[0].label)
 
         active = active_filter_identities_for_entry(
             entry,
