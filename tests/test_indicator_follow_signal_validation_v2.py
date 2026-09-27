@@ -620,6 +620,156 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             window.backtest_trust_metadata["execution_model"]["model_name"],
         )
 
+    def test_referenced_empty_sell_group_toast_is_operator_korean_only(self):
+        window = self._window()
+        state = window.collect_indicator_follow_ui_state()
+        state["basic"]["sell_signal_expr_line"] = "A"
+        condition_a = state["sell_ui"]["signal_conditions"]["condition_a"]
+        for key in tuple(condition_a):
+            if str(key).endswith("_check"):
+                condition_a[key] = False
+        runs = []
+        window.validation_run_requested.connect(runs.append)
+
+        with patch.object(
+            window,
+            "collect_indicator_follow_ui_state",
+            return_value=state,
+        ), patch(
+            "gui_indicator_follow_signal_validation_window.show_toast"
+        ) as toast:
+            self.assertIsNone(window.request_validation())
+
+        toast.assert_called_once()
+        message = toast.call_args.args[1]
+        self.assertEqual(
+            "매도 신호조건 A가 조합식에 포함되어 있지만 적용된 필터가 없습니다.",
+            message,
+        )
+        self.assertNotIn("sell condition", message)
+        self.assertEqual([], runs)
+
+    def test_sell_validation_internal_warnings_are_localized_for_operator(self):
+        localize = (
+            IndicatorFollowSignalValidationWindow._sell_input_error_toast_message
+        )
+        cases = {
+            "sell condition A is referenced by expression but has no active conditions":
+                "매도 신호조건 A가 조합식에 포함되어 있지만 적용된 필터가 없습니다.",
+            "sell condition B candidate group was not generated":
+                "매도 신호조건 B를 구성할 수 없습니다. 필터 설정을 확인하세요.",
+            "sell condition A OCR convert bar is not a non-negative integer":
+                "매도조건 A의 OCR 전환 봉 수는 0 이상의 정수여야 합니다.",
+            "sell condition A OCR turn is not mapped: 'X'":
+                "매도조건 A의 OCR 전환방향을 확인하세요. (X)",
+            "sell condition A OCR compare is not mapped: 'X'":
+                "매도조건 A의 OCR 비교조건을 확인하세요. (X)",
+            "sell condition A OCR threshold is not numeric":
+                "매도조건 A의 OCR 기준값은 숫자여야 합니다.",
+            "sell condition A RSI period or threshold is missing":
+                "매도조건 A의 RSI 기간과 기준값을 입력하세요.",
+            "sell condition A RSI period is not numeric":
+                "매도조건 A의 RSI 기간은 1 이상의 숫자여야 합니다.",
+            "sell condition A RSI compare is not mapped: 'X'":
+                "매도조건 A의 RSI 비교조건을 확인하세요. (X)",
+            "sell condition A RSI threshold is not numeric":
+                "매도조건 A의 RSI 기준값은 숫자여야 합니다.",
+            "sell condition A GAP 가격 기준 재선택 필요":
+                "매도조건 A의 가격비교 가격기준을 다시 선택하세요.",
+            "sell condition B GAP 동일 가격 기준 비교는 허용되지 않음":
+                "매도조건 B의 가격비교에서 왼쪽과 오른쪽에 같은 가격기준을 사용할 수 없습니다.",
+            "sell condition C GAP policy is invalid":
+                "매도조건 C의 가격비교 방향·비교조건·값을 확인하세요.",
+            "sell condition A GAP BOTH requires WITHIN/OUTSIDE":
+                "매도조건 A의 가격비교가 ‘상하’일 때는 ‘이내’ 또는 ‘이탈’을 선택하세요.",
+            "sell condition B GAP directional policy requires GTE/LTE":
+                "매도조건 B의 가격비교가 ‘상향/하향’일 때는 ‘이상’ 또는 ‘이하’를 선택하세요.",
+            "sell condition B Price Box policy is invalid":
+                "매도조건 B의 가격박스 방향·부호·값·비교조건을 확인하세요.",
+            "sell condition B Bollinger direction is not mapped: 'X'":
+                "매도조건 B의 볼린저밴드 방향을 확인하세요. (X)",
+            "sell condition B Bollinger compare is not mapped: 'X'":
+                "매도조건 B의 볼린저밴드 비교조건을 확인하세요. (X)",
+            "sell condition B Bollinger sign is not mapped: 'X'":
+                "매도조건 B의 볼린저밴드 +/- 부호를 확인하세요. (X)",
+            "sell condition B Bollinger offset is not numeric":
+                "매도조건 B의 볼린저밴드 기준값은 숫자여야 합니다.",
+            "sell condition C MACD target is not mapped: 'X'":
+                "매도조건 C의 MACD 대상(MACD선/시그널선)을 확인하세요. (X)",
+            "sell condition C MACD compare is not mapped: 'X'":
+                "매도조건 C의 MACD 비교조건을 확인하세요. (X)",
+            "sell condition C MACD value is not numeric":
+                "매도조건 C의 MACD 기준값은 숫자여야 합니다.",
+            "sell condition C ARRAY first period is not numeric":
+                "매도조건 C의 첫 번째 이평 기간은 1 이상의 숫자여야 합니다.",
+            "sell condition C ARRAY second period is not numeric":
+                "매도조건 C의 두 번째 이평 기간은 1 이상의 숫자여야 합니다.",
+            "sell condition C ARRAY third period is not numeric":
+                "매도조건 C의 세 번째 이평 기간은 1 이상의 숫자여야 합니다.",
+            "sell condition C ARRAY first compare is not mapped: 'X'":
+                "매도조건 C의 첫 번째 이평 비교조건을 확인하세요. (X)",
+            "sell condition C ARRAY second compare is not mapped: 'X'":
+                "매도조건 C의 두 번째 이평 비교조건을 확인하세요. (X)",
+        }
+        for internal, expected in cases.items():
+            with self.subTest(internal=internal):
+                actual = localize(
+                    ValueError("SELL_VALIDATION_INPUT_ERROR: " + internal)
+                )
+                self.assertEqual(expected, actual)
+
+    def test_sell_expression_reason_codes_are_localized_for_operator(self):
+        localize = (
+            IndicatorFollowSignalValidationWindow._sell_input_error_toast_message
+        )
+        cases = {
+            "CONDITION_EXPRESSION_EMPTY":
+                "매도 신호 조합식이 비어 있습니다.",
+            "CONDITION_EXPRESSION_TOKEN_UNSUPPORTED:X":
+                "매도 신호 조합식에 사용할 수 없는 항목이 있습니다. (X)",
+            "CONDITION_EXPRESSION_IDENTIFIER_MISSING":
+                "매도 신호 조합식에 A/B/C 조건이 없습니다.",
+            "CONDITION_EXPRESSION_IDENTIFIER_LIMIT_EXCEEDED":
+                "매도 신호 조합식의 조건 수가 허용 범위를 초과했습니다.",
+            "CONDITION_EXPRESSION_DUPLICATE_IDENTIFIER":
+                "매도 신호 조합식에서 같은 조건을 중복 사용할 수 없습니다.",
+            "CONDITION_EXPRESSION_OPERAND_MISSING":
+                "매도 신호 조합식의 연산자 뒤에 조건이 없습니다.",
+            "CONDITION_EXPRESSION_PARENTHESIS_UNBALANCED":
+                "매도 신호 조합식의 괄호 짝이 맞지 않습니다.",
+            "CONDITION_EXPRESSION_OPERAND_INVALID:X":
+                "매도 신호 조합식의 조건 위치에 잘못된 항목이 있습니다. (X)",
+            "CONDITION_EXPRESSION_TRAILING_TOKEN:X":
+                "매도 신호 조합식 끝에 처리할 수 없는 항목이 있습니다. (X)",
+        }
+        for reason, expected_reason in cases.items():
+            with self.subTest(reason=reason):
+                actual = localize(
+                    ValueError(
+                        "SELL_VALIDATION_INPUT_ERROR: "
+                        "sell signal expression is invalid: "
+                        + reason
+                    )
+                )
+                self.assertEqual(
+                    "매도 신호 조합식이 올바르지 않습니다. " + expected_reason,
+                    actual,
+                )
+
+        multi = localize(
+            ValueError(
+                "SELL_VALIDATION_INPUT_ERROR: "
+                "sell condition A is referenced by expression but has no active conditions; "
+                "sell condition C MACD value is not numeric"
+            )
+        )
+        self.assertEqual(
+            "매도 신호조건 A가 조합식에 포함되어 있지만 적용된 필터가 없습니다.\n"
+            "매도조건 C의 MACD 기준값은 숫자여야 합니다.",
+            multi,
+        )
+        self.assertNotIn("sell condition", multi)
+
     def _replay_snapshot(
         self,
         entries,

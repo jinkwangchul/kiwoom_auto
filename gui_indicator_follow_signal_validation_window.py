@@ -6237,15 +6237,228 @@ class IndicatorFollowSignalValidationWindow(
         return run_request
 
     @staticmethod
+    def _operator_warning_detail(value: object) -> str:
+        detail = str(value or "").strip()
+        if (
+            len(detail) >= 2
+            and detail[0] == detail[-1]
+            and detail[0] in {"'", '"'}
+        ):
+            detail = detail[1:-1]
+        return detail
+
+    @staticmethod
+    def _condition_expression_reason_to_operator_text(reason: object) -> str:
+        raw = str(reason or "").strip()
+        code, separator, detail = raw.partition(":")
+        messages = {
+            "CONDITION_EXPRESSION_EMPTY":
+                "매도 신호 조합식이 비어 있습니다.",
+            "CONDITION_EXPRESSION_TOKEN_UNSUPPORTED":
+                "매도 신호 조합식에 사용할 수 없는 항목이 있습니다.",
+            "CONDITION_EXPRESSION_IDENTIFIER_MISSING":
+                "매도 신호 조합식에 A/B/C 조건이 없습니다.",
+            "CONDITION_EXPRESSION_IDENTIFIER_LIMIT_EXCEEDED":
+                "매도 신호 조합식의 조건 수가 허용 범위를 초과했습니다.",
+            "CONDITION_EXPRESSION_DUPLICATE_IDENTIFIER":
+                "매도 신호 조합식에서 같은 조건을 중복 사용할 수 없습니다.",
+            "CONDITION_EXPRESSION_OPERAND_MISSING":
+                "매도 신호 조합식의 연산자 뒤에 조건이 없습니다.",
+            "CONDITION_EXPRESSION_PARENTHESIS_UNBALANCED":
+                "매도 신호 조합식의 괄호 짝이 맞지 않습니다.",
+            "CONDITION_EXPRESSION_OPERAND_INVALID":
+                "매도 신호 조합식의 조건 위치에 잘못된 항목이 있습니다.",
+            "CONDITION_EXPRESSION_TRAILING_TOKEN":
+                "매도 신호 조합식 끝에 처리할 수 없는 항목이 있습니다.",
+        }
+        message = messages.get(code)
+        if message is None:
+            return "매도 신호 조합식을 확인하세요."
+        if separator and detail:
+            return (
+                message
+                + " ("
+                + IndicatorFollowSignalValidationWindow._operator_warning_detail(
+                    detail
+                )
+                + ")"
+            )
+        return message
+
+    @staticmethod
+    def _sell_validation_warning_to_operator_text(warning: object) -> str:
+        text = str(warning or "").strip()
+        expression_prefix = "sell signal expression is invalid:"
+        if text.startswith(expression_prefix):
+            reason = text[len(expression_prefix):].strip()
+            return (
+                "매도 신호 조합식이 올바르지 않습니다. "
+                + IndicatorFollowSignalValidationWindow
+                ._condition_expression_reason_to_operator_text(reason)
+            )
+
+        for group_name in ("A", "B", "C"):
+            prefix = f"sell condition {group_name} "
+            if not text.startswith(prefix):
+                continue
+            body = text[len(prefix):].strip()
+
+            generic_messages = {
+                "is referenced by expression but has no active conditions":
+                    f"매도 신호조건 {group_name}가 조합식에 포함되어 있지만 적용된 필터가 없습니다.",
+                "candidate group was not generated":
+                    f"매도 신호조건 {group_name}를 구성할 수 없습니다. 필터 설정을 확인하세요.",
+                "GAP 가격 기준 재선택 필요":
+                    f"매도조건 {group_name}의 가격비교 가격기준을 다시 선택하세요.",
+                "GAP 동일 가격 기준 비교는 허용되지 않음":
+                    f"매도조건 {group_name}의 가격비교에서 왼쪽과 오른쪽에 같은 가격기준을 사용할 수 없습니다.",
+                "GAP policy is invalid":
+                    f"매도조건 {group_name}의 가격비교 방향·비교조건·값을 확인하세요.",
+                "GAP BOTH requires WITHIN/OUTSIDE":
+                    f"매도조건 {group_name}의 가격비교가 ‘상하’일 때는 ‘이내’ 또는 ‘이탈’을 선택하세요.",
+                "GAP directional policy requires GTE/LTE":
+                    f"매도조건 {group_name}의 가격비교가 ‘상향/하향’일 때는 ‘이상’ 또는 ‘이하’를 선택하세요.",
+            }
+            if body in generic_messages:
+                return generic_messages[body]
+
+            if group_name == "A":
+                exact_messages = {
+                    "OCR convert bar is not a non-negative integer":
+                        "매도조건 A의 OCR 전환 봉 수는 0 이상의 정수여야 합니다.",
+                    "OCR threshold is not numeric":
+                        "매도조건 A의 OCR 기준값은 숫자여야 합니다.",
+                    "RSI period or threshold is missing":
+                        "매도조건 A의 RSI 기간과 기준값을 입력하세요.",
+                    "RSI period is not numeric":
+                        "매도조건 A의 RSI 기간은 1 이상의 숫자여야 합니다.",
+                    "RSI threshold is not numeric":
+                        "매도조건 A의 RSI 기준값은 숫자여야 합니다.",
+                }
+                if body in exact_messages:
+                    return exact_messages[body]
+                for internal_prefix, operator_label in (
+                    ("OCR turn is not mapped:", "OCR 전환방향"),
+                    ("OCR compare is not mapped:", "OCR 비교조건"),
+                    ("RSI compare is not mapped:", "RSI 비교조건"),
+                ):
+                    if body.startswith(internal_prefix):
+                        detail = (
+                            IndicatorFollowSignalValidationWindow
+                            ._operator_warning_detail(
+                                body[len(internal_prefix):]
+                            )
+                        )
+                        return (
+                            f"매도조건 A의 {operator_label}을 확인하세요."
+                            + (f" ({detail})" if detail else "")
+                        )
+
+            if group_name == "B":
+                exact_messages = {
+                    "Price Box policy is invalid":
+                        "매도조건 B의 가격박스 방향·부호·값·비교조건을 확인하세요.",
+                    "Bollinger offset is not numeric":
+                        "매도조건 B의 볼린저밴드 기준값은 숫자여야 합니다.",
+                }
+                if body in exact_messages:
+                    return exact_messages[body]
+                if body.startswith("Bollinger sign is not mapped:"):
+                    detail = (
+                        IndicatorFollowSignalValidationWindow
+                        ._operator_warning_detail(
+                            body[len("Bollinger sign is not mapped:"):]
+                        )
+                    )
+                    return (
+                        "매도조건 B의 볼린저밴드 +/- 부호를 확인하세요."
+                        + (f" ({detail})" if detail else "")
+                    )
+                for internal_prefix, operator_label in (
+                    ("Bollinger direction is not mapped:", "볼린저밴드 방향"),
+                    ("Bollinger compare is not mapped:", "볼린저밴드 비교조건"),
+                ):
+                    if body.startswith(internal_prefix):
+                        detail = (
+                            IndicatorFollowSignalValidationWindow
+                            ._operator_warning_detail(
+                                body[len(internal_prefix):]
+                            )
+                        )
+                        return (
+                            f"매도조건 B의 {operator_label}을 확인하세요."
+                            + (f" ({detail})" if detail else "")
+                        )
+
+            if group_name == "C":
+                exact_messages = {
+                    "MACD value is not numeric":
+                        "매도조건 C의 MACD 기준값은 숫자여야 합니다.",
+                    "ARRAY first period is not numeric":
+                        "매도조건 C의 첫 번째 이평 기간은 1 이상의 숫자여야 합니다.",
+                    "ARRAY second period is not numeric":
+                        "매도조건 C의 두 번째 이평 기간은 1 이상의 숫자여야 합니다.",
+                    "ARRAY third period is not numeric":
+                        "매도조건 C의 세 번째 이평 기간은 1 이상의 숫자여야 합니다.",
+                }
+                if body in exact_messages:
+                    return exact_messages[body]
+                for internal_prefix, operator_label in (
+                    (
+                        "MACD target is not mapped:",
+                        "MACD 대상(MACD선/시그널선)",
+                    ),
+                    ("MACD compare is not mapped:", "MACD 비교조건"),
+                    ("ARRAY first compare is not mapped:", "첫 번째 이평 비교조건"),
+                    ("ARRAY second compare is not mapped:", "두 번째 이평 비교조건"),
+                ):
+                    if body.startswith(internal_prefix):
+                        detail = (
+                            IndicatorFollowSignalValidationWindow
+                            ._operator_warning_detail(
+                                body[len(internal_prefix):]
+                            )
+                        )
+                        return (
+                            f"매도조건 C의 {operator_label}을 확인하세요."
+                            + (f" ({detail})" if detail else "")
+                        )
+
+            return f"매도 신호조건 {group_name}의 필터 설정을 확인하세요."
+
+        if text.startswith("sell signal"):
+            return "매도 신호 조합식을 확인하세요."
+        if text.startswith("sell condition"):
+            return "매도 신호조건의 필터 설정을 확인하세요."
+        return text
+
+    @staticmethod
     def _sell_input_error_toast_message(error: ValueError) -> str:
         message = str(error or "")
         if message.startswith("매도 신호 조합식 오류:"):
             reason = message.split(":", 1)[1].strip()
-            return f"매도 신호 조합식을 확인하세요.\n{reason}"
+            return (
+                "매도 신호 조합식이 올바르지 않습니다. "
+                + IndicatorFollowSignalValidationWindow
+                ._condition_expression_reason_to_operator_text(reason)
+            )
         if message.startswith("가격 기준 재선택 필요:"):
             return message.split(":", 1)[1].strip()
         if message.startswith("SELL_VALIDATION_INPUT_ERROR:"):
-            return message.split(":", 1)[1].strip()
+            raw_warnings = [
+                item.strip()
+                for item in message.split(":", 1)[1].split(";")
+                if item.strip()
+            ]
+            localized: list[str] = []
+            for warning in raw_warnings:
+                operator_text = (
+                    IndicatorFollowSignalValidationWindow
+                    ._sell_validation_warning_to_operator_text(warning)
+                )
+                if operator_text and operator_text not in localized:
+                    localized.append(operator_text)
+            return "\n".join(localized) or "매도 신호 설정을 확인하세요."
         if message.startswith("BUY_BOLLINGER_SIGN_SELECTION_REQUIRED:"):
             return message.split(":", 1)[1].strip()
         return ""
