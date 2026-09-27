@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QPoint, QRectF
+from PyQt5.QtCore import QPoint, QRectF, Qt
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtWidgets import QApplication, QHBoxLayout, QScrollArea, QWidget
 
@@ -514,7 +514,6 @@ class StaticValidationVisualizationGeometryTest(unittest.TestCase):
         )
         self.assertEqual(248, canvas.price_scale().plot_bottom)
 
-
     def test_candle_render_is_clipped_to_price_plot_before_lower_panes(self):
         candles = [{
             "time": "20260918090000",
@@ -778,6 +777,210 @@ class StaticValidationVisualizationGeometryTest(unittest.TestCase):
         ))
         assert_legend_matches_rendered_series()
 
+    def test_unsupported_macd_signal_keeps_distinct_visible_channel_styles(self):
+        candles = _candles([100.0 + index for index in range(30)])
+        descriptor = ValidationFilterDescriptor(
+            identity="MACD-UNSUPPORTED",
+            family=FAMILY_MACD_SIGNAL,
+            label=FAMILY_MACD_SIGNAL,
+            axis=LOWER_AXIS,
+            sides=("SELL",),
+            series_keys=("MACD", "SIGNAL", "CRITERION"),
+            parameter_json='{"criterion_label":"MACD 0 이상","fast":12,"signal":9,"slow":26}',
+            evidence_keys=("fixture",),
+            supported_sides=(),
+            unsupported_sides=("SELL",),
+            supported=False,
+            unavailable_reason="VALIDATION_FILTER_NOT_EVALUATED",
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            (
+                (
+                    descriptor.identity,
+                    "MACD",
+                    tuple(float(index % 7 - 3) for index in range(len(candles))),
+                ),
+                (
+                    descriptor.identity,
+                    "SIGNAL",
+                    tuple(float(index % 5 - 2) for index in range(len(candles))),
+                ),
+                (
+                    descriptor.identity,
+                    "CRITERION",
+                    tuple(0.0 for _ in candles),
+                ),
+            ),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(descriptor,),
+            visualization_cache=cache,
+        )
+        self.widgets.append(canvas)
+
+        styles = {
+            record["channel"]: record
+            for record in canvas.visualization_style_records()
+        }
+        self.assertEqual("UNSUPPORTED", styles["MACD"]["state"])
+        self.assertEqual(int(Qt.SolidLine), styles["MACD"]["pen_style"])
+        self.assertEqual(int(Qt.DashLine), styles["SIGNAL"]["pen_style"])
+        self.assertEqual(int(Qt.DotLine), styles["CRITERION"]["pen_style"])
+        self.assertNotEqual("#4b5563", styles["MACD"]["color"])
+        self.assertNotEqual("#4b5563", styles["SIGNAL"]["color"])
+        self.assertNotEqual(styles["MACD"]["color"], styles["SIGNAL"]["color"])
+        self.assertGreater(styles["MACD"]["alpha"], 135)
+        self.assertLess(styles["MACD"]["alpha"], 255)
+
+    def test_legend_separator_uses_fixed_side_padding(self):
+        canvas = self._canvas((FAMILY_RSI,))
+        metrics = QFontMetrics(canvas.font())
+
+        separator_text, padding, slot_width = canvas._legend_separator_layout(
+            metrics,
+            "  |  ",
+        )
+
+        self.assertEqual("|", separator_text)
+        self.assertEqual(8.0, padding)
+        self.assertEqual(
+            metrics.horizontalAdvance("|") + 16.0,
+            slot_width,
+        )
+
+    def test_ma_arrangement_legend_pairs_each_line_with_period_label(self):
+        candles = _candles([100.0 + index for index in range(20)])
+        descriptor = ValidationFilterDescriptor(
+            identity="MA-ARRANGEMENT",
+            family="MA_ARRANGEMENT",
+            label="이평배열",
+            axis=PRICE_AXIS,
+            sides=("SELL",),
+            series_keys=("MA5", "MA20", "MA60"),
+            parameter_json='{"periods":[5,20,60]}',
+            evidence_keys=(),
+            supported_sides=("SELL",),
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            tuple(
+                (
+                    descriptor.identity,
+                    channel,
+                    tuple(100.0 + index for index in range(len(candles))),
+                )
+                for channel in descriptor.series_keys
+            ),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(descriptor,),
+            visualization_cache=cache,
+        )
+        self.widgets.append(canvas)
+
+        blocks = canvas._price_legend_blocks("SELL")
+
+        self.assertEqual(1, len(blocks))
+        self.assertEqual("", blocks[0]["caption"])
+        self.assertEqual((), blocks[0]["pens"])
+        self.assertEqual(
+            ["5이평", "20이평", "60이평"],
+            [
+                label
+                for label, _pen in blocks[0]["segments"]
+            ],
+        )
+        self.assertEqual(3, len(blocks[0]["segments"]))
+        rows = canvas._price_legend_rows()
+        self.assertEqual(1, len(rows[0][2]))
+
+    def test_price_legend_rows_group_filters_by_buy_and_sell(self):
+        candles = _candles([100.0 + index for index in range(20)])
+        buy_descriptor = ValidationFilterDescriptor(
+            identity="BUY-MA20",
+            family=FAMILY_MOVING_AVERAGE,
+            label="이동평균",
+            axis=PRICE_AXIS,
+            sides=("BUY",),
+            series_keys=("MA20",),
+            parameter_json='{"periods":[20]}',
+            evidence_keys=(),
+            supported_sides=("BUY",),
+        )
+        sell_descriptor = ValidationFilterDescriptor(
+            identity="SELL-MA60",
+            family=FAMILY_MOVING_AVERAGE,
+            label="이동평균",
+            axis=PRICE_AXIS,
+            sides=("SELL",),
+            series_keys=("MA60",),
+            parameter_json='{"periods":[60]}',
+            evidence_keys=(),
+            supported_sides=("SELL",),
+        )
+        shared_descriptor = ValidationFilterDescriptor(
+            identity="SHARED-MA120",
+            family=FAMILY_MOVING_AVERAGE,
+            label="이동평균",
+            axis=PRICE_AXIS,
+            sides=("BUY", "SELL"),
+            series_keys=("MA120",),
+            parameter_json='{"periods":[120]}',
+            evidence_keys=(),
+            supported_sides=("BUY", "SELL"),
+        )
+        cache = ValidationIndicatorSeriesCache(
+            len(candles),
+            (
+                (
+                    buy_descriptor.identity,
+                    "MA20",
+                    tuple(100.0 for _ in candles),
+                ),
+                (
+                    sell_descriptor.identity,
+                    "MA60",
+                    tuple(101.0 for _ in candles),
+                ),
+                (
+                    shared_descriptor.identity,
+                    "MA120",
+                    tuple(102.0 for _ in candles),
+                ),
+            ),
+        )
+        canvas = IndicatorFollowSignalValidationChartCanvas(
+            candles,
+            [],
+            visualization_descriptors=(
+                buy_descriptor,
+                sell_descriptor,
+                shared_descriptor,
+            ),
+            visualization_cache=cache,
+        )
+        self.widgets.append(canvas)
+
+        rows = canvas._price_legend_rows()
+
+        self.assertEqual(
+            ["▪ 매수 :", "▪ 매도 :"],
+            [row[1] for row in rows],
+        )
+        self.assertEqual(
+            {"이동평균(20)", "이동평균(120)"},
+            {block["caption"] for block in rows[0][2]},
+        )
+        self.assertEqual(
+            {"이동평균(60)", "이동평균(120)"},
+            {block["caption"] for block in rows[1][2]},
+        )
+
     def test_price_legend_paints_actual_series_color_swatch(self):
         canvas = self._canvas(())
         canvas.show()
@@ -794,9 +997,16 @@ class StaticValidationVisualizationGeometryTest(unittest.TestCase):
         canvas.render(pixmap)
         image = pixmap.toImage()
 
-        swatch_left = round(canvas.plot_left + 4)
+        metrics = QFontMetrics(canvas.font())
+        first_row_prefix = canvas._price_legend_rows()[0][1]
+        swatch_left = round(
+            canvas.plot_left
+            + 4
+            + metrics.horizontalAdvance(first_row_prefix)
+            + 8
+        )
         swatch_center_y = round(
-            scale.plot_top + 2 + (QFontMetrics(canvas.font()).height() + 2) / 2
+            scale.plot_top + 2 + (metrics.height() + 2) / 2
         )
         rendered = {
             image.pixelColor(x, y).name()

@@ -341,12 +341,14 @@ class ValidationEvidenceInteractionTest(unittest.TestCase):
         }
         self.assertEqual(2, records["ACTIVE-MA"]["pen_width"])
         self.assertLess(records["INACTIVE-RSI"]["alpha"], 255)
-        self.assertIn("[미지원]", canvas._styled_descriptor_caption(
-            unsupported_descriptor
-        ))
-        self.assertIn("[오류]", canvas._styled_descriptor_caption(
-            error_descriptor
-        ))
+        self.assertEqual(
+            canvas._descriptor_caption(unsupported_descriptor),
+            canvas._styled_descriptor_caption(unsupported_descriptor),
+        )
+        self.assertEqual(
+            canvas._descriptor_caption(error_descriptor),
+            canvas._styled_descriptor_caption(error_descriptor),
+        )
 
         QTest.mouseClick(canvas, Qt.LeftButton, pos=marker_pos)
         self.app.processEvents()

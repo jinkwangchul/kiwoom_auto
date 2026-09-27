@@ -66,6 +66,7 @@ from indicator_follow_validation_timeframe import (
 )
 from gui_indicator_follow_timeframe_combo import IndicatorFollowTimeframeComboBox
 from indicator_follow_signal_validation_visualization import (
+    FAMILY_MA_ARRANGEMENT,
     FAMILY_MACD_SIGNAL,
     FAMILY_OCR_OSC,
     FAMILY_RSI,
@@ -1227,6 +1228,7 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._lower_boundary_drag_index: int | None = None
         self._reset_lower_pane_layout_state()
         self._price_series_groups = self._build_series_groups(PRICE_AXIS)
+        self._price_legend_series_groups = self._price_series_groups
         self._lower_series_groups = {
             family: self._build_series_groups(LOWER_AXIS, family=family)
             for family in self._lower_families
@@ -1312,6 +1314,7 @@ class IndicatorFollowSignalValidationChartCanvas(
         if self._lower_families != previous_lower_families:
             self._reset_lower_pane_layout_state()
         self._price_series_groups = self._build_series_groups(PRICE_AXIS)
+        self._price_legend_series_groups = self._price_series_groups
         self._lower_series_groups = {
             family: self._build_series_groups(LOWER_AXIS, family=family)
             for family in self._lower_families
@@ -1566,13 +1569,21 @@ class IndicatorFollowSignalValidationChartCanvas(
             x = self._x_for_index(index)
             blockers.append(QRectF(x - 10.0, y - 12.0, 20.0, 24.0))
 
-        if self._legend_entries(PRICE_AXIS):
+        price_legend_rows = self._price_legend_rows()
+        if price_legend_rows:
             metrics = QFontMetrics(self.font())
+            line_height = metrics.height() + 2
+            row_gap = 2
+            legend_height = (
+                len(price_legend_rows) * line_height
+                + max(0, len(price_legend_rows) - 1) * row_gap
+                + 4
+            )
             blockers.append(QRectF(
                 float(self.plot_left),
                 float(scale.plot_top),
                 float(max(1, self.width() - self._RIGHT - self.plot_left)),
-                float(metrics.height() + 8),
+                float(legend_height),
             ))
         return blockers
 
@@ -2036,20 +2047,14 @@ class IndicatorFollowSignalValidationChartCanvas(
         self,
         descriptor: ValidationFilterDescriptor,
     ) -> str:
-        caption = self._descriptor_caption(descriptor)
-        state = self._descriptor_display_state(descriptor)
-        if state == "ERROR":
-            return f"{caption} [오류]"
-        if state == "UNSUPPORTED":
-            return f"{caption} [미지원]"
-        return caption
+        return self._descriptor_caption(descriptor)
 
     def _descriptor_legend_line_pens(
         self,
         descriptor: ValidationFilterDescriptor,
     ) -> tuple[tuple[str, QPen], ...]:
         groups = (
-            self._price_series_groups
+            self._price_legend_series_groups
             if descriptor.axis == PRICE_AXIS
             else self._lower_series_groups.get(
                 self._display_lower_family(descriptor.family),
@@ -2062,10 +2067,8 @@ class IndicatorFollowSignalValidationChartCanvas(
                 continue
             if descriptor.family == FAMILY_OCR_OSC and channel == "OSC":
                 continue
-            result.append((
-                channel,
-                self._combined_series_pen(list(owners), channel),
-            ))
+            pen = self._combined_series_pen(list(owners), channel)
+            result.append((channel, pen))
         return tuple(result)
 
     def legend_records(self) -> list[dict[str, Any]]:
@@ -2095,11 +2098,18 @@ class IndicatorFollowSignalValidationChartCanvas(
         axis: str,
         *,
         family: str | None = None,
+        side: str | None = None,
     ) -> list[tuple[str, tuple[QPen, ...]]]:
+        normalized_side = str(side or "").strip().upper()
         order: list[str] = []
         grouped: dict[str, list[tuple[str, QPen]]] = {}
         for descriptor in self._visualization_descriptors:
             if descriptor.axis != axis:
+                continue
+            if normalized_side and normalized_side not in {
+                str(value or "").strip().upper()
+                for value in descriptor.sides
+            }:
                 continue
             if family is not None:
                 descriptor_family = (
@@ -2109,6 +2119,7 @@ class IndicatorFollowSignalValidationChartCanvas(
                 )
                 if descriptor_family != family:
                     continue
+            line_pens = self._descriptor_legend_line_pens(descriptor)
             caption = self._styled_descriptor_caption(descriptor)
             if caption not in grouped:
                 grouped[caption] = []
@@ -2117,7 +2128,7 @@ class IndicatorFollowSignalValidationChartCanvas(
                 channel
                 for channel, _pen in grouped[caption]
             }
-            for channel, pen in self._descriptor_legend_line_pens(descriptor):
+            for channel, pen in line_pens:
                 if channel in existing_channels:
                     continue
                 grouped[caption].append((channel, QPen(pen)))
@@ -2149,14 +2160,27 @@ class IndicatorFollowSignalValidationChartCanvas(
 
         for index, (caption, pens) in enumerate(entries):
             if index:
-                separator_width = metrics.horizontalAdvance(separator)
+                (
+                    separator_text,
+                    separator_padding,
+                    separator_width,
+                ) = IndicatorFollowSignalValidationChartCanvas._legend_separator_layout(
+                    metrics,
+                    separator,
+                )
                 if x + separator_width > right:
                     return
                 painter.setPen(_LOWER_LABEL)
+                text_width = metrics.horizontalAdvance(separator_text)
                 painter.drawText(
-                    QRectF(x, rect.top(), separator_width, rect.height()),
+                    QRectF(
+                        x + separator_padding,
+                        rect.top(),
+                        text_width,
+                        rect.height(),
+                    ),
                     Qt.AlignLeft | Qt.AlignVCenter,
-                    separator,
+                    separator_text,
                 )
                 x += separator_width
 
@@ -2439,15 +2463,11 @@ class IndicatorFollowSignalValidationChartCanvas(
         channel: str,
     ) -> QPen:
         state = self._series_state(descriptor, channel)
-        if state == "ACTIVE":
-            return QPen(self._series_base_color(descriptor, channel), 2)
-        if state == "NORMAL":
-            return QPen(self._series_base_color(descriptor, channel), 1)
-        if state == "INACTIVE":
-            return QPen(_INACTIVE_SERIES, 1)
-        if state == "UNSUPPORTED":
-            return QPen(_UNSUPPORTED_SERIES, 1, Qt.DashLine)
-        return QPen(_ERROR_SERIES, 1, Qt.DotLine)
+        return self._series_pen_for_state(
+            descriptor,
+            channel,
+            state,
+        )
 
     def visualization_style_records(self) -> list[dict[str, Any]]:
         marker_key = self.effective_marker_key
@@ -3208,25 +3228,26 @@ class IndicatorFollowSignalValidationChartCanvas(
             self._series_state(descriptor, channel)
             for descriptor in descriptors
         ]
-        if "ACTIVE" in states:
+        for state in (
+            "ACTIVE",
+            "ERROR",
+            "NORMAL",
+            "INACTIVE",
+            "UNSUPPORTED",
+        ):
+            if state not in states:
+                continue
             owner = next(
                 descriptor
                 for descriptor in descriptors
-                if self._series_state(descriptor, channel) == "ACTIVE"
+                if self._series_state(descriptor, channel) == state
             )
-            return QPen(self._series_base_color(owner, channel), 2)
-        if "ERROR" in states:
-            return QPen(_ERROR_SERIES, 1, Qt.DotLine)
-        if "NORMAL" in states:
-            owner = next(
-                descriptor
-                for descriptor in descriptors
-                if self._series_state(descriptor, channel) == "NORMAL"
+            return self._series_pen_for_state(
+                owner,
+                channel,
+                state,
             )
-            return QPen(self._series_base_color(owner, channel), 1)
-        if "INACTIVE" in states:
-            return QPen(_INACTIVE_SERIES, 1)
-        return QPen(_UNSUPPORTED_SERIES, 1, Qt.DashLine)
+        return QPen(_ERROR_SERIES, 1, Qt.DotLine)
 
     def _draw_price_overlays(
         self,
@@ -3245,26 +3266,355 @@ class IndicatorFollowSignalValidationChartCanvas(
             )
         painter.restore()
 
+    @staticmethod
+    def _legend_separator_layout(
+        metrics: QFontMetrics,
+        separator: str,
+    ) -> tuple[str, float, float]:
+        text = str(separator or "").strip() or str(separator or "")
+        padding = 8.0
+        return (
+            text,
+            padding,
+            float(metrics.horizontalAdvance(text)) + padding * 2.0,
+        )
+    @staticmethod
+    def _series_channel_pen_style(channel: str) -> Qt.PenStyle:
+        normalized = str(channel or "").strip().upper()
+        if normalized == "SIGNAL":
+            return Qt.DashLine
+        if normalized.startswith("CRITERION"):
+            return Qt.DotLine
+        return Qt.SolidLine
+    def _series_pen_for_state(
+        self,
+        descriptor: ValidationFilterDescriptor,
+        channel: str,
+        state: str,
+    ) -> QPen:
+        normalized_state = str(state or "").strip().upper()
+        if normalized_state == "ERROR":
+            return QPen(_ERROR_SERIES, 1, Qt.DotLine)
+
+        color = QColor(self._series_base_color(descriptor, channel))
+        if normalized_state == "INACTIVE":
+            color.setAlpha(170)
+        elif normalized_state == "UNSUPPORTED":
+            color.setAlpha(210)
+
+        width = 2 if normalized_state == "ACTIVE" else 1
+        return QPen(
+            color,
+            width,
+            self._series_channel_pen_style(channel),
+        )
+    def _price_legend_blocks(
+        self,
+        side: str,
+    ) -> list[dict[str, Any]]:
+        normalized_side = str(side or "").strip().upper()
+        blocks: list[dict[str, Any]] = []
+        standard_by_caption: dict[str, dict[str, Any]] = {}
+        arrangement_by_key: dict[tuple[str, ...], dict[str, Any]] = {}
+
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != PRICE_AXIS:
+                continue
+            if normalized_side not in {
+                str(value or "").strip().upper()
+                for value in descriptor.sides
+            }:
+                continue
+
+            line_pens = self._descriptor_legend_line_pens(descriptor)
+            identity = str(descriptor.identity or "").strip()
+            if descriptor.family == FAMILY_MA_ARRANGEMENT:
+                segments: list[tuple[str, QPen]] = []
+                for channel, pen in line_pens:
+                    normalized_channel = str(channel or "").strip().upper()
+                    if (
+                        normalized_channel.startswith("MA")
+                        and normalized_channel[2:].isdigit()
+                    ):
+                        label = f"{normalized_channel[2:]}이평"
+                    else:
+                        label = self._styled_descriptor_caption(descriptor)
+                    segments.append((label, QPen(pen)))
+                key = tuple(label for label, _pen in segments)
+                block = arrangement_by_key.get(key)
+                if segments and block is None:
+                    block = {
+                        "caption": "",
+                        "pens": (),
+                        "segments": tuple(segments),
+                        "_channels": [
+                            str(channel or "").strip().upper()
+                            for channel, _pen in line_pens
+                        ],
+                        "_identities": [],
+                    }
+                    arrangement_by_key[key] = block
+                    blocks.append(block)
+                if block is not None and identity not in block["_identities"]:
+                    block["_identities"].append(identity)
+                continue
+
+            caption = self._styled_descriptor_caption(descriptor)
+            block = standard_by_caption.get(caption)
+            if block is None:
+                block = {
+                    "caption": caption,
+                    "pens": [],
+                    "segments": (),
+                    "_channels": set(),
+                    "_identities": [],
+                }
+                standard_by_caption[caption] = block
+                blocks.append(block)
+
+            channels = block["_channels"]
+            for channel, pen in line_pens:
+                if channel in channels:
+                    continue
+                block["pens"].append(QPen(pen))
+                channels.add(channel)
+            if identity not in block["_identities"]:
+                block["_identities"].append(identity)
+
+        normalized_blocks: list[dict[str, Any]] = []
+        for block in blocks:
+            identities = tuple(
+                identity
+                for identity in block.get("_identities", ())
+                if identity
+            )
+            caption = str(block.get("caption") or "")
+            segments = tuple(block.get("segments") or ())
+            label_color = _LOWER_LABEL
+            normalized_blocks.append({
+                "caption": caption,
+                "pens": tuple(
+                    QPen(pen)
+                    for pen in (block.get("pens") or ())
+                ),
+                "segments": tuple(
+                    (label, QPen(pen))
+                    for label, pen in segments
+                ),
+                "descriptor_identities": identities,
+                "channels": tuple(block.get("_channels") or ()),
+                "label_color": QColor(label_color),
+            })
+        return normalized_blocks
+    def _price_legend_rows(
+        self,
+    ) -> list[
+        tuple[
+            str,
+            str,
+            list[dict[str, Any]],
+        ]
+    ]:
+        rows = []
+        for side, label in (
+            ("BUY", "▪ 매수 :"),
+            ("SELL", "▪ 매도 :"),
+        ):
+            blocks = self._price_legend_blocks(side)
+            if blocks:
+                rows.append((side, label, blocks))
+        return rows
+    @staticmethod
+    def _layout_price_legend_blocks(
+        blocks: list[dict[str, Any]],
+        rect: QRectF,
+        metrics: QFontMetrics,
+    ) -> list[dict[str, Any]]:
+        layouts: list[dict[str, Any]] = []
+        x = float(rect.left())
+        right = float(rect.right())
+        swatch_slot_width = 16.0
+        internal_separator_width = float(metrics.horizontalAdvance(", "))
+
+        for block_index, block in enumerate(blocks):
+            separator = None
+            if block_index:
+                text, padding, width = (
+                    IndicatorFollowSignalValidationChartCanvas._legend_separator_layout(
+                        metrics,
+                        "  |  ",
+                    )
+                )
+                if x + width > right:
+                    break
+                separator = {
+                    "text": text,
+                    "rect": QRectF(
+                        x + padding,
+                        rect.top(),
+                        metrics.horizontalAdvance(text),
+                        rect.height(),
+                    ),
+                }
+                x += width
+
+            segments = tuple(block.get("segments") or ())
+            if segments:
+                block_width = sum(
+                    swatch_slot_width + metrics.horizontalAdvance(label)
+                    for label, _pen in segments
+                ) + max(0, len(segments) - 1) * internal_separator_width
+                if x + block_width > right:
+                    break
+                caption_text = ""
+            else:
+                caption = str(block.get("caption") or "")
+                swatches_width = len(tuple(block.get("pens") or ())) * swatch_slot_width
+                available_text_width = max(0, int(right - x - swatches_width))
+                if available_text_width <= 0:
+                    break
+                caption_text = metrics.elidedText(
+                    caption,
+                    Qt.ElideRight,
+                    available_text_width,
+                )
+                block_width = swatches_width + metrics.horizontalAdvance(caption_text)
+                if block_width <= 0:
+                    break
+
+            layouts.append({
+                "block": block,
+                "rect": QRectF(x, rect.top(), block_width, rect.height()),
+                "separator": separator,
+                "caption_text": caption_text,
+            })
+            x += block_width
+            if not segments and caption_text != str(block.get("caption") or ""):
+                break
+        return layouts
+    def _price_legend_layout(
+        self,
+        scale: _ValidationPriceScale,
+        font,
+    ) -> list[dict[str, Any]]:
+        rows = self._price_legend_rows()
+        if not rows:
+            return []
+        metrics = QFontMetrics(font)
+        line_height = metrics.height() + 2
+        row_gap = 2.0
+        prefix_gap = 8.0
+        left = float(self.plot_left + 4)
+        right = float(self.plot_left + self._plot_width() - 4)
+        layouts: list[dict[str, Any]] = []
+        for row_index, (side, prefix, blocks) in enumerate(rows):
+            top = float(scale.plot_top + 2) + row_index * (
+                line_height + row_gap
+            )
+            prefix_width = float(metrics.horizontalAdvance(prefix))
+            blocks_left = left + prefix_width + prefix_gap
+            if blocks_left >= right:
+                break
+            layouts.append({
+                "side": side,
+                "prefix": prefix,
+                "prefix_rect": QRectF(left, top, prefix_width, line_height),
+                "blocks": self._layout_price_legend_blocks(
+                    blocks,
+                    QRectF(
+                        blocks_left,
+                        top,
+                        max(1.0, right - blocks_left),
+                        line_height,
+                    ),
+                    metrics,
+                ),
+            })
+        return layouts
+    @staticmethod
+    def _draw_price_legend_block_layout(
+        painter: QPainter,
+        layouts: list[dict[str, Any]],
+    ) -> None:
+        metrics = QFontMetrics(painter.font())
+        swatch_width = 12.0
+        swatch_gap = 4.0
+        internal_separator = ", "
+        for layout in layouts:
+            separator = layout.get("separator")
+            if separator is not None:
+                painter.setPen(_LOWER_LABEL)
+                painter.drawText(
+                    separator["rect"],
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    separator["text"],
+                )
+
+            block = layout["block"]
+            rect = layout["rect"]
+            x = float(rect.left())
+            center_y = float(rect.center().y())
+            label_color = QColor(
+                block.get("label_color") or _LOWER_LABEL
+            )
+            segments = tuple(block.get("segments") or ())
+            if segments:
+                for segment_index, (label, pen) in enumerate(segments):
+                    if segment_index:
+                        width = metrics.horizontalAdvance(internal_separator)
+                        painter.setPen(label_color)
+                        painter.drawText(
+                            QRectF(x, rect.top(), width, rect.height()),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            internal_separator,
+                        )
+                        x += width
+                    painter.setPen(pen)
+                    painter.drawLine(
+                        QPointF(x, center_y),
+                        QPointF(x + swatch_width, center_y),
+                    )
+                    x += swatch_width + swatch_gap
+                    width = metrics.horizontalAdvance(label)
+                    painter.setPen(label_color)
+                    painter.drawText(
+                        QRectF(x, rect.top(), width, rect.height()),
+                        Qt.AlignLeft | Qt.AlignVCenter,
+                        label,
+                    )
+                    x += width
+                continue
+
+            for pen in tuple(block.get("pens") or ()):
+                painter.setPen(pen)
+                painter.drawLine(
+                    QPointF(x, center_y),
+                    QPointF(x + swatch_width, center_y),
+                )
+                x += swatch_width + swatch_gap
+            painter.setPen(label_color)
+            painter.drawText(
+                QRectF(x, rect.top(), max(0.0, rect.right() - x), rect.height()),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                layout["caption_text"],
+            )
+
     def _draw_price_overlay_legend(
         self,
         painter: QPainter,
         scale: _ValidationPriceScale,
     ) -> None:
-        entries = self._legend_entries(PRICE_AXIS)
-        if not entries:
-            return
-        metrics = QFontMetrics(painter.font())
-        self._draw_legend_entries(
-            painter,
-            entries,
-            QRectF(
-                self.plot_left + 4,
-                scale.plot_top + 2,
-                max(1, int(self._plot_width()) - 8),
-                metrics.height() + 2,
-            ),
-            separator="  |  ",
-        )
+        for row in self._price_legend_layout(scale, painter.font()):
+            painter.setPen(_LOWER_LABEL)
+            painter.drawText(
+                row["prefix_rect"],
+                Qt.AlignLeft | Qt.AlignVCenter,
+                row["prefix"],
+            )
+            self._draw_price_legend_block_layout(
+                painter,
+                row["blocks"],
+            )
 
     @staticmethod
     def _reference_side_label(side: str) -> str:
