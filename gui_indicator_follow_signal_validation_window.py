@@ -7852,64 +7852,114 @@ class IndicatorFollowSignalValidationWindow(
         self,
         rules: Mapping[str, Any],
     ) -> dict[tuple[int, str], tuple[str, ...]]:
-        bounds = self._effective_validation_range()
-        if bounds is None:
-            return {}
-        range_candles, range_entries, range_offset = (
-            self._validation_range_projection()
-        )
-        if not range_candles:
-            return {}
-
-        execution_policy = (
+        policy = (
             rules.get("validation_execution")
             if isinstance(rules, Mapping)
             else None
         )
-        try:
-            simulation = simulate_validation_execution(
+
+        def simulation_records(
+            candles: list[dict[str, Any]],
+            entries: list[ValidationReplayEntry],
+            *,
+            index_offset: int,
+            chart_lookup: Mapping[int, int] | None = None,
+        ) -> dict[tuple[int, str], tuple[str, ...]]:
+            if not candles:
+                return {}
+            try:
+                simulation = simulate_validation_execution(
+                    candles,
+                    entries,
+                    policy,
+                )
+            except (TypeError, ValueError, OverflowError):
+                return {}
+
+            result: dict[tuple[int, str], tuple[str, ...]] = {}
+            cycle_by_sell_index = {
+                int(cycle.sell_index): cycle
+                for cycle in simulation.cycles
+            }
+            cumulative_quantity = 0
+            cumulative_amount = 0.0
+            current_round = 0
+            for fill in simulation.fills:
+                side = str(fill.side or "").strip().upper()
+                chart_index = (
+                    chart_lookup.get(int(fill.evaluation_index), -1)
+                    if chart_lookup is not None
+                    else int(fill.evaluation_index) + index_offset
+                )
+                if side == "BUY":
+                    current_round = (
+                        int(fill.buy_round)
+                        if isinstance(fill.buy_round, int)
+                        and not isinstance(fill.buy_round, bool)
+                        and fill.buy_round > 0
+                        else current_round + 1
+                    )
+                    cumulative_quantity += int(fill.quantity)
+                    cumulative_amount += float(fill.amount)
+                    lines = (
+                        f"▪{current_round}차 / {int(fill.quantity)}주 / "
+                        f"{_format_summary_amount(float(fill.amount))}",
+                        f"▪총 {cumulative_quantity}주 / "
+                        f"{_format_summary_amount(cumulative_amount)}",
+                    )
+                elif side == "SELL":
+                    lines = (
+                        f"▪{int(fill.quantity)}주 / 합계 "
+                        f"{_format_summary_amount(float(fill.amount))}",
+                    )
+                    cumulative_quantity = 0
+                    cumulative_amount = 0.0
+                    current_round = 0
+                else:
+                    continue
+
+                if 0 <= chart_index < len(self._candles):
+                    result[(chart_index, side)] = lines
+            return result
+
+        calculation_candles = (
+            self._calculation_candles
+            if self._calculation_candles
+            else self._candles
+        )
+        calculation_chart_lookup = {
+            calculation_index: chart_index
+            for chart_index, calculation_index in enumerate(
+                self._chart_calculation_indexes
+            )
+        }
+        records = simulation_records(
+            calculation_candles,
+            self._marker_entries_for_calculation(),
+            index_offset=0,
+            chart_lookup=calculation_chart_lookup,
+        )
+
+        bounds = self._effective_validation_range()
+        if not self._range_replay_entries_available or bounds is None:
+            return records
+
+        start, end = bounds
+        records = {
+            key: value
+            for key, value in records.items()
+            if not start <= key[0] <= end
+        }
+        range_candles, range_entries, range_offset = (
+            self._validation_range_projection()
+        )
+        records.update(
+            simulation_records(
                 range_candles,
                 range_entries,
-                execution_policy
-                if isinstance(execution_policy, Mapping)
-                else None,
+                index_offset=range_offset,
             )
-        except (TypeError, ValueError, OverflowError):
-            return {}
-
-        records: dict[tuple[int, str], tuple[str, ...]] = {}
-        cumulative_quantity = 0
-        cumulative_amount = 0.0
-        current_round = 0
-        for fill in simulation.fills:
-            side = str(fill.side or "").strip().upper()
-            global_index = int(fill.evaluation_index) + range_offset
-            if side == "BUY":
-                current_round = (
-                    int(fill.buy_round)
-                    if isinstance(fill.buy_round, int)
-                    and not isinstance(fill.buy_round, bool)
-                    and fill.buy_round > 0
-                    else current_round + 1
-                )
-                cumulative_quantity += int(fill.quantity)
-                cumulative_amount += float(fill.amount)
-                records[(global_index, side)] = (
-                    f"▪{current_round}차 / {int(fill.quantity)}주 / "
-                    f"{_format_summary_amount(float(fill.amount))}",
-                    f"▪총 {cumulative_quantity}주 / "
-                    f"{_format_summary_amount(cumulative_amount)}",
-                )
-                continue
-            if side == "SELL":
-                # SELL has no meaningful "nth buy round / order amount".
-                # Only expose the actually liquidated quantity and proceeds.
-                records[(global_index, side)] = (
-                    f"▪{int(fill.quantity)}주 / 합계 {_format_summary_amount(float(fill.amount))}",
-                )
-                cumulative_quantity = 0
-                cumulative_amount = 0.0
-                current_round = 0
+        )
         return records
 
     def _build_signal_tooltips(self) -> dict[tuple[int, str], str]:
