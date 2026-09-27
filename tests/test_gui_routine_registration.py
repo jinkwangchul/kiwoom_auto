@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QApplication, QDialog, QPushButton
 
 from gui_indicator_follow_routine_settings_dialog import (
     IndicatorFollowRoutineSettingsDialog,
+    _refresh_routine_assignment_views,
     register_routine_instance_snapshot,
 )
 from gui_routine_registration_dialog import (
@@ -743,6 +744,24 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         fake_self.close.assert_called_once_with()
         self.assertEqual("instance-id", fake_self.instance_id)
         self.assertEqual("group-id", fake_self.group_id)
+
+    def test_success_refresh_path_resyncs_monitoring_after_view_refresh(self) -> None:
+        events: list[str] = []
+        refresh_owner = SimpleNamespace(
+            refresh_auto_trade_assignment_views=lambda: events.append("views")
+        )
+
+        with patch(
+            "gui_indicator_follow_routine_settings_dialog.persistent_feature_root",
+            return_value=refresh_owner,
+        ), patch(
+            "gui_indicator_follow_routine_settings_dialog.sync_auto_trade_monitoring_universe",
+            side_effect=lambda owner: events.append("monitoring") or {"ok": True},
+        ) as sync_monitoring:
+            _refresh_routine_assignment_views(SimpleNamespace())
+
+        self.assertEqual(["views", "monitoring"], events)
+        sync_monitoring.assert_called_once_with(refresh_owner)
 
     def test_edit_failure_keeps_dialog_open_without_refresh(self) -> None:
         fake_self = SimpleNamespace(
