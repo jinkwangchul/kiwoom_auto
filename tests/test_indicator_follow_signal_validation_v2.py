@@ -1201,6 +1201,113 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertIn("BACKTEST_SIGNAL_PARITY_MISMATCH", window.errors[0])
         self.assertIn("SIGNAL_PARITY_FAIL", window.errors[0])
 
+    def test_production_m1_undercoverage_refetches_before_install(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY",
+            "ready": True,
+            "selected_ats": [],
+            "selection_source": "none",
+            "session_windows": [
+                {
+                    "name": "regular",
+                    "start_time": "09:00:00",
+                    "end_time": "15:20:00",
+                },
+            ],
+        }
+        rules = deepcopy(self.rules)
+        rules["bar"]["bar_minutes"] = 3
+        rules["validation_timeframe"] = {
+            "key": "M3",
+            "kind": "MINUTE",
+            "minutes": 3,
+            "label": "3��",
+        }
+        seed = self._seed(rules=rules)
+        requested_counts = []
+        handled_counts = []
+
+        class Provider:
+            def __init__(_self, session, _broker):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                requested_counts.append(count)
+                regular_minutes = 6 if count <= 14 else 12
+                candles = []
+                for index in range(regular_minutes):
+                    candles.append({
+                        "time": f"2026092109{index:02d}00",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100,
+                        "volume": 1,
+                    })
+                for index in range(count - regular_minutes):
+                    candles.append({
+                        "time": f"2026092115{40 + index:02d}00",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100,
+                        "volume": 1,
+                    })
+                rows = IndicatorFollowSignalValidationFlow._historical_rows_from_candles(
+                    candles
+                )
+                request = _self.session.request
+                callback(ValidationHistoricalResult(
+                    True,
+                    snapshot=ValidationHistoricalSnapshot(
+                        stock=request.stock,
+                        timeframe_minutes=1,
+                        timeframe_key="M1",
+                        requested_count=count,
+                        request_id=f"PROD-RETRY-{count}",
+                        rows=rows,
+                        market_data_identity="005930_AL",
+                        market_source="INTEGRATED",
+                    ),
+                ))
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=_FakeHost(self.stock),
+            historical_count=2,
+            historical_provider_factory=Provider,
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: deepcopy(contract),
+        )
+        window = _FakeWindow(self.stock, seed)
+        self.widgets.append(window)
+        flow._open_windows[id(window)] = window
+
+        def handled(_window, _session, _result, **kwargs):
+            handled_counts.append(kwargs["cache_requested_count"])
+            return True
+
+        with patch.object(
+            flow_module,
+            "required_validation_history_context_bars",
+            return_value=2,
+        ), patch.object(
+            flow,
+            "_handle_historical_result",
+            side_effect=handled,
+        ):
+            flow._run_validation(
+                window,
+                IndicatorFollowSignalValidationRunRequest(
+                    seed.settings_snapshot,
+                    2,
+                ),
+            )
+
+        self.assertEqual([14, 28], requested_counts)
+        self.assertEqual([28], handled_counts)
+        self.assertEqual([], window.errors)
+
     def _replay_snapshot(
         self,
         entries,
