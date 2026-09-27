@@ -197,7 +197,7 @@ Operation Start result templates that can reach the footer:
 | `주문 후보를 검증하는 중 오류가 발생했습니다. 로그를 확인하십시오.` | Signal cycle raises | same | `gui_auto_trade_timer.py:305-309` |
 | `마감·청산 Command 처리: 진행 {processed} / 차단 {blocked}` | Close command timer has activity | `auto_trade_run_operation_cycle` | `gui_auto_trade_timer.py:487-490` |
 | `ATS 청산 Command 처리: 진행 {processed} / 실패 {failed}` | ATS liquidation timer has activity | same | `gui_auto_trade_timer.py:496-499` |
-| `시간정책 자동반영: 변경 {changed}개[ / 실패 {failed}개]` | Time-policy projection mutates statuses | `auto_trade_on_time_policy_timer_tick` | `gui_auto_trade_timer.py:666-669` |
+| `시간정책 자동반영: 변경 {changed}개[ / 실패 {failed}개]` | Time-policy projection mutates statuses | `auto_trade_run_operation_cycle` | `gui_auto_trade_timer.py:666-669` |
 | `환경설정 저장 완료` | Operation environment dialog saves | `AutoTradeSettingWindow._handle_operation_environment_settings_saved` | `gui_auto_trade_setting_window.py:12743-12755` |
 | `분봉조회할 종목 1개를 선택하세요.` | Minute-candle request has invalid selection count | `AutoTradeSettingWindow.fetch_minute_candles_for_selected_stock` | `gui_auto_trade_setting_window.py:10402` |
 | `키움 API가 초기화되지 않았습니다.` | Minute-candle request has no API | same | `gui_auto_trade_setting_window.py:10409` |

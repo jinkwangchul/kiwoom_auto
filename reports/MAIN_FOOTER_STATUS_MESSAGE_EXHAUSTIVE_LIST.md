@@ -195,7 +195,7 @@
 | 144 | `주문 후보를 검증하는 중 오류가 발생했습니다. 로그를 확인하십시오.` | signal cycle 예외 | `_auto_trade_run_signal_cycle` | `gui_auto_trade_timer.py:305-309` | Queue/오류·경고/한글 |
 | 145 | `마감·청산 Command 처리: 진행 {processed} / 차단 {blocked}` | close command timer activity | `auto_trade_run_operation_cycle` | `gui_auto_trade_timer.py:487-490` | 운영 시작·정지/개발·디버그/한글·혼합/동적 |
 | 146 | `ATS 청산 Command 처리: 진행 {processed} / 실패 {failed}` | ATS command timer activity | 같은 함수 | `gui_auto_trade_timer.py:496-499` | 운영 시작·정지/개발·디버그/한글·혼합/동적 |
-| 147 | `시간정책 자동반영: 변경 {changed}개[ / 실패 {failed}개]` | time policy status mutation | `auto_trade_on_time_policy_timer_tick` | `gui_auto_trade_timer.py:666-669` | 운영 시작·정지/개발·디버그/한글/동적 |
+| 147 | `시간정책 자동반영: 변경 {changed}개[ / 실패 {failed}개]` | time policy status mutation | `auto_trade_run_operation_cycle` | `gui_auto_trade_timer.py:666-669` | 운영 시작·정지/개발·디버그/한글/동적 |
 | 148 | `환경설정 저장 완료` | 환경설정 dialog 저장 | `AutoTradeSettingWindow._handle_operation_environment_settings_saved` | `gui_auto_trade_setting_window.py:12743-12755` | 예산·설정/한글 |
 | 149 | `분봉조회할 종목 1개를 선택하세요.` | selection count 오류 | `AutoTradeSettingWindow.fetch_minute_candles_for_selected_stock` | `gui_auto_trade_setting_window.py:10402` | 기타/오류·경고/한글 |
 | 150 | `키움 API가 초기화되지 않았습니다.` | API object 없음 | 같은 함수 | `gui_auto_trade_setting_window.py:10409` | 연결/오류·경고/한글·혼합 |
