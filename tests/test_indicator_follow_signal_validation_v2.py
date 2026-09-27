@@ -872,6 +872,63 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(contract, captured[0].get("production_session_contract"))
         self.assertEqual("M1", captured[0]["timeframe_key"])
 
+    def test_production_source_pool_projects_target_without_display_scope_changing_signals(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY", "ready": True,
+            "session_windows": [
+                {"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"},
+                {"name": "extra1", "start_time": "15:30:00", "end_time": "16:00:00"},
+            ],
+        }
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: contract,
+        )
+        source_rules = deepcopy(self.rules)
+        source_rules["validation_timeframe"] = {"key": "M1", "kind": "MINUTE", "minutes": 1, "label": "1분"}
+        source_session = ValidationSession(
+            ValidationRequest(self.stock, ValidationSettingsSnapshot(source_rules), 1),
+            operation_active_reader=lambda: False,
+        )
+        minutes = [
+            {"time": f"20260921090{index}00", "open": 100 + index,
+             "high": 101 + index, "low": 99 + index, "close": 100 + index,
+             "volume": 1}
+            for index in range(6)
+        ] + [
+            {"time": f"20260921153{index}00", "open": 200 + index,
+             "high": 201 + index, "low": 199 + index, "close": 200 + index,
+             "volume": 1}
+            for index in range(6)
+        ]
+        pool = flow._pool_from_candles(source_session, minutes, requested_count=12, request_id="M1-1")
+        calculation_by_scope = {}
+        pool["production_session_contract"] = contract
+        for regular_only in (False, True):
+            rules = deepcopy(self.rules)
+            rules["bar"]["bar_minutes"] = 3
+            rules["validation_market_scope"] = {"regular_market_only": regular_only}
+            session = ValidationSession(
+                ValidationRequest(self.stock, ValidationSettingsSnapshot(rules), 3),
+                operation_active_reader=lambda: False,
+            )
+
+            derived = flow._validation_pool_for_session(session, pool, target_count=4)
+
+            self.assertEqual("M3", derived["timeframe_key"])
+            self.assertEqual(
+                ["20260921090000", "20260921090300", "20260921153000", "20260921153300"],
+                [candle["time"] for candle in derived["candles"]],
+            )
+            calculation_by_scope[regular_only] = derived["candles"]
+            self.assertEqual(
+                2 if regular_only else 4,
+                len(derived["display_candles"]),
+            )
+            self.assertIsNotNone(derived.get("production_calculation_cache_identity"))
+        self.assertEqual(calculation_by_scope[False], calculation_by_scope[True])
+
     def _replay_snapshot(
         self,
         entries,
