@@ -80,6 +80,7 @@ from kiwoom_initial_market_snapshot import (
     OPTKWFID_MARKET_FIELDS,
     normalize_optkwfid_market_row,
 )
+from historical_candle_row_normalizer import normalize_date_based_candle_row
 
 
 Opt10080Callback = Callable[[dict[str, Any]], None]
@@ -438,6 +439,13 @@ class KiwoomApi(QObject):
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
+    PERIOD_CANDLE_FIELDS = ("\uc77c\uc790", "\ud604\uc7ac\uac00", "\uac70\ub798\ub7c9", "\uc2dc\uac00", "\uace0\uac00", "\uc800\uac00")
+    VALIDATION_PERIOD_TR_CODES = {
+        "D1": "opt10081",
+        "W1": "opt10082",
+        "MO1": "opt10083",
+        "Y1": "opt10094",
+    }
     OPW00018_FIELDS = (
         "종목번호",
         "종목명",
@@ -1743,6 +1751,19 @@ class KiwoomApi(QObject):
                 errors=(str(stale["error_kind"]),),
             )
             return
+        if pending_type == "period_candles":
+            callback = pending.get("callback")
+            payload = self._stale_broker_session_error(request_name, pending)
+            payload.update(
+                {
+                    "type": "period_candles",
+                    "code": pending.get("code", ""),
+                    "name": pending.get("name", ""),
+                    "timeframe_key": pending.get("timeframe_key", ""),
+                }
+            )
+            self._finish_callback(callback if callable(callback) else None, payload)
+            return
         if pending_type == "minute_candles":
             callback = pending.get("callback")
             payload = self._stale_broker_session_error(request_name, pending)
@@ -2943,6 +2964,212 @@ class KiwoomApi(QObject):
             commit_to_production=False,
         )
 
+    def request_day_candles_read_only(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+    ) -> dict[str, Any]:
+        return self.request_period_candles_read_only(
+            code,
+            name,
+            timeframe_key="D1",
+            count=count,
+            screen_no=screen_no,
+            callback=callback,
+        )
+
+    def request_week_candles_read_only(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+    ) -> dict[str, Any]:
+        return self.request_period_candles_read_only(
+            code,
+            name,
+            timeframe_key="W1",
+            count=count,
+            screen_no=screen_no,
+            callback=callback,
+        )
+
+    def request_month_candles_read_only(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+    ) -> dict[str, Any]:
+        return self.request_period_candles_read_only(
+            code,
+            name,
+            timeframe_key="MO1",
+            count=count,
+            screen_no=screen_no,
+            callback=callback,
+        )
+
+    def request_year_candles_read_only(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+    ) -> dict[str, Any]:
+        return self.request_period_candles_read_only(
+            code,
+            name,
+            timeframe_key="Y1",
+            count=count,
+            screen_no=screen_no,
+            callback=callback,
+        )
+
+    def request_period_candles_read_only(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        timeframe_key: str,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+    ) -> dict[str, Any]:
+        """Request day/week/month/year candles for Validation without Production mutation."""
+        clean_code = normalize_stock_code(code)
+        market_data_identity = (
+            clean_code if is_broker_action_stock_code(clean_code) else ""
+        )
+        market_source = "KRX"
+        key = str(timeframe_key or "").strip().upper()
+        trcode = self.VALIDATION_PERIOD_TR_CODES.get(key)
+        if not clean_code:
+            return self._finish_callback(
+                callback,
+                {"ok": False, "error": "stock code is required"},
+            )
+        if trcode is None:
+            return self._finish_callback(
+                callback,
+                {"ok": False, "code": clean_code, "error": "unsupported validation timeframe"},
+            )
+        if not market_data_identity:
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": False,
+                    "code": clean_code,
+                    "error": "broker support for this stock code is not confirmed",
+                    "reason_code": "BROKER_ALPHANUMERIC_STOCK_CODE_UNCONFIRMED",
+                },
+            )
+        if not self.is_available():
+            return self._finish_callback(
+                callback,
+                {"ok": False, "code": clean_code, "error": self._unavailable_reason or "kiwoom api unavailable"},
+            )
+        if not self.is_connected():
+            return self._finish_callback(
+                callback,
+                {"ok": False, "code": clean_code, "error": "kiwoom api is not connected"},
+            )
+        request_identity = self._capture_broker_request_identity()
+        if request_identity is None:
+            result = self._broker_request_not_ready_error()
+            result["code"] = clean_code
+            return self._finish_callback(callback, result)
+        try:
+            clean_count = min(max(int(count), 1), DEFAULT_CANDLES_MAX_COUNT)
+        except (TypeError, ValueError):
+            clean_count = 300
+
+        rqname = f"{trcode}_{clean_code}_{datetime.now().strftime('%H%M%S%f')}"
+        claimed_screen_no, claim_error = self._claim_tr_screen(
+            purpose=MARKET_TR,
+            rqname=rqname,
+            screen_no=screen_no,
+            callback=callback,
+            failure_payload={"code": clean_code},
+        )
+        if claimed_screen_no is None:
+            return claim_error or {"ok": False, "code": clean_code, "rqname": rqname}
+
+        today = datetime.now().strftime("%Y%m%d")
+        inputs = (
+            ("\uc885\ubaa9\ucf54\ub4dc", market_data_identity),
+            ("\uae30\uc900\uc77c\uc790", today),
+            ("\uc218\uc815\uc8fc\uac00\uad6c\ubd84", "1"),
+        )
+        self._pending_tr[rqname] = {
+            "type": "period_candles",
+            "code": clean_code,
+            "market_data_identity": market_data_identity,
+            "market_source": market_source,
+            "name": str(name or "").strip(),
+            "timeframe_key": key,
+            "trcode": trcode,
+            "count": clean_count,
+            "screen_no": claimed_screen_no,
+            "callback": callback,
+            "rows": [],
+            "inputs": inputs,
+            **request_identity,
+        }
+
+        def start_timeout(_result: Any) -> None:
+            self._arm_minute_candle_timeout(rqname, self._pending_tr.get(rqname))
+
+        def fail_request(result: Any, error: str) -> dict[str, Any]:
+            pending = self._pending_tr.pop(rqname, None)
+            self._release_pending_tr_screen(rqname, pending)
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": False,
+                    "type": "period_candles",
+                    "code": clean_code,
+                    "timeframe_key": key,
+                    "rqname": rqname,
+                    "result": result,
+                    "error": error,
+                },
+            )
+
+        dispatched = self._submit_governed_tr_request(
+            rqname=rqname,
+            trcode=trcode,
+            prev_next=0,
+            screen_no=claimed_screen_no,
+            inputs=inputs,
+            pending=self._pending_tr[rqname],
+            on_dispatched=start_timeout,
+            on_failed=fail_request,
+        )
+        if not dispatched.get("ok"):
+            return dispatched
+        return {
+            "ok": True,
+            "status": dispatched.get("status", "REQUESTED"),
+            "code": clean_code,
+            "market_data_identity": market_data_identity,
+            "market_source": market_source,
+            "timeframe_key": key,
+            "rqname": rqname,
+            "screen_no": claimed_screen_no,
+            "result": dispatched.get("result"),
+        }
+
     def _request_minute_candles_common(
         self,
         code: str,
@@ -3078,7 +3305,10 @@ class KiwoomApi(QObject):
         rqname: str,
         pending: dict[str, Any] | None,
     ) -> None:
-        if not isinstance(pending, dict) or pending.get("type") != "minute_candles":
+        if (
+            not isinstance(pending, dict)
+            or pending.get("type") not in {"minute_candles", "period_candles"}
+        ):
             return
         generation = int(pending.get("timeout_generation") or 0) + 1
         pending["timeout_generation"] = generation
@@ -3104,22 +3334,27 @@ class KiwoomApi(QObject):
         ):
             return
         pending = self._pending_tr.pop(str(rqname), None)
-        if not pending or pending.get("type") != "minute_candles":
+        if not pending or pending.get("type") not in {"minute_candles", "period_candles"}:
             return
         self._record_tr_governor_timeout()
         self._release_pending_tr_screen(str(rqname), pending)
         callback = pending.get("callback")
+        pending_type = str(pending.get("type") or "")
+        payload = {
+            "ok": False,
+            "type": pending_type,
+            "code": pending.get("code", ""),
+            "name": pending.get("name", ""),
+            "rqname": str(rqname),
+            "error": "historical candle request timed out",
+        }
+        if pending_type == "period_candles":
+            payload["timeframe_key"] = str(pending.get("timeframe_key") or "")
+        else:
+            payload.update(_empty_candle_commit_projection())
         self._finish_callback(
             callback if callable(callback) else None,
-            {
-                "ok": False,
-                "type": "minute_candles",
-                "code": pending.get("code", ""),
-                "name": pending.get("name", ""),
-                "rqname": str(rqname),
-                "error": "minute candle request timed out",
-                **_empty_candle_commit_projection(),
-            },
+            payload,
         )
 
     def request_account_holdings_snapshot(
@@ -3828,6 +4063,79 @@ class KiwoomApi(QObject):
                 pending,
             )
             return
+        if pending.get("type") == "period_candles":
+            callback = pending.get("callback")
+            try:
+                requested_count = int(pending.get("count") or 300)
+                accumulated = pending.setdefault("rows", [])
+                remaining = max(requested_count - len(accumulated), 1)
+                accumulated.extend(
+                    self._read_validation_period_rows(
+                        str(trcode),
+                        str(rqname),
+                        remaining,
+                    )
+                )
+                if str(prev_next).strip() == "2" and len(accumulated) < requested_count:
+                    pending["timeout_generation"] = int(pending.get("timeout_generation") or 0) + 1
+                    dispatched = self._submit_governed_tr_request(
+                        rqname=request_name,
+                        trcode=str(pending.get("trcode") or trcode),
+                        prev_next=2,
+                        screen_no=str(pending.get("screen_no") or ""),
+                        inputs=tuple(pending.get("inputs") or ()),
+                        pending=pending,
+                        on_dispatched=lambda _result: self._arm_minute_candle_timeout(
+                            request_name,
+                            self._pending_tr.get(request_name),
+                        ),
+                    )
+                    if isinstance(dispatched, dict) and dispatched.get("ok") is True:
+                        return
+                    raise RuntimeError(
+                        str(
+                            dispatched.get("error")
+                            if isinstance(dispatched, dict)
+                            else "period candle continuation failed"
+                        )
+                    )
+                pending = self._pending_tr.pop(request_name, pending)
+                self._release_pending_tr_screen(request_name, pending)
+                rows = list(accumulated[:requested_count])
+                result = {
+                    "ok": True,
+                    "type": "period_candles",
+                    "request_id": request_name,
+                    "code": pending.get("code", ""),
+                    "market_data_identity": pending.get(
+                        "market_data_identity",
+                        pending.get("code", ""),
+                    ),
+                    "market_source": pending.get("market_source", "KRX"),
+                    "name": pending.get("name", ""),
+                    "timeframe_key": str(pending.get("timeframe_key") or ""),
+                    "rows": rows,
+                    "rows_count": len(rows),
+                    "rqname": str(rqname),
+                    "trcode": str(trcode),
+                    "has_more": str(prev_next).strip() == "2",
+                    "warning": "additional pages available" if str(prev_next).strip() == "2" else "",
+                }
+            except Exception as exc:
+                self._pending_tr.pop(request_name, None)
+                self._release_pending_tr_screen(request_name, pending)
+                result = {
+                    "ok": False,
+                    "type": "period_candles",
+                    "code": pending.get("code", ""),
+                    "name": pending.get("name", ""),
+                    "timeframe_key": str(pending.get("timeframe_key") or ""),
+                    "rqname": str(rqname),
+                    "trcode": str(trcode),
+                    "error": str(exc),
+                }
+            self._finish_callback(callback if callable(callback) else None, result)
+            return
         if pending.get("type") != "minute_candles":
             return
         callback = pending.get("callback")
@@ -4270,6 +4578,38 @@ class KiwoomApi(QObject):
                 )
                 row[field] = str(value or "").strip()
             rows.append(row)
+        return rows
+
+    def _read_validation_period_rows(
+        self,
+        trcode: str,
+        rqname: str,
+        count: int,
+    ) -> list[dict[str, Any]]:
+        repeat_count = int(
+            self._control.dynamicCall(
+                "GetRepeatCnt(QString, QString)",
+                trcode,
+                rqname,
+            )
+            or 0
+        )
+        limit = min(max(int(count or 0), 0), repeat_count) if count else repeat_count
+        rows: list[dict[str, Any]] = []
+        for index in range(limit):
+            raw: dict[str, str] = {}
+            for field in self.PERIOD_CANDLE_FIELDS:
+                value = self._control.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode,
+                    rqname,
+                    index,
+                    field,
+                )
+                raw[field] = str(value or "").strip()
+            normalized = normalize_date_based_candle_row(raw)
+            if normalized is not None:
+                rows.append(normalized)
         return rows
 
     def _read_opt10080_rows(self, trcode: str, rqname: str, count: int) -> list[dict[str, Any]]:

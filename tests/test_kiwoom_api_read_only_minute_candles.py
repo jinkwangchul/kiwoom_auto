@@ -295,6 +295,39 @@ class KiwoomApiReadOnlyMinuteCandlesTest(unittest.TestCase):
         self.assertNotIn(rqname, self.api._pending_tr)
         self.assertFalse(self.api._screen_allocator.is_leased("3005"))
 
+    def test_period_read_only_wrappers_select_exact_trcode_without_commit_mode(self) -> None:
+        cases = (
+            ("request_day_candles_read_only", "D1", "opt10081"),
+            ("request_week_candles_read_only", "W1", "opt10082"),
+            ("request_month_candles_read_only", "MO1", "opt10083"),
+            ("request_year_candles_read_only", "Y1", "opt10094"),
+        )
+        for method_name, key, trcode in cases:
+            with self.subTest(method_name=method_name):
+                result = getattr(self.api, method_name)("005930", count=7)
+                pending = self.api._pending_tr[str(result["rqname"])]
+
+                self.assertEqual("period_candles", pending["type"])
+                self.assertEqual(key, pending["timeframe_key"])
+                self.assertEqual(trcode, pending["trcode"])
+                self.assertNotIn("commit_to_production", pending)
+
+    def test_period_row_reader_emits_stable_fourteen_digit_time(self) -> None:
+        self.control.rows = [{
+            "\uc77c\uc790": "20260918",
+            "\uc2dc\uac00": "+70000",
+            "\uace0\uac00": "+71000",
+            "\uc800\uac00": "+69000",
+            "\ud604\uc7ac\uac00": "+70500",
+            "\uac70\ub798\ub7c9": "12345",
+        }]
+
+        rows = self.api._read_validation_period_rows("opt10081", "REQ", 1)
+
+        self.assertEqual("20260918000000", rows[0]["\uccb4\uacb0\uc2dc\uac04"])
+        self.assertEqual("+70500", rows[0]["\ud604\uc7ac\uac00"])
+        self.assertEqual("12345", rows[0]["\uac70\ub798\ub7c9"])
+
     def test_broker_boundary_does_not_import_validation_gui_or_main(self) -> None:
         source_path = Path(__file__).resolve().parents[1] / "kiwoom_api.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8-sig"))
