@@ -573,8 +573,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         state["buy_ui"]["price_compare"] = {
             "enabled": True,
             "type_combo": "\uac00\uaca9\ube44\uad50",
-            "left_combo": "\ud604\uc7ec\uac00",
-            "right_combo": "\ud3c7\ub2e8\uac00",
+            "left_combo": "CURRENT_PRICE",
+            "right_combo": "AVG_PRICE",
             "ratio_line": "0.15",
             "compare_combo": "\uc774\uc0c1",
         }
@@ -604,6 +604,22 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "operator": "TURN_UP",
             }
         ])
+
+    def test_generic_buy_price_compare_writes_only_canonical_strategy_axes(self):
+        warnings = []
+        candidate = self.mapper._build_buy_price_compare_filter_candidate({
+            "enabled": True,
+            "type_combo": "\uac00\uaca9\ube44\uad50",
+            "left_combo": "CLOSE",
+            "right_combo": "ORDER_PRICE",
+            "ratio_line": "0",
+            "compare_combo": ">=",
+        }, warnings)
+
+        self.assertEqual([], warnings)
+        condition = candidate["value"]["conditions"][0]
+        self.assertEqual("CURRENT_PRICE", condition["target"])
+        self.assertEqual("SIGNAL_PRICE", condition["compare_target"])
 
     def test_buy_bollinger_band_sign_and_operator_are_independent(self):
         cases = (

@@ -842,10 +842,11 @@ def _comparison_price_basis_token(value: Any) -> str | None:
     normalized = text.upper()
     if text in {"\uc2e0\ud638\uac00", "\uc8fc\ubb38\uac00"} or normalized in {"SIGNAL_PRICE", "ORDER_PRICE"}:
         return "SIGNAL_PRICE"
-    return _choice_token(value, {
-        "\ud604\uc7ac\uac00": "CURRENT_PRICE",
-        "\ud3c9\ub2e8\uac00": "AVG_PRICE",
-    })
+    if text in {"\ud604\uc7ac\uac00", "\uc885\uac00"} or normalized in {"CURRENT", "CURRENT_PRICE", "CLOSE"}:
+        return "CURRENT_PRICE"
+    if text == "\ud3c9\ub2e8\uac00" or normalized in {"AVG_PRICE", "AVERAGE_PRICE"}:
+        return "AVG_PRICE"
+    return None
 
 
 def _hoga_mode_token(value: Any) -> str | None:
@@ -1653,8 +1654,8 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
     if type_text and type_text != "\uac00\uaca9\ube44\uad50":
         return None
 
-    target = _series_target(price_compare.get("left_combo"))
-    compare_target = _series_target(price_compare.get("right_combo"))
+    target = _comparison_price_basis_token(price_compare.get("left_combo"))
+    compare_target = _comparison_price_basis_token(price_compare.get("right_combo"))
     threshold = _safe_float(price_compare.get("ratio_line"))
     operator = _price_compare_operator(price_compare.get("compare_combo"))
     if any(key in price_compare for key in ("left_combo", "right_combo", "ratio_line", "compare_combo")):
