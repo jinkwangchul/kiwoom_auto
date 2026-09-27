@@ -222,10 +222,17 @@ evaluate_final_real_order_safety = _allow
         self.assertIn("locator", error)
         self.assertIn("routine_rule_mapper.py", error)
 
-    def test_missing_declared_production_callback_is_rejected_before_pack(self) -> None:
+    def test_candle_free_routine_without_projection_locator_is_accepted_before_pack(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             group, _second, _files = self._source_project(root)
+            metadata_path = next((root / "routines").glob("*/routine.json"))
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["locators"]["evaluation"].pop("market_bar_projection_callable")
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False),
+                encoding="utf-8",
+            )
             routine_path = root / "routines" / "지표추종매매" / "routine.py"
             routine_path.write_text(
                 routine_path.read_text(encoding="utf-8").replace(
@@ -238,8 +245,7 @@ evaluate_final_real_order_safety = _allow
 
             valid, error = validate_group_pack_source(group.group_id, project_root=root)
 
-        self.assertFalse(valid)
-        self.assertIn("market_bar_projection_callable", error)
+        self.assertTrue(valid, error)
 
     def test_missing_settings_registration_callback_is_rejected_before_pack(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

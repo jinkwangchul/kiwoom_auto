@@ -274,10 +274,19 @@ evaluate_final_real_order_safety = _allow
         self.assertFalse((root / "routines").exists())
         self.assertFalse((root / "groups").exists())
 
-    def test_missing_declared_callback_fails_closed_and_rolls_back_install(self) -> None:
+    def test_candle_free_routine_without_projection_locator_registers(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             payload = self._payload()
+            metadata = json.loads(
+                payload["routines/indicator_follow/routine.json"].decode("utf-8")
+            )
+            metadata["locators"]["evaluation"].pop("market_bar_projection_callable")
+            payload["routines/indicator_follow/routine.json"] = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
             payload["routines/indicator_follow/routine.py"] = payload[
                 "routines/indicator_follow/routine.py"
             ].replace(
@@ -288,12 +297,12 @@ evaluate_final_real_order_safety = _allow
             pack = self._write_pack(root, payload=payload)
 
             result = register_group_pack(pack, project_root=root)
+            routines_exist = (root / "routines").exists()
+            groups_exist = (root / "groups").exists()
 
-        self.assertFalse(result.success)
-        self.assertEqual("PACK_REGISTRATION_FAILED", result.error_code)
-        self.assertIn("market_bar_projection_callable", result.error)
-        self.assertFalse((root / "routines").exists())
-        self.assertFalse((root / "groups").exists())
+        self.assertTrue(result.success, result.error)
+        self.assertTrue(routines_exist)
+        self.assertTrue(groups_exist)
 
     def test_registered_definition_can_create_enabled_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

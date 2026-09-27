@@ -35,6 +35,7 @@ from candle_timeframe_aggregation import (
     project_candle_supply,
     read_canonical_bar_minutes,
     required_minute_candles,
+    validate_market_bar_projection_request,
 )
 from execution_universe import (
     ExecutionUniverseSnapshot,
@@ -47,7 +48,7 @@ from event_journal_production import (
     observe_production_exception,
 )
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
-from routine_package_contract import EVALUATION_ROLE, load_routine_module
+from routine_package_contract import EVALUATION_ROLE, load_routine_module, routine_locator
 from routine_main_facts import (
     capture_routine_main_facts,
     routine_main_facts_identity,
@@ -67,6 +68,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 LOG_PATH = RUNTIME_DIR / "routine_signal_probe.log"
 _DEFAULT_OBSERVER_SENTINEL = object()
+_DEFAULT_MARKET_BAR_PROJECTION_READER = object()
+_DEFAULT_CYCLE_PROJECTION_READER = object()
 TRIGGER_PROVENANCE_FIELDS = (
     "trigger_commit_identity",
     "trigger_bar_key",
@@ -225,6 +228,32 @@ def _load_instance_rules(routine_instance_id: str) -> dict[str, Any] | None:
 
 def _load_routine_module(definition: Any):
     return load_routine_module(definition, EVALUATION_ROLE)
+
+
+def _declared_market_bar_projection_reader(definition: Any, routine_module: Any):
+    locator = routine_locator(definition, EVALUATION_ROLE)
+    callable_name = str(locator.get("market_bar_projection_callable") or "").strip()
+    if not callable_name:
+        return None
+    reader = getattr(routine_module, callable_name, None)
+    if not callable(reader):
+        raise RuntimeError(
+            f"declared market bar projection callable is unavailable: {callable_name}"
+        )
+    return reader
+
+
+def _declared_cycle_projection_reader(definition: Any, routine_module: Any):
+    locator = routine_locator(definition, EVALUATION_ROLE)
+    callable_name = str(locator.get("cycle_projection_callable") or "").strip()
+    if not callable_name:
+        return None
+    reader = getattr(routine_module, callable_name, None)
+    if not callable(reader):
+        raise RuntimeError(
+            f"declared cycle projection callable is unavailable: {callable_name}"
+        )
+    return reader
 
 
 def _definition_for_package_dir(routine_dir: Path):
@@ -412,6 +441,8 @@ def probe_routine_for_stock(
     review_marker: Callable[..., Any] | None = None,
     main_facts: dict[str, Any] | None = None,
     fresh_main_facts_provider: Callable[[], dict[str, Any]] | None = None,
+    market_bar_projection_reader: Any = _DEFAULT_MARKET_BAR_PROJECTION_READER,
+    cycle_projection_reader: Any = _DEFAULT_CYCLE_PROJECTION_READER,
     _facts_retry: int = 0,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
@@ -471,51 +502,72 @@ def probe_routine_for_stock(
             else _load_candles_from_stock_dir(stock_dir)
         )
         instance_rules = _load_instance_rules(routine_instance_id)
+        projection_request: dict[str, Any] | None = None
         try:
             tick_time = parse_market_datetime(tick_key)
-            projection_reader = getattr(routine_module, "market_bar_projection_request", None)
+            projection_reader = (
+                getattr(routine_module, "market_bar_projection_request", None)
+                if market_bar_projection_reader is _DEFAULT_MARKET_BAR_PROJECTION_READER
+                else market_bar_projection_reader
+            )
             if not callable(projection_reader):
-                raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_UNAVAILABLE")
-            projection_request = projection_reader(instance_rules)
-            if not isinstance(projection_request, dict) or projection_request.get("projection") not in {
-                "FORMING_BASE_BAR", "COMPLETED_TIMEFRAME"
-            }:
-                raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
-            projected_by_code = facts_market.get("candle_supply_by_code")
-            preprojected = (
-                projected_by_code.get(code)
-                if isinstance(projected_by_code, dict)
-                else None
-            )
-            requested_interval = read_canonical_bar_minutes(instance_rules)
-            requested_warmup = required_minute_candles(
-                requested_interval,
-                int(projection_request.get("warmup_bars") or 1),
-            )
-            if (
-                isinstance(preprojected, dict)
-                and str(preprojected.get("projection") or "").upper()
-                == str(projection_request.get("projection") or "").upper()
-                and int(preprojected.get("timeframe_minutes") or 0) == requested_interval
-                and int(preprojected.get("required_minute_candles") or 0)
-                == int(requested_warmup["required_minute_candles"])
-            ):
-                supply = deepcopy(preprojected)
+                candles = []
+                candle_projection_error = ""
+                candle_projection_evidence = {
+                    "available": True,
+                    "candles": [],
+                    "availability_state": "NOT_REQUIRED",
+                    "projection": "",
+                    "required_minute_candles": 0,
+                }
             else:
-                supply = project_candle_supply(
-                    raw_candles,
-                    instance_rules,
-                    projection_request,
-                    now=tick_time,
-                    session_windows=facts_market.get("candle_session_windows"),
-                    forming_minute=(facts_market.get("forming_minute_by_code") or {}).get(code)
-                    if isinstance(facts_market.get("forming_minute_by_code"), dict)
-                    else None,
-                    completed_projector=completed_timeframe_candles,
+                projection_request = validate_market_bar_projection_request(
+                    projection_reader(instance_rules),
+                    require_warmup=False,
                 )
-            candles = list(supply.get("candles") or ())
-            candle_projection_error = "" if supply.get("available") is True else str(supply.get("reason") or "봉데이터 부족")
-            candle_projection_evidence = supply
+                projected_by_code = facts_market.get("candle_supply_by_code")
+                preprojected = (
+                    projected_by_code.get(code)
+                    if isinstance(projected_by_code, dict)
+                    else None
+                )
+                requested_interval = read_canonical_bar_minutes(instance_rules)
+                requested_warmup = (
+                    required_minute_candles(
+                        requested_interval,
+                        projection_request["warmup_bars"],
+                    )
+                    if "warmup_bars" in projection_request
+                    else {"required_minute_candles": 0}
+                )
+                if (
+                    isinstance(preprojected, dict)
+                    and str(preprojected.get("projection") or "").upper()
+                    == str(projection_request.get("projection") or "").upper()
+                    and int(preprojected.get("timeframe_minutes") or 0) == requested_interval
+                    and int(preprojected.get("required_minute_candles") or 0)
+                    == int(requested_warmup["required_minute_candles"])
+                ):
+                    supply = deepcopy(preprojected)
+                else:
+                    supply = project_candle_supply(
+                        raw_candles,
+                        instance_rules,
+                        projection_request,
+                        now=tick_time,
+                        session_windows=facts_market.get("candle_session_windows"),
+                        forming_minute=(facts_market.get("forming_minute_by_code") or {}).get(code)
+                        if isinstance(facts_market.get("forming_minute_by_code"), dict)
+                        else None,
+                        completed_projector=completed_timeframe_candles,
+                    )
+                candles = list(supply.get("candles") or ())
+                candle_projection_error = (
+                    ""
+                    if supply.get("available") is True
+                    else str(supply.get("reason") or "\ubd09\ub370\uc774\ud130 \ubd80\uc871")
+                )
+                candle_projection_evidence = supply
         except ValueError as exc:
             candles = []
             candle_projection_error = str(exc)
@@ -570,7 +622,10 @@ def probe_routine_for_stock(
                 "tick_key": tick_key,
                 "routine_instance_id": routine_instance_id,
                 "routine_type": routine_type,
-                "forming_base_bar_projection": projection_request["projection"] == "FORMING_BASE_BAR",
+                "forming_base_bar_projection": bool(
+                    isinstance(projection_request, dict)
+                    and projection_request.get("projection") == "FORMING_BASE_BAR"
+                ),
             }
             if isinstance(main_facts, dict):
                 context["main_facts"] = deepcopy(main_facts)
@@ -629,7 +684,11 @@ def probe_routine_for_stock(
                     current_price = None
                 if isinstance(current_price, (int, float)) and current_price > 0:
                     context["actionable_current_price"] = current_price
-            cycle_projector = getattr(routine_module, "project_cycle_context", None)
+            cycle_projector = (
+                getattr(routine_module, "project_cycle_context", None)
+                if cycle_projection_reader is _DEFAULT_CYCLE_PROJECTION_READER
+                else cycle_projection_reader
+            )
             if callable(cycle_projector):
                 try:
                     if not isinstance(main_facts, dict):
@@ -896,8 +955,15 @@ def probe_selected_routine_once(
         stock_dirs = []
 
     try:
-        routine_module = _load_routine_module(
-            _definition_for_package_dir(Path(routine_dir))
+        definition = _definition_for_package_dir(Path(routine_dir))
+        routine_module = _load_routine_module(definition)
+        market_bar_projection_reader = _declared_market_bar_projection_reader(
+            definition,
+            routine_module,
+        )
+        cycle_projection_reader = _declared_cycle_projection_reader(
+            definition,
+            routine_module,
         )
     except Exception as exc:
         observe_production_exception(
@@ -951,6 +1017,8 @@ def probe_selected_routine_once(
             )
         )
         probe_kwargs["review_marker"] = getattr(window, "mark_review_required", None)
+        probe_kwargs["market_bar_projection_reader"] = market_bar_projection_reader
+        probe_kwargs["cycle_projection_reader"] = cycle_projection_reader
         result = probe_routine_for_stock(
             routine_module,
             routine_name,
@@ -1136,6 +1204,14 @@ def probe_execution_stock_for_committed_bar(
         if routine_module is None:
             routine_module = _load_routine_module(definition)
             module_cache[definition_id] = routine_module
+        market_bar_projection_reader = _declared_market_bar_projection_reader(
+            definition,
+            routine_module,
+        )
+        cycle_projection_reader = _declared_cycle_projection_reader(
+            definition,
+            routine_module,
+        )
     except Exception as exc:
         observe_production_exception(
             type(exc),
@@ -1206,7 +1282,7 @@ def probe_execution_stock_for_committed_bar(
             if callable(provider)
             else None
         )
-        projection_reader = getattr(routine_module, "market_bar_projection_request", None)
+        projection_reader = market_bar_projection_reader
         projection_request = (
             projection_reader(applied_rules)
             if callable(provider) and callable(projection_reader)
@@ -1275,6 +1351,8 @@ def probe_execution_stock_for_committed_bar(
         )
     )
     probe_kwargs["review_marker"] = getattr(window, "mark_review_required", None)
+    probe_kwargs["market_bar_projection_reader"] = market_bar_projection_reader
+    probe_kwargs["cycle_projection_reader"] = cycle_projection_reader
     probe_kwargs["main_facts"] = signal_main_facts
     probe_kwargs["fresh_main_facts_provider"] = capture_signal_facts
     return probe_routine_for_stock(

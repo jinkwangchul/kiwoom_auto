@@ -78,6 +78,48 @@ class FullBoundaryP0SignalFactsTest(unittest.TestCase):
             self.assertTrue(capability["resolved"].get(key), key)
         self.assertTrue(set(capability["required_files"]).issubset(set(spec["files"])))
 
+    def test_market_projection_reader_uses_declared_locator_name(self) -> None:
+        custom_reader = lambda _rules: {"projection": "COMPLETED_TIMEFRAME"}
+        definition = types.SimpleNamespace(
+            definition_id="custom",
+            locators={
+                "evaluation": {
+                    "file": "routine.py",
+                    "callable": "evaluate",
+                    "market_bar_projection_callable": "custom_projection",
+                }
+            },
+        )
+        module = types.SimpleNamespace(custom_projection=custom_reader)
+
+        resolved = routine_signal_probe._declared_market_bar_projection_reader(
+            definition,
+            module,
+        )
+
+        self.assertIs(custom_reader, resolved)
+
+    def test_cycle_projection_reader_uses_declared_locator_name(self) -> None:
+        custom_reader = lambda **_facts: {"status": "resolved"}
+        definition = types.SimpleNamespace(
+            definition_id="custom",
+            locators={
+                "evaluation": {
+                    "file": "routine.py",
+                    "callable": "evaluate",
+                    "cycle_projection_callable": "custom_cycle_projection",
+                }
+            },
+        )
+        module = types.SimpleNamespace(custom_cycle_projection=custom_reader)
+
+        resolved = routine_signal_probe._declared_cycle_projection_reader(
+            definition,
+            module,
+        )
+
+        self.assertIs(custom_reader, resolved)
+
     def test_stale_signal_facts_re_evaluate_before_single_queue_mutation(self) -> None:
         first = _facts(marker="old")
         fresh = _facts(marker="fresh")
@@ -150,15 +192,18 @@ class FullBoundaryP0SignalFactsTest(unittest.TestCase):
         )
         self.assertEqual("queued", result["queue_status"])
 
-    def test_missing_market_projection_callback_fails_closed_without_queue(self) -> None:
+    def test_missing_market_projection_callback_allows_candle_free_routine(self) -> None:
         facts = _facts(marker="stable")
+        observed_contexts: list[dict] = []
+
+        def evaluate(context):
+            observed_contexts.append(context)
+            return {"signal": "SKIP", "reason": "external-data-only"}
+
         module = types.SimpleNamespace(
-            ROUTINE_TYPE="auto_trade",
+            ROUTINE_TYPE="external_data",
             project_cycle_context=lambda **_facts: {"status": "resolved"},
-            evaluate=lambda _context: {
-                "signal": "BUY",
-                "execution_intent": {"side": "BUY", "quantity": 1},
-            },
+            evaluate=evaluate,
         )
 
         with tempfile.TemporaryDirectory() as temp:
@@ -171,7 +216,7 @@ class FullBoundaryP0SignalFactsTest(unittest.TestCase):
             ):
                 result = routine_signal_probe.probe_routine_for_stock(
                     module,
-                    "지표추종매매A",
+                    "external-data-only",
                     stock_dir,
                     "2026-09-06 09:00:00",
                     decision_trace_observer=None,
@@ -179,9 +224,45 @@ class FullBoundaryP0SignalFactsTest(unittest.TestCase):
                     fresh_main_facts_provider=lambda: facts,
                 )
 
-        self.assertEqual("ERROR", result["signal"])
-        self.assertIn("ROUTINE_MARKET_PROJECTION_REQUEST_UNAVAILABLE", result["reason"])
-        enqueue.assert_not_called()
+        self.assertEqual("SKIP", result["signal"])
+        self.assertEqual(1, len(observed_contexts))
+        self.assertEqual([], observed_contexts[0]["candles"])
+        self.assertFalse(observed_contexts[0]["forming_base_bar_projection"])
+        enqueue.assert_called_once()
+
+    def test_explicit_candle_free_reader_does_not_fall_back_to_legacy_name(self) -> None:
+        facts = _facts(marker="stable")
+
+        def forbidden_projection(_rules):
+            raise AssertionError("undeclared projection must not be called")
+
+        module = types.SimpleNamespace(
+            ROUTINE_TYPE="external_data",
+            market_bar_projection_request=forbidden_projection,
+            project_cycle_context=lambda **_facts: {"status": "resolved"},
+            evaluate=lambda _context: {"signal": "SKIP", "reason": "external-data-only"},
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_TEST"
+            stock_dir.mkdir()
+            with (
+                patch.object(routine_signal_probe, "_load_instance_rules", return_value={}),
+                patch.object(routine_signal_probe, "_append_log"),
+                patch.object(routine_signal_probe, "_maybe_enqueue_signal"),
+            ):
+                result = routine_signal_probe.probe_routine_for_stock(
+                    module,
+                    "external-data-only",
+                    stock_dir,
+                    "2026-09-06 09:00:00",
+                    decision_trace_observer=None,
+                    main_facts=facts,
+                    fresh_main_facts_provider=lambda: facts,
+                    market_bar_projection_reader=None,
+                )
+
+        self.assertEqual("SKIP", result["signal"])
 
     def test_consumer_rejects_signal_and_intent_facts_identity_mismatch(self) -> None:
         base = _facts(marker="stable")
