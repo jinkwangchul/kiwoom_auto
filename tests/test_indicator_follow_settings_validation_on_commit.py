@@ -910,6 +910,39 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
         )
         self.assertNotIn("Composite setting", message)
 
+    def test_registration_build_preserves_no_widget_legacy_composite(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        legacy_composite = {
+            "enabled": True,
+            "logic": "AND",
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": [
+                {"enabled": True, "logic": "OR", "filters": ["rsi", "ocr"]},
+                {"enabled": False, "logic": "AND", "filters": ["bollinger"]},
+            ],
+        }
+        state = deepcopy(source["indicator_follow_ui_state"]["state"])
+        state["buy_ui"]["signal_filter"]["buy_composite"] = legacy_composite
+
+        dialog = self._dialog(self.source_rules_path)
+        try:
+            applied = dialog.apply_indicator_follow_ui_state(
+                state,
+                source=STATE_AUTHORITY_INSTANCE_CURRENT,
+            )
+            self.assertEqual([], applied["sync_errors"])
+            self._resolve_sell_price_selections(dialog)
+            result = dialog.build_registration_rules_from_current_ui_state()
+        finally:
+            dialog.close()
+
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(
+            legacy_composite,
+            result["rules"]["indicator_follow_ui_state"]["state"]
+            ["buy_ui"]["signal_filter"]["buy_composite"],
+        )
+
     def test_price_compare_operators_commit_and_reopen_without_forced_override(self) -> None:
         source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as temp_dir:
