@@ -1438,6 +1438,7 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
     def test_mock_operation_start_snapshots_latest_applied_without_hot_swap(self) -> None:
         host = MockValidationHost.__new__(MockValidationHost)
         host.project_root = self.project_root
+        host._restart_recovery_blocked_session_ids = frozenset()
         document = {
             "revision": 1,
             "session": {
