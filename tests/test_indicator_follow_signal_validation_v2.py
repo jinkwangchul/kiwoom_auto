@@ -1228,14 +1228,20 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
         projected = project_signal_validation_rules(source, ui_state=seed.to_ui_state())
         self.assertNotIn("execution", projected["buy"])
-        self.assertNotIn("price_compare", projected["buy"]["filters"])
+        self.assertEqual(
+            source["buy"]["filters"]["price_compare"],
+            projected["buy"]["filters"]["price_compare"],
+        )
         self.assertIn(
             "price_compare",
             projected["validation_visualization_rules"]["buy"]["filters"],
         )
         self.assertNotIn("method", projected["sell"])
-        self.assertNotIn("profit_rate_sell", projected["sell"]["signals"])
-        self.assertEqual({}, projected["sell"]["signals"])
+        self.assertEqual(
+            source["sell"]["signals"]["profit_rate_sell"],
+            projected["sell"]["signals"]["profit_rate_sell"],
+        )
+        self.assertIn("macd_sell", projected["sell"]["signals"])
         self.assertNotIn("buy_management", projected)
         self.assertNotIn("order_policy", projected)
 
