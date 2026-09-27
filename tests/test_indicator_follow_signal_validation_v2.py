@@ -44,6 +44,7 @@ from indicator_follow_signal_validation_execution import (
     normalize_validation_execution_policy,
 )
 from indicator_follow_signal_validation_historical_cache import (
+    ValidationHistoricalCacheEntry,
     IndicatorFollowSignalValidationHistoricalCache,
 )
 from indicator_follow_signal_validation_projection import (
@@ -769,6 +770,55 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             multi,
         )
         self.assertNotIn("sell condition", multi)
+
+    def test_production_session_does_not_relabel_persisted_signal_cache_as_current(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY", "ready": True,
+            "session_windows": [{"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"}],
+        }
+        seed = self._seed()
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: deepcopy(contract),
+        )
+        window = _FakeWindow(self.stock, seed)
+        self.widgets.append(window)
+        flow._open_windows[id(window)] = window
+        flow._request_generation[id(window)] = 0
+        flow._history_targets[id(window)] = 2
+        request = IndicatorFollowSignalValidationRunRequest(seed.settings_snapshot, 2)
+        session = ValidationSession(
+            ValidationRequest(self.stock, seed.settings_snapshot, 5),
+            operation_active_reader=lambda: False,
+        )
+        _source_session, _minutes, _key, fetch_count = flow._validation_fetch_contract(
+            session,
+            2 + flow_module.required_validation_history_context_bars(
+                seed.settings_snapshot.to_dict()
+            ),
+            production_contract=contract,
+        )
+        persistent = ValidationHistoricalCacheEntry(
+            stock_code=self.stock.code, stock_name=self.stock.name,
+            timeframe_minutes=1, timeframe_key="M1", requested_count=fetch_count,
+            candles=tuple({
+                "time": (
+                    datetime(2026, 9, 17 + (index // 380), 9, 0)
+                    + timedelta(minutes=index % 380)
+                ).strftime("%Y%m%d%H%M%S"),
+                "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1,
+            } for index in range(fetch_count)),
+            updated_at="2026-09-21T12:00:00+09:00",
+            market_data_identity="005930_AL", market_source="INTEGRATED",
+        )
+        with patch.object(flow, "_cached_history", return_value=persistent), \
+             patch.object(flow, "_cached_signal_entries", return_value=()) as load_signals, \
+             patch.object(flow, "_persistent_cache_requires_broker_probe", return_value=False), \
+             patch.object(flow, "_install_pool") as install_pool:
+            flow._run_validation(window, request)
+        install_pool.assert_called_once()
+        load_signals.assert_not_called()
 
     def _replay_snapshot(
         self,
