@@ -7908,9 +7908,24 @@ class IndicatorFollowSignalValidationWindow(
                         f"{_format_summary_amount(cumulative_amount)}",
                     )
                 elif side == "SELL":
+                    cycle = cycle_by_sell_index.get(int(fill.evaluation_index))
+                    profit_lines: tuple[str, ...] = ()
+                    if cycle is not None:
+                        profit_amount = _completed_cycle_profit_amount(cycle)
+                        profit_percent = (
+                            float(cycle.estimated_return_percent)
+                            if math.isfinite(float(cycle.estimated_return_percent))
+                            else 0.0
+                        )
+                        if profit_amount is not None:
+                            profit_lines = (
+                                f"▪수익 {profit_percent:.2f}% / "
+                                f"{_format_summary_amount(profit_amount)}",
+                            )
                     lines = (
                         f"▪{int(fill.quantity)}주 / 합계 "
                         f"{_format_summary_amount(float(fill.amount))}",
+                        *profit_lines,
                     )
                     cumulative_quantity = 0
                     cumulative_amount = 0.0

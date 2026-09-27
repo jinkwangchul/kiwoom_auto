@@ -2930,8 +2930,24 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.set_replay_snapshot(replay)
         base_tooltips = dict(window._signal_tooltips)
 
+        # The default full-chart simulation exposes the same actual virtual
+        # fills even before a validation range is selected.
+        self.assertIn("▪1차 / 1주 / 100원", base_tooltips[(0, "BUY")])
+        self.assertIn("▪총 2주 / 200원", base_tooltips[(1, "BUY")])
+        self.assertIn("▪2주 / 합계 240원", base_tooltips[(2, "SELL")])
+        self.assertIn("▪수익 20.00% / 40원", base_tooltips[(2, "SELL")])
+        self.assertNotIn("합계", base_tooltips[(3, "SELL")])
+        self.assertNotIn("▪수익", base_tooltips[(3, "SELL")])
+        self.assertIn("▪1차 / 1주 / 130원", base_tooltips[(4, "BUY")])
+
         window._set_validation_range(0, 3)
         window._refresh_validation_range_results()
+
+        summary = window.estimated_return_label.text()
+        self.assertIn("손익 +20.00%/+40원", summary)
+        self.assertIn("투입 전체 200원/ 평균 200원", summary)
+        self.assertNotIn("추정평단", summary)
+        self.assertNotIn("추정매도가격", summary)
 
         buy_first = window._signal_tooltips[(0, "BUY")]
         buy_second = window._signal_tooltips[(1, "BUY")]
@@ -2943,6 +2959,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertIn("▪총 2주 / 200원", buy_second)
 
         self.assertIn("▪2주 / 합계 240원", sell)
+        self.assertIn("▪수익 20.00% / 40원", sell)
         self.assertNotIn("차 /", sell)
 
         # Signals with no virtual fill stay byte-for-byte equivalent to their
