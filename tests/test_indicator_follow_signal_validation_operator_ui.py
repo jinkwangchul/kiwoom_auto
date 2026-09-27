@@ -1425,7 +1425,10 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
             marker["side"]: marker["tooltip"]
             for marker in window.canvas.marker_records()
         }
-        self.assertEqual({"BUY": buy_tooltip, "SELL": tooltip}, marker_tooltips)
+        self.assertTrue(marker_tooltips["BUY"].startswith(buy_tooltip))
+        self.assertIn("▪1차 / 1주 /", marker_tooltips["BUY"])
+        self.assertIn("▪총 1주 /", marker_tooltips["BUY"])
+        self.assertEqual(tooltip, marker_tooltips["SELL"])
         self.assertFalse(hasattr(window, "signal_list_table"))
         self.assertEqual(0, window.completed_cycle_table.rowCount())
         self.assertFalse(window.completed_cycle_empty_label.isHidden())
