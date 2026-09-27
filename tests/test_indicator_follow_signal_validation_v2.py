@@ -259,6 +259,26 @@ class _MemoryRecentStockStore:
 
 
 class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
+    def test_large_target_source_request_is_blocked_before_historical_provider(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY", "ready": True,
+            "session_windows": [{"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"}],
+        }
+        rules = deepcopy(self.rules)
+        rules["bar"]["bar_minutes"] = 240
+        rules["validation_timeframe"] = {"key": "M240", "kind": "MINUTE", "minutes": 240, "label": "240분"}
+        session = ValidationSession(
+            ValidationRequest(self.stock, ValidationSettingsSnapshot(rules), 240),
+            operation_active_reader=lambda: False,
+        )
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: contract,
+        )
+        with self.assertRaisesRegex(ValueError, "CANDLE_WARMUP_LIMIT_EXCEEDED"):
+            flow._validation_fetch_contract(session, 900, production_contract=contract)
+
     def test_deleted_flow_drops_background_completion_emit(self):
         flow = IndicatorFollowSignalValidationFlow(
             _FakeBroker(True),
