@@ -1485,6 +1485,64 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(25, captured["end"])
         self.assertIsNone(captured["display_count"])
 
+    def test_settings_identity_change_rerequests_existing_validation_range(self):
+        window = self._window()
+        candles = [
+            {
+                "time": f"2026091114{index:02d}00",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 1,
+            }
+            for index, price in enumerate((100.0, 110.0, 120.0))
+        ]
+        base_rules = window._signal_validation_seed.settings_snapshot.to_dict()
+        base_settings = ValidationSettingsSnapshot(base_rules)
+        base_replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=base_settings.rules_hash,
+            historical_request_id="RANGE-AUTO-BASE",
+            evaluated_start_index=0,
+            evaluated_end_index=2,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=[],
+        )
+        window._pending_result_settings_snapshot = base_settings
+        window.set_replay_snapshot(base_replay)
+        window._set_validation_range(0, 2)
+
+        updated_rules = deepcopy(base_rules)
+        updated_rules.setdefault("validation_execution", {})["first_buy_quantity"] = 2
+        updated_settings = ValidationSettingsSnapshot(updated_rules)
+        updated_replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=updated_settings.rules_hash,
+            historical_request_id="RANGE-AUTO-UPDATED",
+            evaluated_start_index=0,
+            evaluated_end_index=2,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=[],
+        )
+        requests = []
+        window.validation_range_evaluation_requested.connect(
+            lambda start, end: requests.append((start, end))
+        )
+        window._pending_result_settings_snapshot = updated_settings
+        window.set_replay_snapshot(updated_replay)
+
+        self.assertEqual((0, 2), window.validation_range)
+        self.assertEqual([(0, 2)], requests)
+        self.assertEqual(
+            updated_settings.rules_hash,
+            window._result_settings_snapshot.rules_hash,
+        )
+
     def _replay_snapshot(
         self,
         entries,

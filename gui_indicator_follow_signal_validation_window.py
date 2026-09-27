@@ -7382,6 +7382,12 @@ class IndicatorFollowSignalValidationWindow(
             self._position_indicator_index
         )
         self._refresh_validation_range_results()
+        if settings_identity_changed and self._validation_range is not None:
+            range_start, range_end = self._validation_range
+            self.validation_range_evaluation_requested.emit(
+                range_start,
+                range_end,
+            )
         self.validation_status_label.setText("")
         pending_fingerprint = self._pending_validation_ui_fingerprint
         self._pending_validation_ui_fingerprint = None
