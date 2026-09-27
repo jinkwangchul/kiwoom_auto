@@ -303,6 +303,53 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual((1, "M1", 550), (source_minutes, source_key, source_count))
             self.assertEqual("M1", source_session.request.timeframe_key)
 
+    def test_unregistered_source_can_never_authorize_production_filter_backtest(self):
+        rules = deepcopy(self.rules)
+        rules["bar"]["bar_minutes"] = 1
+        rules["validation_timeframe"] = {"key": "M1", "kind": "MINUTE", "minutes": 1, "label": "1분"}
+        seed = self._seed(rules=rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, seed.settings_snapshot, 1),
+            operation_active_reader=lambda: False,
+        )
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            historical_count=2, window_factory=_FakeWindow,
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+                "reason": "PRODUCTION_STOCK_UNREGISTERED",
+            },
+        )
+        source = [
+            {"time": f"20260921090{index}00", "open": 100.0,
+             "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1}
+            for index in range(4)
+        ]
+        pool = flow._pool_from_candles(
+            session, source, requested_count=4, request_id="UNREGISTERED"
+        )
+        window = _FakeWindow(self.stock, seed)
+        self.widgets.append(window)
+        key = id(window)
+        flow._open_windows[key] = window
+        flow._request_generation[key] = 1
+        flow._history_targets[key] = 2
+        completed = []
+        flow.signal_scan_completed.connect(completed.append)
+        flow._use_pool_for_window(window, session, pool, evaluation_count=2)
+        for _ in range(200):
+            self.app.processEvents()
+            if completed:
+                break
+            QTest.qWait(10)
+        self.assertTrue(completed)
+        self.assertEqual("", completed[0].get("error"), completed[0].get("error"))
+        self.assertEqual(
+            "FILTER_SIGNAL_BACKTEST_BLOCKED",
+            completed[0]["backtest_filter_signal_authorization"]["status"],
+        )
+
     def test_deleted_flow_drops_background_completion_emit(self):
         flow = IndicatorFollowSignalValidationFlow(
             _FakeBroker(True),
