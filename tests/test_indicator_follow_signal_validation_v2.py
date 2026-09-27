@@ -1391,6 +1391,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         )
         self.assertNotIn((2, "SELL"), markers)
         self.assertNotIn((3, "BUY"), markers)
+        self.assertIn("▪2주 / 합계 208원", window._signal_tooltips[(4, "SELL")])
 
     def test_range_replay_keeps_full_historical_prefix_for_fixed_filters(self):
         rules = {
