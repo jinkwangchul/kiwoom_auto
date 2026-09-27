@@ -3338,6 +3338,12 @@ class IndicatorFollowRoutineSettingsDialog(
             label.setVisible(bool(message))
 
     def _collect_buy_composite_ui_state(self):
+        if not hasattr(self, "buy_composite_enabled_check"):
+            preserved = getattr(self, "_preserved_buy_composite_ui_state", None)
+            if isinstance(preserved, dict):
+                return deepcopy(preserved)
+            return self._default_buy_composite_ui_state()
+
         groups = []
         for group_index in (1, 2):
             filters = []
@@ -3361,6 +3367,10 @@ class IndicatorFollowRoutineSettingsDialog(
     def _apply_buy_composite_ui_state(self, values, result=None):
         result = result if result is not None else {"applied": [], "skipped": []}
         state = deepcopy(values) if isinstance(values, dict) else self._default_buy_composite_ui_state()
+        if not hasattr(self, "buy_composite_enabled_check"):
+            self._preserved_buy_composite_ui_state = deepcopy(state)
+            return result
+
         groups = state.get("groups")
         if not isinstance(groups, list):
             groups = self._default_buy_composite_ui_state()["groups"]

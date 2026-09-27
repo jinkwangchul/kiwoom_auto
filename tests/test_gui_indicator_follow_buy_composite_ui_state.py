@@ -200,6 +200,11 @@ class GuiIndicatorFollowBuyCompositeUiStateTest(unittest.TestCase):
             ],
         }
 
+    def _remove_composite_widgets(self) -> None:
+        for name in tuple(vars(self.dialog)):
+            if name.startswith("buy_composite_"):
+                delattr(self.dialog, name)
+
     def test_composite_ui_widgets_are_created(self) -> None:
         expected_names = [
             "buy_composite_enabled_check",
@@ -283,6 +288,71 @@ class GuiIndicatorFollowBuyCompositeUiStateTest(unittest.TestCase):
 
         self.assertEqual([], result["sync_errors"])
         self.assertEqual(self.dialog._collect_buy_composite_ui_state(), state)
+
+    def test_no_widget_full_state_load_preserves_legacy_composite(self) -> None:
+        state = self._sample_state()
+        self._remove_composite_widgets()
+
+        result = self.dialog.apply_indicator_follow_ui_state({
+            "buy_ui": {"signal_filter": {"buy_composite": state}}
+        })
+
+        self.assertEqual(state, self.dialog._collect_buy_composite_ui_state())
+        self.assertFalse(any(
+            item.get("name", "").startswith("buy_composite_")
+            for item in result["skipped"]
+        ))
+
+    def test_no_widget_second_full_state_load_replaces_preserved_composite(self) -> None:
+        first = self._sample_state()
+        second = self._sample_state()
+        second["logic"] = "OR"
+        second["groups"][0]["filters"] = ["ocr"]
+        self._remove_composite_widgets()
+
+        self.dialog.apply_indicator_follow_ui_state({
+            "buy_ui": {"signal_filter": {"buy_composite": first}}
+        })
+        self.dialog.apply_indicator_follow_ui_state({
+            "buy_ui": {"signal_filter": {"buy_composite": second}}
+        })
+
+        self.assertEqual(second, self.dialog._collect_buy_composite_ui_state())
+
+    def test_no_widget_preserved_composite_is_detached_from_input_and_collect(self) -> None:
+        state = self._sample_state()
+        expected = deepcopy(state)
+        self._remove_composite_widgets()
+
+        self.dialog.apply_indicator_follow_ui_state({
+            "buy_ui": {"signal_filter": {"buy_composite": state}}
+        })
+        state["groups"][0]["filters"].append("ocr")
+        collected = self.dialog._collect_buy_composite_ui_state()
+        collected["groups"][1]["filters"].clear()
+
+        self.assertEqual(expected, self.dialog._collect_buy_composite_ui_state())
+
+    def test_no_widget_missing_full_state_composite_resets_to_default(self) -> None:
+        self._remove_composite_widgets()
+        self.dialog.apply_indicator_follow_ui_state({
+            "buy_ui": {"signal_filter": {"buy_composite": self._sample_state()}}
+        })
+
+        self.dialog.apply_indicator_follow_ui_state({"buy_ui": {"signal_filter": {}}})
+
+        self.assertEqual(
+            self.dialog._default_buy_composite_ui_state(),
+            self.dialog._collect_buy_composite_ui_state(),
+        )
+
+    def test_widgets_remain_authoritative_over_detached_compatibility_state(self) -> None:
+        self.dialog._preserved_buy_composite_ui_state = self._sample_state()
+
+        self.assertEqual(
+            self.dialog._default_buy_composite_ui_state(),
+            self.dialog._collect_buy_composite_ui_state(),
+        )
 
     def test_missing_composite_state_restores_defaults(self) -> None:
         self.dialog._apply_buy_composite_ui_state(self._sample_state())
