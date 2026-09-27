@@ -775,7 +775,7 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
     def test_composite_group_limit_warning_is_korean(self) -> None:
         dialog = self._dialog(self.source_rules_path)
         try:
-            dialog.buy_composite_warning_label = QLabel("")
+            composite_box = dialog._make_buy_composite_filter_controls()
             dialog._apply_buy_composite_ui_state({"groups": [{}, {}, {}]})
             message = dialog.buy_composite_warning_label.text()
         finally:
