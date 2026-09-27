@@ -260,6 +260,41 @@ class RealtimeCanonicalCommitTests(unittest.TestCase):
 
 
 class ReconciliationRequestEntryPointTests(unittest.TestCase):
+    def test_request_retention_uses_bounded_host_history_requirement(self) -> None:
+        cases = (
+            (73, 3, 73),
+            (2, 9, 9),
+            (300_000, 3, 200_000),
+            (None, 3, 200_000),
+        )
+        for required_count, request_count, expected_max_count in cases:
+            with self.subTest(
+                required_count=required_count,
+                request_count=request_count,
+            ):
+                request = Mock(return_value={"ok": True})
+                window = SimpleNamespace(
+                    kiwoom_api=SimpleNamespace(request_minute_candles=request),
+                )
+                if required_count is not None:
+                    window.candle_history_required_count = lambda _code, value=required_count: value
+
+                auto_candle_refresh.request_operation_candle_for_stock(
+                    window,
+                    Path("C:/temp/005930_Test"),
+                    "005930",
+                    "Test",
+                    operation_cycle_minute_key="2026-08-20 10:16",
+                    request_kind="REALTIME_RECONCILIATION",
+                    reconciliation_minute="2026-08-20 10:15",
+                    count=request_count,
+                )
+
+                self.assertEqual(
+                    expected_max_count,
+                    request.call_args.kwargs["max_count"],
+                )
+
     def test_reconciliation_reuses_request_minute_candles_and_owned_context(self) -> None:
         terminal = []
         registered = []
