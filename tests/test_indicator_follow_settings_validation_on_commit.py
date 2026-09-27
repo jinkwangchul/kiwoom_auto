@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import QApplication, QDialog, QLabel
 from candle_timeframe_aggregation import read_canonical_bar_minutes
 from gui_indicator_follow_routine_settings_dialog import (
     IndicatorFollowRoutineSettingsDialog,
+    STATE_AUTHORITY_INSTANCE_CURRENT,
     _INTERNAL_VALIDATION_MESSAGE,
     _REGISTRATION_PROCESSING_FAILURE_MESSAGE,
     _RULES_LOAD_FAILURE_MESSAGE,
@@ -38,15 +39,8 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
         cls.routine_dir = cls.project_root / "routines" / "지표추종매매"
         cls.source_rules_path = cls.routine_dir / "rules.json"
 
-    def _dialog(self, rules_path: Path, *, instance_id: str = ""):
-        dialog = IndicatorFollowRoutineSettingsDialog(
-            rules_path=rules_path,
-            routine_path=self.routine_dir,
-            routine_name="검증 루틴",
-            definition_id="indicator_follow",
-            instance_id=instance_id,
-            settings_mode="edit" if instance_id else "registration",
-        )
+    @staticmethod
+    def _resolve_sell_price_selections(dialog) -> None:
         for group_name in "abc":
             getattr(
                 dialog,
@@ -56,13 +50,85 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 dialog,
                 f"sell_signal_condition_{group_name}_gap_right_combo",
             ).setCurrentText("현재가")
+
+    def _dialog(self, rules_path: Path, *, instance_id: str = ""):
+        dialog = IndicatorFollowRoutineSettingsDialog(
+            rules_path=rules_path,
+            routine_path=self.routine_dir,
+            routine_name="검증 루틴",
+            definition_id="indicator_follow",
+            instance_id=instance_id,
+            settings_mode="edit" if instance_id else "registration",
+        )
+        self._resolve_sell_price_selections(dialog)
         return dialog
+
+    def test_bollinger_direction_ui_uses_upper_lower_terms_and_restores_legacy_values(self) -> None:
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        signal_filter = source["indicator_follow_ui_state"]["state"]["buy_ui"]["signal_filter"]
+        condition_b = source["indicator_follow_ui_state"]["state"]["sell_ui"][
+            "signal_conditions"
+        ]["condition_b"]
+        signal_filter["buy_bollinger_direction_combo"] = "\uc0c1\ud5a5"
+        condition_b["bollinger_direction_combo"] = "\ud558\ud5a5"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            rules_path.write_text(
+                json.dumps(source, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            dialog = self._dialog(rules_path)
+            try:
+                applied = dialog.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
+                self.assertEqual(
+                    ["\uc0c1\ub2e8", "\ud558\ub2e8"],
+                    [
+                        dialog.buy_bollinger_direction_combo.itemText(index)
+                        for index in range(dialog.buy_bollinger_direction_combo.count())
+                    ],
+                )
+                self.assertEqual(
+                    ["\uc0c1\ub2e8", "\ud558\ub2e8"],
+                    [
+                        dialog.sell_signal_condition_b_bollinger_direction_combo.itemText(index)
+                        for index in range(
+                            dialog.sell_signal_condition_b_bollinger_direction_combo.count()
+                        )
+                    ],
+                )
+                self.assertEqual(
+                    "\uc0c1\ub2e8",
+                    dialog.buy_bollinger_direction_combo.currentText(),
+                )
+                self.assertEqual(
+                    "\ud558\ub2e8",
+                    dialog.sell_signal_condition_b_bollinger_direction_combo.currentText(),
+                )
+            finally:
+                dialog.close()
 
     def test_legacy_missing_bollinger_sign_normalizes_and_allows_registration(self) -> None:
         before = hashlib.sha256(self.source_rules_path.read_bytes()).hexdigest()
+        source = json.loads(self.source_rules_path.read_text(encoding="utf-8"))
+        legacy_state = source["indicator_follow_ui_state"]["state"]
+        legacy_state["buy_ui"]["signal_filter"].pop(
+            "buy_bollinger_sign_combo",
+            None,
+        )
         dialog = self._dialog(self.source_rules_path)
         try:
-            self.assertEqual(dialog.buy_bollinger_direction_combo.currentText(), "하향")
+            applied = dialog.apply_indicator_follow_ui_state(
+                legacy_state,
+                source=STATE_AUTHORITY_INSTANCE_CURRENT,
+            )
+            self.assertEqual([], applied["sync_errors"])
+            self._resolve_sell_price_selections(dialog)
+            self.assertEqual(dialog.buy_bollinger_direction_combo.currentText(), "하단")
             self.assertEqual(dialog.buy_bollinger_sign_combo.currentText(), "-")
             result = dialog.build_registration_rules_from_current_ui_state()
         finally:
@@ -92,6 +158,11 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             )
             dialog = self._dialog(rules_path)
             try:
+                applied = dialog.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
                 self.assertEqual(dialog.buy_bollinger_sign_combo.currentText(), "+")
             finally:
                 dialog.close()
@@ -104,6 +175,11 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             )
             explicit = self._dialog(rules_path)
             try:
+                applied = explicit.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
                 self.assertEqual(explicit.buy_bollinger_sign_combo.currentText(), "+")
             finally:
                 explicit.close()
@@ -126,6 +202,12 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 settings_mode="registration",
             )
             try:
+                applied = dialog.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
+                self._resolve_sell_price_selections(dialog)
                 self.assertEqual(dialog.buy_bollinger_sign_combo.currentIndex(), -1)
                 result = dialog.build_registration_rules_from_current_ui_state()
             finally:
@@ -147,7 +229,7 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             )
             dialog = self._dialog(rules_path)
             try:
-                dialog.buy_bollinger_direction_combo.setCurrentText("상향")
+                dialog.buy_bollinger_direction_combo.setCurrentText("상단")
                 dialog.buy_bollinger_sign_combo.setCurrentText("+")
                 dialog.buy_bollinger_value_line.setText("0.1")
                 dialog.buy_bollinger_compare_combo.setCurrentText("이하")
@@ -160,9 +242,12 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            reloaded = self._dialog(rules_path)
+            reloaded = self._dialog(
+                rules_path,
+                instance_id="SIGNED-PERCENT-RELOAD",
+            )
             try:
-                self.assertEqual(reloaded.buy_bollinger_direction_combo.currentText(), "상향")
+                self.assertEqual(reloaded.buy_bollinger_direction_combo.currentText(), "상단")
                 self.assertEqual(reloaded.buy_bollinger_sign_combo.currentText(), "+")
                 self.assertEqual(reloaded.buy_bollinger_value_line.text(), "0.1")
                 self.assertEqual(reloaded.buy_bollinger_compare_combo.currentText(), "이하")
@@ -182,6 +267,12 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             )
             dialog = self._dialog(rules_path)
             try:
+                applied = dialog.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
+                self._resolve_sell_price_selections(dialog)
                 self.assertEqual(dialog.buy_bollinger_sign_combo.currentText(), "+")
                 result = dialog.build_registration_rules_from_current_ui_state()
             finally:
@@ -197,9 +288,12 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            reloaded = self._dialog(rules_path)
+            reloaded = self._dialog(
+                rules_path,
+                instance_id="LEGACY-SIGN-RELOAD",
+            )
             try:
-                self.assertEqual(reloaded.buy_bollinger_direction_combo.currentText(), "상향")
+                self.assertEqual(reloaded.buy_bollinger_direction_combo.currentText(), "상단")
                 self.assertEqual(reloaded.buy_bollinger_sign_combo.currentText(), "+")
             finally:
                 reloaded.close()
@@ -300,6 +394,11 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                     )
                     dialog = self._dialog(rules_path)
                     try:
+                        applied = dialog.apply_indicator_follow_ui_state(
+                            legacy["indicator_follow_ui_state"]["state"],
+                            source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                        )
+                        self.assertEqual([], applied["sync_errors"])
                         self.assertEqual(
                             expected_sign,
                             dialog.sell_signal_condition_b_bollinger_sign_combo.currentText(),
@@ -322,10 +421,16 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             )
             dialog = self._dialog(rules_path)
             try:
+                applied = dialog.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
                 self.assertEqual(
                     "-",
                     dialog.sell_signal_condition_b_bollinger_sign_combo.currentText(),
                 )
+                self._resolve_sell_price_selections(dialog)
                 result = dialog.build_registration_rules_from_current_ui_state()
             finally:
                 dialog.close()
@@ -334,10 +439,13 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            reloaded = self._dialog(rules_path)
+            reloaded = self._dialog(
+                rules_path,
+                instance_id="SELL-BOLLINGER-RELOAD",
+            )
             try:
                 self.assertEqual(
-                    ("하향", "-", "0.1", "이상"),
+                    ("하단", "-", "0.1", "이상"),
                     (
                         reloaded.sell_signal_condition_b_bollinger_direction_combo.currentText(),
                         reloaded.sell_signal_condition_b_bollinger_sign_combo.currentText(),
