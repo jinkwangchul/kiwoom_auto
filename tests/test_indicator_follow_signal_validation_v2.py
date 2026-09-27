@@ -1100,6 +1100,107 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertIn("FILTER_SIGNAL_BACKTEST_BLOCKED", window.errors[-1])
         self.assertIn("PRODUCTION_SOURCE_HISTORY_INSUFFICIENT", window.errors[-1])
 
+    def test_signal_parity_mismatch_fails_validation_preparation(self):
+        class Replay:
+            def __init__(_self, session):
+                _self.session = session
+
+            def evaluate(_self, historical, *, display_count=None):
+                request = _self.session.request
+                candle = {
+                    "time": "20260911143000",
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 1,
+                }
+                return ValidationReplayResult(
+                    True,
+                    snapshot=ValidationReplaySnapshot(
+                        stock=request.stock,
+                        timeframe_minutes=request.timeframe_minutes,
+                        settings_hash=request.settings_snapshot.rules_hash,
+                        historical_request_id=historical.request_id,
+                        evaluated_start_index=0,
+                        evaluated_end_index=0,
+                        dropped_raw_rows_count=0,
+                        candles=[candle],
+                        entries=[],
+                    ),
+                )
+
+            def scan_signal_entries(_self, historical, *, context_provider=None):
+                return (
+                    ValidationReplayEntry(
+                        evaluation_side="BUY",
+                        evaluation_index=0,
+                        evaluation_time="20260911143000",
+                        signal="BUY",
+                        reason="batch false positive fixture",
+                        signal_index=0,
+                        signal_time="20260911143000",
+                        delay_bar=0,
+                        matched_groups=["A"],
+                        details=["batch-only"],
+                        trace={"conditions": [], "groups": [], "aggregations": []},
+                    ),
+                )
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=_FakeHost(self.stock),
+            historical_count=1_000,
+            replay_factory=Replay,
+            window_factory=_FakeWindow,
+            recent_stock_store=_MemoryRecentStockStore(),
+        )
+        seed = self._seed()
+        session = ValidationSession(
+            ValidationRequest(
+                self.stock,
+                seed.settings_snapshot,
+                seed.settings_snapshot.to_dict()["bar"]["bar_minutes"],
+            ),
+            operation_active_reader=lambda: False,
+        )
+        pool = flow._pool_from_candles(
+            session,
+            [{
+                "time": "20260911143000",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1,
+            }],
+            requested_count=1_000,
+            request_id="PARITY-MISMATCH",
+        )
+        window = _FakeWindow(self.stock, seed)
+        self.widgets.append(window)
+        key = id(window)
+        flow._open_windows[key] = window
+        flow._request_generation[key] = 1
+
+        flow._use_pool_for_window(
+            window,
+            session,
+            pool,
+            evaluation_count=100,
+        )
+        for _ in range(100):
+            self.app.processEvents()
+            if window.errors:
+                break
+            QTest.qWait(10)
+
+        self.assertEqual([], window.pool_installs)
+        self.assertEqual([], window.snapshots)
+        self.assertEqual(1, len(window.errors))
+        self.assertIn("BACKTEST_SIGNAL_PARITY_MISMATCH", window.errors[0])
+        self.assertIn("SIGNAL_PARITY_FAIL", window.errors[0])
+
     def _replay_snapshot(
         self,
         entries,
