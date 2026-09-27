@@ -1544,6 +1544,100 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             window._result_settings_snapshot.rules_hash,
         )
 
+    def test_averaging_settings_change_replays_existing_range_automatically(self):
+        window = self._window()
+        candles = [
+            {
+                "time": f"2026091114{index:02d}00",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 1,
+            }
+            for index, price in enumerate((100.0, 110.0, 120.0))
+        ]
+        entries = [
+            self._entry("BUY", 0, "BUY"),
+            self._entry("SELL", 2, "SELL"),
+        ]
+
+        base_rules = window._signal_validation_seed.settings_snapshot.to_dict()
+        base_rules["validation_execution"] = {
+            "enabled": False,
+            "first_buy_quantity": 1,
+            "repeat_mode": "ROUND",
+            "round_operator": "ADD",
+            "round_budget_value": 0.5,
+            "budget_ratio": 2.0,
+            "active_direction": "UP",
+            "active_ratio": 0.45,
+            "active_compare": ">=",
+            "trading_cost_enabled": False,
+            "trading_cost_percent": 0.2,
+        }
+        base_settings = ValidationSettingsSnapshot(base_rules)
+        base_replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=base_settings.rules_hash,
+            historical_request_id="AVERAGING-RANGE-BASE",
+            evaluated_start_index=0,
+            evaluated_end_index=2,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=entries,
+        )
+        window._pending_result_settings_snapshot = base_settings
+        window.set_replay_snapshot(base_replay)
+        window._set_validation_range(0, 2)
+        window.apply_range_replay_snapshot(base_replay)
+        self.assertTrue(window._range_replay_entries_available)
+        self.assertIn(
+            "투입 전체 100원/ 평균 100원",
+            window.estimated_return_label.text(),
+        )
+
+        updated_rules = deepcopy(base_rules)
+        updated_rules["validation_execution"]["enabled"] = True
+        updated_rules["validation_execution"]["first_buy_quantity"] = 2
+        updated_settings = ValidationSettingsSnapshot(updated_rules)
+        updated_replay = ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=updated_settings.rules_hash,
+            historical_request_id="AVERAGING-RANGE-UPDATED",
+            evaluated_start_index=0,
+            evaluated_end_index=2,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=entries,
+        )
+        range_requests = []
+
+        def apply_updated_range(start, end):
+            range_requests.append((start, end))
+            window.apply_range_replay_snapshot(updated_replay)
+
+        window.validation_range_evaluation_requested.connect(
+            apply_updated_range
+        )
+        window._pending_result_settings_snapshot = updated_settings
+        window.set_replay_snapshot(updated_replay)
+
+        self.assertEqual((0, 2), window.validation_range)
+        self.assertEqual([(0, 2)], range_requests)
+        self.assertTrue(window._range_replay_entries_available)
+        self.assertEqual(
+            updated_settings.rules_hash,
+            window._result_settings_snapshot.rules_hash,
+        )
+        summary = window.estimated_return_label.text()
+        self.assertIn("손익 +20.00%/+40원", summary)
+        self.assertIn("투입 전체 200원/ 평균 200원", summary)
+        self.assertNotIn("추정평단", summary)
+        self.assertNotIn("추정매도가격", summary)
+
     def _replay_snapshot(
         self,
         entries,
