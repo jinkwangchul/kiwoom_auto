@@ -5436,6 +5436,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         toast.assert_called_once()
         self.assertIn("조합식", toast.call_args.args[1])
         self.assertNotIn("가격비교", toast.call_args.args[1])
+        self.assertNotIn("CONDITION_EXPRESSION_", toast.call_args.args[1])
         self.assertEqual(status_before, window.validation_status_label.text())
 
     def test_sell_input_error_uses_toast_without_emitting_apply_candidate(self):
