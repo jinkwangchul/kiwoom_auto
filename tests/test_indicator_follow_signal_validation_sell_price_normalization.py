@@ -96,6 +96,9 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         for group_name in ("condition_a", "condition_b", "condition_c"):
             conditions[group_name]["gap_left_combo"] = "평단가"
             conditions[group_name]["gap_right_combo"] = "현재가"
+        signal_filter = state.get("buy_ui", {}).get("signal_filter", {})
+        if isinstance(signal_filter, dict):
+            signal_filter["buy_bollinger_sign_combo"] = "-"
         return state
 
     @staticmethod
@@ -133,44 +136,35 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                         self.assertNotIn("주문가", [
                             combo.itemText(index) for index in range(combo.count())
                         ])
-                collected = dialog.collect_indicator_follow_ui_state()
-                self.assertEqual(3, len(sell_price_selection_issues(collected)))
-                self.assertEqual(
-                    "가격 기준 재선택 필요",
-                    dialog.sell_signal_condition_a_gap_left_combo.placeholderText(),
-                )
-                self.assertEqual(
-                    "주문가",
-                    collected["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"],
-                )
-                signal_payloads = []
-                dialog.signal_validation_requested.connect(signal_payloads.append)
-                dialog.basic_signal_interval_combo.setCurrentText("3")
-                with patch.object(dialog_module.QMessageBox, "warning") as warning:
-                    seed = dialog._handle_signal_validation_clicked()
-                warning.assert_not_called()
-                self.assertIsInstance(seed, IndicatorFollowSignalValidationSeed)
-                self.assertEqual([seed], signal_payloads)
-                self.assertEqual(3, seed.settings_snapshot.to_dict()["bar"]["bar_minutes"])
-                self.assertEqual(
-                    "주문가",
-                    seed.to_ui_state()["sell_ui"]["signal_conditions"][
-                        "condition_a"
-                    ]["gap_left_combo"],
-                )
-                registration_result = dialog.build_registration_rules_from_current_ui_state()
-                self.assertFalse(registration_result["success"])
-                self.assertIn("재선택", " ".join(
-                    registration_result.get("internal_blocked_reasons", [])
-                    + [registration_result.get("internal_error", "")]
-                ))
-                self.assertEqual(file_before, path.read_bytes())
 
-                self.assertIn("주문가", [
+                collected = dialog.collect_indicator_follow_ui_state()
+                issues = sell_price_selection_issues(collected)
+                if mode == "registration":
+                    self.assertEqual((), issues)
+                    self.assertEqual(
+                        "평단가",
+                        collected["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"],
+                    )
+                else:
+                    self.assertEqual(3, len(issues))
+                    combo = dialog.sell_signal_condition_a_gap_left_combo
+                    self.assertEqual(-1, combo.currentIndex())
+                    self.assertEqual("", combo.placeholderText())
+                    self.assertIn("현재가 또는 평단가", combo.toolTip())
+                    self.assertEqual(
+                        "주문가",
+                        combo.property("indicatorFollowUnresolvedSellPriceBasis"),
+                    )
+                    self.assertEqual(
+                        "주문가",
+                        collected["sell_ui"]["signal_conditions"]["condition_a"]["gap_left_combo"],
+                    )
+
+                self.assertIn("신호가", [
                     dialog.sell_a_perform1_single_combo.itemText(index)
                     for index in range(dialog.sell_a_perform1_single_combo.count())
                 ])
-                self.assertIn("주문가", [
+                self.assertIn("신호가", [
                     dialog.buy_cycle_order_combo.itemText(index)
                     for index in range(dialog.buy_cycle_order_combo.count())
                 ])
@@ -190,6 +184,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                 self.assertEqual((), sell_price_selection_issues(
                     dialog.collect_indicator_follow_ui_state()
                 ))
+                self.assertEqual(file_before, path.read_bytes())
 
     def test_unresolved_price_is_entry_only_but_blocks_run_and_apply_payloads(self):
         unresolved = deepcopy(self.rules["indicator_follow_ui_state"]["state"])
@@ -213,9 +208,17 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         dialog, _path = self._dialog()
         before = dialog.collect_indicator_follow_ui_state()
         changed = deepcopy(before)
-        changed["basic"]["buy_signal_expr_line"] = "D"
+        changed["basic"]["sell_signal_expr_line"] = "A"
+        condition_a = changed["sell_ui"]["signal_conditions"]["condition_a"]
+        condition_a["gap_check"] = True
+        condition_a["gap_left_combo"] = "주문가"
+        condition_a["gap_right_combo"] = "현재가"
         result = dialog.apply_signal_validation_ui_state(changed)
         self.assertTrue(result["skipped"])
+        self.assertEqual(
+            "invalid_signal_validation_state",
+            result["skipped"][0]["reason"],
+        )
         self.assertEqual(before, dialog.collect_indicator_follow_ui_state())
 
     def test_unresolved_window_defers_initial_run_and_apply_until_reselected(self):
@@ -231,10 +234,13 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         window.validation_run_requested.connect(run_requests.append)
         window.settings_apply_requested.connect(apply_payloads.append)
 
-        self.assertIsNone(window.request_initial_validation())
+        with patch("gui_indicator_follow_signal_validation_window.show_toast") as toast:
+            self.assertIsNone(window.request_initial_validation())
         self.assertEqual([], run_requests)
         self.assertTrue(window.run_validation_button.isEnabled())
-        self.assertIn("현재가 또는 평단가", window.validation_status_label.text())
+        toast.assert_called_once()
+        self.assertIn("가격비교", str(toast.call_args.args[1]))
+        self.assertEqual("과거 분봉 데이터 조회 중...", window.validation_status_label.text())
         self.assertIsNone(window._request_settings_apply())
         self.assertEqual([], apply_payloads)
 
@@ -250,8 +256,9 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
         self.assertIsNotNone(request)
         self.assertEqual([request], run_requests)
         payload = window._request_settings_apply()
-        self.assertIsNotNone(payload)
-        self.assertEqual([payload], apply_payloads)
+        self.assertIsNone(payload)
+        self.assertEqual([], apply_payloads)
+        self.assertEqual("validate", window._primary_validation_action_state)
 
     def test_new_sell_price_defaults_are_average_to_current_and_v2_can_run(self):
         class FreshDialog(IndicatorFollowRoutineSettingsDialog):
@@ -393,7 +400,7 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "sell signal malformed"):
                 dialog.build_signal_validation_entry_snapshot_from_current_ui_state()
 
-    def test_mapper_materializes_only_current_v2_sell_candidates(self):
+    def test_mapper_preserves_runtime_sell_signals_and_overrides_current_v2_candidates(self):
         state = self._resolved_state(
             self.rules["indicator_follow_ui_state"]["state"]
         )
@@ -405,12 +412,14 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
             preview["preview_rules"], ui_state=state
         )
         signals = projected["sell"]["signals"]
-        self.assertEqual(
-            {"ui_condition_a", "ui_condition_b", "ui_condition_c"},
-            set(signals),
+        expected_runtime = set(
+            (self.rules.get("sell", {}).get("signals", {}) or {}).keys()
         )
-        self.assertNotIn("macd_sell", signals)
-        self.assertNotIn("profit_rate_sell", signals)
+        self.assertTrue(
+            expected_runtime
+            | {"ui_condition_a", "ui_condition_b", "ui_condition_c"}
+            <= set(signals)
+        )
         self.assertNotIn("indicator_follow_rule_preview", projected)
         self.assertIn(
             "AVG_PRICE",
@@ -503,6 +512,17 @@ class SellPriceValidationNormalizationTest(unittest.TestCase):
                     "ui_condition_a": {
                         "enabled": True,
                         "order_delay_bars": 0,
+                        "signal_expression": {
+                            "source": "A",
+                            "normalized": "A",
+                            "ast": {"type": "identifier", "name": "A"},
+                            "identifiers": ["A"],
+                            "identifier_map": {
+                                "A": "ui_condition_a",
+                                "B": "ui_condition_b",
+                                "C": "ui_condition_c",
+                            },
+                        },
                         "groups": [{
                             "enabled": True,
                             "name": "condition_a",
