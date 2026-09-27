@@ -6790,6 +6790,20 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         host = _FakeHost(self.stock)
         scan_started = Event()
         release_scan = Event()
+        completed_payloads = []
+        production_contract_reader = Mock(return_value={
+            "status": "PRODUCTION_SESSION_READY",
+            "selected_ats": [],
+            "selection_source": "none",
+            "session_windows": [{
+                "name": "regular",
+                "start_time": "09:00:00",
+                "end_time": "15:20:00",
+            }],
+            "ready": True,
+            "production_equivalent": True,
+            "reason": "",
+        })
 
         class Replay:
             def __init__(_self, session):
@@ -6831,7 +6845,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             window_factory=_FakeWindow,
             recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=production_contract_reader,
         )
+        flow.signal_scan_completed.connect(completed_payloads.append)
         seed = self._seed()
         request = IndicatorFollowSignalValidationRunRequest(
             seed.settings_snapshot,
@@ -6885,6 +6901,87 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertEqual([(1, 1_000)], window.pool_installs)
             self.assertEqual([()], window.signal_marker_batches)
             self.assertEqual(1, len(window.snapshots))
+            payload = completed_payloads[-1]
+            backtest_trust = payload["backtest_trust_metadata"]
+            prepared_trust = payload["prepared_presentation"].trust_metadata
+            production_contract_reader.assert_called_once_with(
+                self.stock.code,
+                self.stock.name,
+            )
+            for trust_metadata in (backtest_trust, prepared_trust):
+                self.assertIn("candle_projection_parity", trust_metadata)
+                self.assertIn("market_session_parity", trust_metadata)
+                self.assertIn(
+                    "filter_signal_backtest_authorization",
+                    trust_metadata,
+                )
+                self.assertIn("production_decision_scope", trust_metadata)
+                self.assertFalse(
+                    trust_metadata["candle_projection_parity"][
+                        "production_equivalent"
+                    ]
+                )
+                self.assertEqual(
+                    "FILTER_SIGNAL_ONLY",
+                    trust_metadata["production_decision_scope"]["status"],
+                )
+                self.assertEqual(
+                    "MARKET_SESSION_PARITY_FAIL",
+                    trust_metadata["market_session_parity"]["status"],
+                )
+                self.assertEqual(
+                    "FILTER_SIGNAL_BACKTEST_BLOCKED",
+                    trust_metadata["filter_signal_backtest_authorization"][
+                        "status"
+                    ],
+                )
+            self.assertEqual(
+                backtest_trust["market_session_parity"],
+                payload["backtest_market_session_parity"],
+            )
+            self.assertEqual(
+                backtest_trust["filter_signal_backtest_authorization"],
+                payload["backtest_filter_signal_authorization"],
+            )
+            backtest_trust["candle_projection_parity"]["status"] = "mutated"
+            backtest_trust["market_session_parity"]["status"] = "mutated"
+            backtest_trust["filter_signal_backtest_authorization"][
+                "status"
+            ] = "mutated"
+            self.assertEqual(
+                "MARKET_SESSION_PARITY_FAIL",
+                payload["backtest_market_session_parity"]["status"],
+            )
+            self.assertEqual(
+                "FILTER_SIGNAL_BACKTEST_BLOCKED",
+                payload["backtest_filter_signal_authorization"]["status"],
+            )
+            self.assertEqual(
+                "COMPLETED_BAR_SOURCE_PARITY_NOT_VERIFIED",
+                prepared_trust["candle_projection_parity"]["status"],
+            )
+            self.assertEqual(
+                "MARKET_SESSION_PARITY_FAIL",
+                prepared_trust["market_session_parity"]["status"],
+            )
+            self.assertEqual(
+                "FILTER_SIGNAL_BACKTEST_BLOCKED",
+                prepared_trust["filter_signal_backtest_authorization"][
+                    "status"
+                ],
+            )
+            payload["backtest_market_session_parity"]["status"] = "mutated"
+            payload["backtest_filter_signal_authorization"]["status"] = "mutated"
+            self.assertEqual(
+                "MARKET_SESSION_PARITY_FAIL",
+                prepared_trust["market_session_parity"]["status"],
+            )
+            self.assertEqual(
+                "FILTER_SIGNAL_BACKTEST_BLOCKED",
+                prepared_trust["filter_signal_backtest_authorization"][
+                    "status"
+                ],
+            )
         finally:
             release_scan.set()
 
