@@ -147,6 +147,7 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
             self.assertEqual("09:00", fixed_range[0].strftime("%H:%M"))
             self.assertEqual("15:30", fixed_range[1].strftime("%H:%M"))
             owner.operation_host.operation_cycle_completed.emit(_completed_result())
+            self.app.processEvents()
             self.assertEqual(fixed_range, window.chart.fixed_time_range)
             self.assertEqual(2, len(window.chart.close_series))
             self.assertEqual(1, len(window.chart.buy_series))
@@ -236,8 +237,10 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
                 ):
                     window = StockInstanceChartWindow("005930", TODAY, owner)
                     owner.operation_host.operation_cycle_completed.emit(_completed_result())
+                    self.app.processEvents()
                     self.assertEqual("+1,000(+1.00%)", window.info_labels["cumulative_pnl"].text())
                     owner.operation_host.operation_cycle_completed.emit(_completed_result())
+                    self.app.processEvents()
                     self.assertEqual("+2,000(+1.00%)", window.info_labels["cumulative_pnl"].text())
                     window.close()
                 owner.close()
@@ -554,6 +557,7 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
             nested_parent = QDialog(owner)
             second = StockInstanceChartWindow("000660", TODAY, nested_parent)
             owner.operation_host.operation_cycle_completed.emit(_completed_result())
+            self.app.processEvents()
 
             self.assertEqual({"005930": 2, "000660": 2}, calls)
             self.assertIn("이전 그래프", first.notice_label.text())
