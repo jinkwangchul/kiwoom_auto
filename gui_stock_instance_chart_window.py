@@ -99,6 +99,28 @@ def _today_trade_date() -> str:
     return datetime.now(SEOUL_TIMEZONE).date().isoformat()
 
 
+def _live_price_market_source(
+    *,
+    nxt_available: bool,
+    now_dt: datetime | None = None,
+) -> str:
+    """Select the display source without granting NXT execution authority."""
+
+    if not nxt_available:
+        return "KRX"
+    current = now_dt or datetime.now(SEOUL_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SEOUL_TIMEZONE)
+    else:
+        current = current.astimezone(SEOUL_TIMEZONE)
+    minute = current.hour * 60 + current.minute
+    if (8 * 60) <= minute < (8 * 60 + 50):
+        return "NXT"
+    if (15 * 60 + 40) <= minute < (20 * 60):
+        return "NXT"
+    return "KRX"
+
+
 def _main_monitoring_owner(parent: QWidget | None) -> QWidget | None:
     """Resolve the stable MainWindow owner using the existing monitoring contract."""
     current = parent
@@ -2008,7 +2030,7 @@ class StockInstanceChartWindow(QDialog):
         return bool(clear()) if callable(clear) else False
 
     def refresh_live_price_projection(self) -> bool:
-        """Refresh only the UI live marker from process-local market state."""
+        """Refresh only the UI live marker from the authorized display source."""
 
         if self.trade_date != _today_trade_date():
             return self._clear_live_price_projection()
@@ -2017,13 +2039,39 @@ class StockInstanceChartWindow(QDialog):
             return self._clear_live_price_projection()
         try:
             snapshot = host.high_resolution_market_data_snapshot()
-            state = host.high_resolution_market_state(self.stock_code)
+            eligibility = self.last_projection.get("market_eligibility")
+            nxt_available = (
+                eligibility.get("nxt") is True
+                if isinstance(eligibility, dict)
+                else self.last_projection.get("nxt_available") is True
+            )
+            market_source = _live_price_market_source(
+                nxt_available=nxt_available,
+            )
+            if market_source == "NXT":
+                reader = getattr(host, "nxt_display_live_price_state", None)
+                state = reader(self.stock_code) if callable(reader) else None
+            else:
+                state = host.high_resolution_market_state(self.stock_code)
         except Exception:
             return self._clear_live_price_projection()
         if state is None or snapshot is None:
             return self._clear_live_price_projection()
-        if str(getattr(state, "stock_code", "") or "").strip() != self.stock_code:
+
+        if market_source == "NXT":
+            if (
+                str(getattr(state, "canonical_stock_code", "") or "").strip()
+                != self.stock_code
+                or str(getattr(state, "broker_code_identity", "") or "").strip()
+                != f"{self.stock_code}_NX"
+                or str(getattr(state, "market_source", "") or "").strip() != "NXT"
+                or str(getattr(state, "source_real_type", "") or "").strip()
+                != "ECN주식체결"
+            ):
+                return self._clear_live_price_projection()
+        elif str(getattr(state, "stock_code", "") or "").strip() != self.stock_code:
             return self._clear_live_price_projection()
+
         if not bool(getattr(snapshot, "broker_connected", False)):
             return self._clear_live_price_projection()
         state_identity = (

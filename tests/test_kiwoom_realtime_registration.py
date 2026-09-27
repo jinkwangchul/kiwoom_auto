@@ -8,8 +8,13 @@ from PyQt5.QtCore import QCoreApplication
 
 from kiwoom_api import KiwoomApi, RealtimeShadowRegistrationSnapshot
 from kiwoom_initial_market_snapshot import normalize_optkwfid_market_row
-from kiwoom_realtime_fids import REALTIME_SHADOW_FIDS
+from kiwoom_realtime_fids import (
+    NXT_DISPLAY_REALTIME_FIDS,
+    NXT_REALTIME_EXECUTION_TYPE,
+    REALTIME_SHADOW_FIDS,
+)
 from kiwoom_realtime_shadow import RealtimeShadowBarBuilder
+from stock_code_contract import is_valid_stock_code, normalize_stock_code
 from kiwoom_screen_allocator import (
     SCREEN_POOL_EXHAUSTED,
     KiwoomScreenAllocator,
@@ -42,6 +47,10 @@ class _Control:
             18: "-1100",
             30: "-12.43",
             228: "117.2",
+            10013: "3456",
+            10015: "+12",
+            10010: "-261000",
+            10020: "180001",
         }
         self.raise_on_registration = False
         self.tr_rows = []
@@ -111,6 +120,7 @@ def _api(*, connected: bool = True):
     api._tr_governor_last_error_reason = ""
     api.realtime_shadow_tick_received = _Signal()
     api.realtime_shadow_bar_completed = _Signal()
+    api.nxt_display_tick_received = _Signal()
     api.login_state_changed = _Signal()
     return api
 
@@ -359,6 +369,57 @@ class RealtimeRegistrationTests(unittest.TestCase):
         )
         self.assertTrue(all(call[1][3] == "0" for call in calls))
         self.assertTrue(all(call[1][0].startswith("4") for call in calls))
+
+    def test_nxt_registration_uses_separate_suffix_identity_and_fids(self) -> None:
+        api = _api()
+        api.sync_realtime_monitoring_registration(("005930",))
+        result = api.sync_nxt_display_registration(("005930",))
+
+        self.assertTrue(result["active"])
+        calls = self.registration_calls(api)
+        self.assertEqual("005930", calls[0][1][1])
+        self.assertEqual("005930_NX", calls[1][1][1])
+        self.assertEqual(
+            ";".join(str(fid) for fid in NXT_DISPLAY_REALTIME_FIDS),
+            calls[1][1][2],
+        )
+        snapshot = api.nxt_display_registration_snapshot()
+        self.assertEqual(("005930",), snapshot.canonical_stock_codes)
+        self.assertEqual(("005930_NX",), snapshot.broker_code_identities)
+        self.assertEqual("005930_NX", normalize_stock_code("005930_NX"))
+        self.assertFalse(is_valid_stock_code("005930_NX"))
+
+    def test_valid_ecn_execution_emits_only_nxt_display_tick(self) -> None:
+        api = _api()
+        api.sync_nxt_display_registration(("005930",))
+        api._on_receive_real_data("005930_NX", NXT_REALTIME_EXECUTION_TYPE, "")
+
+        self.assertEqual([], api.realtime_shadow_tick_received.values)
+        self.assertEqual(1, len(api.nxt_display_tick_received.values))
+        payload = api.nxt_display_tick_received.values[0]
+        self.assertEqual("005930", payload["canonical_stock_code"])
+        self.assertEqual("005930_NX", payload["broker_code_identity"])
+        self.assertEqual("NXT", payload["market_source"])
+        self.assertEqual(261000, payload["current_price"])
+        self.assertEqual(12, payload["execution_quantity"])
+
+    def test_invalid_ecn_time_and_non_nxt_identity_fail_closed(self) -> None:
+        api = _api()
+        api.sync_nxt_display_registration(("005930",))
+        api._control.real_values[10020] = "bad"
+        api._on_receive_real_data("005930_NX", NXT_REALTIME_EXECUTION_TYPE, "")
+        api._on_receive_real_data("005930", NXT_REALTIME_EXECUTION_TYPE, "")
+
+        self.assertEqual([], api.nxt_display_tick_received.values)
+
+    def test_nxt_registration_empty_target_removes_owned_screen(self) -> None:
+        api = _api()
+        api.sync_nxt_display_registration(("005930",))
+        result = api.sync_nxt_display_registration(())
+
+        self.assertFalse(result["active"])
+        self.assertEqual(1, len(self.remove_calls(api)))
+        self.assertFalse(api.nxt_display_registration_snapshot().active)
 
     def test_same_target_is_idempotent_and_change_replaces_owned_screen(self) -> None:
         api = _api()

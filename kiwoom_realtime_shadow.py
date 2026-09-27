@@ -65,6 +65,26 @@ class RealtimeShadowTick:
 
 
 @dataclass(frozen=True)
+class NxtDisplayRealtimeTick:
+    canonical_stock_code: str
+    broker_code_identity: str
+    market_source: str
+    source_real_type: str
+    execution_time_raw: str
+    current_price: int | float
+    execution_quantity: int | float | None
+    cumulative_volume: int | float | None
+    received_at: str
+    received_monotonic: int | float
+    receive_sequence: int
+    market_datetime: str
+    connection_epoch: int
+    login_session_id: str
+
+    def to_payload(self) -> dict[str, object]:
+        return asdict(self)
+
+@dataclass(frozen=True)
 class RealtimeShadowBar:
     stock_code: str
     timeframe_minutes: int
@@ -203,6 +223,80 @@ def normalize_realtime_shadow_tick(
         login_session_id=session_id,
     )
 
+
+def normalize_nxt_display_realtime_tick(
+    *,
+    broker_code_identity: object,
+    real_type: object,
+    execution_time_raw: object,
+    current_price_raw: object,
+    execution_quantity_raw: object,
+    cumulative_volume_raw: object,
+    connection_epoch: object,
+    login_session_id: object,
+    receive_sequence: object,
+    received_monotonic: object,
+    received_at: datetime | None = None,
+) -> NxtDisplayRealtimeTick | None:
+    """Normalize one source-identified ECN execution for display-only use."""
+
+    broker_identity = str(broker_code_identity or "").strip().upper()
+    if not broker_identity.endswith("_NX"):
+        return None
+    canonical_code = broker_identity[:-3]
+    if len(canonical_code) != 6 or not canonical_code.isdigit():
+        return None
+    execution_time = str(execution_time_raw or "").strip()
+    price = normalize_kiwoom_price(current_price_raw)
+    if (
+        len(execution_time) != 6
+        or not execution_time.isdigit()
+        or price is None
+        or price <= 0
+    ):
+        return None
+
+    observed_at = received_at or datetime.now(SEOUL_TIMEZONE)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=SEOUL_TIMEZONE)
+    else:
+        observed_at = observed_at.astimezone(SEOUL_TIMEZONE)
+    try:
+        tick_clock = datetime.strptime(execution_time, "%H%M%S").time()
+        epoch = int(connection_epoch)
+        sequence = int(receive_sequence)
+    except (TypeError, ValueError):
+        return None
+    session_id = str(login_session_id or "").strip()
+    monotonic_value = _number(received_monotonic)
+    if epoch < 0 or sequence <= 0 or not session_id or monotonic_value is None or monotonic_value < 0:
+        return None
+    market_time = datetime.combine(
+        observed_at.date(),
+        tick_clock,
+        tzinfo=SEOUL_TIMEZONE,
+    )
+    normalized_price = int(price) if price.is_integer() else price
+    return NxtDisplayRealtimeTick(
+        canonical_stock_code=canonical_code,
+        broker_code_identity=broker_identity,
+        market_source="NXT",
+        source_real_type=str(real_type or "").strip(),
+        execution_time_raw=execution_time,
+        current_price=normalized_price,
+        execution_quantity=_number(
+            str(execution_quantity_raw).replace(",", "").strip()
+            if execution_quantity_raw not in (None, "")
+            else execution_quantity_raw
+        ),
+        cumulative_volume=_positive_number(cumulative_volume_raw),
+        received_at=observed_at.isoformat(timespec="microseconds"),
+        received_monotonic=monotonic_value,
+        receive_sequence=sequence,
+        market_datetime=market_time.isoformat(timespec="seconds"),
+        connection_epoch=epoch,
+        login_session_id=session_id,
+    )
 
 @dataclass
 class _CurrentShadowBar:

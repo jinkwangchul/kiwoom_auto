@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -47,6 +48,7 @@ class _LiveHost(QObject):
         super().__init__()
         self.gate_enabled = False
         self.states: dict[str, object] = {}
+        self.nxt_states: dict[str, object] = {}
         self.snapshot = SimpleNamespace(
             broker_connected=True,
             connection_epoch=7,
@@ -64,6 +66,9 @@ class _LiveHost(QObject):
 
     def high_resolution_market_data_snapshot(self):
         return self.snapshot
+
+    def nxt_display_live_price_state(self, stock_code: str):
+        return self.nxt_states.get(str(stock_code))
 
 
 class _Owner(QDialog):
@@ -90,6 +95,26 @@ def _state(
         last_market_datetime=f"{TODAY}T09:13:27+09:00",
         last_price=price,
         data_quality=quality,
+    )
+
+
+def _nxt_state(
+    stock_code: str = "005930",
+    *,
+    price: int = 261000,
+    epoch: int = 7,
+    session_id: str = "SESSION-7",
+):
+    return SimpleNamespace(
+        canonical_stock_code=stock_code,
+        broker_code_identity=f"{stock_code}_NX",
+        market_source="NXT",
+        source_real_type="ECN주식체결",
+        connection_epoch=epoch,
+        login_session_id=session_id,
+        last_market_datetime=f"{TODAY}T18:00:01+09:00",
+        last_price=price,
+        data_quality="NORMAL",
     )
 
 
@@ -133,6 +158,84 @@ class StockInstanceChartLivePriceTests(unittest.TestCase):
         self.assertEqual(canonical, window.chart.close_series)
         self.assertEqual(70350.0, window.chart.live_price_point[1])
         self.assertEqual(1, self.provider.call_count)
+
+    def test_live_price_source_uses_nxt_only_windows(self) -> None:
+        def at(hour: int, minute: int) -> datetime:
+            return datetime(
+                2026, 8, 24, hour, minute,
+                tzinfo=chart_window.SEOUL_TIMEZONE,
+            )
+
+        expected = (
+            (True, 8, 20, "NXT"),
+            (True, 8, 50, "KRX"),
+            (True, 10, 0, "KRX"),
+            (True, 15, 30, "KRX"),
+            (True, 15, 40, "NXT"),
+            (True, 19, 59, "NXT"),
+            (True, 20, 0, "KRX"),
+            (False, 18, 0, "KRX"),
+        )
+        for nxt_available, hour, minute, source in expected:
+            with self.subTest(
+                nxt_available=nxt_available,
+                hour=hour,
+                minute=minute,
+            ):
+                self.assertEqual(
+                    source,
+                    chart_window._live_price_market_source(
+                        nxt_available=nxt_available,
+                        now_dt=at(hour, minute),
+                    ),
+                )
+
+    def test_nxt_only_window_uses_separate_nxt_display_state(self) -> None:
+        self.provider.side_effect = lambda code, date: {
+            **_projection(code, date),
+            "nxt_available": True,
+        }
+        self.host.states["005930"] = _state(price=259500)
+        self.host.nxt_states["005930"] = _nxt_state(price=261000)
+        with patch.object(
+            chart_window,
+            "_live_price_market_source",
+            return_value="NXT",
+        ):
+            window = self._window()
+
+        self.assertEqual(261000.0, window.chart.live_price_point[1])
+
+    def test_nxt_only_window_never_falls_back_to_krx_state(self) -> None:
+        self.provider.side_effect = lambda code, date: {
+            **_projection(code, date),
+            "nxt_available": True,
+        }
+        self.host.states["005930"] = _state(price=259500)
+        with patch.object(
+            chart_window,
+            "_live_price_market_source",
+            return_value="NXT",
+        ):
+            window = self._window()
+
+        self.assertIsNone(window.chart.live_price_point)
+
+    def test_regular_window_keeps_krx_when_nxt_state_exists(self) -> None:
+        self.provider.side_effect = lambda code, date: {
+            **_projection(code, date),
+            "nxt_available": True,
+        }
+        self.host.states["005930"] = _state(price=259500)
+        self.host.nxt_states["005930"] = _nxt_state(price=261000)
+        with patch.object(
+            chart_window,
+            "_live_price_market_source",
+            return_value="KRX",
+        ):
+            window = self._window()
+
+        self.assertEqual(259500.0, window.chart.live_price_point[1])
 
     def test_on_projects_live_price_without_mutating_completed_candles(self) -> None:
         self.host.gate_enabled = True

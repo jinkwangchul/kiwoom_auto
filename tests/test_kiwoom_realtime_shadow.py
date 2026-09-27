@@ -12,6 +12,7 @@ from kiwoom_realtime_shadow import (
     RealtimeShadowBar,
     RealtimeShadowBarBuilder,
     compare_shadow_bar_to_canonical,
+    normalize_nxt_display_realtime_tick,
     normalize_realtime_shadow_tick,
 )
 
@@ -60,6 +61,49 @@ def _bar(*, close: int = 103, volume=40, volume_complete: bool = True):
 
 
 class RealtimeShadowBarTests(unittest.TestCase):
+    def test_nxt_display_tick_preserves_broker_and_canonical_identity(self) -> None:
+        tick = normalize_nxt_display_realtime_tick(
+            broker_code_identity="005930_NX",
+            real_type="ECN주식체결",
+            execution_time_raw="180001",
+            current_price_raw="-261000",
+            execution_quantity_raw="+12",
+            cumulative_volume_raw="3456",
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            receive_sequence=1,
+            received_monotonic=1.0,
+            received_at=datetime(2026, 8, 20, 18, 0, 1, tzinfo=SEOUL_TIMEZONE),
+        )
+        self.assertEqual("005930", tick.canonical_stock_code)
+        self.assertEqual("005930_NX", tick.broker_code_identity)
+        self.assertEqual("NXT", tick.market_source)
+        self.assertEqual(261000, tick.current_price)
+        self.assertEqual("2026-08-20T18:00:01+09:00", tick.market_datetime)
+
+        common = dict(
+            real_type="ECN주식체결",
+            execution_quantity_raw="1",
+            cumulative_volume_raw="1",
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            receive_sequence=1,
+            received_monotonic=1.0,
+            received_at=datetime(2026, 8, 20, 18, 0, 1, tzinfo=SEOUL_TIMEZONE),
+        )
+        self.assertIsNone(normalize_nxt_display_realtime_tick(
+            broker_code_identity="005930", execution_time_raw="180001",
+            current_price_raw="261000", **common
+        ))
+        self.assertIsNone(normalize_nxt_display_realtime_tick(
+            broker_code_identity="005930_NX", execution_time_raw="bad",
+            current_price_raw="261000", **common
+        ))
+        self.assertIsNone(normalize_nxt_display_realtime_tick(
+            broker_code_identity="005930_NX", execution_time_raw="180001",
+            current_price_raw="bad", **common
+        ))
+
     def test_tick_normalizes_official_fields_and_rejects_bad_time_or_price(self) -> None:
         tick = _tick("101501", "-1,234", "-9,876")
         self.assertIsNotNone(tick)

@@ -48,6 +48,12 @@ from kiwoom_screen_allocator import (
     ScreenAllocationError,
 )
 from kiwoom_realtime_fids import (
+    NXT_DISPLAY_REALTIME_FIDS,
+    NXT_REALTIME_CUMULATIVE_VOLUME_FID,
+    NXT_REALTIME_CURRENT_PRICE_FID,
+    NXT_REALTIME_EXECUTION_TIME_FID,
+    NXT_REALTIME_EXECUTION_TYPE,
+    NXT_REALTIME_TRADE_VOLUME_FID,
     REALTIME_CHANGE_RATE_FID,
     REALTIME_CUMULATIVE_VOLUME_FID,
     REALTIME_CURRENT_PRICE_FID,
@@ -67,6 +73,7 @@ from mock_validation_market_data import normalize_mock_orderbook_snapshot
 from kiwoom_realtime_shadow import (
     RealtimeShadowBar,
     RealtimeShadowBarBuilder,
+    normalize_nxt_display_realtime_tick,
     normalize_realtime_shadow_tick,
 )
 from kiwoom_initial_market_snapshot import (
@@ -152,6 +159,20 @@ class RealtimeShadowRegistrationSnapshot:
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
 
+
+@dataclass(frozen=True)
+class NxtDisplayRegistrationSnapshot:
+    active: bool
+    connection_epoch: int
+    login_session_id: str
+    canonical_stock_codes: tuple[str, ...]
+    broker_code_identities: tuple[str, ...]
+    fid_list: tuple[int, ...]
+    screen_batches: tuple[RealtimeShadowScreenBatch, ...]
+    last_error: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
 
 @dataclass(frozen=True)
 class MockOrderbookScreenBatch:
@@ -412,6 +433,7 @@ class KiwoomApi(QObject):
     bar_committed = pyqtSignal(object)
     realtime_shadow_tick_received = pyqtSignal(object)
     realtime_shadow_bar_completed = pyqtSignal(object)
+    nxt_display_tick_received = pyqtSignal(object)
     mock_orderbook_received = pyqtSignal(object)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
@@ -602,6 +624,8 @@ class KiwoomApi(QObject):
         self._realtime_shadow_builder = RealtimeShadowBarBuilder()
         self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
         self._realtime_receive_sequence = 0
+        self._nxt_display_registration = self._empty_nxt_display_snapshot()
+        self._nxt_display_receive_sequence = 0
         self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot()
         self._mock_orderbook_receive_sequence = 0
 
@@ -726,6 +750,201 @@ class KiwoomApi(QObject):
     ) -> RealtimeShadowRegistrationSnapshot:
         self._ensure_realtime_shadow_state()
         return self._realtime_shadow_registration
+
+    @staticmethod
+    def _empty_nxt_display_snapshot(
+        *,
+        connection_epoch: int = 0,
+        login_session_id: str = "",
+        last_error: str = "",
+    ) -> NxtDisplayRegistrationSnapshot:
+        return NxtDisplayRegistrationSnapshot(
+            active=False,
+            connection_epoch=int(connection_epoch or 0),
+            login_session_id=str(login_session_id or ""),
+            canonical_stock_codes=(),
+            broker_code_identities=(),
+            fid_list=tuple(NXT_DISPLAY_REALTIME_FIDS),
+            screen_batches=(),
+            last_error=str(last_error or ""),
+        )
+
+    def _ensure_nxt_display_state(self) -> None:
+        state = self.__dict__
+        if "_screen_allocator" not in state:
+            self._screen_allocator = KiwoomScreenAllocator()
+        if not isinstance(
+            state.get("_nxt_display_registration"),
+            NxtDisplayRegistrationSnapshot,
+        ):
+            self._nxt_display_registration = self._empty_nxt_display_snapshot()
+        if "_nxt_display_receive_sequence" not in state:
+            self._nxt_display_receive_sequence = 0
+
+    def _next_nxt_display_receive_sequence(self) -> int:
+        self._ensure_nxt_display_state()
+        self._nxt_display_receive_sequence += 1
+        return self._nxt_display_receive_sequence
+
+    def nxt_display_registration_snapshot(self) -> NxtDisplayRegistrationSnapshot:
+        self._ensure_nxt_display_state()
+        return self._nxt_display_registration
+
+    def sync_nxt_display_registration(self, stock_codes: object) -> dict[str, Any]:
+        """Register verified NXT-eligible canonical observations as ``_NX``."""
+
+        self._ensure_nxt_display_state()
+        session = self.broker_session_snapshot()
+        if not session.api_available or not session.connected or not session.login_session_id:
+            self.clear_nxt_display_registration(
+                remove_from_broker=False,
+                reason="NXT_DISPLAY_BROKER_SESSION_NOT_READY",
+            )
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "BROKER_SESSION_NOT_READY",
+                "snapshot": self._nxt_display_registration,
+            }
+        candidates = stock_codes if isinstance(stock_codes, (list, tuple, set, frozenset)) else ()
+        canonical_targets = tuple(
+            sorted(
+                {
+                    normalize_stock_code(code)
+                    for code in candidates
+                    if is_broker_action_stock_code(normalize_stock_code(code))
+                }
+            )
+        )
+        broker_targets = tuple(f"{code}_NX" for code in canonical_targets)
+        current = self._nxt_display_registration
+        if (
+            current.active
+            and current.connection_epoch == session.connection_epoch
+            and current.login_session_id == session.login_session_id
+            and current.canonical_stock_codes == canonical_targets
+            and current.fid_list == tuple(NXT_DISPLAY_REALTIME_FIDS)
+        ):
+            return {
+                "ok": True,
+                "changed": False,
+                "active": True,
+                "reason_code": "NXT_DISPLAY_UNCHANGED",
+                "snapshot": current,
+            }
+        had_registration = bool(current.screen_batches)
+        if had_registration:
+            cleared = self.clear_nxt_display_registration(
+                remove_from_broker=True,
+                reason="NXT_DISPLAY_TARGET_REPLACED",
+            )
+            if cleared.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "changed": True,
+                    "active": False,
+                    "reason_code": "NXT_DISPLAY_REPLACEMENT_CLEAR_FAILED",
+                    "errors": tuple(cleared.get("errors", ())),
+                    "snapshot": self._nxt_display_registration,
+                }
+        if not broker_targets:
+            return {
+                "ok": True,
+                "changed": had_registration,
+                "active": False,
+                "reason_code": "NXT_DISPLAY_EMPTY_TARGET",
+                "snapshot": self._nxt_display_registration,
+            }
+
+        fid_text = ";".join(str(fid) for fid in NXT_DISPLAY_REALTIME_FIDS)
+        registered: list[RealtimeShadowScreenBatch] = []
+        try:
+            for offset in range(0, len(broker_targets), 100):
+                codes = broker_targets[offset:offset + 100]
+                owner = f"nxt_display:{session.connection_epoch}:{offset // 100}"
+                lease = self._screen_allocator.claim(REALTIME, owner)
+                registered.append(
+                    RealtimeShadowScreenBatch(
+                        screen_no=lease.screen_no,
+                        owner=owner,
+                        stock_codes=codes,
+                    )
+                )
+                raw_result = self._control.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    lease.screen_no,
+                    ";".join(codes),
+                    fid_text,
+                    "0",
+                )
+                registered[-1] = RealtimeShadowScreenBatch(
+                    screen_no=lease.screen_no,
+                    owner=owner,
+                    stock_codes=codes,
+                    raw_registration_result=raw_result,
+                )
+        except Exception as exc:
+            self._clear_realtime_shadow_batches(registered, remove_from_broker=True)
+            self._nxt_display_registration = self._empty_nxt_display_snapshot(
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                last_error=str(exc),
+            )
+            return {
+                "ok": False,
+                "changed": True,
+                "active": False,
+                "reason_code": "NXT_DISPLAY_REGISTRATION_FAILED",
+                "error": str(exc),
+                "snapshot": self._nxt_display_registration,
+            }
+        self._nxt_display_registration = NxtDisplayRegistrationSnapshot(
+            active=True,
+            connection_epoch=session.connection_epoch,
+            login_session_id=session.login_session_id,
+            canonical_stock_codes=canonical_targets,
+            broker_code_identities=broker_targets,
+            fid_list=tuple(NXT_DISPLAY_REALTIME_FIDS),
+            screen_batches=tuple(registered),
+            last_error="",
+        )
+        return {
+            "ok": True,
+            "changed": True,
+            "active": True,
+            "reason_code": "NXT_DISPLAY_REGISTER_CALL_RETURNED",
+            "snapshot": self._nxt_display_registration,
+        }
+
+    def clear_nxt_display_registration(
+        self,
+        *,
+        remove_from_broker: bool | None = None,
+        reason: str = "NXT_DISPLAY_CLEARED",
+    ) -> dict[str, Any]:
+        self._ensure_nxt_display_state()
+        current = self._nxt_display_registration
+        batches = list(current.screen_batches)
+        if remove_from_broker is None:
+            remove_from_broker = bool(self._connected and self._control is not None)
+        errors = self._clear_realtime_shadow_batches(
+            batches,
+            remove_from_broker=bool(remove_from_broker),
+        )
+        self._nxt_display_registration = self._empty_nxt_display_snapshot(
+            connection_epoch=int(getattr(self, "_connection_epoch", 0) or 0),
+            login_session_id=str(getattr(self, "_login_session_id", "") or ""),
+            last_error="; ".join(errors),
+        )
+        return {
+            "ok": not errors,
+            "changed": bool(batches),
+            "active": False,
+            "reason_code": reason if not errors else "NXT_DISPLAY_CLEAR_FAILED",
+            "errors": tuple(errors),
+            "snapshot": self._nxt_display_registration,
+        }
 
     @staticmethod
     def _empty_mock_orderbook_snapshot(
@@ -1357,6 +1576,12 @@ class KiwoomApi(QObject):
             reset_shadow(
                 remove_from_broker=False,
                 reason="REALTIME_SHADOW_SESSION_INVALIDATED",
+            )
+        reset_nxt_display = getattr(self, "clear_nxt_display_registration", None)
+        if callable(reset_nxt_display):
+            reset_nxt_display(
+                remove_from_broker=False,
+                reason="NXT_DISPLAY_SESSION_INVALIDATED",
             )
         reset_mock_orderbook = getattr(
             self,
@@ -3271,6 +3496,10 @@ class KiwoomApi(QObject):
                 remove_from_broker=False,
                 reason="REALTIME_SHADOW_NEW_SESSION",
             )
+            self.clear_nxt_display_registration(
+                remove_from_broker=False,
+                reason="NXT_DISPLAY_NEW_SESSION",
+            )
             self.clear_mock_orderbook_registration(
                 remove_from_broker=False,
                 reason="MOCK_ORDERBOOK_NEW_SESSION",
@@ -3360,6 +3589,9 @@ class KiwoomApi(QObject):
         if real_type == REALTIME_ORDERBOOK_TYPE:
             self._on_receive_mock_orderbook(stock_code)
             return
+        if real_type == NXT_REALTIME_EXECUTION_TYPE:
+            self._on_receive_nxt_display_tick(stock_code)
+            return
         registration = self._realtime_shadow_registration
         if (
             not registration.active
@@ -3423,6 +3655,53 @@ class KiwoomApi(QObject):
                 target_name=stock_code,
                 reason_code="REALTIME_SHADOW_TICK_FAILED",
                 failure_scope=f"realtime_shadow_tick:{stock_code}",
+            )
+
+    def _on_receive_nxt_display_tick(self, broker_code_identity: str) -> None:
+        """Emit one registered ECN execution tick to the display-only path."""
+
+        self._ensure_nxt_display_state()
+        registration = self._nxt_display_registration
+        if (
+            not registration.active
+            or broker_code_identity not in registration.broker_code_identities
+        ):
+            return
+        session = self.broker_session_snapshot()
+        if (
+            not session.connected
+            or not session.login_session_id
+            or session.connection_epoch != registration.connection_epoch
+            or session.login_session_id != registration.login_session_id
+        ):
+            return
+        try:
+            values = {
+                fid: self._control.dynamicCall(
+                    "GetCommRealData(QString, int)",
+                    broker_code_identity,
+                    fid,
+                )
+                for fid in NXT_DISPLAY_REALTIME_FIDS
+            }
+            tick = normalize_nxt_display_realtime_tick(
+                broker_code_identity=broker_code_identity,
+                real_type=NXT_REALTIME_EXECUTION_TYPE,
+                execution_time_raw=values[NXT_REALTIME_EXECUTION_TIME_FID],
+                current_price_raw=values[NXT_REALTIME_CURRENT_PRICE_FID],
+                execution_quantity_raw=values[NXT_REALTIME_TRADE_VOLUME_FID],
+                cumulative_volume_raw=values[NXT_REALTIME_CUMULATIVE_VOLUME_FID],
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                receive_sequence=self._next_nxt_display_receive_sequence(),
+                received_monotonic=monotonic(),
+            )
+            if tick is not None:
+                self.nxt_display_tick_received.emit(tick.to_payload())
+        except Exception as exc:
+            self._nxt_display_registration = replace(
+                registration,
+                last_error=str(exc),
             )
 
     def _on_receive_mock_orderbook(self, stock_code: str) -> None:

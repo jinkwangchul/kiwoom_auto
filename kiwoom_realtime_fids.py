@@ -28,6 +28,21 @@ REALTIME_SHADOW_FIDS = (
     REALTIME_EXECUTION_STRENGTH_FID,
 )
 
+# Installed KOA StudioSA 2.34 Real Type "ECN주식체결".  These FIDs are
+# intentionally isolated from REALTIME_SHADOW_FIDS because the current NXT
+# contract is display-only and must not feed KRX execution/shadow consumers.
+NXT_REALTIME_EXECUTION_TYPE = "ECN주식체결"
+NXT_REALTIME_EXECUTION_TIME_FID = 10020
+NXT_REALTIME_CURRENT_PRICE_FID = 10010
+NXT_REALTIME_TRADE_VOLUME_FID = 10015
+NXT_REALTIME_CUMULATIVE_VOLUME_FID = 10013
+NXT_DISPLAY_REALTIME_FIDS = (
+    NXT_REALTIME_EXECUTION_TIME_FID,
+    NXT_REALTIME_CURRENT_PRICE_FID,
+    NXT_REALTIME_TRADE_VOLUME_FID,
+    NXT_REALTIME_CUMULATIVE_VOLUME_FID,
+)
+
 # Installed KOA StudioSA 2.34 ``koarealtime.dat`` Real Type
 # "주식호가잔량" plus the installed KOAStudioSA FID dictionary.
 # These remain separate from REALTIME_SHADOW_FIDS because they feed only the
