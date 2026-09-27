@@ -4508,6 +4508,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             historical_provider_factory=Provider,
             replay_factory=Replay,
             recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         window = _FakeWindow(self.stock, self._seed())
         self.widgets.append(window)
@@ -5269,6 +5272,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             window_factory=window_factory,
             recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         carrier = type(
             "Carrier",
@@ -5487,6 +5493,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             window_factory=window_factory,
             recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         flow._last_selected_stock = self.stock
         carrier = type("Carrier", (QDialog,), {"signal_validation_requested": pyqtSignal(object)})()
@@ -5596,6 +5605,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             window_factory=window_factory,
             recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         flow._last_selected_stock = self.stock
         carrier = type("Carrier", (QDialog,), {"signal_validation_requested": pyqtSignal(object)})()
@@ -5813,6 +5825,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             window_factory=_FakeWindow,
             recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         seed = self._seed()
         request = IndicatorFollowSignalValidationRunRequest(
@@ -5973,6 +5988,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             recent_stock_store=_MemoryRecentStockStore(),
             historical_cache=cache,
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         first_window = _FakeWindow(self.stock, seed)
         self.widgets.append(first_window)
@@ -5998,6 +6016,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=Replay,
             recent_stock_store=_MemoryRecentStockStore(),
             historical_cache=cache,
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         second_flow._now_factory = lambda: latest + timedelta(days=3)
         second_window = _FakeWindow(self.stock, seed)
@@ -6094,6 +6115,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             replay_factory=ReplayWithoutSignalScan,
             recent_stock_store=_MemoryRecentStockStore(),
             historical_cache=cache,
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
         )
         flow._now_factory = lambda: latest + timedelta(days=3)
         window = _FakeWindow(self.stock, seed)
