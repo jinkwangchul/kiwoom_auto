@@ -280,6 +280,21 @@ class StockInstanceChartLivePriceTests(unittest.TestCase):
         self.assertIsNone(window.chart.live_price_point)
         self.assertEqual(1, self.provider.call_count)
 
+    def test_live_price_diagnostic_records_failure_and_recovery(self) -> None:
+        window = self._window()
+        failed = window.live_price_diagnostic_snapshot()
+        self.assertEqual("NO_LIVE_PRICE_STATE", failed["stage"])
+        self.assertEqual("KRX", failed["market_source"])
+
+        self.host.states["005930"] = _state(price=70350)
+        self.assertTrue(self._refresh(window))
+
+        recovered = window.live_price_diagnostic_snapshot()
+        self.assertEqual("LIVE_PRICE_APPLIED", recovered["stage"])
+        self.assertEqual("KRX", recovered["market_source"])
+        self.assertEqual(70350.0, recovered["price"])
+        self.assertGreater(recovered["count"], failed["count"])
+
     def test_past_date_has_no_live_timer_or_overlay(self) -> None:
         self.host.gate_enabled = True
         self.host.states["005930"] = _state()

@@ -1914,6 +1914,8 @@ class StockInstanceChartWindow(QDialog):
         self._bar_committed_refresh_pending = False
         self._live_price_operation_host = None
         self._live_price_refresh_timer: QTimer | None = None
+        self._live_price_diagnostic_count = 0
+        self._live_price_diagnostic_last: dict[str, Any] = {}
         self._operation_header_refresh_timer: QTimer | None = None
         self._operation_command_in_progress = False
         self._stock_operation_adapter = None
@@ -2029,13 +2031,34 @@ class StockInstanceChartWindow(QDialog):
         clear = getattr(self.chart, "clear_live_price_projection", None)
         return bool(clear()) if callable(clear) else False
 
+    def _observe_live_price_diagnostic(
+        self,
+        stage: str,
+        **details: Any,
+    ) -> None:
+        """Keep one process-local read-only live-price diagnostic snapshot."""
+
+        self._live_price_diagnostic_count += 1
+        self._live_price_diagnostic_last = {
+            "stage": str(stage or "").strip(),
+            "stock_code": self.stock_code,
+            "trade_date": self.trade_date,
+            **details,
+            "count": self._live_price_diagnostic_count,
+        }
+
+    def live_price_diagnostic_snapshot(self) -> dict[str, Any]:
+        return dict(self._live_price_diagnostic_last)
+
     def refresh_live_price_projection(self) -> bool:
         """Refresh only the UI live marker from the authorized display source."""
 
         if self.trade_date != _today_trade_date():
+            self._observe_live_price_diagnostic("TRADE_DATE_NOT_CURRENT")
             return self._clear_live_price_projection()
         host = self._live_price_operation_host
         if host is None:
+            self._observe_live_price_diagnostic("NO_OPERATION_HOST")
             return self._clear_live_price_projection()
         try:
             snapshot = host.high_resolution_market_data_snapshot()
@@ -2053,9 +2076,20 @@ class StockInstanceChartWindow(QDialog):
                 state = reader(self.stock_code) if callable(reader) else None
             else:
                 state = host.high_resolution_market_state(self.stock_code)
-        except Exception:
+        except Exception as exc:
+            self._observe_live_price_diagnostic(
+                "LIVE_PRICE_LOOKUP_FAILED",
+                exception_type=type(exc).__name__,
+            )
             return self._clear_live_price_projection()
-        if state is None or snapshot is None:
+        if snapshot is None:
+            self._observe_live_price_diagnostic("NO_HIGH_RES_SNAPSHOT")
+            return self._clear_live_price_projection()
+        if state is None:
+            self._observe_live_price_diagnostic(
+                "NO_LIVE_PRICE_STATE",
+                market_source=market_source,
+            )
             return self._clear_live_price_projection()
 
         if market_source == "NXT":
@@ -2068,11 +2102,24 @@ class StockInstanceChartWindow(QDialog):
                 or str(getattr(state, "source_real_type", "") or "").strip()
                 != "ECN주식체결"
             ):
+                self._observe_live_price_diagnostic(
+                    "NXT_DISPLAY_IDENTITY_MISMATCH",
+                    market_source=market_source,
+                )
                 return self._clear_live_price_projection()
         elif str(getattr(state, "stock_code", "") or "").strip() != self.stock_code:
+            self._observe_live_price_diagnostic(
+                "STOCK_IDENTITY_MISMATCH",
+                market_source=market_source,
+                state_stock_code=str(getattr(state, "stock_code", "") or "").strip(),
+            )
             return self._clear_live_price_projection()
 
         if not bool(getattr(snapshot, "broker_connected", False)):
+            self._observe_live_price_diagnostic(
+                "BROKER_DISCONNECTED",
+                market_source=market_source,
+            )
             return self._clear_live_price_projection()
         state_identity = (
             int(getattr(state, "connection_epoch", 0) or 0),
@@ -2083,21 +2130,53 @@ class StockInstanceChartWindow(QDialog):
             str(getattr(snapshot, "login_session_id", "") or "").strip(),
         )
         if not state_identity[1] or state_identity != snapshot_identity:
+            self._observe_live_price_diagnostic(
+                "SESSION_IDENTITY_MISMATCH",
+                market_source=market_source,
+                state_identity=state_identity,
+                snapshot_identity=snapshot_identity,
+            )
             return self._clear_live_price_projection()
         market_datetime = parse_market_datetime(
             getattr(state, "last_market_datetime", None)
         )
-        if (
-            market_datetime is None
-            or market_datetime.date().isoformat() != self.trade_date
-        ):
+        if market_datetime is None:
+            self._observe_live_price_diagnostic(
+                "MARKET_DATETIME_UNAVAILABLE",
+                market_source=market_source,
+            )
+            return self._clear_live_price_projection()
+        if market_datetime.date().isoformat() != self.trade_date:
+            self._observe_live_price_diagnostic(
+                "TRADE_DATE_MISMATCH",
+                market_source=market_source,
+                market_datetime=market_datetime.isoformat(),
+            )
             return self._clear_live_price_projection()
         price = _finite_number(getattr(state, "last_price", None))
         if price is None or price <= 0:
+            self._observe_live_price_diagnostic(
+                "PRICE_INVALID",
+                market_source=market_source,
+                price=getattr(state, "last_price", None),
+            )
             return self._clear_live_price_projection()
         apply_live = getattr(self.chart, "set_live_price_projection", None)
         if not callable(apply_live):
+            self._observe_live_price_diagnostic(
+                "LIVE_PRICE_APPLIER_UNAVAILABLE",
+                market_source=market_source,
+            )
             return False
+        self._observe_live_price_diagnostic(
+            "LIVE_PRICE_APPLIED",
+            market_source=market_source,
+            price=price,
+            market_datetime=market_datetime.isoformat(),
+            connection_epoch=state_identity[0],
+            login_session_id=state_identity[1],
+            data_quality=getattr(state, "data_quality", "NORMAL"),
+        )
         return bool(
             apply_live(
                 market_datetime,
