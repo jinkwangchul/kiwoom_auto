@@ -16,6 +16,7 @@ import weakref
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5 import sip
 from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics, QMouseEvent, QPixmap, QWheelEvent
 from PyQt5.QtTest import QTest
@@ -256,6 +257,21 @@ class _MemoryRecentStockStore:
 
 
 class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
+    def test_deleted_flow_drops_background_completion_emit(self):
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=_FakeHost(self.stock),
+            recent_stock_store=_MemoryRecentStockStore(),
+        )
+        received = []
+        flow.signal_scan_completed.connect(received.append)
+
+        sip.delete(flow)
+
+        self.assertTrue(sip.isdeleted(flow))
+        self.assertFalse(flow._emit_signal_scan_completed({"probe": True}))
+        self.assertEqual([], received)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

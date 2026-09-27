@@ -13,6 +13,7 @@ import tempfile
 from threading import Thread
 import weakref
 
+from PyQt5 import sip
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QDialog, QWidget
 
@@ -1760,13 +1761,25 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 payload["replay_snapshot"] = None
                 payload["prepared_presentation"] = None
                 payload["error"] = str(exc)
-            self.signal_scan_completed.emit(payload)
+            self._emit_signal_scan_completed(payload)
 
         Thread(
             target=prepare_result,
             name="indicator-follow-validation-prepare",
             daemon=True,
         ).start()
+
+    def _emit_signal_scan_completed(self, payload: object) -> bool:
+        """Emit prepare completion unless this QObject was already torn down."""
+        if sip.isdeleted(self):
+            return False
+        try:
+            self.signal_scan_completed.emit(payload)
+        except RuntimeError:
+            if sip.isdeleted(self):
+                return False
+            raise
+        return True
 
     def _on_signal_scan_completed(self, payload: object) -> None:
         if not isinstance(payload, dict):
