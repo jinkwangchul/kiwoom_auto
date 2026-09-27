@@ -1308,6 +1308,90 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual([28], handled_counts)
         self.assertEqual([], window.errors)
 
+    def test_range_replay_replaces_only_selected_marker_interval(self):
+        window = self._window()
+        rules = window._signal_validation_seed.settings_snapshot.to_dict()
+        rules["validation_execution"] = {
+            "enabled": False,
+            "first_buy_quantity": 1,
+            "repeat_mode": "ROUND",
+            "round_operator": "ADD",
+            "round_budget_value": 0.5,
+            "budget_ratio": 2.0,
+            "active_direction": "UP",
+            "active_ratio": 0.45,
+            "active_compare": ">=",
+            "trading_cost_enabled": False,
+            "trading_cost_percent": 0.2,
+        }
+        settings = ValidationSettingsSnapshot(rules)
+        prices = (100.0, 101.0, 102.0, 103.0, 104.0, 105.0)
+        candles = [
+            {
+                "time": f"2026091114{index:02d}00",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 1,
+            }
+            for index, price in enumerate(prices)
+        ]
+        baseline = [
+            self._entry("BUY", 0, "BUY"),
+            self._entry("SELL", 2, "SELL"),
+            self._entry("BUY", 3, "BUY"),
+            self._entry("SELL", 5, "SELL"),
+        ]
+        window._pending_result_settings_snapshot = settings
+        window.set_replay_snapshot(ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=settings.rules_hash,
+            historical_request_id="BASE-MARKERS",
+            evaluated_start_index=0,
+            evaluated_end_index=5,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=baseline,
+        ))
+
+        window._set_validation_range(1, 4)
+        range_entries = [
+            self._entry("BUY", 1, "BUY"),
+            self._entry("BUY", 2, "BUY"),
+            self._entry("SELL", 4, "SELL"),
+        ]
+        window.apply_range_replay_snapshot(ValidationReplaySnapshot(
+            stock=self.stock,
+            timeframe_minutes=5,
+            settings_hash=settings.rules_hash,
+            historical_request_id="RANGE-MARKERS",
+            evaluated_start_index=1,
+            evaluated_end_index=4,
+            dropped_raw_rows_count=0,
+            candles=candles,
+            entries=range_entries,
+        ))
+
+        markers = {
+            (entry.evaluation_index, entry.evaluation_side)
+            for entry in window._marker_entries_for_display()
+            if entry.signal == entry.evaluation_side
+        }
+        self.assertEqual(
+            {
+                (0, "BUY"),
+                (1, "BUY"),
+                (2, "BUY"),
+                (4, "SELL"),
+                (5, "SELL"),
+            },
+            markers,
+        )
+        self.assertNotIn((2, "SELL"), markers)
+        self.assertNotIn((3, "BUY"), markers)
+
     def _replay_snapshot(
         self,
         entries,

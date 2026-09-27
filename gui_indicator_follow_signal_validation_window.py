@@ -4642,6 +4642,9 @@ class IndicatorFollowSignalValidationWindow(
         self._entries: list[ValidationReplayEntry] = []
         self._signal_marker_entries: list[ValidationReplayEntry] = []
         self._signal_marker_entries_available = False
+        self._range_replay_calculation_entries: list[ValidationReplayEntry] = []
+        self._range_replay_entries: list[ValidationReplayEntry] = []
+        self._range_replay_entries_available = False
         self._completed_cycles: list[IndicatorFollowValidationCompletedCycle] = []
         self._selected_index: int | None = None
         self._position_indicator_index: int | None = None
@@ -6695,6 +6698,9 @@ class IndicatorFollowSignalValidationWindow(
         self._entries = []
         self._signal_marker_entries = []
         self._signal_marker_entries_available = False
+        self._range_replay_calculation_entries = []
+        self._range_replay_entries = []
+        self._range_replay_entries_available = False
         self._completed_cycles = []
         self._selected_index = None
         self._position_indicator_index = None
@@ -7016,6 +7022,9 @@ class IndicatorFollowSignalValidationWindow(
         self._entries = []
         self._signal_marker_entries = []
         self._signal_marker_entries_available = False
+        self._range_replay_calculation_entries = []
+        self._range_replay_entries = []
+        self._range_replay_entries_available = False
 
     @staticmethod
     def _entry_with_indexes(
@@ -7138,11 +7147,46 @@ class IndicatorFollowSignalValidationWindow(
         self._pending_prepared_presentation = prepared
         self._backtest_trust_metadata = deepcopy(prepared.trust_metadata or {})
 
-    def _marker_entries_for_display(self) -> list[ValidationReplayEntry]:
+    def _base_marker_entries_for_display(self) -> list[ValidationReplayEntry]:
         return (
             self._signal_marker_entries
             if self._signal_marker_entries_available
             else self._entries
+        )
+    @staticmethod
+    def _replace_signal_entries_in_range(
+        baseline: list[ValidationReplayEntry],
+        override: list[ValidationReplayEntry],
+        start_index: int,
+        end_index: int,
+    ) -> list[ValidationReplayEntry]:
+        retained = [
+            entry for entry in baseline
+            if not start_index <= entry.evaluation_index <= end_index
+        ]
+        replacements = [
+            entry for entry in override
+            if (
+                start_index <= entry.evaluation_index <= end_index
+                and entry.signal == entry.evaluation_side
+            )
+        ]
+        return IndicatorFollowSignalValidationWindow._merged_replay_entries(
+            retained,
+            replacements,
+        )
+
+    def _marker_entries_for_display(self) -> list[ValidationReplayEntry]:
+        baseline = self._base_marker_entries_for_display()
+        bounds = self._effective_validation_range()
+        if not self._range_replay_entries_available or bounds is None:
+            return baseline
+        start, end = bounds
+        return self._replace_signal_entries_in_range(
+            baseline,
+            self._range_replay_entries,
+            start,
+            end,
         )
 
     def _marker_entries_for_calculation(self) -> list[ValidationReplayEntry]:
@@ -7176,6 +7220,12 @@ class IndicatorFollowSignalValidationWindow(
         if replay_snapshot.stock != self.stock:
             raise ValueError("replay stock identity mismatch")
         previous_snapshot = self._replay_snapshot
+        settings_identity_changed = (
+            isinstance(previous_snapshot, ValidationReplaySnapshot)
+            and previous_snapshot.settings_hash != replay_snapshot.settings_hash
+        )
+        if settings_identity_changed:
+            self._clear_range_replay_override()
         history_extension_anchor = self._pending_history_extension_view_anchor
         self._pending_history_extension_view_anchor = None
         prepared_presentation = self._pending_prepared_presentation
@@ -7386,14 +7436,33 @@ class IndicatorFollowSignalValidationWindow(
         calculation_entries, chart_entries = self._mapped_replay_entries(
             replay_snapshot
         )
+        bounds = self._effective_validation_range()
+        if bounds is None:
+            raise ValueError("range replay requires an active validation range")
+        start, end = bounds
+        calculation_start = self._chart_calculation_indexes[start]
+        calculation_end = self._chart_calculation_indexes[end]
         self._calculation_entries = self._merged_replay_entries(
-            self._calculation_entries,
+            [
+                entry
+                for entry in self._calculation_entries
+                if not calculation_start
+                <= entry.evaluation_index
+                <= calculation_end
+            ],
             calculation_entries,
         )
         self._entries = self._merged_replay_entries(
-            self._entries,
+            [
+                entry
+                for entry in self._entries
+                if not start <= entry.evaluation_index <= end
+            ],
             chart_entries,
         )
+        self._range_replay_calculation_entries = list(calculation_entries)
+        self._range_replay_entries = list(chart_entries)
+        self._range_replay_entries_available = True
         self._replay_snapshot = replay_snapshot
         self._rebuild_visualization_data()
         self._signal_tooltips = self._build_signal_tooltips()
@@ -7428,11 +7497,17 @@ class IndicatorFollowSignalValidationWindow(
             return (start, end)
         return None
 
+    def _clear_range_replay_override(self) -> None:
+        self._range_replay_calculation_entries = []
+        self._range_replay_entries = []
+        self._range_replay_entries_available = False
+
     def _set_validation_range(
         self,
         start_index: int | None,
         end_index: int | None,
     ) -> None:
+        previous_range = self._validation_range
         if start_index is None or end_index is None:
             self._validation_range = None
             self._validation_range_times = None
@@ -7446,6 +7521,8 @@ class IndicatorFollowSignalValidationWindow(
                 str(self._candles[start].get("time") or ""),
                 str(self._candles[end].get("time") or ""),
             )
+        if self._validation_range is None or self._validation_range != previous_range:
+            self._clear_range_replay_override()
         canvas = getattr(self, "canvas", None)
         if canvas is not None:
             if self._validation_range is None:
