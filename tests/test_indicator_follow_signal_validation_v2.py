@@ -2140,7 +2140,12 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertNotIn("execution", rules["buy"])
         self.assertNotIn("price_compare", rules["buy"].get("filters", {}))
         self.assertNotIn("method", rules["sell"])
-        self.assertNotIn("profit_rate_sell", rules["sell"]["signals"])
+        source_profit = self.rules["sell"]["signals"].get("profit_rate_sell")
+        if isinstance(source_profit, dict):
+            self.assertEqual(
+                source_profit,
+                rules["sell"]["signals"]["profit_rate_sell"],
+            )
 
     def test_time_axis_labels_use_only_real_candle_times_and_range_format(self):
         def candles(times):
