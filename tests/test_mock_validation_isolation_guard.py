@@ -50,6 +50,36 @@ class MockValidationIsolationGuardTest(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual("SendOrder", result["violations"][0]["name"])
 
+    def test_production_market_data_host_import_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mock_validation_bad_market_data.py"
+            path.write_text("from gui_market_data_host import MarketDataHost\n", encoding="utf-8")
+            result = audit_mock_dependency_graph([path])
+            self.assertFalse(result["ok"])
+            self.assertEqual("gui_market_data_host", result["violations"][0]["name"])
+
+    def test_dynamic_forbidden_import_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mock_validation_bad_dynamic.py"
+            path.write_text(
+                "import importlib\n"
+                "value = importlib.import_module('kiwoom_send_order_executor')\n",
+                encoding="utf-8",
+            )
+            result = audit_mock_dependency_graph([path])
+            self.assertFalse(result["ok"])
+            self.assertEqual("DYNAMIC_IMPORT", result["violations"][0]["kind"])
+
+    def test_dynamic_routine_source_is_audited(self) -> None:
+        result = audit_mock_dependency_graph(
+            [PROJECT_ROOT / "mock_validation_indicator_follow_adapter.py"]
+        )
+        checked_names = {Path(value).name for value in result["files_checked"]}
+        self.assertIn("routine_buy_execution.py", checked_names)
+        self.assertIn("routine_sell_execution.py", checked_names)
+        self.assertIn("routine_lifecycle.py", checked_names)
+        self.assertTrue(result["ok"], result["violations"])
+
 
 if __name__ == "__main__":
     unittest.main()
