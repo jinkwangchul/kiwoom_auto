@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -8,6 +11,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtWidgets import QApplication
 
 import gui_stock_instance_chart_window as chart
+import mock_validation_quick_chart as mock_chart
+from mock_validation_contract import payload_hash
+from mock_validation_host import MockValidationHost
+from mock_validation_ui_actions import MockValidationUIActions
+from tests.test_mock_validation_host_ui import _Api, _reference
 from tests.test_stock_instance_chart_auto_refresh import (
     ChartOwner,
     TODAY,
@@ -175,6 +183,66 @@ class ChartRenderPerformanceTests(unittest.TestCase):
             self.assertFalse(window._operation_cycle_refresh_connected)
 
 
+
+class MockChartReadReuseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "project"
+        self.root.mkdir()
+        self.now = datetime.fromisoformat("2026-09-07T12:00:00+09:00")
+        self.host = MockValidationHost(_Api(), project_root=self.root, now_factory=lambda: self.now)
+        self.addCleanup(self.host.dispose)
+        self.actions = MockValidationUIActions(self.host)
+        document = self.actions.create_waiting_session(_reference())["document"]
+        self.sid = document["session"]["validation_session_id"]
+        self.target = SimpleNamespace(stock_code="005930", validation_session_id=self.sid, routine_instance_id="A")
+        self.owner = SimpleNamespace(mock_validation_host=self.host)
+        self.cache = {}
+
+    def test_unchanged_reads_zero_and_official_mutation_refreshes_immediately(self):
+        read = lambda: mock_chart._target_document(self.owner, self.target, read_cache=self.cache)
+        before = read()
+        before_hash = payload_hash(before)
+        with patch.object(self.host, "current_session", wraps=self.host.current_session) as reader:
+            for _ in range(6):
+                self.assertIs(before, read())
+                mock_chart._fresh_operation_header_display(self.owner, self.target, read_cache=self.cache)
+            reader.assert_not_called()
+            self.actions.set_instance_effective_settings("005930", "A", operation_mode="CONTINUOUS")
+            reader.reset_mock()
+            after = read()
+            reader.assert_called_once()
+        self.assertGreater(after["revision"], before["revision"])
+        self.assertEqual("CONTINUOUS", after["effective_settings_by_instance"]["A"]["operation_mode"])
+        self.assertEqual(before_hash, payload_hash(before))
+        self.assertEqual(before["reference_snapshot"], after["reference_snapshot"])
+
+    def test_replaced_index_rejects_old_target_and_missing_source_never_reuses(self):
+        mock_chart._target_document(self.owner, self.target, read_cache=self.cache)
+        self.host.repository._write_current_index("005930", "")
+        self.assertIsNone(mock_chart._target_document(self.owner, self.target, read_cache=self.cache))
+        path = self.root / "missing.json"
+        reader = Mock(return_value=[])
+        mock_chart._read_chart_source(self.cache, "missing", (path,), reader)
+        mock_chart._read_chart_source(self.cache, "missing", (path,), reader)
+        self.assertEqual(2, reader.call_count)
+
+    def test_event_journal_invalidates_independently_of_session_revision(self):
+        repo = self.host.repository
+        path = repo.root / "events" / f"{self.sid}.json"
+        read = lambda: mock_chart._read_chart_source(self.cache, "events", (path,), lambda: repo.read_events(self.sid))
+        initial = read()
+        revision = repo.read_session(self.sid)["revision"]
+        with patch.object(repo, "read_events", wraps=repo.read_events) as reader:
+            self.assertIs(initial, read())
+            reader.assert_not_called()
+            event = dict(initial[0])
+            event["event_id"] = "ME-PERFORMANCE-APPEND"
+            repo.append_event(event)
+            self.assertEqual(len(initial) + 1, len(read()))
+            reader.assert_called_once()
+        self.assertEqual(revision, repo.read_session(self.sid)["revision"])
 
 if __name__ == "__main__":
     unittest.main()
