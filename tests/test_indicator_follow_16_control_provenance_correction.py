@@ -479,7 +479,14 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
         group_a = signal_a["groups"][0]
         self.assertEqual(group_a["conditions"][0]["operator"], "TURN_UP")
         self.assertEqual(signal_a["order_delay_bars"], 7)
-        self.assertEqual(signal_a["delay_anchor"], "FOLLOWING_BASE_BAR_ENTRY")
+        self.assertEqual(
+            signal_a["delay_anchor"],
+            "FOLLOWING_COMPLETED_BASE_BAR_ENTRY",
+        )
+        self.assertEqual(
+            signal_a["zero_bar_mode"],
+            "COMPLETED_TRANSITION_CONFIRMATION",
+        )
         self.assertNotIn("bar_offset", group_a["conditions"][0])
         self.assertEqual(1, group_a["conditions"][1]["bar_offset"])
         self.assertEqual(group_a["condition_expression"]["operator"], "OR")
@@ -588,7 +595,14 @@ class MapperAndConsumerProvenanceTest(unittest.TestCase):
             conditions = signal["groups"][0]["conditions"]
             self.assertEqual(conditions[0]["operator"], "TURN_DOWN")
             self.assertEqual(signal["order_delay_bars"], offset)
-            self.assertEqual(signal["delay_anchor"], "FOLLOWING_BASE_BAR_ENTRY")
+            self.assertEqual(
+                signal["delay_anchor"],
+                "FOLLOWING_COMPLETED_BASE_BAR_ENTRY",
+            )
+            self.assertEqual(
+                signal["zero_bar_mode"],
+                "COMPLETED_TRANSITION_CONFIRMATION",
+            )
             self.assertNotIn("bar_offset", conditions[0])
             self.assertEqual(1, conditions[1]["bar_offset"])
 
