@@ -215,6 +215,49 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         self.widgets.append(window)
         return window
 
+    def test_v2_seed_composite_survives_collect_without_widgets(self):
+        state = deepcopy(self.ui_state)
+        composite = {
+            "enabled": True,
+            "logic": "AND",
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": [
+                {"enabled": True, "logic": "OR", "filters": ["rsi", "ocr"]},
+                {"enabled": False, "logic": "AND", "filters": ["bollinger"]},
+            ],
+        }
+        state["buy_ui"]["signal_filter"]["buy_composite"] = composite
+
+        window = self._window(state)
+
+        self.assertFalse(hasattr(window, "buy_composite_enabled_check"))
+        self.assertEqual(
+            composite,
+            window.collect_indicator_follow_ui_state()["buy_ui"]["signal_filter"]
+            ["buy_composite"],
+        )
+    def test_v2_apply_payload_excludes_preserved_composite(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"]["buy_composite"] = {
+            "enabled": True,
+            "logic": "AND",
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": [
+                {"enabled": True, "logic": "OR", "filters": ["rsi"]},
+                {"enabled": True, "logic": "AND", "filters": ["ocr"]},
+            ],
+        }
+
+        window = self._window(state)
+        payload = IndicatorFollowSignalValidationApplyPayload(
+            window.collect_indicator_follow_ui_state()
+        )
+
+        self.assertNotIn(
+            "buy_composite",
+            payload.to_ui_state()["buy_ui"]["signal_filter"],
+        )
+
     def test_timeframe_options_and_legacy_entry_restore_share_one_contract(self):
         state = deepcopy(self.ui_state)
         state["basic"]["basic_signal_interval_combo"] = "3"
