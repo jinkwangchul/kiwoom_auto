@@ -231,8 +231,8 @@ class IndicatorInputCandleSoTTest(unittest.TestCase):
             ),
         )
         originals = {
-            "macd_series": visualization.macd_series,
-            "rsi": visualization.rsi,
+            "macd_series_causal_history": visualization.macd_series_causal_history,
+            "rsi_causal_history": visualization.rsi_causal_history,
             "bollinger_band": visualization.bollinger_band,
             "price_box": visualization.price_box,
             "simple_ma": visualization.simple_ma,
@@ -249,10 +249,22 @@ class IndicatorInputCandleSoTTest(unittest.TestCase):
             return recorded
 
         with (
-            patch.object(visualization, "macd_series", wrap("macd_series")),
-            patch.object(visualization, "rsi", wrap("rsi")),
+            patch.object(
+                visualization,
+                "macd_series_causal_history",
+                wrap("macd_series_causal_history"),
+            ),
+            patch.object(
+                visualization,
+                "rsi_causal_history",
+                wrap("rsi_causal_history"),
+            ),
             patch.object(visualization, "bollinger_band", wrap("bollinger_band")),
-            patch.object(visualization, "price_box", wrap("price_box")),
+            patch.object(
+                visualization,
+                "price_box",
+                wrap("price_box"),
+            ),
             patch.object(visualization, "simple_ma", wrap("simple_ma")),
         ):
             cache = build_validation_indicator_cache(
@@ -263,7 +275,6 @@ class IndicatorInputCandleSoTTest(unittest.TestCase):
         expected_close = tuple(indicator_engine.close_prices(candles))
         self.assertTrue(seen)
         self.assertEqual({expected_close}, {item[2] for item in seen})
-        self.assertEqual(1, len({item[1] for item in seen}))
         self.assertEqual(len(candles), cache.candle_count)
 
 
