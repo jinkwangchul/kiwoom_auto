@@ -929,6 +929,87 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.assertIsNotNone(derived.get("production_calculation_cache_identity"))
         self.assertEqual(calculation_by_scope[False], calculation_by_scope[True])
 
+    def test_production_m1_input_detailed_replay_batch_and_four_gates_agree(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY", "ready": True,
+            "selected_ats": [], "selection_source": "manual",
+            "session_windows": [{"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"}],
+        }
+        rules = deepcopy(self.rules)
+        rules["bar"]["bar_minutes"] = 1
+        rules["validation_timeframe"] = {"key": "M1", "kind": "MINUTE", "minutes": 1, "label": "1분"}
+        rules["validation_market_scope"] = {"regular_market_only": True}
+        seed = self._seed(rules=rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, seed.settings_snapshot, 1),
+            operation_active_reader=lambda: False,
+        )
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            historical_count=2, window_factory=_FakeWindow,
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: deepcopy(contract),
+        )
+        source = []
+        for day_offset in range(3):
+            start = datetime(2026, 9, 14 + day_offset, 9, 0)
+            for minute_offset in range(380):
+                timestamp = (start + timedelta(minutes=minute_offset)).strftime("%Y%m%d%H%M%S")
+                close = 100.0 + ((minute_offset * 7) % 17) - (minute_offset % 5)
+                source.append({
+                    "time": timestamp, "open": close, "high": close + 1,
+                    "low": close - 1, "close": close, "volume": 1,
+                })
+        pool = flow._pool_from_candles(
+            session, source, requested_count=len(source), request_id="PRODUCTION-M1"
+        )
+        pool["production_session_contract"] = deepcopy(contract)
+        window = _FakeWindow(self.stock, seed)
+        self.widgets.append(window)
+        key = id(window)
+        flow._open_windows[key] = window
+        flow._request_generation[key] = 1
+        flow._history_targets[key] = 2
+        completed = []
+        flow.signal_scan_completed.connect(completed.append)
+
+        flow._use_pool_for_window(window, session, pool, evaluation_count=2)
+        for _ in range(500):
+            self.app.processEvents()
+            if completed:
+                break
+            QTest.qWait(10)
+        self.assertTrue(completed, "production-input differential replay did not finish")
+        self.assertEqual("", completed[0].get("error"), completed[0].get("error"))
+        self.assertTrue(completed[0]["optimized_entries"])
+        self.assertTrue(completed[0]["entries"])
+        active_pool = flow._validation_pool_for_session(
+            session,
+            pool,
+            target_count=2 + flow_module.required_validation_history_context_bars(rules),
+        )
+        targeted_scan = ValidationHistoricalReplay(session).scan_signal_entries(
+            active_pool["snapshot"],
+            start_index=len(active_pool["candles"]) - 2,
+            context_provider=flow._context_provider_for_session(session),
+        )
+        self.assertEqual(
+            [entry.to_dict() for entry in completed[0]["entries"]],
+            [entry.to_dict() for entry in targeted_scan],
+        )
+        self.assertEqual([], window.errors)
+        trust = completed[0]["backtest_trust_metadata"]
+        self.assertEqual("SIGNAL_PARITY_PASS", trust["signal_parity"]["status"])
+        self.assertTrue(trust["market_session_parity"]["production_equivalent"])
+        self.assertTrue(trust["candle_projection_parity"]["production_equivalent"])
+        self.assertEqual(
+            "FILTER_SIGNAL_BACKTEST_AUTHORIZED",
+            trust["filter_signal_backtest_authorization"]["status"],
+        )
+        self.assertEqual(
+            "NOT_PRODUCTION_EQUIVALENT", trust["execution_model"]["status"]
+        )
+
     def _replay_snapshot(
         self,
         entries,
