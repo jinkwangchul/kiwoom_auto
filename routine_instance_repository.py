@@ -243,7 +243,7 @@ class RoutineInstanceRepository:
             "definition_id": str(request.definition_id).strip(),
             "display_name": str(request.display_name).strip(),
             "description": str(request.description or "").strip(),
-            "enabled": False,
+            "enabled": True,
             "buy_limit_enabled": request.buy_limit_enabled,
             "buy_limit_amount": request.buy_limit_amount,
             "rules_file": "rules.json",

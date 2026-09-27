@@ -42,7 +42,7 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
             now_factory=lambda: datetime(2026, 7, 18, 14, 0, tzinfo=timezone.utc),
         )
 
-    def test_create_writes_complete_disabled_instance(self) -> None:
+    def test_create_writes_complete_enabled_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repository = self._repository(root)
@@ -65,7 +65,8 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertIsNotNone(result.instance)
-        self.assertFalse(metadata["enabled"])
+        self.assertTrue(metadata["enabled"])
+        self.assertTrue(result.instance.enabled)
         self.assertEqual(12_000_000, metadata["buy_limit_amount"])
         self.assertEqual(rules, saved_rules)
         self.assertFalse(hasattr(result.instance, "real_trade_allowed"))
@@ -136,7 +137,7 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
             saved_rules = json.loads(reloaded.rules_path.read_text(encoding="utf-8"))
 
         self.assertTrue(result.success)
-        self.assertFalse(reloaded.enabled)
+        self.assertTrue(reloaded.enabled)
         self.assertEqual(group_id, reloaded.group_id)
         self.assertEqual(source_rules, saved_rules)
         self.assertFalse((root / "stocks").exists())

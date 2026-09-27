@@ -173,7 +173,7 @@ evaluate_final_real_order_safety = _allow
         self.assertTrue(packed.success)
         self.assertTrue(registered.success)
         self.assertTrue(instance.success)
-        self.assertFalse(instance.instance.enabled)
+        self.assertTrue(instance.instance.enabled)
 
     def test_distribution_profile_environment_does_not_gate_packing(self) -> None:
         for profile in ("beta", "production", "", "invalid"):

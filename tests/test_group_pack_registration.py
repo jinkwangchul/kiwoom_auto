@@ -295,7 +295,7 @@ evaluate_final_real_order_safety = _allow
         self.assertFalse((root / "routines").exists())
         self.assertFalse((root / "groups").exists())
 
-    def test_registered_definition_can_create_disabled_instance(self) -> None:
+    def test_registered_definition_can_create_enabled_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             pack = self._write_pack(root)
@@ -312,7 +312,7 @@ evaluate_final_real_order_safety = _allow
                 )
 
         self.assertTrue(instance.success)
-        self.assertFalse(instance.instance.enabled)
+        self.assertTrue(instance.instance.enabled)
         self.assertEqual(registered.group.group_id, instance.instance.group_id)
 
 
