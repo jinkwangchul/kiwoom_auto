@@ -1010,6 +1010,96 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             "NOT_PRODUCTION_EQUIVALENT", trust["execution_model"]["status"]
         )
 
+    def test_production_m1_undercoverage_at_cap_fails_closed_before_install(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY",
+            "ready": True,
+            "selected_ats": [],
+            "selection_source": "none",
+            "session_windows": [{
+                "name": "regular",
+                "start_time": "09:00:00",
+                "end_time": "15:20:00",
+            }],
+        }
+        rules = deepcopy(self.rules)
+        rules["bar"]["bar_minutes"] = 3
+        rules["validation_timeframe"] = {
+            "key": "M3",
+            "kind": "MINUTE",
+            "minutes": 3,
+            "label": "3��",
+        }
+        seed = self._seed(rules=rules)
+        requested_counts = []
+
+        class Provider:
+            def __init__(_self, session, _broker):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                requested_counts.append(count)
+                rows = IndicatorFollowSignalValidationFlow._historical_rows_from_candles([
+                    {
+                        "time": "20260921154000",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100,
+                        "volume": 1,
+                    },
+                ])
+                request = _self.session.request
+                callback(ValidationHistoricalResult(
+                    True,
+                    snapshot=ValidationHistoricalSnapshot(
+                        stock=request.stock,
+                        timeframe_minutes=1,
+                        timeframe_key="M1",
+                        requested_count=count,
+                        request_id=f"PROD-CAP-{count}",
+                        rows=rows,
+                        market_data_identity="005930_AL",
+                        market_source="INTEGRATED",
+                    ),
+                ))
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=_FakeHost(self.stock),
+            historical_count=2,
+            historical_provider_factory=Provider,
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: deepcopy(contract),
+        )
+        window = _FakeWindow(self.stock, seed)
+        self.widgets.append(window)
+        flow._open_windows[id(window)] = window
+
+        with patch.object(
+            flow_module,
+            "required_validation_history_context_bars",
+            return_value=2,
+        ), patch.object(
+            flow,
+            "_handle_historical_result",
+        ) as handled:
+            flow._run_validation(
+                window,
+                IndicatorFollowSignalValidationRunRequest(
+                    seed.settings_snapshot,
+                    2,
+                ),
+            )
+
+        self.assertEqual(14, requested_counts[0])
+        self.assertEqual(200_000, requested_counts[-1])
+        self.assertGreater(len(requested_counts), 1)
+        handled.assert_not_called()
+        self.assertTrue(window.errors)
+        self.assertIn("FILTER_SIGNAL_BACKTEST_BLOCKED", window.errors[-1])
+        self.assertIn("PRODUCTION_SOURCE_HISTORY_INSUFFICIENT", window.errors[-1])
+
     def _replay_snapshot(
         self,
         entries,
