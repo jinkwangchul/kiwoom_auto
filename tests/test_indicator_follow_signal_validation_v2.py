@@ -279,6 +279,30 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CANDLE_WARMUP_LIMIT_EXCEEDED"):
             flow._validation_fetch_contract(session, 900, production_contract=contract)
 
+    def test_registered_minute_calculation_fetch_uses_m1_regardless_of_display_scope(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY", "ready": True,
+            "session_windows": [{"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"}],
+        }
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: contract,
+        )
+        for regular_only in (False, True):
+            rules = deepcopy(self.rules)
+            rules["bar"]["bar_minutes"] = 5
+            rules["validation_market_scope"] = {"regular_market_only": regular_only}
+            request = ValidationRequest(self.stock, ValidationSettingsSnapshot(rules), 5)
+            session = ValidationSession(request, operation_active_reader=lambda: False)
+
+            source_session, source_minutes, source_key, source_count = (
+                flow._validation_fetch_contract(session, 100)
+            )
+
+            self.assertEqual((1, "M1", 550), (source_minutes, source_key, source_count))
+            self.assertEqual("M1", source_session.request.timeframe_key)
+
     def test_deleted_flow_drops_background_completion_emit(self):
         flow = IndicatorFollowSignalValidationFlow(
             _FakeBroker(True),
