@@ -77,6 +77,7 @@ from indicator_follow_signal_validation_visualization import (
     active_filter_identities_for_entry,
     build_validation_filter_universe,
     build_validation_indicator_cache,
+    indicator_transition_indexes,
 )
 from gui_toast import show_toast
 from routines.지표추종매매.routine_validation_contract import (
@@ -3686,6 +3687,90 @@ class IndicatorFollowSignalValidationChartCanvas(
             "SELL": "매도",
         }.get(str(side or "").strip().upper(), str(side or "").strip())
 
+    def lower_transition_line_records(
+        self,
+        family: str,
+    ) -> list[dict[str, Any]]:
+        visible_start, visible_end = self._visible_index_bounds()
+        grouped: dict[
+            tuple[int, str, str],
+            dict[str, Any],
+        ] = {}
+
+        for descriptor in self._visualization_descriptors:
+            if descriptor.axis != LOWER_AXIS:
+                continue
+            if self._display_lower_family(descriptor.family) != family:
+                continue
+            condition = descriptor.parameters.get("condition")
+            if not isinstance(condition, Mapping):
+                continue
+            operator = str(condition.get("operator") or "").strip().upper()
+            if operator not in {
+                "TURN_UP",
+                "TURN_DOWN",
+                "ZERO_CROSS_UP",
+                "ZERO_CROSS_DOWN",
+            }:
+                continue
+
+            target = str(condition.get("target") or "").strip().upper()
+            if target == "OCR":
+                target = "OSC"
+            if not target:
+                target = (
+                    "OSC"
+                    if descriptor.family == FAMILY_OCR_OSC
+                    else "MACD"
+                )
+            values = self._cached_values(descriptor, target)
+            if len(values) != len(self._candles):
+                continue
+
+            direction = "UP" if operator.endswith("_UP") else "DOWN"
+            render_mode = "TRANSITION_VERTICAL_LINE"
+            for index in indicator_transition_indexes(values, operator):
+                if not visible_start <= index < visible_end:
+                    continue
+                marker_value = _finite_number(values[index])
+                key = (int(index), direction, render_mode)
+                record = grouped.setdefault(
+                    key,
+                    {
+                        "family": family,
+                        "index": int(index),
+                        "x": self._x_for_index(int(index)),
+                        "direction": direction,
+                        "render_mode": render_mode,
+                        "value": marker_value,
+                        "operators": set(),
+                        "sides": set(),
+                        "descriptor_identities": set(),
+                    },
+                )
+                record["operators"].add(operator)
+                record["sides"].update(
+                    str(side or "").strip().upper()
+                    for side in descriptor.sides
+                    if str(side or "").strip()
+                )
+                identity = str(descriptor.identity or "").strip()
+                if identity:
+                    record["descriptor_identities"].add(identity)
+
+        result: list[dict[str, Any]] = []
+        for key in sorted(grouped):
+            record = grouped[key]
+            result.append({
+                **record,
+                "operators": tuple(sorted(record["operators"])),
+                "sides": tuple(sorted(record["sides"])),
+                "descriptor_identities": tuple(
+                    sorted(record["descriptor_identities"])
+                ),
+            })
+        return result
+
     def lower_reference_line_records(
         self,
         family: str,
@@ -3841,6 +3926,22 @@ class IndicatorFollowSignalValidationChartCanvas(
                         scale,
                         pen,
                     )
+
+            for record in self.lower_transition_line_records(family):
+                color = QColor(
+                    _UP
+                    if str(record.get("direction") or "").upper() == "UP"
+                    else _DOWN
+                )
+                color.setAlpha(190)
+                x = float(record["x"])
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(color, 1, Qt.DotLine))
+                painter.drawLine(
+                    QPointF(x, float(scale.plot_top)),
+                    QPointF(x, float(scale.plot_bottom)),
+                )
+
             painter.restore()
 
     def _draw_crosshair(

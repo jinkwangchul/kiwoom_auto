@@ -742,6 +742,54 @@ def required_validation_warmup_bars(
     return required
 
 
+def indicator_transition_indexes(
+    values: tuple[float | None, ...] | list[float | None],
+    operator: str,
+) -> tuple[int, ...]:
+    """Return chart indexes for confirmed turn/zero-cross visualization.
+
+    TURN_* conditions are confirmed by the following bar, so the visible line
+    belongs to the pivot bar at evaluation_index - 1. ZERO_CROSS_* belongs to
+    the bar that actually crosses zero.
+    """
+    normalized = str(operator or "").strip().upper()
+    if normalized not in {
+        "TURN_UP",
+        "TURN_DOWN",
+        "ZERO_CROSS_UP",
+        "ZERO_CROSS_DOWN",
+    }:
+        return ()
+
+    result: list[int] = []
+    if normalized in {"TURN_UP", "TURN_DOWN"}:
+        for index in range(2, len(values)):
+            prev2 = _safe_float(values[index - 2])
+            prev = _safe_float(values[index - 1])
+            current = _safe_float(values[index])
+            if prev2 is None or prev is None or current is None:
+                continue
+            if normalized == "TURN_UP":
+                matched = prev2 > prev and current > prev
+            else:
+                matched = prev2 < prev and current < prev
+            if matched:
+                result.append(index - 1)
+        return tuple(result)
+
+    for index in range(1, len(values)):
+        prev = _safe_float(values[index - 1])
+        current = _safe_float(values[index])
+        if prev is None or current is None:
+            continue
+        if normalized == "ZERO_CROSS_UP":
+            matched = prev <= 0 and current > 0
+        else:
+            matched = prev >= 0 and current < 0
+        if matched:
+            result.append(index)
+    return tuple(result)
+
 def build_validation_indicator_cache(
     candles: list[dict[str, Any]],
     rules: Mapping[str, Any],
