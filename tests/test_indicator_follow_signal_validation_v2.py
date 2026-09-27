@@ -820,6 +820,58 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         install_pool.assert_called_once()
         load_signals.assert_not_called()
 
+    def test_fetched_m1_pool_retains_the_request_generation_session_contract(self):
+        contract = {
+            "status": "PRODUCTION_SESSION_READY", "ready": True,
+            "session_windows": [{"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"}],
+        }
+        captured = []
+
+        class Provider:
+            def __init__(_self, session, _broker):
+                _self.session = session
+
+            def request_latest(_self, count, callback):
+                rows = [{
+                    "체결시간": f"20260921090{index}00", "시가": "100",
+                    "고가": "101", "저가": "99", "현재가": "100", "거래량": "1",
+                } for index in range(6)]
+                callback(ValidationHistoricalResult(True, snapshot=ValidationHistoricalSnapshot(
+                    stock=self.stock, timeframe_minutes=1, timeframe_key="M1",
+                    requested_count=count, request_id="PROD-M1", rows=rows,
+                    market_data_identity="005930_AL", market_source="INTEGRATED",
+                )))
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            historical_count=2, historical_provider_factory=Provider,
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: contract,
+        )
+        window = _FakeWindow(self.stock, self._seed())
+        self.widgets.append(window)
+        flow._open_windows[id(window)] = window
+        with patch.object(
+            flow_module,
+            "required_validation_history_context_bars",
+            return_value=0,
+        ), patch.object(
+            flow,
+            "_use_pool_for_window",
+            side_effect=lambda _w, _s, pool, **_kw: captured.append(pool),
+        ):
+            flow._run_validation(
+                window,
+                IndicatorFollowSignalValidationRunRequest(
+                    self._seed().settings_snapshot,
+                    2,
+                ),
+            )
+
+        self.assertEqual(1, len(captured))
+        self.assertEqual(contract, captured[0].get("production_session_contract"))
+        self.assertEqual("M1", captured[0]["timeframe_key"])
+
     def _replay_snapshot(
         self,
         entries,
