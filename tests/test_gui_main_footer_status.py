@@ -21,14 +21,14 @@ class MainFooterStatusProjectionTest(unittest.TestCase):
         self.assertEqual(expected_text, projection.text)
         self.assertEqual(expected_color, projection.color)
 
-    def test_canonical_vocabulary_is_fixed_to_thirty_messages(self) -> None:
+    def test_canonical_vocabulary_is_fixed_to_twenty_nine_messages(self) -> None:
         messages = operator_footer_canonical_messages()
-        self.assertEqual(30, len(messages))
-        self.assertEqual(30, len(set(messages)))
+        self.assertEqual(29, len(messages))
+        self.assertEqual(29, len(set(messages)))
         self.assertEqual(8, sum(message.startswith("✓") for message in messages))
         self.assertEqual(11, sum(message.startswith("✕") for message in messages))
         self.assertEqual(7, sum(message.startswith("▷") for message in messages))
-        self.assertEqual(3, sum(message.startswith("●") for message in messages))
+        self.assertEqual(2, sum(message.startswith("●") for message in messages))
         self.assertEqual(1, sum(message.startswith("※") for message in messages))
 
     def test_connection_messages_are_short_korean_operator_messages(self) -> None:
