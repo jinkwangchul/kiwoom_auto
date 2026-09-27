@@ -742,11 +742,68 @@ class KiwoomApi(QObject):
             self._realtime_shadow_builder = RealtimeShadowBarBuilder()
         if not hasattr(self, "_realtime_receive_sequence"):
             self._realtime_receive_sequence = 0
+        if "_realtime_boundary_diagnostic_counts" not in self.__dict__:
+            self._realtime_boundary_diagnostic_counts = {}
+        if "_realtime_boundary_diagnostic_last" not in self.__dict__:
+            self._realtime_boundary_diagnostic_last = {}
+        if "_realtime_boundary_diagnostic_transition" not in self.__dict__:
+            self._realtime_boundary_diagnostic_transition = {}
         if not isinstance(
             getattr(self, "_realtime_shadow_registration", None),
             RealtimeShadowRegistrationSnapshot,
         ):
             self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
+
+    def _observe_realtime_boundary(
+        self,
+        stage: str,
+        stock_code: object,
+        *,
+        reason: str = "",
+        channel: str = "",
+        **details: Any,
+    ) -> None:
+        """Keep bounded process-local realtime callback diagnostics."""
+
+        self._ensure_realtime_shadow_state()
+        code = normalize_stock_code(stock_code) or str(stock_code or "").strip()
+        stage_text = str(stage or "").strip()
+        if not stage_text:
+            return
+        counts = self._realtime_boundary_diagnostic_counts.setdefault(code, {})
+        counts[stage_text] = counts.get(stage_text, 0) + 1
+        key = (code, stage_text, str(channel or "").strip())
+        evidence = {
+            "stage": stage_text,
+            "stock_code": code,
+            "reason": str(reason or "").strip(),
+            **details,
+            "count": counts[stage_text],
+        }
+        self._realtime_boundary_diagnostic_last[key] = evidence
+        self._realtime_boundary_diagnostic_transition[key] = (
+            evidence["reason"] or stage_text
+        )
+
+    def realtime_boundary_diagnostic_snapshot(
+        self,
+        stock_code: object,
+    ) -> dict[str, Any]:
+        """Return read-only process-local realtime callback diagnostics."""
+
+        self._ensure_realtime_shadow_state()
+        code = normalize_stock_code(stock_code) or str(stock_code or "").strip()
+        return {
+            "stock_code": code,
+            "counts": dict(
+                self._realtime_boundary_diagnostic_counts.get(code, {})
+            ),
+            "last": tuple(
+                dict(evidence)
+                for key, evidence in self._realtime_boundary_diagnostic_last.items()
+                if key[0] == code
+            ),
+        }
 
     def _next_realtime_receive_sequence(self) -> int:
         self._ensure_realtime_shadow_state()
@@ -3825,6 +3882,12 @@ class KiwoomApi(QObject):
         self._ensure_realtime_shadow_state()
         stock_code = str(args[0] or "").strip()
         real_type = str(args[1] or "").strip()
+        self._observe_realtime_boundary(
+            "REAL_CALLBACK_RECEIVED",
+            stock_code,
+            channel=real_type,
+            real_type=real_type,
+        )
         if real_type == REALTIME_ORDERBOOK_TYPE:
             self._on_receive_mock_orderbook(stock_code)
             return
@@ -3832,11 +3895,30 @@ class KiwoomApi(QObject):
             self._on_receive_nxt_display_tick(stock_code)
             return
         registration = self._realtime_shadow_registration
-        if (
-            not registration.active
-            or stock_code not in registration.target_stock_codes
-            or real_type != REALTIME_EXECUTION_TYPE
-        ):
+        if real_type != REALTIME_EXECUTION_TYPE:
+            self._observe_realtime_boundary(
+                "REGISTRATION_IDENTITY_REJECTED",
+                stock_code,
+                reason="REAL_TYPE_UNSUPPORTED",
+                channel=real_type,
+                real_type=real_type,
+            )
+            return
+        if not registration.active:
+            self._observe_realtime_boundary(
+                "REGISTRATION_IDENTITY_REJECTED",
+                stock_code,
+                reason="REGISTRATION_INACTIVE",
+                channel=real_type,
+            )
+            return
+        if stock_code not in registration.target_stock_codes:
+            self._observe_realtime_boundary(
+                "REGISTRATION_IDENTITY_REJECTED",
+                stock_code,
+                reason="STOCK_NOT_EXPECTED",
+                channel=real_type,
+            )
             return
         session = self.broker_session_snapshot()
         if (
@@ -3844,6 +3926,12 @@ class KiwoomApi(QObject):
             or session.connection_epoch != registration.connection_epoch
             or session.login_session_id != registration.login_session_id
         ):
+            self._observe_realtime_boundary(
+                "REGISTRATION_IDENTITY_REJECTED",
+                stock_code,
+                reason="SESSION_IDENTITY_MISMATCH",
+                channel=real_type,
+            )
             return
         try:
             values = {
@@ -3875,13 +3963,34 @@ class KiwoomApi(QObject):
                 received_monotonic=monotonic(),
             )
             if tick is None:
+                self._observe_realtime_boundary(
+                    "RAW_TICK_REJECTED",
+                    stock_code,
+                    reason="PAYLOAD_UNAVAILABLE",
+                    channel=real_type,
+                )
                 return
+            self._observe_realtime_boundary(
+                "RAW_TICK_ACCEPTED",
+                stock_code,
+                channel=real_type,
+                current_price=tick.current_price,
+                market_datetime=tick.market_datetime,
+                receive_sequence=tick.receive_sequence,
+            )
             self.realtime_shadow_tick_received.emit(tick.to_payload())
             if stock_code in self._registration_shadow_targets(registration):
                 _status, completed = self._realtime_shadow_builder.accept_tick(tick)
                 if completed is not None:
                     self.realtime_shadow_bar_completed.emit(completed.to_payload())
         except Exception as exc:
+            self._observe_realtime_boundary(
+                "RAW_TICK_REJECTED",
+                stock_code,
+                reason="PAYLOAD_UNAVAILABLE",
+                channel=real_type,
+                exception_type=type(exc).__name__,
+            )
             observe_production_exception(
                 type(exc),
                 exc,

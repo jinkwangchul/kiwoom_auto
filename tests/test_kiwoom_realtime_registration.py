@@ -528,6 +528,39 @@ class RealtimeHandlerTests(unittest.TestCase):
             any(call[0].startswith("CommRqData") for call in self.api._control.calls)
         )
 
+    def test_realtime_boundary_diagnostic_counts_ticks_process_locally(self) -> None:
+        self.api._on_receive_real_data("005930", "주식체결", "")
+        self.api._on_receive_real_data("005930", "주식체결", "")
+
+        snapshot = self.api.realtime_boundary_diagnostic_snapshot("005930")
+        self.assertEqual(2, snapshot["counts"]["REAL_CALLBACK_RECEIVED"])
+        self.assertEqual(2, snapshot["counts"]["RAW_TICK_ACCEPTED"])
+        stages = [item["stage"] for item in snapshot["last"]]
+        self.assertIn("REAL_CALLBACK_RECEIVED", stages)
+        self.assertIn("RAW_TICK_ACCEPTED", stages)
+
+    def test_realtime_boundary_diagnostic_preserves_existing_rejects(self) -> None:
+        self.api._on_receive_real_data("006400", "주식체결", "")
+        self.api._on_receive_real_data("005930", "unsupported", "")
+
+        samsung = self.api.realtime_boundary_diagnostic_snapshot("005930")
+        other = self.api.realtime_boundary_diagnostic_snapshot("006400")
+        self.assertEqual([], self.api.realtime_shadow_tick_received.values)
+        self.assertIn(
+            "REAL_TYPE_UNSUPPORTED",
+            {item["reason"] for item in samsung["last"]},
+        )
+        self.assertIn(
+            "STOCK_NOT_EXPECTED",
+            {item["reason"] for item in other["last"]},
+        )
+
+    def test_realtime_boundary_diagnostic_retains_other_stock_evidence(self) -> None:
+        self.api._on_receive_real_data("006400", "주식체결", "")
+
+        snapshot = self.api.realtime_boundary_diagnostic_snapshot("006400")
+        self.assertEqual(1, snapshot["counts"]["REAL_CALLBACK_RECEIVED"])
+
     def test_trade_volume_preserves_sell_sign_and_invalid_is_unavailable(self) -> None:
         self.api._control.real_values[15] = "-123"
         self.api._on_receive_real_data("005930", "주식체결", "")
