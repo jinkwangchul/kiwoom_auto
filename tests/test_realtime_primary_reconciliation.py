@@ -216,8 +216,26 @@ class RealtimeCanonicalCommitTests(unittest.TestCase):
             bar_time="2026-08-20T10:15:00+09:00", trade_date="2026-08-20",
             error_kind="", error="", notification=notification,
         )
-        with patch.object(kiwoom_api, "commit_realtime_primary_bar_for_stock", return_value=commit):
-            result = kiwoom_api.KiwoomApi.commit_realtime_primary_bar(fake, _bar(), stock_name="Test")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_Test"
+            repository = SimpleNamespace(
+                resolve_stock_dir=lambda *_args, **_kwargs: stock_dir
+            )
+            with patch.object(
+                kiwoom_api,
+                "StockRepository",
+                return_value=repository,
+                create=True,
+            ), patch.object(
+                kiwoom_api,
+                "commit_realtime_primary_bar_for_stock",
+                return_value=commit,
+            ):
+                result = kiwoom_api.KiwoomApi.commit_realtime_primary_bar(
+                    fake,
+                    _bar(),
+                    stock_name="Test",
+                )
         self.assertTrue(result["commit_verified"])
         self.assertEqual([{"source": "realtime_primary"}], emitted)
 
