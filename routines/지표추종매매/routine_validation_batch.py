@@ -22,6 +22,9 @@ from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
     validation_virtual_fill_price,
 )
+from indicator_follow_strategy_price_contract import (
+    canonicalize_buy_strategy_price_comparison_rules,
+)
 
 from .routine_macd_engine import (
     BUY_FILTER_ORDER,
@@ -39,13 +42,14 @@ from .routine_macd_engine import (
     build_indicator_follow_base_series,
     evaluate_indicator_follow_routine,
 )
+from .routine_signal_selection import select_signal_side
 _SUPPORTED_CONDITION_OPERATORS = {
     "TURN_UP", "TURN_DOWN", "TREND_UP", "TREND_DOWN",
     "CROSS_UP", "CROSS_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN",
     "PERCENT_GAP", ">", ">=", "<", "<=", "=", "==",
     "GT", "GTE", "LT", "LTE", "EQ", "ABOVE", "BELOW",
 }
-_DYNAMIC_SERIES = {"AVG_PRICE", "ORDER_PRICE", "CURRENT_PRICE"}
+_DYNAMIC_SERIES = {"AVG_PRICE", "SIGNAL_PRICE", "CURRENT_PRICE"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,11 +273,16 @@ class _IncrementalAverageContext:
                     else None
                 )
             signals = self._signals_by_index.get(index, set())
-            if "SELL" in signals:
+            selection = select_signal_side(
+                "SELL" in signals,
+                "BUY" in signals,
+                len(self._fill_prices),
+            )
+            if selection.selected_side == "SELL":
                 self._fill_prices.clear()
                 self._fill_price_sum = 0.0
                 self._buy_indexes.clear()
-            elif "BUY" in signals:
+            elif selection.selected_side == "BUY":
                 fill_price = validation_virtual_fill_price(candles[index])
                 if fill_price is not None:
                     self._fill_prices.append(fill_price)
@@ -292,6 +301,7 @@ class _IncrementalAverageContext:
                 "side": str(side or "").upper(),
                 "evaluation_index": evaluation_index,
                 "estimated_average_price": average,
+                "position_quantity": len(self._buy_indexes),
                 "contributing_buy_indexes": list(self._buy_indexes),
                 "average_source": "VALIDATION_BUY_CLOSE_SIGNAL_PRICE_SEGMENT",
             },
@@ -371,6 +381,12 @@ def _condition_bool(condition: dict[str, Any], series_map: dict[str, list[float 
     """Allocation-free equivalent of the canonical condition decision."""
     if not condition.get("enabled", True):
         return True
+    issue = condition.get("_strategy_price_contract_issue")
+    if (
+        isinstance(issue, dict)
+        and issue.get("reason") == "LEGACY_SELL_ORDER_PRICE_RESELECTION_REQUIRED"
+    ):
+        return False
     try:
         bar_offset = int(condition.get("bar_offset", 0))
     except (TypeError, ValueError):
@@ -477,6 +493,12 @@ def _expression_bool(node: Any, values: dict[str, bool]) -> bool:
 
 def _validate_condition(condition: dict[str, Any], base_series: dict[str, list[float | None]]) -> None:
     if not bool(condition.get("enabled", True)):
+        return
+    issue = condition.get("_strategy_price_contract_issue")
+    if (
+        isinstance(issue, dict)
+        and issue.get("reason") == "LEGACY_SELL_ORDER_PRICE_RESELECTION_REQUIRED"
+    ):
         return
     operator = str(condition.get("operator") or "").strip().upper()
     if operator not in _SUPPORTED_CONDITION_OPERATORS:
@@ -983,7 +1005,12 @@ def _authoritative_record(side: str, evaluation_index: int, expected_index: int,
     observer = _DirectTraceObserver()
     traced_context = dict(context)
     traced_context["decision_trace_observer"] = observer
-    signal = evaluate_indicator_follow_routine(prefix, rules, traced_context, _base_series_map=series_map)
+    signal = evaluate_indicator_follow_routine(
+        prefix,
+        rules,
+        traced_context,
+        _base_series_map=series_map,
+    )
     if signal.signal != side or signal.signal_index != expected_index or signal.delay_bar != expected_delay:
         return None
     return ValidationBatchSignalRecord(
@@ -1002,6 +1029,7 @@ def scan_indicator_follow_validation_batch(candles: list[dict[str, Any]], rules:
         return ValidationBatchScanResult(False, fallback_reason="BATCH_CANDLES_UNSUPPORTED")
     if not isinstance(rules, dict):
         return ValidationBatchScanResult(False, fallback_reason="BATCH_RULES_UNSUPPORTED")
+    rules = canonicalize_buy_strategy_price_comparison_rules(rules)
     if context_provider is build_validation_average_price_context:
         context_provider = _IncrementalAverageContext()
     if context_provider is not None and (

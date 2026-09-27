@@ -1848,6 +1848,127 @@ class ValidationHistoricalReplayTest(unittest.TestCase):
         ]
         self.assertEqual(entries_a, entries_b)
 
+
+    def test_long_history_detailed_and_batch_details_use_global_evaluation_indexes(self) -> None:
+        rules = self._rules()
+        rules["buy"]["groups"] = [{
+            "enabled": True,
+            "name": "legacy_osc_turn_up",
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "OSC",
+                "operator": "TURN_UP",
+            }],
+        }]
+        parsed = parse_condition_expression(
+            "B",
+            allowed_identifiers={"A", "B", "C", "D"},
+        )
+        self.assertTrue(parsed["ok"], parsed)
+        rules["buy"]["filters"] = {
+            "bollinger": {
+                "enabled": True,
+                "conditions": [{
+                    "enabled": True,
+                    "not": False,
+                    "target": "CLOSE",
+                    "operator": ">=",
+                    "compare_target": "BOLLINGER_LOWER",
+                    "value": -0.1,
+                }],
+            },
+            "composite": {
+                "enabled": True,
+                "expression": {
+                    "source": "B",
+                    "normalized": parsed["normalized"],
+                    "ast": parsed["ast"],
+                    "identifiers": parsed["identifiers"],
+                    "identifier_map": {
+                        "A": "ocr",
+                        "B": "bollinger",
+                        "C": "moving_average",
+                        "D": "rsi",
+                    },
+                },
+                "include_unreferenced_active_filters": "AND_REQUIRED",
+                "groups": [],
+            },
+        }
+        rules["sell"] = {
+            "delay_bar": 0,
+            "signal_logic": "OR",
+            "signals": {"macd_sell": {"enabled": False, "groups": []}},
+        }
+
+        template = self._historical(closes=(123,)).to_rows()[0]
+        time_key = next(
+            key for key, value in template.items()
+            if str(value) == "20260913090000"
+        )
+        high_key = next(key for key, value in template.items() if str(value) == "124")
+        low_key = next(key for key, value in template.items() if str(value) == "122")
+        volume_key = next(key for key, value in template.items() if str(value) == "100")
+        price_keys = [
+            key for key, value in template.items()
+            if str(value) == "123"
+        ]
+        self.assertEqual(2, len(price_keys))
+
+        start = datetime(2026, 1, 2, 9, 0)
+        rows = []
+        for index in range(930):
+            stamp = start + timedelta(minutes=index * 3)
+            close = 100.0 + ((index * 7) % 17) - (index % 5)
+            row = {
+                time_key: stamp.strftime("%Y%m%d%H%M%S"),
+                high_key: str(close + 1),
+                low_key: str(close - 1),
+                volume_key: str(100 + index),
+            }
+            for key in price_keys:
+                row[key] = str(close)
+            rows.append(row)
+        historical = self._historical(rows=list(reversed(rows)))
+        settings = ValidationSettingsSnapshot(rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, settings, 3),
+            operation_active_reader=Mock(return_value=False),
+        )
+        replay = ValidationHistoricalReplay(session)
+        detailed = replay.evaluate(
+            historical,
+            start_index=905,
+            end_index=929,
+        )
+        scanned = replay.scan_signal_entries(
+            historical,
+            start_index=905,
+            end_index=929,
+        )
+
+        self.assertTrue(detailed.ok, detailed)
+        detailed_signals = [
+            entry.to_dict()
+            for entry in detailed.snapshot.to_entries()
+            if entry.signal is not None
+        ]
+        scanned_signals = [
+            entry.to_dict()
+            for entry in scanned
+            if entry.signal is not None
+        ]
+        self.assertTrue(detailed_signals)
+        self.assertEqual(detailed_signals, scanned_signals)
+        for entry in detailed_signals:
+            for detail in entry["details"]:
+                if "evaluation_index=" in detail:
+                    self.assertIn(
+                        f"evaluation_index={entry['evaluation_index']}",
+                        detail,
+                    )
+
     def test_snapshot_metadata_preserves_validation_identity(self) -> None:
         result = ValidationHistoricalReplay(self._session()).evaluate(
             self._historical(),

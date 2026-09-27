@@ -8,6 +8,7 @@ import math
 from typing import Any, Mapping
 
 from buy_execution_policy import STATUS_READY, evaluate_buy_execution_policy
+from routines.지표추종매매.routine_signal_selection import select_signal_side
 
 
 DEFAULT_VALIDATION_EXECUTION = {
@@ -371,7 +372,12 @@ class ValidationVirtualPositionTracker:
             else self._signals_at(index, candles, entries)
         )
         fill_price = validation_virtual_fill_price(candle)
-        if "SELL" in signals:
+        selection = select_signal_side(
+            "SELL" in signals,
+            "BUY" in signals,
+            self.holding_quantity,
+        )
+        if selection.selected_side == "SELL":
             if (
                 self.holding_quantity > 0
                 and self.average_buy_price is not None
@@ -422,7 +428,7 @@ class ValidationVirtualPositionTracker:
                 self.buy_indexes = []
             return
 
-        if "BUY" not in signals:
+        if selection.selected_side != "BUY":
             return
         if fill_price is None:
             self.skipped.append((index, "VALIDATION_VIRTUAL_FILL_PRICE_UNAVAILABLE"))

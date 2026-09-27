@@ -28,6 +28,10 @@ from engines.indicator_engine import (
     rsi_causal_history,
 )
 from engines.signal_result import RoutineSignal, signal_to_dict
+from indicator_follow_strategy_price_contract import (
+    BUY_STRATEGY_PRICE_AXES,
+    canonicalize_buy_strategy_price_compare_filter,
+)
 
 
 DEFAULT_INDICATOR_FOLLOW_CONFIG: dict[str, Any] = {
@@ -180,6 +184,22 @@ def _normalize_sell_runtime_groups(groups: Any) -> list[dict[str, Any]]:
             operator = str(condition.get("operator") or "").strip().upper()
             target = str(condition.get("target") or "").strip().upper()
             compare = str(condition.get("compare_target") or "").strip().upper()
+            unresolved_fields = [
+                field
+                for field, token in (("target", target), ("compare_target", compare))
+                if token == "ORDER_PRICE"
+            ]
+            if unresolved_fields:
+                condition["_strategy_price_contract_issue"] = {
+                    "reason": "LEGACY_SELL_ORDER_PRICE_RESELECTION_REQUIRED",
+                    "fields": unresolved_fields,
+                    "target": condition.get("target"),
+                    "compare_target": condition.get("compare_target"),
+                    "operator": condition.get("operator"),
+                }
+                condition["target"] = "LEGACY_SELL_ORDER_PRICE_UNRESOLVED"
+                condition["operator"] = "RESELECTION_REQUIRED"
+                continue
             if operator == "PERCENT_GAP" and {target, compare} == {"CLOSE", "AVG_PRICE"}:
                 if target == "CLOSE":
                     condition["target"] = "CURRENT_PRICE"
@@ -624,7 +644,9 @@ def _evaluate_buy_price_compare_filter(
     evaluation_index: int,
     observer: Any = None,
 ) -> tuple[bool, str | None]:
-    filter_cfg = _buy_price_compare_filter_config(config, buy_cfg)
+    filter_cfg = canonicalize_buy_strategy_price_compare_filter(
+        _buy_price_compare_filter_config(config, buy_cfg)
+    )
     if not filter_cfg:
         return True, None
 
@@ -662,7 +684,7 @@ def _evaluate_buy_price_compare_filter(
         target = condition.get("target")
         compare_target = condition.get("compare_target")
         operator = condition.get("operator")
-        if target not in {"CLOSE", "SIGNAL_PRICE", "ORDER_PRICE", "AVG_PRICE"} or compare_target not in {"CLOSE", "SIGNAL_PRICE", "ORDER_PRICE", "AVG_PRICE"}:
+        if target not in BUY_STRATEGY_PRICE_AXES or compare_target not in BUY_STRATEGY_PRICE_AXES:
             return False, _price_compare_detail(
                 enabled=True,
                 target=target,
@@ -1593,11 +1615,6 @@ def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested
 def _enrich_price_compare_series(series_map: dict[str, list[float | None]], context: dict[str, Any] | None) -> None:
     close_series = series_map.get("CLOSE")
     length = len(close_series) if isinstance(close_series, list) else 0
-    order_price = _context_float(
-        context,
-        ("order_price", "buy_order_price", "planned_order_price", "mock_order_price"),
-        (("order", "price"), ("planned_order", "price"), ("buy", "order_price")),
-    )
     current_price = _context_float(
         context,
         (
@@ -1644,11 +1661,6 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
     # persisted as signal_bar_close/signal_price by the execution boundary.
     if isinstance(close_series, list):
         series_map["SIGNAL_PRICE"] = list(close_series)
-    if order_price is not None:
-        # Legacy strategy rules may still contain ORDER_PRICE. Keep their
-        # historical execution-context interpretation for read compatibility;
-        # new strategy comparison rules are written as SIGNAL_PRICE.
-        series_map["ORDER_PRICE"] = [order_price] * length
     # CURRENT_PRICE is an evaluation-time strategy axis. It must remain the
     # same fresh value even when a condition belongs to a delayed signal bar.
     # Keep the axis present with None when fresh evidence is unavailable so

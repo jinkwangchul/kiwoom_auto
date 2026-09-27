@@ -22,6 +22,24 @@ from gui_indicator_follow_signal_validation_window import (
     prepare_signal_validation_presentation,
 )
 from indicator_follow_signal_validation_execution import ValidationVirtualPositionTracker
+from indicator_follow_backtest_parity import (
+    candle_projection_parity_report,
+    emitted_signal_entries,
+    execution_model_report,
+    filter_signal_backtest_authorization_report,
+    market_session_parity_report,
+    production_decision_scope_report,
+    require_signal_replay_parity,
+    require_signal_rule_support,
+)
+from indicator_follow_validation_production_session import (
+    production_calculation_cache_identity,
+    production_minute_source_plan,
+    production_minute_source_retry_plan,
+    project_production_calculation_candles,
+    production_session_contract_for_stock,
+    unavailable_production_session_contract,
+)
 from indicator_follow_signal_validation_historical_cache import (
     IndicatorFollowSignalValidationHistoricalCache,
     ValidationHistoricalCacheEntry,
@@ -30,14 +48,6 @@ from indicator_follow_signal_validation_historical_cache import (
 from indicator_follow_validation_timeframe import (
     normalize_validation_timeframe,
     validation_timeframe_from_rules,
-)
-from indicator_follow_validation_regular_market import (
-    project_regular_market_candles,
-    regular_market_source_minutes,
-    required_regular_market_source_candles,
-)
-from indicator_follow_signal_validation_visualization import (
-    required_validation_warmup_bars,
 )
 from indicator_follow_validation_history_contract import (
     required_validation_history_context_bars,
@@ -118,6 +128,9 @@ class IndicatorFollowSignalValidationFlow(QObject):
         window_factory: Callable[..., object] = IndicatorFollowSignalValidationWindow,
         recent_stock_store: object | None = None,
         historical_cache: object | None = None,
+        production_session_contract_reader: Callable[..., dict[str, object]] = (
+            production_session_contract_for_stock
+        ),
     ) -> None:
         super().__init__(parent)
         if (
@@ -130,6 +143,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             ("historical_provider_factory", historical_provider_factory),
             ("replay_factory", replay_factory),
             ("window_factory", window_factory),
+            ("production_session_contract_reader", production_session_contract_reader),
         ):
             if not callable(factory):
                 raise TypeError(f"{name} must be callable")
@@ -139,6 +153,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         self._historical_provider_factory = historical_provider_factory
         self._replay_factory = replay_factory
         self._window_factory = window_factory
+        self._production_session_contract_reader = production_session_contract_reader
         self._recent_stock_store = (
             recent_stock_store
             if recent_stock_store is not None
@@ -810,7 +825,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         )
 
     @staticmethod
-    def _signal_view_signature(pool: object) -> tuple[str, int, str, str] | None:
+    def _signal_view_signature(pool: object) -> tuple[object, ...] | None:
         if not isinstance(pool, dict):
             return None
         candles = pool.get("candles")
@@ -821,6 +836,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             len(candles),
             str(candles[0].get("time") or ""),
             str(candles[-1].get("time") or ""),
+            pool.get("production_calculation_cache_identity"),
         )
 
     def _pool_matches(
@@ -1186,27 +1202,78 @@ class IndicatorFollowSignalValidationFlow(QObject):
         normalized_raw = [
             dict(candle) for candle in raw_candles if isinstance(candle, dict)
         ]
-        if not regular_minute and len(normalized_raw) <= target_count:
-            return pool
-        if regular_minute:
+        production_contract = pool.get("production_session_contract")
+        if (
+            timeframe["kind"] == "MINUTE"
+            and pool.get("timeframe_key") == "M1"
+            and isinstance(production_contract, dict)
+            and production_contract.get("status") == "PRODUCTION_SESSION_READY"
+        ):
             target_minutes = int(timeframe["minutes"])
-            target_key = str(timeframe["key"])
-            projected = project_regular_market_candles(
+            projection = project_production_calculation_candles(
                 normalized_raw,
                 target_minutes,
-                limit=target_count,
+                production_contract,
+                as_of=self._now_factory(),
             )
-            request_suffix = "REGULAR"
-        else:
-            target_minutes = session.request.timeframe_minutes
-            target_key = session.request.timeframe_key
-            projected = normalized_raw[-target_count:]
-            request_suffix = "ACTIVE"
+            if not projection["ready"]:
+                raise ValueError(str(projection["reason"]))
+            projected = projection["candles"][-target_count:]
+            identity = production_calculation_cache_identity(
+                session.request.stock.code,
+                str(pool.get("market_data_identity") or ""),
+                target_minutes,
+                production_contract,
+                normalized_raw,
+                target_count,
+                str(pool.get("request_id") or ""),
+            )
+            derived = dict(pool)
+            derived["timeframe_minutes"] = target_minutes
+            derived["timeframe_key"] = str(timeframe["key"])
+            derived["requested_count"] = min(target_count, len(projected))
+            derived["candles"] = projected
+            derived["display_candles"] = (
+                [candle for candle in projected if candle.get("session") == "regular"]
+                if regular_minute else projected
+            )
+            derived["source_timeframe_minutes"] = 1
+            derived["source_timeframe_key"] = "M1"
+            derived["source_requested_count"] = pool.get("requested_count")
+            derived["source_coverage_sufficient"] = len(projected) >= target_count
+            derived["forming_bar_status"] = projection["forming_bar_status"]
+            derived["calculation_source"] = "PRODUCTION_M1_SESSION_AGGREGATION"
+            derived["production_calculation_cache_identity"] = identity
+            derived["snapshot"] = ValidationHistoricalSnapshot(
+                stock=session.request.stock,
+                timeframe_minutes=target_minutes,
+                timeframe_key=str(timeframe["key"]),
+                requested_count=max(1, min(target_count, len(projected))),
+                request_id=f"{str(pool.get('request_id') or 'POOL')}:PRODUCTION",
+                rows=self._historical_rows_from_candles(projected),
+                market_data_identity=str(pool.get("market_data_identity") or ""),
+                market_source=str(pool.get("market_source") or ""),
+            )
+            return derived
+        if not regular_minute and len(normalized_raw) <= target_count:
+            return pool
+        target_minutes = session.request.timeframe_minutes
+        target_key = session.request.timeframe_key
+        projected = normalized_raw[-target_count:]
         derived = dict(pool)
         derived["timeframe_minutes"] = target_minutes
         derived["timeframe_key"] = target_key
         derived["requested_count"] = min(target_count, len(projected))
         derived["candles"] = projected
+        if regular_minute:
+            derived["display_candles"] = [
+                candle for candle in projected
+                if (
+                    len(str(candle.get("time") or "")) == 14
+                    and str(candle.get("time") or "").isdigit()
+                    and "0900" <= str(candle.get("time"))[8:12] < "1520"
+                )
+            ]
         derived["signal_entries_by_settings_hash"] = pool.setdefault(
             "signal_entries_by_settings_hash",
             {},
@@ -1224,7 +1291,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
             timeframe_key=target_key,
             requested_count=max(1, min(target_count, len(projected))),
             request_id=(
-                f"{str(pool.get('request_id') or 'POOL')}:{request_suffix}"
+                f"{str(pool.get('request_id') or 'POOL')}:ACTIVE"
             ),
             rows=self._historical_rows_from_candles(projected),
             market_data_identity=str(pool.get("market_data_identity") or ""),
@@ -1297,6 +1364,10 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 view_pool["candles"],
                 chart_candle_count=chart_candle_count,
             )
+        display_candles = view_pool.get("display_candles")
+        set_display = getattr(window, "set_historical_display_candles", None)
+        if isinstance(display_candles, list) and callable(set_display):
+            set_display(display_candles[-chart_candle_count:])
         stage_prepared_presentation = getattr(
             window,
             "stage_prepared_validation_presentation",
@@ -1355,8 +1426,25 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if not isinstance(candles, list) or not candles:
             raise ValueError("HISTORICAL_POOL_EMPTY")
 
-        chart_count = min(history_target, len(candles))
-        chart_start = len(candles) - chart_count
+        visible_candles = active_pool.get("display_candles")
+        if isinstance(visible_candles, list):
+            visible_candles = visible_candles[-history_target:]
+            if not visible_candles:
+                raise ValueError("DISPLAY_CANDLES_UNAVAILABLE")
+            calculation_lookup = {
+                str(candle.get("time") or ""): index
+                for index, candle in enumerate(candles)
+            }
+            chart_indexes = tuple(
+                calculation_lookup[str(candle.get("time") or "")]
+                for candle in visible_candles
+            )
+            chart_count = len(chart_indexes)
+            chart_start = chart_indexes[0]
+        else:
+            chart_count = min(history_target, len(candles))
+            chart_start = len(candles) - chart_count
+            chart_indexes = tuple(range(chart_start, len(candles)))
         if chart_range is None:
             count = max(1, min(int(evaluation_count or 1), chart_count))
             evaluation_start = len(candles) - count
@@ -1371,15 +1459,28 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 or not 0 <= start <= end < chart_count
             ):
                 raise ValueError("INVALID_CACHED_REPLAY_RANGE")
-            evaluation_start = chart_start + start
-            evaluation_end = chart_start + end
-            count = end - start + 1
+            evaluation_start = chart_indexes[start]
+            evaluation_end = chart_indexes[end]
+            count = evaluation_end - evaluation_start + 1
 
-        slice_start = max(0, evaluation_start - warmup_bars)
-        replay_candles = [
-            dict(candle)
-            for candle in candles[slice_start : evaluation_end + 1]
-        ]
+        if chart_range is None:
+            slice_start = max(0, evaluation_start - warmup_bars)
+            replay_candles = [
+                dict(candle)
+                for candle in candles[slice_start : evaluation_end + 1]
+            ]
+            replay_start_index = None
+            replay_end_index = None
+        else:
+            # Keep the same historical prefix as the base scan so fixed
+            # indicators retain identical values.  Only the position-dependent
+            # replay state starts at the selected range boundary.
+            replay_candles = [
+                dict(candle)
+                for candle in candles[: evaluation_end + 1]
+            ]
+            replay_start_index = evaluation_start
+            replay_end_index = evaluation_end
         if not replay_candles:
             raise ValueError("CACHED_REPLAY_INPUT_EMPTY")
 
@@ -1397,16 +1498,31 @@ class IndicatorFollowSignalValidationFlow(QObject):
         evaluate_with_context = getattr(replay, "evaluate_with_context", None)
         evaluate = getattr(replay, "evaluate", None)
         if callable(evaluate_with_context):
-            replay_result = evaluate_with_context(
-                replay_historical,
-                context_provider=self._context_provider_for_session(session),
-                display_count=count,
-            )
+            if replay_start_index is None:
+                replay_result = evaluate_with_context(
+                    replay_historical,
+                    context_provider=self._context_provider_for_session(session),
+                    display_count=count,
+                )
+            else:
+                replay_result = evaluate_with_context(
+                    replay_historical,
+                    context_provider=self._context_provider_for_session(session),
+                    start_index=replay_start_index,
+                    end_index=replay_end_index,
+                )
         elif callable(evaluate):
-            replay_result = evaluate(
-                replay_historical,
-                display_count=count,
-            )
+            if replay_start_index is None:
+                replay_result = evaluate(
+                    replay_historical,
+                    display_count=count,
+                )
+            else:
+                replay_result = evaluate(
+                    replay_historical,
+                    start_index=replay_start_index,
+                    end_index=replay_end_index,
+                )
         else:
             raise TypeError("replay evaluator is unavailable")
         if (
@@ -1498,7 +1614,9 @@ class IndicatorFollowSignalValidationFlow(QObject):
 
         def prepare_result() -> None:
             try:
-                entries = (
+                rules = session.request.settings_snapshot.to_dict()
+                signal_rule_support = require_signal_rule_support(rules)
+                optimized_entries = (
                     cached_entries
                     if cached_entries is not None
                     else tuple(
@@ -1516,33 +1634,129 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     history_target=history_target,
                     evaluation_count=evaluation_count,
                 )
-                rules = session.request.settings_snapshot.to_dict()
+                authoritative_entries = emitted_signal_entries(
+                    replay_result.snapshot.to_entries()
+                )
+                replay_snapshot = replay_result.snapshot
+                evaluated_candles = replay_snapshot.to_candles()[
+                    replay_snapshot.evaluated_start_index:
+                    replay_snapshot.evaluated_end_index + 1
+                ]
+                evaluated_times = {
+                    str(candle.get("time") or "")
+                    for candle in evaluated_candles
+                }
+                parity_report = require_signal_replay_parity(
+                    authoritative_entries,
+                    tuple(
+                        entry for entry in optimized_entries
+                        if entry.evaluation_time in evaluated_times
+                    ),
+                )
                 warmup_bars = required_validation_history_context_bars(rules)
                 active_pool = self._validation_pool_for_session(
                     session,
                     pool,
                     target_count=history_target + warmup_bars,
                 )
+                candle_projection_parity = candle_projection_parity_report(
+                    historical_snapshot,
+                    calculation_provenance=active_pool,
+                )
+                stock = session.request.stock
+                try:
+                    production_contract = self._production_session_contract_reader(
+                        stock.code,
+                        stock.name,
+                    )
+                except Exception:
+                    production_contract = unavailable_production_session_contract(
+                        "PRODUCTION_SESSION_READER_FAILED"
+                    )
+                market_session_parity = market_session_parity_report(
+                    production_contract,
+                    rules.get("validation_market_scope")
+                    if isinstance(rules, dict)
+                    else None,
+                    timeframe_key=session.request.timeframe_key,
+                    timeframe_minutes=session.request.timeframe_minutes,
+                    calculation_provenance=active_pool,
+                )
+                filter_signal_authorization = (
+                    filter_signal_backtest_authorization_report(
+                        signal_rule_support,
+                        parity_report.to_dict(),
+                        market_session_parity,
+                        candle_projection_parity,
+                    )
+                )
+                trust_metadata = {
+                    "signal_parity": parity_report.to_dict(),
+                    "execution_model": execution_model_report(rules),
+                    "candle_projection_parity": candle_projection_parity,
+                    "market_session_parity": market_session_parity,
+                    "filter_signal_backtest_authorization": (
+                        filter_signal_authorization
+                    ),
+                    "production_decision_scope": (
+                        production_decision_scope_report(rules)
+                    ),
+                }
+                # Presentation/backtest consumers always use the authoritative
+                # full replay. The optimized scan is retained only as a
+                # differential accelerator and must match exactly.
+                entries = authoritative_entries
                 active_candles = active_pool.get("candles")
                 if not isinstance(active_candles, list) or not active_candles:
                     raise ValueError("HISTORICAL_POOL_EMPTY")
-                chart_count = min(history_target, len(active_candles))
+                display_candles = active_pool.get("display_candles")
+                if isinstance(display_candles, list):
+                    display_candles = display_candles[-history_target:]
+                    if not display_candles:
+                        raise ValueError("DISPLAY_CANDLES_UNAVAILABLE")
+                else:
+                    display_candles = None
+                chart_count = (
+                    len(display_candles)
+                    if display_candles is not None
+                    else min(history_target, len(active_candles))
+                )
                 chart_start = len(active_candles) - chart_count
+                if display_candles is not None:
+                    display_start_time = str(display_candles[0].get("time") or "")
+                    chart_start = next(
+                        index for index, candle in enumerate(active_candles)
+                        if str(candle.get("time") or "") == display_start_time
+                    )
                 prepared_presentation = prepare_signal_validation_presentation(
                     active_candles,
                     entries,
                     session.request.settings_snapshot,
                     chart_start_index=chart_start,
                     chart_count=chart_count,
+                    trust_metadata=trust_metadata,
+                    display_candles=display_candles,
                 )
                 payload = dict(payload_base)
                 payload["entries"] = entries
+                payload["optimized_entries"] = optimized_entries
                 payload["replay_snapshot"] = replay_result.snapshot
                 payload["prepared_presentation"] = prepared_presentation
+                payload["backtest_signal_rule_support"] = signal_rule_support
+                payload["backtest_signal_parity"] = parity_report.to_dict()
+                payload["backtest_execution_parity"] = trust_metadata["execution_model"]
+                payload["backtest_market_session_parity"] = deepcopy(
+                    market_session_parity
+                )
+                payload["backtest_filter_signal_authorization"] = deepcopy(
+                    filter_signal_authorization
+                )
+                payload["backtest_trust_metadata"] = trust_metadata
                 payload["error"] = ""
             except Exception as exc:
                 payload = dict(payload_base)
                 payload["entries"] = ()
+                payload["optimized_entries"] = ()
                 payload["replay_snapshot"] = None
                 payload["prepared_presentation"] = None
                 payload["error"] = str(exc)
@@ -1579,6 +1793,11 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if self._historical_pools.get(window_key) is not pool:
             return
         entries = tuple(payload.get("entries") or ())
+        optimized_entries = tuple(
+            payload.get("optimized_entries")
+            if "optimized_entries" in payload
+            else entries
+        )
         settings_hash = str(payload.get("settings_hash") or "")
         cached_by_settings = pool.setdefault(
             "signal_entries_by_settings_hash",
@@ -1594,11 +1813,13 @@ class IndicatorFollowSignalValidationFlow(QObject):
             and isinstance(cached_signatures, dict)
             and settings_hash
             and isinstance(active_signal_signature, tuple)
-            and len(active_signal_signature) == 4
+            and len(active_signal_signature) == 5
         ):
-            cached_by_settings[settings_hash] = entries
+            # Cache/persist the optimizer output, not the authoritative replay,
+            # so every subsequent preparation still gates batch versus replay.
+            cached_by_settings[settings_hash] = optimized_entries
             cached_signatures[settings_hash] = active_signal_signature
-            active_timeframe_key, active_count, _first_time, _last_time = (
+            active_timeframe_key, active_count, _first_time, _last_time, _source_identity = (
                 active_signal_signature
             )
             raw_requested_count = int(pool.get("requested_count") or 0)
@@ -1616,7 +1837,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     str(pool.get("timeframe_key") or ""),
                     raw_requested_count,
                     settings_hash,
-                    list(entries),
+                    list(optimized_entries),
                 )
         evaluation_count = payload.get("evaluation_count")
         if isinstance(evaluation_count, bool) or not isinstance(evaluation_count, int):
@@ -1637,54 +1858,53 @@ class IndicatorFollowSignalValidationFlow(QObject):
         self,
         session: ValidationSession,
         target_count: int,
+        *,
+        production_contract: dict[str, object] | None = None,
     ) -> tuple[ValidationSession, int, str, int]:
-        rules = session.request.settings_snapshot.to_dict()
-        scope = (
-            rules.get("validation_market_scope")
-            if isinstance(rules, dict)
-            else None
-        )
         timeframe = normalize_validation_timeframe(
             session.request.timeframe_key,
             fallback_minutes=session.request.timeframe_minutes,
         )
+        if production_contract is None:
+            try:
+                production_contract = self._production_session_contract_reader(
+                    session.request.stock.code,
+                    session.request.stock.name,
+                )
+            except Exception:
+                production_contract = None
         if (
-            not isinstance(scope, dict)
-            or scope.get("regular_market_only") is not True
-            or timeframe["kind"] != "MINUTE"
+            timeframe["kind"] == "MINUTE"
+            and isinstance(production_contract, dict)
+            and production_contract.get("status") == "PRODUCTION_SESSION_READY"
+            and production_contract.get("ready") is True
         ):
-            return (
-                session,
-                session.request.timeframe_minutes,
-                session.request.timeframe_key,
-                target_count,
+            target_minutes = int(timeframe["minutes"])
+            plan = production_minute_source_plan(target_minutes, target_count, 0)
+            if not plan["ready"]:
+                raise ValueError(
+                    f"FILTER_SIGNAL_BACKTEST_BLOCKED: {plan['reason']}"
+                )
+            source_rules = session.request.settings_snapshot.to_dict()
+            source_rules["validation_timeframe"] = normalize_validation_timeframe(1)
+            source_snapshot = ValidationSettingsSnapshot(source_rules)
+            source_request = ValidationRequest(
+                session.request.stock,
+                source_snapshot,
+                1,
             )
-
-        target_minutes = int(timeframe["minutes"])
-        source_minutes = regular_market_source_minutes(target_minutes)
-        source_rules = deepcopy(rules)
-        source_rules["validation_timeframe"] = normalize_validation_timeframe(
-            source_minutes,
-            fallback_minutes=source_minutes,
-        )
-        source_snapshot = ValidationSettingsSnapshot(source_rules)
-        source_request = ValidationRequest(
-            session.request.stock,
-            source_snapshot,
-            source_minutes,
-        )
-        source_session = ValidationSession(
-            source_request,
-            operation_active_reader=self._operation_active_reader,
-        )
+            source_session = ValidationSession(
+                source_request,
+                operation_active_reader=self._operation_active_reader,
+            )
+            return source_session, 1, source_request.timeframe_key, int(
+                plan["requested_source_count"]
+            )
         return (
-            source_session,
-            source_minutes,
-            source_request.timeframe_key,
-            required_regular_market_source_candles(
-                target_minutes,
-                target_count,
-            ),
+            session,
+            session.request.timeframe_minutes,
+            session.request.timeframe_key,
+            target_count,
         )
 
     def _run_validation(
@@ -1755,6 +1975,14 @@ class IndicatorFollowSignalValidationFlow(QObject):
             if not availability.allowed:
                 self._fail_window(window, str(availability.reason or "VALIDATION_BLOCKED"))
                 return
+            try:
+                production_contract = self._production_session_contract_reader(
+                    stock.code, stock.name,
+                )
+            except Exception:
+                production_contract = unavailable_production_session_contract(
+                    "PRODUCTION_SESSION_READER_FAILED"
+                )
             (
                 fetch_session,
                 timeframe_minutes,
@@ -1763,6 +1991,12 @@ class IndicatorFollowSignalValidationFlow(QObject):
             ) = self._validation_fetch_contract(
                 session,
                 target_fetch_count,
+                production_contract=production_contract,
+            )
+            production_calculation_enabled = (
+                isinstance(production_contract, dict)
+                and production_contract.get("status") == "PRODUCTION_SESSION_READY"
+                and fetch_session.request.timeframe_key == "M1"
             )
             fetch_availability = fetch_session.readiness()
             if not fetch_availability.allowed:
@@ -1785,6 +2019,9 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     self._shared_pool_key(stock, timeframe_key)
                 )
             if self._pool_matches(pool, stock, timeframe_key, fetch_count):
+                if production_calculation_enabled:
+                    pool = dict(pool)
+                    pool["production_session_contract"] = deepcopy(production_contract)
                 self._use_pool_for_window(
                     window,
                     session,
@@ -1817,6 +2054,39 @@ class IndicatorFollowSignalValidationFlow(QObject):
 
         cached_pool = None
         persistent_capacity = fetch_count
+        production_refetch_count: int | None = None
+
+        def production_retry_plan_for_candles(
+            source_candles: list[dict[str, object]],
+            current_source_count: int,
+        ) -> dict[str, object] | None:
+            if not production_calculation_enabled:
+                return None
+            try:
+                projection = project_production_calculation_candles(
+                    source_candles,
+                    session.request.timeframe_minutes,
+                    production_contract,
+                    as_of=self._now_factory(),
+                )
+                projected = projection.get("candles")
+                projected_count = len(projected) if isinstance(projected, list) else 0
+                return production_minute_source_retry_plan(
+                    current_source_count,
+                    projected_count,
+                    target_fetch_count,
+                )
+            except Exception:
+                return {
+                    "ready": False,
+                    "retry": False,
+                    "status": "FILTER_SIGNAL_BACKTEST_BLOCKED",
+                    "requested_source_count": current_source_count,
+                    "projected_target_bars": 0,
+                    "required_target_bars": target_fetch_count,
+                    "reason": "PRODUCTION_SOURCE_PROJECTION_FAILED",
+                }
+
         if persistent is not None:
             persistent_capacity = max(fetch_count, persistent.requested_count)
             cached_pool = self._pool_from_candles(
@@ -1827,6 +2097,34 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 market_data_identity=persistent.market_data_identity,
                 market_source=persistent.market_source,
             )
+            if production_calculation_enabled:
+                cached_pool["production_session_contract"] = deepcopy(
+                    production_contract
+                )
+                cached_source = cached_pool.get("candles")
+                retry_plan = (
+                    production_retry_plan_for_candles(
+                        cached_source,
+                        persistent_capacity,
+                    )
+                    if isinstance(cached_source, list)
+                    else None
+                )
+                if isinstance(retry_plan, dict) and retry_plan.get("ready") is not True:
+                    if retry_plan.get("retry") is True:
+                        production_refetch_count = int(
+                            retry_plan["requested_source_count"]
+                        )
+                    else:
+                        self._fail_window(
+                            window,
+                            "FILTER_SIGNAL_BACKTEST_BLOCKED: "
+                            + str(
+                                retry_plan.get("reason")
+                                or "PRODUCTION_SOURCE_HISTORY_INSUFFICIENT"
+                            ),
+                        )
+                        return
             settings_hash = session.request.settings_snapshot.rules_hash
             exact_signal_cache_identity = (
                 persistent.requested_count == fetch_count
@@ -1872,6 +2170,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
 
         if (
             persistent is not None
+            and production_refetch_count is None
             and not self._persistent_cache_requires_broker_probe(
                 persistent,
             )
@@ -1896,7 +2195,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 install_cached_pool()
             return
 
-        def request_full() -> None:
+        def request_full(request_count: int = fetch_count) -> None:
             target = current_target()
             if target is None:
                 return
@@ -1907,21 +2206,58 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 completed_target = current_target()
                 if completed_target is None:
                     return
+                if (
+                    production_calculation_enabled
+                    and isinstance(result, ValidationHistoricalResult)
+                    and result.ok is True
+                    and result.snapshot is not None
+                ):
+                    try:
+                        source_candles, _dropped_count = project_validation_candles(
+                            result.snapshot
+                        )
+                    except Exception:
+                        source_candles = []
+                    retry_plan = production_retry_plan_for_candles(
+                        source_candles,
+                        request_count,
+                    )
+                    if isinstance(retry_plan, dict):
+                        if retry_plan.get("retry") is True:
+                            request_full(int(retry_plan["requested_source_count"]))
+                            return
+                        if retry_plan.get("ready") is not True:
+                            self._fail_window(
+                                completed_target,
+                                "FILTER_SIGNAL_BACKTEST_BLOCKED: "
+                                + str(
+                                    retry_plan.get("reason")
+                                    or "PRODUCTION_SOURCE_HISTORY_INSUFFICIENT"
+                                ),
+                            )
+                            return
                 self._handle_historical_result(
                     completed_target,
                     session,
                     result,
                     evaluation_count=run_request.candle_count,
-                    cache_requested_count=fetch_count,
+                    cache_requested_count=request_count,
                     source_session=fetch_session,
+                    production_contract=(
+                        production_contract if production_calculation_enabled else None
+                    ),
                 )
 
             try:
-                request_latest(fetch_count, full_completed)
+                request_latest(request_count, full_completed)
             except Exception as exc:
                 self._active_providers.pop(request_key, None)
                 if current_target() is not None:
                     self._fail_window(target, f"HISTORICAL_REQUEST_ERROR: {exc}")
+
+        if production_refetch_count is not None:
+            request_full(production_refetch_count)
+            return
 
         if persistent is None:
             request_full()
@@ -1998,6 +2334,10 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     market_data_identity=result.snapshot.market_data_identity,
                     market_source=result.snapshot.market_source,
                 )
+                if production_calculation_enabled:
+                    pool["production_session_contract"] = deepcopy(
+                        production_contract
+                    )
                 if current_target() is None:
                     return
                 self._persist_history(
@@ -2035,6 +2375,7 @@ class IndicatorFollowSignalValidationFlow(QObject):
         evaluation_count: int,
         cache_requested_count: int | None = None,
         source_session: ValidationSession | None = None,
+        production_contract: dict[str, object] | None = None,
     ) -> bool:
         if (
             not isinstance(result, ValidationHistoricalResult)
@@ -2067,6 +2408,8 @@ class IndicatorFollowSignalValidationFlow(QObject):
             market_data_identity=result.snapshot.market_data_identity,
             market_source=result.snapshot.market_source,
         )
+        if production_contract is not None:
+            pool["production_session_contract"] = deepcopy(production_contract)
         self._persist_history(
             persistence_session.request.stock,
             persistence_session.request.timeframe_minutes,
@@ -2117,8 +2460,24 @@ class IndicatorFollowSignalValidationFlow(QObject):
             self._fail_window(window, "HISTORICAL_POOL_EMPTY")
             return
 
-        chart_count = min(history_target, len(candles))
-        chart_start = len(candles) - chart_count
+        visible_candles = pool.get("display_candles")
+        if isinstance(visible_candles, list):
+            visible_candles = visible_candles[-history_target:]
+            if not visible_candles:
+                self._fail_window(window, "DISPLAY_CANDLES_UNAVAILABLE")
+                return
+            calculation_lookup = {
+                str(candle.get("time") or ""): index
+                for index, candle in enumerate(candles)
+            }
+            chart_indexes = tuple(
+                calculation_lookup[str(candle.get("time") or "")]
+                for candle in visible_candles
+            )
+            chart_count = len(chart_indexes)
+        else:
+            chart_count = min(history_target, len(candles))
+            chart_indexes = tuple(range(len(candles) - chart_count, len(candles)))
         if chart_range is None:
             count = max(1, min(int(evaluation_count or 1), chart_count))
             evaluation_start = len(candles) - count
@@ -2134,17 +2493,29 @@ class IndicatorFollowSignalValidationFlow(QObject):
             ):
                 self._fail_window(window, "INVALID_CACHED_REPLAY_RANGE")
                 return
-            evaluation_start = chart_start + start
-            evaluation_end = chart_start + end
-            count = end - start + 1
+            evaluation_start = chart_indexes[start]
+            evaluation_end = chart_indexes[end]
+            count = evaluation_end - evaluation_start + 1
 
         rules = session.request.settings_snapshot.to_dict()
         warmup_bars = required_validation_history_context_bars(rules)
-        slice_start = max(0, evaluation_start - warmup_bars)
-        replay_candles = [
-            dict(candle)
-            for candle in candles[slice_start : evaluation_end + 1]
-        ]
+        if chart_range is None:
+            slice_start = max(0, evaluation_start - warmup_bars)
+            replay_candles = [
+                dict(candle)
+                for candle in candles[slice_start : evaluation_end + 1]
+            ]
+            replay_start_index = None
+            replay_end_index = None
+        else:
+            # Range replay keeps the base scan's historical prefix so
+            # fixed-filter results remain position-stable.
+            replay_candles = [
+                dict(candle)
+                for candle in candles[: evaluation_end + 1]
+            ]
+            replay_start_index = evaluation_start
+            replay_end_index = evaluation_end
         if not replay_candles:
             self._fail_window(window, "CACHED_REPLAY_INPUT_EMPTY")
             return
@@ -2163,16 +2534,31 @@ class IndicatorFollowSignalValidationFlow(QObject):
             evaluate_with_context = getattr(replay, "evaluate_with_context", None)
             evaluate = getattr(replay, "evaluate", None)
             if callable(evaluate_with_context):
-                replay_result = evaluate_with_context(
-                    replay_historical,
-                    context_provider=self._context_provider_for_session(session),
-                    display_count=count,
-                )
+                if replay_start_index is None:
+                    replay_result = evaluate_with_context(
+                        replay_historical,
+                        context_provider=self._context_provider_for_session(session),
+                        display_count=count,
+                    )
+                else:
+                    replay_result = evaluate_with_context(
+                        replay_historical,
+                        context_provider=self._context_provider_for_session(session),
+                        start_index=replay_start_index,
+                        end_index=replay_end_index,
+                    )
             elif callable(evaluate):
-                replay_result = evaluate(
-                    replay_historical,
-                    display_count=count,
-                )
+                if replay_start_index is None:
+                    replay_result = evaluate(
+                        replay_historical,
+                        display_count=count,
+                    )
+                else:
+                    replay_result = evaluate(
+                        replay_historical,
+                        start_index=replay_start_index,
+                        end_index=replay_end_index,
+                    )
             else:
                 raise TypeError("replay evaluator is unavailable")
         except Exception as exc:

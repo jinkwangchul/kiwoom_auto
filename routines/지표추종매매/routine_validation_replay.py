@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
 import math
+import re
 from typing import Any, Callable
 
 from candle_timeframe_aggregation import MARKET_BUCKET_ANCHOR, SEOUL_TIMEZONE
@@ -105,6 +106,28 @@ def _remap_trace_indexes(
                 if isinstance(index, int) and not isinstance(index, bool):
                     snapshot["index"] = index + offset
     return remapped
+
+
+_EVALUATION_INDEX_DETAIL_PATTERN = re.compile(r"\bevaluation_index=(-?\d+)\b")
+
+
+def _remap_detail_indexes(
+    details: list[str],
+    offset: int,
+) -> list[str]:
+    """Project evaluator detail indexes from a bounded history prefix to global indexes."""
+    if not isinstance(details, list) or any(not isinstance(value, str) for value in details):
+        raise TypeError("details must be a list of strings")
+    if offset <= 0:
+        return list(details)
+
+    def replace(match: re.Match[str]) -> str:
+        return f"evaluation_index={int(match.group(1)) + offset}"
+
+    return [
+        _EVALUATION_INDEX_DETAIL_PATTERN.sub(replace, detail)
+        for detail in details
+    ]
 
 
 def _normalized_number(value: Any) -> float | None:
@@ -985,6 +1008,6 @@ class ValidationHistoricalReplay:
             signal_time=signal_time,
             delay_bar=signal.delay_bar,
             matched_groups=signal.matched_groups,
-            details=signal.details,
+            details=_remap_detail_indexes(signal.details, signal_index_offset),
             trace=trace,
         )

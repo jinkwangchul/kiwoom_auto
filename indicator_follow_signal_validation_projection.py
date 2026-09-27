@@ -26,11 +26,18 @@ from gui_indicator_follow_sell_controls import (
 from gui_indicator_follow_buy_controls import (
     require_resolved_buy_bollinger_sign_selection,
 )
+from indicator_follow_strategy_price_contract import (
+    canonicalize_buy_strategy_price_comparison_rules,
+)
+from routines.지표추종매매.routine_signal_selection import select_signal_side
 
 
 _FORBIDDEN_PRICE_TARGETS = {
+    # AVG_PRICE is replayable from ValidationVirtualPositionTracker and must
+    # remain in signal rules for backtest/live parity. ORDER_PRICE and legacy
+    # purchase-price aliases still depend on execution context that the
+    # signal-only replay does not own.
     "ORDER_PRICE",
-    "AVG_PRICE",
     "AVERAGE_PRICE",
     "BUY_PRICE",
     "PURCHASE_PRICE",
@@ -299,11 +306,16 @@ def build_validation_average_price_context(
         average_series.append(average)
         contributor_series.append(list(running_indexes))
         signals = signals_by_index.get(index, set())
-        if "SELL" in signals:
+        selection = select_signal_side(
+            "SELL" in signals,
+            "BUY" in signals,
+            len(running_fill_prices),
+        )
+        if selection.selected_side == "SELL":
             running_fill_prices.clear()
             running_indexes.clear()
             continue
-        if "BUY" not in signals:
+        if selection.selected_side != "BUY":
             continue
         fill_price = validation_virtual_fill_price(candles[index])
         if fill_price is not None:
@@ -318,6 +330,7 @@ def build_validation_average_price_context(
             "side": str(side or "").upper(),
             "evaluation_index": evaluation_index,
             "estimated_average_price": current_average,
+            "position_quantity": len(contributor_series[evaluation_index]),
             "contributing_buy_indexes": contributor_series[evaluation_index],
             "average_source": "VALIDATION_BUY_CLOSE_SIGNAL_PRICE_SEGMENT",
         },
@@ -451,14 +464,6 @@ def project_signal_validation_ui_state(
     safe_signal_filter = (
         deepcopy(signal_filter) if isinstance(signal_filter, dict) else {}
     )
-    composite = safe_signal_filter.get("buy_composite")
-    if isinstance(composite, dict):
-        for group in composite.get("groups", []):
-            if isinstance(group, dict) and isinstance(group.get("filters"), list):
-                group["filters"] = [
-                    item for item in group["filters"]
-                    if str(item).strip().lower() != "price_compare"
-                ]
     return {
         "basic": {
             key: deepcopy(value)
@@ -509,7 +514,9 @@ def project_signal_validation_rules(
     if ui_state is not None:
         require_expression_aware_sell_price_selections(ui_state)
         require_resolved_buy_bollinger_sign_selection(dict(ui_state))
-    source_rules = _json_copy(rules)
+    source_rules = canonicalize_buy_strategy_price_comparison_rules(
+        _json_copy(rules)
+    )
     source_buy = source_rules.get("buy") if isinstance(source_rules.get("buy"), dict) else {}
     source_sell = source_rules.get("sell") if isinstance(source_rules.get("sell"), dict) else {}
     validation_visualization_rules = {
@@ -539,15 +546,10 @@ def project_signal_validation_rules(
         buy.pop("execution", None)
         filters = buy.get("filters")
         if isinstance(filters, dict):
-            filters.pop("price_compare", None)
-            composite = filters.get("composite")
-            if isinstance(composite, dict):
-                for group in composite.get("groups", []):
-                    if isinstance(group, dict) and isinstance(group.get("filters"), list):
-                        group["filters"] = [
-                            item for item in group["filters"]
-                            if str(item).strip().lower() != "price_compare"
-                        ]
+            # Signal-affecting price comparison is replayable from
+            # SIGNAL_PRICE/CURRENT_PRICE/AVG_PRICE and must remain identical to
+            # the production evaluator. Execution-only policies stay stripped.
+            pass
 
     sell = projected.get("sell")
     if isinstance(sell, dict):
@@ -599,6 +601,15 @@ def project_signal_validation_rules(
 def _materialize_validation_sell_signals(
     source_rules: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Preserve production signal semantics while applying unsaved UI previews."""
+    sell = source_rules.get("sell")
+    signals = sell.get("signals") if isinstance(sell, Mapping) else None
+    materialized: dict[str, Any] = {
+        str(name): _json_copy(value)
+        for name, value in (signals.items() if isinstance(signals, Mapping) else ())
+        if isinstance(value, Mapping)
+    }
+
     preview_root = source_rules.get("indicator_follow_rule_preview")
     candidates = (
         preview_root.get("candidates") if isinstance(preview_root, Mapping) else None
@@ -611,7 +622,6 @@ def _materialize_validation_sell_signals(
         if isinstance(sell_candidates, Mapping)
         else None
     )
-    materialized: dict[str, Any] = {}
     if isinstance(add_candidates, Mapping):
         for preview_path, signal_name in _SELL_PREVIEW_TARGETS.items():
             candidate = add_candidates.get(preview_path)
@@ -621,43 +631,48 @@ def _materialize_validation_sell_signals(
                 materialized_value.pop("preview_candidate", None)
                 materialized[signal_name] = materialized_value
 
-        expression_contract = next(
-            (
-                signal.get("signal_expression")
-                for signal in materialized.values()
-                if isinstance(signal, Mapping)
-                and isinstance(signal.get("signal_expression"), Mapping)
-            ),
-            None,
-        )
-        if isinstance(expression_contract, Mapping):
-            identifier_map = expression_contract.get("identifier_map")
-            identifiers = expression_contract.get("identifiers")
-            if isinstance(identifier_map, Mapping) and isinstance(identifiers, list):
-                missing = [
-                    str(identifier)
-                    for identifier in identifiers
-                    if str(identifier_map.get(str(identifier).upper()) or "")
-                    not in materialized
-                ]
-                if missing:
-                    raise ValueError(
-                        "SELL validation candidate is missing: " + ", ".join(missing)
-                    )
-        return materialized
+    set_signal_candidates = (
+        sell_candidates.get("set_signal_candidates")
+        if isinstance(sell_candidates, Mapping)
+        else None
+    )
+    profit_candidate = (
+        set_signal_candidates.get("sell.signals.profit_rate_sell")
+        if isinstance(set_signal_candidates, Mapping)
+        else None
+    )
+    profit_value = (
+        profit_candidate.get("value")
+        if isinstance(profit_candidate, Mapping)
+        else None
+    )
+    if isinstance(profit_value, Mapping):
+        materialized["profit_rate_sell"] = _json_copy(profit_value)
 
-    if isinstance(preview_root, Mapping):
-        return {}
-
-    sell = source_rules.get("sell")
-    signals = sell.get("signals") if isinstance(sell, Mapping) else None
-    if not isinstance(signals, Mapping):
-        return {}
-    return {
-        name: _json_copy(value)
-        for name, value in signals.items()
-        if name in _SELL_VALIDATION_SIGNAL_NAMES and isinstance(value, Mapping)
-    }
+    expression_contract = next(
+        (
+            signal.get("signal_expression")
+            for signal in materialized.values()
+            if isinstance(signal, Mapping)
+            and isinstance(signal.get("signal_expression"), Mapping)
+        ),
+        None,
+    )
+    if isinstance(expression_contract, Mapping):
+        identifier_map = expression_contract.get("identifier_map")
+        identifiers = expression_contract.get("identifiers")
+        if isinstance(identifier_map, Mapping) and isinstance(identifiers, list):
+            missing = [
+                str(identifier)
+                for identifier in identifiers
+                if str(identifier_map.get(str(identifier).upper()) or "")
+                not in materialized
+            ]
+            if missing:
+                raise ValueError(
+                    "SELL validation candidate is missing: " + ", ".join(missing)
+                )
+    return materialized
 
 
 def build_signal_validation_snapshot(

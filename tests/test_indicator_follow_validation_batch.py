@@ -119,6 +119,7 @@ def _legacy_entries(candles, rules, context_provider):
             context = {
                 "decision_trace_observer": observer,
                 "_indicator_follow_evaluate_side": side,
+                "_indicator_follow_validation_current_price": prefix[-1].get("close"),
             }
             supplied = context_provider(
                 evaluation_index, side, prefix, entries

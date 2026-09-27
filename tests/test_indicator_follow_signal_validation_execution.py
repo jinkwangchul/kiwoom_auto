@@ -306,6 +306,23 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
         self.assertEqual(1, len(simulation.cycles))
         self.assertEqual(0, simulation.open_quantity)
 
+    def test_same_bar_unexecutable_sell_allows_new_buy_cycle(self):
+        candles = _candles([100, 110])
+        simulation = simulate_validation_execution(
+            candles,
+            [
+                _entry("SELL", 0, candles),
+                _entry("BUY", 0, candles),
+                _entry("SELL", 1, candles),
+            ],
+        )
+
+        self.assertEqual([("BUY", 0), ("SELL", 1)], [
+            (fill.side, fill.evaluation_index) for fill in simulation.fills
+        ])
+        self.assertEqual(1, len(simulation.cycles))
+        self.assertEqual(0, simulation.open_quantity)
+
     def test_incremental_tracker_uses_quantity_weighted_average_before_sell(self):
         candles = _candles([100, 50, 80])
         entries = [
