@@ -1400,8 +1400,10 @@ class StockInstanceCloseChart(QWidget):
 
     def _session_gap_bridge_segments(
         self,
+        solid_segments=None,
     ) -> list[list[tuple[datetime, float]]]:
-        solid_segments = self._line_segments()
+        if solid_segments is None:
+            solid_segments = self._line_segments()
         bridges: list[list[tuple[datetime, float]]] = []
         for previous, following in zip(solid_segments, solid_segments[1:]):
             if not previous or not following:
@@ -1418,14 +1420,14 @@ class StockInstanceCloseChart(QWidget):
                 bridges.append([previous_item, following_item])
         return bridges
 
-    def _draw_session_gap_bridges(self, painter: QPainter, plot: QRectF) -> None:
+    def _draw_session_gap_bridges(self, painter: QPainter, plot: QRectF, *, scales=None, segments=None) -> None:
         painter.setPen(QPen(SESSION_GAP_BRIDGE_COLOR, 2, Qt.DashLine))
         painter.setBrush(Qt.NoBrush)
-        for segment in self._session_gap_bridge_segments():
+        for segment in self._session_gap_bridge_segments(segments):
             points = [
                 point
                 for bar_time, value in segment
-                if (point := self.position_for(bar_time, value, plot)) is not None
+                if (point := self.position_for(bar_time, value, plot, scales=scales)) is not None
             ]
             if len(points) != 2:
                 continue
@@ -1436,17 +1438,19 @@ class StockInstanceCloseChart(QWidget):
     def _live_price_bridge_points(
         self,
         plot: QRectF | None = None,
+        *,
+        scales=None,
     ) -> tuple[QPointF, QPointF] | None:
         if self.live_price_point is None or not self.close_series:
             return None
         target = plot or self._plot_rect()
         live_time, live_price = self.live_price_point
-        endpoint = self.position_for(live_time, live_price, target)
+        endpoint = self.position_for(live_time, live_price, target, scales=scales)
         visible_plot = target.adjusted(-1, -1, 1, 1)
         if endpoint is None or not visible_plot.contains(endpoint):
             return None
         for bar_time, close in reversed(self.close_series):
-            startpoint = self.position_for(bar_time, close, target)
+            startpoint = self.position_for(bar_time, close, target, scales=scales)
             if startpoint is None or not visible_plot.contains(startpoint):
                 continue
             if endpoint.x() <= startpoint.x():
@@ -1454,8 +1458,8 @@ class StockInstanceCloseChart(QWidget):
             return startpoint, endpoint
         return None
 
-    def _draw_live_price_bridge(self, painter: QPainter, plot: QRectF) -> None:
-        points = self._live_price_bridge_points(plot)
+    def _draw_live_price_bridge(self, painter: QPainter, plot: QRectF, *, scales=None) -> None:
+        points = self._live_price_bridge_points(plot, scales=scales)
         if points is None:
             return
         painter.setPen(QPen(LINE_COLOR, 2))
@@ -1501,8 +1505,9 @@ class StockInstanceCloseChart(QWidget):
             padding = max((high - low) * 0.08, 0.01)
         return time_range[0], time_range[1], low - padding, high + padding
 
-    def _x_axis_label_points(self, plot: QRectF) -> list[tuple[datetime, float]]:
-        time_range = self._time_range()
+    def _x_axis_label_points(self, plot: QRectF, *, time_range=None) -> list[tuple[datetime, float]]:
+        if time_range is None:
+            time_range = self._time_range()
         if time_range is None:
             return []
         minimum_time, maximum_time = time_range
@@ -1555,12 +1560,14 @@ class StockInstanceCloseChart(QWidget):
         painter: QPainter,
         plot: QRectF,
         text_color: QColor,
+        *,
+        time_range=None,
     ) -> None:
         label_font = QFont(painter.font())
         label_font.setPointSize(max(7, label_font.pointSize() - 1))
         painter.setFont(label_font)
         painter.setPen(text_color)
-        for bar_time, x in self._x_axis_label_points(plot):
+        for bar_time, x in self._x_axis_label_points(plot, time_range=time_range):
             painter.drawText(
                 QRectF(x - 32, plot.bottom() + 7, 64, 18),
                 Qt.AlignHCenter | Qt.AlignTop,
@@ -1572,9 +1579,12 @@ class StockInstanceCloseChart(QWidget):
         bar_time: Any,
         close: Any,
         plot: QRectF | None = None,
+        *,
+        scales: tuple[datetime, datetime, float, float] | None = None,
     ) -> QPointF | None:
         """Return the exact chart coordinate used by both lines and markers."""
-        scales = self._scale_values()
+        if scales is None:
+            scales = self._scale_values()
         parsed_time = parse_market_datetime(bar_time)
         parsed_close = _finite_number(close)
         if scales is None or parsed_time is None or parsed_close is None:
@@ -1690,11 +1700,13 @@ class StockInstanceCloseChart(QWidget):
         self,
         painter: QPainter,
         plot: QRectF,
+        *,
+        scales=None,
     ) -> None:
         if self.live_price_point is None:
             return
         market_datetime, price = self.live_price_point
-        point = self.position_for(market_datetime, price, plot)
+        point = self.position_for(market_datetime, price, plot, scales=scales)
         if point is None or not plot.adjusted(-1, -1, 1, 1).contains(point):
             return
         painter.setPen(QPen(LIVE_PRICE_COLOR, 2))
@@ -1720,10 +1732,11 @@ class StockInstanceCloseChart(QWidget):
         )
         painter.setFont(self.font())
 
-    def _draw_average_price_projection(self, painter: QPainter, plot: QRectF) -> None:
+    def _draw_average_price_projection(self, painter: QPainter, plot: QRectF, *, scales=None) -> None:
         if self.average_price is None:
             return
-        point = self.position_for(self._time_range()[0] if self._time_range() else None, self.average_price, plot)
+        time_range = scales[:2] if scales is not None else self._time_range()
+        point = self.position_for(time_range[0] if time_range else None, self.average_price, plot, scales=scales)
         if point is None:
             return
         y = point.y()
@@ -1752,9 +1765,9 @@ class StockInstanceCloseChart(QWidget):
         axis_color = self.palette().mid().color()
 
         self._draw_plot_axes(painter, plot, axis_color)
-        self._draw_x_axis_labels(painter, plot, text_color)
-        painter.setFont(self.font())
         scales = self._scale_values()
+        self._draw_x_axis_labels(painter, plot, text_color, time_range=scales[:2] if scales else None)
+        painter.setFont(self.font())
         if scales is None:
             painter.setPen(text_color)
             painter.drawText(plot, Qt.AlignCenter, self.empty_message)
@@ -1778,9 +1791,10 @@ class StockInstanceCloseChart(QWidget):
             )
             painter.setPen(QPen(grid_color, 1, Qt.DotLine))
 
-        for segment in self._line_segments():
+        segments = self._line_segments()
+        for segment in segments:
             plotted = [
-                self.position_for(bar_time, value, plot)
+                self.position_for(bar_time, value, plot, scales=scales)
                 for bar_time, value in segment
             ]
             points = [point for point in plotted if point is not None]
@@ -1796,13 +1810,13 @@ class StockInstanceCloseChart(QWidget):
                 painter.setBrush(LINE_COLOR)
                 painter.drawEllipse(points[0], 2.5, 2.5)
 
-        self._draw_session_gap_bridges(painter, plot)
-        self._draw_live_price_bridge(painter, plot)
+        self._draw_session_gap_bridges(painter, plot, scales=scales, segments=segments)
+        self._draw_live_price_bridge(painter, plot, scales=scales)
 
-        self._draw_average_price_projection(painter, plot)
+        self._draw_average_price_projection(painter, plot, scales=scales)
 
         for bar_time, value in self.buy_series:
-            point = self.position_for(bar_time, value, plot)
+            point = self.position_for(bar_time, value, plot, scales=scales)
             if point is not None:
                 self._draw_marker(painter, point, BUY_COLOR)
                 self._draw_signal_label(
@@ -1814,7 +1828,7 @@ class StockInstanceCloseChart(QWidget):
                     above=True,
                 )
         for bar_time, value in self.sell_series:
-            point = self.position_for(bar_time, value, plot)
+            point = self.position_for(bar_time, value, plot, scales=scales)
             if point is not None:
                 self._draw_marker(painter, point, SELL_COLOR)
                 self._draw_signal_label(
@@ -1830,6 +1844,7 @@ class StockInstanceCloseChart(QWidget):
                 marker.get("_occurred_at"),
                 marker.get("_filled_price"),
                 plot,
+                scales=scales,
             )
             if point is None:
                 continue
@@ -1848,7 +1863,7 @@ class StockInstanceCloseChart(QWidget):
                 ACTUAL_BUY_FILL_COLOR if marker.get("side") == "BUY" else ACTUAL_SELL_FILL_COLOR,
                 selected=selected,
             )
-        self._draw_live_price_projection(painter, plot)
+        self._draw_live_price_projection(painter, plot, scales=scales)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         plot = self._plot_rect()
