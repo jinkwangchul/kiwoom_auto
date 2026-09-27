@@ -34,9 +34,11 @@ from gui_indicator_follow_signal_validation_window import (
     IndicatorFollowSignalValidationWindow,
     _completed_cycle_financial_summary,
     _marker_records,
+    _mapped_validation_entries,
     _time_axis_label_records,
     _validation_price_text,
     estimated_signal_return_percent,
+    prepare_signal_validation_presentation,
 )
 from indicator_follow_signal_validation_execution import (
     normalize_validation_execution_policy,
@@ -349,6 +351,182 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             matched_groups=[],
             details=[],
             trace={"conditions": [], "groups": [], "aggregations": []},
+        )
+
+    def test_display_projection_maps_replay_entries_by_timestamp_not_suffix_offset(self):
+        candles = [
+            {"time": f"20260911140{index}00", "close": 100.0}
+            for index in range(4)
+        ]
+        entries = [
+            ValidationReplayEntry(
+                evaluation_side="BUY",
+                evaluation_index=index,
+                evaluation_time=candles[index]["time"],
+                signal="BUY",
+                reason="fixture",
+                signal_index=index,
+                signal_time=candles[index]["time"],
+                delay_bar=0,
+                matched_groups=[],
+                details=[],
+                trace={"conditions": [], "groups": [], "aggregations": []},
+            )
+            for index in range(4)
+        ]
+        calculation_entries, chart_entries = _mapped_validation_entries(
+            candles,
+            entries,
+            chart_start_index=0,
+            chart_count=2,
+            chart_calculation_indexes=(0, 2),
+        )
+        self.assertEqual([entry.evaluation_index for entry in calculation_entries], [0, 1, 2, 3])
+        self.assertEqual([entry.evaluation_index for entry in chart_entries], [0, 1])
+        self.assertEqual([entry.evaluation_time for entry in chart_entries], [candles[0]["time"], candles[2]["time"]])
+    def test_window_display_projection_retains_calculation_candles_and_maps_visible_entries(self):
+        window = self._window()
+        candles = [
+            {
+                "time": f"20260911140{index}00",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1,
+            }
+            for index in range(4)
+        ]
+        window.set_historical_candle_pool(candles, chart_candle_count=4)
+        window.set_historical_display_candles([candles[0], candles[2]])
+        self.assertEqual(window._calculation_candles, candles)
+        self.assertEqual(window._chart_calculation_indexes, (0, 2))
+        self.assertEqual([candle["time"] for candle in window._candles], [candles[0]["time"], candles[2]["time"]])
+
+        entries = [
+            ValidationReplayEntry(
+                evaluation_side="BUY",
+                evaluation_index=index,
+                evaluation_time=candles[index]["time"],
+                signal="BUY",
+                reason="fixture",
+                signal_index=index,
+                signal_time=candles[index]["time"],
+                delay_bar=0,
+                matched_groups=[],
+                details=[],
+                trace={"conditions": [], "groups": [], "aggregations": []},
+            )
+            for index in range(4)
+        ]
+        calculation_entries, display_entries = window._mapped_entries(entries)
+        self.assertEqual([entry.evaluation_index for entry in calculation_entries], [0, 1, 2, 3])
+        self.assertEqual([entry.evaluation_index for entry in display_entries], [0, 1])
+        prepared = prepare_signal_validation_presentation(
+            candles,
+            entries,
+            self._seed().settings_snapshot,
+            chart_start_index=0,
+            chart_count=2,
+            display_candles=[candles[0], candles[2]],
+        )
+        window.stage_prepared_validation_presentation(prepared)
+        self.assertEqual((0, 2), prepared.chart_calculation_indexes)
+        self.assertEqual(2, prepared.visualization_cache.candle_count)
+        self.assertEqual([0, 1], [entry.evaluation_index for entry in window._signal_marker_entries])
+    def test_range_replay_uses_display_timestamps_to_select_calculation_indexes(self):
+        seed = self._seed()
+        session = ValidationSession(
+            ValidationRequest(self.stock, seed.settings_snapshot, 5),
+            operation_active_reader=lambda: False,
+        )
+        candles = [
+            {"time": f"2026091114{index * 5:02d}00", "open": 100.0,
+             "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1}
+            for index in range(4)
+        ]
+        captured = []
+
+        class Replay:
+            def evaluate_with_context(_self, historical, *, context_provider=None,
+                                      start_index=None, end_index=None):
+                captured.append((start_index, end_index, len(historical.to_rows())))
+                return ValidationReplayResult(
+                    True,
+                    snapshot=ValidationReplaySnapshot(
+                        stock=self.stock, timeframe_minutes=5,
+                        settings_hash=seed.settings_snapshot.rules_hash,
+                        historical_request_id=historical.request_id,
+                        evaluated_start_index=start_index,
+                        evaluated_end_index=end_index,
+                        dropped_raw_rows_count=0,
+                        candles=candles[:end_index + 1], entries=[],
+                    ),
+                )
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True), host=_FakeHost(self.stock),
+            replay_factory=lambda _session: Replay(),
+            recent_stock_store=_MemoryRecentStockStore(),
+            production_session_contract_reader=lambda *_args: {
+                "status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False,
+            },
+        )
+        pool = flow._pool_from_candles(
+            session, candles, requested_count=4, request_id="RANGE-TIMES"
+        )
+        pool["display_candles"] = [candles[0], candles[2]]
+        result = flow._prepare_replay_result_from_pool(
+            session, pool, history_target=2, chart_range=(0, 1),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual([(0, 2, 3)], captured)
+        window = _FakeWindow(self.stock, seed)
+        window.apply_range_replay_snapshot = Mock()
+        self.widgets.append(window)
+        flow._history_targets[id(window)] = 2
+        flow._replay_from_pool(window, session, pool, chart_range=(0, 1))
+        self.assertEqual([(0, 2, 3), (0, 2, 3)], captured)
+        window.apply_range_replay_snapshot.assert_called_once()
+    def test_prepared_window_contract_carries_detached_backtest_trust_metadata(self):
+        window = self._window()
+        candles = self._candle_count_snapshot(3).to_candles()
+        trust_metadata = {
+            "signal_parity": {"status": "SIGNAL_PARITY_PASS"},
+            "execution_model": {
+                "model_name": "SIMPLIFIED_CLOSE_FILL",
+                "execution_parity": "NOT_PRODUCTION_EQUIVALENT",
+            },
+        }
+        prepared = prepare_signal_validation_presentation(
+            candles,
+            (),
+            window._signal_validation_seed.settings_snapshot,
+            chart_start_index=0,
+            chart_count=len(candles),
+            trust_metadata=trust_metadata,
+        )
+        trust_metadata["signal_parity"]["status"] = "mutated"
+
+        window.set_historical_candle_pool(
+            candles,
+            chart_candle_count=len(candles),
+        )
+        window.stage_prepared_validation_presentation(prepared)
+
+        actual = window.backtest_trust_metadata
+        self.assertEqual(
+            "SIGNAL_PARITY_PASS",
+            actual["signal_parity"]["status"],
+        )
+        self.assertEqual(
+            "SIMPLIFIED_CLOSE_FILL",
+            actual["execution_model"]["model_name"],
+        )
+        actual["execution_model"]["model_name"] = "mutated"
+        self.assertEqual(
+            "SIMPLIFIED_CLOSE_FILL",
+            window.backtest_trust_metadata["execution_model"]["model_name"],
         )
 
     def _replay_snapshot(

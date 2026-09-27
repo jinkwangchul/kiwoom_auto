@@ -649,6 +649,8 @@ class PreparedSignalValidationPresentation:
     visualization_cache: ValidationIndicatorSeriesCache
     visualization_active_by_marker: dict[tuple[int, str], tuple[str, ...]]
     signal_tooltips: dict[tuple[int, str], str]
+    trust_metadata: dict[str, Any] | None = None
+    chart_calculation_indexes: tuple[int, ...] = ()
 
 
 def _validation_candle_signature(
@@ -661,12 +663,33 @@ def _validation_candle_signature(
     )
 
 
+def _calculation_indexes_for_display(
+    calculation_candles: list[dict[str, Any]],
+    display_candles: list[dict[str, Any]],
+) -> tuple[int, ...]:
+    lookup: dict[str, int] = {}
+    for index, candle in enumerate(calculation_candles):
+        timestamp = str(candle.get("time") or "")
+        if not timestamp or timestamp in lookup:
+            raise ValueError("CALCULATION_CANDLE_TIME_IDENTITY_INVALID")
+        lookup[timestamp] = index
+    indexes = tuple(
+        lookup.get(str(candle.get("time") or ""), -1)
+        for candle in display_candles
+    )
+    if any(index < 0 for index in indexes) or any(
+        right <= left for left, right in zip(indexes, indexes[1:])
+    ):
+        raise ValueError("DISPLAY_CANDLE_TIME_IDENTITY_INVALID")
+    return indexes
+
 def _mapped_validation_entries(
     calculation_candles: list[dict[str, Any]],
     entries: list[ValidationReplayEntry] | tuple[ValidationReplayEntry, ...],
     *,
     chart_start_index: int,
     chart_count: int,
+    chart_calculation_indexes: tuple[int, ...] | None = None,
 ) -> tuple[list[ValidationReplayEntry], list[ValidationReplayEntry]]:
     calculation_lookup = {
         str(candle.get("time") or ""): index
@@ -674,7 +697,15 @@ def _mapped_validation_entries(
     }
     calculation_entries: list[ValidationReplayEntry] = []
     chart_entries: list[ValidationReplayEntry] = []
-    chart_end = chart_start_index + chart_count
+    displayed_indexes = (
+        chart_calculation_indexes
+        if chart_calculation_indexes is not None
+        else tuple(range(chart_start_index, chart_start_index + chart_count))
+    )
+    chart_lookup = {
+        calculation_index: chart_index
+        for chart_index, calculation_index in enumerate(displayed_indexes)
+    }
     for entry in entries:
         calculation_index = calculation_lookup.get(entry.evaluation_time)
         if calculation_index is None:
@@ -689,15 +720,18 @@ def _mapped_validation_entries(
             signal_index,
         )
         calculation_entries.append(calculation_entry)
-        if not chart_start_index <= calculation_index < chart_end:
+        chart_index = chart_lookup.get(calculation_index)
+        if chart_index is None:
             continue
         chart_signal_index = (
             None
             if signal_index is None
-            else signal_index - chart_start_index
+            else chart_lookup.get(signal_index)
         )
+        if signal_index is not None and chart_signal_index is None:
+            continue
         chart_entries.append(entry.remap_indexes(
-            calculation_index - chart_start_index,
+            chart_index,
             chart_signal_index,
         ))
     return calculation_entries, chart_entries
@@ -710,14 +744,24 @@ def prepare_signal_validation_presentation(
     *,
     chart_start_index: int,
     chart_count: int,
+    trust_metadata: Mapping[str, Any] | None = None,
+    display_candles: list[dict[str, Any]] | None = None,
 ) -> PreparedSignalValidationPresentation:
     if not isinstance(settings_snapshot, ValidationSettingsSnapshot):
         raise TypeError("settings_snapshot must be ValidationSettingsSnapshot")
+    chart_indexes = (
+        _calculation_indexes_for_display(calculation_candles, display_candles)
+        if display_candles is not None
+        else tuple(range(chart_start_index, chart_start_index + chart_count))
+    )
+    if len(chart_indexes) != chart_count:
+        raise ValueError("DISPLAY_CANDLE_COUNT_MISMATCH")
     calculation_entries, chart_entries = _mapped_validation_entries(
         calculation_candles,
         signal_entries,
         chart_start_index=chart_start_index,
         chart_count=chart_count,
+        chart_calculation_indexes=chart_indexes,
     )
     rules = settings_snapshot.to_dict()
     descriptors = build_validation_filter_universe(rules)
@@ -727,11 +771,10 @@ def prepare_signal_validation_presentation(
         descriptors,
         entries=calculation_entries,
     )
-    chart_end = chart_start_index + chart_count
     cache = ValidationIndicatorSeriesCache(
         candle_count=chart_count,
         series=tuple(
-            (identity, channel, values[chart_start_index:chart_end])
+            (identity, channel, tuple(values[index] for index in chart_indexes))
             for identity, channel, values in full_cache.series
         ),
     )
@@ -763,6 +806,8 @@ def prepare_signal_validation_presentation(
         visualization_cache=cache,
         visualization_active_by_marker=active_by_marker,
         signal_tooltips=tooltips,
+        trust_metadata=deepcopy(dict(trust_metadata or {})),
+        chart_calculation_indexes=chart_indexes,
     )
 
 
@@ -4604,6 +4649,7 @@ class IndicatorFollowSignalValidationWindow(
         self._historical_candle_count = self._INITIAL_HISTORICAL_CANDLE_COUNT
         self._evaluation_candle_count = self._INITIAL_EVALUATION_CANDLE_COUNT
         self._chart_pool_start_index = 0
+        self._chart_calculation_indexes: tuple[int, ...] = ()
         self._historical_pool_installed = False
         self._validation_range_anchor_index: int | None = None
         self._validation_range_anchor_time: str | None = None
@@ -4625,6 +4671,7 @@ class IndicatorFollowSignalValidationWindow(
         self._preserve_view_on_next_replay = False
         self._pending_history_extension_view_anchor: _HistoryExtensionViewAnchor | None = None
         self._pending_prepared_presentation: PreparedSignalValidationPresentation | None = None
+        self._backtest_trust_metadata: dict[str, Any] = {}
         self._pending_validation_ui_fingerprint: str | None = None
         self._validated_ui_fingerprint: str | None = None
         self._pending_result_settings_snapshot: ValidationSettingsSnapshot | None = None
@@ -4667,6 +4714,10 @@ class IndicatorFollowSignalValidationWindow(
     @property
     def replay_snapshot(self) -> ValidationReplaySnapshot | None:
         return self._replay_snapshot
+
+    @property
+    def backtest_trust_metadata(self) -> dict[str, Any]:
+        return deepcopy(self._backtest_trust_metadata)
 
     @property
     def selected_evaluation_index(self) -> int | None:
@@ -6440,11 +6491,13 @@ class IndicatorFollowSignalValidationWindow(
         self._validation_range = None
         self._validation_range_times = None
         self._chart_pool_start_index = 0
+        self._chart_calculation_indexes = ()
         self._historical_pool_installed = False
         self._historical_pool_signature = None
         self._preserve_view_on_next_replay = False
         self._pending_history_extension_view_anchor = None
         self._pending_prepared_presentation = None
+        self._backtest_trust_metadata = {}
         self._history_extension_intent_generation += 1
         self._visible_start_index = 0.0
         self._visible_candle_span = 1.0
@@ -6741,6 +6794,10 @@ class IndicatorFollowSignalValidationWindow(
         self._candles = deepcopy(
             self._calculation_candles[self._chart_pool_start_index :]
         )
+        self._chart_calculation_indexes = tuple(range(
+            self._chart_pool_start_index,
+            len(self._calculation_candles),
+        ))
         self._calculation_entries = []
         self._calculation_signal_marker_entries = []
         self._entries = []
@@ -6755,6 +6812,21 @@ class IndicatorFollowSignalValidationWindow(
     ) -> ValidationReplayEntry:
         return entry.remap_indexes(evaluation_index, signal_index)
 
+    def set_historical_display_candles(
+        self,
+        display_candles: list[dict[str, Any]],
+    ) -> None:
+        """Project visible bars without changing the installed calculation pool."""
+        if not isinstance(display_candles, list) or not display_candles:
+            raise ValueError("DISPLAY_CANDLES_UNAVAILABLE")
+        indexes = _calculation_indexes_for_display(
+            self._calculation_candles,
+            display_candles,
+        )
+        self._candles = deepcopy(display_candles)
+        self._chart_calculation_indexes = indexes
+        self._chart_pool_start_index = indexes[0]
+
     def _mapped_entries(
         self,
         entries: list[ValidationReplayEntry],
@@ -6764,6 +6836,7 @@ class IndicatorFollowSignalValidationWindow(
             entries,
             chart_start_index=self._chart_pool_start_index,
             chart_count=len(self._candles),
+            chart_calculation_indexes=self._chart_calculation_indexes,
         )
 
     def _mapped_replay_entries(
@@ -6840,6 +6913,8 @@ class IndicatorFollowSignalValidationWindow(
         if (
             prepared.chart_start_index != self._chart_pool_start_index
             or prepared.chart_count != len(self._candles)
+            or prepared.chart_calculation_indexes
+            not in ((), self._chart_calculation_indexes)
         ):
             raise ValueError("prepared presentation chart range mismatch")
         self._calculation_signal_marker_entries = list(
@@ -6848,6 +6923,7 @@ class IndicatorFollowSignalValidationWindow(
         self._signal_marker_entries = list(prepared.chart_entries)
         self._signal_marker_entries_available = True
         self._pending_prepared_presentation = prepared
+        self._backtest_trust_metadata = deepcopy(prepared.trust_metadata or {})
 
     def _marker_entries_for_display(self) -> list[ValidationReplayEntry]:
         return (
@@ -6907,6 +6983,10 @@ class IndicatorFollowSignalValidationWindow(
             self._calculation_candles = replay_snapshot.to_candles()
             self._chart_pool_start_index = replay_snapshot.evaluated_start_index
             self._candles = replay_snapshot.to_display_candles()
+            self._chart_calculation_indexes = _calculation_indexes_for_display(
+                self._calculation_candles,
+                self._candles,
+            )
             self._calculation_signal_marker_entries = []
             self._signal_marker_entries = []
             self._signal_marker_entries_available = False
@@ -6951,6 +7031,8 @@ class IndicatorFollowSignalValidationWindow(
             and prepared_presentation.chart_start_index
             == self._chart_pool_start_index
             and prepared_presentation.chart_count == len(self._candles)
+            and prepared_presentation.chart_calculation_indexes
+            in ((), self._chart_calculation_indexes)
         )
         if prepared_is_current:
             self._visualization_descriptors = (
@@ -7447,12 +7529,12 @@ class IndicatorFollowSignalValidationWindow(
                 descriptors,
                 entries=calculation_entries,
             )
-            start = self._chart_pool_start_index
-            end = start + len(self._candles)
             cache = ValidationIndicatorSeriesCache(
                 candle_count=len(self._candles),
                 series=tuple(
-                    (identity, channel, values[start:end])
+                    (identity, channel, tuple(
+                        values[index] for index in self._chart_calculation_indexes
+                    ))
                     for identity, channel, values in full_cache.series
                 ),
             )

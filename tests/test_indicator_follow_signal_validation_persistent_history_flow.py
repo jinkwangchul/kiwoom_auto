@@ -18,7 +18,7 @@ from indicator_follow_signal_validation_historical_cache import (
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationRunRequest,
 )
-from indicator_follow_signal_validation_visualization import required_validation_warmup_bars
+from indicator_follow_validation_history_contract import required_validation_history_context_bars
 from routines.지표추종매매.routine_validation_contract import (
     ValidationSettingsSnapshot,
     ValidationStockRef,
@@ -37,6 +37,10 @@ class _Host(QObject):
     validation_blocked = pyqtSignal(str)
 
 
+def _legacy_session_unavailable(*_args):
+    return {"status": "PRODUCTION_SESSION_UNAVAILABLE", "ready": False}
+
+
 class _Window:
     def __init__(self, stock):
         self.stock = stock
@@ -44,9 +48,13 @@ class _Window:
         self.snapshots = []
         self.errors = []
         self.signal_marker_batches = []
+        self.display_installs = []
 
     def set_historical_candle_pool(self, candles, *, chart_candle_count):
         self.pool_installs.append((len(candles), int(chart_candle_count)))
+
+    def set_historical_display_candles(self, candles):
+        self.display_installs.append(tuple(candle["time"] for candle in candles))
 
     def set_signal_marker_entries(self, entries):
         self.signal_marker_batches.append(tuple(entries))
@@ -121,7 +129,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
 
     @property
     def fetch_count(self):
-        return 120 + required_validation_warmup_bars(self.settings.to_dict())
+        return 120 + required_validation_history_context_bars(self.settings.to_dict())
 
     @property
     def probe_count(self):
@@ -178,6 +186,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
             historical_provider_factory=provider_factory,
             replay_factory=ReplayWithoutSignalScan,
             historical_cache=cache,
+            production_session_contract_reader=_legacy_session_unavailable,
         )
         # Most tests below exercise the broker-refresh path. Keep their
         # default clock on a weekday after the freshly stored cache; tests
@@ -255,7 +264,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
         flow._open_windows[key] = window
         flow._request_generation[key] = 0
 
-    def test_regular_market_only_derives_minute_view_without_mutating_raw_pool(self):
+    def test_regular_market_only_projects_display_without_mutating_calculation_pool(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
             flow = self._flow(cache, lambda *_args: None)
@@ -307,11 +316,15 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
             self.assertIs(all_view, pool)
             self.assertEqual(candles, pool["candles"])
             self.assertEqual(
-                ["20260918090000", "20260918152700", "20260918153000"],
+                [item["time"] for item in candles],
                 [item["time"] for item in regular_view["candles"]],
             )
             self.assertEqual(
-                ["20260918090000", "20260918152700", "20260918153000"],
+                ["20260918090000"],
+                [item["time"] for item in regular_view["display_candles"]],
+            )
+            self.assertEqual(
+                [item["time"] for item in candles],
                 [
                     item["체결시간"]
                     for item in regular_view["snapshot"].to_rows()
@@ -339,17 +352,17 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 flow._validation_pool_for_session(period_session, period_pool),
             )
 
-    def test_regular_market_large_timeframe_fetches_five_minute_source(self):
+    def test_regular_market_only_does_not_change_untrusted_target_fetch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
             flow = self._flow(cache, lambda *_args: None)
             settings = ValidationSettingsSnapshot({
-                "bar": {"bar_minutes": 3},
+                "bar": {"bar_minutes": 120},
                 "validation_timeframe": {"key": "M120"},
                 "validation_market_scope": {"regular_market_only": True},
             })
             session = flow_module.ValidationSession(
-                flow_module.ValidationRequest(self.stock, settings, 3),
+                flow_module.ValidationRequest(self.stock, settings, 120),
                 operation_active_reader=lambda: False,
             )
 
@@ -358,30 +371,29 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 5060,
             )
 
-            self.assertEqual(5, minutes)
-            self.assertEqual("M5", key)
-            self.assertEqual("M5", fetch_session.request.timeframe_key)
-            self.assertGreater(count, 100_000)
-            self.assertLessEqual(count, 200_000)
+            self.assertIs(session, fetch_session)
+            self.assertEqual(120, minutes)
+            self.assertEqual("M120", key)
+            self.assertEqual(5060, count)
 
             all_market = ValidationSettingsSnapshot({
-                "bar": {"bar_minutes": 3},
+                "bar": {"bar_minutes": 120},
                 "validation_timeframe": {"key": "M120"},
                 "validation_market_scope": {"regular_market_only": False},
             })
             all_session = flow_module.ValidationSession(
-                flow_module.ValidationRequest(self.stock, all_market, 3),
+                flow_module.ValidationRequest(self.stock, all_market, 120),
                 operation_active_reader=lambda: False,
             )
             same_session, same_minutes, same_key, same_count = (
                 flow._validation_fetch_contract(all_session, 5060)
             )
             self.assertIs(all_session, same_session)
-            self.assertEqual(3, same_minutes)
+            self.assertEqual(120, same_minutes)
             self.assertEqual("M120", same_key)
             self.assertEqual(5060, same_count)
 
-    def test_regular_market_run_fetches_m5_and_installs_target_projection(self):
+    def test_untrusted_regular_only_run_keeps_target_source_and_display_projection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
             seen = {}
@@ -407,18 +419,19 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
 
             class Provider:
                 def __init__(_self, session, _requester):
+                    _self.session = session
                     seen["timeframe_key"] = session.request.timeframe_key
                     seen["timeframe_minutes"] = session.request.timeframe_minutes
 
                 def request_latest(_self, count, callback):
                     seen["count"] = int(count)
-                    callback(_result(self.stock, 5, source_rows, "REGULAR-M5"))
+                    callback(_result(self.stock, _self.session.request.timeframe_minutes, source_rows, "DISPLAY-ONLY"))
 
             flow = self._flow(cache, Provider)
             window = _Window(self.stock)
             self._register_window(flow, window)
             settings = ValidationSettingsSnapshot({
-                "bar": {"bar_minutes": 3},
+                "bar": {"bar_minutes": 120},
                 "validation_timeframe": {"key": "M120"},
                 "validation_market_scope": {"regular_market_only": True},
             })
@@ -427,11 +440,15 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 IndicatorFollowSignalValidationRunRequest(settings, 2),
             )
 
-            self.assertEqual("M5", seen["timeframe_key"])
-            self.assertEqual(5, seen["timeframe_minutes"])
-            self.assertGreater(seen["count"], 120)
+            self.assertEqual("M120", seen["timeframe_key"])
+            self.assertEqual(120, seen["timeframe_minutes"])
+            self.assertEqual(120 + required_validation_history_context_bars(settings.to_dict()), seen["count"])
             self.assertTrue(window.pool_installs)
-            self.assertEqual(2, window.pool_installs[-1][0])
+            self.assertEqual(len(source_rows), window.pool_installs[-1][0])
+            self.assertEqual(
+                ("20260918130000", "20260918145500", "20260918150000", "20260918151500"),
+                window.display_installs[-1],
+            )
 
     def test_weekend_verified_cache_reuses_without_broker_probe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -640,31 +657,18 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
             self.assertEqual([(self.fetch_count, 120)], window.pool_installs)
             self.assertEqual(1, len(window.snapshots))
 
-    def test_persisted_signal_entries_restore_without_full_signal_scan(self):
+    def test_persisted_empty_signal_entries_restore_without_full_signal_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
             self._store_cache(cache)
             sunday = datetime(2026, 9, 20, 12, 40, tzinfo=SEOUL_TIMEZONE)
             self._set_cache_updated_at(cache, sunday)
-            entry = ValidationReplayEntry(
-                evaluation_side="BUY",
-                evaluation_index=self.fetch_count - 1,
-                evaluation_time=self.latest.strftime("%Y%m%d%H%M%S"),
-                signal="BUY",
-                reason="persisted",
-                signal_index=self.fetch_count - 1,
-                signal_time=self.latest.strftime("%Y%m%d%H%M%S"),
-                delay_bar=0,
-                matched_groups=["B"],
-                details=[],
-                trace={"conditions": [], "groups": [], "aggregations": []},
-            )
             self.assertTrue(cache.store_signal_entries(
                 stock_code=self.stock.code,
                 timeframe_minutes=3,
                 requested_count=self.fetch_count,
                 settings_hash=self.settings.rules_hash,
-                entries=[entry.to_dict()],
+                entries=[],
             ))
             requested_counts = []
 
@@ -695,6 +699,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 historical_provider_factory=Provider,
                 replay_factory=Replay,
                 historical_cache=cache,
+                production_session_contract_reader=_legacy_session_unavailable,
             )
             flow._now_factory = lambda: sunday
             window = _Window(self.stock)
@@ -710,7 +715,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
             self.assertEqual([], requested_counts)
             self.assertEqual([(self.fetch_count, 120)], window.pool_installs)
             self.assertEqual(1, len(window.signal_marker_batches))
-            self.assertEqual((entry,), window.signal_marker_batches[0])
+            self.assertEqual((), window.signal_marker_batches[0])
             self.assertEqual(1, len(window.snapshots))
             self.assertEqual([], window.errors)
 
@@ -811,16 +816,22 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 historical_count=120,
                 replay_factory=Replay,
                 historical_cache=cache,
+                production_session_contract_reader=_legacy_session_unavailable,
             )
             request = flow_module.ValidationRequest(self.stock, self.settings, 3)
             session = flow_module.ValidationSession(
                 request,
                 operation_active_reader=lambda: False,
             )
+            history_context = (
+                flow_module.required_validation_history_context_bars(
+                    self.settings.to_dict()
+                )
+            )
             pool = flow._pool_from_candles(
                 session,
-                _candles(240, 3, self.latest),
-                requested_count=240,
+                _candles(1_200, 3, self.latest),
+                requested_count=1_200,
                 request_id="ACTIVE-SIGNATURE",
             )
             window = _Window(self.stock)
@@ -830,7 +841,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
             first_view = flow._validation_pool_for_session(
                 session,
                 pool,
-                target_count=120,
+                target_count=120 + history_context,
             )
             settings_hash = self.settings.rules_hash
             pool["signal_entries_by_settings_hash"][settings_hash] = ()
@@ -864,7 +875,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 application.processEvents()
                 time.sleep(0.005)
 
-            self.assertEqual([240], scan_counts)
+            self.assertEqual([240 + history_context], scan_counts)
 
     def test_valid_cache_waits_for_deferred_probe_then_applies_final_pool_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -912,7 +923,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
             historical_count = 600
-            warmup = required_validation_warmup_bars(self.settings.to_dict())
+            warmup = required_validation_history_context_bars(self.settings.to_dict())
             fetch_count = historical_count + warmup
             cached_latest = self.latest
             cached = _candles(fetch_count, 3, cached_latest)
@@ -956,6 +967,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 historical_provider_factory=Provider,
                 replay_factory=ReplayWithoutSignalScan,
                 historical_cache=cache,
+                production_session_contract_reader=_legacy_session_unavailable,
             )
             flow._now_factory = lambda: self.latest + timedelta(days=1)
             window = _Window(self.stock)
