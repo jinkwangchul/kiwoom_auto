@@ -1392,6 +1392,99 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertNotIn((2, "SELL"), markers)
         self.assertNotIn((3, "BUY"), markers)
 
+    def test_range_replay_keeps_full_historical_prefix_for_fixed_filters(self):
+        rules = {
+            "enabled": True,
+            "bar": {"bar_minutes": 5},
+            "buy": {"filters": {}, "groups": []},
+            "sell": {"signals": {}},
+        }
+        settings = ValidationSettingsSnapshot(rules)
+        session = ValidationSession(
+            ValidationRequest(self.stock, settings, 5),
+            operation_active_reader=lambda: False,
+        )
+        candles = [
+            {
+                "time": f"20260912{9 + index // 60:02d}{index % 60:02d}00",
+                "open": 100.0 + index,
+                "high": 101.0 + index,
+                "low": 99.0 + index,
+                "close": 100.0 + index,
+                "volume": 1,
+            }
+            for index in range(40)
+        ]
+        captured = {}
+
+        class CapturingReplay:
+            def __init__(_self, replay_session):
+                _self.session = replay_session
+
+            def evaluate_with_context(
+                _self,
+                historical_snapshot,
+                *,
+                context_provider,
+                start_index=0,
+                end_index=None,
+                display_count=None,
+            ):
+                replay_candles, _ = flow_module.project_validation_candles(
+                    historical_snapshot
+                )
+                captured.update({
+                    "count": len(replay_candles),
+                    "start": start_index,
+                    "end": end_index,
+                    "display_count": display_count,
+                })
+                return ValidationReplayResult(
+                    True,
+                    snapshot=ValidationReplaySnapshot(
+                        stock=_self.session.request.stock,
+                        timeframe_minutes=_self.session.request.timeframe_minutes,
+                        timeframe_key=historical_snapshot.timeframe_key,
+                        settings_hash=_self.session.request.settings_snapshot.rules_hash,
+                        historical_request_id=historical_snapshot.request_id,
+                        evaluated_start_index=start_index,
+                        evaluated_end_index=end_index,
+                        dropped_raw_rows_count=0,
+                        candles=replay_candles,
+                        entries=[],
+                    ),
+                )
+
+        flow = IndicatorFollowSignalValidationFlow(
+            _FakeBroker(True),
+            host=_FakeHost(self.stock),
+            replay_factory=CapturingReplay,
+            recent_stock_store=_MemoryRecentStockStore(),
+        )
+        pool = {
+            "stock": self.stock,
+            "timeframe_minutes": 5,
+            "timeframe_key": "M5",
+            "request_id": "FIXED-PREFIX",
+            "market_data_identity": "",
+            "market_source": "",
+            "candles": candles,
+            "signal_entries_by_settings_hash": {},
+            "signal_entries_signature_by_settings_hash": {},
+        }
+
+        result = flow._prepare_replay_result_from_pool(
+            session,
+            pool,
+            history_target=40,
+            chart_range=(20, 25),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(26, captured["count"])
+        self.assertEqual(20, captured["start"])
+        self.assertEqual(25, captured["end"])
+        self.assertIsNone(captured["display_count"])
+
     def _replay_snapshot(
         self,
         entries,
