@@ -8201,6 +8201,7 @@ class IndicatorFollowSignalValidationWindow(
 
     def _populate_completed_cycles(self) -> None:
         QToolTip.hideText()
+        self._clear_completed_cycle_selection()
         rules = (
             self._result_settings_snapshot.to_dict()
             if isinstance(self._result_settings_snapshot, ValidationSettingsSnapshot)

@@ -1507,6 +1507,24 @@ class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
         window.select_evaluation_index(0)
         self.assertEqual(0, window.selected_evaluation_index)
 
+    def test_completed_cycle_rebuild_clears_table_and_canvas_selection(self):
+        window = self._window()
+        window.set_replay_snapshot(self._snapshot([
+            self._entry("BUY", 0, signal="BUY"),
+            self._entry("SELL", 1, signal="SELL"),
+        ]))
+        window._set_validation_range(0, 1)
+        window._refresh_validation_range_results()
+
+        window._completed_cycle_row_clicked(0, 0)
+        self.assertTrue(window.completed_cycle_table.selectionModel().hasSelection())
+        self.assertEqual(1, window.canvas.selected_completed_cycle_number)
+
+        window._populate_completed_cycles()
+
+        self.assertFalse(window.completed_cycle_table.selectionModel().hasSelection())
+        self.assertIsNone(window.canvas.selected_completed_cycle_number)
+
     def test_completed_cycle_table_keeps_five_rows_and_markers_remain_independent(self):
         window = self._window()
         window.show()
