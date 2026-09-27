@@ -3013,7 +3013,7 @@ class KiwoomApi(QObject):
         )
         if claimed_screen_no is None:
             return claim_error or {"ok": False, "code": clean_code, "rqname": rqname}
-        self._pending_tr[rqname] = {
+        pending = {
             "type": "minute_candles",
             "code": clean_code,
             "name": str(name or "").strip(),
@@ -3026,6 +3026,10 @@ class KiwoomApi(QObject):
             "commit_to_production": bool(commit_to_production),
             **request_identity,
         }
+        if not commit_to_production:
+            pending["market_data_identity"] = clean_code
+            pending["market_source"] = "KRX"
+        self._pending_tr[rqname] = pending
 
         def start_timeout(_result: Any) -> None:
             self._arm_minute_candle_timeout(rqname, self._pending_tr.get(rqname))
@@ -3862,6 +3866,11 @@ class KiwoomApi(QObject):
                     "type": "minute_candles",
                     "request_id": request_name,
                     "code": pending.get("code", ""),
+                    "market_data_identity": pending.get(
+                        "market_data_identity",
+                        pending.get("code", ""),
+                    ),
+                    "market_source": pending.get("market_source", "KRX"),
                     "name": pending.get("name", ""),
                     "interval": int(pending.get("interval") or 1),
                     "rows": rows,

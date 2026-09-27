@@ -190,6 +190,8 @@ class KiwoomApiReadOnlyMinuteCandlesTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(rqname, result["request_id"])
         self.assertEqual("005930", result["code"])
+        self.assertEqual("005930", result["market_data_identity"])
+        self.assertEqual("KRX", result["market_source"])
         self.assertEqual("삼성전자", result["name"])
         self.assertEqual(5, result["interval"])
         self.assertEqual(rows, result["rows"])
