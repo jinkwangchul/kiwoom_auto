@@ -42,6 +42,39 @@ class ConditionEngineTest(unittest.TestCase):
     def test_ocr_condition_turn_up(self):
         self.assertConditionPassed({"target": "OSC", "operator": "TURN_UP"})
 
+    def test_turn_signals_fire_on_confirmation_bar_not_extremum_bar(self):
+        turn_up_series = {"OSC": [3.0, 2.0, 3.0]}
+        self.assertFalse(
+            evaluate_condition(
+                {"target": "OSC", "operator": "TURN_UP"},
+                turn_up_series,
+                1,
+            ).passed
+        )
+        self.assertTrue(
+            evaluate_condition(
+                {"target": "OSC", "operator": "TURN_UP"},
+                turn_up_series,
+                2,
+            ).passed
+        )
+
+        turn_down_series = {"OSC": [1.0, 2.0, 1.0]}
+        self.assertFalse(
+            evaluate_condition(
+                {"target": "OSC", "operator": "TURN_DOWN"},
+                turn_down_series,
+                1,
+            ).passed
+        )
+        self.assertTrue(
+            evaluate_condition(
+                {"target": "OSC", "operator": "TURN_DOWN"},
+                turn_down_series,
+                2,
+            ).passed
+        )
+
     def test_rsi_condition_threshold(self):
         self.assertConditionPassed({"target": "RSI", "operator": "<=", "value": 45})
 
@@ -1161,15 +1194,16 @@ class IndicatorFollowBuyPriceCompareFilterTest(unittest.TestCase):
         self.assertEqual(signal.signal, "BUY")
         self.assertEqual("", self._price_detail(signal))
 
-    def test_buy_price_compare_filter_passes_after_buy_main_signal(self):
-        signal = self._signal(self._filter(), context={"order_price": 10, "average_price": 9})
+    def test_buy_price_compare_filter_legacy_order_uses_signal_without_order_context(self):
+        signal = self._signal(self._filter(), context={"average_price": 9})
 
         self.assertEqual(signal.signal, "BUY")
         self.assertIn("filter_type=PRICE_COMPARE", self._price_detail(signal))
+        self.assertIn("compare_target=SIGNAL_PRICE", self._price_detail(signal))
         self.assertIn("passed=True", self._price_detail(signal))
 
     def test_buy_price_compare_filter_blocks_buy_only(self):
-        signal = self._signal(self._filter(), context={"order_price": 10, "average_price": 11})
+        signal = self._signal(self._filter(), context={"average_price": 14})
 
         self.assertIsNone(signal.signal)
         self.assertEqual(signal.reason, "BUY price compare filter blocked")
@@ -1182,7 +1216,7 @@ class IndicatorFollowBuyPriceCompareFilterTest(unittest.TestCase):
         self.assertIn("enabled=False", self._price_detail(signal))
 
     def test_buy_price_compare_filter_blocks_missing_context_data(self):
-        signal = self._signal(self._filter(), context={"average_price": 9})
+        signal = self._signal(self._filter(), context={})
 
         self.assertIsNone(signal.signal)
         self.assertEqual(signal.reason, "BUY price compare filter blocked")
@@ -1195,7 +1229,7 @@ class IndicatorFollowBuyPriceCompareFilterTest(unittest.TestCase):
         self.assertIn("reason=unsupported_target", self._price_detail(signal))
 
     def test_actual_gui_price_compare_filter_blocks_equality_gap(self):
-        signal = self._signal(self._actual_gui_filter(), context={"order_price": 10, "average_price": 10})
+        signal = self._signal(self._actual_gui_filter(), context={"average_price": 13})
 
         self.assertIsNone(signal.signal)
         self.assertEqual(signal.reason, "BUY price compare filter blocked")
