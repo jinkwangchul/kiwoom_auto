@@ -325,6 +325,11 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                     )
                     dialog = self._dialog(rules_path)
                     try:
+                        applied = dialog.apply_indicator_follow_ui_state(
+                            legacy["indicator_follow_ui_state"]["state"],
+                            source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                        )
+                        self.assertEqual([], applied["sync_errors"])
                         self.assertEqual(
                             expected_sign,
                             dialog.sell_signal_condition_b_price_box_sign_combo.currentText(),
@@ -344,10 +349,16 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
             )
             dialog = self._dialog(rules_path)
             try:
+                applied = dialog.apply_indicator_follow_ui_state(
+                    source["indicator_follow_ui_state"]["state"],
+                    source=STATE_AUTHORITY_INSTANCE_CURRENT,
+                )
+                self.assertEqual([], applied["sync_errors"])
                 self.assertEqual(
                     "-",
                     dialog.sell_signal_condition_b_price_box_sign_combo.currentText(),
                 )
+                self._resolve_sell_price_selections(dialog)
                 result = dialog.build_registration_rules_from_current_ui_state()
             finally:
                 dialog.close()
@@ -356,7 +367,10 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
                 json.dumps(result["rules"], ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            reloaded = self._dialog(rules_path)
+            reloaded = self._dialog(
+                rules_path,
+                instance_id="SELL-PRICE-BOX-RELOAD",
+            )
             try:
                 self.assertEqual(
                     ("하향", "-", "0.1", "이상"),
