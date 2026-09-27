@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -142,6 +142,35 @@ class _MemoryRecentStockStore:
 
 
 class IndicatorFollowSignalValidationOperatorUiTest(unittest.TestCase):
+    def test_validation_sell_b_restores_both_between_filter_logic_operators(self):
+        window = self._window()
+
+        self.assertIsNotNone(
+            window.sell_signal_condition_b_price_box_logic_combo
+        )
+        self.assertIsNotNone(
+            window.sell_signal_condition_b_bollinger_logic_combo
+        )
+        self.assertEqual(
+            ["AND", "OR", "NOT"],
+            [
+                window.sell_signal_condition_b_bollinger_logic_combo.itemText(index)
+                for index in range(
+                    window.sell_signal_condition_b_bollinger_logic_combo.count()
+                )
+            ],
+        )
+
+        window.sell_signal_condition_b_bollinger_logic_combo.setCurrentText("OR")
+        collected = window.collect_indicator_follow_ui_state()
+        self.assertEqual(
+            "OR",
+            collected["sell_ui"]["signal_conditions"]["condition_b"][
+                "bollinger_logic_combo"
+            ],
+        )
+
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

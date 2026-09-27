@@ -518,7 +518,7 @@ class IndicatorFollowSellControlsMixin:
             bollinger_value_line,
             QLabel("%"),
             bollinger_compare_combo,
-        ], "AND", True, not getattr(self, "_signal_validation_mode", False))
+        ], "AND", True)
         self.sell_signal_condition_b_bollinger_check = bollinger_check
         self.sell_signal_condition_b_bollinger_direction_combo = bollinger_direction_combo
         self.sell_signal_condition_b_bollinger_sign_combo = bollinger_sign_combo
