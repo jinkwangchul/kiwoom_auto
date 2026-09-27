@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -1228,8 +1228,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             {
                 "account_numbers": ["12345678"],
                 "selected_account_valid": True,
-                "real_trade_source": "test_config",
-                "real_trade_config_found": True,
                 "real_trade_guard_source": "gui_session",
             }
         )
@@ -2372,6 +2370,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             window.current_selected_routine_dir = lambda: routine_dir
 
             with (
+                mock.patch.object(execution_boundary, "signal_dispatch_block_reasons", return_value=[]),
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
                 mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
@@ -2515,6 +2514,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             window.current_selected_routine_dir = lambda: routine_dir
 
             with (
+                mock.patch.object(execution_boundary, "signal_dispatch_block_reasons", return_value=[]),
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
                 mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
@@ -2768,6 +2768,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(execution_boundary, "stock_nxt_availability", return_value=False),
                 mock.patch.object(
                     gui,
                     "load_group_scope",
@@ -2894,6 +2895,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                mock.patch.object(execution_boundary, "stock_nxt_availability", return_value=False),
                 self._patch_fresh_dispatch_evidence(),
             ):
                 gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
@@ -3058,6 +3060,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(execution_boundary, "stock_nxt_availability", return_value=False),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
                 self._patch_fresh_dispatch_evidence(broker_holdings_path=broker_holdings_path),
             ):
@@ -3484,6 +3487,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(execution_boundary, "stock_nxt_availability", return_value=False),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
                 self._patch_fresh_dispatch_evidence(
                     broker_holdings_path=broker_holdings_path
@@ -3518,6 +3522,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(execution_boundary, "stock_nxt_availability", return_value=False),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
                 self._patch_fresh_dispatch_evidence(),
             ):
