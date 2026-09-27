@@ -7747,43 +7747,21 @@ class IndicatorFollowSignalValidationWindow(
         estimated = aggregate_completed_cycle_return_percent(
             self._completed_cycles
         )
+        (
+            invested_amount,
+            profit_amount,
+            _average_price,
+            _sell_price,
+        ) = _completed_cycle_financial_summary(self._completed_cycles)
+        average_invested = _average_completed_cycle_invested_amount(
+            self._completed_cycles
+        )
         summary_text = (
-            f"| 기간내 추정손익 {_format_summary_return_percent(estimated)}"
+            f"| 손익 {_format_summary_return_percent(estimated)}/"
+            f"{_format_summary_amount(profit_amount, signed=True)}"
+            f" | 투입 전체 {_format_summary_amount(invested_amount)}/ "
+            f"평균 {_format_summary_amount(average_invested)}"
         )
-        rules = (
-            self._result_settings_snapshot.to_dict()
-            if isinstance(self._result_settings_snapshot, ValidationSettingsSnapshot)
-            else {}
-        )
-        execution = (
-            rules.get("validation_execution")
-            if isinstance(rules, dict)
-            else None
-        )
-        if (
-            isinstance(execution, dict)
-            and (
-                execution.get("enabled", False) is True
-                or execution.get("trading_cost_enabled", False) is True
-            )
-        ):
-            (
-                invested_amount,
-                profit_amount,
-                average_price,
-                sell_price,
-            ) = _completed_cycle_financial_summary(self._completed_cycles)
-            average_text = (
-                f"{_validation_price_text(average_price)}원"
-                if average_price is not None
-                else "-"
-            )
-            summary_text += (
-                f" | 추정투입금액 {_format_summary_amount(invested_amount)}"
-                f" | 추정수익금액 {_format_summary_amount(profit_amount, signed=True)}"
-                f" | 추정평단 {average_text}"
-                f" | 추정매도가격 {_format_summary_amount(sell_price)}"
-            )
         self.estimated_return_label.setText(summary_text)
 
     def select_evaluation_index(self, index: int) -> bool:

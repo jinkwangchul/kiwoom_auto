@@ -2777,12 +2777,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(120.0, cycle.sell_price)
         self.assertAlmostEqual(20.0, cycle.estimated_return_percent)
         summary = window.estimated_return_label.text()
-        self.assertIn("기간내 추정손익 +20.00%", summary)
-        self.assertIn("추정투입금액 300원", summary)
-        self.assertIn("추정수익금액 +60원", summary)
-        self.assertIn("추정평단 100원", summary)
-        self.assertIn("추정매도가격 120원", summary)
-        self.assertNotIn("추정매도가격 360원", summary)
+        self.assertIn("손익 +20.00%/+60원", summary)
+        self.assertIn("투입 전체 300원/ 평균 300원", summary)
+        self.assertNotIn("추정평단", summary)
+        self.assertNotIn("추정매도가격", summary)
 
     def test_range_tooltips_append_only_meaningful_execution_information(self):
         window = self._window()
@@ -2988,8 +2986,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(200.0, cycle.buy_cost)
         self.assertEqual(100.0, cycle.average_buy_price)
         summary = window.estimated_return_label.text()
-        self.assertEqual("| 기간내 추정손익 +20.00%", summary)
-        self.assertNotIn("추정투입금액", summary)
+        self.assertEqual(
+            "| 손익 +20.00%/+40원 | 투입 전체 200원/ 평균 200원",
+            summary,
+        )
 
     def test_same_settings_second_replay_preserves_visualization_snapshot(self):
         window = self._window()
@@ -5605,7 +5605,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             )).split()
         )
         self.assertEqual(
-            "005930 삼성전자 | 5분봉 | 3캔들 | 매수신호 1 | 매도신호 1 | 기간내 추정손익 +50.00%",
+            "005930 삼성전자 | 5분봉 | 3캔들 | 매수신호 1 | 매도신호 1 | 손익 +50.00%/+50원 | 투입 전체 100원/ 평균 100원",
             summary,
         )
         self.assertNotIn("검증 완료", summary)
@@ -5660,7 +5660,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window._set_validation_range(0, 2)
         window._refresh_validation_range_results()
         self.assertEqual(1, len(window.completed_cycles))
-        self.assertEqual("| 기간내 추정손익 +10.00%", window.estimated_return_label.text())
+        self.assertEqual(
+            "| 손익 +10.00%/+10원 | 투입 전체 100원/ 평균 100원",
+            window.estimated_return_label.text(),
+        )
 
         losing_cycle = self._replay_snapshot([
             self._entry("BUY", 0, "BUY"),
@@ -5669,7 +5672,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         window.set_replay_snapshot(losing_cycle)
         window._set_validation_range(0, 1)
         window._refresh_validation_range_results()
-        self.assertEqual("| 기간내 추정손익 -10.00%", window.estimated_return_label.text())
+        self.assertEqual(
+            "| 손익 -10.00%/-10원 | 투입 전체 100원/ 평균 100원",
+            window.estimated_return_label.text(),
+        )
 
         offsetting_cycles = self._replay_snapshot([
             self._entry("BUY", 0, "BUY"),
@@ -5683,7 +5689,10 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertEqual(2, len(window.completed_cycles))
         self.assertAlmostEqual(-5.0, window.completed_cycles[-1].estimated_return_percent)
         self.assertAlmostEqual(0.0, estimated_signal_return_percent(offsetting_cycles))
-        self.assertEqual("| 기간내 추정손익 0.00%", window.estimated_return_label.text())
+        self.assertEqual(
+            "| 손익 0.00%/0원 | 투입 전체 300원/ 평균 150원",
+            window.estimated_return_label.text(),
+        )
 
     def test_result_chart_markers_selection_trace_and_estimate_are_real(self):
         window = self._window()
