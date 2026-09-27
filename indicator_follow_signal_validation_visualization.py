@@ -232,7 +232,7 @@ def _criterion_label(
                 elif direction == "DOWN":
                     signed = f"-{_format_number(abs(percent))}%"
                 elif direction == "BOTH":
-                    signed = f"?{_format_number(abs(percent))}%"
+                    signed = f"±{_format_number(abs(percent))}%"
                 else:
                     signed = f"{_format_number(percent)}%"
             compare_mode = chart_compare_mode_label(contract.get("compare_mode"))

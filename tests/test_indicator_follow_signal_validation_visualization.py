@@ -363,6 +363,28 @@ class ValidationVisualizationDataTest(unittest.TestCase):
         ):
             self.assertNotIn(token, joined)
 
+    def test_percent_gap_both_compare_uses_operator_korean_not_engine_tokens(self):
+        rules = _rules()
+        gap_condition = rules["sell"]["signals"]["ui_condition_b"]["groups"][0][
+            "conditions"
+        ][3]
+        gap_condition["direction"] = "BOTH"
+        gap_condition["compare_mode"] = "WITHIN"
+        gap_condition["value"] = 0.25
+        rules["validation_visualization_rules"]["sell"]["signals"][
+            "ui_condition_b"
+        ]["groups"][0]["conditions"][3] = deepcopy(gap_condition)
+
+        labels = {
+            str(descriptor.parameters.get("criterion_label") or "")
+            for descriptor in build_validation_filter_universe(rules)
+        }
+
+        self.assertIn("평단 대비 ±0.25% 이내", labels)
+        joined = "\n".join(labels)
+        self.assertNotIn("WITHIN", joined)
+        self.assertNotIn("?0.25%", joined)
+
     def test_macd_caption_preserves_reversed_operand_direction(self):
         rules = _rules()
         actual = rules["sell"]["signals"]["ui_condition_b"]["groups"][0]["conditions"][0]
