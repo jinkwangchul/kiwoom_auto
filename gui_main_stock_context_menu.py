@@ -14,6 +14,7 @@ from gui_auto_trade_close import (
     auto_trade_apply_selected_early_close_profit_loss,
     auto_trade_apply_selected_individual_liquidation_method,
     auto_trade_cancel_selected_early_close,
+    auto_trade_return_selected_early_close_to_auto,
 )
 from gui_auto_trade_run_control import (
     OperationStartCommandRequest,
@@ -655,6 +656,7 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
             adapter
         ),
         early_close_cancel=lambda: auto_trade_cancel_selected_early_close(adapter),
+        early_close_return_auto=lambda: auto_trade_return_selected_early_close_to_auto(adapter),
         individual_liquidation=(
             lambda method, minutes: auto_trade_apply_selected_individual_liquidation_method(
                 adapter,

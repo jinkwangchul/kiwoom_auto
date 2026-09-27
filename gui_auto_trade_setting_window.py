@@ -2036,6 +2036,7 @@ from gui_auto_trade_close import (
     auto_trade_apply_selected_early_close_default,
     auto_trade_apply_selected_early_close_profit_loss,
     auto_trade_cancel_selected_early_close,
+    auto_trade_return_selected_early_close_to_auto,
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
@@ -12711,6 +12712,9 @@ class AutoTradeSettingWindow(QDialog):
 
     def cancel_selected_early_close(self) -> None:
         auto_trade_cancel_selected_early_close(self)
+
+    def return_selected_early_close_to_auto(self) -> None:
+        auto_trade_return_selected_early_close_to_auto(self)
 
     def apply_selected_early_close(
         self,
