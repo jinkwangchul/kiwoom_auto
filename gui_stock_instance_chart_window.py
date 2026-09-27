@@ -502,8 +502,13 @@ def queue_open_stock_instance_chart_refresh(stock_code: object) -> bool:
     """Coalesce a read-only refresh for an already-open matching stock chart."""
     global _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED
     canonical_code = normalize_broker_stock_code(stock_code)
-    if not canonical_code or _open_stock_instance_chart_for_refresh(canonical_code) is None:
+    window = _open_stock_instance_chart_for_refresh(canonical_code) if canonical_code else None
+    if window is None:
         return False
+    queue_refresh = getattr(window, "_queue_projection_refresh", None)
+    if callable(queue_refresh):
+        queue_refresh()
+        return True
     _PENDING_STOCK_INSTANCE_CHART_REFRESH_CODES.add(canonical_code)
     if not _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED:
         _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED = True
@@ -516,7 +521,6 @@ def queue_open_stock_instance_chart_refresh(stock_code: object) -> bool:
         )
     return True
 
-
 def clear_pending_stock_instance_chart_refreshes() -> None:
     """Invalidate queued callbacks during application shutdown."""
     global _STOCK_INSTANCE_CHART_REFRESH_DRAIN_SCHEDULED
@@ -528,6 +532,8 @@ def clear_pending_stock_instance_chart_refreshes() -> None:
 
 def _refresh_chart_open_code_views(owner: QWidget | None = None) -> None:
     """Repaint chart-entry code cells without reloading Runtime projections."""
+    if getattr(owner, "_main_window_closing", False) is True:
+        return
     main_owner = _main_monitoring_owner(owner)
     if main_owner is not None:
         table = getattr(main_owner, "routine_table", None)
@@ -567,7 +573,6 @@ def _refresh_chart_open_code_views(owner: QWidget | None = None) -> None:
                 refresh_styles()
         except (AttributeError, RuntimeError, TypeError):
             continue
-
 
 def _common_pnl_refresh_timer(*, create: bool = False) -> QTimer | None:
     global _COMMON_PNL_REFRESH_TIMER
@@ -1927,6 +1932,7 @@ class StockInstanceChartWindow(QDialog):
         self._bar_committed_signal_owner = None
         self._bar_committed_refresh_connected = False
         self._bar_committed_refresh_pending = False
+        self._chart_closed = False
         self._live_price_operation_host = None
         self._live_price_refresh_timer: QTimer | None = None
         self._live_price_diagnostic_count = 0
@@ -2304,15 +2310,24 @@ class StockInstanceChartWindow(QDialog):
             return
         if str(payload.get("trade_date") or "").strip() != self.trade_date:
             return
+        self._queue_projection_refresh()
+
+    def _queue_projection_refresh(self) -> None:
+        if self._chart_closed:
+            return
         if self._bar_committed_refresh_pending:
             return
         self._bar_committed_refresh_pending = True
-        QTimer.singleShot(0, self._refresh_after_bar_committed)
+        generation = _STOCK_INSTANCE_CHART_REFRESH_GENERATION
+        QTimer.singleShot(0, lambda: self._refresh_after_bar_committed(generation))
 
-    def _refresh_after_bar_committed(self) -> None:
-        self._bar_committed_refresh_pending = False
-        if not self._bar_committed_refresh_connected:
+    def _refresh_after_bar_committed(self, generation: int | None = None) -> None:
+        if generation is not None and generation != _STOCK_INSTANCE_CHART_REFRESH_GENERATION:
+            self._bar_committed_refresh_pending = False
             return
+        if not self._bar_committed_refresh_pending or self._chart_closed:
+            return
+        self._bar_committed_refresh_pending = False
         try:
             self.refresh_projection(preserve_pnl_if_same_bar=True)
         except RuntimeError:
@@ -2324,12 +2339,12 @@ class StockInstanceChartWindow(QDialog):
             return
         if not isinstance(result, dict) or result.get("processed") is not True:
             return
-        try:
-            self.refresh_projection(preserve_pnl_if_same_bar=True)
-        except RuntimeError:
-            self._disconnect_operation_cycle_refresh()
+        # The cycle result contains counts, not an exhaustive affected-stock set.
+        # Keep the safe full invalidation, but merge it with BAR/fill invalidations.
+        self._queue_projection_refresh()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._chart_closed = True
         header_timer = self._operation_header_refresh_timer
         if header_timer is not None:
             header_timer.stop()
@@ -2345,7 +2360,12 @@ class StockInstanceChartWindow(QDialog):
         if _OPEN_STOCK_INSTANCE_CHARTS.get(self.stock_code) is self:
             _OPEN_STOCK_INSTANCE_CHARTS.pop(self.stock_code, None)
         _refresh_chart_open_code_views(owner)
-        _update_common_pnl_refresh_timer()
+        if getattr(owner, "_main_window_closing", False) is True:
+            timer = _common_pnl_refresh_timer()
+            if timer is not None and timer.isActive():
+                timer.stop()
+        else:
+            _update_common_pnl_refresh_timer()
         super().closeEvent(event)
 
     def refresh_pnl_only(self) -> None:
@@ -3249,6 +3269,7 @@ class StockInstanceChartWindow(QDialog):
 
     def refresh_projection(self, *, preserve_pnl_if_same_bar: bool = False) -> None:
         """Re-read only the projection; it never requests or writes candles."""
+        self._bar_committed_refresh_pending = False
         try:
             projected = self._projection_provider(self.stock_code, self.trade_date)
         except Exception:
@@ -3335,7 +3356,8 @@ def open_stock_instance_chart(
         if registered is dialog_reference():
             _OPEN_STOCK_INSTANCE_CHARTS.pop(registry_key, None)
         _refresh_chart_open_code_views(view_owner_reference())
-        _update_common_pnl_refresh_timer()
+        if getattr(view_owner_reference(), "_main_window_closing", False) is not True:
+            _update_common_pnl_refresh_timer()
 
     dialog.destroyed.connect(remove_destroyed_window)
     dialog.show()
