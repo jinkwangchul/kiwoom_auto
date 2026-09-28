@@ -262,9 +262,13 @@ def normalize_buy_situation_ui_state(value):
     if not has_new_slots and "type_combo" in state:
         state["unfilled_enabled_check"] = state.get("type_combo") == "미체결"
         state["price_enabled_check"] = state.get("type_combo") == "가격비교"
+        def normalize_legacy_price_source(value):
+            text = str(value or "").strip()
+            return "신호가" if text == "주문가" or text.upper() == "ORDER_PRICE" else value
+
         common = {
-            "left_combo": state.get("left_combo"),
-            "right_combo": state.get("right_combo"),
+            "left_combo": normalize_legacy_price_source(state.get("left_combo")),
+            "right_combo": normalize_legacy_price_source(state.get("right_combo")),
             "ratio_line": state.get("ratio_line"),
             "compare_combo": state.get("compare_combo"),
             "action_combo": state.get("action_combo"),
