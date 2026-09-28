@@ -111,6 +111,39 @@ class MockAtsImmediateCleanupBoundaryTest(unittest.TestCase):
             operation["close_source"],
             operation["close_method"],
         ))
+        ats_end = at.replace(hour=19, minute=50, second=0)
+        self.assertFalse(
+            host._instance_pending_cleanup_boundary_reached(
+                requested,
+                "A",
+                operation,
+                at,
+            )
+        )
+        self.assertFalse(
+            host._instance_final_close_boundary_reached(
+                requested,
+                "A",
+                operation,
+                at,
+            )
+        )
+        self.assertTrue(
+            host._instance_pending_cleanup_boundary_reached(
+                requested,
+                "A",
+                operation,
+                ats_end,
+            )
+        )
+        self.assertTrue(
+            host._instance_final_close_boundary_reached(
+                requested,
+                "A",
+                operation,
+                ats_end,
+            )
+        )
 
         host.process_due_cycles(as_of=at + timedelta(milliseconds=100))
         progressed = host.current_session("005380")
