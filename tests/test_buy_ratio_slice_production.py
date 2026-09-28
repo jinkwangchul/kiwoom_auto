@@ -76,8 +76,9 @@ class BuyRatioSliceProductionTest(unittest.TestCase):
         self.rules["buy"]["execution"]["base"].update(ratio_value=0.15)
         self.prepare()
         # Integral market prices at the exact 0.15% boundary.
+        # Comparison uses canonical SIGNAL_PRICE; ORDER_PRICE is record-only.
         for child in self.signal["execution_intents"]:
-            child["multi_ratio_plan"]["order_price"] = 100000
+            child["multi_ratio_plan"]["signal_price"] = 100000
         self.write("routine_signals.json", "signals", [self.signal])
         self.assertTrue(self.inspect(price=100150)["proposals"])
         self.assertFalse(self.inspect(price=100149)["proposals"])
