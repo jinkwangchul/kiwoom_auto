@@ -61,7 +61,11 @@ class TestJournalCreation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             journal = _create_journal(storage_root=tmp)
             self.assertEqual(journal["create_status"], CREATE_OK)
-            self.assertTrue(journal["journal_path"].startswith(tmp))
+            self.assertTrue(
+                Path(journal["journal_path"]).resolve().is_relative_to(
+                    Path(tmp).resolve()
+                )
+            )
 
     def test_create_invalid_empty_transaction_id(self):
         journal = create_recovery_journal(transaction_id="", commit_id="commit-1")
