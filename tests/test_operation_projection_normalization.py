@@ -285,6 +285,31 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
                         ),
                     )
 
+    def test_zero_holding_auto_close_evidence_does_not_project_liquidation(self) -> None:
+        requested_at = f"{policy.auto_trade_setting_today_date_text()} 10:00:00"
+        state = {
+            "status": "AUTO_CLOSE",
+            "holding_qty": 0,
+            "auto_close_requested_at": requested_at,
+            "auto_close_source": "TIME_POLICY",
+            "auto_close_method": "시장가",
+            "auto_close_policy": {"method": "시장가"},
+        }
+        with patch.object(
+            policy,
+            "read_operation_policy",
+            return_value=deepcopy(self.operation_policy),
+        ):
+            self.assertEqual(
+                "-",
+                policy.auto_trade_setting_liquidation_text(
+                    {"operation_mode": "CONTINUOUS"},
+                    "자동마감",
+                    state,
+                    holding_qty=0,
+                ),
+            )
+
     def test_stale_early_close_metadata_is_read_only_and_does_not_split_views(self) -> None:
         state = {
             "status": "EARLY_CLOSE",

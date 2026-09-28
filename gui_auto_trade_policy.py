@@ -1436,6 +1436,12 @@ def auto_trade_setting_liquidation_text(
         else auto_trade_setting_display_status(raw_display_status)
     )
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+    if (
+        status_text == "자동마감"
+        and holding_qty is not None
+        and holding_qty <= 0
+    ):
+        return "-"
     early_close_forced = auto_trade_setting_early_close_requested(state)
     individual_policy = (
         individual_liquidation_policy_from_state(state)
