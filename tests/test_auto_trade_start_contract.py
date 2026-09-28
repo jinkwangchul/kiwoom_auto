@@ -527,6 +527,10 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 "manual_ats_session_definition",
                 side_effect=ats_session,
             ),
+            patch(
+                "gui_auto_trade_policy.stock_nxt_availability",
+                return_value=True,
+            ),
         ):
             pre_start = auto_trade_setting_start_target_decision(
                 window,
@@ -699,7 +703,13 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 events.append(f"participant:{','.join(stock_codes)}")
                 return original_register(owner, stock_codes)
 
-            def phase_for_mode(config, _state, *, now_dt=None):
+            def phase_for_mode(
+                config,
+                _state,
+                *,
+                now_dt=None,
+                nxt_available=None,
+            ):
                 mode = str(config.get("operation_mode") or "SCHEDULED").upper()
                 return {
                     "evaluable": True,
@@ -862,13 +872,20 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 },
             }
 
-            def fixed_production_phase(config, state, *, now_dt=None):
+            def fixed_production_phase(
+                config,
+                state,
+                *,
+                now_dt=None,
+                nxt_available=None,
+            ):
                 return gui_ats_utils.auto_trade_operation_session_phase(
                     config,
                     state,
                     now_dt=datetime(2026, 8, 28, 16, 0, 0),
                     operation_policy_reader=lambda: operation_policy,
                     ats_session_reader=lambda _key: {},
+                    nxt_available=nxt_available,
                 )
 
             with (
