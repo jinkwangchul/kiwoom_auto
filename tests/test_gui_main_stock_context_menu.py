@@ -2317,7 +2317,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             patch.object(common_menu, "_append_stock_context_decision"),
         ):
             common_menu.show_monitor_stock_context_menu(
-                self.window.routine_table,
+                self.window,
                 QPoint(),
                 has_selection=True,
                 callbacks=callbacks,
