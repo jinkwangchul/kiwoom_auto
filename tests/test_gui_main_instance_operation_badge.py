@@ -182,6 +182,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             btn_auto_trade_setting=QPushButton("자동매매설정"),
             btn_close_all_windows=QPushButton("모든창닫기"),
             btn_log_view=QPushButton("이벤트기록"),
+            btn_review_manage=QPushButton("검토관리"),
             btn_exit=QPushButton("종료"),
         )
 
@@ -193,6 +194,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "▶ 운영시작",
                 "자동매매설정",
                 "이벤트기록",
+                "검토관리",
                 "모든창닫기",
                 "종료",
             ],
@@ -209,6 +211,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             QPushButton("▶ 운영시작"),
             QPushButton("자동매매설정"),
             QPushButton("이벤트"),
+            QPushButton("검토관리"),
             QPushButton("모든창닫기"),
             QPushButton("종료"),
         ]
@@ -216,8 +219,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             btn_start=buttons[0],
             btn_auto_trade_setting=buttons[1],
             btn_log_view=buttons[2],
-            btn_close_all_windows=buttons[3],
-            btn_exit=buttons[4],
+            btn_review_manage=buttons[3],
+            btn_close_all_windows=buttons[4],
+            btn_exit=buttons[5],
         )
         container = QWidget()
         container.setLayout(gui_windows.MainWindow._create_button_area(window))
@@ -231,11 +235,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             self.assertEqual(24, window.main_status_message_label.geometry().left())
 
             widths = [button.width() for button in buttons]
-            old_equal_width = (container.contentsRect().width() - (8 * 4)) / 5
+            available_width = (
+                container.contentsRect().width()
+                - margins.left()
+                - margins.right()
+            )
+            expected_button_width = available_width * 7 / 55
             self.assertLessEqual(max(widths) - min(widths), 1)
-            self.assertGreater(widths[0] / old_equal_width, 0.73)
-            self.assertLess(widths[0] / old_equal_width, 0.78)
-            self.assertAlmostEqual(widths[0] / 147.0, 1.20, delta=0.03)
+            self.assertAlmostEqual(
+                widths[0],
+                expected_button_width,
+                delta=2,
+            )
 
             gaps = [
                 buttons[0].geometry().left()
