@@ -2371,6 +2371,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(execution_boundary, "signal_dispatch_block_reasons", return_value=[]),
+                mock.patch.object(
+                    execution_boundary,
+                    "stock_nxt_availability",
+                    return_value=False,
+                ),
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
                 mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
