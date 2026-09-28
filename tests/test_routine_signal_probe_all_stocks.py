@@ -62,12 +62,24 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
                     display_name="정의 A",
                     package_dir=root / "routine-a",
                     package_enabled=True,
+                    locators={
+                        "evaluation": {
+                            "file": "routine.py",
+                            "callable": "evaluate",
+                        }
+                    },
                 ),
                 SimpleNamespace(
                     definition_id="def-b",
                     display_name="정의 B",
                     package_dir=root / "routine-b",
                     package_enabled=True,
+                    locators={
+                        "evaluation": {
+                            "file": "routine.py",
+                            "callable": "evaluate",
+                        }
+                    },
                 ),
             ]
             calls: list[tuple[str, Path]] = []
