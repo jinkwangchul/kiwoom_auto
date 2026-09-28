@@ -102,9 +102,14 @@ def _current_price(market: MockMarketSnapshot | None, trade_fresh: bool) -> floa
     return _positive(market.trade.current_price)
 
 
+def _signal_price(plan: dict[str, Any]) -> float | None:
+    return _positive(_intent(plan).get("signal_price"))
+
+
 def evaluate_price_reset_policy(
     policy: dict[str, Any], *, order_price: float | None,
     current_price: float | None, average_price: float | None,
+    signal_price: float | None = None,
 ) -> dict[str, Any]:
     """Pure reset evaluation matching Production left-to-right semantics."""
     if not policy or policy.get("enabled") is False:
@@ -115,11 +120,11 @@ def evaluate_price_reset_policy(
         return {"active": True, "triggered": False, "reason": "CURRENT_PRICE_UNAVAILABLE"}
     left = resolve_price_source(
         left_source, order_price=order_price, current_price=current_price,
-        average_price=average_price,
+        average_price=average_price, signal_price=signal_price,
     )
     right = resolve_price_source(
         right_source, order_price=order_price, current_price=current_price,
-        average_price=average_price,
+        average_price=average_price, signal_price=signal_price,
     )
     threshold = _positive(policy.get("threshold_percent"))
     if left is None or right is None or threshold is None:
@@ -550,7 +555,7 @@ class MockIndicatorFollowContinuationCoordinator:
             for policy in policies:
                 evaluated = evaluate_price_reset_policy(
                     policy, order_price=_order_price(plan), current_price=current,
-                    average_price=average,
+                    average_price=average, signal_price=_signal_price(plan),
                 )
                 if evaluated.get("triggered") is True:
                     triggered.append((policy, evaluated))

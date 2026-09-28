@@ -87,7 +87,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
         }
         base["buy_price_reset_policy"] = {
             "policy": "BUY_PRICE_CHANGE_RESET", "enabled": True, "action": "RESET",
-            "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+            "left_source": "SIGNAL_PRICE", "right_source": "CURRENT_PRICE",
             "direction": "UP", "compare": ">=", "threshold_percent": 1,
         }
         repository, _, _, adapter, _ = self.build({"A": rules})
@@ -174,7 +174,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
     def test_recovery_origin_reset_restarts_base_contract_without_recovery_fields(self):
         response = {
             "policy": "BUY_PRICE_CHANGE_RESPONSE", "enabled": True, "action": "RESET",
-            "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+            "left_source": "SIGNAL_PRICE", "right_source": "CURRENT_PRICE",
             "direction": "UP", "compare": ">=", "threshold_percent": 1,
         }
         rules = _buy_rules(qty=3, budget=10_000)
@@ -207,7 +207,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
     def test_price_cancel_batch_enters_confirmed_residual_recovery(self):
         response = {
             "policy": "BUY_PRICE_CHANGE_RESPONSE", "enabled": True, "action": "CANCEL_BATCH",
-            "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+            "left_source": "SIGNAL_PRICE", "right_source": "CURRENT_PRICE",
             "direction": "UP", "compare": ">=", "threshold_percent": 1,
         }
         rules = _buy_rules(qty=2, budget=10_000)
@@ -327,7 +327,7 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
         setting = rules["sell"]["method"]["setting_a"]
         setting.update({
             "perform3_title_combo": "가격비교", "perform3_price_action": "매도리셋",
-            "perform3_price_left": "주문가", "perform3_price_right": "현재가",
+            "perform3_price_left": "신호가", "perform3_price_right": "현재가",
             "perform3_price_direction": "상향", "perform3_price_value": "1",
             "perform3_price_compare": "이상",
         })
@@ -419,9 +419,15 @@ class MockIndicatorFollowContinuationTest(MockIndicatorFollowAdapterTest):
         self.assertIn("FINAL_RESIDUAL_MARKET_STARTED", event_types)
 
     def test_price_reset_waits_on_stale_current_price(self):
-        policy = {"enabled": True, "left_source": "ORDER_PRICE", "right_source": "CURRENT_PRICE",
+        policy = {"enabled": True, "left_source": "SIGNAL_PRICE", "right_source": "CURRENT_PRICE",
                   "direction": "UP", "compare": ">=", "threshold_percent": 1}
-        result = evaluate_price_reset_policy(policy, order_price=100, current_price=None, average_price=90)
+        result = evaluate_price_reset_policy(
+            policy,
+            order_price=100,
+            current_price=None,
+            average_price=90,
+            signal_price=100,
+        )
         self.assertEqual((True, False, "CURRENT_PRICE_UNAVAILABLE"),
                          (result["active"], result["triggered"], result["reason"]))
 
