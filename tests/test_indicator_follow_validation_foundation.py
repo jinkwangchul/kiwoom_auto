@@ -20,6 +20,8 @@ from routines.지표추종매매.routine_validation_trace import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VALIDATION_MODULES = (
+    PROJECT_ROOT / "indicator_follow_validation_timeframe.py",
+    PROJECT_ROOT / "historical_candle_row_normalizer.py",
     PROJECT_ROOT
     / "routines"
     / "지표추종매매"
@@ -141,6 +143,8 @@ class ValidationIndependenceTest(unittest.TestCase):
             "hashlib",
             "json",
             "typing",
+            "indicator_follow_validation_timeframe",
+            "historical_candle_row_normalizer",
         }
         forbidden_fragments = {
             "gui_market_data_host",
