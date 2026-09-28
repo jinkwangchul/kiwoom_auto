@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -193,6 +194,11 @@ class AutoCloseRuntimePolicySnapshotTest(unittest.TestCase):
                 ),
                 patch.object(
                     status_ops,
+                    "current_datetime",
+                    return_value=datetime(2026, 7, 27, 13, 30, 0),
+                ),
+                patch.object(
+                    status_ops,
                     "now_text",
                     return_value="2026-07-27 13:30:00",
                 ),
@@ -239,6 +245,11 @@ class AutoCloseRuntimePolicySnapshotTest(unittest.TestCase):
                 ),
                 patch.object(
                     status_ops,
+                    "current_datetime",
+                    return_value=datetime(2026, 7, 27, 13, 31, 0),
+                ),
+                patch.object(
+                    status_ops,
                     "now_text",
                     return_value="2026-07-27 13:31:00",
                 ),
@@ -268,6 +279,11 @@ class AutoCloseRuntimePolicySnapshotTest(unittest.TestCase):
                     status_ops,
                     "read_operation_policy",
                     return_value={"auto_close": {"method": "시장가"}},
+                ),
+                patch.object(
+                    status_ops,
+                    "current_datetime",
+                    return_value=datetime(2026, 7, 27, 15, 30, 0),
                 ),
                 patch.object(
                     status_ops,

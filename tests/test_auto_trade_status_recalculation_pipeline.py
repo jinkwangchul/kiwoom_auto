@@ -106,6 +106,43 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         )
         self.assertEqual("RUNNING", state["status"])
 
+    def test_recalculation_persists_one_decision_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            window = self._window([stock_dir])
+            decision_now = datetime(2026, 9, 4, 13, 29, 59)
+            decision_timestamp = "2026-09-04 13:29:59"
+            with (
+                patch.object(status_ops, "current_datetime", return_value=decision_now),
+                patch.object(status_ops, "now_text", return_value="2026-09-04 13:30:00"),
+                patch.object(status_ops, "read_operation_policy", return_value={}),
+                patch.object(
+                    status_ops,
+                    "auto_close_runtime_snapshot_metadata",
+                    side_effect=lambda **kwargs: {
+                        "auto_close_requested_at": kwargs["captured_at"]
+                    },
+                ),
+                patch.object(status_ops, "append_stock_log"),
+            ):
+                result = status_ops.auto_trade_recalculate_stock_status_by_operation_policy(
+                    window,
+                    stock_dir,
+                    "111111",
+                    "Stock",
+                    "clock consistency",
+                    extra_state={"trade_enabled": True},
+                )
+
+            state = read_json_dict(stock_dir / "state.json")
+
+        self.assertEqual(("unchanged", "RUNNING", "RUNNING"), result)
+        self.assertEqual(
+            decision_timestamp,
+            state["operation_policy_recalculated_at"],
+        )
+        self.assertEqual(decision_timestamp, state["auto_close_requested_at"])
+
     def test_emergency_status_precedes_disabled_trade_display(self) -> None:
         state = {
             "status": "EMERGENCY_STOPPED",

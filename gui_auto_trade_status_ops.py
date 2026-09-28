@@ -874,7 +874,7 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
             # 상태/권한 단일 write에서도 그대로 사용한다.
             new_status = guarded_start_status
 
-    recalculated_at = now_text()
+    recalculated_at = decision_now.strftime("%Y-%m-%d %H:%M:%S")
     metadata = {
         "operation_policy_recalculated_at": recalculated_at,
         "operation_policy_reason": reason,
