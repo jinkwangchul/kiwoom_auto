@@ -143,7 +143,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         self.assertIn("대기(3)", projection["counts_text"])
         self.assertEqual("수익(0 / 0.00%)", projection["profit_text"])
 
-    def test_valid_badges_use_operation_plus_waiting_hierarchy_without_changing_registered_totals(self) -> None:
+    def test_valid_badges_use_operation_waiting_hierarchy_and_normal_stock_scope(self) -> None:
         updater = MagicMock()
         window = SimpleNamespace(
             _main_routine_valid_only=True,
@@ -172,6 +172,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         counts = {
             "instance-a": {
                 "registered": 4,
+                "normal": 2,
                 "operation_running": 1,
                 "waiting": 1,
                 "excluded": 1,
@@ -179,6 +180,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             },
             "instance-b": {
                 "registered": 2,
+                "normal": 0,
                 "operation_running": 0,
                 "waiting": 0,
                 "excluded": 2,
@@ -186,6 +188,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             },
             "instance-c": {
                 "registered": 5,
+                "normal": 3,
                 "operation_running": 0,
                 "waiting": 3,
                 "excluded": 1,
@@ -193,6 +196,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             },
             "instance-d": {
                 "registered": 5,
+                "normal": 0,
                 "operation_running": 0,
                 "waiting": 0,
                 "excluded": 1,
