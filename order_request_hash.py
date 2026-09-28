@@ -80,6 +80,36 @@ def _stable_number_text(value: Any) -> str:
     return format(number.normalize(), "f")
 
 
+def _current_price_provenance(
+    order: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    raw = _as_dict(order.get("current_price_provenance"))
+    if not raw:
+        return {}, []
+    provenance = {
+        "canonical_stock_code": _norm(raw.get("canonical_stock_code")),
+        "broker_code_identity": _norm(raw.get("broker_code_identity")),
+        "market_source": _norm(raw.get("market_source")),
+        "source_real_type": _clean_text(raw.get("source_real_type")),
+        "current_price": _stable_number_text(raw.get("current_price")),
+        "market_datetime": _clean_text(raw.get("market_datetime")),
+        "received_at": _clean_text(raw.get("received_at")),
+        "receive_sequence": _stable_number_text(raw.get("receive_sequence")),
+        "connection_epoch": _stable_number_text(raw.get("connection_epoch")),
+        "login_session_id": _clean_text(raw.get("login_session_id")),
+        "authority_window": _clean_text(raw.get("authority_window")),
+    }
+    issues = [
+        f"current_price_provenance.{field} is required"
+        for field, value in provenance.items()
+        if not value
+    ]
+    order_price = _stable_number_text(order.get("price"))
+    if provenance["current_price"] and provenance["current_price"] != order_price:
+        issues.append("current_price_provenance.current_price must match price")
+    return provenance, issues
+
+
 def _stable_hash(hash_source: dict[str, Any]) -> str:
     payload = json.dumps(
         hash_source,
@@ -109,6 +139,7 @@ def build_order_request_hash_preview(
     if not isinstance(lock_preview, dict):
         warnings.append("lock_preview must be a dict")
 
+    provenance, provenance_issues = _current_price_provenance(order_dict)
     hash_source = {
         "order_id": _extract_order_id(order_dict),
         "source_signal_id": _extract_source_signal_id(order_dict),
@@ -119,6 +150,9 @@ def build_order_request_hash_preview(
         "hoga": _extract_hoga(execution_preview_dict),
         "lock_id": _extract_lock_id(lock_preview_dict),
     }
+    if provenance:
+        hash_source["current_price_provenance"] = provenance
+        blocked_reasons.extend(provenance_issues)
 
     required_names = {
         "order_id": "order_id is required",

@@ -75,6 +75,7 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
                 current_orderable_cash=lambda: self.orderable_cash,
                 broker_holdings_path=lambda: self.holdings_path,
                 fresh_current_price=self._fresh_price,
+                fresh_current_price_evidence=self._fresh_evidence,
             )
         )
 
@@ -84,6 +85,24 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
     def _fresh_price(self, code: str) -> int | None:
         self.price_calls.append(code)
         return self.current_price
+
+    def _fresh_evidence(self, code: str):
+        self.price_calls.append(code)
+        if self.current_price is None:
+            return None
+        return SimpleNamespace(
+            canonical_stock_code=code,
+            broker_code_identity=code,
+            market_source="KRX",
+            source_real_type="주식체결",
+            current_price=self.current_price,
+            market_datetime="2026-09-28T09:22:00+09:00",
+            received_at="2026-09-28T09:22:00.001+09:00",
+            receive_sequence=77,
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            authority_window="KRX_0900_1530",
+        )
 
     def _order(
         self,
@@ -436,6 +455,37 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
         self.assertEqual("REAL_READY", frozen["status"])
         self.assertEqual(12_000, frozen["price"])
         self.assertEqual(10, frozen["quantity"])
+        self.assertEqual(
+            "KRX",
+            frozen["current_price_provenance"]["market_source"],
+        )
+        self.assertEqual(
+            77,
+            frozen["current_price_provenance"]["receive_sequence"],
+        )
+
+    def test_hash_rejects_current_price_provenance_price_mismatch(self) -> None:
+        order = self._order()
+        result = self._finalize(order)
+        self.assertTrue(result["ok"], result)
+        finalized = deepcopy(result["order"])
+        finalized["status"] = "REAL_READY"
+        finalized["execution_enabled"] = True
+        finalized["current_price_provenance"]["current_price"] = 11_999
+
+        preview = preview_execution_for_order(
+            finalized,
+            {"operator_confirmed": True, "account_no": ACCOUNT},
+        )
+
+        self.assertFalse(preview["ok"])
+        pipeline_result = preview["pipeline_result"]
+        self.assertEqual("request_hash_preview", pipeline_result["blocked_stage"])
+        hash_preview = pipeline_result["pipeline"]["request_hash_preview"]
+        self.assertIn(
+            "current_price_provenance.current_price must match price",
+            hash_preview["blocked_reasons"],
+        )
 
     def test_hash_and_queue_preview_use_final_price_and_commit_readback_matches(self) -> None:
         order = self._order()
@@ -453,12 +503,35 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
 
         self.assertTrue(preview["ok"], preview)
         pipeline = preview["pipeline_result"]["pipeline"]
-        self.assertEqual("12000", pipeline["request_hash_preview"]["hash_source"]["price"])
+        provenance = finalized["current_price_provenance"]
+        hash_source = pipeline["request_hash_preview"]["hash_source"]
+        self.assertEqual("12000", hash_source["price"])
+        self.assertEqual(
+            {
+                "canonical_stock_code": CODE,
+                "broker_code_identity": CODE,
+                "market_source": "KRX",
+                "source_real_type": "주식체결",
+                "current_price": "12000",
+                "market_datetime": "2026-09-28T09:22:00+09:00",
+                "received_at": "2026-09-28T09:22:00.001+09:00",
+                "receive_sequence": "77",
+                "connection_epoch": "7",
+                "login_session_id": "SESSION-7",
+                "authority_window": "KRX_0900_1530",
+            },
+            hash_source["current_price_provenance"],
+        )
         request = pipeline["execution_request_preview"]["execution_request"]
         self.assertEqual(12_000, request["request_preview"]["price"])
+        self.assertEqual(provenance, request["current_price_provenance"])
         queue_preview = preview["queue_write_preview_result"]
         record_preview = queue_preview["order_queued_record_preview"]
         self.assertEqual(12_000, record_preview["execution_request"]["request_preview"]["price"])
+        self.assertEqual(
+            provenance,
+            record_preview["execution_request"]["current_price_provenance"],
+        )
         request_hash = record_preview["request_hash"]
 
         commit = commit_execution_queue_write(
@@ -474,6 +547,10 @@ class CurrentPricePreHashRevalidationTest(unittest.TestCase):
         self.assertEqual(request_hash, stored["request_hash"])
         self.assertEqual(12_000, stored["execution_request"]["request_preview"]["price"])
         self.assertEqual(10, stored["execution_request"]["request_preview"]["quantity"])
+        self.assertEqual(
+            provenance,
+            stored["execution_request"]["current_price_provenance"],
+        )
 
 
 if __name__ == "__main__":

@@ -330,6 +330,7 @@ class AutoTradeOrderExecutionContext:
     current_orderable_cash: Callable[[], int | None] | None = None
     broker_holdings_path: Callable[[], Path] | None = None
     fresh_current_price: Callable[[str], int | float | None] | None = None
+    fresh_current_price_evidence: Callable[[str], object | None] | None = None
     production_recovery_gate_for_stock: Callable[[str, str], object] | None = None
 
 
@@ -1133,12 +1134,114 @@ class AutoTradeOrderExecutionBoundary:
         return self._positive_price(value)
 
     @staticmethod
+    def _current_price_provenance_from_evidence(
+        evidence: object,
+        stock_code: object,
+    ) -> tuple[dict[str, object] | None, str]:
+        code = normalize_stock_code(stock_code)
+        if not code:
+            return None, "CURRENT_PRICE stock code is unavailable"
+        if isinstance(evidence, Mapping):
+            getter = evidence.get
+        else:
+            getter = lambda field, default=None: getattr(evidence, field, default)
+
+        canonical_code = normalize_stock_code(getter("canonical_stock_code", ""))
+        broker_identity = normalize_stock_code(getter("broker_code_identity", ""))
+        market_source = str(getter("market_source", "") or "").strip().upper()
+        source_real_type = str(getter("source_real_type", "") or "").strip()
+        market_datetime = str(getter("market_datetime", "") or "").strip()
+        received_at = str(getter("received_at", "") or "").strip()
+        login_session_id = str(getter("login_session_id", "") or "").strip()
+        authority_window = str(getter("authority_window", "") or "").strip()
+        price, price_reason = AutoTradeOrderExecutionBoundary._positive_price(
+            getter("current_price", None)
+        )
+        try:
+            receive_sequence = int(getter("receive_sequence", 0) or 0)
+            connection_epoch = int(getter("connection_epoch", 0) or 0)
+        except (TypeError, ValueError):
+            return None, "CURRENT_PRICE provenance sequence/session is invalid"
+
+        if canonical_code != code:
+            return None, "CURRENT_PRICE provenance stock code mismatch"
+        if market_source not in {"KRX", "NXT"}:
+            return None, "CURRENT_PRICE provenance market source is invalid"
+        expected_broker_identity = code if market_source == "KRX" else f"{code}_NX"
+        expected_real_type = "주식체결" if market_source == "KRX" else "ECN주식체결"
+        if broker_identity != expected_broker_identity:
+            return None, "CURRENT_PRICE provenance broker identity mismatch"
+        if source_real_type != expected_real_type:
+            return None, "CURRENT_PRICE provenance real type mismatch"
+        if price is None:
+            return None, price_reason
+        if (
+            not market_datetime
+            or not received_at
+            or receive_sequence <= 0
+            or connection_epoch <= 0
+            or not login_session_id
+            or not authority_window
+        ):
+            return None, "CURRENT_PRICE provenance is incomplete"
+
+        return {
+            "canonical_stock_code": code,
+            "broker_code_identity": broker_identity,
+            "market_source": market_source,
+            "source_real_type": source_real_type,
+            "current_price": price,
+            "market_datetime": market_datetime,
+            "received_at": received_at,
+            "receive_sequence": receive_sequence,
+            "connection_epoch": connection_epoch,
+            "login_session_id": login_session_id,
+            "authority_window": authority_window,
+        }, ""
+
+    def _fresh_current_price_with_provenance(
+        self,
+        stock_code: object,
+    ) -> tuple[int | float | None, dict[str, object] | None, str]:
+        code = normalize_stock_code(stock_code)
+        if not code:
+            return None, None, "CURRENT_PRICE stock code is unavailable"
+        evidence_callback = getattr(
+            self._context,
+            "fresh_current_price_evidence",
+            None,
+        )
+        if callable(evidence_callback):
+            try:
+                evidence = evidence_callback(code)
+            except Exception as exc:
+                return None, None, f"CURRENT_PRICE evidence resolver failed: {exc}"
+            if evidence is None:
+                return None, None, "CURRENT_PRICE authority evidence is unavailable"
+            provenance, reason = self._current_price_provenance_from_evidence(
+                evidence,
+                code,
+            )
+            if provenance is None:
+                return None, None, reason
+            return provenance["current_price"], provenance, ""
+        price, reason = self._fresh_current_price(code)
+        return price, None, reason
+
+    @staticmethod
     def _order_with_final_current_price(
         order: Mapping[str, object],
         price: int | float,
+        *,
+        current_price_provenance: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         finalized = deepcopy(dict(order))
         finalized["price"] = price
+        finalized.pop("current_price_provenance", None)
+        if isinstance(current_price_provenance, Mapping):
+            finalized["current_price_provenance"] = deepcopy(
+                dict(current_price_provenance)
+            )
         for key in ("execution_intent", "order_intent"):
             source = finalized.get(key)
             if not isinstance(source, dict) or "price" not in source:
@@ -1173,7 +1276,9 @@ class AutoTradeOrderExecutionBoundary:
         )
         if price_basis != "CURRENT_PRICE":
             if current_evidence_required:
-                final_price, price_reason = self._fresh_current_price(original.get("code"))
+                final_price, current_price_provenance, price_reason = (
+                    self._fresh_current_price_with_provenance(original.get("code"))
+                )
                 if final_price is None:
                     return {
                         "ok": False,
@@ -1189,6 +1294,7 @@ class AutoTradeOrderExecutionBoundary:
                     "stage": "eligibility_current_price_pre_hash_validated",
                     "price_basis": price_basis,
                     "validated_current_price": final_price,
+                    "current_price_provenance": current_price_provenance,
                     "order": original,
                     "blocked_reasons": [],
                 }
@@ -1201,8 +1307,13 @@ class AutoTradeOrderExecutionBoundary:
                 "blocked_reasons": [],
             }
 
+        current_price_provenance: dict[str, object] | None = None
         if resolved_current_price is None:
-            final_price, price_reason = self._fresh_current_price(original.get("code"))
+            (
+                final_price,
+                current_price_provenance,
+                price_reason,
+            ) = self._fresh_current_price_with_provenance(original.get("code"))
         else:
             final_price, price_reason = self._positive_price(resolved_current_price)
         if final_price is None:
@@ -1215,7 +1326,11 @@ class AutoTradeOrderExecutionBoundary:
                 "blocked_reasons": [price_reason],
             }
 
-        finalized = self._order_with_final_current_price(original, final_price)
+        finalized = self._order_with_final_current_price(
+            original,
+            final_price,
+            current_price_provenance=current_price_provenance,
+        )
         side = str(finalized.get("side") or "").strip().upper()
         quantity, quantity_reason = self._positive_int(
             finalized.get("quantity"),
@@ -1312,6 +1427,7 @@ class AutoTradeOrderExecutionBoundary:
             "order": finalized,
             "original_price": original.get("price"),
             "final_price": final_price,
+            "current_price_provenance": current_price_provenance,
             "quantity": quantity,
             "approved_budget": approved_budget,
             "refreshed_exposure": refreshed_exposure,

@@ -107,6 +107,9 @@ class AutoTradeOperationHost(QObject):
                 fresh_current_price=lambda stock_code: (
                     self._fresh_current_price_for_order(stock_code)
                 ),
+                fresh_current_price_evidence=lambda stock_code: (
+                    self.production_current_price_evidence(stock_code)
+                ),
                 production_recovery_gate_for_stock=(
                     (
                         lambda stock_code, caller_name: recovery_gate(

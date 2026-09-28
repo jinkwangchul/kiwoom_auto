@@ -173,6 +173,11 @@ def build_execution_request_preview(
         }
         if source_command_id:
             execution_request["source_command_id"] = source_command_id
+        current_price_provenance = order_dict.get("current_price_provenance")
+        if isinstance(current_price_provenance, dict):
+            execution_request["current_price_provenance"] = deepcopy(
+                current_price_provenance
+            )
         execution_intent = order_dict.get("execution_intent")
         if isinstance(execution_intent, dict):
             execution_request["execution_intent"] = deepcopy(execution_intent)
