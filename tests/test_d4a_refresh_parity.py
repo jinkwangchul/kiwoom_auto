@@ -112,8 +112,8 @@ class D4aRefreshParityTests(unittest.TestCase):
         refresh.assert_called_once()
 
         with patch.object(status_ops, "refresh_auto_trade_views") as refresh, patch.object(
-            status_ops.QMessageBox,
-            "warning",
+            status_ops,
+            "show_toast",
         ):
             status_ops.auto_trade_finalize_operation_mode_result(
                 object(),
@@ -143,6 +143,10 @@ class D4aRefreshParityTests(unittest.TestCase):
             ats_ops,
             "write_manual_ats_runtime_selection",
             return_value=True,
+        ), patch.object(
+            ats_ops,
+            "stock_nxt_availability",
+            return_value=True,
         ), patch.object(ats_ops, "append_production_event"), patch.object(
             ats_ops,
             "append_stock_log",
@@ -163,6 +167,10 @@ class D4aRefreshParityTests(unittest.TestCase):
         ), patch.object(
             ats_ops,
             "write_manual_ats_runtime_selection",
+            return_value=True,
+        ), patch.object(
+            ats_ops,
+            "stock_nxt_availability",
             return_value=True,
         ), patch.object(ats_ops, "append_stock_log"), patch.object(
             ats_ops,
