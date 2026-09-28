@@ -126,6 +126,40 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.assertIs(self.owner.kiwoom_api, self.market.kiwoom_api)
         self.assertIs(self.host, self.market.parent())
 
+    def test_order_fresh_current_price_reads_only_authorized_evidence(self) -> None:
+        callback = self.host._order_execution_boundary._context.fresh_current_price
+        with patch.object(
+            self.host,
+            "production_current_price_evidence",
+            return_value=SimpleNamespace(current_price=261000),
+        ) as evidence, patch.object(
+            self.host,
+            "fresh_monitoring_market_information_state",
+            side_effect=AssertionError("legacy monitoring price must not be used"),
+        ):
+            self.assertEqual(261000, callback("005930"))
+
+        evidence.assert_called_once_with("005930")
+
+    def test_order_fresh_current_price_missing_evidence_keeps_pre_hash_fail_closed(self) -> None:
+        callback = self.host._order_execution_boundary._context.fresh_current_price
+        with patch.object(
+            self.host,
+            "production_current_price_evidence",
+            return_value=None,
+        ):
+            self.assertIsNone(callback("005930"))
+            result = self.host._order_execution_boundary.finalize_current_price_before_hash(
+                {
+                    "code": "005930",
+                    "price_basis": "CURRENT_PRICE",
+                },
+                queue_path=Path("unused-order-queue.json"),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("current_price_pre_hash_unavailable", result["stage"])
+
     def test_session_clear_invalidates_candle_refresh_coordination_state(self) -> None:
         self.market._automatic_candle_refresh_generation = 7
         self.market._automatic_candle_refresh_inflight = True

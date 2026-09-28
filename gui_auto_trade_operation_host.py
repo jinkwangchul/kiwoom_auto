@@ -105,11 +105,7 @@ class AutoTradeOperationHost(QObject):
                     else None
                 ),
                 fresh_current_price=lambda stock_code: (
-                    getattr(
-                        self.fresh_monitoring_market_information_state(stock_code),
-                        "last_price",
-                        None,
-                    )
+                    self._fresh_current_price_for_order(stock_code)
                 ),
                 production_recovery_gate_for_stock=(
                     (
@@ -556,6 +552,12 @@ class AutoTradeOperationHost(QObject):
             stock_code,
             now_dt=now_dt,
         )
+
+    def _fresh_current_price_for_order(self, stock_code: str):
+        """Return only the price from authorized Production CURRENT_PRICE evidence."""
+
+        evidence = self.production_current_price_evidence(stock_code)
+        return getattr(evidence, "current_price", None)
 
     def monitoring_market_information_state(self, stock_code: str):
         return self._market_data_host.monitoring_market_information_state(stock_code)
