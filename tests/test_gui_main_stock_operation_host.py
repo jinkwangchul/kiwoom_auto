@@ -438,7 +438,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             resolved_starting_budget=start_amount,
         )
 
-        self.assertIsNone(start_amount)
+        self.assertEqual(1_000_000, start_amount)
         self.assertTrue(validation["allowed"])
         self.assertEqual("explicit", validation["starting_budget_source"])
 
@@ -754,15 +754,46 @@ class MainStockOperationHostTest(unittest.TestCase):
         ), patch.object(
             gui_auto_trade_timer,
             "consume_pending_routine_signals_dry_run",
-            return_value={"summary": {"signals_checked": 1, "approved": 1}},
+            return_value={
+                "summary": {
+                    "signals_checked": 1,
+                    "approved": 1,
+                    "executable_order_ids": ["ORDER_1"],
+                }
+            },
         ) as consumer, patch.object(
             gui_auto_trade_timer,
             "project_execution_universe",
             return_value=SimpleNamespace(
                 entries=[
-                    SimpleNamespace(stock_code="003550", execution_ready=True),
+                    SimpleNamespace(
+                        stock_code="003550",
+                        execution_ready=True,
+                        signal_probe_only=False,
+                        stock_dir=None,
+                    ),
                 ]
             ),
+        ), patch.object(
+            gui_auto_trade_timer,
+            "capture_routine_main_facts",
+            return_value=SimpleNamespace(
+                to_payload=lambda: {
+                    "revision": "FACTS-1",
+                    "stock_configs": {
+                        "003550": {"assigned_routine_instance_id": "instance-a"}
+                    },
+                    "stock_states": {"003550": {"status": "RUNNING"}},
+                }
+            ),
+        ), patch.object(
+            gui_auto_trade_timer,
+            "evaluate_routine_lifecycle",
+            return_value={"ok": True, "decisions": []},
+        ), patch.object(
+            gui_auto_trade_timer,
+            "actionable_current_price",
+            return_value=85000,
         ), patch.object(
             gui_auto_trade_timer,
             "auto_trade_signal_probe_only_active",
@@ -775,16 +806,22 @@ class MainStockOperationHostTest(unittest.TestCase):
             result = gui_auto_trade_timer.auto_trade_run_operation_cycle(host)
 
         self.assertTrue(result["processed"])
-        consumer.assert_called_once_with(
-            limit=5,
-            mark_previewed=True,
-            write_order_queue=True,
-            apply_approval=True,
-            allowed_stock_codes=("003550",),
-            signal_cutoff_by_stock_code={"003550": ""},
+        consumer.assert_called_once()
+        consumer_kwargs = consumer.call_args.kwargs
+        self.assertEqual(5, consumer_kwargs["limit"])
+        self.assertTrue(consumer_kwargs["mark_previewed"])
+        self.assertTrue(consumer_kwargs["write_order_queue"])
+        self.assertTrue(consumer_kwargs["apply_approval"])
+        self.assertEqual(("003550",), consumer_kwargs["allowed_stock_codes"])
+        self.assertEqual(
+            {"003550": ""},
+            consumer_kwargs["signal_cutoff_by_stock_code"],
         )
+        self.assertEqual("FACTS-1", consumer_kwargs["main_facts"]["revision"])
+        self.assertTrue(callable(consumer_kwargs["fresh_main_facts_provider"]))
         host.auto_process_executable_orders_for_real_trade.assert_called_once_with(
-            limit=5
+            limit=5,
+            order_ids=["ORDER_1"],
         )
         self.assertFalse(hasattr(host, "isVisible") and host.isVisible.called)
 
