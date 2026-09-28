@@ -111,7 +111,7 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         )
         with (
             patch.object(status_ops, "append_changelog"),
-            patch.object(status_ops.QMessageBox, "warning") as warning,
+            patch.object(status_ops, "show_toast") as toast,
         ):
             result = status_ops.auto_trade_set_selected_operation_mode(
                 window,
@@ -143,7 +143,7 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         )
         window.refresh_all.assert_called_once_with()
         parent.refresh_all.assert_called_once_with()
-        warning.assert_called_once()
+        toast.assert_called_once()
 
     @unittest.skip("모달 확인 방식 복원으로 즉시 실행 helper는 사용하지 않는다.")
     def test_unregister_resolves_each_target_instance_and_keeps_partial_failure(self) -> None:
@@ -424,6 +424,11 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
                 ats_ops,
                 "write_manual_ats_runtime_selection",
                 side_effect=[True, False],
+            ),
+            patch.object(
+                ats_ops,
+                "stock_nxt_availability",
+                return_value=True,
             ),
             patch.object(ats_ops, "append_stock_log"),
         ):
