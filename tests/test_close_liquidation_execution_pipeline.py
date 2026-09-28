@@ -1355,6 +1355,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         window = Mock()
         window._persistent_feature_owner_ref = None
         window.parent = Mock(return_value=None)
+        window.production_recovery_gate_for_stock = None
         boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
         base_state = {
             "status": "EARLY_CLOSE",
@@ -1407,6 +1408,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         window = Mock()
         window._persistent_feature_owner_ref = None
         window.parent = Mock(return_value=None)
+        window.production_recovery_gate_for_stock = None
         boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
         boundary.auto_trade_runtime_state_for_order = Mock(return_value={
             "found": True,
