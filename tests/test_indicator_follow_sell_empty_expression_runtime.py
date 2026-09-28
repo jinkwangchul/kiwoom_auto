@@ -438,7 +438,7 @@ class SellEmptyExpressionV2IntegrationTest(unittest.TestCase):
             markers = window.canvas.marker_records()
             self.assertGreater(sum(marker["side"] == "BUY" for marker in markers), 0)
             self.assertEqual(0, sum(marker["side"] == "SELL" for marker in markers))
-            self.assertIn("SELL 0", window.result_summary_label.text())
+            self.assertNotIn("매도신호", window.result_summary_label.text())
             self.assertFalse(hasattr(window, "signal_list_table"))
             self.assertEqual(0, window.completed_cycle_table.rowCount())
             self.assertFalse(window.completed_cycle_table.isHidden())
@@ -456,14 +456,30 @@ class SellEmptyExpressionV2IntegrationTest(unittest.TestCase):
             self.assertEqual(original_ui_state, ui_state)
             projected_signals = seed.settings_snapshot.to_dict()["sell"]["signals"]
             self.assertEqual(
-                {"ui_condition_a", "ui_condition_b", "ui_condition_c"},
+                {
+                    "macd_sell",
+                    "profit_rate_sell",
+                    "ui_condition_a",
+                    "ui_condition_b",
+                    "ui_condition_c",
+                },
                 set(projected_signals),
             )
             self.assertTrue(all(
                 "signal_expression" not in signal
                 for signal in projected_signals.values()
             ))
-            self.assertTrue(all(signal["groups"] for signal in projected_signals.values()))
+            self.assertTrue(all(
+                projected_signals[name]["groups"]
+                for name in (
+                    "macd_sell",
+                    "ui_condition_a",
+                    "ui_condition_b",
+                    "ui_condition_c",
+                )
+            ))
+            self.assertFalse(projected_signals["macd_sell"]["enabled"])
+            self.assertFalse(projected_signals["profit_rate_sell"]["enabled"])
         finally:
             window.close()
             window.deleteLater()
