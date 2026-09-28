@@ -308,7 +308,7 @@ class OperationStartBlockReasonMessageTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            "대상종목 3  |  기운영중 0  |  운영시작 0  |  운영불가 3\n검토관리 1 · 복구 미완료 1 · 시간운영 종료 1",
+            "대상종목 3  |  기운영중 0  |  운영시작 0  |  운영불가 3\n검토관리 1 · 로그인 상태 확인 미완료 1 · 시간운영 종료 1",
             operation_start_result_summary_toast_text(
                 {
                     "started_count": 0,

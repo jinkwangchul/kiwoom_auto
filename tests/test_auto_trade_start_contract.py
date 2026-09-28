@@ -355,7 +355,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
     def test_recovery_block_message_contract_is_shared(self) -> None:
         self.assertEqual(
             "운영시작할 수 없습니다. "
-            "로그인, 계좌 선택 및 Recovery 완료 상태를 확인하십시오.",
+            "로그인, 계좌 선택 및 현재 로그인 상태 확인 여부를 확인하십시오.",
             startup_recovery_operation_block_message(
                 "운영시작",
                 "INVALID_RUNTIME",
@@ -1199,7 +1199,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
             self.assertEqual((), participant_codes(window))
             window.send_order.assert_not_called()
             self.assertIn("운영을 시작할 수 없습니다", result["user_message"])
-            self.assertIn("다음 로그인 Recovery 완료 후", result["user_message"])
+            self.assertIn("다시 로그인한 후 운영 가능합니다.", result["user_message"])
 
     def test_runtime_missing_isolated_as_review_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1602,11 +1602,11 @@ class AutoTradeStartContractTest(unittest.TestCase):
             )
 
         self.assertIn(
-            "005930 삼성전자는 현재 로그인 세션에서 Recovery가 완료되지 않아 "
+            "005930 삼성전자는 현재 로그인 상태 확인이 완료되지 않아 "
             "운영을 시작할 수 없습니다.",
             stock_result["user_message"],
         )
-        self.assertIn("다음 로그인 Recovery 완료 후 운영 가능합니다.", stock_result["user_message"])
+        self.assertIn("다시 로그인한 후 운영 가능합니다.", stock_result["user_message"])
         self.assertNotIn("RECOVERY_STOCK_PENDING", stock_result["user_message"])
         self.assertEqual(
             "키움 서버에 로그인되어 있지 않습니다.\n로그인한 뒤 다시 시도하십시오.",
