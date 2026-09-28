@@ -1453,13 +1453,11 @@ from gui_main_table_loader import (
     main_sort_running_table_by_column,
     main_load_routine_table,
     main_load_running_stock_table,
-    main_budget_display_auth_state,
     main_monitoring_table_font,
     main_monitoring_cell_font,
     main_stock_row_tooltip_from_projection,
     routine_instance_consumed_text,
     stock_buy_limit_state,
-    SERVER_AUTH_COMPLETE,
 )
 from routine_tree_title_display import tree_title_text
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
@@ -1739,6 +1737,11 @@ from mock_validation_ui_projection import (
     mock_operation_start_exclusion_reason,
 )
 from mock_validation_quick_chart import open_mock_instance_quick_chart
+from mock_validation_user_response import (
+    mock_action_result_message,
+    mock_action_status_text,
+    mock_user_message,
+)
 from manual_ats_runtime import VALID_SESSION_KEYS
 
 
@@ -6220,11 +6223,7 @@ class MainWindow(QMainWindow):
             else:
                 unsupported.append(instance)
         if not eligible:
-            QMessageBox.information(
-                self,
-                "모의검증",
-                "현재 모의검증 실행 어댑터를 지원하는 루틴이 없습니다.",
-            )
+            show_toast(self, "현재 모의검증 실행 어댑터를 지원하는 루틴이 없습니다.")
             return None
         dialog = QDialog(self)
         dialog.setWindowTitle("모의검증 루틴 선택")
@@ -6260,7 +6259,7 @@ class MainWindow(QMainWindow):
             if empty_selection_toast:
                 show_toast(self, empty_selection_toast)
             else:
-                QMessageBox.information(self, "모의검증", "루틴을 1개 이상 선택하세요.")
+                show_toast(self, "루틴을 1개 이상 선택하세요.")
             return None
         return selected
 
@@ -6275,7 +6274,7 @@ class MainWindow(QMainWindow):
         host = getattr(self, "mock_validation_host", None)
         actions = getattr(self, "mock_validation_ui_actions", None)
         if host is None or actions is None:
-            QMessageBox.warning(self, "모의검증", "모의검증 실행 기반을 사용할 수 없습니다.")
+            show_toast(self, "모의검증 실행 기반을 사용할 수 없습니다.")
             return False
         if host.current_session(target.code) is not None:
             show_toast(self, "이미 진행 중인 모의검증 종목입니다.")
@@ -6404,7 +6403,8 @@ class MainWindow(QMainWindow):
                 effective_settings_by_instance=effective_settings,
             )
         except Exception as exc:
-            QMessageBox.warning(self, "모의검증", f"모의검증 종목을 만들지 못했습니다.\n사유: {exc}")
+            LOGGER.exception("Mock validation registration failed")
+            show_toast(self, mock_user_message(exc))
             return False
         show_toast(self, "모의검증 종목으로 등록 되었습니다.")
         return True
@@ -6427,7 +6427,7 @@ class MainWindow(QMainWindow):
         host = getattr(self, "mock_validation_host", None)
         actions = getattr(self, "mock_validation_ui_actions", None)
         if host is None or actions is None:
-            QMessageBox.warning(self, "모의검증", "모의검증 실행 기반을 사용할 수 없습니다.")
+            show_toast(self, "모의검증 실행 기반을 사용할 수 없습니다.")
             return False
         if host.current_session(code) is not None:
             show_toast(self, "이미 진행 중인 모의검증 종목입니다.")
@@ -6446,7 +6446,7 @@ class MainWindow(QMainWindow):
         if not selected:
             return False
         if needs_registration and not append_central_base_stock(code, name):
-            QMessageBox.warning(self, "모의검증", "종목을 등록하지 못했습니다.")
+            show_toast(self, "종목을 등록하지 못했습니다.")
             return False
         return self.begin_mock_validation(target, selected_instances=selected)
 
@@ -6486,10 +6486,31 @@ class MainWindow(QMainWindow):
     def _mock_action_result(self, title: str, operation) -> None:
         try:
             result = operation()
-        except Exception as exc:
-            QMessageBox.warning(self, title, f"처리하지 못했습니다.\n사유: {exc}")
+        except MockValidationError as exc:
+            LOGGER.info("Mock action blocked: %s reason=%s", title, exc)
+            show_toast(self, mock_user_message(exc), duration_ms=2500)
             return
-        self.statusBar().showMessage(f"{title}: {result.get('status', '완료') if isinstance(result, dict) else '완료'}", 5000)
+        except Exception as exc:
+            LOGGER.exception("Mock action failed: %s", title)
+            show_toast(self, mock_user_message(exc), duration_ms=2500)
+            return
+        summary_toast = (
+            str(result.get("summary_toast_message") or "").strip()
+            if isinstance(result, dict)
+            else ""
+        )
+        if summary_toast:
+            show_toast(
+                self,
+                summary_toast,
+                duration_ms=3200 if "\n" in summary_toast else 2000,
+            )
+        elif (message := mock_action_result_message(result)):
+            show_toast(self, message, duration_ms=2500)
+        self.statusBar().showMessage(
+            f"{title}: {mock_action_status_text(result)}",
+            5000,
+        )
 
     def start_mock_validation_stock(self, stock_code: str) -> None:
         self._mock_action_result(
@@ -10102,10 +10123,7 @@ class MainWindow(QMainWindow):
         )
 
     def _mock_start_budget_edit_authorized(self) -> bool:
-        if main_budget_display_auth_state(self) == SERVER_AUTH_COMPLETE:
-            return True
-        show_toast(self, "서버 인증 완료 후 모의 시작예산을 변경할 수 있습니다.")
-        return False
+        return True
 
     def _mock_start_budget_current_price(self, stock_code: str) -> float | None:
         host = getattr(self, "mock_validation_host", None)
@@ -10139,11 +10157,8 @@ class MainWindow(QMainWindow):
                 **changes,
             )
         except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "모의 Instance 설정",
-                f"설정을 저장하지 못했습니다.\n사유: {exc}",
-            )
+            LOGGER.exception("Mock instance settings write failed")
+            show_toast(self, mock_user_message(exc), duration_ms=2500)
             return False
         self._reload_main_routine_table_preserving_view()
         return bool(isinstance(result, dict))
@@ -10258,11 +10273,8 @@ class MainWindow(QMainWindow):
                 requested_at=dialog.requested_at,
             )
         except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "모의 시작예산 설정",
-                f"설정을 저장하지 못했습니다.\n사유: {exc}",
-            )
+            LOGGER.exception("Mock initial budget write failed")
+            show_toast(self, mock_user_message(exc), duration_ms=2500)
             return
         self._reload_main_routine_table_preserving_view()
         show_toast(self, "기본예산을 변경했습니다.")

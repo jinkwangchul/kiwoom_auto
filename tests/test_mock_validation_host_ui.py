@@ -1653,34 +1653,30 @@ class MockValidationHostUiTest(unittest.TestCase):
         self.assertTrue(dialog.start_hour_combo.isEnabled())
         self.assertTrue(dialog.end_hour_combo.isEnabled())
 
-    def test_mock_start_budget_requires_official_server_auth(self):
+    def test_mock_start_budget_is_independent_of_production_server_auth(self):
         self.create()
+        self.set_mock_trade_price(100)
         window = self._phase1_mock_table_window()
         window.load_routine_table()
-        item = window.routine_table.item(1, 0)
-        projection = dict(
-            item.data(main_table_loader.ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
-        )
-        projection["current_price"] = 100
-        item.setData(
-            main_table_loader.ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
-            projection,
-        )
         window.kiwoom_api = SimpleNamespace(is_connected=lambda: False)
+        window.selected_account_no = lambda: ""
+        window._account_authentication_states = {}
         before = self.host.current_session("005930")
+        row = self._row_for_instance(window.routine_table, "A")
 
-        with (
-            patch.object(gui_windows, "show_toast") as toast,
-            patch.object(gui_windows, "RunningBudgetAdjustmentDialog") as dialog,
-        ):
-            window.toggle_mock_routine_instance_initial_buy_mode(1)
-            window.open_mock_routine_instance_initial_buy_dialog(1)
+        with patch.object(gui_windows, "show_toast") as toast:
+            self.assertTrue(window._mock_start_budget_edit_authorized())
+            window.toggle_mock_routine_instance_initial_buy_mode(row)
 
+        after = self.host.current_session("005930")
+        self.assertGreater(after["revision"], before["revision"])
         self.assertEqual(
-            before["revision"], self.host.current_session("005930")["revision"]
+            "AMOUNT",
+            after["effective_settings_by_instance"]["A"]["initial_buy"]["mode"],
         )
-        dialog.assert_not_called()
-        self.assertEqual(2, toast.call_count)
+        toast.assert_not_called()
+        self.assertFalse(window.kiwoom_api.is_connected())
+        self.assertEqual({}, window._account_authentication_states)
 
     def test_actual_mock_child_budget_dialog_round_trip_is_mock_only(self):
         created = self.create()
@@ -4526,6 +4522,21 @@ class MockValidationHostUiTest(unittest.TestCase):
             },
         )
         self.assertEqual(2, len(results[-1]["skipped"]))
+
+    def test_mock_action_result_uses_existing_toast_for_start_summary(self):
+        status_bar = SimpleNamespace(showMessage=Mock())
+        window = SimpleNamespace(statusBar=lambda: status_bar)
+        message = (
+            "대상종목 1  |  기운영중 0  |  운영시작 0  |  운영불가 1\n"
+            "시간운영 종료 1"
+        )
+        with patch.object(gui_windows, "show_toast") as show_toast:
+            MainWindow._mock_action_result(
+                window,
+                "모의 Instance 운영시작",
+                lambda: {"status": "BLOCKED", "summary_toast_message": message},
+            )
+        show_toast.assert_called_once_with(window, message, duration_ms=3200)
 
     def test_mock_select_all_and_clear_target_children_only(self):
         self.create()
