@@ -1429,17 +1429,39 @@ def auto_trade_setting_liquidation_text(
     단, 유효한 일회성 개별청산 요청이 있으면 해당 Command 값을 우선 표시한다.
     조기마감 상태에서는 청산정책 표시가 가능하다.
     """
-    status_text = auto_trade_setting_display_status(display_status)
+    raw_display_status = str(display_status or "").strip()
+    status_text = (
+        raw_display_status
+        if raw_display_status in {"조기마감", "자동마감", "청산"}
+        else auto_trade_setting_display_status(raw_display_status)
+    )
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     early_close_forced = auto_trade_setting_early_close_requested(state)
-    if mode == "CONTINUOUS" and not early_close_forced:
-        return "-"
     individual_policy = (
         individual_liquidation_policy_from_state(state)
         if mode == "CONTINUOUS"
         else individual_liquidation_setting_policy_from_state(state)
     )
     has_individual = bool(individual_policy)
+    has_auto_close_evidence = bool(
+        isinstance(state, dict)
+        and (
+            str(state.get("auto_close_requested_at", "") or "").strip()
+            or str(state.get("auto_close_source", "") or "").strip()
+            or str(state.get("auto_close_method", "") or "").strip()
+            or (
+                isinstance(state.get("auto_close_policy"), dict)
+                and bool(state.get("auto_close_policy"))
+            )
+        )
+    )
+    if (
+        mode == "CONTINUOUS"
+        and not early_close_forced
+        and not (status_text == "청산" and has_individual)
+        and not (status_text == "자동마감" and has_auto_close_evidence)
+    ):
+        return "-"
     if (
         not has_individual
         and not early_close_forced

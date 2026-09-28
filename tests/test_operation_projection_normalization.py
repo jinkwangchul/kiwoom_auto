@@ -247,12 +247,17 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
             (
                 "청산",
                 {
+                    "trade_started_at": requested_at,
+                    "operation_policy_snapshot": {
+                        "operation_identity": requested_at,
+                    },
                     "individual_liquidation_request": {
                         "status": "REQUESTED",
                         "requested_at": requested_at,
+                        "operation_identity": requested_at,
                         "minutes_before_regular_close": "5",
                         "method": "현재가",
-                    }
+                    },
                 },
             ),
             (
