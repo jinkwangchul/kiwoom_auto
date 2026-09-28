@@ -85,6 +85,11 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
+                patch.object(
+                    status_ops,
+                    "current_datetime",
+                    return_value=datetime(2026, 9, 4, 10, 0),
+                ),
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
             ):

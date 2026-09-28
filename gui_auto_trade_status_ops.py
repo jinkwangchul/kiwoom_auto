@@ -859,7 +859,12 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         config = default_config()
 
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-    new_status = status_after_operation_mode_change(mode, config)
+    decision_now = current_datetime()
+    new_status = status_after_operation_mode_change(
+        mode,
+        config,
+        now_dt=decision_now,
+    )
     if start_requested and extra_state:
         guarded_start_status = str(
             extra_state.get("start_policy_status") or ""
