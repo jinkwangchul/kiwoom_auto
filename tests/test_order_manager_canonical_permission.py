@@ -41,6 +41,7 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
         now: datetime | None = None,
         operation_state: dict[str, object] | None = None,
         config: dict[str, object] | None = None,
+        stock_code: str = "",
     ) -> dict[str, object]:
         return order_manager.decide_routine_order(
             state,
@@ -53,6 +54,7 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
                 else operation_state
             ),
             now_dt=now or self.NOW,
+            stock_code=stock_code,
         )
 
     def assert_sides(self, state: dict[str, object], allowed: bool, **kwargs) -> None:
@@ -188,15 +190,26 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
     def test_manual_ats_uses_existing_canonical_session_helper(self) -> None:
         manual_config = dict(self.config, operation_mode="CONTINUOUS")
         outside_regular = datetime(2026, 8, 10, 18, 0, 0)
-        with patch(
-            "routine_order_permission.manual_ats_active_now",
-            return_value=True,
-        ) as ats_active:
+        ats_state = dict(
+            self.running_state,
+            manual_ats_selection={"selected_sessions": ["extra2"]},
+        )
+        with (
+            patch(
+                "routine_order_permission.manual_ats_active_now",
+                return_value=True,
+            ) as ats_active,
+            patch(
+                "routine_order_permission.stock_nxt_availability",
+                return_value=True,
+            ),
+        ):
             self.assert_sides(
-                self.running_state,
+                ats_state,
                 True,
                 now=outside_regular,
                 config=manual_config,
+                stock_code="005930",
             )
         self.assertEqual(2, ats_active.call_count)
 
