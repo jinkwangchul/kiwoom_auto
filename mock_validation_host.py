@@ -1390,6 +1390,31 @@ class MockValidationHost:
         now_seconds = now.hour * 3600 + now.minute * 60 + now.second
         return now_seconds >= boundary_seconds
 
+    def _instance_pending_cleanup_boundary_reached(
+        self,
+        document: dict[str, Any],
+        instance_id: str,
+        operation: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        if not self._instance_pending_order_cancel_boundary_reached(operation, now):
+            return False
+        snapshot = operation.get("operation_policy_snapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        settings = self._operation_effective_settings(document, instance_id)
+        mode = str(settings.get("operation_mode") or "").strip().upper()
+        _market_active, ats_active = self._mock_market_session_phase(
+            settings,
+            now,
+            operation_policy=snapshot,
+        )
+        return not (
+            mode == "CONTINUOUS"
+            and ats_active
+            and str(operation.get("close_source") or "").strip().upper()
+            == "IMMEDIATE"
+        )
+
     def _instance_final_close_boundary_reached(
         self,
         document: dict[str, Any],
@@ -1985,7 +2010,9 @@ class MockValidationHost:
                             now,
                         ),
                         pending_order_cleanup_boundary=(
-                            self._instance_pending_order_cancel_boundary_reached(
+                            self._instance_pending_cleanup_boundary_reached(
+                                current,
+                                instance_id,
                                 operation,
                                 now,
                             )
@@ -2024,7 +2051,9 @@ class MockValidationHost:
                             now,
                         ),
                         pending_order_cleanup_boundary=(
-                            self._instance_pending_order_cancel_boundary_reached(
+                            self._instance_pending_cleanup_boundary_reached(
+                                current,
+                                instance_id,
                                 operation,
                                 now,
                             )
