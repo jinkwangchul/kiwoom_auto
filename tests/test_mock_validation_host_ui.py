@@ -1480,6 +1480,18 @@ class MockValidationHostUiTest(unittest.TestCase):
             "005930", "A", operation_mode="MANUAL"
         )
         self.host.start_instance_operation("005930", "A", as_of=NOW)
+        session_id = self.host.current_session("005930")["session"][
+            "validation_session_id"
+        ]
+        self.host.session_service.set_instance_position(
+            session_id,
+            "A",
+            holding_qty=1,
+            available_qty=1,
+            average_price=100,
+            realized_cost_basis=100,
+            command_id="MC-settings-blocked-holding-A",
+        )
         with self.assertRaisesRegex(
             MockValidationError,
             "MOCK_INSTANCE_SETTINGS_REQUIRE_WAITING",
@@ -2101,6 +2113,15 @@ class MockValidationHostUiTest(unittest.TestCase):
         window.kiwoom_api = self.api
         self.host.start_instance_operation("005930", "A", as_of=NOW)
         self.host.start_instance_operation("005930", "B", as_of=NOW)
+        self.host.session_service.set_instance_position(
+            created["document"]["session"]["validation_session_id"],
+            "B",
+            holding_qty=1,
+            available_qty=1,
+            average_price=100,
+            realized_cost_basis=100,
+            command_id="MC-operation-settings-holding-B",
+        )
         self.host.request_instance_early_close(
             "005930", "B", method="시장가", as_of=NOW
         )
@@ -2352,6 +2373,30 @@ class MockValidationHostUiTest(unittest.TestCase):
                 "end_buy_time": "14:10:00",
             },
         )
+        self.host._operation_policy_provider = lambda: {
+            "manual_operation": {"use_regular_market": True},
+            "regular_market": {
+                "start_time": "09:00:00",
+                "end_time": "15:30:00",
+            },
+            "extra_sessions": [
+                {
+                    "enabled": True,
+                    "start_time": "08:00:00",
+                    "end_time": "08:50:00",
+                },
+                {
+                    "enabled": True,
+                    "start_time": "15:40:00",
+                    "end_time": "19:50:00",
+                },
+            ],
+            "liquidation": {
+                "minutes_before_regular_close": "5",
+                "method": "시장가",
+            },
+            "review_policy": {"long_term_holding_enabled": False},
+        }
         self.host.start_instance_operation("005930", "A", as_of=NOW)
         self.host.stop_instance_validation(
             "005930", "A", command_id="MC-stop-before-settings-reset-A"
@@ -3192,7 +3237,7 @@ class MockValidationHostUiTest(unittest.TestCase):
 
         document["instance_execution"]["A"]["state"] = "ENDED"
         projection = mock_instance_projection(document, "A", as_of=NOW)
-        self.assertEqual("감시/대기", projection["display_status"])
+        self.assertEqual("운영종료", projection["display_status"])
         self.assertFalse(projection["status_cell_active"])
         self.assertFalse(projection["method_cell_active"])
         self.assertFalse(projection["liquidation_cell_active"])
@@ -6735,28 +6780,37 @@ class MockValidationHostUiTest(unittest.TestCase):
         window, _results = self._mock_context_window()
         table = window.routine_table
         child_row = self._row_for_instance(table, "B")
-        position = table.visualItemRect(table.item(child_row, 0)).center()
-
-        _Menu.chosen_text = "운영시작"
-        _Menu.chosen_menu_title = None
-        with patch.object(mock_context_menu, "QMenu", _Menu):
-            table.customContextMenuRequested.emit(position)
+        self.actions.start_instance("005930", "B")
+        session_id = self.host.current_session("005930")["session"][
+            "validation_session_id"
+        ]
+        self.host.session_service.set_instance_position(
+            session_id,
+            "B",
+            holding_qty=1,
+            available_qty=1,
+            average_price=100,
+            realized_cost_basis=100,
+            command_id="MC-profit-loss-holding-B",
+        )
+        target = mock_context_menu.mock_context_target_for_row(window, child_row)
+        self.assertIsNotNone(target)
 
         dialog = SimpleNamespace(
             exec_=Mock(return_value=QDialog.Accepted),
             values=Mock(return_value=(3.5, 1.25)),
         )
-        _Menu.chosen_text = "손/익절"
-        _Menu.chosen_menu_title = "조기마감"
-        with (
-            patch.object(mock_context_menu, "QMenu", _Menu),
-            patch.object(
-                mock_context_menu,
-                "ProfitLossEarlyCloseDialog",
-                return_value=dialog,
-            ),
+        with patch.object(
+            mock_context_menu,
+            "ProfitLossEarlyCloseDialog",
+            return_value=dialog,
         ):
-            table.customContextMenuRequested.emit(position)
+            mock_context_menu._apply_mock_profit_loss_early_close(
+                window,
+                child_row,
+                target,
+                self.actions,
+            )
 
         operation = self.host.current_session("005930")["mock_operation_lifecycle"][
             "instance_operations"
@@ -6830,8 +6884,17 @@ class MockValidationHostUiTest(unittest.TestCase):
         self.assertEqual([], results)
 
     def test_auto_close_due_is_idempotent_and_stops_routine_progression(self):
-        self.create()
+        created = self.create()["document"]
         self.actions.start("005930")
+        self.host.session_service.set_instance_position(
+            created["session"]["validation_session_id"],
+            "A",
+            holding_qty=1,
+            available_qty=1,
+            average_price=100,
+            realized_cost_basis=100,
+            command_id="MC-auto-close-holding-A",
+        )
         self.host.routine_adapter.evaluate_cycle = Mock()
         due = NOW.replace(hour=15, minute=25, second=0)
         self.host.process_due_cycles(as_of=due)
