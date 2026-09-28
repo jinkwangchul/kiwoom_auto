@@ -6810,7 +6810,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertFalse(window.stock_table.horizontalHeader().isSortIndicatorShown())
         self.assertEqual(
             stock_register_window.stock_register_performance_column_width(
-                window.stock_table.fontMetrics()
+                window.fontMetrics()
             ),
             window.stock_table.columnWidth(4),
         )
@@ -11535,6 +11535,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         window = self._window_harness()
+        window._setup_routine_table()
         window._routine_instance_operation_counts = lambda: {
             "inst-a": {"registered": 2, "running": 0, "stopped": 2, "error": 0}
         }

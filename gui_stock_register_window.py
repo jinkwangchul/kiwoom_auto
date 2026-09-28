@@ -1233,8 +1233,14 @@ def stock_register_performance_summary_display(stocks: list[dict[str, object]]) 
     }
 
 
-def stock_register_performance_widget(performance: dict[str, object]) -> QWidget:
+def stock_register_performance_widget(
+    performance: dict[str, object],
+    *,
+    font: QFont | None = None,
+) -> QWidget:
     widget = QWidget()
+    if font is not None:
+        widget.setFont(QFont(font))
     widget.setFocusPolicy(Qt.NoFocus)
     widget.setAttribute(Qt.WA_StyledBackground, True)
     widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -1253,7 +1259,7 @@ def stock_register_performance_widget(performance: dict[str, object]) -> QWidget
         color: str = "",
         object_name: str = "",
     ) -> None:
-        label = QLabel(text)
+        label = QLabel(text, widget)
         if object_name:
             label.setObjectName(object_name)
         label.setAlignment(alignment)
@@ -1501,14 +1507,21 @@ class StockRegisterWindow(QDialog):
         title_label.setFocusPolicy(Qt.NoFocus)
         title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         title_label.setAlignment(Qt.AlignCenter)
-        title_width = max(64, title_label.fontMetrics().horizontalAdvance("전체결산") + 20)
-        title_label.setFixedSize(title_width, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
         title_label.setStyleSheet(
             auto_trade_setting_badge_stylesheet(
                 "QLabel",
                 text_color=AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
                 border_color=AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
             )
+        )
+        title_label.ensurePolished()
+        title_width = max(
+            64,
+            title_label.fontMetrics().horizontalAdvance("전체결산") + 20,
+        )
+        title_label.setFixedSize(
+            title_width,
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
         )
         title_slot_layout.addWidget(title_label, 0, Qt.AlignVCenter)
         title_slot_layout.addStretch(1)
@@ -1790,7 +1803,7 @@ class StockRegisterWindow(QDialog):
         self.stock_table.setColumnWidth(3, 120)
         self.stock_table.setColumnWidth(
             4,
-            stock_register_performance_column_width(self.stock_table.fontMetrics()),
+            stock_register_performance_column_width(self.fontMetrics()),
         )
         self.stock_table.setWordWrap(False)
         self.stock_table.verticalHeader().setDefaultSectionSize(42)
@@ -2725,7 +2738,10 @@ class StockRegisterWindow(QDialog):
                     self.stock_table.setCellWidget(
                         row,
                         col,
-                        stock_register_performance_widget(performance),
+                        stock_register_performance_widget(
+                            performance,
+                            font=self.font(),
+                        ),
                     )
 
         self.stock_table.resizeRowsToContents()
