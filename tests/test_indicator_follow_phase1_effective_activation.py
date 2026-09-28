@@ -136,17 +136,23 @@ class IndicatorFollowEffectiveActivationTest(unittest.TestCase):
                 manual_rule_commit_confirmed=True,
             )
 
-    def test_ui_and_pending_save_do_not_change_effective_core(self) -> None:
-        calls: list[str] = []
+    def test_save_edit_delegates_to_canonical_commit_only(self) -> None:
         owner = SimpleNamespace(
-            save_indicator_follow_ui_state_to_rules=lambda: calls.append("ui") or {"success": True},
-            save_indicator_follow_rule_pending_to_rules=lambda: calls.append("pending") or {"success": True},
+            commit_current_settings=mock.Mock(
+                return_value={"success": True, "ok": True, "committed": True}
+            ),
+            save_indicator_follow_ui_state_to_rules=mock.Mock(),
+            save_indicator_follow_rule_pending_to_rules=mock.Mock(),
             close=mock.Mock(),
         )
-        with mock.patch.object(dialog_module, "_refresh_routine_assignment_views"):
+        with mock.patch.object(dialog_module, "_refresh_routine_assignment_views") as refresh:
             result = IndicatorFollowRoutineSettingsDialog.save_edit_settings_and_close(owner)
         self.assertTrue(result["success"])
-        self.assertEqual(calls, ["ui", "pending"])
+        owner.commit_current_settings.assert_called_once_with()
+        owner.save_indicator_follow_ui_state_to_rules.assert_not_called()
+        owner.save_indicator_follow_rule_pending_to_rules.assert_not_called()
+        refresh.assert_called_once_with(owner)
+        owner.close.assert_called_once_with()
         self.assertEqual(self.base_rules["bar"]["bar_minutes"], 1)
 
     def test_manual_confirmation_is_required(self) -> None:
@@ -304,9 +310,16 @@ class IndicatorFollowEffectiveActivationTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        def completed(_candles, rules, **_kwargs):
+        def project_supply(_candles, rules, projection_request, **_kwargs):
             captured["bar_minutes"] = rules["bar"]["bar_minutes"]
-            return []
+            return {
+                "available": True,
+                "candles": [],
+                "availability_state": "READY",
+                "projection": projection_request["projection"],
+                "timeframe_minutes": rules["bar"]["bar_minutes"],
+                "required_minute_candles": 0,
+            }
 
         def evaluate(context):
             captured["context_rules"] = context["rules"]
@@ -322,15 +335,21 @@ class IndicatorFollowEffectiveActivationTest(unittest.TestCase):
             return_value=[],
         ), mock.patch.object(
             routine_signal_probe,
-            "completed_timeframe_candles",
-            side_effect=completed,
+            "project_candle_supply",
+            side_effect=project_supply,
         ), mock.patch.object(
             routine_signal_probe,
             "_maybe_enqueue_signal",
             return_value=None,
         ), mock.patch.object(routine_signal_probe, "_append_log"):
             routine_signal_probe.probe_routine_for_stock(
-                SimpleNamespace(ROUTINE_TYPE="INDICATOR_FOLLOW", evaluate=evaluate),
+                SimpleNamespace(
+                    ROUTINE_TYPE="INDICATOR_FOLLOW",
+                    evaluate=evaluate,
+                    market_bar_projection_request=lambda _rules: {
+                        "projection": "COMPLETED_TIMEFRAME"
+                    },
+                ),
                 "테스트 루틴",
                 stock_dir,
                 "2026-08-20 10:15",
