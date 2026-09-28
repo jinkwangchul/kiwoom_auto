@@ -1668,7 +1668,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             "보유수량이 없습니다.",
             duration_ms=2500,
         )
-        window.statusBarMessage.assert_called_with("조기마감 적용: 0개")
+        window.statusBarMessage.assert_not_called()
         self.assertEqual(
             {
                 "ok": False,
@@ -3347,11 +3347,13 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             for action in self._FakeMenu.root.submenus[1].actions
             if not action.separator
         ]
-        self.assertTrue(
-            all(
-                not action.property("individualLiquidationCurrent")
+        self.assertEqual(
+            ["이월"],
+            [
+                action.text
                 for action in actions
-            )
+                if action.property("individualLiquidationCurrent")
+            ],
         )
 
     def test_early_close_menu_keeps_plain_labels_when_setting_read_fails(
