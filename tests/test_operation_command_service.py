@@ -959,7 +959,7 @@ class OperationCommandServiceTest(unittest.TestCase):
             )
 
             status_result = service.record_manual_ats_liquidation_status(
-                str(stock),
+                "005930",
                 "ats-command-2",
                 "SEND_CALL_ACCEPTED",
                 order_id="ATS_ORDER_1",
@@ -993,7 +993,7 @@ class OperationCommandServiceTest(unittest.TestCase):
                 }
             ]
             waiting_result = service.record_manual_ats_liquidation_status(
-                str(stock),
+                "005930",
                 "ats-command-waiting",
                 "WAITING_CANCEL_CONFIRMATION",
                 cancel_order_identities=identities,
@@ -1012,7 +1012,7 @@ class OperationCommandServiceTest(unittest.TestCase):
                 },
             )
             ready_result = service.record_manual_ats_liquidation_status(
-                str(stock),
+                "005930",
                 "ats-command-waiting",
                 "READY_TO_RESUME",
             )
