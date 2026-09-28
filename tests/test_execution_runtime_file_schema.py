@@ -19,6 +19,7 @@ class ExecutionRuntimeFileSchemaTest(unittest.TestCase):
             {
                 "version": 1,
                 "updated_at": None,
+                "processes": [],
                 "executions": [],
             },
         )

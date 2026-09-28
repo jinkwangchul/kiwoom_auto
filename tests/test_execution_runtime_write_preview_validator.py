@@ -44,6 +44,11 @@ class ExecutionRuntimeWritePreviewValidatorTest(unittest.TestCase):
                 "order_id": "ORDER_1",
                 "lock_id": "LOCK_1",
             },
+            "append_requirements": {
+                "process": False,
+                "execution": True,
+                "lock": True,
+            },
             "would_write_targets": {
                 "order_executions": "runtime/order_executions.json",
                 "order_locks": "runtime/order_locks.json",
