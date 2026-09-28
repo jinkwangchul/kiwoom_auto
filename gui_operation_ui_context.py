@@ -116,18 +116,41 @@ def actionable_current_price(operation_context, stock_code: object) -> float | N
         candidates.append(owner)
 
     for candidate in candidates:
+        host_getter = getattr(
+            candidate,
+            "main_monitoring_auto_trade_operation_host",
+            None,
+        )
+        host = host_getter() if callable(host_getter) else None
+
+        evidence_getter = getattr(
+            candidate,
+            "production_current_price_evidence",
+            None,
+        )
+        if not callable(evidence_getter):
+            evidence_getter = getattr(
+                host,
+                "production_current_price_evidence",
+                None,
+            )
+        if callable(evidence_getter):
+            try:
+                evidence = evidence_getter(code)
+                price = getattr(evidence, "current_price", None)
+                number = float(price)
+            except Exception:
+                return None
+            if not isinstance(price, bool) and isfinite(number) and number > 0:
+                return number
+            return None
+
         state_getter = getattr(
             candidate,
             "fresh_monitoring_market_information_state",
             None,
         )
         if not callable(state_getter):
-            host_getter = getattr(
-                candidate,
-                "main_monitoring_auto_trade_operation_host",
-                None,
-            )
-            host = host_getter() if callable(host_getter) else None
             state_getter = getattr(
                 host,
                 "fresh_monitoring_market_information_state",
