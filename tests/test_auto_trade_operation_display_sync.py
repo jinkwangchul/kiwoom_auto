@@ -620,7 +620,10 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 status_item = window.stock_table.item(row, 4)
                 rank_by_status[status_item.text()] = status_item.data(SORT_ROLE)
 
-            self.assertEqual({"감시/대기": 0}, rank_by_status)
+            self.assertEqual(
+                {"감시/대기": 0, "운영종료": 99},
+                rank_by_status,
+            )
 
     def test_setting_trade_column_reuses_main_buy_sell_trade_counts(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -933,7 +936,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             self.assertEqual(["000002", "000001"], codes(situation_asc))
             self.assertEqual(["000001", "000002"], codes(situation_desc))
             self.assertEqual(["000001", "000002"], codes(status_asc))
-            self.assertEqual(["000001", "000002"], codes(status_desc))
+            self.assertEqual(["000002", "000001"], codes(status_desc))
 
     def test_manual_and_scheduled_display_contract(self) -> None:
         continuous = {"operation_mode": "CONTINUOUS"}
@@ -1249,7 +1252,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             )
 
             expected_status = create_auto_trade_setting_activity_status_item(
-                "감시/대기",
+                "운영종료",
                 False,
             )
             self.assertEqual(
@@ -1354,7 +1357,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
 
             self.assertEqual(before_text, state_path.read_text(encoding="utf-8"))
             self.assertEqual(original_state, read_json_dict(state_path))
-            self.assertEqual("감시/대기", window.stock_table.item(0, 4).text())
+            self.assertEqual("운영종료", window.stock_table.item(0, 4).text())
 
     def test_stale_and_no_target_display_projection_is_runtime_read_only(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -1372,7 +1375,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "operation_notice": "EARLY_CLOSE_WAITING",
                     "trade_started_at": "2026-08-10 11:00:00",
                 },
-                "감시/대기",
+                "운영종료",
             ),
             (
                 "no-target",
@@ -1385,7 +1388,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "operation_notice": "EARLY_CLOSE_NO_TARGET",
                     "operation_notice_reason": "조기마감 대상 없음",
                 },
-                "감시/대기",
+                "운영종료",
             ),
         )
 
