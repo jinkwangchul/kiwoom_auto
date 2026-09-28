@@ -1150,6 +1150,126 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             ("005930",)
         )
 
+    def test_production_current_price_evidence_selects_krx_in_regular_window(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=10, price=259500)
+            )
+        )
+        self.assertTrue(
+            self.market._process_nxt_display_tick(
+                self._nxt_tick_payload(sequence=20, price=261000)
+            )
+        )
+        with patch(
+            "gui_market_data_host.stock_nxt_availability",
+            return_value=True,
+        ):
+            evidence = self.host.production_current_price_evidence(
+                "005930",
+                now_dt=datetime.fromisoformat("2026-08-20T10:15:02+09:00"),
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual("KRX", evidence.market_source)
+        self.assertEqual("005930", evidence.broker_code_identity)
+        self.assertEqual(259500, evidence.current_price)
+
+    def test_production_current_price_evidence_selects_nxt_after_hours(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=10, price=259500)
+            )
+        )
+        self.assertTrue(
+            self.market._process_nxt_display_tick(
+                self._nxt_tick_payload(sequence=20, price=261000)
+            )
+        )
+        with patch(
+            "gui_market_data_host.stock_nxt_availability",
+            return_value=True,
+        ):
+            evidence = self.host.production_current_price_evidence(
+                "005930",
+                now_dt=datetime.fromisoformat("2026-08-20T18:00:02+09:00"),
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual("NXT", evidence.market_source)
+        self.assertEqual("005930_NX", evidence.broker_code_identity)
+        self.assertEqual("ECN주식체결", evidence.source_real_type)
+        self.assertEqual(261000, evidence.current_price)
+        self.assertEqual(
+            259500,
+            self.market.high_resolution_market_state("005930").last_price,
+        )
+
+    def test_production_current_price_evidence_gaps_and_ineligible_nxt_fail_closed(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=10, price=259500)
+            )
+        )
+        self.assertTrue(
+            self.market._process_nxt_display_tick(
+                self._nxt_tick_payload(sequence=20, price=261000)
+            )
+        )
+
+        with patch(
+            "gui_market_data_host.stock_nxt_availability",
+            return_value=True,
+        ):
+            self.assertIsNone(
+                self.market.production_current_price_evidence(
+                    "005930",
+                    now_dt=datetime.fromisoformat("2026-08-20T15:35:00+09:00"),
+                )
+            )
+        with patch(
+            "gui_market_data_host.stock_nxt_availability",
+            return_value=False,
+        ):
+            self.assertIsNone(
+                self.market.production_current_price_evidence(
+                    "005930",
+                    now_dt=datetime.fromisoformat("2026-08-20T18:00:02+09:00"),
+                )
+            )
+
+    def test_production_current_price_evidence_requires_current_broker_session(self) -> None:
+        self._activate_raw_session()
+        self.market._production_monitoring_stock_codes = ("005930",)
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=10, price=259500)
+            )
+        )
+        self.owner.kiwoom_api.broker_session_snapshot = Mock(
+            return_value=SimpleNamespace(
+                connected=False,
+                connection_epoch=7,
+                login_session_id="SESSION-7",
+            )
+        )
+        with patch(
+            "gui_market_data_host.stock_nxt_availability",
+            return_value=True,
+        ):
+            self.assertIsNone(
+                self.market.production_current_price_evidence(
+                    "005930",
+                    now_dt=datetime.fromisoformat("2026-08-20T10:15:02+09:00"),
+                )
+            )
+
     def _activate_raw_session(self) -> None:
         self.market._realtime_shadow_session_identity = (7, "SESSION-7")
 

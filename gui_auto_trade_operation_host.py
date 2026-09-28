@@ -546,6 +546,17 @@ class AutoTradeOperationHost(QObject):
     def nxt_display_live_price_state(self, stock_code: str):
         return self._market_data_host.nxt_display_live_price_state(stock_code)
 
+    def production_current_price_evidence(
+        self,
+        stock_code: str,
+        *,
+        now_dt=None,
+    ):
+        return self._market_data_host.production_current_price_evidence(
+            stock_code,
+            now_dt=now_dt,
+        )
+
     def monitoring_market_information_state(self, stock_code: str):
         return self._market_data_host.monitoring_market_information_state(stock_code)
 

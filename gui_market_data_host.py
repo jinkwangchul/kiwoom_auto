@@ -30,6 +30,7 @@ from event_journal_production import observe_production_exception
 from gui_stock_data import (
     STOCK_LIBRARY_READY,
     load_stock_library_snapshot,
+    stock_nxt_availability,
 )
 from kiwoom_market_data_authority import (
     MarketDataAuthority,
@@ -48,6 +49,10 @@ from kiwoom_realtime_shadow import (
     NO_CANONICAL_BAR,
     RealtimeShadowBar,
     compare_shadow_bar_to_canonical,
+)
+from production_current_price_authority import (
+    ProductionCurrentPriceEvidence,
+    select_production_current_price_evidence,
 )
 from stock_repository import StockRepository
 from stock_code_contract import (
@@ -1511,6 +1516,44 @@ class MarketDataHost(QObject):
         if code not in self._display_observation_target_stock_codes():
             return None
         return state
+
+    def production_current_price_evidence(
+        self,
+        stock_code: str,
+        *,
+        now_dt: datetime | None = None,
+    ) -> ProductionCurrentPriceEvidence | None:
+        """Project one read-only current-price authority evidence without mutation."""
+
+        code = str(stock_code or "").strip()
+        if not code:
+            return None
+        session_getter = getattr(self.kiwoom_api, "broker_session_snapshot", None)
+        if not callable(session_getter):
+            return None
+        try:
+            session = session_getter()
+            session_identity = (
+                int(getattr(session, "connection_epoch", 0) or 0),
+                str(getattr(session, "login_session_id", "") or "").strip(),
+            )
+        except Exception:
+            return None
+        if (
+            getattr(session, "connected", False) is not True
+            or not session_identity[1]
+            or session_identity != self._realtime_shadow_session_identity
+        ):
+            return None
+        return select_production_current_price_evidence(
+            canonical_stock_code=code,
+            connection_epoch=session_identity[0],
+            login_session_id=session_identity[1],
+            nxt_available=stock_nxt_availability(code),
+            krx_state=self.high_resolution_market_state(code),
+            nxt_state=self.nxt_display_live_price_state(code),
+            now_dt=now_dt,
+        )
 
     def _display_observation_target_stock_codes(self) -> tuple[str, ...]:
         return tuple(
