@@ -212,7 +212,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         _Menu.latest_root._test_runtime_state = dict(runtime_state)
         return _Menu.latest_root, callbacks
 
-    def test_scheduled_review_keeps_only_case_a_management_actions_enabled(self) -> None:
+    def test_scheduled_review_keeps_management_and_close_surfaces_available(self) -> None:
         review_menu, _callbacks = self._render("SCHEDULED", review=True)
         normal_menu, _callbacks = self._render("SCHEDULED", review=False)
         review = review_menu.top_entries()
@@ -221,12 +221,12 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         self.assertEqual(list(normal), list(review))
         for label in ("전체선택", "선택해제", "시간변경", "변경리셋"):
             self.assertTrue(review[label].enabled, label)
+        for label in ("조기마감", "개별청산"):
+            self.assertTrue(review[label].enabled, label)
         for label in (
             "운영시작",
             "검토정지",
             "운영제외",
-            "조기마감",
-            "개별청산",
             "종목등록",
             "등록해제",
             "간이차트",
@@ -234,7 +234,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             self.assertFalse(review[label].enabled, label)
         self.assertNotIn("ATS설정", review)
 
-    def test_continuous_review_keeps_only_case_b_management_actions_enabled(self) -> None:
+    def test_continuous_review_keeps_management_and_close_surfaces_available(self) -> None:
         review_menu, _callbacks = self._render("CONTINUOUS", review=True)
         normal_menu, _callbacks = self._render("CONTINUOUS", review=False)
         review = review_menu.top_entries()
@@ -243,12 +243,12 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         self.assertEqual(list(normal), list(review))
         for label in ("전체선택", "선택해제", "ATS설정"):
             self.assertTrue(review[label].enabled, label)
+        for label in ("조기마감", "개별청산"):
+            self.assertTrue(review[label].enabled, label)
         for label in (
             "운영시작",
             "검토정지",
             "운영제외",
-            "조기마감",
-            "개별청산",
             "종목등록",
             "등록해제",
             "간이차트",
@@ -273,7 +273,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         ):
             self.assertTrue(entries[label].enabled, label)
         for label in ("조기마감", "개별청산"):
-            self.assertFalse(entries[label].enabled, label)
+            self.assertTrue(entries[label].enabled, label)
 
     def test_scheduled_excluded_management_keeps_exact_requested_actions_enabled(self) -> None:
         menu, _callbacks = self._render(
@@ -312,7 +312,9 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "간이차트",
         ):
             self.assertTrue(entries[label].enabled, label)
-        for label in ("검토정지", "조기마감", "개별청산", "종목등록"):
+        for label in ("조기마감", "개별청산"):
+            self.assertTrue(entries[label].enabled, label)
+        for label in ("검토정지", "종목등록"):
             self.assertFalse(entries[label].enabled, label)
 
     def test_scheduled_excluded_management_dispatches_each_enabled_action(self) -> None:
@@ -337,8 +339,8 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
                 )
                 getattr(callbacks, callback_name).assert_called_once_with()
 
-    def test_scheduled_excluded_management_rejects_forced_disabled_actions(self) -> None:
-        for label in ("검토정지", "루틴마감", "종목등록"):
+    def test_scheduled_excluded_management_dispatches_close_but_rejects_restricted_actions(self) -> None:
+        for label in ("검토정지", "종목등록"):
             with self.subTest(label=label):
                 _menu, callbacks = self._render(
                     "SCHEDULED",
@@ -348,39 +350,51 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
                     scheduled_excluded_management=True,
                 )
                 callbacks.emergency_stop.assert_not_called()
-                callbacks.early_close.assert_not_called()
-                callbacks.individual_liquidation.assert_not_called()
                 callbacks.stock_register.assert_not_called()
 
-    def test_review_dispatch_rejects_forced_disabled_actions(self) -> None:
-        for label in ("운영시작", "루틴마감", "등록해제"):
+        _menu, callbacks = self._render(
+            "SCHEDULED",
+            review=False,
+            chosen_label="루틴마감",
+            operation_excluded=True,
+            scheduled_excluded_management=True,
+        )
+        callbacks.early_close.assert_called_once_with("루틴")
+
+    def test_review_dispatch_keeps_close_callback_but_rejects_restricted_actions(self) -> None:
+        for label in ("운영시작", "등록해제"):
             with self.subTest(label=label):
                 _menu, callbacks = self._render(
                     "SCHEDULED",
                     review=True,
                     chosen_label=label,
                 )
-
                 callbacks.start.assert_not_called()
-                callbacks.early_close.assert_not_called()
-                callbacks.individual_liquidation.assert_not_called()
                 callbacks.unregister.assert_not_called()
 
-    def test_review_disabled_submenus_cannot_be_forced_to_dispatch(self) -> None:
-        for menu_label, action_label in (
-            ("조기마감", "시장가"),
-            ("개별청산", "시장가"),
-        ):
-            with self.subTest(menu=menu_label):
-                _menu, callbacks = self._render(
-                    "SCHEDULED",
-                    review=True,
-                    chosen_label=action_label,
-                    chosen_menu_label=menu_label,
-                )
+        _menu, callbacks = self._render(
+            "SCHEDULED",
+            review=True,
+            chosen_label="루틴마감",
+        )
+        callbacks.early_close.assert_called_once_with("루틴")
 
-                callbacks.early_close.assert_not_called()
-                callbacks.individual_liquidation.assert_not_called()
+    def test_review_close_submenus_dispatch_to_backend_guard(self) -> None:
+        _menu, callbacks = self._render(
+            "SCHEDULED",
+            review=True,
+            chosen_label="시장가",
+            chosen_menu_label="조기마감",
+        )
+        callbacks.early_close.assert_called_once_with("시장가즉시")
+
+        _menu, callbacks = self._render(
+            "SCHEDULED",
+            review=True,
+            chosen_label="시장가",
+            chosen_menu_label="개별청산",
+        )
+        callbacks.individual_liquidation.assert_called_once_with("시장가", "5")
 
     def test_review_projection_preserves_canonical_reason_codes(self) -> None:
         menu, _callbacks = self._render("SCHEDULED", review=True)
