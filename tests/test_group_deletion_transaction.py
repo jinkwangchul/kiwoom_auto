@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,10 +23,10 @@ class GroupDeletionTransactionTests(unittest.TestCase):
             self.assertTrue(marked.success)
             self.assertTrue(marked.changed)
             self.assertFalse(repeated.changed)
-            self.assertEqual(
-                root / "groups" / ".transactions" / f"{group_id}.delete.json",
-                marked.marker_path,
+            expected_marker = (
+                root / "groups" / ".transactions" / f"{group_id}.delete.json"
             )
+            self.assertTrue(os.path.samefile(expected_marker, marked.marker_path))
             self.assertEqual(group_id, payload["group_id"])
             self.assertEqual("DELETE", payload["operation"])
             self.assertEqual("PENDING", payload["state"])
