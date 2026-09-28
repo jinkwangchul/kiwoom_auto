@@ -430,6 +430,12 @@ class IndicatorFollowExecutionKillSwitchTest(unittest.TestCase):
                 definition_id="indicator_follow",
                 display_name="지표추종매매",
                 package_dir=Path(temp),
+                locators={
+                    "evaluation": {
+                        "file": "routine.py",
+                        "callable": "evaluate",
+                    }
+                },
             )
             instance = SimpleNamespace(
                 definition_id="indicator_follow",
