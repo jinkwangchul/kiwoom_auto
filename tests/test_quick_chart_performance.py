@@ -1,3 +1,5 @@
+"""Chart performance boundaries, using isolated GUI and repository fixtures."""
+
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,95 +18,42 @@ from mock_validation_contract import payload_hash
 from mock_validation_host import MockValidationHost
 from mock_validation_ui_actions import MockValidationUIActions
 from tests.test_mock_validation_host_ui import _Api, _reference
-from tests.test_stock_instance_chart_auto_refresh import (
-    ChartOwner,
-    TODAY,
-    _completed_result,
-    _projection,
-)
+from tests.test_stock_instance_chart_auto_refresh import ChartOwner, TODAY, _projection, _completed_result
 
 
-class ChartRenderPerformanceTests(unittest.TestCase):
+class ChartPerformanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_paint_reuses_scale_time_range_and_segments(self):
+    def test_paint_scale_once_with_all_marker_and_bridge_paths(self):
         for count in (100, 300, 600, 1000):
             with self.subTest(candles=count):
                 widget = chart.StockInstanceCloseChart()
                 start = datetime(2026, 9, 11, 8)
                 end = start + timedelta(minutes=count + 2)
                 records = [
-                    {
-                        "bar_time": (start + timedelta(minutes=i)).isoformat(),
-                        "close": 100 + i % 17,
-                    }
+                    {"bar_time": (start + timedelta(minutes=i)).isoformat(), "close": 100 + i % 17}
                     for i in range(count)
                 ]
-                signals = [{
-                    "signal_bar_time": records[20]["bar_time"],
-                    "signal_bar_close": 103,
-                }]
-                fills = [{
-                    "marker_id": "F",
-                    "fill_id": "F",
-                    "side": "BUY",
-                    "occurred_at": records[30]["bar_time"],
-                    "filled_price": 106,
-                }]
+                signals = [{"signal_bar_time": records[20]["bar_time"], "signal_bar_close": 103}]
+                fills = [{"marker_id": "F", "fill_id": "F", "side": "BUY",
+                          "occurred_at": records[30]["bar_time"], "filled_price": 106}]
                 widget.set_projection(
-                    records,
-                    signals,
-                    signals,
-                    actual_fill_markers=fills,
-                    average_price=105,
-                    x_range_start=start,
-                    x_range_end=end,
-                    visible_time_ranges=[
-                        (start, start + timedelta(minutes=49)),
-                        (start + timedelta(minutes=60), end),
-                    ],
+                    records, signals, signals, actual_fill_markers=fills, average_price=105,
+                    x_range_start=start, x_range_end=end,
+                    visible_time_ranges=[(start, start + timedelta(minutes=49)),
+                                         (start + timedelta(minutes=60), end)],
                 )
                 widget.set_live_price_projection(end, 110)
                 scales = widget._scale_values()
-
-                series = (
-                    widget.close_series
-                    + widget.buy_series
-                    + widget.sell_series
-                    + widget.actual_buy_fill_series
-                    + [widget.live_price_point]
-                )
-                for time_value, value in series:
-                    self.assertEqual(
-                        widget.position_for(time_value, value),
-                        widget.position_for(
-                            time_value,
-                            value,
-                            scales=scales,
-                        ),
-                    )
-                self.assertEqual(
-                    widget._live_price_bridge_points(),
-                    widget._live_price_bridge_points(scales=scales),
-                )
-
-                with patch.object(
-                    widget,
-                    "_scale_values",
-                    wraps=widget._scale_values,
-                ) as scale, patch.object(
-                    widget,
-                    "_time_range",
-                    wraps=widget._time_range,
-                ) as time_range, patch.object(
-                    widget,
-                    "_line_segments",
-                    wraps=widget._line_segments,
-                ) as segments:
+                for time_value, value in widget.close_series + widget.buy_series + widget.sell_series + widget.actual_buy_fill_series + [widget.live_price_point]:
+                    self.assertEqual(widget.position_for(time_value, value), widget.position_for(time_value, value, scales=scales))
+                self.assertEqual(widget._live_price_bridge_points(), widget._live_price_bridge_points(scales=scales))
+                with patch.object(widget, "_scale_values", wraps=widget._scale_values) as scale, patch.object(
+                    widget, "_time_range", wraps=widget._time_range
+                ) as time_range, patch.object(widget, "_line_segments", wraps=widget._line_segments) as segments:
                     widget.grab()
-
                 self.assertEqual(1, scale.call_count)
                 self.assertEqual(1, time_range.call_count)
                 self.assertEqual(1, segments.call_count)
@@ -145,7 +94,6 @@ class ChartRenderPerformanceTests(unittest.TestCase):
             self.assertEqual(0, owner.operation_host.receivers(owner.operation_host.operation_cycle_completed))
             self.assertEqual(0, owner.kiwoom_api.receivers(owner.kiwoom_api.bar_committed))
 
-
     def test_shutdown_clear_cancels_actual_chart_queued_refresh(self):
         owner = ChartOwner()
         self.addCleanup(owner.close)
@@ -159,7 +107,6 @@ class ChartRenderPerformanceTests(unittest.TestCase):
             self.app.processEvents()
             provider.assert_not_called()
             self.assertFalse(window._bar_committed_refresh_pending)
-
 
     def test_shutdown_stops_timer_and_disconnects_without_repeated_global_refresh(self):
         owner = ChartOwner()
@@ -181,7 +128,6 @@ class ChartRenderPerformanceTests(unittest.TestCase):
             self.assertNotIn("005930", chart._OPEN_STOCK_INSTANCE_CHARTS)
             self.assertFalse(window._bar_committed_refresh_connected)
             self.assertFalse(window._operation_cycle_refresh_connected)
-
 
 
 class MockChartReadReuseTests(unittest.TestCase):
@@ -243,6 +189,7 @@ class MockChartReadReuseTests(unittest.TestCase):
             self.assertEqual(len(initial) + 1, len(read()))
             reader.assert_called_once()
         self.assertEqual(revision, repo.read_session(self.sid)["revision"])
+
 
 if __name__ == "__main__":
     unittest.main()
