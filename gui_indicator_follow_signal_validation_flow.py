@@ -83,10 +83,7 @@ from routines.지표추종매매.routine_validation_replay import (
 )
 from routines.지표추종매매.routine_validation_session import ValidationSession
 from stock_code_contract import normalize_broker_stock_code
-from stock_code_contract import (
-    market_data_identity_for_nxt_availability,
-    market_source_for_identity,
-)
+from stock_code_contract import market_source_for_identity
 
 
 DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 500
@@ -803,15 +800,32 @@ class IndicatorFollowSignalValidationFlow(QObject):
         )
 
     def _validation_market_data_identity(self, stock: ValidationStockRef) -> str:
-        broker_resolver = getattr(self._broker, "_market_data_request_identity", None)
-        if callable(broker_resolver):
-            try:
-                canonical, identity, _source = broker_resolver(stock.code)
-            except Exception:
-                canonical, identity = "", ""
-            if str(canonical or "").strip() == stock.code and str(identity or "").strip():
-                return str(identity).strip()
-        return market_data_identity_for_nxt_availability(stock.code, None)
+        """Validation Historical remains canonical KRX regardless of ATS eligibility."""
+        return stock.code
+
+    def _historical_result_matches_validation_source(
+        self,
+        result: object,
+        stock: ValidationStockRef,
+    ) -> bool:
+        if (
+            not isinstance(result, ValidationHistoricalResult)
+            or result.ok is not True
+            or result.snapshot is None
+        ):
+            return False
+        expected_identity = self._validation_market_data_identity(stock)
+        response_identity = str(
+            result.snapshot.market_data_identity or expected_identity
+        ).strip()
+        response_source = str(
+            result.snapshot.market_source
+            or market_source_for_identity(response_identity)
+        ).strip().upper()
+        return (
+            response_identity == expected_identity
+            and response_source == "KRX"
+        )
 
     @staticmethod
     def _context_provider_for_session(
@@ -949,12 +963,6 @@ class IndicatorFollowSignalValidationFlow(QObject):
         if entry_identity and entry_identity != expected_identity:
             return None
         if marker_identity and marker_identity != expected_identity:
-            return None
-        if (
-            not entry_identity
-            and not marker_identity
-            and expected_identity.endswith("_AL")
-        ):
             return None
         return entry
 
@@ -2221,9 +2229,10 @@ class IndicatorFollowSignalValidationFlow(QObject):
                     return
                 if (
                     production_calculation_enabled
-                    and isinstance(result, ValidationHistoricalResult)
-                    and result.ok is True
-                    and result.snapshot is not None
+                    and self._historical_result_matches_validation_source(
+                        result,
+                        fetch_session.request.stock,
+                    )
                 ):
                     try:
                         source_candles, _dropped_count = project_validation_candles(
@@ -2290,10 +2299,9 @@ class IndicatorFollowSignalValidationFlow(QObject):
                 refresh_target = current_target()
                 if refresh_target is None:
                     return
-                if (
-                    not isinstance(result, ValidationHistoricalResult)
-                    or result.ok is not True
-                    or result.snapshot is None
+                if not self._historical_result_matches_validation_source(
+                    result,
+                    fetch_session.request.stock,
                 ):
                     install_cached_pool()
                     return
@@ -2397,6 +2405,17 @@ class IndicatorFollowSignalValidationFlow(QObject):
         ):
             self._fail_window(window, self._failure_text("HISTORICAL", result))
             return False
+        persistence_session = (
+            source_session
+            if isinstance(source_session, ValidationSession)
+            else session
+        )
+        if not self._historical_result_matches_validation_source(
+            result,
+            persistence_session.request.stock,
+        ):
+            self._fail_window(window, "HISTORICAL: MARKET_SOURCE_IDENTITY_INVALID")
+            return False
         try:
             candles, _dropped_count = project_validation_candles(result.snapshot)
         except Exception as exc:
@@ -2408,11 +2427,6 @@ class IndicatorFollowSignalValidationFlow(QObject):
 
         requested_count = int(cache_requested_count or result.snapshot.requested_count)
         candles = merge_validation_candles([], candles, requested_count)
-        persistence_session = (
-            source_session
-            if isinstance(source_session, ValidationSession)
-            else session
-        )
         pool = self._pool_from_candles(
             persistence_session,
             candles,

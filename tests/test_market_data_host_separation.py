@@ -263,7 +263,7 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.assertEqual((70100, 102), (samsung.last_price, samsung.last_receive_sequence))
         self.assertEqual((210000, 101), (hynix.last_price, hynix.last_receive_sequence))
 
-    def test_integrated_tick_identity_survives_primary_host_processing(self) -> None:
+    def test_integrated_tick_identity_is_rejected_by_primary_host_admission(self) -> None:
         self._activate_raw_session()
         payload = self._raw_tick_payload(sequence=100)
         payload.update(
@@ -271,13 +271,10 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             market_source="INTEGRATED",
         )
 
-        self.assertTrue(self.market._process_raw_realtime_tick(payload))
+        self.assertFalse(self.market._raw_realtime_tick_minimally_valid(payload))
+        self.assertIsNone(self.market.high_resolution_market_state("005930"))
 
-        state = self.market.high_resolution_market_state("005930")
-        self.assertEqual("005930_AL", state.broker_code_identity)
-        self.assertEqual("INTEGRATED", state.market_source)
-
-    def test_registered_integrated_identity_is_not_re_resolved_at_callback_time(self) -> None:
+    def test_registered_integrated_identity_remains_rejected_by_contract(self) -> None:
         self.owner.kiwoom_api.snapshot = SimpleNamespace(
             active=True,
             connection_epoch=7,
@@ -295,7 +292,7 @@ class MarketDataHostSeparationTests(unittest.TestCase):
             "gui_stock_data.stock_nxt_availability",
             return_value=False,
         ) as current_eligibility:
-            self.assertTrue(self.market._raw_realtime_tick_minimally_valid(payload))
+            self.assertFalse(self.market._raw_realtime_tick_minimally_valid(payload))
 
         current_eligibility.assert_not_called()
 

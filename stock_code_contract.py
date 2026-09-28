@@ -7,12 +7,8 @@ from typing import Any
 
 
 STOCK_CODE_LENGTH = 6
-INTEGRATED_MARKET_DATA_SUFFIX = "_AL"
 NXT_MARKET_DATA_SUFFIX = "_NX"
-MARKET_DATA_SUFFIXES = (
-    INTEGRATED_MARKET_DATA_SUFFIX,
-    NXT_MARKET_DATA_SUFFIX,
-)
+MARKET_DATA_SUFFIXES = (NXT_MARKET_DATA_SUFFIX,)
 
 
 def normalize_stock_code(value: Any) -> str:
@@ -53,7 +49,7 @@ def canonical_stock_code_from_market_data_identity(value: Any) -> str:
 
 
 def is_market_data_stock_code(value: Any) -> bool:
-    """Accept bare, integrated, or NXT quote identities without changing orders."""
+    """Accept only bare canonical or explicit NXT quote identities."""
     identity = normalize_stock_code(value)
     canonical = canonical_stock_code_from_market_data_identity(identity)
     if not canonical:
@@ -67,19 +63,14 @@ def market_data_identity_for_nxt_availability(
     canonical_code: Any,
     nxt_available: bool | None,
 ) -> str:
-    """Choose Kiwoom integrated quotes only from verified positive evidence."""
+    """Compatibility shim: eligibility alone never changes quote identity."""
+    del nxt_available
     code = normalize_stock_code(canonical_code)
-    if not is_broker_action_stock_code(code):
-        return ""
-    if nxt_available is True:
-        return f"{code}{INTEGRATED_MARKET_DATA_SUFFIX}"
-    return code
+    return code if is_broker_action_stock_code(code) else ""
 
 
 def market_source_for_identity(value: Any) -> str:
     identity = normalize_stock_code(value)
-    if identity.endswith(INTEGRATED_MARKET_DATA_SUFFIX) and is_market_data_stock_code(identity):
-        return "INTEGRATED"
     if identity.endswith(NXT_MARKET_DATA_SUFFIX) and is_market_data_stock_code(identity):
         return "NXT"
     if is_broker_action_stock_code(identity):

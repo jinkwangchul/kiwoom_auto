@@ -810,7 +810,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1,
             } for index in range(fetch_count)),
             updated_at="2026-09-21T12:00:00+09:00",
-            market_data_identity="005930_AL", market_source="INTEGRATED",
+            market_data_identity="005930", market_source="KRX",
         )
         with patch.object(flow, "_cached_history", return_value=persistent), \
              patch.object(flow, "_cached_signal_entries", return_value=()) as load_signals, \
@@ -839,7 +839,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 callback(ValidationHistoricalResult(True, snapshot=ValidationHistoricalSnapshot(
                     stock=self.stock, timeframe_minutes=1, timeframe_key="M1",
                     requested_count=count, request_id="PROD-M1", rows=rows,
-                    market_data_identity="005930_AL", market_source="INTEGRATED",
+                    market_data_identity="005930", market_source="KRX",
                 )))
 
         flow = IndicatorFollowSignalValidationFlow(
@@ -1059,8 +1059,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                         requested_count=count,
                         request_id=f"PROD-CAP-{count}",
                         rows=rows,
-                        market_data_identity="005930_AL",
-                        market_source="INTEGRATED",
+                        market_data_identity="005930",
+                        market_source="KRX",
                     ),
                 ))
 
@@ -1266,8 +1266,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                         requested_count=count,
                         request_id=f"PROD-RETRY-{count}",
                         rows=rows,
-                        market_data_identity="005930_AL",
-                        market_source="INTEGRATED",
+                        market_data_identity="005930",
+                        market_source="KRX",
                     ),
                 ))
 

@@ -48,19 +48,19 @@ class IndicatorFollowValidationProductionSessionTest(unittest.TestCase):
             {"time": "20260921090000", "close": 100},
             {"time": "20260921090100", "close": 101},
         ]
-        base = identity("005930", "005930_AL", 5, contract, rows, 100, "REQ-1")
+        base = identity("005930", "005930", 5, contract, rows, 100, "REQ-1")
         self.assertIsNotNone(base)
-        self.assertNotEqual(base, identity("005930", "005930", 5, contract, rows, 100, "REQ-1"))
-        self.assertNotEqual(base, identity("005930", "005930_AL", 3, contract, rows, 100, "REQ-1"))
-        self.assertNotEqual(base, identity("005930", "005930_AL", 5, contract, rows, 200, "REQ-1"))
-        self.assertNotEqual(base, identity("005930", "005930_AL", 5, contract, rows[1:], 100, "REQ-1"))
+        self.assertNotEqual(base, identity("005930", "ALT_SOURCE", 5, contract, rows, 100, "REQ-1"))
+        self.assertNotEqual(base, identity("005930", "005930", 3, contract, rows, 100, "REQ-1"))
+        self.assertNotEqual(base, identity("005930", "005930", 5, contract, rows, 200, "REQ-1"))
+        self.assertNotEqual(base, identity("005930", "005930", 5, contract, rows[1:], 100, "REQ-1"))
         ats_contract = dict(contract, session_windows=[
             *contract["session_windows"],
             {"name": "extra2", "start_time": "15:40:00", "end_time": "20:00:00"},
         ])
-        self.assertNotEqual(base, identity("005930", "005930_AL", 5, ats_contract, rows, 100, "REQ-1"))
+        self.assertNotEqual(base, identity("005930", "005930", 5, ats_contract, rows, 100, "REQ-1"))
         selected_contract = dict(contract, selected_ats=["extra1"])
-        self.assertNotEqual(base, identity("005930", "005930_AL", 5, selected_contract, rows, 100, "REQ-1"))
+        self.assertNotEqual(base, identity("005930", "005930", 5, selected_contract, rows, 100, "REQ-1"))
 
     def test_production_minute_plan_blocks_a_target_above_the_production_cap(self):
         plan = getattr(production_session, "production_minute_source_plan", lambda *_: None)(

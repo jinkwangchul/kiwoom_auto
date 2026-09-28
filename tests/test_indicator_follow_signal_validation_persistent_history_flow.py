@@ -194,31 +194,34 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
         flow._now_factory = lambda: self.latest + timedelta(days=1)
         return flow
 
-    def test_market_data_identity_follows_broker_contract_and_unknown_is_krx(self):
+    def test_validation_market_data_identity_is_always_canonical_krx(self):
         class IntegratedBroker:
             @staticmethod
             def _market_data_request_identity(code):
                 return code, f"{code}_AL", "INTEGRATED"
 
-        flow = IndicatorFollowSignalValidationFlow(IntegratedBroker(), host=_Host())
-        self.assertEqual("005930_AL", flow._validation_market_data_identity(self.stock))
+        class NxtBroker:
+            @staticmethod
+            def _market_data_request_identity(code):
+                return code, f"{code}_NX", "NXT"
 
-        fallback = IndicatorFollowSignalValidationFlow(object(), host=_Host())
-        self.assertEqual("005930", fallback._validation_market_data_identity(self.stock))
+        class KrxBroker:
+            @staticmethod
+            def _market_data_request_identity(code):
+                return code, code, "KRX"
 
-    def test_response_provenance_is_persisted_after_broker_resolver_changes(self):
+        for broker in (IntegratedBroker(), NxtBroker(), KrxBroker(), object()):
+            with self.subTest(broker=type(broker).__name__):
+                flow = IndicatorFollowSignalValidationFlow(broker, host=_Host())
+                self.assertEqual(
+                    "005930",
+                    flow._validation_market_data_identity(self.stock),
+                )
+
+    def test_unsupported_response_provenance_is_rejected_without_persistence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
             flow = self._flow(cache, lambda *_args: None)
-            flow._broker = type(
-                "ChangedBroker",
-                (),
-                {
-                    "_market_data_request_identity": staticmethod(
-                        lambda code: (code, code, "KRX")
-                    )
-                },
-            )()
             session = flow_module.ValidationSession(
                 flow_module.ValidationRequest(self.stock, self.settings, 3),
                 operation_active_reader=lambda: False,
@@ -234,7 +237,7 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 market_source="INTEGRATED",
             )
 
-            self.assertTrue(
+            self.assertFalse(
                 flow._handle_historical_result(
                     window,
                     session,
@@ -251,12 +254,41 @@ class SignalValidationPersistentHistoryFlowTest(unittest.TestCase):
                 "M3",
                 self.fetch_count,
             )
-            marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            entry = cache.load(self.stock.code, 3, self.fetch_count, "M3")
-            self.assertEqual("005930_AL", marker["market_data_identity"])
-            self.assertEqual("INTEGRATED", marker["market_source"])
-            self.assertEqual("005930_AL", entry.market_data_identity)
-            self.assertEqual("INTEGRATED", entry.market_source)
+            self.assertFalse(marker_path.exists())
+            self.assertIsNone(
+                cache.load(self.stock.code, 3, self.fetch_count, "M3")
+            )
+
+    def test_cached_history_rejects_legacy_integrated_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = IndicatorFollowSignalValidationHistoricalCache(temp_dir)
+            candles = _candles(
+                self.fetch_count,
+                3,
+                self.latest,
+            )
+            self.assertTrue(
+                cache.store(
+                    stock_code=self.stock.code,
+                    stock_name=self.stock.name,
+                    timeframe_minutes=3,
+                    timeframe_key="M3",
+                    requested_count=self.fetch_count,
+                    candles=candles,
+                    market_data_identity="005930_AL",
+                    market_source="INTEGRATED",
+                )
+            )
+            flow = self._flow(cache, lambda *_args: None)
+
+            self.assertIsNone(
+                flow._cached_history(
+                    self.stock,
+                    3,
+                    "M3",
+                    self.fetch_count,
+                )
+            )
 
     @staticmethod
     def _register_window(flow, window):

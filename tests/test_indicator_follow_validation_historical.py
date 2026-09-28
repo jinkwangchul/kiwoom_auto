@@ -328,18 +328,18 @@ class ValidationHistoricalProviderTest(unittest.TestCase):
         provider, broker = self._provider(Mock(side_effect=(False, False)))
         results = []
         response = self._valid_response(
-            market_data_identity="005930_AL",
-            market_source="INTEGRATED",
+            market_data_identity="005930",
+            market_source="KRX",
         )
         provider.request_latest(2, results.append)
 
         broker.complete(response)
-        response["market_data_identity"] = "005930"
-        response["market_source"] = "KRX"
+        response["market_data_identity"] = "CHANGED"
+        response["market_source"] = "CHANGED"
 
         snapshot = results[0].snapshot
-        self.assertEqual("005930_AL", snapshot.market_data_identity)
-        self.assertEqual("INTEGRATED", snapshot.market_source)
+        self.assertEqual("005930", snapshot.market_data_identity)
+        self.assertEqual("KRX", snapshot.market_source)
 
     def test_broker_payload_mutation_cannot_change_snapshot_or_cache(self) -> None:
         provider, broker = self._provider(Mock(side_effect=(False, False)))
