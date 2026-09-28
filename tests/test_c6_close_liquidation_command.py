@@ -92,6 +92,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 intent=command.INDIVIDUAL_LIQUIDATION,
                 requested_method="시장가",
                 requested_minutes="5",
+                now_dt=datetime(2026, 8, 30, 10, 0),
                 recovery_inspector=self._recovery_allowed,
             )
             after = {
@@ -462,6 +463,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 method="시장가",
                 minutes_before_regular_close="5",
                 source="test",
+                now_dt=datetime(2026, 8, 30, 10, 0),
                 project_root=root,
                 command_service_factory=factory,
             )
@@ -475,6 +477,7 @@ class CloseLiquidationCommandTest(unittest.TestCase):
                 method="시장가",
                 minutes_before_regular_close="5",
                 source="test",
+                now_dt=datetime(2026, 8, 30, 10, 0),
                 project_root=root,
                 recovery_inspector=lambda _code, _caller: SimpleNamespace(
                     allowed=False,
