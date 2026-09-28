@@ -109,7 +109,7 @@ class TransitionProductionGuardTest(unittest.TestCase):
                 transition_requested_at="2026-07-27 13:30:00",
             ),
             current="시장가",
-            requested="현재가",
+            requested="루틴매도신호",
         )
         self.assertFalse(result.allowed)
         self.assertEqual(result.evidence_status, EVIDENCE_COMPLETE)
