@@ -9160,13 +9160,33 @@ class AutoTradeSettingWindow(QDialog):
         def send_order_callable():
             return getattr(api_object(), "send_order", None)
 
-        def fresh_current_price(stock_code: str):
+        def operation_host():
             owner = persistent_feature_owner(self)
-            host_getter = getattr(owner, "main_monitoring_auto_trade_operation_host", None)
-            host = host_getter() if callable(host_getter) else None
-            state_getter = getattr(host, "fresh_monitoring_market_information_state", None)
-            state = state_getter(stock_code) if callable(state_getter) else None
-            return getattr(state, "last_price", None)
+            host_getter = getattr(
+                owner,
+                "main_monitoring_auto_trade_operation_host",
+                None,
+            )
+            if not callable(host_getter):
+                return None
+            try:
+                return host_getter()
+            except Exception:
+                return None
+
+        def production_current_price_evidence(stock_code: str):
+            host = operation_host()
+            getter = getattr(host, "production_current_price_evidence", None)
+            if not callable(getter):
+                return None
+            try:
+                return getter(stock_code)
+            except Exception:
+                return None
+
+        def fresh_current_price(stock_code: str):
+            evidence = production_current_price_evidence(stock_code)
+            return getattr(evidence, "current_price", None)
 
         def production_recovery_gate_for_stock(stock_code: str, caller_name: str):
             owner = persistent_feature_owner(self)
@@ -9217,6 +9237,7 @@ class AutoTradeSettingWindow(QDialog):
                 else None
             ),
             fresh_current_price=fresh_current_price,
+            fresh_current_price_evidence=production_current_price_evidence,
             production_recovery_gate_for_stock=(
                 production_recovery_gate_for_stock
                 if callable(owner_recovery_gate)
