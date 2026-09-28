@@ -46,6 +46,7 @@ from gui_operation_ui_primitives import (
     CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
     PersistentContextMenu,
     _MenuActionColorProxyStyle,
+    _menu_item_text_color,
     _add_ats_settings_menu as _build_ats_settings_menu,
     _add_early_close_menu,
     _add_individual_liquidation_menu,
