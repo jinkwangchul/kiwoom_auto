@@ -431,6 +431,8 @@ class RoutineLimitNextRoundRecalculationTest(unittest.TestCase):
                         "assigned_routine_instance_id": "instance-a",
                         "routine_instance_name": "루틴 A",
                         "operation_mode": "SCHEDULED",
+                        "start_time": "09:00:00",
+                        "end_buy_time": "13:30:00",
                     },
                     ensure_ascii=False,
                 ),
@@ -450,6 +452,11 @@ class RoutineLimitNextRoundRecalculationTest(unittest.TestCase):
             with (
                 patch.object(run_control, "ORDER_QUEUE_PATH", queue_path),
                 patch.object(run_control, "read_operation_state", return_value={}),
+                patch.object(
+                    run_control,
+                    "current_datetime",
+                    return_value=datetime(2026, 8, 10, 10, 0, 0),
+                ),
                 patch.object(
                     run_control,
                     "initial_buy_start_validation",

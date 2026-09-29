@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime
 import os
 import sys
 import unittest
@@ -30,6 +31,16 @@ from PyQt5.QtWidgets import (
 
 import gui_main_table_loader as table_loader
 import gui_windows
+
+
+_REAL_STOCK_OPERATION_CATEGORY = table_loader.auto_trade_stock_operation_category
+
+
+def _fixed_stock_operation_category(*args, **kwargs):
+    kwargs["now_dt"] = datetime(2026, 8, 10, 10, 0, 0)
+    return _REAL_STOCK_OPERATION_CATEGORY(*args, **kwargs)
+
+
 from gui_auto_trade_display import profit_loss_value_color
 from gui_windows import MainWindow
 from tests.participant_owner_fixture import attach_participant_owner, participant_owner
@@ -263,6 +274,11 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 ],
             ),
             patch.object(table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
+            ),
         ):
             counts = table_loader._instance_stock_counts(
                 window=SimpleNamespace(
@@ -1235,6 +1251,11 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "load_persisted_routine_instances",
                 return_value=[SimpleNamespace(instance_id="instance-a")],
             ),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
+            ),
         ):
             window = SimpleNamespace(
                 _main_monitoring_auto_trade_operation_host=participant_owner({"000001"}),
@@ -1276,6 +1297,11 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 table_loader,
                 "load_persisted_routine_instances",
                 return_value=[SimpleNamespace(instance_id="instance-a")],
+            ),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
             ),
         ):
             ended = table_loader._instance_stock_counts(

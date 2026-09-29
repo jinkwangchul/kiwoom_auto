@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -3853,7 +3853,19 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "enabled": True,
                 "stock_path": str(stock_dir),
             }
+            real_operation_category = (
+                gui_main_table_loader.auto_trade_stock_operation_category
+            )
+
+            def fixed_operation_category(*args, **kwargs):
+                kwargs["now_dt"] = datetime(2026, 8, 10, 10, 0, 0)
+                return real_operation_category(*args, **kwargs)
+
             with patch.object(
+                gui_main_table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=fixed_operation_category,
+            ), patch.object(
                 gui_main_table_loader,
                 "project_confirmable_cumulative_pnl",
                 return_value={"available": False},

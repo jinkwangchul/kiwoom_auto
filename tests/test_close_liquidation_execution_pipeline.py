@@ -838,7 +838,10 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                     return_value={"ok": True},
                 ),
             ):
-                result = close.auto_trade_continue_pending_close_liquidations(Mock())
+                result = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    now_dt=datetime(2026, 7, 27, 10, 0, 0),
+                )
 
         self.assertEqual(0, result["processed"])
         self.assertEqual(1, result["blocked"])

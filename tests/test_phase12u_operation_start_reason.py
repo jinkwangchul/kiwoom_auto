@@ -91,7 +91,7 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
             run_control._start_failure_user_message([]),
         )
 
-    def test_all_structural_targets_outside_time_are_admitted(self) -> None:
+    def test_final_session_ended_target_is_blocked_before_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _write_target(Path(temp_dir), "000001")
             window = _StartReasonWindow([target])
@@ -117,17 +117,18 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                     request_scope=run_control.START_REQUEST_MULTIPLE,
                 )
 
-            self.assertTrue(result["ok"])
-            self.assertEqual(1, result["started_count"])
-            self.assertEqual((target,), result["time_eligible_targets"])
-            self.assertEqual((), result["time_blocked_targets"])
+            self.assertFalse(result["ok"])
+            self.assertEqual(0, result["started_count"])
+            self.assertEqual((), result["time_eligible_targets"])
+            self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
+            self.assertEqual(("FINAL_SESSION_ENDED",), result["internal_reason"])
             self.assertEqual(
-                ("000001",),
+                (),
                 run_control.auto_trade_current_session_operation_participant_codes(
                     window
                 ),
             )
-            writer.assert_called_once_with(participant_stock_codes=["000001"])
+            writer.assert_not_called()
 
     def test_time_eligible_target_keeps_downstream_validation_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -164,10 +165,11 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                 )
 
             self.assertFalse(result["ok"])
-            self.assertIn("운영 상태를 저장하지 못했습니다", str(result["user_message"]))
-            self.assertNotIn("매매 운영 시간이 아닙니다", str(result["user_message"]))
-            self.assertEqual((outside, inside), result["time_eligible_targets"])
-            self.assertEqual((), result["time_blocked_targets"])
+            self.assertIn("유효 운영세션 없음", str(result["user_message"]))
+            self.assertEqual((inside,), result["time_eligible_targets"])
+            self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
+            self.assertEqual(("STATE_SAVE_FAILED",), result["internal_reason"])
+            self.assertEqual(("000002 테스트",), result["failed"])
             writer.assert_not_called()
 
     def test_schedule_helper_matches_guard_time_contract(self) -> None:
@@ -183,7 +185,7 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
         self.assertTrue(run_control.auto_trade_operation_time_allowed(config, now_dt=during))
         self.assertFalse(run_control.auto_trade_operation_time_allowed(config, now_dt=after))
 
-    def test_main_global_adapter_path_allows_outside_time_start(self) -> None:
+    def test_main_global_adapter_path_blocks_after_final_session_end(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _write_target(Path(temp_dir), "012210")
 
@@ -275,10 +277,17 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                     operation_state_reader=lambda: {},
                 )
 
-            self.assertTrue(result_holder["result"]["ok"])
-            self.assertEqual(1, result_holder["result"]["started_count"])
-            self.assertEqual((), result_holder["result"]["time_blocked_targets"])
-            writer.assert_called_once_with(participant_stock_codes=["012210"])
+            self.assertFalse(result_holder["result"]["ok"])
+            self.assertEqual(0, result_holder["result"]["started_count"])
+            self.assertEqual(
+                ("012210 테스트",),
+                result_holder["result"]["time_blocked_targets"],
+            )
+            self.assertEqual(
+                ("FINAL_SESSION_ENDED",),
+                result_holder["result"]["internal_reason"],
+            )
+            writer.assert_not_called()
 
 
 if __name__ == "__main__":

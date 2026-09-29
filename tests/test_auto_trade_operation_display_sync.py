@@ -612,6 +612,11 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "pending_order_side_quantities",
                     return_value=(0, 0),
                 ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "auto_trade_stock_operation_category",
+                    return_value="waiting",
+                ),
             ):
                 gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(window)
 
@@ -620,10 +625,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 status_item = window.stock_table.item(row, 4)
                 rank_by_status[status_item.text()] = status_item.data(SORT_ROLE)
 
-            self.assertEqual(
-                {"감시/대기": 0, "운영종료": 99},
-                rank_by_status,
-            )
+            self.assertEqual({"감시/대기": 0}, rank_by_status)
 
     def test_setting_trade_column_reuses_main_buy_sell_trade_counts(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -912,6 +914,11 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "pending_order_side_quantities",
                     return_value=(0, 0),
                 ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "auto_trade_stock_operation_category",
+                    return_value="waiting",
+                ),
             ):
                 gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(window)
             return window
@@ -936,7 +943,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             self.assertEqual(["000002", "000001"], codes(situation_asc))
             self.assertEqual(["000001", "000002"], codes(situation_desc))
             self.assertEqual(["000001", "000002"], codes(status_asc))
-            self.assertEqual(["000002", "000001"], codes(status_desc))
+            self.assertEqual(["000001", "000002"], codes(status_desc))
 
     def test_manual_and_scheduled_display_contract(self) -> None:
         continuous = {"operation_mode": "CONTINUOUS"}
@@ -1218,6 +1225,11 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "pending_order_side_quantities",
                     return_value=(0, 0),
                 ),
+                patch.object(
+                    gui_main_table_loader,
+                    "auto_trade_stock_operation_category",
+                    return_value="waiting",
+                ),
             ):
                 gui_main_table_loader.main_load_running_stock_table(window)
 
@@ -1252,7 +1264,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             )
 
             expected_status = create_auto_trade_setting_activity_status_item(
-                "운영종료",
+                "감시/대기",
                 False,
             )
             self.assertEqual(
@@ -1350,6 +1362,11 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "auto_trade_setting_is_after_regular_end",
                     return_value=True,
                 ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "auto_trade_stock_operation_category",
+                    return_value="waiting",
+                ),
             ):
                 gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(
                     window
@@ -1357,7 +1374,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
 
             self.assertEqual(before_text, state_path.read_text(encoding="utf-8"))
             self.assertEqual(original_state, read_json_dict(state_path))
-            self.assertEqual("운영종료", window.stock_table.item(0, 4).text())
+            self.assertEqual("감시/대기", window.stock_table.item(0, 4).text())
 
     def test_stale_and_no_target_display_projection_is_runtime_read_only(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -1375,7 +1392,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "operation_notice": "EARLY_CLOSE_WAITING",
                     "trade_started_at": "2026-08-10 11:00:00",
                 },
-                "운영종료",
+                "감시/대기",
             ),
             (
                 "no-target",
@@ -1388,7 +1405,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "operation_notice": "EARLY_CLOSE_NO_TARGET",
                     "operation_notice_reason": "조기마감 대상 없음",
                 },
-                "운영종료",
+                "감시/대기",
             ),
         )
 
@@ -1453,6 +1470,11 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                         gui_auto_trade_table_loader,
                         "status_after_operation_mode_change",
                         return_value="WAIT_BUY",
+                    ),
+                    patch.object(
+                        gui_auto_trade_table_loader,
+                        "auto_trade_stock_operation_category",
+                        return_value="waiting",
                     ),
                 ):
                     gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(

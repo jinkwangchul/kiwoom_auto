@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime
 import tempfile
 import types
 import unittest
@@ -126,6 +127,7 @@ def _install_pyqt5_import_stubs() -> None:
 _install_pyqt5_import_stubs()
 
 import gui_main_table_loader
+import gui_auto_trade_policy
 import gui_auto_trade_timer
 from gui_auto_trade_policy import (
     auto_trade_register_current_session_operation_participants,
@@ -136,6 +138,14 @@ from gui_auto_trade_run_control import auto_trade_start_selected_auto_trades
 from gui_auto_trade_timer import auto_trade_real_execution_active, auto_trade_run_operation_cycle
 from operator_reconciliation_service import assess_startup_recovery
 from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
+
+
+_REAL_OPERATION_SESSION_PHASE = gui_auto_trade_policy.auto_trade_operation_session_phase
+
+
+def _fixed_operation_session_phase(*args, **kwargs):
+    kwargs["now_dt"] = datetime(2026, 8, 10, 10, 0, 0)
+    return _REAL_OPERATION_SESSION_PHASE(*args, **kwargs)
 
 
 class StartupRecoverySessionResumeTest(unittest.TestCase):
@@ -724,9 +734,14 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 "create_auto_trade_setting_activity_status_item",
                 side_effect=lambda status, _active: {"status": status},
             ),
+            patch.object(
+                gui_auto_trade_policy,
+                "auto_trade_operation_session_phase",
+                side_effect=_fixed_operation_session_phase,
+            ),
         )
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             blocked = Window(ready=False)
             attach_participant_owner(blocked)
             gui_main_table_loader.main_load_running_stock_table(blocked)
@@ -881,6 +896,11 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 gui_main_table_loader,
                 "create_auto_trade_setting_activity_status_item",
                 side_effect=lambda status, _active: {"status": status},
+            ),
+            patch.object(
+                gui_auto_trade_policy,
+                "auto_trade_operation_session_phase",
+                side_effect=_fixed_operation_session_phase,
             ),
         ):
             window = Window()

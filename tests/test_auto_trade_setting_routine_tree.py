@@ -47,6 +47,14 @@ import gui_routine_policy as routine_policy
 from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
 
+_REAL_STOCK_OPERATION_CATEGORY = table_loader.auto_trade_stock_operation_category
+
+
+def _fixed_stock_operation_category(*args, **kwargs):
+    kwargs["now_dt"] = datetime(2026, 8, 10, 10, 0, 0)
+    return _REAL_STOCK_OPERATION_CATEGORY(*args, **kwargs)
+
+
 class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -11221,6 +11229,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "current_stock_trade_counts_by_code",
                 return_value={},
             ),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
+            ),
         ):
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(expected_codes, loaded_codes())
@@ -15199,7 +15212,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ]
 
         with patch.object(table_loader, "read_base_stocks", return_value=stocks), \
-                patch.object(table_loader, "read_json_dict", side_effect=fake_read_json):
+                patch.object(table_loader, "read_json_dict", side_effect=fake_read_json), \
+                patch.object(
+                    table_loader,
+                    "auto_trade_stock_operation_category",
+                    side_effect=_fixed_stock_operation_category,
+                ):
             window._stock_status_filter = "all"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(["111111", "222222", "333333", "444444", "555555"], loaded_codes())
@@ -15296,6 +15314,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(table_loader, "read_base_stocks", return_value=stocks),
             patch.object(table_loader, "read_json_dict", side_effect=fake_read_json),
             patch.object(table_loader, "current_stock_trade_counts_by_code", return_value={}),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
+            ),
         ):
             window._stock_status_filter = "all"
             table_loader.auto_trade_load_selected_routine_stocks(window)
@@ -15382,6 +15405,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(table_loader, "read_base_stocks", return_value=stocks),
             patch.object(table_loader, "read_json_dict", side_effect=fake_read_json),
             patch.object(table_loader, "current_stock_trade_counts_by_code", return_value={}),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
+            ),
+            patch.object(
+                main_table_loader,
+                "auto_trade_stock_operation_category",
+                side_effect=_fixed_stock_operation_category,
+            ),
         ):
             counts = aggregate_counts()
             self.assertEqual((5, 5, 0), (

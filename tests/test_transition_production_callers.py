@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -243,6 +244,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     window,
                     "시장가",
                     "10",
+                    now_dt=datetime(2026, 7, 27, 10, 0),
                 )
 
             self.assertEqual(
@@ -285,6 +287,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     window,
                     "\uc2dc\uc7a5\uac00",
                     "10",
+                    now_dt=datetime(2026, 7, 27, 10, 0),
                 )
 
             self.assertEqual(state_path.read_bytes(), before)
