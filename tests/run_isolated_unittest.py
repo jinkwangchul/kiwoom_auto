@@ -19,7 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = Path(__file__).resolve().parent
 RAN_RE = re.compile(r"Ran\s+(\d+)\s+tests?\s+in")
 COUNT_RE = re.compile(r"(failures|errors|skipped)=(\d+)")
-PER_TEST_MODULES: set[str] = set()
+PER_TEST_MODULES: set[str] = {
+    "tests.test_mock_validation_host_ui",
+    "tests.test_stock_name_tooltip_persistence",
+}
 
 
 def _test_modules() -> list[str]:

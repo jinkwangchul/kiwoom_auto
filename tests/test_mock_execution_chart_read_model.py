@@ -13,6 +13,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
+from tests.qt_test_support import ensure_qapplication
 from mock_validation_contract import payload_hash
 from mock_validation_execution_chart_read_model import project_mock_execution_chart
 import mock_validation_quick_chart as quick_chart
@@ -196,7 +197,7 @@ class MockExecutionChartTests(unittest.TestCase):
 class MockExecutionChartGuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
 
     def test_diamond_click_rail_click_round_and_simulated_time(self):
         doc = document_fixture(); add_plan(doc, mode="MULTI_HOGA", count=3, completed=3)
@@ -209,9 +210,19 @@ class MockExecutionChartGuiTests(unittest.TestCase):
         window = StockInstanceChartWindow("005930", DAY, projection_provider=lambda *_: projection)
         self.addCleanup(window.close)
         window.show(); self.app.processEvents()
-        with patch.object(window.chart, "_draw_actual_fill_marker", wraps=window.chart._draw_actual_fill_marker) as draw:
+        original_draw = window.chart._draw_actual_fill_marker
+        draw_count = [0]
+
+        def counted_draw(painter, point, color, *, selected):
+            draw_count[0] += 1
+            return original_draw(painter, point, color, selected=selected)
+
+        window.chart._draw_actual_fill_marker = counted_draw
+        try:
             window.chart.grab()
-        self.assertGreater(draw.call_count, 0)
+        finally:
+            window.chart._draw_actual_fill_marker = original_draw
+        self.assertGreater(draw_count[0], 0)
         self.assertEqual(3, len(window.chart.actual_fill_marker_records))
         self.assertEqual(1, len(window.chart.buy_series))
         marker = window.chart.actual_fill_marker_records[1]
