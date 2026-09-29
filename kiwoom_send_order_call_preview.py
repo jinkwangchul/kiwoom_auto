@@ -49,6 +49,7 @@ def _result(
 
 def _validate_send_order_params(params: dict[str, Any]) -> str | None:
     required = (
+        "rqname",
         "screen_no",
         "order_name",
         "account_no",
@@ -72,8 +73,8 @@ def _validate_send_order_params(params: dict[str, Any]) -> str | None:
 
 def _build_send_order_args(params: dict[str, Any]) -> list[Any]:
     return [
+        params.get("rqname"),
         params.get("screen_no"),
-        params.get("order_name"),
         params.get("account_no"),
         params.get("order_type"),
         params.get("code"),
@@ -159,8 +160,8 @@ def preview_kiwoom_send_order_call(
         "send_order_params": deepcopy(params),
         "send_order_args_ready": True,
         "send_order_arg_order": [
+            "rqname",
             "screen_no",
-            "order_name",
             "account_no",
             "order_type",
             "code",

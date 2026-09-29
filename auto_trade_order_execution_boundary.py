@@ -332,6 +332,8 @@ class AutoTradeOrderExecutionContext:
     fresh_current_price: Callable[[str], int | float | None] | None = None
     fresh_current_price_evidence: Callable[[str], object | None] | None = None
     production_recovery_gate_for_stock: Callable[[str, str], object] | None = None
+    send_order_reconciliation_register: Callable[[dict[str, object]], object] | None = None
+    live_sor_reconciliation_capability: Callable[[], object] | None = None
 
 
 class AutoTradeOrderExecutionBoundary:
@@ -949,6 +951,31 @@ class AutoTradeOrderExecutionBoundary:
             send_order_callable = self._context.send_order_callable()
         except Exception:
             send_order_callable = None
+        reconciliation_register = self._context.send_order_reconciliation_register
+        capability_getter = self._context.live_sor_reconciliation_capability
+        try:
+            capability_value = (
+                capability_getter()
+                if callable(capability_getter)
+                else {}
+            )
+        except Exception:
+            capability_value = {
+                "ready": False,
+                "missing_capabilities": [
+                    "live_sor_reconciliation_capability_unavailable"
+                ],
+            }
+        capability_snapshot = (
+            dict(capability_value)
+            if isinstance(capability_value, dict)
+            else {
+                "ready": False,
+                "missing_capabilities": [
+                    "live_sor_reconciliation_capability_invalid"
+                ],
+            }
+        )
 
         execution_request = order.get("execution_request")
         execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
@@ -993,6 +1020,12 @@ class AutoTradeOrderExecutionBoundary:
             "request_account_no": request_account,
             "canonical_queue_path": canonical_queue,
             "send_order_callable": send_order_callable,
+            "send_order_reconciliation_register": (
+                reconciliation_register
+                if callable(reconciliation_register)
+                else None
+            ),
+            "live_sor_reconciliation_capability_snapshot": capability_snapshot,
         }
 
     @staticmethod
@@ -3006,6 +3039,14 @@ class AutoTradeOrderExecutionBoundary:
             context={
                 "send_order_attempt_owner": "AUTO_TRADE_SEND_ORDER",
                 "send_order_attempt_source": "auto_trade_timer",
+                "send_order_reconciliation_register": latest_environment.get(
+                    "send_order_reconciliation_register"
+                ),
+                "live_sor_reconciliation_capability_snapshot": (
+                    latest_environment.get(
+                        "live_sor_reconciliation_capability_snapshot"
+                    )
+                ),
             },
         )
         result["order_id"] = order_id

@@ -85,7 +85,7 @@ def _process_claimed_send_worker(queue_path: str, start_event: object, result_qu
         "GUI_MANUAL",
         1,
         ClaimedSendOrderCallable(0),
-        ["0101", "SELL", "12345678", 2, "003550", 10, 85000, "00", ""],
+        ["SELL", "0101", "12345678", 2, "003550", 10, 85000, "00", ""],
         {"send_order_attempt_id": "ATTEMPT_PROCESS"},
     )
     result_queue.put(result)
@@ -93,7 +93,7 @@ def _process_claimed_send_worker(queue_path: str, start_event: object, result_qu
 
 class KiwoomSendOrderExecutorTest(unittest.TestCase):
     def _call_preview(self, **overrides: object) -> dict[str, object]:
-        args = ["0101", "BUY", "12345678", 1, "003550", 10, 85000, "03", ""]
+        args = ["BUY", "0101", "12345678", 1, "003550", 10, 85000, "03", ""]
         result: dict[str, object] = {
             "status": "SEND_ORDER_CALL_READY",
             "send_order_call_preview": {
@@ -157,7 +157,7 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         return target
 
     def _claimed_args(self) -> list[object]:
-        return ["0101", "SELL", "12345678", 2, "003550", 10, 85000, "00", ""]
+        return ["SELL", "0101", "12345678", 2, "003550", 10, 85000, "00", ""]
 
     def _execute_claimed(
         self,
@@ -195,13 +195,13 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertFalse(result["queue_write"])
         self.assertFalse(result["recorded"])
         self.assertEqual(1, len(adapter.calls))
-        self.assertEqual(tuple(["0101", "BUY", "12345678", 1, "003550", 10, 85000, "03", ""]), adapter.calls[0])
+        self.assertEqual(tuple(["BUY", "0101", "12345678", 1, "003550", 10, 85000, "03", ""]), adapter.calls[0])
         self.assertEqual(0, result["send_order_result"]["return_code"])
 
     def test_preview_executor_still_allows_sor_order_types(self) -> None:
         for order_type in (11, 12, 13, 15):
             with self.subTest(order_type=order_type):
-                args = ["0101", "SOR", "12345678", order_type, "003550", 10, 85000, "00", ""]
+                args = ["SOR", "0101", "12345678", order_type, "003550", 10, 85000, "00", ""]
                 adapter = RecordingAdapter(0)
 
                 result = execute_kiwoom_send_order(
@@ -384,6 +384,103 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertNotIn("CLAIM_TOKEN", json.dumps(data))
         self.assertNotIn("CLAIM_TOKEN", json.dumps(result))
 
+    def test_claimed_send_order_registers_reconciliation_context_before_callable(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._write_claimed_queue(queue_path)
+        call_order: list[str] = []
+        registrations: list[dict[str, object]] = []
+
+        def register(payload: dict[str, object]) -> dict[str, object]:
+            call_order.append("register")
+            registrations.append(dict(payload))
+            return {
+                "registered": True,
+                "rqname": payload.get("rqname"),
+                "screen_no": payload.get("screen_no"),
+                "order_id": payload.get("order_id"),
+                "dispatch_claim_id": payload.get("dispatch_claim_id"),
+                "send_order_attempt_id": payload.get("send_order_attempt_id"),
+            }
+
+        class OrderedCallable(ClaimedSendOrderCallable):
+            def __call__(self, *args: object) -> object:
+                call_order.append("send_order")
+                return super().__call__(*args)
+
+        adapter = OrderedCallable(0)
+        result = execute_claimed_send_order(
+            queue_path,
+            _claimed_identity(record),
+            "CLAIM_1",
+            "CLAIM_TOKEN",
+            "GUI_MANUAL",
+            1,
+            adapter,
+            self._claimed_args(),
+            {
+                "send_order_attempt_id": "ATTEMPT_1",
+                "send_order_reconciliation_register": register,
+            },
+        )
+
+        self.assertEqual(["register", "send_order"], call_order)
+        self.assertEqual(1, len(registrations))
+        registration = registrations[0]
+        self.assertEqual("SELL", registration["rqname"])
+        self.assertEqual("0101", registration["screen_no"])
+        self.assertEqual("ORDER_1", registration["order_id"])
+        self.assertEqual("EXEC_1", registration["execution_id"])
+        self.assertEqual("SIG_1", registration["signal_id"])
+        self.assertEqual("CLAIM_1", registration["dispatch_claim_id"])
+        self.assertEqual("ATTEMPT_1", registration["send_order_attempt_id"])
+        self.assertEqual("KRX", registration["market_route"])
+        self.assertEqual(2, registration["order_type"])
+        self.assertTrue(
+            result["reconciliation_registration_result"]["registered"]
+        )
+        queue_text = queue_path.read_text(encoding="utf-8")
+        self.assertNotIn("send_order_reconciliation_register", queue_text)
+        self.assertNotIn("function", queue_text.lower())
+
+    def test_claimed_send_order_registration_failure_is_diagnostic_only_for_krx(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._write_claimed_queue(queue_path)
+        adapter = ClaimedSendOrderCallable(0)
+
+        result = execute_claimed_send_order(
+            queue_path,
+            _claimed_identity(record),
+            "CLAIM_1",
+            "CLAIM_TOKEN",
+            "GUI_MANUAL",
+            1,
+            adapter,
+            self._claimed_args(),
+            {
+                "send_order_attempt_id": "ATTEMPT_1",
+                "send_order_reconciliation_register": (
+                    lambda _payload: {
+                        "registered": False,
+                        "reason": "TEST_REGISTER_UNAVAILABLE",
+                    }
+                ),
+            },
+        )
+
+        self.assertEqual("SEND_CALL_ACCEPTED", result["status"])
+        self.assertEqual(1, len(adapter.calls))
+        self.assertFalse(
+            result["reconciliation_registration_result"]["registered"]
+        )
+        self.assertEqual(
+            "TEST_REGISTER_UNAVAILABLE",
+            result["reconciliation_registration_result"]["reason"],
+        )
+
     def test_claimed_sor_order_types_fail_closed_before_attempt_without_fallback(self) -> None:
         for order_type in (11, 12, 13, 15):
             with self.subTest(order_type=order_type):
@@ -397,7 +494,7 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
                 self._write_claimed_queue(queue_path, record)
                 before = queue_path.read_bytes()
                 adapter = ClaimedSendOrderCallable(0)
-                args = ["0101", "SOR", "12345678", order_type, "003550", 10, 85000, "00", ""]
+                args = ["SOR", "0101", "12345678", order_type, "003550", 10, 85000, "00", ""]
 
                 with mock.patch(
                     "kiwoom_send_order_executor.observe_live_sor_execution_blocked",
@@ -431,6 +528,62 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
                 self.assertEqual("SOR", queued["execution_request"]["request_preview"]["market_route"])
                 diagnostic.assert_called_once()
 
+    def test_claimed_sor_gate_reports_ready_capability_but_stays_closed(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimed_record(
+            market_route="SOR",
+            execution_request={"request_preview": {"market_route": "SOR"}},
+        )
+        self._write_claimed_queue(queue_path, record)
+        before = queue_path.read_bytes()
+        adapter = ClaimedSendOrderCallable(0)
+        capability = {
+            "ready": True,
+            "login_session_id": "SESSION_1",
+            "checks": {
+                "kiwoom_connected": True,
+                "login_session_available": True,
+                "raw_chejan_consumer_bound": True,
+                "raw_order_tr_consumer_bound": True,
+                "raw_message_consumer_bound": True,
+                "reconciliation_register_available": True,
+                "transport_evidence_recorder_available": True,
+            },
+            "missing_capabilities": [],
+        }
+
+        with mock.patch(
+            "kiwoom_send_order_executor.observe_live_sor_execution_blocked"
+        ) as diagnostic:
+            result = execute_claimed_send_order(
+                queue_path,
+                _claimed_identity(record),
+                "CLAIM_1",
+                "CLAIM_TOKEN",
+                "GUI_MANUAL",
+                1,
+                adapter,
+                ["SOR", "0101", "12345678", 11, "003550", 10, 85000, "00", ""],
+                {
+                    "send_order_attempt_id": "ATTEMPT_SOR_READY_DIAGNOSTIC",
+                    "live_sor_reconciliation_capability_snapshot": capability,
+                },
+            )
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertEqual(
+            "LIVE_SOR_RECONCILIATION_UNVERIFIED",
+            result["reason_code"],
+        )
+        self.assertEqual(
+            capability,
+            result["live_sor_reconciliation_capability_snapshot"],
+        )
+        self.assertEqual([], adapter.calls)
+        self.assertEqual(before, queue_path.read_bytes())
+
     def test_claimed_krx_route_still_invokes_original_order_type(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -441,7 +594,7 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         )
         self._write_claimed_queue(queue_path, record)
         adapter = ClaimedSendOrderCallable(0)
-        args = ["0101", "KRX", "12345678", 1, "003550", 10, 85000, "00", ""]
+        args = ["KRX", "0101", "12345678", 1, "003550", 10, 85000, "00", ""]
 
         result = execute_claimed_send_order(
             queue_path,
@@ -479,7 +632,7 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
                 "GUI_MANUAL",
                 1,
                 adapter,
-                ["0101", "SOR", "12345678", 11, "003550", 10, 85000, "00", ""],
+                ["SOR", "0101", "12345678", 11, "003550", 10, 85000, "00", ""],
                 {"send_order_attempt_id": "ATTEMPT_SOR_DIAGNOSTIC_FAILURE"},
             )
 
@@ -487,6 +640,51 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertEqual("LIVE_SOR_RECONCILIATION_UNVERIFIED", result["reason_code"])
         self.assertEqual([], adapter.calls)
         self.assertEqual(before, queue_path.read_bytes())
+
+    def test_claimed_krx_registers_reconciliation_context_without_persisting_callback(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._write_claimed_queue(queue_path)
+        registrations: list[dict[str, object]] = []
+
+        def register(payload: dict[str, object]) -> dict[str, object]:
+            registrations.append(deepcopy(payload))
+            return {
+                "registered": True,
+                "order_id": payload.get("order_id"),
+                "dispatch_claim_id": payload.get("dispatch_claim_id"),
+                "send_order_attempt_id": payload.get("send_order_attempt_id"),
+            }
+
+        result, adapter = self._execute_claimed(
+            queue_path,
+            record,
+            0,
+            context={
+                "send_order_attempt_id": "ATTEMPT_1",
+                "send_order_reconciliation_register": register,
+            },
+        )
+
+        self.assertEqual("SEND_CALL_ACCEPTED", result["status"])
+        self.assertEqual(1, len(adapter.calls))
+        self.assertEqual(1, len(registrations))
+        payload = registrations[0]
+        self.assertEqual("SELL", payload["rqname"])
+        self.assertEqual("0101", payload["screen_no"])
+        self.assertEqual("ORDER_1", payload["order_id"])
+        self.assertEqual("EXEC_1", payload["execution_id"])
+        self.assertEqual("SIG_1", payload["signal_id"])
+        self.assertEqual("CLAIM_1", payload["dispatch_claim_id"])
+        self.assertEqual("ATTEMPT_1", payload["send_order_attempt_id"])
+        self.assertEqual("KRX", payload["market_route"])
+        self.assertEqual(2, payload["order_type"])
+        self.assertTrue(
+            result["reconciliation_registration_result"]["registered"]
+        )
+        durable_text = queue_path.read_text(encoding="utf-8")
+        self.assertNotIn("send_order_reconciliation_register", durable_text)
 
     def test_claimed_send_order_non_zero_records_send_call_rejected(self) -> None:
         tmp = tempfile.TemporaryDirectory()

@@ -34,6 +34,7 @@ def _protected_paths() -> list[Path]:
 class KiwoomSendOrderCallPreviewTest(unittest.TestCase):
     def _send_order_params(self) -> dict[str, object]:
         return {
+            "rqname": "BUY_003550_TEST0001",
             "screen_no": "0101",
             "order_name": "BUY",
             "account_no": "12345678",
@@ -113,10 +114,24 @@ class KiwoomSendOrderCallPreviewTest(unittest.TestCase):
         self.assertFalse(result["runtime_write"])
         self.assertFalse(result["queue_write"])
         self.assertEqual(
-            ["0101", "BUY", "12345678", 1, "003550", 10, 85000, "03", ""],
+            ["BUY_003550_TEST0001", "0101", "12345678", 1, "003550", 10, 85000, "03", ""],
             result["send_order_args"],
         )
         preview = result["send_order_call_preview"]
+        self.assertEqual(
+            [
+                "rqname",
+                "screen_no",
+                "account_no",
+                "order_type",
+                "code",
+                "quantity",
+                "price",
+                "hoga",
+                "original_order_no",
+            ],
+            preview["send_order_arg_order"],
+        )
         self.assertEqual("KIWOOM_SEND_ORDER_CALL_PREVIEW", preview["preview_type"])
         self.assertEqual("FINAL_CALL_TOKEN_1", preview["final_call_token"])
         self.assertTrue(preview["send_order_args_ready"])

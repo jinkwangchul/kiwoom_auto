@@ -338,6 +338,124 @@ def observe_send_order_result(order: Any, result: Any) -> dict[str, Any]:
 
 
 @_fail_open_observer
+def observe_broker_order_tr_evidence(raw_event: Any) -> dict[str, Any]:
+    """Record correlated SendOrder TR evidence without mutating Queue state."""
+
+    event = _dict(raw_event)
+    request = _dict(event.get("send_order_request"))
+    if request.get("reconciliation_context_registered") is not True:
+        return {
+            "appended": False,
+            "skipped": True,
+            "reason": "ORDER_TR_RECONCILIATION_CONTEXT_MISSING",
+        }
+    identity = _identity(request, event)
+    stable_id = _first(
+        request.get("send_order_attempt_id"),
+        request.get("dispatch_claim_id"),
+        identity["order_id"],
+    )
+    if not stable_id:
+        return {
+            "appended": False,
+            "skipped": True,
+            "reason": "ORDER_TR_IDENTITY_MISSING",
+        }
+    broker_order_no = _text(event.get("broker_order_no"))
+    return _append_once(
+        (
+            "BROKER_ORDER_TR_EVIDENCE",
+            stable_id,
+            broker_order_no or _text(event.get("received_at")),
+        ),
+        "BROKER_ORDER_TR_EVIDENCE",
+        severity="NOTICE",
+        result="SUCCESS",
+        source="KiwoomApi.raw_order_tr_received",
+        occurred_at=_text(event.get("received_at")) or None,
+        template_args={
+            "stock_name": identity["stock_name"] or identity["stock_code"]
+        },
+        broker_order_no=broker_order_no or None,
+        details={
+            "rqname": _text(event.get("rqname")),
+            "screen_no": _text(event.get("screen_no")),
+            "trcode": _text(event.get("trcode")),
+            "record_name": _text(event.get("record_name")),
+            "market_route": _text(request.get("market_route")).upper(),
+            "order_type": request.get("order_type"),
+            "send_order_attempt_id": _text(
+                request.get("send_order_attempt_id")
+            ),
+            "dispatch_claim_id": _text(request.get("dispatch_claim_id")),
+            "login_session_id": _text(event.get("login_session_id")),
+            "connection_epoch": event.get("connection_epoch"),
+            "order_no_error": _text(event.get("order_no_error")),
+        },
+        **_target_fields(identity),
+    )
+
+
+@_fail_open_observer
+def observe_broker_message_evidence(raw_event: Any) -> dict[str, Any]:
+    """Record correlated broker message evidence without mutating Queue state."""
+
+    event = _dict(raw_event)
+    request = _dict(event.get("send_order_request"))
+    if request.get("reconciliation_context_registered") is not True:
+        return {
+            "appended": False,
+            "skipped": True,
+            "reason": "BROKER_MESSAGE_RECONCILIATION_CONTEXT_MISSING",
+        }
+    identity = _identity(request, event)
+    stable_id = _first(
+        request.get("send_order_attempt_id"),
+        request.get("dispatch_claim_id"),
+        identity["order_id"],
+    )
+    if not stable_id:
+        return {
+            "appended": False,
+            "skipped": True,
+            "reason": "BROKER_MESSAGE_IDENTITY_MISSING",
+        }
+    message = _text(event.get("message"))
+    return _append_once(
+        (
+            "BROKER_MESSAGE_EVIDENCE",
+            stable_id,
+            _text(event.get("rqname")),
+            message,
+        ),
+        "BROKER_MESSAGE_EVIDENCE",
+        severity="NOTICE",
+        result="SUCCESS",
+        source="KiwoomApi.raw_message_received",
+        occurred_at=_text(event.get("received_at")) or None,
+        template_args={
+            "stock_name": identity["stock_name"] or identity["stock_code"]
+        },
+        details={
+            "rqname": _text(event.get("rqname")),
+            "screen_no": _text(event.get("screen_no")),
+            "trcode": _text(event.get("trcode")),
+            "message": message,
+            "market_route": _text(request.get("market_route")).upper(),
+            "order_type": request.get("order_type"),
+            "send_order_attempt_id": _text(
+                request.get("send_order_attempt_id")
+            ),
+            "dispatch_claim_id": _text(request.get("dispatch_claim_id")),
+            "broker_order_no": _text(request.get("broker_order_no")),
+            "login_session_id": _text(event.get("login_session_id")),
+            "connection_epoch": event.get("connection_epoch"),
+        },
+        **_target_fields(identity),
+    )
+
+
+@_fail_open_observer
 def observe_live_sor_execution_blocked(order: Any, result: Any) -> dict[str, Any]:
     """Record the pre-call live-SOR reconciliation gate without changing it."""
 
@@ -352,6 +470,9 @@ def observe_live_sor_execution_blocked(order: Any, result: Any) -> dict[str, Any
     stable_id = _first(identity["execution_id"], identity["order_id"], identity["signal_id"])
     if not stable_id:
         return {"appended": False, "skipped": True, "reason": "LIVE_SOR_BLOCK_IDENTITY_MISSING"}
+    capability = _dict(
+        value.get("live_sor_reconciliation_capability_snapshot")
+    )
     return _append_once(
         ("EXECUTION_BLOCKED", stable_id, reason_code),
         "EXECUTION_BLOCKED",
@@ -363,6 +484,12 @@ def observe_live_sor_execution_blocked(order: Any, result: Any) -> dict[str, Any
             "reason_code": reason_code,
             "market_route": "SOR",
             "order_type": value.get("order_type"),
+            "reconciliation_capability_ready": (
+                capability.get("ready") is True
+            ),
+            "missing_capabilities": list(
+                capability.get("missing_capabilities") or []
+            ),
         },
         **_target_fields(identity),
     )

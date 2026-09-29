@@ -74,6 +74,87 @@ class EventJournalBrokerFillCloseConnectionTest(unittest.TestCase):
         self.assertTrue(all(item["category"] == "ORDER" for item in events))
         self.assertNotIn("BROKER_ORDER_ACCEPTED", [item["event_type"] for item in events])
 
+    def test_correlated_order_tr_and_message_evidence_are_recorded_once(self) -> None:
+        request = {
+            "reconciliation_context_registered": True,
+            "rqname": "BUY_005930_A1B2C3D4",
+            "screen_no": "0101",
+            "code": "005930",
+            "name": "삼성전자",
+            "order_id": "ORDER-1",
+            "dispatch_claim_id": "CLAIM-1",
+            "send_order_attempt_id": "ATTEMPT-1",
+            "execution_id": "EXEC-1",
+            "signal_id": "SIGNAL-1",
+            "market_route": "SOR",
+            "order_type": 11,
+        }
+        tr_event = {
+            "source": "kiwoom_order_tr",
+            "screen_no": "0101",
+            "rqname": request["rqname"],
+            "trcode": "KOA_NORMAL_BUY_KP_ORD",
+            "record_name": "주문",
+            "broker_order_no": "BROKER-1",
+            "received_at": "2026-09-29 10:01:02.003+09:00",
+            "login_session_id": "SESSION-1",
+            "connection_epoch": 7,
+            "send_order_request": dict(request),
+        }
+        msg_event = {
+            "source": "kiwoom_message",
+            "screen_no": "0101",
+            "rqname": request["rqname"],
+            "trcode": "",
+            "message": "주문 접수",
+            "received_at": "2026-09-29 10:01:02.100+09:00",
+            "login_session_id": "SESSION-1",
+            "connection_epoch": 7,
+            "send_order_request": {
+                **request,
+                "broker_order_no": "BROKER-1",
+            },
+        }
+
+        first_tr = observer.observe_broker_order_tr_evidence(tr_event)
+        duplicate_tr = observer.observe_broker_order_tr_evidence(tr_event)
+        first_msg = observer.observe_broker_message_evidence(msg_event)
+        duplicate_msg = observer.observe_broker_message_evidence(msg_event)
+
+        self.assertTrue(first_tr["appended"])
+        self.assertTrue(duplicate_tr["duplicate"])
+        self.assertTrue(first_msg["appended"])
+        self.assertTrue(duplicate_msg["duplicate"])
+
+        events = self.events()
+        self.assertEqual(
+            ["BROKER_ORDER_TR_EVIDENCE", "BROKER_MESSAGE_EVIDENCE"],
+            [item["event_type"] for item in events],
+        )
+        self.assertEqual(
+            ["EXEC-1", "EXEC-1"],
+            [item["correlation_id"] for item in events],
+        )
+        self.assertEqual("BROKER-1", events[0]["broker_order_no"])
+        self.assertEqual("SOR", events[0]["details"]["market_route"])
+        self.assertEqual("주문 접수", events[1]["details"]["message"])
+
+    def test_uncorrelated_broker_message_evidence_is_skipped(self) -> None:
+        observed = observer.observe_broker_message_evidence(
+            {
+                "source": "kiwoom_message",
+                "rqname": "GENERAL",
+                "message": "일반 메시지",
+            }
+        )
+
+        self.assertTrue(observed["skipped"])
+        self.assertEqual(
+            "BROKER_MESSAGE_RECONCILIATION_CONTEXT_MISSING",
+            observed["reason"],
+        )
+        self.assertEqual([], self.events())
+
     def test_live_sor_execution_block_has_distinct_fail_open_diagnostic(self) -> None:
         result = {
             "status": "BLOCKED",

@@ -190,7 +190,7 @@ class AlphanumericStockCodeContractTests(unittest.TestCase):
         api._realtime_shadow_registration = api._empty_realtime_shadow_snapshot()
 
         with self.assertRaisesRegex(ValueError, "UNCONFIRMED"):
-            api.send_order("0101", "BUY", "12345678", 1, CODE, 1, 0, "03", "")
+            api.send_order("BUY", "0101", "12345678", 1, CODE, 1, 0, "03", "")
         candle = api.request_minute_candles(CODE)
         self.assertFalse(candle["ok"])
         self.assertEqual("BROKER_ALPHANUMERIC_STOCK_CODE_UNCONFIRMED", candle["reason_code"])
@@ -198,6 +198,48 @@ class AlphanumericStockCodeContractTests(unittest.TestCase):
         self.assertFalse(realtime["ok"])
         self.assertEqual("BROKER_ALPHANUMERIC_STOCK_CODE_UNCONFIRMED", realtime["reason_code"])
         control.dynamicCall.assert_not_called()
+
+    def test_send_order_uses_official_rqname_then_screen_no_order(self) -> None:
+        control = MagicMock()
+        control.dynamicCall.return_value = 0
+        api = KiwoomApi.__new__(KiwoomApi)
+        QObject.__init__(api)
+        api._control = control
+        api._available = True
+        api._connected = True
+        api._unavailable_reason = ""
+        api._login_session_id = "SESSION"
+        api._connection_epoch = 1
+        api._login_requested = False
+        api.last_login_error = 0
+        api.last_login_message = "connected"
+
+        with patch.object(api, "is_connected", return_value=True):
+            result = api.send_order(
+                "BUY_005930",
+                "0101",
+                "12345678",
+                1,
+                "005930",
+                2,
+                70000,
+                "00",
+                "",
+            )
+
+        self.assertEqual(0, result)
+        control.dynamicCall.assert_called_once_with(
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+            "BUY_005930",
+            "0101",
+            "12345678",
+            1,
+            "005930",
+            2,
+            70000,
+            "00",
+            "",
+        )
 
     def test_send_order_safety_gate_blocks_alphanumeric_identity(self) -> None:
         params = {

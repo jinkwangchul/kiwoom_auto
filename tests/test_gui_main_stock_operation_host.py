@@ -226,6 +226,38 @@ class MainStockOperationHostTest(unittest.TestCase):
             settings_boundary,
             AutoTradeOrderExecutionBoundary,
         )
+        self.assertTrue(
+            callable(
+                host._order_execution_boundary._context.send_order_reconciliation_register
+            )
+        )
+        self.assertTrue(
+            callable(
+                settings_boundary._context.send_order_reconciliation_register
+            )
+        )
+
+    def test_host_reconciliation_register_delegates_to_kiwoom_api(self) -> None:
+        owner = Mock()
+        owner.kiwoom_api = Mock()
+        owner.kiwoom_api.register_send_order_reconciliation_context.return_value = {
+            "registered": True,
+        }
+        host = AutoTradeOperationHost(owner)
+        payload = {
+            "rqname": "BUY_005930_ABCDEF12",
+            "screen_no": "0101",
+            "order_id": "ORDER_1",
+            "dispatch_claim_id": "CLAIM_1",
+            "send_order_attempt_id": "ATTEMPT_1",
+        }
+
+        result = host._send_order_reconciliation_register(payload)
+
+        self.assertEqual({"registered": True}, result)
+        owner.kiwoom_api.register_send_order_reconciliation_context.assert_called_once_with(
+            payload
+        )
 
     def test_monitor_operation_adapter_is_widget_free(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(Mock(), [])

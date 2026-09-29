@@ -8,6 +8,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+from PyQt5.QtCore import QObject
+
 from kiwoom_api import KiwoomApi
 from kiwoom_realtime_fids import (
     REALTIME_ASK_PRICE_FIDS,
@@ -67,6 +69,7 @@ class _Control:
 
 def _api(*, connected: bool = True) -> KiwoomApi:
     api = KiwoomApi.__new__(KiwoomApi)
+    QObject.__init__(api)
     api._control = _Control()
     api._available = True
     api._connected = connected

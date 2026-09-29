@@ -9,6 +9,7 @@ runtime writers.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 from typing import Any
 
 
@@ -130,6 +131,20 @@ def _zero_or_positive_number(value: Any) -> bool:
         return False
 
 
+def _send_order_rqname(
+    *,
+    side: str,
+    action: str,
+    code: str,
+    order_id: str,
+    dispatch_id: str,
+) -> str:
+    label = ACTION_ORDER_NAME_MAP[(side, action)]
+    correlation_key = f"{order_id}|{dispatch_id}"
+    digest = hashlib.sha256(correlation_key.encode("utf-8")).hexdigest()[:8].upper()
+    return f"{label}_{code}_{digest}"
+
+
 def _extract_params(broker_dispatch_preview_result: dict[str, Any]) -> dict[str, Any]:
     params = _as_dict(broker_dispatch_preview_result.get("send_order_params_preview"))
     if params:
@@ -237,9 +252,18 @@ def build_kiwoom_send_order_adapter_contract(
         if market_route == "SOR"
         else ACTION_ORDER_TYPE_MAP
     )
+    order_name = ACTION_ORDER_NAME_MAP[(side, action)]
+    rqname = _send_order_rqname(
+        side=side,
+        action=action,
+        code=code,
+        order_id=_text(params.get("order_id")),
+        dispatch_id=_text(params.get("dispatch_id")),
+    )
     send_order_params = {
+        "rqname": rqname,
         "screen_no": screen_no,
-        "order_name": ACTION_ORDER_NAME_MAP[(side, action)],
+        "order_name": order_name,
         "account_no": account_no,
         "order_type": order_type_map[(side, action)],
         "market_route": market_route,
@@ -254,6 +278,7 @@ def build_kiwoom_send_order_adapter_contract(
         "order_id": _text(params.get("order_id")),
         "account_no": account_no,
         "screen_no": screen_no,
+        "rqname": send_order_params["rqname"],
         "order_name": send_order_params["order_name"],
         "order_type": send_order_params["order_type"],
         "market_route": market_route,

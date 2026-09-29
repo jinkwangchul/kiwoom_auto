@@ -2906,7 +2906,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
-            self.assertEqual(["0101", "BUY", "12345678", 1, "003550", 10, 1000, "00", ""], list(parent.kiwoom_api.send_order_calls[0]))
+            send_args = list(parent.kiwoom_api.send_order_calls[0])
+            self.assertRegex(send_args[0], r"^BUY_003550_[0-9A-F]{8}$")
+            self.assertEqual(
+                ["0101", "12345678", 1, "003550", 10, 1000, "00", ""],
+                send_args[1:],
+            )
             self.assertEqual("SEND_CALL_ACCEPTED", window.send_order_reports[-1]["status"])
             self.assertEqual(1, len(confirmation_previews))
             self.assertEqual(
@@ -2966,9 +2971,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
+            send_args = list(parent.kiwoom_api.send_order_calls[0])
+            self.assertRegex(send_args[0], r"^BUY_CANCEL_003550_[0-9A-F]{8}$")
             self.assertEqual(
-                [request_preview["screen_no"], "BUY_CANCEL", "12345678", 3, "003550", 4, 0, "00", "987654"],
-                list(parent.kiwoom_api.send_order_calls[0]),
+                [request_preview["screen_no"], "12345678", 3, "003550", 4, 0, "00", "987654"],
+                send_args[1:],
             )
             self.assertEqual("SEND_CALL_ACCEPTED", window.send_order_reports[-1]["status"])
 
@@ -3110,9 +3117,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 gui.AutoTradeSettingWindow.cancel_pending_order_manually(window)
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
+            send_args = list(parent.kiwoom_api.send_order_calls[0])
+            self.assertRegex(send_args[0], r"^BUY_CANCEL_003550_[0-9A-F]{8}$")
             self.assertEqual(
-                [gui.project_order_default_screen_no(), "BUY_CANCEL", "12345678", 3, "003550", 4, 0, "00", "987654"],
-                list(parent.kiwoom_api.send_order_calls[0]),
+                [gui.project_order_default_screen_no(), "12345678", 3, "003550", 4, 0, "00", "987654"],
+                send_args[1:],
             )
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             self.assertEqual(2, len(data["orders"]))
@@ -3296,9 +3305,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 gui.AutoTradeSettingWindow.modify_pending_order_manually(window)
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
+            send_args = list(parent.kiwoom_api.send_order_calls[0])
+            self.assertRegex(send_args[0], r"^SELL_MODIFY_003550_[0-9A-F]{8}$")
             self.assertEqual(
-                [gui.project_order_default_screen_no(), "SELL_MODIFY", "12345678", 6, "003550", 5, 1200, "00", "222333"],
-                list(parent.kiwoom_api.send_order_calls[0]),
+                [gui.project_order_default_screen_no(), "12345678", 6, "003550", 5, 1200, "00", "222333"],
+                send_args[1:],
             )
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             self.assertEqual(2, len(data["orders"]))

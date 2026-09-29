@@ -424,12 +424,23 @@ TRADE_COST_DIAGNOSTIC_FIDS = (
     "939",
 )
 
+ORDER_RECONCILIATION_EVIDENCE_FIDS = (
+    "9203",  # 주문번호
+    "904",   # 원주문번호
+    "909",   # 체결번호
+    "2134",  # 거래소 구분 코드
+    "2135",  # 거래소명
+    "2136",  # SOR 여부
+)
+
 
 class KiwoomApi(QObject):
     """Minimal Kiwoom API wrapper for opt10080 candle lookup."""
 
     login_state_changed = pyqtSignal(dict)
     raw_chejan_received = pyqtSignal(dict)
+    raw_message_received = pyqtSignal(dict)
+    raw_order_tr_received = pyqtSignal(dict)
     account_authentication_required = pyqtSignal(dict)
     bar_committed = pyqtSignal(object)
     realtime_shadow_tick_received = pyqtSignal(object)
@@ -613,6 +624,7 @@ class KiwoomApi(QObject):
         self.last_login_message = "login not requested"
         self._pending_tr: dict[str, dict[str, Any]] = {}
         self._account_funds_request_accounts: dict[str, str] = {}
+        self._send_order_request_evidence: dict[tuple[str, str], dict[str, Any]] = {}
         self._tr_request_queue: deque[dict[str, Any]] = deque()
         self._tr_last_dispatch_monotonic_ms: int | None = None
         self._tr_governor_timer_scheduled = False
@@ -1615,6 +1627,11 @@ class KiwoomApi(QObject):
         return True
 
     def _establish_login_session(self, *, account_payload: str) -> str:
+        evidence_store = getattr(self, "_send_order_request_evidence", None)
+        if isinstance(evidence_store, dict):
+            evidence_store.clear()
+        else:
+            self._send_order_request_evidence = {}
         connected_at = datetime.now().isoformat(timespec="microseconds")
         next_epoch = self._connection_epoch + 1
         digest = hashlib.sha256(
@@ -1658,6 +1675,11 @@ class KiwoomApi(QObject):
                 remove_from_broker=False,
                 reason="MOCK_ORDERBOOK_SESSION_INVALIDATED",
             )
+        evidence_store = getattr(self, "_send_order_request_evidence", None)
+        if isinstance(evidence_store, dict):
+            evidence_store.clear()
+        else:
+            self._send_order_request_evidence = {}
         self._connected = False
         self._login_session_id = ""
         if increment_epoch and had_session:
@@ -2656,10 +2678,114 @@ class KiwoomApi(QObject):
         """Return the current process-local Kiwoom login session identity."""
         return self._login_session_id if self.is_connected() else ""
 
+    def register_send_order_reconciliation_context(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Register queue/execution identity before one SendOrder call."""
+        data = dict(payload) if isinstance(payload, dict) else {}
+        rqname = str(data.get("rqname") or "").strip()
+        screen_no = str(data.get("screen_no") or "").strip()
+        order_id = str(data.get("order_id") or "").strip()
+        dispatch_claim_id = str(data.get("dispatch_claim_id") or "").strip()
+        attempt_id = str(data.get("send_order_attempt_id") or "").strip()
+        session_id = str(getattr(self, "_login_session_id", "") or "").strip()
+        connection_epoch = getattr(self, "_connection_epoch", None)
+
+        missing = [
+            field
+            for field, value in (
+                ("rqname", rqname),
+                ("screen_no", screen_no),
+                ("order_id", order_id),
+                ("dispatch_claim_id", dispatch_claim_id),
+                ("send_order_attempt_id", attempt_id),
+            )
+            if not value
+        ]
+        if missing:
+            return {
+                "registered": False,
+                "reason": "SEND_ORDER_RECONCILIATION_IDENTITY_INCOMPLETE",
+                "missing_fields": missing,
+            }
+        if not session_id or not self.is_connected():
+            return {
+                "registered": False,
+                "reason": "SEND_ORDER_RECONCILIATION_SESSION_UNAVAILABLE",
+            }
+
+        evidence_store = getattr(self, "_send_order_request_evidence", None)
+        if not isinstance(evidence_store, dict):
+            evidence_store = {}
+            self._send_order_request_evidence = evidence_store
+        key = (screen_no, rqname)
+        existing = evidence_store.get(key)
+        if isinstance(existing, dict):
+            existing_identity = (
+                str(existing.get("order_id") or "").strip(),
+                str(existing.get("dispatch_claim_id") or "").strip(),
+                str(existing.get("send_order_attempt_id") or "").strip(),
+                str(existing.get("login_session_id") or "").strip(),
+                existing.get("connection_epoch"),
+            )
+            new_identity = (
+                order_id,
+                dispatch_claim_id,
+                attempt_id,
+                session_id,
+                connection_epoch,
+            )
+            if any(existing_identity) and existing_identity != new_identity:
+                return {
+                    "registered": False,
+                    "reason": "SEND_ORDER_RECONCILIATION_CONTEXT_CONFLICT",
+                }
+
+        evidence = dict(existing) if isinstance(existing, dict) else {}
+        evidence.update(
+            {
+                "reconciliation_context_registered": True,
+                "reconciliation_context_source": str(
+                    data.get("source") or "claimed_send_order_executor"
+                ).strip(),
+                "rqname": rqname,
+                "screen_no": screen_no,
+                "order_id": order_id,
+                "dispatch_claim_id": dispatch_claim_id,
+                "send_order_attempt_id": attempt_id,
+                "execution_id": str(data.get("execution_id") or "").strip(),
+                "signal_id": str(data.get("signal_id") or "").strip(),
+                "market_route": str(data.get("market_route") or "").strip().upper(),
+                "order_type": data.get("order_type"),
+                "login_session_id": session_id,
+                "connection_epoch": connection_epoch,
+                "reconciliation_context_registered_at": (
+                    datetime.now().astimezone().isoformat(
+                        sep=" ",
+                        timespec="milliseconds",
+                    )
+                ),
+            }
+        )
+        evidence_store[key] = evidence
+        while len(evidence_store) > 512:
+            evidence_store.pop(next(iter(evidence_store)))
+        return {
+            "registered": True,
+            "rqname": rqname,
+            "screen_no": screen_no,
+            "order_id": order_id,
+            "dispatch_claim_id": dispatch_claim_id,
+            "send_order_attempt_id": attempt_id,
+            "login_session_id": session_id,
+            "connection_epoch": connection_epoch,
+        }
+
     def send_order(
         self,
+        rqname: str,
         screen_no: str,
-        order_name: str,
         account_no: str,
         order_type: int,
         code: str,
@@ -2668,7 +2794,11 @@ class KiwoomApi(QObject):
         hoga: str,
         original_order_no: str,
     ) -> Any:
-        """Call Kiwoom OpenAPI SendOrder once with the official 9 arguments."""
+        """Call Kiwoom OpenAPI SendOrder once in official RQName/ScreenNo order."""
+        rqname_text = str(rqname or "").strip()
+        screen_no_text = str(screen_no or "").strip()
+        if not rqname_text:
+            raise ValueError("send order rqname is required")
         clean_code = normalize_stock_code(code)
         if not clean_code:
             raise ValueError("stock code is required")
@@ -2678,18 +2808,67 @@ class KiwoomApi(QObject):
             raise RuntimeError(self._unavailable_reason or "kiwoom api unavailable")
         if not self.is_connected():
             raise RuntimeError("kiwoom api is not connected")
-        return self._control.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            str(screen_no or ""),
-            str(order_name or ""),
-            str(account_no or ""),
-            int(order_type),
-            clean_code,
-            int(quantity),
-            int(price),
-            str(hoga or ""),
-            str(original_order_no or ""),
+
+        evidence_store = getattr(self, "_send_order_request_evidence", None)
+        if not isinstance(evidence_store, dict):
+            evidence_store = {}
+            self._send_order_request_evidence = evidence_store
+        request_key = (screen_no_text, rqname_text)
+        existing_evidence = evidence_store.get(request_key)
+        request_evidence = (
+            dict(existing_evidence)
+            if isinstance(existing_evidence, dict)
+            else {}
         )
+        request_evidence.update({
+            "source": "kiwoom_send_order",
+            "rqname": rqname_text,
+            "screen_no": screen_no_text,
+            "account_no": str(account_no or "").strip(),
+            "order_type": int(order_type),
+            "code": clean_code,
+            "quantity": int(quantity),
+            "price": int(price),
+            "hoga": str(hoga or "").strip(),
+            "original_order_no": str(original_order_no or "").strip(),
+            "login_session_id": str(getattr(self, "_login_session_id", "") or "").strip(),
+            "connection_epoch": getattr(self, "_connection_epoch", None),
+            "requested_at": datetime.now().astimezone().isoformat(
+                sep=" ", timespec="milliseconds"
+            ),
+        })
+        evidence_store[request_key] = request_evidence
+        while len(evidence_store) > 512:
+            evidence_store.pop(next(iter(evidence_store)))
+
+        try:
+            raw_result = self._control.dynamicCall(
+                "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                rqname_text,
+                screen_no_text,
+                str(account_no or ""),
+                int(order_type),
+                clean_code,
+                int(quantity),
+                int(price),
+                str(hoga or ""),
+                str(original_order_no or ""),
+            )
+        except Exception as exc:
+            request_evidence["send_order_exception"] = str(exc)
+            request_evidence["send_order_returned_at"] = (
+                datetime.now().astimezone().isoformat(
+                    sep=" ", timespec="milliseconds"
+                )
+            )
+            raise
+        request_evidence["send_order_raw_result"] = raw_result
+        request_evidence["send_order_returned_at"] = (
+            datetime.now().astimezone().isoformat(
+                sep=" ", timespec="milliseconds"
+            )
+        )
+        return raw_result
 
     def request_initial_market_snapshot(
         self,
@@ -3838,7 +4017,15 @@ class KiwoomApi(QObject):
             if fid:
                 fids.append(fid)
 
-        observed_fids = list(dict.fromkeys([*fids, *TRADE_COST_DIAGNOSTIC_FIDS]))
+        observed_fids = list(
+            dict.fromkeys(
+                [
+                    *fids,
+                    *TRADE_COST_DIAGNOSTIC_FIDS,
+                    *ORDER_RECONCILIATION_EVIDENCE_FIDS,
+                ]
+            )
+        )
         fid_raw_values: dict[str, str] = {}
         fid_values: dict[str, str] = {}
         for fid in observed_fids:
@@ -4097,12 +4284,51 @@ class KiwoomApi(QObject):
             )
 
     def _on_receive_msg(self, *args: Any) -> None:
-        """Project only verified account-password messages into account UI evidence."""
+        """Preserve raw broker messages, then project verified account-auth evidence."""
 
         if len(args) < 4:
             return
         screen_no, rqname, trcode, message = args[:4]
         request_name = str(rqname or "")
+        raw_message = {
+            "source": "kiwoom_message",
+            "screen_no": str(screen_no or "").strip(),
+            "rqname": request_name,
+            "trcode": str(trcode or "").strip(),
+            "message_raw": "" if message is None else str(message),
+            "message": str(message or "").strip(),
+            "login_session_id": str(
+                getattr(self, "_login_session_id", "") or ""
+            ).strip(),
+            "connection_epoch": getattr(self, "_connection_epoch", None),
+            "received_at": datetime.now().astimezone().isoformat(
+                sep=" ", timespec="milliseconds"
+            ),
+        }
+        evidence_store = getattr(self, "_send_order_request_evidence", None)
+        request_evidence = (
+            evidence_store.get(
+                (str(screen_no or "").strip(), request_name)
+            )
+            if isinstance(evidence_store, dict)
+            else None
+        )
+        if isinstance(request_evidence, dict):
+            current_session_id = str(
+                getattr(self, "_login_session_id", "") or ""
+            ).strip()
+            current_epoch = getattr(self, "_connection_epoch", None)
+            if (
+                str(request_evidence.get("login_session_id") or "").strip()
+                != current_session_id
+                or request_evidence.get("connection_epoch") != current_epoch
+            ):
+                request_evidence = None
+        if isinstance(request_evidence, dict):
+            raw_message["send_order_request"] = dict(request_evidence)
+        raw_message_signal = getattr(self, "raw_message_received", None)
+        if raw_message_signal is not None and hasattr(raw_message_signal, "emit"):
+            raw_message_signal.emit(dict(raw_message))
         account_id = str(
             self._account_funds_request_accounts.get(request_name, "") or ""
         ).strip()
@@ -4140,7 +4366,71 @@ class KiwoomApi(QObject):
         if len(args) < 5:
             return
         _screen_no, rqname, trcode, _record_name, prev_next = args[:5]
-        request_name = str(rqname)
+        screen_no_text = str(_screen_no or "").strip()
+        request_name = str(rqname or "").strip()
+
+        evidence_store = getattr(self, "_send_order_request_evidence", None)
+        request_evidence = (
+            evidence_store.get((screen_no_text, request_name))
+            if isinstance(evidence_store, dict)
+            else None
+        )
+        if isinstance(request_evidence, dict):
+            current_session_id = str(
+                getattr(self, "_login_session_id", "") or ""
+            ).strip()
+            current_epoch = getattr(self, "_connection_epoch", None)
+            if (
+                str(request_evidence.get("login_session_id") or "").strip()
+                != current_session_id
+                or request_evidence.get("connection_epoch") != current_epoch
+            ):
+                request_evidence = None
+        if isinstance(request_evidence, dict):
+            broker_order_no = ""
+            order_no_error = ""
+            try:
+                raw_order_no = self._control.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    str(trcode or ""),
+                    request_name,
+                    0,
+                    "주문번호",
+                )
+                broker_order_no = str(raw_order_no or "").strip()
+            except Exception as exc:
+                order_no_error = str(exc)
+            received_at = datetime.now().astimezone().isoformat(
+                sep=" ", timespec="milliseconds"
+            )
+            request_evidence["broker_order_no"] = broker_order_no
+            request_evidence["order_tr_received_at"] = received_at
+            request_evidence["order_trcode"] = str(trcode or "").strip()
+            request_evidence["order_record_name"] = str(_record_name or "").strip()
+            request_evidence["order_no_error"] = order_no_error
+            raw_order_tr = {
+                "source": "kiwoom_order_tr",
+                "screen_no": screen_no_text,
+                "rqname": request_name,
+                "trcode": str(trcode or "").strip(),
+                "record_name": str(_record_name or "").strip(),
+                "prev_next": str(prev_next or "").strip(),
+                "broker_order_no": broker_order_no,
+                "order_no_error": order_no_error,
+                "login_session_id": str(
+                    getattr(self, "_login_session_id", "") or ""
+                ).strip(),
+                "connection_epoch": getattr(self, "_connection_epoch", None),
+                "received_at": received_at,
+                "send_order_request": dict(request_evidence),
+            }
+            raw_order_tr_signal = getattr(self, "raw_order_tr_received", None)
+            if (
+                raw_order_tr_signal is not None
+                and hasattr(raw_order_tr_signal, "emit")
+            ):
+                raw_order_tr_signal.emit(raw_order_tr)
+
         pending = self._pending_tr.get(request_name)
         if not pending:
             return

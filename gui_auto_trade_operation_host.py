@@ -120,6 +120,12 @@ class AutoTradeOperationHost(QObject):
                     if callable(recovery_gate)
                     else None
                 ),
+                send_order_reconciliation_register=(
+                    self._send_order_reconciliation_register
+                ),
+                live_sor_reconciliation_capability=(
+                    self._live_sor_reconciliation_capability_snapshot
+                ),
             )
         )
         self._bar_commit_trigger_queue: deque[dict[str, object]] = deque()
@@ -841,6 +847,55 @@ class AutoTradeOperationHost(QObject):
 
     def _send_order_callable(self):
         return getattr(self._kiwoom_api(), "send_order", None)
+
+    def _send_order_reconciliation_register(
+        self,
+        payload: dict[str, object],
+    ):
+        register = getattr(
+            self._kiwoom_api(),
+            "register_send_order_reconciliation_context",
+            None,
+        )
+        if not callable(register):
+            return {
+                "registered": False,
+                "reason": "SEND_ORDER_RECONCILIATION_REGISTER_UNAVAILABLE",
+            }
+        return register(payload)
+
+    def _live_sor_reconciliation_capability_snapshot(self):
+        getter = getattr(
+            self._owner,
+            "live_sor_reconciliation_capability_snapshot",
+            None,
+        )
+        if not callable(getter):
+            return {
+                "ready": False,
+                "missing_capabilities": [
+                    "main_window_sor_reconciliation_capability_unavailable"
+                ],
+            }
+        try:
+            value = getter()
+        except Exception:
+            return {
+                "ready": False,
+                "missing_capabilities": [
+                    "main_window_sor_reconciliation_capability_failed"
+                ],
+            }
+        return (
+            dict(value)
+            if isinstance(value, dict)
+            else {
+                "ready": False,
+                "missing_capabilities": [
+                    "main_window_sor_reconciliation_capability_invalid"
+                ],
+            }
+        )
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
         checker = getattr(self._owner, "startup_recovery_session_ready", None)

@@ -179,6 +179,54 @@ class ChejanEventReviewServiceTest(unittest.TestCase):
                     result["blocked_reasons"],
                 )
 
+    def test_sor_order_requires_explicit_sor_chejan_evidence(self) -> None:
+        sor_record = self._record(market_route="SOR")
+
+        missing = self._review(
+            normalized_event=self._event(is_sor=None),
+            order_record=sor_record,
+        )
+        false_value = self._review(
+            normalized_event=self._event(is_sor=False),
+            order_record=sor_record,
+        )
+        matched = self._review(
+            normalized_event=self._event(is_sor=True),
+            order_record=sor_record,
+        )
+
+        for result in (missing, false_value):
+            self.assertFalse(result["chejan_review_ok"])
+            self.assertIn(
+                "normalized_event.is_sor is not true for SOR order",
+                result["blocked_reasons"],
+            )
+        self.assertTrue(matched["chejan_review_ok"])
+
+    def test_krx_order_rejects_explicit_sor_chejan_evidence(self) -> None:
+        krx_record = self._record(market_route="KRX")
+
+        mismatch = self._review(
+            normalized_event=self._event(is_sor=True),
+            order_record=krx_record,
+        )
+        explicit_krx = self._review(
+            normalized_event=self._event(is_sor=False),
+            order_record=krx_record,
+        )
+        legacy_missing = self._review(
+            normalized_event=self._event(is_sor=None),
+            order_record=krx_record,
+        )
+
+        self.assertFalse(mismatch["chejan_review_ok"])
+        self.assertIn(
+            "normalized_event.is_sor is true for KRX order",
+            mismatch["blocked_reasons"],
+        )
+        self.assertTrue(explicit_krx["chejan_review_ok"])
+        self.assertTrue(legacy_missing["chejan_review_ok"])
+
     def test_matching_broker_order_no_succeeds(self) -> None:
         result = self._review()
 

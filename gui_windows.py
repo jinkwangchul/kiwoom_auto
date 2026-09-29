@@ -1580,6 +1580,10 @@ from event_journal_production import (
     append_production_event,
     observe_owner_failure_transition,
 )
+from event_journal_trade_observer import (
+    observe_broker_message_evidence,
+    observe_broker_order_tr_evidence,
+)
 from runtime_io import read_json_dict
 from routine_order_permission import canonical_stock_trading_time_status
 from gui_operation_environment import (
@@ -1623,6 +1627,10 @@ from gui_auto_trade_setting_window import (
     normalize_base_stock_single_routine_file,
     open_instance_stock_search_register_dialog,
     open_routine_settings_dialog_for_owner,
+)
+from send_order_reconciliation_evidence import (
+    inspect_send_order_reconciliation_evidence_storage,
+    record_send_order_reconciliation_evidence,
 )
 from gui_routine_registry import (
     group_record_by_id,
@@ -4108,6 +4116,109 @@ class RunningBudgetAdjustmentDialog(QDialog):
         self.accept()
 
 
+def _project_live_sor_reconciliation_capability(owner) -> dict[str, object]:
+    """Project live-SOR reconciliation readiness outside MainWindow composition."""
+
+    api = getattr(owner, "kiwoom_api", None)
+    connected = False
+    session_id = ""
+    try:
+        checker = getattr(api, "is_connected", None)
+        connected = bool(checker()) if callable(checker) else False
+    except Exception:
+        connected = False
+    try:
+        session_getter = getattr(api, "login_session_id", None)
+        session_id = (
+            str(session_getter() or "").strip()
+            if callable(session_getter)
+            else ""
+        )
+    except Exception:
+        session_id = ""
+
+    register = getattr(
+        api,
+        "register_send_order_reconciliation_context",
+        None,
+    )
+    storage = inspect_send_order_reconciliation_evidence_storage()
+    checks = {
+        "kiwoom_connected": connected,
+        "login_session_available": bool(session_id),
+        "raw_chejan_consumer_bound": (
+            getattr(owner, "_raw_chejan_evidence_bound", False) is True
+        ),
+        "raw_order_tr_consumer_bound": (
+            getattr(owner, "_raw_order_tr_evidence_bound", False) is True
+        ),
+        "raw_message_consumer_bound": (
+            getattr(owner, "_raw_message_evidence_bound", False) is True
+        ),
+        "reconciliation_register_available": callable(register),
+        "transport_evidence_recorder_available": callable(
+            record_send_order_reconciliation_evidence
+        ),
+        "transport_evidence_storage_ready": storage.get("ready") is True,
+    }
+    missing = [
+        name for name, available in checks.items() if available is not True
+    ]
+    pipeline_ready = not missing
+    live_execution_authorized = False
+    blocking_reasons = list(missing)
+    if pipeline_ready and not live_execution_authorized:
+        blocking_reasons.append(
+            "LIVE_SOR_PRODUCTION_EVIDENCE_UNVERIFIED"
+        )
+    validation_state = (
+        "LIVE_SOR_EXECUTION_AUTHORIZED"
+        if pipeline_ready and live_execution_authorized
+        else "READY_FOR_CONTROLLED_VALIDATION"
+        if pipeline_ready
+        else "SOR_RECONCILIATION_CAPABILITY_INCOMPLETE"
+    )
+    return {
+        "ready": pipeline_ready and live_execution_authorized,
+        "pipeline_ready": pipeline_ready,
+        "controlled_validation_ready": (
+            pipeline_ready and not live_execution_authorized
+        ),
+        "validation_state": validation_state,
+        "live_execution_authorized": live_execution_authorized,
+        "authorization_reason": (
+            ""
+            if live_execution_authorized
+            else "LIVE_SOR_PRODUCTION_EVIDENCE_UNVERIFIED"
+        ),
+        "login_session_id": session_id,
+        "checks": checks,
+        "transport_evidence_storage": storage,
+        "missing_capabilities": missing,
+        "blocking_reasons": blocking_reasons,
+        "evidence_pipeline": (
+            "SEND_ORDER_CONTEXT->TR/MESSAGE_JSONL->CHEJAN_MATCH->"
+            "RECONCILIATION_PREVIEW"
+        ),
+    }
+
+
+def _record_kiwoom_order_transport_evidence(
+    owner,
+    raw_event: dict[str, object],
+) -> dict[str, object]:
+    request = raw_event.get("send_order_request")
+    if not isinstance(request, dict):
+        return {
+            "recorded": False,
+            "ignored": True,
+            "reason": "NO_SEND_ORDER_REQUEST_EVIDENCE",
+        }
+    result = record_send_order_reconciliation_evidence(raw_event)
+    owner.last_order_transport_evidence_result = result
+    return result
+
+
 class MainWindow(QMainWindow):
     """
     키움 자동매매 시스템 메인 윈도우
@@ -4115,6 +4226,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+
+        self._raw_chejan_evidence_bound = False
+        self._raw_order_tr_evidence_bound = False
+        self._raw_message_evidence_bound = False
 
         self.setWindowTitle("키움 OpenAPI 자동매매 시스템 - v1.1 Windows GUI")
         self.setMinimumWidth(1680)
@@ -4132,6 +4247,27 @@ class MainWindow(QMainWindow):
             raw_chejan_received = getattr(self.kiwoom_api, "raw_chejan_received", None)
             if raw_chejan_received is not None:
                 raw_chejan_received.connect(self.on_kiwoom_raw_chejan_received)
+                self._raw_chejan_evidence_bound = True
+            raw_order_tr_received = getattr(
+                self.kiwoom_api,
+                "raw_order_tr_received",
+                None,
+            )
+            if raw_order_tr_received is not None:
+                raw_order_tr_received.connect(
+                    self.on_kiwoom_raw_order_tr_received
+                )
+                self._raw_order_tr_evidence_bound = True
+            raw_message_received = getattr(
+                self.kiwoom_api,
+                "raw_message_received",
+                None,
+            )
+            if raw_message_received is not None:
+                raw_message_received.connect(
+                    self.on_kiwoom_raw_message_received
+                )
+                self._raw_message_evidence_bound = True
             authentication_required = getattr(
                 self.kiwoom_api,
                 "account_authentication_required",
@@ -13399,6 +13535,39 @@ class MainWindow(QMainWindow):
         window.raise_()
         window.activateWindow()
         return window
+
+    def live_sor_reconciliation_capability_snapshot(
+        self,
+    ) -> dict[str, object]:
+        return _project_live_sor_reconciliation_capability(self)
+
+    def _record_kiwoom_order_transport_evidence(
+        self,
+        raw_event: dict[str, object],
+    ) -> dict[str, object]:
+        return _record_kiwoom_order_transport_evidence(self, raw_event)
+
+    def on_kiwoom_raw_order_tr_received(
+        self,
+        raw_event: dict[str, object],
+    ) -> None:
+        self.last_order_tr_transport_evidence_result = (
+            self._record_kiwoom_order_transport_evidence(raw_event)
+        )
+        self.last_broker_order_tr_evidence_result = (
+            observe_broker_order_tr_evidence(raw_event)
+        )
+
+    def on_kiwoom_raw_message_received(
+        self,
+        raw_event: dict[str, object],
+    ) -> None:
+        self.last_message_transport_evidence_result = (
+            self._record_kiwoom_order_transport_evidence(raw_event)
+        )
+        self.last_broker_message_evidence_result = (
+            observe_broker_message_evidence(raw_event)
+        )
 
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
         self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(

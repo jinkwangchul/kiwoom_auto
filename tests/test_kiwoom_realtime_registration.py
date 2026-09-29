@@ -4,7 +4,7 @@ from collections import deque
 import unittest
 from unittest.mock import Mock, patch
 
-from PyQt5.QtCore import QCoreApplication
+from PyQt5.QtCore import QCoreApplication, QObject
 
 from kiwoom_api import KiwoomApi, RealtimeShadowRegistrationSnapshot
 from kiwoom_initial_market_snapshot import normalize_optkwfid_market_row
@@ -89,6 +89,7 @@ class _QAxControl(_Control):
 
 def _api(*, connected: bool = True):
     api = KiwoomApi.__new__(KiwoomApi)
+    QObject.__init__(api)
     api._control = _Control()
     api._available = True
     api._connected = connected

@@ -144,6 +144,37 @@ def _request_preview(record: dict[str, Any]) -> dict[str, Any]:
     return request_preview if isinstance(request_preview, dict) else {}
 
 
+def _market_route(record: dict[str, Any]) -> str:
+    request = _request_preview(record)
+    return _clean_text(
+        record.get("market_route")
+        or request.get("market_route")
+        or request.get("order_route")
+    ).upper()
+
+
+def _market_route_block(
+    event: dict[str, Any],
+    record: dict[str, Any],
+    event_type: str,
+) -> dict[str, Any] | None:
+    route = _market_route(record)
+    is_sor = event.get("is_sor")
+    if route == "SOR" and is_sor is not True:
+        return _blocked(
+            "event_link",
+            "normalized_event.is_sor is not true for SOR order",
+            event_type,
+        )
+    if route == "KRX" and is_sor is True:
+        return _blocked(
+            "event_link",
+            "normalized_event.is_sor is true for KRX order",
+            event_type,
+        )
+    return None
+
+
 def _cancel_modify_action(record: dict[str, Any]) -> str:
     action = _clean_text(_request_preview(record).get("order_action")).upper()
     return action if action in {"CANCEL", "MODIFY"} else ""
@@ -216,6 +247,14 @@ def review_chejan_event(
             return _blocked("event_link", f"{key} is required", event_type)
         if event_value != record_value:
             return _blocked("event_link", f"normalized_event.{key} does not match order_record.{key}", event_type)
+
+    route_blocked = _market_route_block(
+        normalized_event,
+        order_record,
+        event_type,
+    )
+    if route_blocked is not None:
+        return route_blocked
 
     result_blocked = _validate_result_review(send_order_result_review_result, order_record)
     if result_blocked is not None:

@@ -2199,6 +2199,10 @@ from chejan_event_recorder import (
     record_chejan_event,
 )
 from chejan_event_review_service import review_chejan_event
+from send_order_reconciliation_evidence import (
+    DEFAULT_EVIDENCE_PATH as SEND_ORDER_RECONCILIATION_EVIDENCE_PATH,
+    read_send_order_reconciliation_evidence,
+)
 from final_send_gate_service import evaluate_final_send_gate
 from order_queued_review_service import review_order_queued_record
 from position_update_service import update_position_from_fill
@@ -2748,6 +2752,46 @@ def startup_recovery_action_allowed(window, action: str) -> bool:
     return True
 
 
+def _narrow_chejan_candidates_with_transport_evidence(
+    candidates: list[dict[str, object]],
+    broker_order_no: str,
+) -> list[dict[str, object]]:
+    if len(candidates) <= 1 or not str(broker_order_no or "").strip():
+        return candidates
+    evidence_records = read_send_order_reconciliation_evidence(
+        SEND_ORDER_RECONCILIATION_EVIDENCE_PATH,
+        broker_order_no=str(broker_order_no or "").strip(),
+    )
+    if not evidence_records:
+        return candidates
+
+    narrowed: list[dict[str, object]] = []
+    for candidate in candidates:
+        candidate_identity = (
+            str(candidate.get("order_id") or "").strip(),
+            str(candidate.get("dispatch_claim_id") or "").strip(),
+            str(candidate.get("send_order_attempt_id") or "").strip(),
+        )
+        if not all(candidate_identity):
+            continue
+        matched = False
+        for evidence in evidence_records:
+            identity = evidence.get("identity")
+            if not isinstance(identity, dict):
+                continue
+            evidence_identity = (
+                str(identity.get("order_id") or "").strip(),
+                str(identity.get("dispatch_claim_id") or "").strip(),
+                str(identity.get("send_order_attempt_id") or "").strip(),
+            )
+            if candidate_identity == evidence_identity:
+                matched = True
+                break
+        if matched:
+            narrowed.append(candidate)
+    return narrowed if len(narrowed) == 1 else candidates
+
+
 def handle_kiwoom_raw_chejan_event(
     raw_event: dict[str, object],
     live_context: dict[str, object] | None = None,
@@ -2805,6 +2849,10 @@ def handle_kiwoom_raw_chejan_event(
             continue
         candidates.append(dict(item))
 
+    candidates = _narrow_chejan_candidates_with_transport_evidence(
+        candidates,
+        broker_order_no,
+    )
     if len(candidates) != 1:
         return {
             "recorded": False,
@@ -9195,6 +9243,50 @@ class AutoTradeSettingWindow(QDialog):
                 raise RuntimeError("production recovery gate is unavailable")
             return checker(stock_code, caller_name=caller_name)
 
+        def send_order_reconciliation_register(payload: dict[str, object]):
+            api = api_object()
+            register = getattr(
+                api,
+                "register_send_order_reconciliation_context",
+                None,
+            )
+            if not callable(register):
+                return {
+                    "registered": False,
+                    "reason": "SEND_ORDER_RECONCILIATION_REGISTER_UNAVAILABLE",
+                }
+            return register(payload)
+
+        def live_sor_reconciliation_capability():
+            owner = persistent_feature_owner(self)
+            getter = getattr(
+                owner,
+                "live_sor_reconciliation_capability_snapshot",
+                None,
+            )
+            if not callable(getter):
+                return {
+                    "ready": False,
+                    "missing_capabilities": [
+                        "main_window_sor_reconciliation_capability_unavailable"
+                    ],
+                }
+            try:
+                value = getter()
+            except Exception:
+                return {
+                    "ready": False,
+                    "missing_capabilities": [
+                        "main_window_sor_reconciliation_capability_failed"
+                    ],
+                }
+            return dict(value) if isinstance(value, dict) else {
+                "ready": False,
+                "missing_capabilities": [
+                    "main_window_sor_reconciliation_capability_invalid"
+                ],
+            }
+
         owner_recovery_gate = getattr(
             persistent_feature_owner(self),
             "production_recovery_gate_for_stock",
@@ -9242,6 +9334,10 @@ class AutoTradeSettingWindow(QDialog):
                 production_recovery_gate_for_stock
                 if callable(owner_recovery_gate)
                 else None
+            ),
+            send_order_reconciliation_register=send_order_reconciliation_register,
+            live_sor_reconciliation_capability=(
+                live_sor_reconciliation_capability
             ),
         )
         boundary = AutoTradeOrderExecutionBoundary(context)
@@ -12249,6 +12345,14 @@ class AutoTradeSettingWindow(QDialog):
             context={
                 "send_order_attempt_owner": "GUI_MANUAL_SEND_ORDER",
                 "send_order_attempt_source": "gui_manual_send_order",
+                "send_order_reconciliation_register": latest_environment.get(
+                    "send_order_reconciliation_register"
+                ),
+                "live_sor_reconciliation_capability_snapshot": (
+                    latest_environment.get(
+                        "live_sor_reconciliation_capability_snapshot"
+                    )
+                ),
             },
         )
         result["order_id"] = order_id

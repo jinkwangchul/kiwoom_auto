@@ -17,6 +17,9 @@ from typing import Any
 
 from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
 from event_journal_trade_observer import observe_broker_chejan_result
+from send_order_reconciliation_evidence import (
+    read_send_order_reconciliation_evidence,
+)
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -1657,6 +1660,7 @@ def inspect_incomplete_order_reconciliation(
     identity: Any,
     *,
     fills_path: str | Path | None = None,
+    transport_evidence_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Inspect Queue/Chejan/fills evidence for restart reconciliation without writes."""
     target_path = Path(queue_path)
@@ -1693,10 +1697,58 @@ def inspect_incomplete_order_reconciliation(
             "broker_api_called": False,
         }
 
+    transport_records: list[dict[str, Any]] = []
+    if transport_evidence_path is not None:
+        transport_records = read_send_order_reconciliation_evidence(
+            Path(transport_evidence_path),
+            order_id=_clean_text(record.get("order_id")),
+            dispatch_claim_id=_clean_text(record.get("dispatch_claim_id")),
+            send_order_attempt_id=_clean_text(
+                record.get("send_order_attempt_id")
+            ),
+        )
+    transport_broker_order_nos = sorted(
+        {
+            _clean_text(
+                _as_dict(item.get("broker_evidence")).get(
+                    "broker_order_no"
+                )
+            )
+            for item in transport_records
+            if _clean_text(
+                _as_dict(item.get("broker_evidence")).get(
+                    "broker_order_no"
+                )
+            )
+        }
+    )
+
     fills, fill_warnings, _ = _read_fills_ledger(Path(fills_path) if fills_path is not None else None)
     fill_summary = _fill_ledger_summary(fills, record)
     evidence = _chejan_evidence(record)
     mismatch_reasons, mismatch_warnings = _queue_fill_mismatches(record, fill_summary, evidence)
+    queue_broker_order_no = _clean_text(record.get("broker_order_no"))
+    transport_broker_order_no = (
+        transport_broker_order_nos[0]
+        if len(transport_broker_order_nos) == 1
+        else ""
+    )
+    if len(transport_broker_order_nos) > 1:
+        mismatch_reasons.append(
+            "broker_order_no mismatch across transport evidence"
+        )
+    elif transport_broker_order_no:
+        if (
+            queue_broker_order_no
+            and queue_broker_order_no != transport_broker_order_no
+        ):
+            mismatch_reasons.append(
+                "broker_order_no mismatch between queue and transport evidence"
+            )
+        elif not queue_broker_order_no:
+            mismatch_warnings.append(
+                "broker_order_no available from SendOrder transport evidence"
+            )
     warnings = fill_warnings + mismatch_warnings
     classification = _classify_reconciliation(_clean_text(record.get("status")), mismatch_reasons, mismatch_warnings, fill_warnings)
     original_quantity = _int_or_none(record.get("original_order_quantity") or record.get("quantity"))
@@ -1713,7 +1765,10 @@ def inspect_incomplete_order_reconciliation(
         "queue_snapshot_unchanged": before_hash == after_hash,
         "order_index": index,
         "current_queue_status": _clean_text(record.get("status")),
-        "broker_order_no": _clean_text(record.get("broker_order_no")),
+        "broker_order_no": queue_broker_order_no,
+        "transport_broker_order_no": transport_broker_order_no,
+        "send_order_transport_evidence_count": len(transport_records),
+        "send_order_transport_evidence": transport_records,
         "dispatch_claim_id": _clean_text(record.get("dispatch_claim_id")),
         "send_order_attempt_id": _clean_text(record.get("send_order_attempt_id")),
         "identity": _record_identity(record),
@@ -1760,9 +1815,15 @@ def build_order_reconciliation_preview(
     identity: Any,
     *,
     fills_path: str | Path | None = None,
+    transport_evidence_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build a manual reconciliation proposal from read-only inspection evidence."""
-    inspection = inspect_incomplete_order_reconciliation(queue_path, identity, fills_path=fills_path)
+    inspection = inspect_incomplete_order_reconciliation(
+        queue_path,
+        identity,
+        fills_path=fills_path,
+        transport_evidence_path=transport_evidence_path,
+    )
     if inspection.get("inspection_ok") is not True:
         return {
             "preview_type": "ORDER_RECONCILIATION_PREVIEW",
@@ -1805,6 +1866,14 @@ def build_order_reconciliation_preview(
         "fills_summed_quantity": filled_quantity,
         "fills_weighted_average_price": inspection.get("fills_weighted_average_price"),
         "chejan_evidence": evidence,
+        "send_order_transport_evidence": inspection.get(
+            "send_order_transport_evidence",
+            [],
+        ),
+        "transport_broker_order_no": inspection.get(
+            "transport_broker_order_no",
+            "",
+        ),
         "blocked_reasons": inspection.get("blocked_reasons", []),
         "warnings": inspection.get("warnings", []),
     }
@@ -1824,7 +1893,10 @@ def build_order_reconciliation_preview(
         if isinstance(inspection.get("original_quantity"), int) and isinstance(filled_quantity, int)
         else inspection.get("queue_remaining"),
         "proposed_average_fill_price": inspection.get("fills_weighted_average_price"),
-        "proposed_broker_order_no": inspection.get("broker_order_no"),
+        "proposed_broker_order_no": (
+            inspection.get("broker_order_no")
+            or inspection.get("transport_broker_order_no")
+        ),
         "proposed_reconciliation_reason": inspection.get("warnings") or inspection.get("blocked_reasons"),
         "source_event_identities": inspection.get("source_event_identities", []),
         "expected_revision": inspection.get("queue_revision"),

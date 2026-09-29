@@ -93,6 +93,7 @@ class KiwoomSendOrderAdapterContractTest(unittest.TestCase):
             "order_id",
             "account_no",
             "screen_no",
+            "rqname",
             "order_name",
             "order_type",
             "code",
@@ -108,6 +109,9 @@ class KiwoomSendOrderAdapterContractTest(unittest.TestCase):
         self.assertEqual("ORDER_KIWOOM_CONTRACT_1", contract["order_id"])
         self.assertEqual("12345678", contract["account_no"])
         self.assertEqual("0101", contract["screen_no"])
+        self.assertRegex(contract["rqname"], r"^BUY_003550_[0-9A-F]{8}$")
+        self.assertLessEqual(len(contract["rqname"].encode("utf-8")), 80)
+        self.assertEqual(contract["rqname"], contract["send_order_params"]["rqname"])
         self.assertEqual("BUY", contract["order_name"])
         self.assertEqual(1, contract["order_type"])
         self.assertEqual("003550", contract["code"])
@@ -116,6 +120,28 @@ class KiwoomSendOrderAdapterContractTest(unittest.TestCase):
         self.assertEqual("03", contract["hoga"])
         self.assertEqual("", contract["original_order_no"])
         self.assertEqual(contract["send_order_params"], result["send_order_params"])
+
+    def test_rqname_changes_for_new_dispatch_of_same_order_id(self) -> None:
+        first = build_kiwoom_send_order_adapter_contract(
+            self._broker_preview(),
+            self._account_context(),
+            self._screen_context(),
+        )
+        second_preview = self._broker_preview()
+        second_preview["send_order_params_preview"]["dispatch_id"] = (
+            "DISPATCH_KIWOOM_CONTRACT_2"
+        )
+        second = build_kiwoom_send_order_adapter_contract(
+            second_preview,
+            self._account_context(),
+            self._screen_context(),
+        )
+
+        first_rqname = first["send_order_adapter_contract"]["rqname"]
+        second_rqname = second["send_order_adapter_contract"]["rqname"]
+        self.assertRegex(first_rqname, r"^BUY_003550_[0-9A-F]{8}$")
+        self.assertRegex(second_rqname, r"^BUY_003550_[0-9A-F]{8}$")
+        self.assertNotEqual(first_rqname, second_rqname)
 
     def test_broker_dispatch_blocked_returns_blocked(self) -> None:
         result = build_kiwoom_send_order_adapter_contract(

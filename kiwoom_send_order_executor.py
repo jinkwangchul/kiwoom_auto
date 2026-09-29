@@ -253,6 +253,24 @@ def execute_claimed_send_order(
 ) -> dict[str, Any]:
     """Execute one already-claimed SendOrder through the durable queue lifecycle."""
     ctx = _as_dict(context)
+    reconciliation_register = ctx.pop(
+        "send_order_reconciliation_register",
+        None,
+    )
+    sor_capability_value = ctx.pop(
+        "live_sor_reconciliation_capability_snapshot",
+        {},
+    )
+    sor_capability_snapshot = (
+        deepcopy(sor_capability_value)
+        if isinstance(sor_capability_value, dict)
+        else {
+            "ready": False,
+            "missing_capabilities": [
+                "live_sor_reconciliation_capability_invalid"
+            ],
+        }
+    )
     if expected_revision is None:
         return _blocked_result("revision_cas", "expected_revision is required")
     if not callable(send_order_callable):
@@ -272,6 +290,9 @@ def execute_claimed_send_order(
             reason_code="LIVE_SOR_RECONCILIATION_UNVERIFIED",
             market_route="SOR",
             order_type=send_order_args[3],
+            live_sor_reconciliation_capability_snapshot=(
+                sor_capability_snapshot
+            ),
         )
         observe_live_sor_execution_blocked(
             {**_as_dict(identity), "code": send_order_args[4]},
@@ -316,6 +337,45 @@ def execute_claimed_send_order(
             **_merge_writer_result("in_progress", in_progress),
         )
 
+    reconciliation_registration_result: dict[str, Any] = {}
+    if callable(reconciliation_register):
+        identity_dict = _as_dict(identity)
+        registration_payload = {
+            "source": "kiwoom_send_order_executor.execute_claimed_send_order",
+            "rqname": send_order_args[0],
+            "screen_no": send_order_args[1],
+            "order_id": identity_dict.get("order_id"),
+            "execution_id": identity_dict.get("execution_id"),
+            "signal_id": (
+                identity_dict.get("signal_id")
+                or identity_dict.get("source_signal_id")
+            ),
+            "dispatch_claim_id": dispatch_claim_id,
+            "send_order_attempt_id": attempt_id,
+            "market_route": final_market_route,
+            "order_type": send_order_args[3],
+        }
+        try:
+            registration_value = reconciliation_register(registration_payload)
+        except Exception as exc:
+            reconciliation_registration_result = {
+                "registered": False,
+                "reason": "SEND_ORDER_RECONCILIATION_REGISTER_EXCEPTION",
+                "exception": str(exc),
+            }
+        else:
+            if isinstance(registration_value, dict):
+                reconciliation_registration_result = deepcopy(registration_value)
+            else:
+                reconciliation_registration_result = {
+                    "registered": bool(registration_value),
+                    "reason": (
+                        ""
+                        if bool(registration_value)
+                        else "SEND_ORDER_RECONCILIATION_REGISTER_REJECTED"
+                    ),
+                }
+
     args_for_callable = deepcopy(send_order_args)
     raw_result: Any = None
     callable_error = ""
@@ -342,11 +402,21 @@ def execute_claimed_send_order(
                 callable_executed=True,
                 callable_exception=callable_error,
                 raw_result=None,
+                reconciliation_registration_result=deepcopy(
+                    reconciliation_registration_result
+                ),
                 **_merge_writer_result("attempt", attempt),
                 **_merge_writer_result("in_progress", in_progress),
                 **_merge_writer_result("record", recorded),
             )
-        finished = _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=None, callable_exception=callable_error)
+        finished = _finish_claimed_call_result(
+            recorded,
+            attempt,
+            in_progress,
+            raw_result=None,
+            callable_exception=callable_error,
+            reconciliation_registration_result=reconciliation_registration_result,
+        )
         observe_send_order_result({**_as_dict(identity), "code": send_order_args[4]}, finished)
         return finished
 
@@ -391,11 +461,21 @@ def execute_claimed_send_order(
             callable_executed=True,
             raw_result=deepcopy(raw_result),
             return_code=code,
+            reconciliation_registration_result=deepcopy(
+                reconciliation_registration_result
+            ),
             **_merge_writer_result("attempt", attempt),
             **_merge_writer_result("in_progress", in_progress),
             **_merge_writer_result("record", recorded),
         )
-    finished = _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=raw_result, return_code=code)
+    finished = _finish_claimed_call_result(
+        recorded,
+        attempt,
+        in_progress,
+        raw_result=raw_result,
+        return_code=code,
+        reconciliation_registration_result=reconciliation_registration_result,
+    )
     observe_send_order_result({**_as_dict(identity), "code": send_order_args[4]}, finished)
     return finished
 
@@ -415,6 +495,7 @@ def _finish_claimed_call_result(
     raw_result: Any,
     return_code: Any = None,
     callable_exception: str = "",
+    reconciliation_registration_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status = _text(recorded.get("status")) or STATUS_SEND_UNCERTAIN
     return {
@@ -441,6 +522,9 @@ def _finish_claimed_call_result(
         "attempt_result": deepcopy(attempt),
         "in_progress_result": deepcopy(in_progress),
         "record_result": deepcopy(recorded),
+        "reconciliation_registration_result": deepcopy(
+            reconciliation_registration_result or {}
+        ),
         "blocked_reasons": [],
         "warnings": list(recorded.get("warnings") or []),
     }

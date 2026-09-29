@@ -34,6 +34,9 @@ from production_performance_linkage import (
     record_buy_entry_lot,
 )
 from realized_pnl_ledger import record_realized_pnl
+from send_order_reconciliation_evidence import (
+    DEFAULT_EVIDENCE_PATH as DEFAULT_SEND_ORDER_RECONCILIATION_EVIDENCE_PATH,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -671,10 +674,21 @@ def assess_startup_recovery(
             review_reasons.append(f"{label}: manual reconciliation required")
 
         if status in {"SEND_CALL_IN_PROGRESS", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+            try:
+                use_transport_evidence = (
+                    Path(queue_path).resolve() == DEFAULT_QUEUE_PATH.resolve()
+                )
+            except Exception:
+                use_transport_evidence = False
             inspection = inspect_incomplete_order_reconciliation(
                 queue_path,
                 order,
                 fills_path=fills_path,
+                transport_evidence_path=(
+                    DEFAULT_SEND_ORDER_RECONCILIATION_EVIDENCE_PATH
+                    if use_transport_evidence
+                    else None
+                ),
             )
             reconciliation_details.append(inspection)
             classification = _clean_text(
