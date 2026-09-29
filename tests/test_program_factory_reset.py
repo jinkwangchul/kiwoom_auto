@@ -523,7 +523,10 @@ class ProgramFactoryResetTests(unittest.TestCase):
 
             def fail_second_target(source: object, destination: object) -> None:
                 nonlocal injected
-                if Path(source) == root / "routine_instances" and not injected:
+                if (
+                    Path(source).resolve() == (root / "routine_instances").resolve()
+                    and not injected
+                ):
                     injected = True
                     raise PermissionError("injected staging lock")
                 real_replace(source, destination)

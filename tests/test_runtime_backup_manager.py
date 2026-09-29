@@ -99,7 +99,8 @@ class TestRuntimeBackupManager(unittest.TestCase):
         )
         self.assertEqual(len(plan["backup_targets"]), 1)
         self.assertEqual(
-            plan["backup_targets"][0]["source"], str(f1)
+            Path(plan["backup_targets"][0]["source"]).resolve(),
+            f1.resolve(),
         )
 
     # 6. backup_created=False 확인

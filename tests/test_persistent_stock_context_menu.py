@@ -13,6 +13,7 @@ from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QWidget
 
+from tests.qt_test_support import ensure_qapplication, dispose_qt_widget
 import gui_auto_trade_context_menu as context_menu
 from gui_auto_trade_context_menu import (
     PersistentContextMenu,
@@ -24,10 +25,11 @@ from tests.participant_owner_fixture import participant_owner
 class PersistentStockContextMenuTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
 
     def _visible_menu(self) -> PersistentContextMenu:
         menu = PersistentContextMenu()
+        self.addCleanup(dispose_qt_widget, menu, close=True)
         menu.show()
         self.app.processEvents()
         self.assertTrue(menu.isVisible())
@@ -187,10 +189,12 @@ class PersistentStockContextMenuTest(unittest.TestCase):
                 observed.append(self.isVisible())
 
         callbacks = self._callbacks(mock_actions=mock_actions)
+        scripted_menu = ScriptedMenu()
+        self.addCleanup(dispose_qt_widget, scripted_menu, close=True)
         with patch.object(
             context_menu,
             "_new_stock_context_menu",
-            return_value=ScriptedMenu(),
+            return_value=scripted_menu,
         ):
             context_menu.show_monitor_stock_context_menu(
                 None,
@@ -235,10 +239,12 @@ class PersistentStockContextMenuTest(unittest.TestCase):
             individual_liquidation=production_immediate,
             mock_actions=mock_actions,
         )
+        scripted_menu = ScriptedMenu()
+        self.addCleanup(dispose_qt_widget, scripted_menu, close=True)
         with patch.object(
             context_menu,
             "_new_stock_context_menu",
-            return_value=ScriptedMenu(),
+            return_value=scripted_menu,
         ):
             context_menu.show_monitor_stock_context_menu(
                 None,
@@ -300,6 +306,8 @@ class PersistentStockContextMenuTest(unittest.TestCase):
                 early_close=early,
                 individual_liquidation=individual,
             )
+            scripted_menu = ScriptedMenu()
+            self.addCleanup(dispose_qt_widget, scripted_menu, close=True)
             owner = SimpleNamespace(
                 _main_monitoring_auto_trade_operation_host=participant_owner(
                     {"005930"}
@@ -309,7 +317,7 @@ class PersistentStockContextMenuTest(unittest.TestCase):
                 patch.object(
                     context_menu,
                     "_new_stock_context_menu",
-                    return_value=ScriptedMenu(),
+                    return_value=scripted_menu,
                 ),
                 patch.object(context_menu, "_append_stock_context_decision"),
             ):

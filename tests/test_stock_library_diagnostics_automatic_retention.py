@@ -236,7 +236,7 @@ class StockLibraryDiagnosticsAutomaticRetentionTest(unittest.TestCase):
         original_unlink = retention._unlink_file
 
         def controlled_unlink(path: Path) -> None:
-            if path == blocked:
+            if path.resolve() == blocked.resolve():
                 raise PermissionError(5, "file in use", str(path))
             original_unlink(path)
 

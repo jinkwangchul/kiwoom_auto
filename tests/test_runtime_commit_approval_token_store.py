@@ -93,7 +93,10 @@ class TestStoragePlan(unittest.TestCase):
         plan = _make_plan(str(self.tmp))
         self.assertEqual(plan["plan_status"], PLAN_STATUS_READY)
         self.assertTrue(plan["token_path"].endswith("tok-1.json"))
-        self.assertTrue(plan["token_path"].startswith(str(self.tmp)))
+        self.assertEqual(
+            Path(plan["token_path"]).resolve().relative_to(self.tmp.resolve()).as_posix(),
+            "approval_tokens/tok-1.json",
+        )
         self.assertTrue(plan["claim_path"].endswith(".consume.lock"))
         self.assertTrue(plan["preview_only"])
         for flag, val in plan["safety_flags"].items():

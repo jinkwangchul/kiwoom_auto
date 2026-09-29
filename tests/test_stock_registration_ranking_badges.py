@@ -10,9 +10,10 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QObject, Qt
 from PyQt5.QtWidgets import QApplication, QDialog
 
+from tests.qt_test_support import ensure_qapplication, dispose_qt_widget
 import gui_auto_trade_setting_window as setting_window
 from kiwoom_api import KiwoomApi
 from kiwoom_realtime_shadow import RealtimeShadowBarBuilder
@@ -45,6 +46,7 @@ class _Control:
 
 def _api() -> KiwoomApi:
     api = KiwoomApi.__new__(KiwoomApi)
+    QObject.__init__(api)
     api._control = _Control()
     api._available = True
     api._connected = True
@@ -83,7 +85,7 @@ def _api() -> KiwoomApi:
 class StockRankingBrokerBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
 
     def test_each_source_uses_one_governed_ranking_request_with_integrated_market(self) -> None:
         expected = {
@@ -249,7 +251,7 @@ class _DialogApi:
 class StockRegistrationRankingBadgeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
 
     def _dialog(self, api: _DialogApi):
         library = (
@@ -284,7 +286,7 @@ class StockRegistrationRankingBadgeTests(unittest.TestCase):
             instance_metadata={"target_kind": "unassigned"},
             kiwoom_api=api,
         )
-        self.addCleanup(dialog.close)
+        self.addCleanup(dispose_qt_widget, dialog, close=True)
         return dialog
 
     @staticmethod

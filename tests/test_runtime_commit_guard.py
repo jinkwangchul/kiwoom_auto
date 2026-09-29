@@ -68,7 +68,10 @@ class TestGuardPlan(unittest.TestCase):
         plan = _make_guard_plan(str(self.tmp))
         self.assertEqual(plan["guard_status"], GUARD_STATUS_READY)
         self.assertTrue(plan["lock_path"].endswith(".json"))
-        self.assertTrue(plan["lock_path"].startswith(str(self.tmp)))
+        self.assertEqual(
+            Path(plan["lock_path"]).resolve().parent.relative_to(self.tmp.resolve()).as_posix(),
+            "locks",
+        )
         self.assertTrue(plan["preview_only"])
         for flag, val in plan["safety_flags"].items():
             self.assertFalse(val)

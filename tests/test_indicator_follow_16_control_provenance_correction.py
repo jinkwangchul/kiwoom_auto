@@ -8,11 +8,13 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtWidgets import QApplication
 
+from tests.qt_test_support import ensure_qapplication
 from buy_execution_policy import _repeat_budget
 from engines.condition_engine import (
     evaluate_condition,
@@ -932,13 +934,14 @@ class ErrorPolicyContractTest(unittest.TestCase):
 class ConnectedUiAndSaveLoadTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.rules_path = Path(self.temp.name) / "rules.json"
         self.rules_path.write_bytes((ROUTINE_DIR / "rules.json").read_bytes())
-        self.dialog = dialog_module.IndicatorFollowRoutineSettingsDialog(rules_path=self.rules_path)
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            self.dialog = dialog_module.IndicatorFollowRoutineSettingsDialog(rules_path=self.rules_path)
 
     def tearDown(self):
         self.dialog.close()
@@ -990,7 +993,8 @@ class ConnectedUiAndSaveLoadTest(unittest.TestCase):
 
         saved = self.dialog.save_indicator_follow_ui_state_to_rules_for_maintenance()
         self.assertTrue(saved["success"], saved)
-        other = dialog_module.IndicatorFollowRoutineSettingsDialog(rules_path=self.rules_path)
+        with patch.object(dialog_module.QTimer, "singleShot"):
+            other = dialog_module.IndicatorFollowRoutineSettingsDialog(rules_path=self.rules_path)
         try:
             reapplied = other.collect_indicator_follow_ui_state()
             self.assertEqual(reapplied["basic"]["buy_signal_expr_line"], values["buy_signal_expr_line"])

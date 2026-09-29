@@ -22,6 +22,7 @@ from PyQt5.QtGui import QFontMetrics, QMouseEvent, QPixmap, QWheelEvent
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QScrollArea
 
+from tests.qt_test_support import ensure_qapplication, flush_deferred_deletes
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_flow as flow_module
 from gui_indicator_follow_signal_validation_flow import (
@@ -368,7 +369,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
         cls.project_root = Path(__file__).resolve().parents[1]
         cls.routine_dir = cls.project_root / "routines" / "지표추종매매"
         cls.rules = json.loads(
@@ -399,7 +400,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 widget.deleteLater()
             except RuntimeError:
                 pass
-        self.app.processEvents()
+        flush_deferred_deletes(self.app)
         self.history_cache_patch.stop()
         self.history_cache_temporary.cleanup()
 

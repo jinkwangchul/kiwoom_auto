@@ -247,7 +247,10 @@ class TestRuntimeRollbackManager(unittest.TestCase):
             failed_targets=[f2],
         )
         self.assertEqual(len(plan["rollback_targets"]), 1)
-        self.assertEqual(plan["rollback_targets"][0]["source"], str(f2))
+        self.assertEqual(
+            Path(plan["rollback_targets"][0]["source"]).resolve(),
+            f2.resolve(),
+        )
 
     # 17. failed_targets가 backup_targets와 매칭 안 되면 BLOCKED
     def test_blocked_with_non_matching_failed_targets(self):
