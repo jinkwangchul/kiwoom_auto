@@ -359,7 +359,10 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
             self.assertEqual(final_diff[0]["value"]["conditions"][0]["compare_target"], "MA")
             self.assertEqual(final_diff[0]["value"]["conditions"][0]["period"], 60)
             self.assertEqual(final_diff[1]["operation"], "set_filter")
-            self.assertEqual(final_diff[1]["value"]["conditions"][0]["target"], "CLOSE")
+            self.assertEqual(
+                final_diff[1]["value"]["conditions"][0]["target"],
+                "CURRENT_PRICE",
+            )
             self.assertEqual(final_diff[1]["value"]["conditions"][0]["operator"], ">=")
             self.assertEqual(final_diff[1]["value"]["conditions"][0]["compare_target"], "AVG_PRICE")
             self.assertEqual(final_diff[1]["value"]["conditions"][0]["value"], 0.15)
