@@ -19,6 +19,10 @@ from execution_queue_writer import (
     record_broker_send_uncertain,
 )
 from event_journal_trade_observer import observe_live_sor_execution_blocked, observe_send_order_result
+from live_sor_reconciliation_authority import (
+    AUTHORIZATION_CONTRACT as LIVE_SOR_AUTHORIZATION_CONTRACT,
+    inspect_live_sor_validation_certificate,
+)
 
 
 STATUS_SENT = "SEND_ORDER_SENT"
@@ -284,21 +288,51 @@ def execute_claimed_send_order(
             "send_order_args order_type has no supported KRX/SOR market route",
         )
     if final_market_route == "SOR":
-        blocked = _blocked_result(
-            "live_sor_reconciliation_gate",
-            "LIVE_SOR_RECONCILIATION_UNVERIFIED",
-            reason_code="LIVE_SOR_RECONCILIATION_UNVERIFIED",
-            market_route="SOR",
-            order_type=send_order_args[3],
-            live_sor_reconciliation_capability_snapshot=(
-                sor_capability_snapshot
+        certificate_recheck = inspect_live_sor_validation_certificate(
+            expected_login_session_id=_text(
+                sor_capability_snapshot.get("login_session_id")
+            ),
+            expected_connection_epoch=(
+                sor_capability_snapshot.get("connection_epoch") or 0
+            ),
+            expected_account_fingerprint=_text(
+                sor_capability_snapshot.get("account_fingerprint")
+            ),
+            expected_server_type=_text(
+                sor_capability_snapshot.get("server_type")
             ),
         )
-        observe_live_sor_execution_blocked(
-            {**_as_dict(identity), "code": send_order_args[4]},
-            blocked,
+        snapshot_certificate_hash = _text(
+            sor_capability_snapshot.get("validation_certificate_hash")
         )
-        return blocked
+        sor_authorized = bool(
+            sor_capability_snapshot.get("ready") is True
+            and sor_capability_snapshot.get("live_execution_authorized") is True
+            and sor_capability_snapshot.get("authorization_verified") is True
+            and sor_capability_snapshot.get("validation_certificate_valid") is True
+            and snapshot_certificate_hash
+            and _text(sor_capability_snapshot.get("authorization_contract"))
+            == LIVE_SOR_AUTHORIZATION_CONTRACT
+            and certificate_recheck.get("valid") is True
+            and _text(certificate_recheck.get("certificate_hash"))
+            == snapshot_certificate_hash
+        )
+        if not sor_authorized:
+            blocked = _blocked_result(
+                "live_sor_reconciliation_gate",
+                "LIVE_SOR_RECONCILIATION_UNVERIFIED",
+                reason_code="LIVE_SOR_RECONCILIATION_UNVERIFIED",
+                market_route="SOR",
+                order_type=send_order_args[3],
+                live_sor_reconciliation_capability_snapshot=(
+                    sor_capability_snapshot
+                ),
+            )
+            observe_live_sor_execution_blocked(
+                {**_as_dict(identity), "code": send_order_args[4]},
+                blocked,
+            )
+            return blocked
 
     attempt = mark_send_order_attempted(
         queue_path,

@@ -13,6 +13,7 @@ from unittest import mock
 
 from kiwoom_send_order_executor import execute_claimed_send_order, execute_kiwoom_send_order
 from execution_queue_writer import mark_send_order_attempted, mark_send_order_call_in_progress
+from live_sor_reconciliation_authority import AUTHORIZATION_CONTRACT
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -541,7 +542,15 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         adapter = ClaimedSendOrderCallable(0)
         capability = {
             "ready": True,
+            "live_execution_authorized": True,
+            "authorization_verified": True,
+            "validation_certificate_valid": True,
+            "validation_certificate_hash": "CERT_HASH",
+            "authorization_contract": AUTHORIZATION_CONTRACT,
             "login_session_id": "SESSION_1",
+            "connection_epoch": 7,
+            "account_fingerprint": "ACCOUNT_FP",
+            "server_type": "REAL",
             "checks": {
                 "kiwoom_connected": True,
                 "login_session_available": True,
@@ -555,6 +564,13 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         }
 
         with mock.patch(
+            "kiwoom_send_order_executor.inspect_live_sor_validation_certificate",
+            return_value={
+                "valid": False,
+                "certificate_hash": "",
+                "blocked_reasons": ["source evidence missing"],
+            },
+        ) as certificate_recheck, mock.patch(
             "kiwoom_send_order_executor.observe_live_sor_execution_blocked"
         ) as diagnostic:
             result = execute_claimed_send_order(
@@ -583,6 +599,87 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         )
         self.assertEqual([], adapter.calls)
         self.assertEqual(before, queue_path.read_bytes())
+        certificate_recheck.assert_called_once_with(
+            expected_login_session_id="SESSION_1",
+            expected_connection_epoch=7,
+            expected_account_fingerprint="ACCOUNT_FP",
+            expected_server_type="REAL",
+        )
+
+    def test_claimed_sor_route_executes_only_with_verified_validation_certificate(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimed_record(
+            market_route="SOR",
+            execution_request={"request_preview": {"market_route": "SOR"}},
+        )
+        self._write_claimed_queue(queue_path, record)
+        adapter = ClaimedSendOrderCallable(0)
+        capability = {
+            "ready": True,
+            "live_execution_authorized": True,
+            "authorization_verified": True,
+            "validation_certificate_valid": True,
+            "validation_certificate_hash": "CERT_HASH",
+            "authorization_contract": AUTHORIZATION_CONTRACT,
+            "login_session_id": "SESSION_1",
+            "connection_epoch": 7,
+            "account_fingerprint": "ACCOUNT_FP",
+            "server_type": "REAL",
+        }
+        args = [
+            "SOR",
+            "0101",
+            "12345678",
+            11,
+            "003550",
+            10,
+            85000,
+            "00",
+            "",
+        ]
+
+        with mock.patch(
+            "kiwoom_send_order_executor.inspect_live_sor_validation_certificate",
+            return_value={
+                "valid": True,
+                "certificate_hash": "CERT_HASH",
+                "blocked_reasons": [],
+            },
+        ) as certificate_recheck, mock.patch(
+            "kiwoom_send_order_executor.observe_live_sor_execution_blocked"
+        ) as diagnostic:
+            result = execute_claimed_send_order(
+                queue_path,
+                _claimed_identity(record),
+                "CLAIM_1",
+                "CLAIM_TOKEN",
+                "GUI_MANUAL",
+                1,
+                adapter,
+                args,
+                {
+                    "send_order_attempt_id": "ATTEMPT_SOR_AUTHORIZED",
+                    "live_sor_reconciliation_capability_snapshot": capability,
+                },
+            )
+
+        self.assertEqual("SEND_CALL_ACCEPTED", result["status"])
+        self.assertEqual([tuple(args)], adapter.calls)
+        self.assertTrue(result["send_order_called"])
+        self.assertTrue(result["broker_api_called"])
+        self.assertFalse(result["actual_order_sent"])
+        diagnostic.assert_not_called()
+        certificate_recheck.assert_called_once_with(
+            expected_login_session_id="SESSION_1",
+            expected_connection_epoch=7,
+            expected_account_fingerprint="ACCOUNT_FP",
+            expected_server_type="REAL",
+        )
+        queued = json.loads(queue_path.read_text(encoding="utf-8"))["orders"][0]
+        self.assertEqual("SEND_CALL_ACCEPTED", queued["status"])
+        self.assertEqual("SOR", queued["market_route"])
 
     def test_claimed_krx_route_still_invokes_original_order_type(self) -> None:
         tmp = tempfile.TemporaryDirectory()

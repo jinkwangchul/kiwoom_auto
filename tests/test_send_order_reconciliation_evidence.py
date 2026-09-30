@@ -74,6 +74,8 @@ def _event(source: str, **overrides: object) -> dict[str, object]:
     return value
 
 
+
+
 class SendOrderReconciliationEvidenceTest(unittest.TestCase):
     def test_order_tr_build_preserves_correlations_without_account_copy(self) -> None:
         result = build_send_order_reconciliation_evidence(
@@ -260,16 +262,33 @@ class SendOrderReconciliationEvidenceTest(unittest.TestCase):
         api = SimpleNamespace(
             is_connected=lambda: True,
             login_session_id=lambda: "SESSION_1",
+            broker_session_snapshot=lambda: SimpleNamespace(
+                login_session_id="SESSION_1",
+                connection_epoch=7,
+            ),
             register_send_order_reconciliation_context=lambda _payload: {
                 "registered": True
             },
+            account_server_type=lambda: "REAL",
         )
         main = SimpleNamespace(
             kiwoom_api=api,
+            selected_account_no=lambda: "12345678",
             _raw_chejan_evidence_bound=True,
             _raw_order_tr_evidence_bound=True,
             _raw_message_evidence_bound=True,
         )
+        certificate_patch = patch.object(
+            gui_windows,
+            "inspect_live_sor_validation_certificate",
+            return_value={
+                "valid": False,
+                "certificate_hash": "",
+                "blocked_reasons": [],
+            },
+        )
+        certificate_patch.start()
+        self.addCleanup(certificate_patch.stop)
 
         ready = gui_windows.MainWindow.live_sor_reconciliation_capability_snapshot(
             main
@@ -317,6 +336,60 @@ class SendOrderReconciliationEvidenceTest(unittest.TestCase):
             "raw_message_consumer_bound",
             blocked["blocking_reasons"],
         )
+
+    def test_live_sor_capability_authorizes_only_valid_current_session_certificate(self) -> None:
+        api = SimpleNamespace(
+            is_connected=lambda: True,
+            login_session_id=lambda: "SESSION_1",
+            broker_session_snapshot=lambda: SimpleNamespace(
+                login_session_id="SESSION_1",
+                connection_epoch=7,
+            ),
+            register_send_order_reconciliation_context=lambda _payload: {
+                "registered": True
+            },
+            account_server_type=lambda: "REAL",
+        )
+        main = SimpleNamespace(
+            kiwoom_api=api,
+            selected_account_no=lambda: "12345678",
+            _raw_chejan_evidence_bound=True,
+            _raw_order_tr_evidence_bound=True,
+            _raw_message_evidence_bound=True,
+        )
+        with patch.object(
+            gui_windows,
+            "inspect_live_sor_validation_certificate",
+            return_value={
+                "valid": True,
+                "certificate_hash": "CERT_HASH",
+                "blocked_reasons": [],
+            },
+        ) as inspector:
+            ready = gui_windows.MainWindow.live_sor_reconciliation_capability_snapshot(
+                main
+            )
+
+        self.assertTrue(ready["ready"])
+        self.assertTrue(ready["pipeline_ready"])
+        self.assertTrue(ready["live_execution_authorized"])
+        self.assertTrue(ready["authorization_verified"])
+        self.assertTrue(ready["validation_certificate_valid"])
+        self.assertEqual("CERT_HASH", ready["validation_certificate_hash"])
+        self.assertEqual("LIVE_SOR_EXECUTION_AUTHORIZED", ready["validation_state"])
+        self.assertEqual([], ready["blocking_reasons"])
+        inspector.assert_called_once_with(
+            expected_login_session_id="SESSION_1",
+            expected_connection_epoch=7,
+            expected_account_no="12345678",
+            expected_server_type="REAL",
+        )
+
+
+
+
+
+
 
     def test_main_window_init_wires_raw_tr_and_message_signals(self) -> None:
         source = inspect.getsource(gui_windows.MainWindow.__init__)

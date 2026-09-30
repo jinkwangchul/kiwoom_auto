@@ -1632,6 +1632,10 @@ from send_order_reconciliation_evidence import (
     inspect_send_order_reconciliation_evidence_storage,
     record_send_order_reconciliation_evidence,
 )
+from live_sor_reconciliation_authority import (
+    AUTHORIZATION_CONTRACT as LIVE_SOR_AUTHORIZATION_CONTRACT,
+    inspect_live_sor_validation_certificate,
+)
 from gui_routine_registry import (
     group_record_by_id,
     routine_record_by_name,
@@ -4122,6 +4126,9 @@ def _project_live_sor_reconciliation_capability(owner) -> dict[str, object]:
     api = getattr(owner, "kiwoom_api", None)
     connected = False
     session_id = ""
+    connection_epoch = 0
+    selected_account_no = ""
+    server_type = ""
     try:
         checker = getattr(api, "is_connected", None)
         connected = bool(checker()) if callable(checker) else False
@@ -4136,6 +4143,36 @@ def _project_live_sor_reconciliation_capability(owner) -> dict[str, object]:
         )
     except Exception:
         session_id = ""
+    try:
+        snapshot_getter = getattr(api, "broker_session_snapshot", None)
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
+        connection_epoch = int(
+            getattr(snapshot, "connection_epoch", 0) or 0
+        )
+        if not session_id:
+            session_id = str(
+                getattr(snapshot, "login_session_id", "") or ""
+            ).strip()
+    except Exception:
+        connection_epoch = 0
+    try:
+        account_getter = getattr(owner, "selected_account_no", None)
+        selected_account_no = (
+            str(account_getter() or "").strip()
+            if callable(account_getter)
+            else ""
+        )
+    except Exception:
+        selected_account_no = ""
+    try:
+        server_type_getter = getattr(api, "account_server_type", None)
+        server_type = (
+            str(server_type_getter() or "").strip().upper()
+            if callable(server_type_getter)
+            else ""
+        )
+    except Exception:
+        server_type = ""
 
     register = getattr(
         api,
@@ -4146,6 +4183,9 @@ def _project_live_sor_reconciliation_capability(owner) -> dict[str, object]:
     checks = {
         "kiwoom_connected": connected,
         "login_session_available": bool(session_id),
+        "connection_epoch_available": connection_epoch > 0,
+        "selected_account_available": bool(selected_account_no),
+        "production_real_server": server_type == "REAL",
         "raw_chejan_consumer_bound": (
             getattr(owner, "_raw_chejan_evidence_bound", False) is True
         ),
@@ -4165,15 +4205,27 @@ def _project_live_sor_reconciliation_capability(owner) -> dict[str, object]:
         name for name, available in checks.items() if available is not True
     ]
     pipeline_ready = not missing
-    live_execution_authorized = False
+    certificate = inspect_live_sor_validation_certificate(
+        expected_login_session_id=session_id,
+        expected_connection_epoch=connection_epoch,
+        expected_account_no=selected_account_no,
+        expected_server_type=server_type,
+    )
+    certificate_valid = certificate.get("valid") is True
+    live_execution_authorized = pipeline_ready and certificate_valid
     blocking_reasons = list(missing)
     if pipeline_ready and not live_execution_authorized:
         blocking_reasons.append(
             "LIVE_SOR_PRODUCTION_EVIDENCE_UNVERIFIED"
         )
+        blocking_reasons.extend(
+            str(reason)
+            for reason in certificate.get("blocked_reasons", [])
+            if str(reason).strip()
+        )
     validation_state = (
         "LIVE_SOR_EXECUTION_AUTHORIZED"
-        if pipeline_ready and live_execution_authorized
+        if live_execution_authorized
         else "READY_FOR_CONTROLLED_VALIDATION"
         if pipeline_ready
         else "SOR_RECONCILIATION_CAPABILITY_INCOMPLETE"
@@ -4191,7 +4243,20 @@ def _project_live_sor_reconciliation_capability(owner) -> dict[str, object]:
             if live_execution_authorized
             else "LIVE_SOR_PRODUCTION_EVIDENCE_UNVERIFIED"
         ),
+        "authorization_contract": LIVE_SOR_AUTHORIZATION_CONTRACT,
+        "authorization_verified": live_execution_authorized,
+        "validation_certificate_valid": certificate_valid,
+        "validation_certificate_hash": str(
+            certificate.get("certificate_hash") or ""
+        ),
+        "validation_certificate": certificate,
         "login_session_id": session_id,
+        "connection_epoch": connection_epoch,
+        "account_bound": bool(selected_account_no),
+        "account_fingerprint": str(
+            certificate.get("account_fingerprint") or ""
+        ),
+        "server_type": server_type,
         "checks": checks,
         "transport_evidence_storage": storage,
         "missing_capabilities": missing,
