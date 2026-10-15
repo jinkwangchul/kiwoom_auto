@@ -9408,7 +9408,7 @@ class IndicatorFollowSignalValidationV5Window(
         self.chart_input_invalidated.emit()
 
     def _maybe_request_history_extension(
-        self, *, source: str = "navigation",
+        self, *, source: str = "navigation", continued_wheel_prepend: bool = False,
     ) -> None:
         if (
             source == "wheel"
@@ -9426,7 +9426,8 @@ class IndicatorFollowSignalValidationV5Window(
             self._history_extension_intent_source = None
             return
         QTimer.singleShot(
-            self._HISTORY_EXTENSION_IDLE_DELAY_MS,
+            0 if continued_wheel_prepend and source == "wheel"
+            else self._HISTORY_EXTENSION_IDLE_DELAY_MS,
             lambda expected=generation: self._emit_history_extension_if_idle(expected),
         )
 
@@ -9604,7 +9605,9 @@ class IndicatorFollowSignalValidationV5Window(
         self._set_time_view(start, span, manually_adjusted=True, auto_fit_price=True)
         if desired > span and added >= 500 and len(self._calculation_candles) < 5000:
             self._deferred_wheel_zoom = intent
-            self._maybe_request_history_extension(source="wheel")
+            self._maybe_request_history_extension(
+                source="wheel", continued_wheel_prepend=True,
+            )
 
     def _queue_time_scale_wheel(self, cursor_x: float, wheel_delta: int) -> None:
         self._queue_wheel_zoom("time", cursor_x, wheel_delta)
