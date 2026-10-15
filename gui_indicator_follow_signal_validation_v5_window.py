@@ -9560,6 +9560,13 @@ class IndicatorFollowSignalValidationV5Window(
             )
         span = self._clamped_visible_candle_span(requested_span)
         if span == span_value:
+            if (effective_wheel_delta < 0
+                    and span >= self._MAX_VISIBLE_CANDLE_SPAN
+                    and start_value > 0
+                    and self._historical_pool_installed):
+                # Once zoom saturates, the same wheel input navigates older candles.
+                older_step = min(500.0, max(1.0, span * 0.04 * wheel_steps))
+                return max(0.0, start_value - older_step), span
             # Either the loaded-data boundary or the display cap can need history.
             if (
                 effective_wheel_delta < 0
@@ -9575,11 +9582,15 @@ class IndicatorFollowSignalValidationV5Window(
 
     def _apply_time_zoom_target(self, start: float, span: float) -> None:
         shrinking = span < self._visible_candle_span
+        wheel_pan = (
+            math.isclose(span, self._visible_candle_span, rel_tol=1e-12, abs_tol=1e-12)
+            and not math.isclose(start, self._visible_start_index, rel_tol=1e-12, abs_tol=1e-12)
+        )
         self._set_time_view(
             start,
             span,
             manually_adjusted=True,
-            auto_fit_price=True,
+            auto_fit_price=not wheel_pan,
             user_horizontal_navigation=True,
         )
         if shrinking and self._history_extension_intent_source == "wheel":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+import time
 
 import pytest
 from PyQt5.QtTest import QTest
@@ -30,6 +31,7 @@ def test_each_cap_wheel_fetches_one_chunk_to_5000_without_changing_view(case):
     emitted = []
     window.historical_extension_requested.connect(lambda: emitted.append(1))
     anchor_time = window._candles[0]["time"]
+    previous_visible_time = anchor_time
     price_bounds = window.current_price_bounds
 
     with patch.object(flow, "_run_validation") as run:
@@ -43,7 +45,13 @@ def test_each_cap_wheel_fetches_one_chunk_to_5000_without_changing_view(case):
             _install(window, count)
             flow._history_extension_inflight.pop(key, None)
             assert window._visible_candle_span == 3500
-            assert window._candles[round(window._visible_start_index)]["time"] == anchor_time
+            visible_time = window._candles[round(window._visible_start_index)]["time"]
+            if count == 4000:
+                assert visible_time == anchor_time
+            else:
+                assert visible_time < previous_visible_time
+                assert window.time_navigation_scrollbar.value() < maximum
+            previous_visible_time = visible_time
             assert window.time_navigation_scrollbar.maximum() == maximum
             assert window.time_navigation_scrollbar.isEnabled()
             assert window.current_price_bounds == price_bounds
@@ -53,6 +61,14 @@ def test_each_cap_wheel_fetches_one_chunk_to_5000_without_changing_view(case):
         assert len(emitted) == 3
         assert flow._history_targets[key] == 5000
         assert run.call_count == 3
+
+
+def _wait_target(flow, key, target, timeout_seconds=2.5):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline and flow._history_targets[key] != target:
+        QTest.qWait(75)
+        QApplication.processEvents()
+    assert flow._history_targets[key] == target
 
 
 def test_wheel_then_scrollbar_then_wheel_reaches_cap(case):
@@ -71,14 +87,12 @@ def test_wheel_then_scrollbar_then_wheel_reaches_cap(case):
         flow._history_extension_inflight.pop(key, None)
 
         window.time_navigation_scrollbar.setValue(0)
-        QTest.qWait(700)
-        assert flow._history_targets[key] == 4500
+        _wait_target(flow, key, 4500)
         _install(window, 4500)
         flow._history_extension_inflight.pop(key, None)
 
         wheel_cases.wheel(window.canvas, -120)
-        QTest.qWait(700)
-        assert flow._history_targets[key] == 5000
+        _wait_target(flow, key, 5000)
         assert emitted == [1, 1, 1]
         assert run.call_count == 3
 
