@@ -8,6 +8,9 @@ from indicator_follow_signal_validation_perf_trace import (
     phase as _perf_phase,
     stage as _perf_stage,
 )
+from indicator_follow_signal_validation_v5_settings_diagnostic import (
+    export_settings_snapshot as _export_settings_snapshot,
+)
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -11482,6 +11485,9 @@ class IndicatorFollowSignalValidationV5Window(
                 name="indicator-follow-validation-projection",
                 daemon=True,
             ).start()
+            _export_settings_snapshot(
+                self, "visualization_submitted", projection_request=request,
+            )
         except Exception as exc:
             self._visualization_projection_active = None
             self._visualization_data_error = str(exc)
@@ -11661,6 +11667,10 @@ class IndicatorFollowSignalValidationV5Window(
             canvas.set_validation_range(None, None)
         self.fixed_price_axis.refresh_scale()
         self._refresh_valid_filter_emphasis()
+
+        _export_settings_snapshot(
+            self, "visualization_applied", projection_ui_state=delay_ui_state,
+        )
 
     @staticmethod
     def _marking_source_key_for_candles(

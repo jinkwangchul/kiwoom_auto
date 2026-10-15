@@ -7,6 +7,9 @@ from indicator_follow_signal_validation_perf_trace import (
     ENABLED as _PERF_ENABLED, stage as _perf_stage, emit as _perf_emit,
     phase as _perf_phase,
 )
+from indicator_follow_signal_validation_v5_settings_diagnostic import (
+    export_settings_snapshot as _export_settings_snapshot,
+)
 
 from collections.abc import Callable
 from copy import deepcopy
@@ -3662,6 +3665,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         old_pool = self._historical_pools.get(window_key)
         self._historical_pools[window_key] = pool
         self._validation_sessions[window_key] = session
+        _export_settings_snapshot(
+            window, "history_browse_applied",
+            request_settings=session.request.settings_snapshot,
+        )
         _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[
             self._shared_pool_key(
                 session.request.stock,
@@ -3947,6 +3954,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 session,
                 view_pool,
                 evaluation_count=evaluation_count,
+            )
+        if normal_base_presentation is not None or replay_snapshot is not None:
+            _export_settings_snapshot(
+                window, "calculation_applied",
+                request_settings=session.request.settings_snapshot,
             )
         trace_signal_validation_event(
             "flow.apply_pool.end",
@@ -7468,6 +7480,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if not callable(apply_range):
                     raise TypeError("range replay result API is unavailable")
                 apply_range(replay_result.snapshot)
+            _export_settings_snapshot(
+                window, "replay_applied",
+                request_settings=session.request.settings_snapshot,
+            )
         except Exception as exc:
             self._fail_window(window, f"RESULT_VIEW_ERROR: {exc}")
 
@@ -8400,6 +8416,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             apply_range(
                 snapshot,
                 settings_snapshot=session.request.settings_snapshot,
+            )
+            _export_settings_snapshot(
+                window, "range_calculation_applied",
+                request_settings=session.request.settings_snapshot,
             )
         except Exception as exc:
             self._fail_window(window, f"RESULT_VIEW_ERROR: {exc}")
