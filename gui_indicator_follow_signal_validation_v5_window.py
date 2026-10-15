@@ -8223,6 +8223,8 @@ class IndicatorFollowSignalValidationV5Window(
         self._syncing_time_navigation_scrollbar = False
         self._time_zoom_wheel_accumulator = 0
         self._time_zoom_wheel_last_input_at: float | None = None
+        self._deferred_wheel_zoom = None
+        self._history_wheel_zoom_candidate = None
         self._history_extension_intent_generation = 0
         self._history_extension_intent_source: str | None = None
         self._history_extension_retry_generation: int | None = None
@@ -9341,6 +9343,8 @@ class IndicatorFollowSignalValidationV5Window(
         self._notify_chart_navigation_idle(history_source=history_source)
 
     def _on_chart_interaction_started(self) -> None:
+        self._deferred_wheel_zoom = None
+        self._history_wheel_zoom_candidate = None
         self._chart_interaction_epoch += 1
         canvas = getattr(self, "canvas", None)
         self._history_pointer_gesture = bool(
@@ -9381,6 +9385,7 @@ class IndicatorFollowSignalValidationV5Window(
             self._maybe_request_history_extension(source=history_source)
 
     def _discard_chart_input(self) -> None:
+        self._deferred_wheel_zoom = None
         self._cancel_chart_input_frame()
         self._cancel_pending_time_navigation()
         scrollbar = getattr(self, "time_navigation_scrollbar", None)
@@ -9526,8 +9531,21 @@ class IndicatorFollowSignalValidationV5Window(
         requested_span = (
             span_value / factor
             if effective_wheel_delta > 0
-            else span_value * factor
+            else max(span_value, self._deferred_wheel_zoom[0]
+                     if self._deferred_wheel_zoom else span_value) * factor
         )
+        if (effective_wheel_delta < 0 and requested_span > len(self._candles)
+                and span_value < self._MAX_VISIBLE_CANDLE_SPAN
+                and self._historical_pool_installed):
+            settings = self._result_settings_snapshot
+            snapshot = self._replay_snapshot
+            self._deferred_wheel_zoom = (
+                min(requested_span, self._MAX_VISIBLE_CANDLE_SPAN), anchor_ratio,
+                snapshot.timeframe_key if isinstance(snapshot, ValidationReplaySnapshot)
+                else self._normal_base_timeframe_key,
+                settings.to_dict() if settings is not None else None,
+                snapshot.settings_hash if isinstance(snapshot, ValidationReplaySnapshot) else None,
+            )
         span = self._clamped_visible_candle_span(requested_span)
         if span == span_value:
             # A loaded-data boundary is not the configured 3,500-bar limit.
@@ -9561,6 +9579,31 @@ class IndicatorFollowSignalValidationV5Window(
             self._history_extension_intent_source = None
             self._history_extension_retry_generation = None
         if self._history_extension_is_needed() or self._history_extension_intent_source:
+            self._maybe_request_history_extension(source="wheel")
+
+    def _resume_history_wheel_zoom(
+        self, *, timeframe_key: str,
+        settings_snapshot: ValidationSettingsSnapshot | None = None,
+        settings_hash: str | None = None,
+    ) -> None:
+        candidate = self._history_wheel_zoom_candidate
+        self._history_wheel_zoom_candidate = None
+        if candidate is None:
+            return
+        intent, old_display, added = candidate
+        desired, ratio, old_timeframe, old_settings, old_hash = intent
+        if (timeframe_key != old_timeframe
+                or (settings_snapshot is not None
+                    and settings_snapshot.to_dict() != old_settings)
+                or (settings_hash is not None and settings_hash != old_hash)
+                or added <= 0 or len(self._candles) <= len(old_display)
+                or self._candles[-len(old_display):] != old_display):
+            return
+        span = min(desired, float(len(self._candles)), self._MAX_VISIBLE_CANDLE_SPAN)
+        start = self._visible_start_index + ratio * (self._visible_candle_span - span)
+        self._set_time_view(start, span, manually_adjusted=True, auto_fit_price=True)
+        if desired > span and added >= 500 and len(self._calculation_candles) < 5000:
+            self._deferred_wheel_zoom = intent
             self._maybe_request_history_extension(source="wheel")
 
     def _queue_time_scale_wheel(self, cursor_x: float, wheel_delta: int) -> None:
@@ -9654,6 +9697,9 @@ class IndicatorFollowSignalValidationV5Window(
         target = self._pan_chart_target(delta_x, delta_y)
         if target is None:
             return
+        if target[0] == "time":
+            self._deferred_wheel_zoom = None
+            self._history_wheel_zoom_candidate = None
         if not self._chart_input_frame_active and not self._try_admit_chart_input_frame(history_source="navigation"):
             return
         try:
@@ -9707,6 +9753,8 @@ class IndicatorFollowSignalValidationV5Window(
         self._notify_chart_navigation_idle()
 
     def _begin_time_navigation(self) -> None:
+        self._deferred_wheel_zoom = None
+        self._history_wheel_zoom_candidate = None
         self._cancel_pending_wheel_zoom()
         canvas = getattr(self, "canvas", None)
         if canvas is not None and canvas.is_pointer_interaction_active():
@@ -9773,6 +9821,8 @@ class IndicatorFollowSignalValidationV5Window(
     def _time_navigation_scrollbar_changed(self, value: int) -> None:
         if self._syncing_time_navigation_scrollbar:
             return
+        self._deferred_wheel_zoom = None
+        self._history_wheel_zoom_candidate = None
         self._cancel_pending_wheel_zoom()
         start = float(value) / self._TIME_SCROLL_UNITS_PER_CANDLE
         self._set_time_view(
@@ -9892,6 +9942,9 @@ class IndicatorFollowSignalValidationV5Window(
             self._flush_pending_wheel_zoom()
             pending = None
         if axis == "time":
+            if delta > 0:
+                self._deferred_wheel_zoom = None
+                self._history_wheel_zoom_candidate = None
             target = self._time_zoom_target(
                 cursor_position,
                 int(delta),
@@ -9957,6 +10010,7 @@ class IndicatorFollowSignalValidationV5Window(
         if reset_intent:
             self._time_zoom_wheel_accumulator = 0
             self._time_zoom_wheel_last_input_at = None
+            self._deferred_wheel_zoom = None
 
 
     def _collect_validation_execution_state(self) -> dict[str, Any]:
@@ -13896,6 +13950,16 @@ class IndicatorFollowSignalValidationV5Window(
             previous_range_times=self._validation_range_times,
             previous_range_replay_available=self._range_replay_entries_available,
         )
+        intent = self._deferred_wheel_zoom
+        old_display = self._candles
+        old_pool = self._calculation_candles
+        self._history_wheel_zoom_candidate = (
+            (intent, old_display, len(candles) - len(old_pool))
+            if intent is not None and old_pool and old_display
+            and len(candles) > len(old_pool)
+            and candles[-len(old_pool):] == old_pool
+            else None
+        )
         self._discard_chart_input()
         self._invalidate_visualization_projection_data()
         self._pending_prepared_presentation = None
@@ -14545,6 +14609,7 @@ class IndicatorFollowSignalValidationV5Window(
             vars(self).update(previous)
             vars(self).update(generations)  # Cancellation identities never go backwards.
             self._discard_chart_input()
+            self._history_wheel_zoom_candidate = None
             self._cancel_visualization_projection_work()
             installed = self.chart_scroll_area.widget()
             if installed is not old_canvas:
@@ -14566,6 +14631,10 @@ class IndicatorFollowSignalValidationV5Window(
             )
             raise
         else:
+            self._resume_history_wheel_zoom(
+                timeframe_key=replay_snapshot.timeframe_key,
+                settings_hash=replay_snapshot.settings_hash,
+            )
             if old_canvas is not None and old_canvas is not self.canvas:
                 old_canvas.deleteLater()
         finally:
@@ -14792,6 +14861,9 @@ class IndicatorFollowSignalValidationV5Window(
         else:
             self.select_evaluation_index(len(self._candles) - 1)
         self._capture_entry_chart_view_state()
+        self._resume_history_wheel_zoom(
+            timeframe_key=timeframe_key, settings_snapshot=settings_snapshot,
+        )
         self._refresh_filter_display_projection()
         self._marking_pool_publication_pending = False
         self._resume_marking_policy_refresh()
@@ -15437,6 +15509,8 @@ class IndicatorFollowSignalValidationV5Window(
             or not 0 <= index < len(self._candles)
         ):
             return
+        self._deferred_wheel_zoom = None
+        self._history_wheel_zoom_candidate = None
         self._validation_range_anchor_index = index
         self._validation_range_anchor_time = str(
             self._candles[index].get("time") or ""
@@ -15679,6 +15753,8 @@ class IndicatorFollowSignalValidationV5Window(
             or not 0 <= index < len(self._candles)
         ):
             return False
+        self._deferred_wheel_zoom = None
+        self._history_wheel_zoom_candidate = None
         self._selected_index = index
         self.canvas.set_selected_index(index)
         self._ensure_candle_visible(index)
