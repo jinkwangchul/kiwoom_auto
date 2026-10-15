@@ -5182,6 +5182,8 @@ class IndicatorFollowSignalValidationChartCanvas(
         rectangles_by_color: dict[
             tuple[int, bool], tuple[QColor, list[QRectF], bool]
         ] = {}
+        ocr_filter_plan = self._prepare_ocr_histogram_filters(owners)
+        signal_plan = self._prepare_histogram_signal_owners(owners)
         for index in range(visible_start, visible_end):
             if index >= len(values):
                 break
@@ -5199,10 +5201,12 @@ class IndicatorFollowSignalValidationChartCanvas(
             )
             bar_color = base_color
             color_key = base_color_key
-            ocr_matches = self._ocr_histogram_filter_matches(index, owners)
+            ocr_matches = self._ocr_histogram_filter_matches(
+                index, owners, prepared=ocr_filter_plan,
+            )
             ocr_sides = {side for side, _identities in ocr_matches}
             signal_color = self._histogram_valid_signal_color(
-                index, owners, ocr_sides=ocr_sides,
+                index, owners, ocr_sides=ocr_sides, prepared=signal_plan,
             )
             valid_emphasis = bool(
                 signal_color is not None
@@ -5273,6 +5277,7 @@ class IndicatorFollowSignalValidationChartCanvas(
         owners: tuple[ValidationFilterDescriptor, ...],
         *,
         ocr_sides: set[str] | None = None,
+        prepared=None,
     ) -> QColor | None:
         """Return one side color for configured or confirmed oscillator transitions."""
         sides = (
@@ -5280,6 +5285,38 @@ class IndicatorFollowSignalValidationChartCanvas(
             if ocr_sides is None
             else set(ocr_sides)
         )
+        if prepared is not None:
+            for family, identity, operator, transition_indexes, owner_sides in prepared:
+                for side in owner_sides:
+                    transition_index = int(index)
+                    if family == FAMILY_OCR_OSC and operator in {"TURN_UP", "TURN_DOWN"}:
+                        if self._valid_filter_mode_enabled:
+                            continue
+                        if not self._valid_filter_delay_ranges.get((side, identity)):
+                            continue
+                        delay = self._valid_identity_delay_at_index(side, identity, int(index))
+                        if delay is None:
+                            continue
+                        transition_index -= delay
+                        if (
+                            transition_index >= 0
+                            and transition_index in transition_indexes
+                            and (side, identity) in self._valid_lower_filter_identities
+                            and self._valid_identity_covers_index(side, identity, int(index))
+                        ):
+                            sides.add(side)
+                        continue
+                    if (
+                        side in {"BUY", "SELL"}
+                        and transition_index >= 0
+                        and transition_index in transition_indexes
+                        and (side, identity) in self._valid_lower_filter_identities
+                        and self._valid_identity_covers_index(side, identity, int(index))
+                    ):
+                        sides.add(side)
+            if len(sides) != 1:
+                return None
+            return _BUY if "BUY" in sides else _SELL
         for descriptor in owners:
             if descriptor.family not in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
                 continue
@@ -5340,6 +5377,33 @@ class IndicatorFollowSignalValidationChartCanvas(
             return None
         return _BUY if "BUY" in sides else _SELL
 
+    def _prepare_histogram_signal_owners(self, owners):
+        prepared = []
+        for descriptor in owners:
+            if descriptor.family not in {FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC}:
+                continue
+            identity = str(descriptor.identity or "").strip()
+            condition = _histogram_condition(descriptor.parameter_json)
+            if not identity or not isinstance(condition, Mapping):
+                continue
+            operator = str(condition.get("operator") or "").strip().upper()
+            if operator not in {
+                "TURN_UP", "TURN_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN",
+            }:
+                continue
+            target = self._normalized_lower_condition_channel(condition.get("target"))
+            if not target:
+                target = "OSC" if descriptor.family == FAMILY_OCR_OSC else "MACD"
+            values = self._cached_values(descriptor, target)
+            if len(values) != len(self._candles):
+                continue
+            prepared.append((
+                descriptor.family, identity, operator,
+                self._indicator_transition_indexes(values, operator),
+                tuple(str(side or "").strip().upper() for side in descriptor.sides),
+            ))
+        return tuple(prepared)
+
     @staticmethod
     def _histogram_threshold_matches(
         value: float,
@@ -5363,7 +5427,55 @@ class IndicatorFollowSignalValidationChartCanvas(
         self,
         index: int,
         owners: tuple[ValidationFilterDescriptor, ...],
+        *,
+        prepared=None,
     ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        if prepared is not None:
+            matches = []
+            for side, identities, signal_delay, components in prepared:
+                saw_threshold = False
+                saw_turn = False
+                matched = True
+                expected_turn = "TURN_UP" if side == "BUY" else "TURN_DOWN"
+                for component in components:
+                    if component is None:
+                        matched = False
+                        break
+                    operator, values, delay, bar_offset, threshold, transitions = component
+                    if operator in {"TURN_UP", "TURN_DOWN"}:
+                        saw_turn = True
+                        transition_index = int(index) - delay if delay is not None else -1
+                        if (
+                            operator != expected_turn
+                            or delay is None
+                            or len(values) != len(self._candles)
+                            or transition_index < 0
+                            or transition_index not in transitions
+                        ):
+                            matched = False
+                            break
+                        continue
+                    effective_index = (
+                        int(index) - signal_delay - bar_offset
+                        if signal_delay is not None and bar_offset >= 0
+                        else -1
+                    )
+                    value = (
+                        _finite_number(values[effective_index])
+                        if 0 <= effective_index < len(values)
+                        else None
+                    )
+                    saw_threshold = True
+                    if (
+                        threshold is None
+                        or value is None
+                        or not self._histogram_threshold_matches(value, operator, threshold)
+                    ):
+                        matched = False
+                        break
+                if matched and saw_threshold and saw_turn:
+                    matches.append((side, identities))
+            return tuple(matches)
         descriptor_by_identity = {
             str(descriptor.identity or "").strip(): descriptor
             for descriptor in owners
@@ -5478,6 +5590,77 @@ class IndicatorFollowSignalValidationChartCanvas(
             if matched and saw_threshold and saw_turn:
                 matches.append((side, identities))
         return tuple(matches)
+
+    def _prepare_ocr_histogram_filters(self, owners):
+        descriptor_by_identity = {
+            str(descriptor.identity or "").strip(): descriptor
+            for descriptor in owners
+            if descriptor.family == FAMILY_OCR_OSC
+            and str(descriptor.identity or "").strip()
+        }
+        prepared = []
+        for presentation in self._lower_filter_presentations or ():
+            side = str(presentation.side or "").strip().upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+            identities = tuple(dict.fromkeys(
+                str(identity or "").strip()
+                for identity in presentation.component_descriptor_identities
+                if str(identity or "").strip()
+            ))
+            if not identities or any(identity not in descriptor_by_identity for identity in identities):
+                continue
+            if self._valid_filter_mode_enabled and any(
+                (side, identity) not in self._valid_lower_filter_identities
+                for identity in identities
+            ):
+                continue
+            conditions = tuple(
+                _histogram_condition(descriptor_by_identity[identity].parameter_json)
+                for identity in identities
+            )
+            configured_turn_delays = {
+                self._configured_ocr_turn_delays[(side, identity)]
+                for identity, condition in zip(identities, conditions)
+                if condition is not None
+                and str(condition.get("operator") or "").strip().upper()
+                in {"TURN_UP", "TURN_DOWN"}
+                and (side, identity) in self._configured_ocr_turn_delays
+            }
+            signal_delay = (
+                next(iter(configured_turn_delays))
+                if len(configured_turn_delays) == 1 else None
+            )
+            components = []
+            for identity, condition in zip(identities, conditions):
+                if condition is None:
+                    components.append(None)
+                    continue
+                descriptor = descriptor_by_identity[identity]
+                operator = str(condition.get("operator") or "").strip().upper()
+                target = self._normalized_lower_condition_channel(
+                    condition.get("target")
+                ) or "OSC"
+                values = self._cached_values(descriptor, target)
+                if operator in {"TURN_UP", "TURN_DOWN"}:
+                    delay = self._configured_ocr_turn_delays.get((side, identity))
+                    transitions = (
+                        self._indicator_transition_indexes(values, operator)
+                        if delay is not None and len(values) == len(self._candles)
+                        else frozenset()
+                    )
+                    components.append((operator, values, delay, None, None, transitions))
+                else:
+                    threshold = _finite_number(
+                        condition.get("threshold", condition.get("value"))
+                    )
+                    try:
+                        bar_offset = int(condition.get("bar_offset", 0))
+                    except (TypeError, ValueError):
+                        bar_offset = -1
+                    components.append((operator, values, None, bar_offset, threshold, None))
+            prepared.append((side, identities, signal_delay, tuple(components)))
+        return tuple(prepared)
 
     def _ocr_histogram_filter_sides(
         self,
