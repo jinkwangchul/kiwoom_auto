@@ -513,7 +513,14 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
                 and pending[0] == "time"
                 else self._visible_candle_span
             )
-            if effective_span >= _MAX_SIGNAL_VALIDATION_VISIBLE_CANDLE_SPAN:
+            owner = self.window()
+            if (
+                effective_span >= _MAX_SIGNAL_VALIDATION_VISIBLE_CANDLE_SPAN
+                and not (
+                    getattr(owner, "_historical_pool_installed", False)
+                    and len(getattr(owner, "_candles", ())) <= effective_span
+                )
+            ):
                 event.accept()
                 return
         if delta:
@@ -9413,6 +9420,10 @@ class IndicatorFollowSignalValidationV5Window(
         if (
             source == "wheel"
             and self._visible_candle_span >= self._MAX_VISIBLE_CANDLE_SPAN
+            and (
+                len(self._candles) > self._visible_candle_span
+                or self._history_extension_intent_source == "navigation"
+            )
         ):
             return
         self._history_extension_intent_generation += 1
@@ -9441,6 +9452,13 @@ class IndicatorFollowSignalValidationV5Window(
             self._history_extension_retry_generation = generation
             return
         if not self._history_extension_is_needed():
+            self._history_extension_intent_source = None
+            return
+        if (
+            self._history_extension_intent_source == "wheel"
+            and self._visible_candle_span >= self._MAX_VISIBLE_CANDLE_SPAN
+            and len(self._candles) > self._visible_candle_span
+        ):
             self._history_extension_intent_source = None
             return
         # Provenance belongs to one pending request, not all future wheels.
@@ -9555,7 +9573,6 @@ class IndicatorFollowSignalValidationV5Window(
                 effective_wheel_delta < 0
                 and span >= len(self._candles)
                 and self._historical_pool_installed
-                and span < self._MAX_VISIBLE_CANDLE_SPAN
             ):
                 self._maybe_request_history_extension(source="wheel")
             return None
@@ -9564,6 +9581,7 @@ class IndicatorFollowSignalValidationV5Window(
         return start, span
 
     def _apply_time_zoom_target(self, start: float, span: float) -> None:
+        shrinking = span < self._visible_candle_span
         self._set_time_view(
             start,
             span,
@@ -9571,15 +9589,11 @@ class IndicatorFollowSignalValidationV5Window(
             auto_fit_price=True,
             user_horizontal_navigation=True,
         )
-        if (
-            self._visible_candle_span >= self._MAX_VISIBLE_CANDLE_SPAN
-            and self._history_extension_intent_source == "wheel"
-        ):
-            # A pre-cap wheel request must not run after zoom saturates.
+        if shrinking and self._history_extension_intent_source == "wheel":
             self._history_extension_intent_generation += 1
             self._history_extension_intent_source = None
             self._history_extension_retry_generation = None
-        if self._history_extension_is_needed() or self._history_extension_intent_source:
+        if not shrinking and (self._history_extension_is_needed() or self._history_extension_intent_source):
             self._maybe_request_history_extension(source="wheel")
 
     def _resume_history_wheel_zoom(
