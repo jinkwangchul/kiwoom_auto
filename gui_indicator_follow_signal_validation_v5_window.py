@@ -583,6 +583,9 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
         if not delta_x:
             return
         self._time_pan_gesture_delta_x += float(delta_x)
+        owner = self._input_frame_owner
+        if owner is not None:
+            owner._update_history_drag_target(self._time_pan_gesture_delta_x)
         if not self._time_pan_preview_started:
             self._time_pan_preview_started = True
             legal_delta_x = self._clamp_time_pan_delta(float(delta_x))
@@ -8235,6 +8238,9 @@ class IndicatorFollowSignalValidationV5Window(
         self._history_extension_intent_generation = 0
         self._history_extension_intent_source: str | None = None
         self._history_extension_retry_generation: int | None = None
+        self.desired_history_target = 0.0
+        self._history_drag_base_target = 0.0
+        self._history_drag_start_index = 0.0
         self._chart_interaction_epoch = 0
         self._chart_input_frame_generation = 0
         self._chart_input_frame_active = False
@@ -9359,6 +9365,35 @@ class IndicatorFollowSignalValidationV5Window(
         )
         if canvas is not None:
             canvas._time_pan_gesture_delta_x = 0.0
+        self._history_drag_base_target = max(
+            float(self._historical_candle_count), self.desired_history_target,
+        )
+        self._history_drag_start_index = self._visible_start_index
+
+    def _update_history_drag_target(self, raw_pixels: float) -> None:
+        canvas = getattr(self, "canvas", None)
+        if raw_pixels <= 0:
+            self._cancel_history_extension_intent()
+            return
+        if canvas is None or not self._historical_pool_installed:
+            return
+        pixels = _finite_number(canvas.pixels_per_candle)
+        if pixels is None or pixels <= 0:
+            return
+        base = max(
+            float(self._historical_candle_count), self._history_drag_base_target,
+        )
+        older_bars = raw_pixels / pixels - self._history_drag_start_index
+        if older_bars > 0:
+            self.desired_history_target = min(5000.0, base + older_bars)
+        else:
+            self._cancel_history_extension_intent()
+
+    def _cancel_history_extension_intent(self) -> None:
+        self.desired_history_target = 0.0
+        self._history_extension_intent_generation += 1
+        self._history_extension_intent_source = None
+        self._history_extension_retry_generation = None
 
     def _on_chart_interaction_ended(
         self, cancelled: bool, *, history_source: str = "navigation",
@@ -9391,7 +9426,7 @@ class IndicatorFollowSignalValidationV5Window(
         ):
             self._maybe_request_history_extension(source=history_source)
 
-    def _discard_chart_input(self) -> None:
+    def _discard_chart_input(self, *, preserve_history_target: bool = False) -> None:
         self._deferred_wheel_zoom = None
         self._cancel_chart_input_frame()
         self._cancel_pending_time_navigation()
@@ -9405,6 +9440,10 @@ class IndicatorFollowSignalValidationV5Window(
         self._cancel_pending_wheel_zoom()
         self._history_extension_intent_generation += 1
         self._history_extension_intent_source = None
+        if not preserve_history_target:
+            self.desired_history_target = 0.0
+        self._history_drag_base_target = 0.0
+        self._history_drag_start_index = 0.0
         canvas = getattr(self, "canvas", None)
         if canvas is not None:
             canvas.discard_pointer_interaction()
@@ -9565,7 +9604,12 @@ class IndicatorFollowSignalValidationV5Window(
                     and start_value > 0
                     and self._historical_pool_installed):
                 # Once zoom saturates, the same wheel input navigates older candles.
-                older_step = min(500.0, max(1.0, span * 0.04 * wheel_steps))
+                older_step = max(1.0, span * 0.04 * wheel_steps)
+                if older_step > start_value:
+                    self.desired_history_target = min(5000.0, max(
+                        float(self._historical_candle_count),
+                        self.desired_history_target,
+                    ) + older_step - start_value)
                 return max(0.0, start_value - older_step), span
             # Either the loaded-data boundary or the display cap can need history.
             if (
@@ -9574,6 +9618,15 @@ class IndicatorFollowSignalValidationV5Window(
                      or span >= self._MAX_VISIBLE_CANDLE_SPAN)
                 and self._historical_pool_installed
             ):
+                if span >= self._MAX_VISIBLE_CANDLE_SPAN:
+                    self.desired_history_target = min(5000.0, max(
+                        float(self._historical_candle_count),
+                        self.desired_history_target,
+                    ) + max(1.0, span * 0.04 * wheel_steps))
+                else:
+                    self.desired_history_target = max(
+                        self.desired_history_target, requested_span,
+                    )
                 self._maybe_request_history_extension(source="wheel")
             return None
         start = start_value + anchor_ratio * (span_value - span)
@@ -9594,9 +9647,9 @@ class IndicatorFollowSignalValidationV5Window(
             user_horizontal_navigation=True,
         )
         if shrinking and self._history_extension_intent_source == "wheel":
-            self._history_extension_intent_generation += 1
-            self._history_extension_intent_source = None
-            self._history_extension_retry_generation = None
+            self._cancel_history_extension_intent()
+        elif shrinking:
+            self.desired_history_target = 0.0
         if not shrinking and (self._history_extension_is_needed() or self._history_extension_intent_source):
             self._maybe_request_history_extension(source="wheel")
 
@@ -9684,6 +9737,7 @@ class IndicatorFollowSignalValidationV5Window(
         axis, minimum, maximum = target
         if axis == "time":
             moving_to_older = minimum < self._visible_start_index
+            moving_to_newer = minimum > self._visible_start_index
             self._set_time_view(
                 minimum,
                 maximum,
@@ -9695,10 +9749,9 @@ class IndicatorFollowSignalValidationV5Window(
                 self._history_extension_is_needed() or self._history_extension_intent_source
             ):
                 self._maybe_request_history_extension()
-            elif not moving_to_older and self._history_extension_intent_source == "navigation":
+            elif moving_to_newer:
                 # Reversing toward the latest candle cancels stale older-browse intent.
-                self._history_extension_intent_generation += 1
-                self._history_extension_intent_source = None
+                self._cancel_history_extension_intent()
             return
         canvas = getattr(self, "canvas", None)
         if canvas is None:
@@ -13981,6 +14034,7 @@ class IndicatorFollowSignalValidationV5Window(
             and candles[-len(old_pool):] == old_pool
             else None
         )
+        history_target = self.desired_history_target
         self._discard_chart_input()
         self._invalidate_visualization_projection_data()
         self._pending_prepared_presentation = None
@@ -14004,7 +14058,10 @@ class IndicatorFollowSignalValidationV5Window(
             == str(previous_candles[-1].get("time") or "")
             and str(candles[0].get("time") or "")
             < str(previous_candles[0].get("time") or "")
+            and candles[-len(previous_candles):] == previous_candles
         )
+        if history_extension and history_target > chart_candle_count:
+            self.desired_history_target = history_target
         self._pending_history_extension_view_anchor = (
             self._capture_history_extension_view_anchor()
             if history_extension
@@ -14137,7 +14194,12 @@ class IndicatorFollowSignalValidationV5Window(
                 )
                 cycles.append(cycle if mapped == cycle else mapped)
         # Reject ambiguous/missing cycle timestamps before changing live state.
-        self._discard_chart_input()
+        self._discard_chart_input(
+            preserve_history_target=(
+                self._history_browse_installing
+                and self._pending_history_extension_view_anchor is not None
+            ),
+        )
         preserved_range_entries = (
             list(self._range_replay_calculation_entries)
             if self._range_replay_entries_available
@@ -14813,11 +14875,17 @@ class IndicatorFollowSignalValidationV5Window(
             if getattr(self, "canvas", None) is not None and not timeframe_changed
             else None
         )
+        preserve_history_target = (
+            anchor is not None
+            and self._normal_base_timeframe_key == timeframe_key
+            and self._result_settings_snapshot is not None
+            and self._result_settings_snapshot.to_dict() == settings_snapshot.to_dict()
+        )
         if timeframe_changed:
             # Initial price/time axes and Reset must belong to the new timeframe.
             self._entry_chart_view_state = None
             self._entry_chart_view_anchor = None
-        self._discard_chart_input()
+        self._discard_chart_input(preserve_history_target=preserve_history_target)
         self._normal_base_requested = True
         self._normal_base_ready = False
         self._range_replay_from_normal_base = False
@@ -14920,8 +14988,19 @@ class IndicatorFollowSignalValidationV5Window(
             previous_range_replay_available=self._range_replay_entries_available,
         )
         self.clear_candle_preview(self._candle_preview_token)
-        self._discard_chart_input()
         history_browse = self._history_browse_installing
+        old_replay = self._replay_snapshot
+        preserve_history_target = (
+            history_browse
+            and self._pending_history_extension_view_anchor is not None
+            and isinstance(old_replay, ValidationReplaySnapshot)
+            and old_replay.stock == replay_snapshot.stock
+            and old_replay.timeframe_key == replay_snapshot.timeframe_key
+            and old_replay.settings_hash == replay_snapshot.settings_hash
+        )
+        self._discard_chart_input(
+            preserve_history_target=preserve_history_target,
+        )
         if not history_browse and not presentation_only:
             self._range_replay_from_normal_base = False
         previous_snapshot = self._replay_snapshot
