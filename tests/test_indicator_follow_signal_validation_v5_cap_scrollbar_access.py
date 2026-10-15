@@ -22,7 +22,7 @@ def _install(window, count):
     window.install_normal_base(window._signal_validation_seed.settings_snapshot, "M1")
 
 
-def test_cap_wheel_unlocks_scrollbar_once_then_navigation_reaches_5000(case):
+def test_cap_wheel_then_navigation_reaches_5000(case):
     window = wheel_cases.window_with_rows(case, 3500)
     window.show()
     QApplication.processEvents()
@@ -48,8 +48,9 @@ def test_cap_wheel_unlocks_scrollbar_once_then_navigation_reaches_5000(case):
         assert window.time_navigation_scrollbar.maximum() == 500_000
         assert window.time_navigation_scrollbar.isEnabled()
         assert window.time_navigation_scrollbar.value() == 500_000
-        window.time_navigation_scrollbar.setValue(0)
+        wheel_cases.wheel(window.canvas, -120)
         QTest.qWait(700)
+        assert emitted == [1, 1]
         assert flow._history_targets[key] == 4500
         _install(window, 4500)
         flow._history_extension_inflight.pop(key, None)

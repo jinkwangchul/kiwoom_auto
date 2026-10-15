@@ -518,7 +518,7 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
                 effective_span >= _MAX_SIGNAL_VALIDATION_VISIBLE_CANDLE_SPAN
                 and not (
                     getattr(owner, "_historical_pool_installed", False)
-                    and len(getattr(owner, "_candles", ())) <= effective_span
+                    and int(getattr(owner, "_historical_candle_count", 0)) < 5000
                 )
             ):
                 event.accept()
@@ -9421,7 +9421,7 @@ class IndicatorFollowSignalValidationV5Window(
             source == "wheel"
             and self._visible_candle_span >= self._MAX_VISIBLE_CANDLE_SPAN
             and (
-                len(self._candles) > self._visible_candle_span
+                self._historical_candle_count >= 5000
                 or self._history_extension_intent_source == "navigation"
             )
         ):
@@ -9452,13 +9452,6 @@ class IndicatorFollowSignalValidationV5Window(
             self._history_extension_retry_generation = generation
             return
         if not self._history_extension_is_needed():
-            self._history_extension_intent_source = None
-            return
-        if (
-            self._history_extension_intent_source == "wheel"
-            and self._visible_candle_span >= self._MAX_VISIBLE_CANDLE_SPAN
-            and len(self._candles) > self._visible_candle_span
-        ):
             self._history_extension_intent_source = None
             return
         # Provenance belongs to one pending request, not all future wheels.
@@ -9567,11 +9560,11 @@ class IndicatorFollowSignalValidationV5Window(
             )
         span = self._clamped_visible_candle_span(requested_span)
         if span == span_value:
-            # A loaded-data boundary is not the configured 3,500-bar limit.
-            # Preserve incremental history loading without re-rendering it.
+            # Either the loaded-data boundary or the display cap can need history.
             if (
                 effective_wheel_delta < 0
-                and span >= len(self._candles)
+                and (span >= len(self._candles)
+                     or span >= self._MAX_VISIBLE_CANDLE_SPAN)
                 and self._historical_pool_installed
             ):
                 self._maybe_request_history_extension(source="wheel")
