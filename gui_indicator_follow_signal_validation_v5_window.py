@@ -14580,21 +14580,16 @@ class IndicatorFollowSignalValidationV5Window(
         defer_scrollbar_sync: bool = False,
     ) -> None:
         """Common interactive canvas installation for base and replay results."""
-        self._cancel_chart_input_frame()
-        old_canvas = self.chart_scroll_area.takeWidget()
-        if old_canvas is not None and not history_browse:
-            old_canvas.deleteLater()
         candle_count = len(self._candles)
-        self._visible_candle_span = min(
+        visible_candle_span = min(
             float(max(1, candle_count)),
             self._REFERENCE_CANDLE_COUNT,
         )
-        self._visible_start_index = max(
+        visible_start_index = max(
             0.0,
-            candle_count - self._visible_candle_span,
+            candle_count - visible_candle_span,
         )
-        self._time_scale_manually_adjusted = False
-        self.canvas = IndicatorFollowSignalValidationChartCanvas(
+        next_canvas = IndicatorFollowSignalValidationChartCanvas(
             self._candles,
             markers,
             timeframe_key=timeframe_key,
@@ -14627,12 +14622,41 @@ class IndicatorFollowSignalValidationV5Window(
                 and calculation_index is None
             ),
         )
-        self._refresh_ocr_turn_delays(self._result_ui_state)
-        self.canvas.set_time_view(
-            self._visible_start_index,
-            self._visible_candle_span,
-        )
-        initial_price_scale = self.canvas.price_scale()
+        try:
+            next_canvas.set_ocr_turn_delays(self._ocr_turn_delays_from_ui_state(
+                self._result_ui_state, next_canvas._visualization_descriptors,
+            ))
+            next_canvas.set_time_view(visible_start_index, visible_candle_span)
+            initial_price_scale = next_canvas.price_scale()
+            next_canvas._input_frame_owner = self
+            next_canvas.bar_selected.connect(self.select_evaluation_index)
+            next_canvas.validation_range_drag_started.connect(
+                self._begin_validation_range_drag
+            )
+            next_canvas.validation_range_drag_completed.connect(
+                self._complete_validation_range_drag
+            )
+            next_canvas.validation_range_clear_requested.connect(
+                self._clear_validation_range_interaction
+            )
+            next_canvas.time_scale_wheel_requested.connect(self._queue_time_scale_wheel)
+            next_canvas.pan_requested.connect(self._handle_pan_requested)
+            next_canvas.pointer_interaction_started.connect(
+                self._on_chart_interaction_started
+            )
+            next_canvas.pointer_interaction_ended.connect(
+                self._on_chart_interaction_ended
+            )
+            next_canvas.installEventFilter(self)
+        except Exception:
+            next_canvas.deleteLater()
+            raise
+        self._cancel_chart_input_frame()
+        old_canvas = self.chart_scroll_area.takeWidget()
+        self.canvas = next_canvas
+        self._visible_candle_span = visible_candle_span
+        self._visible_start_index = visible_start_index
+        self._time_scale_manually_adjusted = False
         if initial_price_scale is None:
             self._default_price_minimum = None
             self._default_price_maximum = None
@@ -14644,27 +14668,9 @@ class IndicatorFollowSignalValidationV5Window(
             self._current_price_minimum = initial_price_scale.minimum
             self._current_price_maximum = initial_price_scale.maximum
         self._price_scale_manually_adjusted = False
-        self.canvas._input_frame_owner = self
-        self.canvas.bar_selected.connect(self.select_evaluation_index)
-        self.canvas.validation_range_drag_started.connect(
-            self._begin_validation_range_drag
-        )
-        self.canvas.validation_range_drag_completed.connect(
-            self._complete_validation_range_drag
-        )
-        self.canvas.validation_range_clear_requested.connect(
-            self._clear_validation_range_interaction
-        )
-        self.canvas.time_scale_wheel_requested.connect(self._queue_time_scale_wheel)
-        self.canvas.pan_requested.connect(self._handle_pan_requested)
-        self.canvas.pointer_interaction_started.connect(
-            self._on_chart_interaction_started
-        )
-        self.canvas.pointer_interaction_ended.connect(
-            self._on_chart_interaction_ended
-        )
-        self.canvas.installEventFilter(self)
         self.chart_scroll_area.setWidget(self.canvas)
+        if old_canvas is not None and not history_browse:
+            old_canvas.deleteLater()
         # A preserved view restores its timestamp anchor immediately after
         # this installation. Keep the previous scrollbar state until that
         # restore publishes the one final range/page/value combination.
