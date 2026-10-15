@@ -160,10 +160,7 @@ def test_loaded_data_boundary_below_cap_still_requests(case, count):
     emitted = []
     window.historical_extension_requested.connect(lambda: emitted.append(1))
     wheel(window.canvas, -120)
-    for _ in range(250):
-        if emitted == [1]:
-            break
-        QTest.qWait(10)
+    QTest.qWait(400)
     assert emitted == [1]
     assert window._visible_candle_span == count
 

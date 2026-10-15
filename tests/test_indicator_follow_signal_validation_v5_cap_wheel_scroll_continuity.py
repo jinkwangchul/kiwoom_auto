@@ -75,8 +75,5 @@ def test_wheel_cap_at_oldest_before_extension_keeps_view_and_fetches(case):
     QApplication.processEvents()
     assert window.visible_start_index == 0
     assert window.visible_candle_span == 3500
-    for _ in range(250):
-        if events == [1]:
-            break
-        QTest.qWait(10)
+    QTest.qWait(450)
     assert events == [1]
