@@ -2963,6 +2963,30 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             # PRE/AFTER, rather than hiding indicators on unaligned _AL bars.
             derived["display_candles"] = list(projected)
         elif integrated_display is not None:
+            if premarket or aftermarket:
+                times = [
+                    str(candle.get("time") or "")
+                    for candle in integrated_display if isinstance(candle, dict)
+                ]
+                present = set(times)
+                if (
+                    len(times) == len(integrated_display)
+                    and times and times == sorted(present)
+                    and all(times)
+                ):
+                    krx_times = {str(candle["time"]) for candle in normalized_raw}
+                    missing = [
+                        candle for candle in projected
+                        if (stamp := str(candle["time"])) in krx_times
+                        and stamp not in present
+                        and times[0] <= stamp <= times[-1]
+                        and "1530" <= stamp[8:12] < "1540"
+                    ]
+                    if missing:
+                        integrated_display = sorted(
+                            [*integrated_display, *missing],
+                            key=lambda candle: str(candle["time"]),
+                        )
             display = _integrated_display_with_krx_prefix(
                 projected,
                 integrated_display,
