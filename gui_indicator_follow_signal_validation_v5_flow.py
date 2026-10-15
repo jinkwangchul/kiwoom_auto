@@ -1240,7 +1240,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             window_key,
             self._historical_count,
         )
-        next_target = min(maximum_target, current_target + _HISTORY_EXTENSION_STEP)
+        desired = getattr(window, "desired_history_target", 0)
+        if (isinstance(desired, (int, float)) and not isinstance(desired, bool)
+                and math.isfinite(desired) and desired > 0):
+            next_target = min(
+                maximum_target,
+                int(math.ceil(desired / _HISTORY_EXTENSION_STEP))
+                * _HISTORY_EXTENSION_STEP,
+            )
+        else:
+            next_target = min(maximum_target, current_target + _HISTORY_EXTENSION_STEP)
         if next_target <= current_target:
             return
         source_pool = self._historical_pools.get(window_key)
@@ -1312,6 +1321,49 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             )
         else:
             self._history_exhaustion.pop(window_key, None)
+            window = self._open_windows.get(window_key)
+            requested = int(state.get("requested_target") or 0)
+            desired = getattr(window, "desired_history_target", 0)
+            if (
+                window is not None
+                and isinstance(desired, (int, float))
+                and not isinstance(desired, bool)
+                and math.isfinite(desired)
+                and desired > requested
+                and getattr(window, "_historical_candle_count", 0) >= requested
+            ):
+                generation = self._request_generation.get(window_key, 0)
+                run_request = self._last_run_requests.get(window_key)
+                stock_code = getattr(getattr(window, "stock", None), "code", None)
+                source_pool = self._historical_pools.get(window_key)
+                QTimer.singleShot(
+                    0,
+                    lambda: self._continue_history_extension(
+                        window_key, window, generation, run_request, stock_code,
+                        source_pool,
+                    ),
+                )
+
+    def _continue_history_extension(
+        self, window_key: int, window: object, generation: int,
+        run_request: object, stock_code: object, source_pool: object,
+    ) -> None:
+        if (
+            self._open_windows.get(window_key) is not window
+            or self._request_generation.get(window_key) != generation
+            or self._last_run_requests.get(window_key) is not run_request
+            or getattr(getattr(window, "stock", None), "code", None) != stock_code
+            or self._historical_pools.get(window_key) is not source_pool
+            or not isinstance(run_request, IndicatorFollowSignalValidationRunRequest)
+            or getattr(window, "_result_settings_snapshot", None) != run_request.settings_snapshot
+            or getattr(window, "_normal_base_timeframe_key", None)
+            != validation_timeframe_from_rules(run_request.settings_snapshot.to_dict())["key"]
+            or window_key in self._history_extension_inflight
+            or getattr(window, "desired_history_target", 0)
+            <= self._history_targets.get(window_key, 0)
+        ):
+            return
+        self._request_history_extension(window)
 
     @staticmethod
     def _historical_rows_from_candles(
