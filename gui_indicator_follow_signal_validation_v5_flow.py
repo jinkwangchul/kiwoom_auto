@@ -73,6 +73,7 @@ from indicator_follow_validation_history_contract import (
     required_validation_history_context_bars,
 )
 from candle_manager import DEFAULT_CANDLES_MAX_COUNT
+from engines.indicator_engine import indicator_history_target_bars_from_rules
 from gui_indicator_follow_validation_host import IndicatorFollowValidationHost
 from indicator_follow_signal_validation_recent_stocks import (
     IndicatorFollowSignalValidationRecentStockStore,
@@ -94,7 +95,12 @@ from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
 )
 from indicator_follow_signal_validation_visualization import (
+    FAMILY_MACD_SIGNAL,
+    FAMILY_OCR_OSC,
+    FAMILY_RSI,
+    ValidationIndicatorSeriesCache,
     active_filter_identities_for_entry,
+    build_validation_indicator_cache,
     build_validation_filter_universe,
 )
 from routines.지표추종매매.routine_validation_contract import (
@@ -132,6 +138,112 @@ _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS: dict[
 _OWNER_FLOW_ATTRIBUTE = "_indicator_follow_signal_validation_v5_flow"
 _HISTORY_CACHE_UNSET = object()
 _CACHE_LEASE_UNSET = object()
+
+
+def _extend_prepend_indicator_cache(
+    previous: object,
+    candles: object,
+    source_candles: object,
+    cache_key: tuple[object, ...],
+    rules: dict[str, object],
+    descriptors: tuple[object, ...],
+    cancel_event: Event,
+) -> ValidationIndicatorSeriesCache | None:
+    """Reuse only causal window tails after proving an exact worker-side prepend."""
+    if (cancel_event.is_set() or not isinstance(previous, tuple)
+            or len(previous) != 3 or not isinstance(candles, list)
+            or not isinstance(source_candles, list) or not descriptors):
+        return None
+    old_key, old_cache, old_candles = previous
+    if (not isinstance(old_key, tuple) or len(old_key) != 4
+            or not isinstance(old_cache, ValidationIndicatorSeriesCache)
+            or not isinstance(old_candles, tuple)
+            or len(old_candles) != old_cache.candle_count
+            or source_candles != list(old_candles)
+            or len(candles) <= len(old_candles)
+            or candles[-len(old_candles):] != list(old_candles)
+            or old_key[1:] != cache_key[1:]):
+        return None
+    old_identity, new_identity = old_key[0], cache_key[0]
+    if (not isinstance(old_identity, tuple) or not isinstance(new_identity, tuple)
+            or len(old_identity) != 9 or len(new_identity) != 9
+            or any(old_identity[i] != new_identity[i] for i in (0, 3, 4))):
+        return None
+    history_window = indicator_history_target_bars_from_rules(rules)
+    if (history_window <= 0 or len(old_candles) <= history_window + 16
+            or len({descriptor.identity for descriptor in descriptors}) != len(descriptors)):
+        return None
+    selected = tuple(descriptor for descriptor in descriptors if descriptor.family in {
+        FAMILY_RSI, FAMILY_MACD_SIGNAL, FAMILY_OCR_OSC,
+    })
+    if not selected:
+        return None
+    for descriptor in descriptors:
+        parameters = descriptor.parameters
+        condition = parameters.get("condition") or {}
+        if ("AVG_PRICE" in descriptor.series_keys
+                or (isinstance(condition, dict) and any(
+                    str(condition.get(name) or "").upper() == "AVG_PRICE"
+                    for name in ("target", "compare_target")
+                ))):
+            return None
+        if descriptor in selected:
+            try:
+                if descriptor.family == FAMILY_RSI:
+                    period = int(parameters.get("period") or 14)
+                    sufficient = 0 < period + 1 <= history_window
+                else:
+                    fast = int(parameters.get("fast") or 12)
+                    slow = int(parameters.get("slow") or 26)
+                    signal = int(parameters.get("signal") or 9)
+                    sufficient = (min(fast, slow, signal) > 0
+                                  and max(fast, slow) + signal <= history_window)
+            except (TypeError, ValueError):
+                return None
+            if not sufficient:
+                return None
+    try:
+        if any(not math.isfinite(float(row["close"])) for row in candles):
+            return None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    prepend = len(candles) - len(old_candles)
+    prefix = build_validation_indicator_cache(
+        candles[:prepend + history_window], rules, selected,
+        cancel_predicate=cancel_event.is_set,
+    )
+    if cancel_event.is_set():
+        return None
+    old_selected = {
+        (identity, channel): values for identity, channel, values in old_cache.series
+        if identity in {descriptor.identity for descriptor in selected}
+    }
+    if (len(old_selected) != len(prefix.series)
+            or any((identity, channel) not in old_selected
+                   or len(old_selected[identity, channel]) != len(old_candles)
+                   for identity, channel, _values in prefix.series)):
+        return None
+    stitched = {
+        (identity, channel): values + old_selected[identity, channel][history_window:]
+        for identity, channel, values in prefix.series
+    }
+    others = tuple(descriptor for descriptor in descriptors if descriptor not in selected)
+    if others:
+        full_others = build_validation_indicator_cache(
+            candles, rules, others, cancel_predicate=cancel_event.is_set,
+        )
+        stitched.update({
+            (identity, channel): values
+            for identity, channel, values in full_others.series
+        })
+    if cancel_event.is_set():
+        return None
+    return ValidationIndicatorSeriesCache(
+        len(candles),
+        tuple((descriptor.identity, channel, stitched[descriptor.identity, channel])
+              for descriptor in descriptors for channel in descriptor.series_keys
+              if (descriptor.identity, channel) in stitched),
+    )
 _SIDECAR_UNSET = object()
 _MARKET_SNAPSHOT_FIELDS = (
     "current_price",
@@ -245,7 +357,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._active_run_identity: dict[int, tuple[object, ...]] = {}
         self._history_browse_active: dict[int, object] = {}
         # One accepted, source-bound full indicator cache per live V5 window.
-        self._history_browse_indicator_cache: dict[int, tuple[object, object]] = {}
+        self._history_browse_indicator_cache: dict[int, tuple[object, ...]] = {}
         self._history_browse_deferred: dict[int, tuple[int, dict[str, object]]] = {}
         self._market_snapshot_generation: dict[int, int] = {}
         self._market_snapshot_metadata: dict[int, tuple[str, dict[str, object]]] = {}
@@ -3451,8 +3563,15 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     # source and identical signal/descriptor authority.
                     # The chart-specific index mapping is always rebuilt.
                     cache_eligible = (
-                        manual_browse
-                        and active_candles is worker_pool.get("candles")
+                        (manual_browse and active_candles is worker_pool.get("candles"))
+                        or (
+                            not manual_browse
+                            and isinstance(active_candles, list)
+                            and not display_only_integrated
+                            and all(view_pool.get(field) == worker_pool.get(field)
+                                    for field in ("market_data_identity", "market_source",
+                                                  "timeframe_key", "timeframe_minutes"))
+                        )
                     )
                     cache_key = (
                         source_identity,
@@ -3465,11 +3584,21 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         if (
                             cache_eligible
                             and isinstance(previous_indicator_cache, tuple)
-                            and len(previous_indicator_cache) == 2
+                            and len(previous_indicator_cache) in (2, 3)
                             and previous_indicator_cache[0] == cache_key
                         )
                         else None
                     )
+                    if cache_eligible and cached_series is None and not manual_browse:
+                        cached_series = _extend_prepend_indicator_cache(
+                            previous_indicator_cache,
+                            active_candles,
+                            worker_source_candles,
+                            cache_key,
+                            session.request.settings_snapshot.to_dict(),
+                            worker_visualizations,
+                            cancel_event,
+                        )
                     captured_series = []
                     payload["prepared_presentation"] = (
                         prepare_signal_validation_presentation(
@@ -3492,6 +3621,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         payload["_accepted_indicator_cache"] = (
                             cache_key,
                             cached_series if cached_series is not None else captured_series[0],
+                            tuple(deepcopy(active_candles)),
                         )
                     if browse_probe is not None:
                         browse_probe.checkpoint(
@@ -3680,7 +3810,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         accepted_indicator_cache = payload.get("_accepted_indicator_cache")
         if (
             isinstance(accepted_indicator_cache, tuple)
-            and len(accepted_indicator_cache) == 2
+            and len(accepted_indicator_cache) == 3
         ):
             self._history_browse_indicator_cache[window_key] = accepted_indicator_cache
         else:
