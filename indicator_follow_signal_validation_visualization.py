@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from engines.indicator_engine import (
     bollinger_band,
@@ -59,6 +59,17 @@ _LOWER_FAMILIES = {
     FAMILY_MACD_SIGNAL,
     FAMILY_OCR_OSC,
 }
+
+
+class ValidationProjectionCancelled(RuntimeError):
+    """Raised when an opt-in detached projection is no longer current."""
+
+
+def _check_projection_cancelled(
+    cancel_predicate: Callable[[], bool] | None,
+) -> None:
+    if cancel_predicate is not None and cancel_predicate():
+        raise ValidationProjectionCancelled("VALIDATION_PROJECTION_CANCELLED")
 
 
 def _json(value: Any) -> str:
@@ -155,6 +166,8 @@ def _format_number(value: Any) -> str:
     number = _safe_float(value)
     if number is None:
         return "-"
+    if number == 0.0:
+        return "0"
     return f"{number:g}"
 
 
@@ -432,6 +445,19 @@ class ValidationFilterDescriptor:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationLowerFilterPresentation:
+    key: str
+    side: str
+    source_path: str
+    filter_token: str
+    pane_family: str
+    display_order: tuple[int, ...]
+    descriptor_identities: tuple[str, ...]
+    component_descriptor_identities: tuple[str, ...]
+    component_labels: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationIndicatorSeriesCache:
     candle_count: int
     series: tuple[tuple[str, str, tuple[float | None, ...]], ...]
@@ -470,6 +496,15 @@ def _actual_evidence_keys(rules: Mapping[str, Any], side: str) -> set[str]:
                 keys.add(key)
         if config.get("enabled") is not False and not config.get("conditions"):
             keys.add(f"{side.lower()}-filter:{filter_name}")
+    groups = side_rules.get("groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, Mapping) or group.get("enabled") is False:
+                continue
+            for condition in group.get("conditions", []):
+                key = canonical_validation_condition_key(condition)
+                if key:
+                    keys.add(key)
     signals = _mapping(side_rules.get("signals"))
     for signal in signals.values():
         if not isinstance(signal, Mapping) or signal.get("enabled") is False:
@@ -490,10 +525,349 @@ def _visualization_source(rules: Mapping[str, Any], side: str) -> Mapping[str, A
     return side_source or _mapping(rules.get(side.lower()))
 
 
+_SELL_PRESENTATION_PREFIX_FAMILIES = {
+    "OCR": FAMILY_OCR_OSC,
+    "RSI": FAMILY_RSI,
+    "MACD": FAMILY_MACD_SIGNAL,
+}
+
+
+def _sell_presentation_prefix(
+    condition: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    expression_id = str(condition.get("expression_id") or "").strip()
+    prefix, separator, suffix = expression_id.rpartition("_")
+    normalized = prefix.strip().upper()
+    family = _SELL_PRESENTATION_PREFIX_FAMILIES.get(normalized)
+    if not separator or not suffix.isdigit() or not normalized or family is None:
+        return None
+    if _family_for_condition(condition) != family:
+        return None
+    return normalized, family
+
+
+def build_validation_lower_filter_presentations(
+    rules: Mapping[str, Any],
+    descriptors: tuple[ValidationFilterDescriptor, ...],
+) -> tuple[ValidationLowerFilterPresentation, ...]:
+    """Project lower-pane descriptors onto stable user-visible filter boundaries."""
+    if not isinstance(rules, Mapping):
+        raise TypeError("rules must be a mapping")
+
+    lower_descriptors = tuple(
+        descriptor
+        for descriptor in descriptors
+        if descriptor.axis == LOWER_AXIS
+    )
+    descriptor_by_identity = {
+        descriptor.identity: descriptor
+        for descriptor in lower_descriptors
+    }
+    evidence_index: dict[tuple[str, str], tuple[str, ...]] = {}
+    for side in ("BUY", "SELL"):
+        evidence_to_identities: dict[str, set[str]] = {}
+        for descriptor in lower_descriptors:
+            if side not in {
+                str(value or "").strip().upper()
+                for value in descriptor.sides
+            }:
+                continue
+            for evidence_key in descriptor.evidence_keys:
+                evidence_to_identities.setdefault(evidence_key, set()).add(
+                    descriptor.identity
+                )
+        for evidence_key, identities in evidence_to_identities.items():
+            evidence_index[(side, evidence_key)] = tuple(sorted(identities))
+
+    def component_matches(
+        side: str,
+        condition: Mapping[str, Any],
+        *,
+        expected_family: str | None = None,
+    ) -> tuple[str, ...]:
+        evidence_key = canonical_validation_condition_key(condition)
+        if not evidence_key:
+            return ()
+        identities = evidence_index.get((side, evidence_key), ())
+        if expected_family is None:
+            return identities
+        return tuple(
+            identity
+            for identity in identities
+            if descriptor_by_identity[identity].family == expected_family
+        )
+
+    def component_label(
+        condition: Mapping[str, Any],
+        identity: str,
+    ) -> str:
+        expression_id = str(condition.get("expression_id") or "").strip()
+        if expression_id:
+            return expression_id
+        parameters = descriptor_by_identity[identity].parameters
+        label = str(parameters.get("criterion_label") or "").strip()
+        return label or descriptor_by_identity[identity].label
+
+    def make_record(
+        *,
+        side: str,
+        source_path: str,
+        filter_token: str,
+        display_order: tuple[int, ...],
+        components: list[tuple[Mapping[str, Any], tuple[str, ...]]],
+        key_suffix: str = "",
+    ) -> ValidationLowerFilterPresentation | None:
+        component_identities: list[str] = []
+        component_labels: list[str] = []
+        owned_identities: list[str] = []
+        for condition, identities in components:
+            for identity in identities:
+                component_identities.append(identity)
+                component_labels.append(component_label(condition, identity))
+                if identity not in owned_identities:
+                    owned_identities.append(identity)
+        if not owned_identities:
+            return None
+        families = {
+            descriptor_by_identity[identity].family
+            for identity in owned_identities
+        }
+        pane_family = next(iter(families)) if len(families) == 1 else "MIXED"
+        key = f"{side}:{source_path}:{filter_token}"
+        if key_suffix:
+            key = f"{key}:{key_suffix}"
+        return ValidationLowerFilterPresentation(
+            key=key,
+            side=side,
+            source_path=source_path,
+            filter_token=filter_token,
+            pane_family=pane_family,
+            display_order=display_order,
+            descriptor_identities=tuple(owned_identities),
+            component_descriptor_identities=tuple(component_identities),
+            component_labels=tuple(component_labels),
+        )
+
+    records: list[ValidationLowerFilterPresentation] = []
+    represented_identities: set[tuple[str, str]] = set()
+    explicit_fallbacks: dict[
+        tuple[str, str],
+        tuple[str, str, tuple[int, ...], Mapping[str, Any]],
+    ] = {}
+
+    buy_source = _visualization_source(rules, "BUY")
+    buy_filters = _mapping(buy_source.get("filters"))
+    formal_buy_condition_keys: set[str] = set()
+    for filter_index, (filter_name, config) in enumerate(buy_filters.items()):
+        if filter_name == "composite" or not isinstance(config, Mapping):
+            continue
+        components = []
+        for condition in config.get("conditions", []):
+            if not isinstance(condition, Mapping):
+                continue
+            condition_key = canonical_validation_condition_key(condition)
+            if condition_key:
+                formal_buy_condition_keys.add(condition_key)
+            identities = component_matches("BUY", condition)
+            if identities:
+                components.append((condition, identities))
+        record = make_record(
+            side="BUY",
+            source_path=f"buy.filters.{filter_name}",
+            filter_token=str(filter_name),
+            display_order=(0, filter_index),
+            components=components,
+        )
+        if record is not None:
+            records.append(record)
+            represented_identities.update(
+                (record.side, identity)
+                for identity in record.descriptor_identities
+            )
+
+    buy_groups = buy_source.get("groups")
+    if isinstance(buy_groups, list):
+        for group_index, group in enumerate(buy_groups):
+            if not isinstance(group, Mapping):
+                continue
+            group_path = f"buy.groups[{group_index}]"
+            partitions: dict[
+                str,
+                list[tuple[Mapping[str, Any], tuple[str, ...]]],
+            ] = {}
+            partition_order: dict[str, int] = {}
+            for condition_index, condition in enumerate(group.get("conditions", [])):
+                if not isinstance(condition, Mapping):
+                    continue
+                condition_key = canonical_validation_condition_key(condition)
+                if condition_key and condition_key in formal_buy_condition_keys:
+                    continue
+                identities_by_family: dict[str, list[str]] = {}
+                for identity in component_matches("BUY", condition):
+                    family = descriptor_by_identity[identity].family
+                    identities_by_family.setdefault(family, []).append(identity)
+                for family, identities in identities_by_family.items():
+                    partition_order.setdefault(family, condition_index)
+                    partitions.setdefault(family, []).append(
+                        (condition, tuple(identities))
+                    )
+            for family in sorted(partitions, key=partition_order.__getitem__):
+                record = make_record(
+                    side="BUY",
+                    source_path=group_path,
+                    filter_token=family,
+                    display_order=(
+                        0,
+                        len(buy_filters) + group_index,
+                        partition_order[family],
+                    ),
+                    components=partitions[family],
+                )
+                if record is not None:
+                    records.append(record)
+                    represented_identities.update(
+                        (record.side, identity)
+                        for identity in record.descriptor_identities
+                    )
+
+    sell_source = _visualization_source(rules, "SELL")
+    sell_signals = _mapping(sell_source.get("signals"))
+    signal_rank = {
+        "ui_condition_a": 0,
+        "ui_condition_b": 1,
+        "ui_condition_c": 2,
+    }
+    ordered_signals = sorted(
+        enumerate(sell_signals.items()),
+        key=lambda item: (
+            signal_rank.get(str(item[1][0]), 3),
+            item[0] if str(item[1][0]) not in signal_rank else 0,
+        ),
+    )
+    for signal_order, (_source_index, (signal_name, signal)) in enumerate(
+        ordered_signals
+    ):
+        if not isinstance(signal, Mapping):
+            continue
+        groups = signal.get("groups")
+        if not isinstance(groups, list):
+            continue
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, Mapping):
+                continue
+            group_path = f"sell.signals.{signal_name}.groups[{group_index}]"
+            partitions: dict[
+                str,
+                list[tuple[Mapping[str, Any], tuple[str, ...]]],
+            ] = {}
+            partition_order: dict[str, int] = {}
+            for condition_index, condition in enumerate(group.get("conditions", [])):
+                if not isinstance(condition, Mapping):
+                    continue
+                prefix_contract = _sell_presentation_prefix(condition)
+                if prefix_contract is None:
+                    for identity in component_matches("SELL", condition):
+                        explicit_fallbacks.setdefault(
+                            ("SELL", identity),
+                            (
+                                "SELL",
+                                f"{group_path}.conditions[{condition_index}]",
+                                (1, signal_order, group_index, condition_index),
+                                condition,
+                            ),
+                        )
+                    continue
+                prefix, family = prefix_contract
+                identities = component_matches(
+                    "SELL",
+                    condition,
+                    expected_family=family,
+                )
+                if not identities:
+                    continue
+                partition_order.setdefault(prefix, condition_index)
+                partitions.setdefault(prefix, []).append((condition, identities))
+            for prefix in sorted(partitions, key=partition_order.__getitem__):
+                record = make_record(
+                    side="SELL",
+                    source_path=group_path,
+                    filter_token=prefix,
+                    display_order=(
+                        1,
+                        signal_order,
+                        group_index,
+                        partition_order[prefix],
+                    ),
+                    components=partitions[prefix],
+                )
+                if record is not None:
+                    records.append(record)
+                    represented_identities.update(
+                        (record.side, identity)
+                        for identity in record.descriptor_identities
+                    )
+
+    fallback_candidates = dict(explicit_fallbacks)
+    for descriptor in lower_descriptors:
+        normalized_sides = tuple(
+            str(side or "").strip().upper()
+            for side in descriptor.sides
+            if str(side or "").strip()
+        )
+        for side in normalized_sides or ("UNKNOWN",):
+            key = (side, descriptor.identity)
+            if key in represented_identities or key in fallback_candidates:
+                continue
+            fallback_candidates[key] = (
+                side,
+                f"descriptor.{descriptor.identity}",
+                (2, 0 if side == "BUY" else 1, 0, 0),
+                {},
+            )
+
+    for fallback_index, ((coverage_side, identity), candidate) in enumerate(
+        sorted(
+            fallback_candidates.items(),
+            key=lambda item: (item[1][2], item[0]),
+        )
+    ):
+        if (coverage_side, identity) in represented_identities:
+            continue
+        side, source_path, order, condition = candidate
+        descriptor = descriptor_by_identity[identity]
+        label = (
+            component_label(condition, identity)
+            if condition
+            else descriptor.label
+        )
+        records.append(ValidationLowerFilterPresentation(
+            key=f"{side}:{source_path}:descriptor:{identity}",
+            side=side,
+            source_path=source_path,
+            filter_token=descriptor.family,
+            pane_family=descriptor.family,
+            display_order=order + (fallback_index,),
+            descriptor_identities=(identity,),
+            component_descriptor_identities=(identity,),
+            component_labels=(label,),
+        ))
+
+    return tuple(sorted(
+        records,
+        key=lambda record: (record.display_order, record.key),
+    ))
+
+
 def build_validation_filter_universe(
     rules: Mapping[str, Any],
+    *,
+    include_disabled: bool = False,
 ) -> tuple[ValidationFilterDescriptor, ...]:
-    """Return the BUY∪SELL configured visualization universe."""
+    """Return the BUY∪SELL visualization universe.
+
+    Disabled filters remain excluded by default. include_disabled is
+    presentation-only and must not change signal evaluation semantics.
+    """
     if not isinstance(rules, Mapping):
         raise TypeError("rules must be a mapping")
     actual_by_side = {
@@ -503,7 +877,7 @@ def build_validation_filter_universe(
     grouped: dict[str, dict[str, Any]] = {}
 
     def add_condition(side: str, condition: Mapping[str, Any], hint: str = "") -> None:
-        if condition.get("enabled") is False:
+        if not include_disabled and condition.get("enabled") is False:
             return
         family = _family_for_condition(condition, hint=hint)
         if family is None:
@@ -619,7 +993,7 @@ def build_validation_filter_universe(
         for filter_name, config in filters.items():
             if filter_name == "composite" or not isinstance(config, Mapping):
                 continue
-            if config.get("enabled") is False:
+            if not include_disabled and config.get("enabled") is False:
                 continue
             conditions = [
                 item for item in config.get("conditions", [])
@@ -630,7 +1004,10 @@ def build_validation_filter_universe(
         groups = source.get("groups")
         if isinstance(groups, list):
             for group in groups:
-                if not isinstance(group, Mapping) or group.get("enabled") is False:
+                if (
+                    not isinstance(group, Mapping)
+                    or (not include_disabled and group.get("enabled") is False)
+                ):
                     continue
                 conditions = [
                     condition
@@ -641,10 +1018,16 @@ def build_validation_filter_universe(
 
         signals = _mapping(source.get("signals"))
         for signal in signals.values():
-            if not isinstance(signal, Mapping) or signal.get("enabled") is False:
+            if (
+                not isinstance(signal, Mapping)
+                or (not include_disabled and signal.get("enabled") is False)
+            ):
                 continue
             for group in signal.get("groups", []):
-                if not isinstance(group, Mapping) or group.get("enabled") is False:
+                if (
+                    not isinstance(group, Mapping)
+                    or (not include_disabled and group.get("enabled") is False)
+                ):
                     continue
                 conditions = [
                     condition
@@ -748,9 +1131,8 @@ def indicator_transition_indexes(
 ) -> tuple[int, ...]:
     """Return chart indexes for confirmed turn/zero-cross visualization.
 
-    TURN_* conditions are confirmed by the following bar, so the visible line
-    belongs to the pivot bar at evaluation_index - 1. ZERO_CROSS_* belongs to
-    the bar that actually crosses zero.
+    TURN_* conditions are displayed on their first confirmed bar. ZERO_CROSS_*
+    belongs to the bar that actually crosses zero.
     """
     normalized = str(operator or "").strip().upper()
     if normalized not in {
@@ -774,7 +1156,7 @@ def indicator_transition_indexes(
             else:
                 matched = prev2 < prev and current < prev
             if matched:
-                result.append(index - 1)
+                result.append(index)
         return tuple(result)
 
     for index in range(1, len(values)):
@@ -790,20 +1172,129 @@ def indicator_transition_indexes(
             result.append(index)
     return tuple(result)
 
+def _display_rsi_causal_history(
+    closes: list[float | None],
+    period: int,
+    history_window: int,
+) -> list[float | None]:
+    """Exact per-window RSI tails with precomputed price changes for chart display."""
+    if history_window <= 0 or period <= 0:
+        return rsi_causal_history(closes, period, history_window)
+    window = max(int(history_window), int(period) + 1)
+    if (len(closes) <= window
+            or any(value is None or not math.isfinite(value) for value in closes)):
+        return rsi_causal_history(closes, period, history_window)
+
+    # Keep the canonical prefix and Wilder recurrence, including both zero cases.
+    values = rsi_causal_history(closes[:window], period, window)
+    gains = [0.0] * len(closes)
+    losses = [0.0] * len(closes)
+    for index in range(1, len(closes)):
+        change = closes[index] - closes[index - 1]
+        gains[index] = max(change, 0.0)
+        losses[index] = max(-change, 0.0)
+    for index in range(window, len(closes)):
+        start = index - window + 1
+        avg_gain = sum(gains[start + 1:start + period + 1]) / period
+        avg_loss = sum(losses[start + 1:start + period + 1]) / period
+        for local in range(start + period + 1, index + 1):
+            avg_gain = ((avg_gain * (period - 1)) + gains[local]) / period
+            avg_loss = ((avg_loss * (period - 1)) + losses[local]) / period
+        if avg_gain == 0 and avg_loss == 0:
+            values.append(0.0)
+        elif avg_loss == 0:
+            values.append(100.0)
+        else:
+            values.append(100 - (100 / (1 + avg_gain / avg_loss)))
+    return values
+
+
+def _display_macd_causal_history(
+    closes: list[float | None],
+    fast: int,
+    slow: int,
+    signal_period: int,
+    history_window: int,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Exact MACD window tails for dense chart data; keep canonical engine untouched."""
+    window = max(int(history_window), int(slow) + int(signal_period))
+    seed = max(int(fast), int(slow))
+    if (
+        min(fast, slow, signal_period) <= 0
+        or len(closes) <= window + 16
+        or window < max(seed, int(signal_period))
+        or any(value is None or not math.isfinite(value) for value in closes)
+    ):
+        return macd_series_causal_history(
+            closes, fast, slow, signal_period, history_window,
+        )
+
+    # Reuse the canonical prefix (including Hero4 EAVG backfill semantics).
+    macd_values, signal_values, osc_values = macd_series_causal_history(
+        closes[:window], fast, slow, signal_period, window,
+    )
+    fast_multiplier = 2 / (fast + 1)
+    slow_multiplier = 2 / (slow + 1)
+    signal_multiplier = 2 / (signal_period + 1)
+
+    for index in range(window, len(closes)):
+        local = closes[index - window + 1:index + 1]
+        fast_state = float(local[0])
+        slow_state = float(local[0])
+        fast_prefix = [fast_state]
+        slow_prefix = [slow_state]
+        for close in local[1:seed]:
+            value = float(close)
+            fast_state = (value - fast_state) * fast_multiplier + fast_state
+            slow_state = (value - slow_state) * slow_multiplier + slow_state
+            fast_prefix.append(fast_state)
+            slow_prefix.append(slow_state)
+
+        fast_seed = fast_prefix[fast - 1]
+        slow_seed = slow_prefix[slow - 1]
+        signal_state = None
+        for position in range(seed):
+            macd_value = (
+                (fast_prefix[position] if position >= fast else fast_seed)
+                - (slow_prefix[position] if position >= slow else slow_seed)
+            )
+            signal_state = (
+                macd_value if signal_state is None
+                else (macd_value - signal_state) * signal_multiplier + signal_state
+            )
+        for close in local[seed:]:
+            value = float(close)
+            fast_state = (value - fast_state) * fast_multiplier + fast_state
+            slow_state = (value - slow_state) * slow_multiplier + slow_state
+            macd_value = fast_state - slow_state
+            signal_state = (
+                (macd_value - signal_state) * signal_multiplier + signal_state
+            )
+
+        macd_values.append(macd_value)
+        signal_values.append(signal_state)
+        osc_values.append(macd_value - signal_state)
+    return macd_values, signal_values, osc_values
+
+
 def build_validation_indicator_cache(
     candles: list[dict[str, Any]],
     rules: Mapping[str, Any],
     descriptors: tuple[ValidationFilterDescriptor, ...],
     *,
     entries: list[Any] | None = None,
+    cancel_predicate: Callable[[], bool] | None = None,
 ) -> ValidationIndicatorSeriesCache:
     """Build immutable descriptor-scoped series without re-evaluating signals."""
     if not isinstance(candles, list):
         raise TypeError("candles must be a list")
     if not isinstance(rules, Mapping):
         raise TypeError("rules must be a mapping")
+    _check_projection_cancelled(cancel_predicate)
     closes = close_prices(candles)
+    _check_projection_cancelled(cancel_predicate)
     history_window = indicator_history_target_bars_from_rules(rules)
+    _check_projection_cancelled(cancel_predicate)
     source_entries = list(entries or [])
 
     def normalized_values(values: Any) -> tuple[float | None, ...]:
@@ -811,6 +1302,7 @@ def build_validation_indicator_cache(
             return ()
         result: list[float | None] = []
         for value in values:
+            _check_projection_cancelled(cancel_predicate)
             if value is None:
                 result.append(None)
                 continue
@@ -847,19 +1339,22 @@ def build_validation_indicator_cache(
         )
         projected: list[float | None] = []
         for index in range(len(candles)):
+            _check_projection_cancelled(cancel_predicate)
             context = tracker.context_for_fast(
                 index,
                 "SELL",
                 candles,
                 source_entries,
             )
+            _check_projection_cancelled(cancel_predicate)
             projected.append(context.get("average_price"))
         average_values = tuple(projected)
 
-    fill_values = tuple(
-        validation_virtual_fill_price(candle)
-        for candle in candles
-    )
+    fill_values_list = []
+    for candle in candles:
+        _check_projection_cancelled(cancel_predicate)
+        fill_values_list.append(validation_virtual_fill_price(candle))
+    fill_values = tuple(fill_values_list)
     close_values = normalized_values(closes)
 
     projected_series: list[
@@ -867,6 +1362,7 @@ def build_validation_indicator_cache(
     ] = []
 
     for descriptor in descriptors:
+        _check_projection_cancelled(cancel_predicate)
         parameters = descriptor.parameters
         condition = _mapping(parameters.get("condition"))
         channels: dict[str, tuple[float | None, ...]] = {}
@@ -880,21 +1376,25 @@ def build_validation_indicator_cache(
                     continue
                 period = int(channel[2:])
                 if period not in ma_cache:
+                    _check_projection_cancelled(cancel_predicate)
                     ma_cache[period] = normalized_values(
                         simple_ma(closes, period)
                     )
+                    _check_projection_cancelled(cancel_predicate)
                 channels[channel] = ma_cache[period]
 
         elif descriptor.family == FAMILY_RSI:
             period = _positive_int(parameters.get("period")) or 14
             if period not in rsi_cache:
+                _check_projection_cancelled(cancel_predicate)
                 rsi_cache[period] = normalized_values(
-                    rsi_causal_history(
+                    _display_rsi_causal_history(
                         closes,
                         period,
                         history_window,
                     )
                 )
+                _check_projection_cancelled(cancel_predicate)
             channels["RSI"] = rsi_cache[period]
             if "CRITERION" in descriptor.series_keys:
                 channels["CRITERION"] = _constant_series(
@@ -909,13 +1409,15 @@ def build_validation_indicator_cache(
                 _positive_int(parameters.get("signal")) or 9,
             )
             if macd_key not in macd_cache:
-                macd_values, signal_values, osc_values = macd_series_causal_history(
+                _check_projection_cancelled(cancel_predicate)
+                macd_values, signal_values, osc_values = _display_macd_causal_history(
                     closes,
                     macd_key[0],
                     macd_key[1],
                     macd_key[2],
                     history_window,
                 )
+                _check_projection_cancelled(cancel_predicate)
                 macd_cache[macd_key] = {
                     "MACD": normalized_values(macd_values),
                     "SIGNAL": normalized_values(signal_values),
@@ -938,11 +1440,13 @@ def build_validation_indicator_cache(
                 std_value = 2.0
             bollinger_key = (period, std_value)
             if bollinger_key not in bollinger_cache:
+                _check_projection_cancelled(cancel_predicate)
                 lower, middle, upper = bollinger_band(
                     closes,
                     period,
                     std_value,
                 )
+                _check_projection_cancelled(cancel_predicate)
                 bollinger_cache[bollinger_key] = {
                     "BOLLINGER_LOWER": normalized_values(lower),
                     "BOLLINGER_MIDDLE": normalized_values(middle),
@@ -964,11 +1468,13 @@ def build_validation_indicator_cache(
         elif descriptor.family == FAMILY_PRICE_BOX:
             period = _positive_int(parameters.get("period")) or 24
             if period not in price_box_cache:
+                _check_projection_cancelled(cancel_predicate)
                 lower, middle, upper = price_box(
                     closes,
                     period,
                     history_window=history_window,
                 )
+                _check_projection_cancelled(cancel_predicate)
                 price_box_cache[period] = {
                     "PRICE_BOX_LOWER": normalized_values(lower),
                     "PRICE_BOX_MIDDLE": normalized_values(middle),
@@ -1043,12 +1549,14 @@ def build_validation_indicator_cache(
                     )
 
         for channel in descriptor.series_keys:
+            _check_projection_cancelled(cancel_predicate)
             values = channels.get(channel, ())
             if len(values) == len(candles):
                 projected_series.append(
                     (descriptor.identity, channel, values)
                 )
 
+    _check_projection_cancelled(cancel_predicate)
     return ValidationIndicatorSeriesCache(
         len(candles),
         tuple(projected_series),
