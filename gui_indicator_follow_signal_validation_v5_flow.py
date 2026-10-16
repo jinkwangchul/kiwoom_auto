@@ -6673,20 +6673,29 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if history_extension and isinstance(_history_cache_result, dict)
             else None
         )
-        persistent = (
-            history_cache_bundle.get("persistent")
-            if isinstance(history_cache_bundle, dict)
-            else (
-                None
-                if force_historical_refresh
-                else self._cached_history(
-                    stock,
-                    timeframe_minutes,
-                    timeframe_key,
-                    fetch_count,
-                )
+        if isinstance(history_cache_bundle, dict):
+            persistent = history_cache_bundle.get("persistent")
+        elif force_historical_refresh:
+            persistent = None
+        else:
+            cache_read_started = time.perf_counter() if _PERF_ENABLED else 0.0
+            persistent = self._cached_history(
+                stock,
+                timeframe_minutes,
+                timeframe_key,
+                fetch_count,
             )
-        )
+            if _PERF_ENABLED:
+                _perf_emit(
+                    "history.refresh.cache_ready",
+                    cache_read_started,
+                    window,
+                    window_key=window_key,
+                    generation=generation,
+                    probe_count=min(_PERSISTENT_REFRESH_PROBE_COUNT, fetch_count),
+                    cached_rows=(len(persistent.candles) if persistent is not None else 0),
+                    fetch_count=fetch_count,
+                )
 
         def current_target() -> object | None:
             target = window_ref()
@@ -7079,9 +7088,22 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if target is None:
                 return
             count = min(fetch_count, max(1, int(probe_count)))
+            attempt_owner = object() if _PERF_ENABLED else None
+            attempt_started = 0.0
             self._active_providers[request_key] = provider
 
             def refresh_completed(result: object) -> None:
+                if _PERF_ENABLED:
+                    _perf_emit(
+                        "history.refresh.response_received",
+                        attempt_started,
+                        attempt_owner,
+                        window_key=window_key,
+                        generation=generation,
+                        probe_count=count,
+                        response_ok=(getattr(result, "ok", None) is True),
+                    )
+                    callback_started = time.perf_counter()
                 self._active_providers.pop(request_key, None)
                 refresh_target = current_target()
                 if refresh_target is None:
@@ -7162,7 +7184,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if current_target() is None:
                     return
                 if not history_extension:
-                    self._persist_history(
+                    persist_started = time.perf_counter() if _PERF_ENABLED else 0.0
+                    persist_ok = self._persist_history(
                         stock,
                         timeframe_minutes,
                         timeframe_key,
@@ -7171,6 +7194,23 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         market_data_identity=result.snapshot.market_data_identity,
                         market_source=result.snapshot.market_source,
                     )
+                    if _PERF_ENABLED:
+                        now = time.perf_counter()
+                        _perf_emit(
+                            "history.refresh.merge_persist_done",
+                            attempt_started,
+                            attempt_owner,
+                            window_key=window_key,
+                            generation=generation,
+                            probe_count=count,
+                            cached_rows=len(merged),
+                            persist_ok=persist_ok,
+                            callback_processing_ms=round(
+                                (now - callback_started) * 1000.0,
+                                3,
+                            ),
+                            persist_ms=round((now - persist_started) * 1000.0, 3),
+                        )
                 if current_target() is None:
                     return
                 self._install_acquired_pool(
@@ -7183,6 +7223,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 )
 
             try:
+                if _PERF_ENABLED:
+                    attempt_started = time.perf_counter()
+                    _perf_emit(
+                        "history.refresh.request_start",
+                        attempt_started,
+                        attempt_owner,
+                        window_key=window_key,
+                        generation=generation,
+                        probe_count=count,
+                    )
                 request_latest(count, refresh_completed)
             except Exception:
                 self._active_providers.pop(request_key, None)
