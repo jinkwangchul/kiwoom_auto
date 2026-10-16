@@ -125,7 +125,7 @@ from stock_code_contract import normalize_broker_stock_code
 from stock_code_contract import market_source_for_identity
 
 
-DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 500
+DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 5_000
 MAX_SIGNAL_VALIDATION_HISTORICAL_COUNT = 5_000
 _HISTORY_EXTENSION_STEP = 500
 _PERSISTENT_REFRESH_PROBE_COUNT = 300
@@ -368,7 +368,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._history_extension_inflight: dict[int, dict[str, object]] = {}
         self._history_extension_pending: dict[int, tuple[int, object]] = {}
         self._history_exhaustion: dict[int, tuple[object, ...]] = {}
-        self._background_warmup_started: set[int] = set()
         self._integrated_display_sidecars: dict[
             tuple[str, str, int], dict[str, object]
         ] = {}
@@ -1195,7 +1194,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._historical_pools.pop(window_key, None)
         self._validation_sessions.pop(window_key, None)
         self._history_targets.pop(window_key, None)
-        self._background_warmup_started.discard(window_key)
         inflight = self._history_extension_inflight.pop(window_key, None)
         self._history_extension_pending.pop(window_key, None)
         cancel_event = inflight.get("cancel_event") if isinstance(inflight, dict) else None
@@ -1214,14 +1212,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         run_request = self._last_run_requests.get(window_key)
         if not isinstance(run_request, IndicatorFollowSignalValidationRunRequest):
             return
-        inflight = self._history_extension_inflight.get(window_key)
-        if isinstance(inflight, dict):
-            # An explicit navigation request takes precedence over the
-            # opportunistic one-shot warmup.  Its cancelled worker result is
-            # rejected by the existing generation/token/pool gates.
-            if inflight.get("background_warmup") is not True:
-                return
-            self._complete_history_extension(window_key, success=False)
+        if window_key in self._history_extension_inflight:
+            return
         if (
             window_key in self._prepare_active
             or window_key in self._range_replay_active
@@ -1298,107 +1290,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             force_historical_refresh=False,
         )
         self._run_validation(window, extension_request, history_extension=True)
-
-    def _start_background_history_warmup(self, window: object) -> None:
-        """Prepare one authoritative maximum-history browse after initial paint."""
-        window_key = id(window)
-        if (
-            self._open_windows.get(window_key) is not window
-            or window_key in self._background_warmup_started
-            or window_key in self._history_extension_inflight
-            or self._history_targets.get(window_key, self._historical_count)
-            != self._historical_count
-        ):
-            return
-        run_request = self._last_run_requests.get(window_key)
-        if not isinstance(run_request, IndicatorFollowSignalValidationRunRequest):
-            return
-        try:
-            warmup_bars = required_validation_history_context_bars(
-                run_request.settings_snapshot.to_dict()
-            )
-        except Exception:
-            return
-        target = max(
-            1,
-            min(
-                MAX_SIGNAL_VALIDATION_HISTORICAL_COUNT,
-                DEFAULT_CANDLES_MAX_COUNT - warmup_bars,
-            ),
-        )
-        if target <= self._historical_count:
-            return
-        source_pool = self._historical_pools.get(window_key)
-        stock = getattr(window, "stock", None)
-        self._background_warmup_started.add(window_key)
-        self._history_targets[window_key] = target
-        self._history_extension_inflight[window_key] = {
-            "previous_target": self._historical_count,
-            "requested_target": target,
-            "background_warmup": True,
-            "cancel_event": Event(),
-            "exhaustion_identity": (
-                getattr(stock, "code", ""),
-                run_request.settings_snapshot.rules_hash,
-                target,
-                self._pool_computation_source_identity(source_pool),
-            ),
-        }
-        self._run_validation(window, run_request, history_extension=True)
-
-    def _queue_background_history_warmup(
-        self,
-        window: object,
-        generation: int,
-        session: ValidationSession,
-        pool: dict[str, object],
-    ) -> None:
-        """Yield one paint turn before starting the optional initial-history fetch."""
-        window_key = id(window)
-        if (
-            self._open_windows.get(window_key) is not window
-            or self._request_generation.get(window_key) != generation
-            or self._validation_sessions.get(window_key) is not session
-            or self._historical_pools.get(window_key) is not pool
-            or window_key in self._prepare_pending
-        ):
-            return
-        try:
-            flow_ref = weakref.ref(self)
-            window_ref = weakref.ref(window)
-        except TypeError:
-            return
-
-        def start_if_current(
-            flow_ref: weakref.ReferenceType[IndicatorFollowSignalValidationV5Flow] = flow_ref,
-            window_ref: weakref.ReferenceType[object] = window_ref,
-            window_key: int = window_key,
-            generation: int = generation,
-            session: ValidationSession = session,
-            pool: dict[str, object] = pool,
-        ) -> None:
-            flow = flow_ref()
-            target = window_ref()
-            if (
-                flow is None
-                or target is None
-                or flow._open_windows.get(window_key) is not target
-                or flow._request_generation.get(window_key) != generation
-                or flow._validation_sessions.get(window_key) is not session
-                or flow._historical_pools.get(window_key) is not pool
-                or window_key in flow._prepare_pending
-                or window_key in flow._prepare_active
-                or window_key in flow._range_replay_active
-                or window_key in flow._range_replay_pending
-                or window_key in flow._history_extension_pending
-                or window_key in flow._history_extension_inflight
-                or any(key[0] == window_key for key in flow._active_providers)
-                or not flow._window_accepts_results(target)
-            ):
-                return
-            flow._start_background_history_warmup(target)
-
-        QTimer.singleShot(0, start_if_current)
 
     def _complete_history_extension(
         self,
@@ -3926,13 +3817,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._history_browse_indicator_cache.pop(window_key, None)
         self._history_browse_active.pop(window_key, None)
         release_provider()
-        inflight = self._history_extension_inflight.get(window_key)
-        if isinstance(inflight, dict) and inflight.get("background_warmup") is True:
-            displayed = payload.get("display_candles")
-            if isinstance(displayed, list) and displayed:
-                self._history_targets[window_key] = min(
-                    int(payload["history_target"]), len(displayed)
-                )
         self._complete_history_extension(window_key, success=True)
         self._ensure_integrated_display_sidecar(
             window,
@@ -6234,9 +6118,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if interaction_epoch is not None:
                 self._prepare_deferred[window_key] = (interaction_epoch, dict(payload))
                 return
-            applied = False
             try:
-                applied = self._apply_pool_to_window(
+                self._apply_pool_to_window(
                     window, session, pool, evaluation_count=payload["evaluation_count"],
                     signal_entries=None, prepared_view_pool=payload["prepared_view_pool"],
                     normal_base_presentation=payload["normal_base_presentation"])
@@ -6245,13 +6128,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 self._fail_window(window, f"NORMAL_BASE_VIEW_ERROR: {exc}")
             finally:
                 self._prepare_active.pop(window_key, None)
-            if applied is True:
-                self._queue_background_history_warmup(
-                    window,
-                    generation,
-                    session,
-                    pool,
-                )
             self._start_pending_window_work(window_key)
             return
         if "source_identity_content_cache" in payload:
@@ -6374,18 +6250,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if applied is False:
             self._range_replay_pending.pop(window_key, None)
             return
-        inflight = self._history_extension_inflight.get(window_key)
-        if isinstance(inflight, dict):
-            requested_target = inflight.get("requested_target")
-            if requested_target == self._history_targets.get(window_key):
-                if inflight.get("background_warmup") is True:
-                    displayed = getattr(window, "_candles", None)
-                    if isinstance(displayed, list) and displayed:
-                        self._history_targets[window_key] = min(
-                            int(requested_target), len(displayed)
-                        )
-                self._complete_history_extension(window_key, success=True)
-        self._start_background_history_warmup(window)
         pending_range = self._range_replay_pending.pop(window_key, None)
         if pending_range is not None:
             self._start_range_replay(pending_range)
@@ -6494,8 +6358,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return
         if not history_extension and window_key in self._history_extension_inflight:
             self._complete_history_extension(window_key, success=False)
-        if not history_extension:
-            self._background_warmup_started.discard(window_key)
 
         previous_run_request = self._last_run_requests.get(window_key)
         if (
