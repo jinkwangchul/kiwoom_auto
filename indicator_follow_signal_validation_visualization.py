@@ -61,6 +61,14 @@ _LOWER_FAMILIES = {
 }
 
 
+def _optional_numpy() -> Any | None:
+    try:
+        import numpy
+    except (ImportError, OSError):
+        return None
+    return numpy
+
+
 class ValidationProjectionCancelled(RuntimeError):
     """Raised when an opt-in detached projection is no longer current."""
 
@@ -1185,6 +1193,40 @@ def _display_rsi_causal_history(
             or any(value is None or not math.isfinite(value) for value in closes)):
         return rsi_causal_history(closes, period, history_window)
 
+    numpy = _optional_numpy()
+    if numpy is not None and all(type(value) is float for value in closes):
+        values = rsi_causal_history(closes[:window], period, window)
+        gains = [0.0] * len(closes)
+        losses = [0.0] * len(closes)
+        for index in range(1, len(closes)):
+            change = closes[index] - closes[index - 1]
+            gains[index] = max(change, 0.0)
+            losses[index] = max(-change, 0.0)
+        gains_array = numpy.asarray(gains, dtype=numpy.float64)
+        losses_array = numpy.asarray(losses, dtype=numpy.float64)
+        starts = numpy.arange(1, len(closes) - window + 1, dtype=numpy.int32)
+        avg_gain = numpy.asarray([
+            sum(gains[start + 1:start + period + 1]) / period
+            for start in starts
+        ], dtype=numpy.float64)
+        avg_loss = numpy.asarray([
+            sum(losses[start + 1:start + period + 1]) / period
+            for start in starts
+        ], dtype=numpy.float64)
+        for index in range(period + 1, window):
+            avg_gain = ((avg_gain * (period - 1)) + gains_array[starts + index]) / period
+            avg_loss = ((avg_loss * (period - 1)) + losses_array[starts + index]) / period
+        for gain, loss in zip(avg_gain, avg_loss):
+            gain = float(gain)
+            loss = float(loss)
+            if gain == 0 and loss == 0:
+                values.append(0.0)
+            elif loss == 0:
+                values.append(100.0)
+            else:
+                values.append(100 - (100 / (1 + gain / loss)))
+        return values
+
     # Keep the canonical prefix and Wilder recurrence, including both zero cases.
     values = rsi_causal_history(closes[:window], period, window)
     gains = [0.0] * len(closes)
@@ -1228,6 +1270,49 @@ def _display_macd_causal_history(
         return macd_series_causal_history(
             closes, fast, slow, signal_period, history_window,
         )
+
+    numpy = _optional_numpy()
+    if numpy is not None and all(type(value) is float for value in closes):
+        macd_values, signal_values, osc_values = macd_series_causal_history(
+            closes[:window], fast, slow, signal_period, window,
+        )
+        count = len(closes) - window
+        close_values = numpy.asarray(closes, dtype=numpy.float64)
+        fast_state = close_values[1:1 + count].copy()
+        slow_state = fast_state.copy()
+        fast_prefix = [fast_state.copy()]
+        slow_prefix = [slow_state.copy()]
+        fast_multiplier = 2 / (fast + 1)
+        slow_multiplier = 2 / (slow + 1)
+        signal_multiplier = 2 / (signal_period + 1)
+        for index in range(1, seed):
+            value = close_values[1 + index:1 + index + count]
+            fast_state = (value - fast_state) * fast_multiplier + fast_state
+            slow_state = (value - slow_state) * slow_multiplier + slow_state
+            fast_prefix.append(fast_state)
+            slow_prefix.append(slow_state)
+        fast_seed = fast_prefix[fast - 1]
+        slow_seed = slow_prefix[slow - 1]
+        signal_state = None
+        for position in range(seed):
+            macd_value = (
+                (fast_prefix[position] if position >= fast else fast_seed)
+                - (slow_prefix[position] if position >= slow else slow_seed)
+            )
+            signal_state = (
+                macd_value if signal_state is None
+                else (macd_value - signal_state) * signal_multiplier + signal_state
+            )
+        for index in range(seed, window):
+            value = close_values[1 + index:1 + index + count]
+            fast_state = (value - fast_state) * fast_multiplier + fast_state
+            slow_state = (value - slow_state) * slow_multiplier + slow_state
+            macd_value = fast_state - slow_state
+            signal_state = (macd_value - signal_state) * signal_multiplier + signal_state
+        osc_values.extend(map(float, macd_value - signal_state))
+        macd_values.extend(map(float, macd_value))
+        signal_values.extend(map(float, signal_state))
+        return macd_values, signal_values, osc_values
 
     # Reuse the canonical prefix (including Hero4 EAVG backfill semantics).
     macd_values, signal_values, osc_values = macd_series_causal_history(
