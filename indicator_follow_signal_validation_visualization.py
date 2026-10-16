@@ -1197,9 +1197,9 @@ def _display_rsi_causal_history(
         start = index - window + 1
         avg_gain = sum(gains[start + 1:start + period + 1]) / period
         avg_loss = sum(losses[start + 1:start + period + 1]) / period
-        for local in range(start + period + 1, index + 1):
-            avg_gain = ((avg_gain * (period - 1)) + gains[local]) / period
-            avg_loss = ((avg_loss * (period - 1)) + losses[local]) / period
+        for gain, loss in zip(gains[start + period + 1:index + 1], losses[start + period + 1:index + 1]):
+            avg_gain = ((avg_gain * (period - 1)) + gain) / period
+            avg_loss = ((avg_loss * (period - 1)) + loss) / period
         if avg_gain == 0 and avg_loss == 0:
             values.append(0.0)
         elif avg_loss == 0:
