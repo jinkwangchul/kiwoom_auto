@@ -1,0 +1,26 @@
+{
+  "type": "PATCH_ONLY_INCREMENTAL_NONEXECUTABLE",
+  "depends_on_checkpoint": "a6aa67114b340b8f0cfeb5523da00b28db697875",
+  "base_working_HEAD": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "patch_sha256": "2e0b36a244d721316254c7980a7594d212632726ea29c2b7d854d4b71c08cacd",
+  "files": [
+    {
+      "file": "gui_stock_register_window.py",
+      "base_normalized_sha256": "77c6b089a624452a1e08254e32a1b69d312e071cb2f46cf1b20799416350f304",
+      "new_normalized_sha256": "37d8ddd736c2fc37591b245da7deb41bad95b3e396a6efcad12756bbd69b5b1e",
+      "new_raw_sha256": "257f8ab17e895143c71234ac15de23ca1bb17cfd6e49ea487e7c5959f06cd594",
+      "added_lines": 2,
+      "removed_lines": 10
+    },
+    {
+      "file": "tests/test_auto_trade_setting_routine_tree.py",
+      "base_normalized_sha256": "ac5ad429d06357818ca00852452c78cf5fb17b3ea231b6c9817db393046adc72",
+      "new_normalized_sha256": "a0c60d0437b5e55393e7a5203e9008cf41ed5b05330eec2566b222b313770df3",
+      "new_raw_sha256": "f4e5b0466066728e1e8db4431ce2a2418ca759512dd460801c2491881d54a234",
+      "added_lines": 7,
+      "removed_lines": 7
+    }
+  ],
+  "note": "Mock first stock reset dialog uses identical base message; only last target line is ????/???? ???. Existing Yes/No localized buttons, default No, and subsequent central confirm unchanged.",
+  "tests": "4 focused Python311-32 offscreen unittest tests PASS; real GUI not tested"
+}
