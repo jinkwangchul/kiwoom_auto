@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "kind": "PATCH_ONLY_NONEXECUTABLE",
+  "base_commit": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "source_branch": "feat/restore-auto-trade-setting-ui",
+  "recovery_ref": "refs/heads/recovery/mock-independent-20261017",
+  "patch_sha256": "e3301d1469150687b8ac8ab1ac524f519c734f08b8f2c537a69c9ce1551beeef",
+  "patch_bytes": 75686,
+  "mixed_with_preexisting_wip": {
+    "kiwoom_api.py": {
+      "task_hunks": 25,
+      "excluded_unrelated_hunks": 21
+    },
+    "mock_validation_host.py": {
+      "task_hunks": 11,
+      "excluded_unrelated_hunks": 14
+    },
+    "mock_validation_repository.py": {
+      "task_hunks": 1,
+      "excluded_unrelated_hunks": 6
+    },
+    "gui_windows.py": {
+      "task_hunks": 1,
+      "excluded_unrelated_hunks": 21
+    },
+    "gui_main_table_loader.py": {
+      "task_hunks": 4,
+      "excluded_unrelated_hunks": 3
+    }
+  },
+  "task_only_clean_files": [
+    "gui_stock_register_window.py",
+    "mock_validation_candle_provider.py",
+    "mock_validation_market_data.py",
+    "mock_validation_ui_actions.py",
+    "tests/test_auto_trade_setting_routine_tree.py",
+    "tests/test_mock_market_data_boundary_normalization.py",
+    "tests/test_mock_orderbook_realtime_subscription.py",
+    "tests/test_mock_validation_foundation.py",
+    "tests/test_mock_validation_host_ui.py",
+    "tests/test_mock_validation_market_data.py"
+  ],
+  "post_task_target_file_sha256": {
+    "kiwoom_api.py": "bf6bcb5477177045f7fded3e6b24fe5d5bf0ebf93a931e162c3198d609714bfb",
+    "mock_validation_host.py": "508df6132bcfffccdb0a2c1b25709b4d5fc7d2b24495f12fce13e80075f037da",
+    "mock_validation_repository.py": "42980eed7549d45de6fa86b0b5fef7ec36881f6d63b37d8c8182dfb24bbd779e",
+    "gui_windows.py": "5d8dc56555d93551dde544f35533f5a345f1ce9755e756ea9a72ee33d06ed0c8",
+    "gui_main_table_loader.py": "636f7acf373e458c2c664994e58f001a09f61f018203215a0957038d1ef9817e",
+    "gui_stock_register_window.py": "7af6cfbe5f00bfa057e9cfef5091ce051af8e2b763bde12933ce87cb5a3a9b33",
+    "mock_validation_candle_provider.py": "cf0433eafb26424f003641b1a426841f4397cae28fe227fddbddff1450793b41",
+    "mock_validation_market_data.py": "bf075f043bce3e7f29dcf768652c1ab0055e7f040fb6f9112f7d5ab14a472161",
+    "mock_validation_ui_actions.py": "f9a36716ddf8af7e9f02786cff3c4e1425d10dce5dfc2d4c348db2180a9df4d7",
+    "tests/test_auto_trade_setting_routine_tree.py": "9941983a419fba50d76ca58c8736396031e7748f0f1ac12d680333855837c35a",
+    "tests/test_mock_market_data_boundary_normalization.py": "3210f4e0237eb896128a38ca4bbcb173ebe71a992ed8c5c82228ea0d0cfb37dc",
+    "tests/test_mock_orderbook_realtime_subscription.py": "0c0031f8e2109165d773f738144259dec7944d07d49a076083b8504aed9eee71",
+    "tests/test_mock_validation_foundation.py": "56aaa264f55e039678ca6748d63400b44ce161eb7f51a9bf9f549dbbfd1a7427",
+    "tests/test_mock_validation_host_ui.py": "afc82d124c1f19cd7928c359f206d30848b62449fb48df40ebc6d4b5568705fb",
+    "tests/test_mock_validation_market_data.py": "b262ec38aff5efd7b605dddf54c6ece3802975838f024cd388cfdfe7114b83f1"
+  },
+  "requires_preexisting_wip": true,
+  "standalone_source_tree": false,
+  "live_gui_verified": false,
+  "real_order_performed": false
+}
