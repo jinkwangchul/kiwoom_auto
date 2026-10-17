@@ -1,0 +1,19 @@
+GUI STARTUP NAMEERROR REPAIR | 2026-10-17
+CHECKPOINT TYPE: PATCH RECOVERY DOCUMENTATION ONLY; NOT EXECUTABLE SOURCE.
+Previous GUI failure: NameError name 'market_host' is not defined.
+Root cause: in pre-existing uncommitted gui_windows.py, three host-local definitions were removed during Mock market-data independence edits, but the later market_data_observed and operation_cycle_completed references remained.
+Approved minimal repair: insert EXACTLY these three lines after self._connect_events() and before constructing MockValidationHost:
+
+        operation_host = self.main_monitoring_auto_trade_operation_host()
+        market_host_getter = getattr(operation_host, "market_data_host", None)
+        market_host = market_host_getter() if callable(market_host_getter) else None
+
+Crucially DO NOT reattach a Production candle provider/updater to MockValidationHost.
+These three lines already exist in original parent HEAD 4579864b40243310a383b2f7503dcda57c7961d7, so repair restores a removed baseline WIP declaration; no additional source change against HEAD is appropriate.
+Local post-fix gui_windows.py SHA256: 3f29cc678fd8561f6a5580ee5735dcb779480a63db260c5a8f40edd61f1c8a7e
+Isolated native Python 3.11-32 AST + fake host checks: PASS (market host exists and absent).
+Native Python 3.11-32 Production MarketData regression tests: 82 PASS.
+Codex CLI mutation session 01a149a6-8935-7132-9c2e-e19395af3d64 exited 0.
+Real operating GUI start, Kiwoom login and broker streaming: NOT independently verified.
+Working branch feat/restore-auto-trade-setting-ui HEAD 4579864b40243310a383b2f7503dcda57c7961d7 unchanged; staged 0; protected WIP unchanged.
+Do not use the parent patch-only recovery branch as a standalone runnable release.
