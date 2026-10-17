@@ -1,0 +1,707 @@
+--- a/assignment_authorization_service.py
++++ b/assignment_authorization_service.py
+@@ -7,6 +7,7 @@
+ from typing import Any
+ 
+ from assignment_episode_linkage import assign_stock_routine, unassign_stock_routine
++from assignment_startup_reconciliation_service import quarantine_unassigned_operation_state
+ from gui_auto_trade_integrity import (
+     inspect_review_state_path,
+     is_emergency_stopped_state,
+@@ -217,11 +218,19 @@
+             target_instance_id=target_id,
+         )
+ 
+-    participant = bool(
+-        stock_code
+-        and stock_code
+-        in auto_trade_current_session_operation_participant_codes(owner)
+-    )
++    try:
++        participant = bool(
++            stock_code
++            and stock_code
++            in auto_trade_current_session_operation_participant_codes(owner)
++        )
++    except Exception:
++        return _blocked(
++            reason_code="PARTICIPANT_EVIDENCE_UNAVAILABLE",
++            stock_code=stock_code,
++            intent=clean_intent,
++            target_instance_id=target_id,
++        )
+     if participant:
+         return _blocked(
+             reason_code="CURRENTLY_RUNNING",
+@@ -613,9 +622,19 @@
+             authorization=authorization,
+         )
+     if authorization.reason_code == "ALREADY_UNASSIGNED":
++        if intent == ASSIGNMENT_INTENT_UNASSIGN:
++            quarantine = quarantine_unassigned_operation_state(
++                Path(project_root), authorization.stock_code, name, owner=owner,
++            )
++            if not quarantine["ok"]:
++                return AssignmentCommandResult(
++                    False, reason_code="UNASSIGN_QUARANTINE_FAILED",
++                    reconciliation_required=True, error=str(quarantine["reason"]),
++                    authorization=authorization,
++                )
+         return AssignmentCommandResult(
+             True,
+-            changed=False,
++            changed=bool(quarantine["changed"]) if intent == ASSIGNMENT_INTENT_UNASSIGN else False,
+             reason_code="ALREADY_UNASSIGNED",
+             authorization=authorization,
+         )
+@@ -632,9 +651,22 @@
+         ),
+         stock_repository=repository,
+     )
++    if result.ok and intent == ASSIGNMENT_INTENT_UNASSIGN:
++        quarantine = quarantine_unassigned_operation_state(
++            repository.project_root, authorization.stock_code, name, owner=owner,
++        )
++        if not quarantine["ok"]:
++            return AssignmentCommandResult(
++                False, changed=result.changed, reason_code="UNASSIGN_QUARANTINE_FAILED",
++                transaction_id=result.transaction_id,
++                assignment_before=result.assignment_before,
++                assignment_after=result.assignment_after,
++                reconciliation_required=True, error=str(quarantine["reason"]),
++                authorization=authorization,
++            )
+     return AssignmentCommandResult(
+         result.ok,
+-        changed=result.changed,
++        changed=result.changed or (bool(quarantine["changed"]) if result.ok and intent == ASSIGNMENT_INTENT_UNASSIGN else False),
+         reason_code=result.reason_code,
+         transaction_id=result.transaction_id,
+         assignment_before=result.assignment_before,
+--- a/assignment_startup_reconciliation_service.py
++++ b/assignment_startup_reconciliation_service.py
+@@ -4,6 +4,8 @@
+ 
+ from dataclasses import asdict
+ from datetime import datetime
++from hashlib import sha256
++import json
+ import logging
+ from pathlib import Path
+ from typing import Any, Callable
+@@ -22,6 +24,7 @@
+     operator_review_location,
+     operator_review_reason,
+ )
++from gui_auto_trade_policy import auto_trade_current_session_operation_participant_codes
+ from production_recovery_contract import ACCOUNT_FAILED, STOCK_REVIEW_REQUIRED
+ from production_recovery_state_registry import ProductionRecoveryStateRegistry
+ from runtime_io import read_json_dict
+@@ -33,6 +36,7 @@
+ 
+ ASSIGNMENT_RECONCILIATION_REASON_CODE = "ASSIGNMENT_RECONCILIATION_REQUIRED"
+ ASSIGNMENT_RECONCILIATION_SOURCE = "PRODUCTION_RECOVERY"
++UNASSIGNED_STATE_MISMATCH = "UNASSIGNED_OPERATION_STATE_MISMATCH"
+ 
+ 
+ def _now_text() -> str:
+@@ -77,6 +81,88 @@
+         reason_code=reason_code,
+         details=dict(details or {}),
+     )
++
++
++def inspect_unassigned_operation_state(
++    project_root: Path, stock_code: str, stock_name: str = "",
++) -> dict[str, Any]:
++    """Read only: identify an unassigned stock with stale operation authority."""
++    repository = StockRepository(project_root)
++    record = repository.find_by_code(stock_code)
++    if record is None or (stock_name and record.name != stock_name):
++        return {"mismatch": False, "reason": "STOCK_IDENTITY_CHANGED"}
++    stock_dir = repository.resolve_stock_dir(stock_code, record.name)
++    config_path, state_path = stock_dir / "config.json", stock_dir / "state.json"
++    try:
++        config_bytes, state_bytes = config_path.read_bytes(), state_path.read_bytes()
++        config = json.loads(config_bytes.decode("utf-8-sig"))
++        state = json.loads(state_bytes.decode("utf-8-sig"))
++    except Exception as exc:
++        return {"mismatch": False, "reason": f"STOCK_DATA_UNAVAILABLE: {exc}"}
++    if not isinstance(config, dict) or not isinstance(state, dict) or not state:
++        return {"mismatch": False, "reason": "STOCK_DATA_INVALID"}
++    if str(config.get("assigned_routine_instance_id") or "").strip():
++        return {"mismatch": False, "reason": "STOCK_ASSIGNED"}
++    mismatch = (
++        str(state.get("status") or "").strip().upper() in (
++            "RUNNING", "STARTED", "AUTO", "TRADING"
++        )
++        or state.get("trade_enabled") is True
++    )
++    return {
++        "mismatch": mismatch,
++        "reason": UNASSIGNED_STATE_MISMATCH if mismatch else "UNCHANGED",
++        "stock_dir": stock_dir,
++        "config_sha256": sha256(config_bytes).hexdigest(),
++        "state_sha256": sha256(state_bytes).hexdigest(),
++        "status": str(state.get("status") or ""),
++        "trade_enabled": state.get("trade_enabled"),
++    }
++
++
++def quarantine_unassigned_operation_state(
++    project_root: Path, stock_code: str, stock_name: str, *, owner: object | None,
++) -> dict[str, Any]:
++    """Enter Review only after identity, source bytes, and session guards hold."""
++    inspected = inspect_unassigned_operation_state(project_root, stock_code, stock_name)
++    if not inspected.get("mismatch"):
++        return {"ok": inspected.get("reason") == "UNCHANGED", "changed": False,
++                "reason": inspected.get("reason")}
++    try:
++        if stock_code in auto_trade_current_session_operation_participant_codes(owner):
++            return {"ok": False, "changed": False, "reason": "CURRENT_SESSION_PARTICIPANT"}
++    except Exception:
++        return {"ok": False, "changed": False, "reason": "PARTICIPANT_EVIDENCE_UNAVAILABLE"}
++    checked = inspect_unassigned_operation_state(project_root, stock_code, stock_name)
++    if not checked.get("mismatch") or any(
++        checked.get(key) != inspected.get(key)
++        for key in ("stock_dir", "config_sha256", "state_sha256")
++    ):
++        return {"ok": False, "changed": False, "reason": "STOCK_DATA_CHANGED"}
++    try:
++        if stock_code in auto_trade_current_session_operation_participant_codes(owner):
++            return {"ok": False, "changed": False, "reason": "CURRENT_SESSION_PARTICIPANT"}
++    except Exception:
++        return {"ok": False, "changed": False, "reason": "PARTICIPANT_EVIDENCE_UNAVAILABLE"}
++    stock_dir = checked["stock_dir"]
++    timestamp = _now_text()
++    evidence = (
++        f"{UNASSIGNED_STATE_MISMATCH} stock_code={stock_code} "
++        f"config_sha256={checked['config_sha256']} state_sha256={checked['state_sha256']} "
++        f"status={checked['status']} trade_enabled={checked['trade_enabled']} "
++        "current_session_participant=false"
++    )
++    mutation = mutate_runtime_stock_state(
++        stock_dir, "REVIEW_REQUIRED",
++        {"trade_enabled": False, "review_required": True,
++         "review_status": "PENDING", "review_location": "종목관리",
++         "review_reason": operator_review_reason("운영 데이터 불일치"),
++         "review_detail": evidence, "review_checked_at": timestamp,
++         "review_entered_at": timestamp},
++        updated_at=timestamp, verify_readback=True,
++    )
++    return {"ok": mutation.ok, "changed": mutation.ok,
++            "reason": "REVIEW_REQUIRED" if mutation.ok else mutation.reason}
+ 
+ 
+ def _transition_stock_to_review(
+@@ -263,6 +349,21 @@
+         )
+     )
+     review_codes = tuple(sorted(review_by_stock))
++    # Startup has no session owner at its production call site. Surface stale
++    # unassigned state as blocked evidence; never infer participant absence.
++    unassigned_mismatches: list[str] = []
++    unassigned_scan_failed = False
++    try:
++        for record in StockRepository(root).list_stocks():
++            inspected = inspect_unassigned_operation_state(root, record.code, record.name)
++            if inspected.get("mismatch"):
++                unassigned_mismatches.append(record.code)
++                errors.append({"stock_code": record.code,
++                               "reason": UNASSIGNED_STATE_MISMATCH,
++                               "error": "PARTICIPANT_EVIDENCE_UNAVAILABLE"})
++    except Exception as exc:
++        unassigned_scan_failed = True
++        errors.append({"reason": "UNASSIGNED_STATE_SCAN_FAILED", "error": str(exc)})
+     summary = {
+         "scanned": len(reconciliation_results),
+         "committed_terminalized": sum(
+@@ -287,18 +388,22 @@
+         "review_transitions": tuple(transitions),
+         "review_transition_failures": len(failed_codes),
+         "review_stock_codes": review_codes,
+-        "blocked_stock_codes": review_codes,
++        "unassigned_mismatch_blocked_stock_codes": tuple(sorted(set(unassigned_mismatches))),
++        "blocked_stock_codes": tuple(sorted(set(review_codes) | set(unassigned_mismatches))),
+         "errors": tuple(errors),
+         "results": tuple(asdict(item) for item in reconciliation_results),
+-        "global_fail_closed": any(not item.stock_code for item in reconciliation_results),
+-        "other_stocks_continue": not any(
++        "global_fail_closed": unassigned_scan_failed or any(
++            not item.stock_code for item in reconciliation_results
++        ),
++        "other_stocks_continue": not unassigned_scan_failed and not any(
+             not item.stock_code for item in reconciliation_results
+         ),
+     }
+     _emit_event(
+         writer,
+         "RECOVERY_WARNING" if errors else "RECOVERY_COMPLETED",
+-        result="COMPLETED_WITH_REVIEW" if review_codes else "COMPLETED",
++        result=("BLOCKED" if unassigned_scan_failed or unassigned_mismatches else
++                "COMPLETED_WITH_REVIEW" if review_codes else "COMPLETED"),
+         severity="WARNING" if errors or review_codes else "INFO",
+         reason_code="ASSIGNMENT_RECONCILIATION_SCAN_COMPLETE",
+         details={
+--- a/gui_review_required_window.py
++++ b/gui_review_required_window.py
+@@ -2245,6 +2245,39 @@
+                 )
+                 failed += 1
+                 continue
++            try:
++                if stock_dir.resolve(strict=True) != verified_dir.resolve(strict=True):
++                    raise RuntimeError("선택 종목 경로 변경")
++                owner = persistent_feature_owner(self)
++                mock_host = getattr(owner, "mock_validation_host", None)
++                if mock_host is None:
++                    raise RuntimeError("모의 종목 상태 확인 경로 없음")
++                mock_repository = mock_host.repository
++                mock_session_id = mock_repository.current_session_id(code)
++                if mock_session_id:
++                    document = mock_repository.read_session(mock_session_id)
++                    if document["session"]["stock_code"] != code:
++                        raise RuntimeError("모의 종목 identity 불일치")
++                    actions = getattr(owner, "mock_validation_ui_actions", None)
++                    if actions is None:
++                        raise RuntimeError("모의 종목 초기화 경로 없음")
++                    mock_result = actions.force_unregister_for_stock_reset(
++                        code, expected_validation_session_id=mock_session_id
++                    )
++                    if not isinstance(mock_result, dict) or mock_result.get("ok") is not True:
++                        raise RuntimeError("모의 데이터 삭제 실패")
++            except Exception as exc:
++                append_review_force_reset_event(
++                    stock_dir=stock_dir,
++                    code=code,
++                    name=name,
++                    state_before=state_before,
++                    result="BLOCKED",
++                    reason=str(exc),
++                    delete_target_verified=False,
++                )
++                failed += 1
++                continue
+             result = delete_stock_project_data(code, name, verified_dir)
+             if result.get("status") == "DELETED":
+                 append_review_force_reset_event(
+--- a/gui_stock_register_window.py
++++ b/gui_stock_register_window.py
+@@ -1930,6 +1930,12 @@
+     def _review_writer_callback(self):
+         parent = persistent_feature_owner(self)
+         writer = getattr(parent, "mark_review_required", None)
++        if not callable(writer):
++            host_getter = getattr(parent, "main_monitoring_auto_trade_operation_host", None)
++            host = host_getter() if callable(host_getter) else getattr(
++                parent, "_main_monitoring_auto_trade_operation_host", None
++            )
++            writer = getattr(host, "mark_review_required", None)
+         return writer if callable(writer) else None
+ 
+     def _integrity_writer_failed(self, result: dict[str, object]) -> bool:
+@@ -1957,21 +1963,29 @@
+ 
+             if local_status == LOCAL_STATUS_REVIEW_REQUIRED:
+                 writer = self._review_writer_callback()
+-                if writer is None:
+-                    self._last_integrity_check_result = result
+-                    self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
+-                    return
+-
+                 result = apply_integrity_review_required_issues(
+                     result,
+                     project_root=PROJECT_ROOT,
+-                    review_writer=writer,
++                    review_writer=writer or (lambda *_args, **_kwargs: False),
+                     source="무결성검사",
+                 )
+                 self._last_integrity_check_result = result
+                 self.refresh_stock_table()
+                 if self._integrity_writer_failed(result):
+                     self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
++                    return
++                unwritable = result.get("review_unwritable") or ()
++                if unwritable:
++                    descriptions = [
++                        f"{item['stock_code']} {item['stock_name']}: "
++                        + (", ".join(item["missing_files"]) + " 누락"
++                           if item["missing_files"] else "state.json 읽기 실패")
++                        for item in unwritable
++                    ]
++                    self._show_integrity_toast(
++                        "무결성 검사 경고 | " + " / ".join(descriptions)
++                        + " | 검토관리 기록 불가"
++                    )
+                     return
+                 self._show_integrity_toast("무결성 검사 완료 | 검토관리 대상 종목이 있습니다.")
+                 return
+--- a/integrity_checker.py
++++ b/integrity_checker.py
+@@ -382,6 +382,7 @@
+     root = Path(project_root)
+     issues = [dict(issue) for issue in result.get("issues", []) if isinstance(issue, dict)]
+     grouped: dict[Path, dict[str, object]] = {}
++    unwritable: list[dict[str, object]] = []
+ 
+     for issue in issues:
+         if issue.get("requires_review") is not True:
+@@ -412,6 +413,19 @@
+             bucket["stock_name"] = str(issue.get("stock_name", "") or "").strip()
+ 
+     for stock_dir, bucket in grouped.items():
++        state_path = stock_dir / "state.json"
++        state_ok, state_data, _ = read_json_safely(state_path)
++        if not state_path.is_file() or not state_ok or not isinstance(state_data, dict):
++            unwritable.append({
++                "stock_code": bucket["stock_code"],
++                "stock_name": bucket["stock_name"],
++                "missing_files": tuple(
++                    name for name in ("config.json", "state.json", "orders.json")
++                    if not (stock_dir / name).is_file()
++                ),
++                "reason": "STATE_MISSING_OR_UNREADABLE",
++            })
++            continue
+         state = safe_json_dict(stock_dir / "state.json")
+         existing_reason = str(
+             state.get("review_reason", "") or state.get("review_detail", "") or ""
+@@ -475,7 +489,9 @@
+                 )
+             )
+ 
+-    return _result_with_recalculated_counts(result, issues)
++    updated = _result_with_recalculated_counts(result, issues)
++    updated["review_unwritable"] = tuple(unwritable)
++    return updated
+ 
+ 
+ def _stock_json_targets(stock_dir: Path) -> list[tuple[str, Path]]:
+--- a/tests/test_assignment_startup_reconciliation.py
++++ b/tests/test_assignment_startup_reconciliation.py
+@@ -257,6 +257,24 @@
+         self.assertEqual(before, self._state())
+         self.assertEqual(0, summary["review_required"])
+ 
++    def test_committed_unassign_stale_state_is_reported_without_unsafe_startup_write(self) -> None:
++        stale_path = self.stock_repository.resolve_stock_dir(CODE_A) / "state.json"
++        self._json(stale_path, {"status": "RUNNING", "trade_enabled": True,
++                                "holding_qty": 0, "history": ["keep"]})
++        before = stale_path.read_bytes()
++        other_before = (self.stock_repository.resolve_stock_dir(CODE_B) / "state.json").read_bytes()
++
++        summary = self._run()
++
++        self.assertEqual(0, summary["scanned"])
++        self.assertEqual((CODE_A,), summary["unassigned_mismatch_blocked_stock_codes"])
++        self.assertIn(CODE_A, summary["blocked_stock_codes"])
++        self.assertEqual(before, stale_path.read_bytes())
++        self.assertEqual(other_before, (
++            self.stock_repository.resolve_stock_dir(CODE_B) / "state.json"
++        ).read_bytes())
++        self.assertEqual("PARTICIPANT_EVIDENCE_UNAVAILABLE", summary["errors"][0]["error"])
++
+     def test_terminal_journal_is_not_scanned_or_mutated(self) -> None:
+         self._assign_a()
+         transaction_dir = self.journal_repository.transactions_root / CODE_A
+--- a/tests/test_c5a_assignment_authorization.py
++++ b/tests/test_c5a_assignment_authorization.py
+@@ -5,7 +5,7 @@
+ from types import SimpleNamespace
+ import tempfile
+ import unittest
+-from unittest.mock import Mock
++from unittest.mock import Mock, patch
+ from uuid import UUID
+ 
+ from assignment_authorization_service import (
+@@ -19,6 +19,7 @@
+     inspect_assignment_authorization,
+     inspect_stock_unregister_availability,
+ )
++from assignment_startup_reconciliation_service import quarantine_unassigned_operation_state
+ from stock_repository import StockRepository
+ from tests.participant_owner_fixture import (
+     attach_participant_owner,
+@@ -707,6 +708,88 @@
+         saved = json.loads((self.stock_dir / "config.json").read_text(encoding="utf-8"))
+         self.assertEqual("", saved["assigned_routine_instance_id"])
+ 
++    def test_unassign_quarantines_stale_running_state_without_losing_payload(self) -> None:
++        self.assertTrue(self._assign(INSTANCE_A, "").ok)
++        self._set_state(status="RUNNING", trade_enabled=True, holding_qty=0,
++                        positions=[{"evidence": "keep"}], history=["keep"])
++        broker_calls = [Mock() for _ in range(3)]
++        self.owner.SendOrder, self.owner.CommRqData, self.owner.SetRealReg = broker_calls
++
++        result = execute_assignment_unassign(
++            self.owner, self.root, CODE, NAME, expected_instance_id=INSTANCE_A
++        )
++
++        self.assertTrue(result.ok, result)
++        state = json.loads((self.stock_dir / "state.json").read_text(encoding="utf-8"))
++        self.assertEqual("REVIEW_REQUIRED", state["status"])
++        self.assertFalse(state["trade_enabled"])
++        self.assertTrue(state["review_required"])
++        self.assertEqual("PENDING", state["review_status"])
++        self.assertEqual("종목관리", state["review_location"])
++        self.assertEqual([{"evidence": "keep"}], state["positions"])
++        self.assertEqual(["keep"], state["history"])
++        self.assertIn("state_sha256=", state["review_detail"])
++        for call in broker_calls:
++            call.assert_not_called()
++
++    def test_already_unassigned_quarantines_once(self) -> None:
++        self._set_state(status="RUNNING", trade_enabled=True)
++        first = execute_assignment_unassign(self.owner, self.root, CODE, NAME)
++        state_path = self.stock_dir / "state.json"
++        after = state_path.read_bytes()
++        second = quarantine_unassigned_operation_state(
++            self.root, CODE, NAME, owner=self.owner
++        )
++        self.assertTrue(first.ok and first.changed)
++        self.assertTrue(second["ok"] and not second["changed"])
++        self.assertEqual(after, state_path.read_bytes())
++
++    def test_already_unassigned_active_statuses_require_review(self) -> None:
++        state_path = self.stock_dir / "state.json"
++        config = json.loads((self.stock_dir / "config.json").read_text(encoding="utf-8"))
++        self.assertEqual("", config.get("assigned_routine_instance_id", ""))
++        for status in ("STARTED", "AUTO", "TRADING", "STOPPED"):
++            with self.subTest(status=status):
++                self._set_state(status=status, trade_enabled=False,
++                                review_required=False, review_status="")
++                before = state_path.read_bytes()
++                result = execute_assignment_unassign(self.owner, self.root, CODE, NAME)
++                state = json.loads(state_path.read_text(encoding="utf-8"))
++                self.assertTrue(result.ok, result)
++                if status == "STOPPED":
++                    self.assertFalse(result.changed)
++                    self.assertEqual(before, state_path.read_bytes())
++                else:
++                    self.assertTrue(result.changed)
++                    self.assertEqual("REVIEW_REQUIRED", state["status"])
++                    self.assertFalse(state["trade_enabled"])
++                    self.assertTrue(state["review_required"])
++                    self.assertEqual("PENDING", state["review_status"])
++
++    def test_quarantine_failure_reports_partial_unassign(self) -> None:
++        self.assertTrue(self._assign(INSTANCE_A, "").ok)
++        self._set_state(status="RUNNING", trade_enabled=True)
++        with patch("assignment_startup_reconciliation_service.mutate_runtime_stock_state") as writer:
++            writer.return_value = SimpleNamespace(ok=False, reason="WRITE_FAILED")
++            result = execute_assignment_unassign(
++                self.owner, self.root, CODE, NAME, expected_instance_id=INSTANCE_A
++            )
++        self.assertFalse(result.ok)
++        self.assertTrue(result.changed)
++        self.assertTrue(result.reconciliation_required)
++        self.assertEqual("UNASSIGN_QUARANTINE_FAILED", result.reason_code)
++        self.assertEqual("RUNNING", json.loads(
++            (self.stock_dir / "state.json").read_text(encoding="utf-8")
++        )["status"])
++
++    def test_unassign_without_participant_owner_fails_closed(self) -> None:
++        self._set_state(status="RUNNING", trade_enabled=True)
++        before = self._fingerprint()
++        result = execute_assignment_unassign(None, self.root, CODE, NAME)
++        self.assertFalse(result.ok)
++        self.assertEqual("PARTICIPANT_EVIDENCE_UNAVAILABLE", result.reason_code)
++        self.assertEqual(before, self._fingerprint())
++
+     def test_review_specific_unassign_preserves_explicit_workflow(self) -> None:
+         self.assertTrue(self._assign(INSTANCE_A, "").ok)
+         self._set_state(status="REVIEW_REQUIRED", review_required=True)
+--- a/tests/test_integrity_check_focus.py
++++ b/tests/test_integrity_check_focus.py
+@@ -379,6 +379,22 @@
+         self.assertEqual("Bad", name)
+         self.assertEqual(["운영 데이터 불일치"], item["review_reasons"])
+         self.assertEqual("안정성 검사", item["review_location"])
++
++    def test_missing_unassigned_state_is_diagnostic_without_review_write(self) -> None:
++        stock_dir = self.root / "stocks" / "0162Z0_RISE"
++        (stock_dir / "logs").mkdir(parents=True)
++        before = tuple(path.relative_to(stock_dir) for path in stock_dir.rglob("*"))
++        writer = mock.Mock(return_value=True)
++
++        result = integrity_checker.apply_integrity_review_required_issues(
++            self._result(), project_root=self.root, review_writer=writer,
++        )
++
++        writer.assert_not_called()
++        self.assertEqual(before, tuple(path.relative_to(stock_dir) for path in stock_dir.rglob("*")))
++        self.assertEqual(("config.json", "state.json", "orders.json"),
++                         result["review_unwritable"][0]["missing_files"])
++        self.assertNotIn("CHECK_ERROR", self._issue_codes(result))
+ 
+     def test_check_error_issue_is_not_registered(self) -> None:
+         stock_dir = self._stock()
+@@ -798,6 +814,42 @@
+ 
+         self.parent.review_writer.assert_called_once()
+ 
++    def test_main_like_owner_uses_official_operation_host_writer(self) -> None:
++        window = self._window()
++        self.parent.review_writer.reset_mock()
++        with mock.patch.object(self.parent, "mark_review_required", None):
++            writer = window._review_writer_callback()
++            self.assertEqual(self.operation_host.mark_review_required, writer)
++
++    def test_present_review_issue_calls_main_operation_host_writer(self) -> None:
++        window = self._window()
++        stock_dir = self.root / "stocks" / "005930_삼성전자"
++        stock_dir.mkdir(parents=True)
++        (stock_dir / "state.json").write_text(
++            json.dumps({"status": "STOPPED"}), encoding="utf-8"
++        )
++        result = self._result("REVIEW_REQUIRED", issues=[self._review_issue()])
++        with (
++            mock.patch.object(self.parent, "mark_review_required", None),
++            mock.patch.object(self.operation_host, "mark_review_required", return_value=True) as writer,
++            mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=result),
++        ):
++            window.run_initial_integrity_check()
++        writer.assert_called_once()
++        self.assertNotIn("검토관리 반영에 실패", self.parent.popup_messages[-1])
++
++    def test_missing_state_warning_names_stock_without_writer_failure(self) -> None:
++        window = self._window()
++        stock_dir = self.root / "stocks" / "0162Z0_RISE"
++        (stock_dir / "logs").mkdir(parents=True)
++        with mock.patch("gui_stock_register_window.run_local_stock_integrity_check",
++                        return_value=integrity_checker.run_local_stock_integrity_check(self.root)):
++            window.run_initial_integrity_check()
++        self.parent.review_writer.assert_not_called()
++        self.assertIn("0162Z0", self.parent.popup_messages[-1])
++        self.assertIn("state.json", self.parent.popup_messages[-1])
++        self.assertNotIn("검토관리 반영에 실패", self.parent.popup_messages[-1])
++
+     def test_check_error_does_not_call_writer(self) -> None:
+         window = self._window()
+         result = self._result("CHECK_ERROR", issues=[self._check_error_issue()])
+--- a/tests/test_review_force_reset.py
++++ b/tests/test_review_force_reset.py
+@@ -2,6 +2,7 @@
+ import os
+ from pathlib import Path
+ from tempfile import TemporaryDirectory
++from types import SimpleNamespace
+ import unittest
+ from unittest.mock import MagicMock, patch
+ 
+@@ -73,6 +74,18 @@
+         FakeConfirmationBox.clicked_accept = True
+         FakeConfirmationBox.last = None
+         FakeConfirmationBox.information_calls = []
++        self.mock_repository = MagicMock()
++        self.mock_repository.current_session_id.return_value = ""
++        self.mock_actions = MagicMock()
++        self.mock_owner = SimpleNamespace(
++            mock_validation_host=SimpleNamespace(repository=self.mock_repository),
++            mock_validation_ui_actions=self.mock_actions,
++        )
++        owner_patch = patch.object(
++            review_window, "persistent_feature_owner", return_value=self.mock_owner
++        )
++        owner_patch.start()
++        self.addCleanup(owner_patch.stop)
+ 
+     @staticmethod
+     def _make_review_stock(root: Path, *, holding: int = 0, pending: int = 0) -> Path:
+@@ -272,6 +285,7 @@
+             self.assertTrue(stock_dir.exists())
+             confirm.assert_called_once_with(window, [("111111", "대상")])
+             delete_data.assert_not_called()
++            self.mock_actions.force_unregister_for_stock_reset.assert_not_called()
+             journal.assert_not_called()
+ 
+     def test_review_force_reset_uses_shared_delete_and_refreshes(self):
+@@ -312,6 +326,87 @@
+             self.assertEqual("UNREGISTERED", journal.call_args.kwargs["details"]["final_state"])
+             self.assertTrue(journal.call_args.kwargs["details"]["post_delete_verified"])
+             toast.assert_called_once_with(window, "강제초기화 완료: 1개")
++
++    def test_review_force_reset_purges_only_selected_mock_before_central_delete(self):
++        with TemporaryDirectory() as temp:
++            stock_dir = self._make_review_stock(Path(temp))
++            ready = {"status": stock_window.STOCK_RESET_INITIALIZABLE,
++                     "reason": "", "stock_dir": stock_dir}
++            self.mock_repository.current_session_id.return_value = "session-1"
++            self.mock_repository.read_session.return_value = {
++                "session": {"stock_code": "111111"}
++            }
++            calls = []
++            self.mock_actions.force_unregister_for_stock_reset.side_effect = (
++                lambda code, **kwargs: calls.append(("mock", code)) or {"ok": True}
++            )
++            with (
++                patch.object(review_window, "collect_global_review_required_rows", return_value=[self._row(stock_dir)]),
++                patch.object(stock_window, "force_stock_reset_preflight", return_value=ready),
++                patch.object(stock_window, "confirm_force_stock_reset", return_value=True),
++                patch.object(stock_window, "delete_stock_project_data",
++                             side_effect=lambda code, *_: calls.append(("central", code)) or {"status": "DELETED"}),
++                patch.object(review_window, "append_production_event"),
++                patch.object(review_window, "show_toast"),
++            ):
++                window = review_window.GlobalReviewRequiredWindow()
++                self.addCleanup(window.close)
++                window.table.selectRow(0)
++                window.delete_selected_review_items()
++        self.assertEqual([("mock", "111111"), ("central", "111111")], calls)
++        self.mock_actions.force_unregister_for_stock_reset.assert_called_once_with(
++            "111111", expected_validation_session_id="session-1"
++        )
++
++    def test_review_force_reset_mock_failure_preserves_central_stock(self):
++        with TemporaryDirectory() as temp:
++            stock_dir = self._make_review_stock(Path(temp))
++            ready = {"status": stock_window.STOCK_RESET_INITIALIZABLE,
++                     "reason": "", "stock_dir": stock_dir}
++            self.mock_repository.current_session_id.return_value = "session-1"
++            self.mock_repository.read_session.return_value = {
++                "session": {"stock_code": "111111"}
++            }
++            self.mock_actions.force_unregister_for_stock_reset.return_value = {"ok": False}
++            with (
++                patch.object(review_window, "collect_global_review_required_rows", return_value=[self._row(stock_dir)]),
++                patch.object(stock_window, "force_stock_reset_preflight", return_value=ready),
++                patch.object(stock_window, "confirm_force_stock_reset", return_value=True),
++                patch.object(stock_window, "delete_stock_project_data") as delete_data,
++                patch.object(review_window, "append_production_event"),
++                patch.object(review_window, "show_toast"),
++            ):
++                window = review_window.GlobalReviewRequiredWindow()
++                self.addCleanup(window.close)
++                window.table.selectRow(0)
++                window.delete_selected_review_items()
++            delete_data.assert_not_called()
++            self.assertTrue(stock_dir.exists())
++
++    def test_review_force_reset_stale_target_skips_mock_and_central_delete(self):
++        with TemporaryDirectory() as temp:
++            stock_dir = self._make_review_stock(Path(temp))
++            other_dir = Path(temp) / "stocks" / "222222_Other"
++            other_dir.mkdir()
++            first = {"status": stock_window.STOCK_RESET_INITIALIZABLE,
++                     "reason": "", "stock_dir": stock_dir}
++            changed = {**first, "stock_dir": other_dir}
++            with (
++                patch.object(review_window, "collect_global_review_required_rows", return_value=[self._row(stock_dir)]),
++                patch.object(stock_window, "force_stock_reset_preflight", side_effect=[first, changed]),
++                patch.object(stock_window, "confirm_force_stock_reset", return_value=True),
++                patch.object(stock_window, "delete_stock_project_data") as delete_data,
++                patch.object(review_window, "append_production_event"),
++                patch.object(review_window, "show_toast"),
++            ):
++                window = review_window.GlobalReviewRequiredWindow()
++                self.addCleanup(window.close)
++                window.table.selectRow(0)
++                window.delete_selected_review_items()
++            self.mock_actions.force_unregister_for_stock_reset.assert_not_called()
++            delete_data.assert_not_called()
++            self.assertTrue(stock_dir.exists())
++            self.assertTrue(other_dir.exists())
+ 
+     def test_review_force_reset_records_preflight_block(self):
+         with TemporaryDirectory() as temp:

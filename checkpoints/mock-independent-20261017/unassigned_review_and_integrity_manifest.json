@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "kind": "PATCH_ONLY_NON_EXECUTABLE",
+  "base_working_HEAD": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "recovery_branch_parent": "17f1a5f48dfa4e4cad8d08fa4d7b8000d36fc42a",
+  "git_branch": "feat/restore-auto-trade-setting-ui",
+  "depends_on_protected_WIP": true,
+  "live_GUI_and_Broker_verified": false,
+  "tested_with": "native Python3.11-32 offscreen unittest: 124 PASS",
+  "real_3_stocks_not_modified": [
+    "063440",
+    "130500",
+    "520099"
+  ],
+  "missing_state_stock_not_mutated": "0162Z0",
+  "safe_limits": "Startup mismatch reported/blocked only; no automatic Review state writing without live owner evidence; no real order and no deletion.",
+  "patch_sha256": "f55cf08e1adc472b40bc4f048a3348710d707ce543375d2cd1c6ee5dd8e19b69",
+  "patch_size": 34775,
+  "files": [
+    {
+      "path": "assignment_authorization_service.py",
+      "preimage_normalized_sha256": "1c5e16ee94c5b040ab6667437d2f774c7fbe43c5730009f6adb4fced986685c5",
+      "postimage_normalized_sha256": "d6830dd32d2aab048f634bdc1742e2792d4c6621eb684cfd9ee9f1c673e695e8",
+      "postimage_raw_sha256": "d6830dd32d2aab048f634bdc1742e2792d4c6621eb684cfd9ee9f1c673e695e8",
+      "added_lines": 39,
+      "removed_lines": 7,
+      "source": "working HEAD"
+    },
+    {
+      "path": "assignment_startup_reconciliation_service.py",
+      "preimage_normalized_sha256": "a3d3736d250a2b47fc73b12a460242d6ad2b089e9edf36466ded022e0485893a",
+      "postimage_normalized_sha256": "2bed8ae54fd0127723b8f0482fe9931810c1c96523775ebe8584a3a7011ccd44",
+      "postimage_raw_sha256": "2bed8ae54fd0127723b8f0482fe9931810c1c96523775ebe8584a3a7011ccd44",
+      "added_lines": 109,
+      "removed_lines": 4,
+      "source": "working HEAD"
+    },
+    {
+      "path": "gui_review_required_window.py",
+      "preimage_normalized_sha256": "abd0b3cdca40ce63ae8312258df327cf309c20ca6e2512abc0ef34efa8d481c4",
+      "postimage_normalized_sha256": "c8033ebd2ef8ff204a2885f040a0178d1f4855bfdb5af638502e48c3a197991f",
+      "postimage_raw_sha256": "c8033ebd2ef8ff204a2885f040a0178d1f4855bfdb5af638502e48c3a197991f",
+      "added_lines": 33,
+      "removed_lines": 0,
+      "source": "working HEAD"
+    },
+    {
+      "path": "gui_stock_register_window.py",
+      "preimage_normalized_sha256": "37d8ddd736c2fc37591b245da7deb41bad95b3e396a6efcad12756bbd69b5b1e",
+      "postimage_normalized_sha256": "769caa3dc83ade7d2240687c7f5c31daffcad78ffb93cf5e1dfa5a5844cdb524",
+      "postimage_raw_sha256": "d1015809f61c38852a6f190fb6d049105bb40b45caabb1573320bbe72cd298cf",
+      "added_lines": 20,
+      "removed_lines": 6,
+      "source": "prior recovery patch chain"
+    },
+    {
+      "path": "integrity_checker.py",
+      "preimage_normalized_sha256": "222bb788bee64daf577ede0d6850383db6a8ab03777d7f67e03f681d97d1b954",
+      "postimage_normalized_sha256": "78ea8a03ca989d42dda5c0c57c20445d882fe43b3a16c334cba86fc70d6db045",
+      "postimage_raw_sha256": "11fd741a517312ffb820acb911647f662a725fa8393c5087594de358c1571f78",
+      "added_lines": 17,
+      "removed_lines": 1,
+      "source": "working HEAD"
+    },
+    {
+      "path": "tests/test_assignment_startup_reconciliation.py",
+      "preimage_normalized_sha256": "d67813efc2dbbbb965f4c07e33e789461c66704030eba8678ffe55f461c909b4",
+      "postimage_normalized_sha256": "64fb88f7b07f78df88ecc6f36cd125174a0ed675697a697032a8ec35c5515b1e",
+      "postimage_raw_sha256": "64fb88f7b07f78df88ecc6f36cd125174a0ed675697a697032a8ec35c5515b1e",
+      "added_lines": 18,
+      "removed_lines": 0,
+      "source": "working HEAD"
+    },
+    {
+      "path": "tests/test_c5a_assignment_authorization.py",
+      "preimage_normalized_sha256": "4a2be1e707fe8d00afbc88b75d0faee01ffd377cc81c72d0c907e6bace7ac932",
+      "postimage_normalized_sha256": "3cff859687176fdc1a63c3306971ddfbfcf519f2dbe7dc281c9949d5e54edcaa",
+      "postimage_raw_sha256": "3cff859687176fdc1a63c3306971ddfbfcf519f2dbe7dc281c9949d5e54edcaa",
+      "added_lines": 84,
+      "removed_lines": 1,
+      "source": "working HEAD"
+    },
+    {
+      "path": "tests/test_integrity_check_focus.py",
+      "preimage_normalized_sha256": "36cb7ea7fbc5ae8f5df3436323e6a5adb758538076d2b49d3bcdb9ac73e6a902",
+      "postimage_normalized_sha256": "e7f566b3fdbd548fe631848797c37604d71917f609300870436a4153c91b8c42",
+      "postimage_raw_sha256": "8d4680ebe3d3c656504ce6a5edbccfa1551b77463628153afec8ef90b57ebad9",
+      "added_lines": 52,
+      "removed_lines": 0,
+      "source": "working HEAD"
+    },
+    {
+      "path": "tests/test_review_force_reset.py",
+      "preimage_normalized_sha256": "14a768cba29982c0a174431e945394e6d33bd8fd714827c7cd790ca6d28da438",
+      "postimage_normalized_sha256": "d3c9269087fb35d84995ca4614e2ea19a64e1b015a5fea64a24554eaba32ccf6",
+      "postimage_raw_sha256": "d3c9269087fb35d84995ca4614e2ea19a64e1b015a5fea64a24554eaba32ccf6",
+      "added_lines": 95,
+      "removed_lines": 0,
+      "source": "working HEAD"
+    }
+  ]
+}
