@@ -1,0 +1,148 @@
+{
+  "baseline_protected": "Existing 680 WIP entries; protected hunks excluded; actual working tree unchanged",
+  "branch": "recovery/auto-integrity-toast-review-20261018",
+  "checkpoint_type": "NONEXECUTABLE_TASK_ONLY_DELTA_PATCH",
+  "date_kst": "2026-10-18T07:17:48+09:00",
+  "excluded_test_hunk_warning": "tests/test_integrity_check_focus.py old hunk 800 is mixed with preexisting protected tests; excluded rather than staging unrelated WIP. Full runnable tests live in current WIP.",
+  "files": {
+    "gui_review_required_window.py": {
+      "excluded_protected_hunks": [
+        {
+          "old_line": 2247,
+          "sha256": "6eb8b856019533d0d37e4c0f6a79d4e858343797982d449840d29a438c791923"
+        }
+      ],
+      "included_old_line_hunks": [
+        973
+      ],
+      "selected_hunk_count": 1,
+      "selected_patch_sha256": "515ae6b29f5a43a73a8a76a72480669fb2aa9567d8b3feac359a4eec105324e8",
+      "working_file_sha256": "bd75ff407b317645e96b02dc11adf7f83bb170a7154bd87fe08fa16e9a9e61b9"
+    },
+    "gui_stock_register_window.py": {
+      "excluded_protected_hunks": [
+        {
+          "old_line": 1338,
+          "sha256": "965835932106897b6f25842f39087ac6a7d53e79a21e68084beaac08a1075e9d"
+        },
+        {
+          "old_line": 1343,
+          "sha256": "94f998bfb98e9e9d0b4fab92cc3111e68f34fa4d8131e4f701e5a657b1acfb95"
+        },
+        {
+          "old_line": 1928,
+          "sha256": "3bdacd5cedd6df885047a4c3ffe55efe14c16662802e702d13fdb90015edf8a9"
+        },
+        {
+          "old_line": 1964,
+          "sha256": "a86bf6cdfd38ffa3102475f21cab91743a9772f04355476fc0e44335a0c0b6c0"
+        },
+        {
+          "old_line": 2522,
+          "sha256": "f0017eed0bda3af1e418c120c43f6ccfc70f0a2845b9cc8bfdfd97887ca6e0a6"
+        },
+        {
+          "old_line": 2532,
+          "sha256": "873bce7dff7c44c8ef8413eb6810532153e38fd4e8cecb00fc59b915ee9de848"
+        },
+        {
+          "old_line": 2544,
+          "sha256": "d36fb598f5ccd7905b11e0d5260e090add082aefe2203ffded80f1f3aa65904d"
+        },
+        {
+          "old_line": 2553,
+          "sha256": "97cf0144a11cd92ed912382bf8f6f963bda4a6730d4acc49e6d1ea6d6661c484"
+        }
+      ],
+      "included_old_line_hunks": [
+        1357,
+        1768,
+        1862,
+        1913,
+        1916,
+        1945,
+        1948,
+        1956,
+        1967,
+        1969,
+        1976,
+        1991
+      ],
+      "selected_hunk_count": 12,
+      "selected_patch_sha256": "25058608b9a246b08cd15ec4d524a2f27c6cb884119c4a19c94f8c8db1a18e54",
+      "working_file_sha256": "5ebd9ac68ce5e07a9ff0166b967d8e50328f095e24706a4d6852115516722665"
+    },
+    "tests/test_integrity_check_focus.py": {
+      "excluded_protected_hunks": [
+        {
+          "old_line": 10,
+          "sha256": "3edbedfcd4fcea0686f8cd510323d06c1c06602b9413405cd8dfd476d598ce83"
+        },
+        {
+          "old_line": 11,
+          "sha256": "a1a96ab1a443686c19a5f9a08e93342a6122433fdb439c6c25a76426969cfdc5"
+        },
+        {
+          "old_line": 382,
+          "sha256": "3d820fc9fefc1347fddf75392a9741a2dbf0b732b6f5b7c534add86be7004fbf"
+        },
+        {
+          "old_line": 539,
+          "sha256": "c5b46bb73e1f681392e317bce03afad99e1c270c2880b08531392c3c2ef5ef33"
+        },
+        {
+          "old_line": 800,
+          "sha256": "ef383bd5244d62184dabe4469e6dfea9f0ea4f820c1a44dca39e6f689341b75c"
+        }
+      ],
+      "included_old_line_hunks": [
+        699,
+        713,
+        723,
+        727,
+        737,
+        743,
+        757,
+        763,
+        775,
+        835,
+        886,
+        903,
+        916,
+        935
+      ],
+      "selected_hunk_count": 14,
+      "selected_patch_sha256": "480219de9b05026d82d458ddb5591e82cb760562da4651a3c825c2b8bf883f25",
+      "working_file_sha256": "3575c9d623de6f35fad294ce694c4c402fc34d0cdc42bcf9f6d09da692db09cd"
+    },
+    "tests/test_review_required_transition_time.py": {
+      "excluded_protected_hunks": [],
+      "included_old_line_hunks": [
+        538,
+        545,
+        564,
+        592
+      ],
+      "selected_hunk_count": 4,
+      "selected_patch_sha256": "e9c3b791c6d19b5159cb15e7d2616eb89f1f4624cc69685f6445619d7b82a7f5",
+      "working_file_sha256": "454b3b39cc2ad38c7aa624f7d1ab2b684e93a7f3f1f7c8bca7836e2c67964b20"
+    }
+  },
+  "not_executable_reason": "Task-only hunks depend on protected uncommitted WIP; applying directly to HEAD yielded SyntaxError at gui_stock_register_window.py:1774.",
+  "parent": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "parent_branch": "feat/restore-auto-trade-setting-ui",
+  "patch_file": "auto-integrity-toast-review-20261018.patch",
+  "patch_files": 4,
+  "patch_hunks": 31,
+  "patch_sha256": "bc107901c8f6064a73b6005bcbd268a3a422fd197974088978bd52d086609b8d",
+  "reverse_patch_against_current_worktree": "PASS",
+  "scope": "2026-10-18 automatic integrity entry summary and automatic Review collection, no manual integrity/review designation",
+  "standalone_executable": false,
+  "verification": {
+    "actual_GUI": "NOT VERIFIED",
+    "codex_exit": 0,
+    "native_actual_data_read_only_0162Z0": "Review unresolved, return BLOCKED",
+    "native_offscreen_unittest": "140 PASS",
+    "real_broker_orders": 0
+  }
+}
