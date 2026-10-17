@@ -1,0 +1,33 @@
+{
+  "kind": "PATCH_ONLY_INCREMENTAL_NONEXECUTABLE",
+  "depends_on_existing_task_patch": true,
+  "base_recovery_commit": "89e7891f79f5fa3aa927f40211ab3d754f0ab721",
+  "source_head": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "files": [
+    {
+      "file": "gui_stock_register_window.py",
+      "preimage_raw_sha256": "9d27310e3dc2c3ddcd46b50e42ec18d99fae2ac1db5d506aec86f1c8fea63915",
+      "postimage_raw_sha256": "5d3bbd299cf56729a56b0e3b93db364c39fb3b25b04d3c1b8ed294cb5adad2d8",
+      "preimage_normalized_sha256": "d4a0e766c3caca99ec2e3a3c5c232c51adb6f5b37df2eba362334ad7417160b4",
+      "postimage_normalized_sha256": "77c6b089a624452a1e08254e32a1b69d312e071cb2f46cf1b20799416350f304",
+      "added_lines": 11,
+      "removed_lines": 2
+    },
+    {
+      "file": "tests/test_auto_trade_setting_routine_tree.py",
+      "preimage_raw_sha256": "3fb96e21f11e9864566e4a69010229dd4ad46b5962e728db867b72206afb0d77",
+      "postimage_raw_sha256": "71f786593e7f1bc66f5e66059254e4e64fe0bd0f54948ebede23ec0027745687",
+      "preimage_normalized_sha256": "b441f82e6f161d75f76a0791a496d4787d56186c88a024f4e2db4e44e6d85bfc",
+      "postimage_normalized_sha256": "ac5ad429d06357818ca00852452c78cf5fb17b3ea231b6c9817db393046adc72",
+      "added_lines": 16,
+      "removed_lines": 1
+    }
+  ],
+  "patch_sha256": "4cdb87395f9cee63a1e2141d25be369bf41c4b3a5d06f3d93c77620ea7c78fba",
+  "patch_bytes": 4119,
+  "tests": "4 focused native Python 3.11-32 stock-reset Mock tests PASS; GUI is not live verified",
+  "visual_labels": [
+    "\\uB124",
+    "\\uC544\\uB2C8\\uC624"
+  ]
+}
