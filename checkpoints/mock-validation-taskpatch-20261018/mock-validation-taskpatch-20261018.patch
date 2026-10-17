@@ -1,0 +1,1460 @@
+diff --git a/gui_main_table_loader.py b/gui_main_table_loader.py
+index 530c2ee..42fda31 100644
+--- a/gui_main_table_loader.py
++++ b/gui_main_table_loader.py
+@@ -2528,0 +2529 @@ def _load_mock_routine_table(window) -> None:
++    mock_trades: dict[str, object] = {}
+@@ -2533,0 +2535,2 @@ def _load_mock_routine_table(window) -> None:
++                if trade is not None:
++                    mock_trades[stock_code] = trade
+@@ -2606,0 +2610,16 @@ def _load_mock_routine_table(window) -> None:
++        mock_trade = mock_trades.get(code)
++        stock_state = (
++            {
++                field: getattr(mock_trade, field, None)
++                for field in (
++                    "open_price",
++                    "high_price",
++                    "low_price",
++                    "change_rate",
++                    "previous_day_volume_rate",
++                    "execution_strength",
++                )
++            }
++            if mock_trade is not None
++            else {}
++        )
+@@ -2613 +2632 @@ def _load_mock_routine_table(window) -> None:
+-            "stock_state": {},
++            "stock_state": stock_state,
+diff --git a/gui_stock_register_window.py b/gui_stock_register_window.py
+index 7dd1e2a..70b84de 100644
+--- a/gui_stock_register_window.py
++++ b/gui_stock_register_window.py
+@@ -1338,0 +1339,2 @@ class StockRegisterWindow(QDialog):
++        mock_validation_host=None,
++        mock_validation_actions=None,
+@@ -1343,0 +1346,2 @@ class StockRegisterWindow(QDialog):
++        self._mock_validation_host = mock_validation_host
++        self._mock_validation_actions = mock_validation_actions
+@@ -2522,0 +2541,3 @@ class StockRegisterWindow(QDialog):
++        if active_routine_for_stock(code, name):
++            show_toast(self, "연결된 루틴을 먼저 해제하세요.")
++            return
+@@ -2532,0 +2554,26 @@ class StockRegisterWindow(QDialog):
++        mock_session_id = ""
++        mock_host = getattr(self, "_mock_validation_host", None)
++        if mock_host is not None:
++            try:
++                mock_repository = mock_host.repository
++                mock_session_id = mock_repository.current_session_id(code)
++                if mock_session_id:
++                    document = mock_repository.read_session(mock_session_id)
++                    if document["session"]["stock_code"] != code:
++                        raise RuntimeError("MOCK_STOCK_RESET_IDENTITY_MISMATCH")
++            except Exception:
++                show_toast(self, "모의 종목 상태 확인 실패")
++                return
++        if mock_session_id:
++            decision = QMessageBox(self)
++            decision.setIcon(QMessageBox.Warning)
++            decision.setWindowTitle("⚠ 종목초기화 확인")
++            decision.setText(_stock_reset_confirmation_text([(f"\uBAA8\uC758\uAC80\uC99D/{code}", name)]))
++            decision.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
++            decision.button(QMessageBox.Yes).setText("\uB124")
++            decision.button(QMessageBox.No).setText("\uC544\uB2C8\uC624")
++            decision.setDefaultButton(QMessageBox.No)
++            decision.setEscapeButton(QMessageBox.No)
++            if decision.exec_() != QMessageBox.Yes:
++                return
++
+@@ -2544,0 +2592,3 @@ class StockRegisterWindow(QDialog):
++        if active_routine_for_stock(code, name):
++            show_toast(self, "연결된 루틴을 먼저 해제하세요.")
++            return
+@@ -2553,0 +2604,16 @@ class StockRegisterWindow(QDialog):
++        if mock_session_id:
++            actions = getattr(self, "_mock_validation_actions", None)
++            if actions is None:
++                show_toast(self, "모의 종목 초기화 경로 없음")
++                return
++            try:
++                mock_result = actions.force_unregister_for_stock_reset(
++                    code, expected_validation_session_id=mock_session_id
++                )
++                if not isinstance(mock_result, dict) or mock_result.get("ok") is not True:
++                    raise RuntimeError("MOCK_STOCK_PURGE_NOT_VERIFIED")
++            except Exception:
++                LOGGER.exception("Mock purge blocked central stock reset: %s", code)
++                show_toast(self, "모의 데이터 삭제 실패: 종목 초기화 중단")
++                return
++
+diff --git a/gui_windows.py b/gui_windows.py
+index 790948b..a59a9f4 100644
+--- a/gui_windows.py
++++ b/gui_windows.py
+@@ -13482,0 +13616,2 @@ class MainWindow(QMainWindow):
++            mock_validation_host=self.mock_validation_host,
++            mock_validation_actions=self.mock_validation_ui_actions,
+diff --git a/kiwoom_api.py b/kiwoom_api.py
+index 642189a..f765cc8 100644
+--- a/kiwoom_api.py
++++ b/kiwoom_api.py
+@@ -194,0 +234 @@ class MockOrderbookRegistrationSnapshot:
++    registration_id: str = ""
+@@ -449,0 +490 @@ class KiwoomApi(QObject):
++    mock_execution_tick_received = pyqtSignal(object)
+@@ -1048,0 +1090,4 @@ class KiwoomApi(QObject):
++        if "_mock_execution_receive_sequence" not in state:
++            self._mock_execution_receive_sequence = 0
++        if "_mock_registration_generation" not in state:
++            self._mock_registration_generation = 0
+@@ -1470 +1515 @@ class KiwoomApi(QObject):
+-            and current.fid_list == tuple(REALTIME_ORDERBOOK_FIDS)
++            and current.fid_list == tuple(dict.fromkeys((*REALTIME_ORDERBOOK_FIDS, *REALTIME_SHADOW_FIDS)))
+@@ -1506 +1551,2 @@ class KiwoomApi(QObject):
+-        fid_text = ";".join(str(fid) for fid in REALTIME_ORDERBOOK_FIDS)
++        mock_fids = tuple(dict.fromkeys((*REALTIME_ORDERBOOK_FIDS, *REALTIME_SHADOW_FIDS)))
++        fid_text = ";".join(str(fid) for fid in mock_fids)
+@@ -1550,0 +1597 @@ class KiwoomApi(QObject):
++        self._mock_registration_generation += 1
+@@ -1556 +1603 @@ class KiwoomApi(QObject):
+-            fid_list=tuple(REALTIME_ORDERBOOK_FIDS),
++            fid_list=mock_fids,
+@@ -1558,0 +1606 @@ class KiwoomApi(QObject):
++            registration_id=f"{session.connection_epoch}:{self._mock_registration_generation}",
+@@ -4069 +4243,0 @@ class KiwoomApi(QObject):
+-        self._ensure_realtime_shadow_state()
+@@ -4072,6 +4246,8 @@ class KiwoomApi(QObject):
+-        self._observe_realtime_boundary(
+-            "REAL_CALLBACK_RECEIVED",
+-            stock_code,
+-            channel=real_type,
+-            real_type=real_type,
+-        )
++        if real_type not in {REALTIME_EXECUTION_TYPE, REALTIME_ORDERBOOK_TYPE}:
++            self._ensure_realtime_shadow_state()
++            self._observe_realtime_boundary(
++                "REAL_CALLBACK_RECEIVED",
++                stock_code,
++                channel=real_type,
++                real_type=real_type,
++            )
+@@ -4084 +4260,3 @@ class KiwoomApi(QObject):
+-        registration = self._realtime_shadow_registration
++        registration = getattr(self, "_realtime_shadow_registration", None)
++        if registration is None:
++            registration = self._empty_realtime_shadow_snapshot()
+@@ -4094,9 +4272,18 @@ class KiwoomApi(QObject):
+-        if not registration.active:
+-            self._observe_realtime_boundary(
+-                "REGISTRATION_IDENTITY_REJECTED",
+-                stock_code,
+-                reason="REGISTRATION_INACTIVE",
+-                channel=real_type,
+-            )
+-            return
+-        if stock_code not in registration.target_stock_codes:
++        self._ensure_mock_orderbook_state()
++        mock_registration = self._mock_orderbook_registration
++        session = self.broker_session_snapshot()
++        production_target = bool(
++            registration.active
++            and stock_code in registration.target_stock_codes
++            and session.connected
++            and session.connection_epoch == registration.connection_epoch
++            and session.login_session_id == registration.login_session_id
++        )
++        mock_target = bool(
++            mock_registration.active
++            and stock_code in mock_registration.target_stock_codes
++            and session.connected
++            and session.connection_epoch == mock_registration.connection_epoch
++            and session.login_session_id == mock_registration.login_session_id
++        )
++        if not production_target and not mock_target:
+@@ -4106 +4293 @@ class KiwoomApi(QObject):
+-                reason="STOCK_NOT_EXPECTED",
++                reason="STOCK_OR_SESSION_NOT_EXPECTED",
+@@ -4110,6 +4297 @@ class KiwoomApi(QObject):
+-        session = self.broker_session_snapshot()
+-        if (
+-            not session.connected
+-            or session.connection_epoch != registration.connection_epoch
+-            or session.login_session_id != registration.login_session_id
+-        ):
++        if production_target:
+@@ -4117,4 +4299,2 @@ class KiwoomApi(QObject):
+-                "REGISTRATION_IDENTITY_REJECTED",
+-                stock_code,
+-                reason="SESSION_IDENTITY_MISMATCH",
+-                channel=real_type,
++                "REAL_CALLBACK_RECEIVED", stock_code,
++                channel=real_type, real_type=real_type,
+@@ -4122 +4301,0 @@ class KiwoomApi(QObject):
+-            return
+@@ -4132 +4311 @@ class KiwoomApi(QObject):
+-            tick = normalize_realtime_shadow_tick(
++            tick_args = dict(
+@@ -4149 +4327,0 @@ class KiwoomApi(QObject):
+-                receive_sequence=self._next_realtime_receive_sequence(),
+@@ -4151,0 +4330,8 @@ class KiwoomApi(QObject):
++            tick = normalize_realtime_shadow_tick(
++                **tick_args,
++                receive_sequence=(
++                    self._next_realtime_receive_sequence()
++                    if production_target
++                    else self._mock_execution_receive_sequence + 1
++                ),
++            )
+@@ -4152,0 +4339,7 @@ class KiwoomApi(QObject):
++                if production_target:
++                    self._observe_realtime_boundary(
++                        "RAW_TICK_REJECTED", stock_code,
++                        reason="PAYLOAD_UNAVAILABLE", channel=real_type,
++                    )
++                return
++            if production_target:
+@@ -4154,3 +4347 @@ class KiwoomApi(QObject):
+-                    "RAW_TICK_REJECTED",
+-                    stock_code,
+-                    reason="PAYLOAD_UNAVAILABLE",
++                    "RAW_TICK_ACCEPTED", stock_code,
+@@ -4157,0 +4349,3 @@ class KiwoomApi(QObject):
++                    current_price=tick.current_price,
++                    market_datetime=tick.market_datetime,
++                    receive_sequence=tick.receive_sequence,
+@@ -4159,14 +4353,12 @@ class KiwoomApi(QObject):
+-                return
+-            self._observe_realtime_boundary(
+-                "RAW_TICK_ACCEPTED",
+-                stock_code,
+-                channel=real_type,
+-                current_price=tick.current_price,
+-                market_datetime=tick.market_datetime,
+-                receive_sequence=tick.receive_sequence,
+-            )
+-            self.realtime_shadow_tick_received.emit(tick.to_payload())
+-            if stock_code in self._registration_shadow_targets(registration):
+-                _status, completed = self._realtime_shadow_builder.accept_tick(tick)
+-                if completed is not None:
+-                    self.realtime_shadow_bar_completed.emit(completed.to_payload())
++            if production_target:
++                self.realtime_shadow_tick_received.emit(tick.to_payload())
++                if stock_code in self._registration_shadow_targets(registration):
++                    _status, completed = self._realtime_shadow_builder.accept_tick(tick)
++                    if completed is not None:
++                        self.realtime_shadow_bar_completed.emit(completed.to_payload())
++            if mock_target:
++                self._mock_execution_receive_sequence += 1
++                self.mock_execution_tick_received.emit({
++                    **replace(tick, receive_sequence=self._mock_execution_receive_sequence).to_payload(),
++                    "mock_registration_id": mock_registration.registration_id,
++                })
+@@ -4174,20 +4366,16 @@ class KiwoomApi(QObject):
+-            self._observe_realtime_boundary(
+-                "RAW_TICK_REJECTED",
+-                stock_code,
+-                reason="PAYLOAD_UNAVAILABLE",
+-                channel=real_type,
+-                exception_type=type(exc).__name__,
+-            )
+-            observe_production_exception(
+-                type(exc),
+-                exc,
+-                exc.__traceback__,
+-                component="realtime_shadow",
+-                operation="receive_realtime_tick",
+-                source="kiwoom_api.KiwoomApi._on_receive_real_data",
+-                target_type="MARKET_DATA",
+-                target_id=stock_code,
+-                target_name=stock_code,
+-                reason_code="REALTIME_SHADOW_TICK_FAILED",
+-                failure_scope=f"realtime_shadow_tick:{stock_code}",
+-            )
++            if production_target:
++                self._observe_realtime_boundary(
++                    "RAW_TICK_REJECTED", stock_code,
++                    reason="PAYLOAD_UNAVAILABLE", channel=real_type,
++                    exception_type=type(exc).__name__,
++                )
++                observe_production_exception(
++                    type(exc), exc, exc.__traceback__,
++                    component="realtime_shadow",
++                    operation="receive_realtime_tick",
++                    source="kiwoom_api.KiwoomApi._on_receive_real_data",
++                    target_type="MARKET_DATA", target_id=stock_code,
++                    target_name=stock_code,
++                    reason_code="REALTIME_SHADOW_TICK_FAILED",
++                    failure_scope=f"realtime_shadow_tick:{stock_code}",
++                )
+@@ -4276,0 +4465 @@ class KiwoomApi(QObject):
++                registration_id=registration.registration_id,
+diff --git a/mock_validation_candle_provider.py b/mock_validation_candle_provider.py
+index 990a367..d86237e 100644
+--- a/mock_validation_candle_provider.py
++++ b/mock_validation_candle_provider.py
+@@ -6 +6 @@ from __future__ import annotations
+-from datetime import datetime
++from datetime import datetime, timedelta
+@@ -10 +10 @@ from typing import Any, Callable
+-from candle_manager import canonical_candle_content_hash, load_candles
++from candle_manager import DEFAULT_CANDLES_MAX_COUNT, canonical_candle_content_hash
+@@ -13 +13,2 @@ from candle_timeframe_aggregation import (
+-    project_candle_supply,
++    candle_market_datetime,
++    normalize_candle_sessions,
+@@ -15 +15,0 @@ from candle_timeframe_aggregation import (
+-    required_minute_candles,
+@@ -18 +18 @@ from candle_timeframe_aggregation import (
+-from stock_repository import StockRepository
++from kiwoom_candle_adapter import normalize_opt10080_rows
+@@ -45,0 +46,4 @@ def project_mock_routine_candles(
++    cache: dict[tuple[str, int], dict[str, Any]] | None = None,
++    pending: set[tuple[str, int]] | None = None,
++    identity_reader: Callable[[str], tuple[str, int, str, str]] | None = None,
++    latest_trade: Any = None,
+@@ -47 +51 @@ def project_mock_routine_candles(
+-    """Project Mock candles without mutating Production market-data state."""
++    """Read direct source-timeframe bars through Mock-owned read-only TRs."""
+@@ -49 +53 @@ def project_mock_routine_candles(
+-    del consumer_scope
++    del project_root, consumer_scope
+@@ -64 +67,0 @@ def project_mock_routine_candles(
+-    projection = request["projection"]
+@@ -67,4 +69,0 @@ def project_mock_routine_candles(
+-        warmup = required_minute_candles(
+-            interval,
+-            request.get("warmup_bars", 1),
+-        )
+@@ -80 +79 @@ def project_mock_routine_candles(
+-    base = {
++    base: dict[str, Any] = {
+@@ -83,2 +82,2 @@ def project_mock_routine_candles(
+-        "projection": projection,
+-        **warmup,
++        "projection": request["projection"],
++        "direct_timeframe_source": True,
+@@ -86 +85,5 @@ def project_mock_routine_candles(
+-    if not warmup["within_limit"]:
++    windows = normalize_candle_sessions(session_windows)
++    if isinstance(session_windows, (list, tuple)) and session_windows and len(windows) != len(session_windows):
++        return {**base, "available": False, "candles": [], "availability_state": "SESSION_INVALID"}
++    reader = getattr(api, "request_minute_candles_read_only", None)
++    if not callable(reader) or not callable(identity_reader):
+@@ -91 +94 @@ def project_mock_routine_candles(
+-            "availability_state": "WARMUP_LIMIT_EXCEEDED",
++            "availability_state": "DIRECT_SOURCE_UNAVAILABLE",
+@@ -92,0 +96,21 @@ def project_mock_routine_candles(
++    cache = cache if cache is not None else {}
++    pending = pending if pending is not None else set()
++    key = (code, interval)
++    now = as_of or datetime.now(SEOUL_TIMEZONE)
++    if now.tzinfo is None:
++        now = now.replace(tzinfo=SEOUL_TIMEZONE)
++    now = now.astimezone(SEOUL_TIMEZONE)
++    try:
++        identity = identity_reader(code)
++    except Exception:
++        identity = ("", 0, "", "")
++    entry = cache.get(key, {})
++    if entry and entry.get("identity") != identity:
++        cache.pop(key, None)
++        pending.discard(key)
++        entry = {}
++    minute_key = now.strftime("%Y%m%d%H%M")
++    if key not in pending and entry.get("request_minute") != minute_key:
++        if identity[0] and identity[2]:
++            pending.add(key)
++            cache[key] = {**entry, "identity": identity, "request_minute": minute_key}
+@@ -94,7 +118,23 @@ def project_mock_routine_candles(
+-    repository = StockRepository(Path(project_root).resolve())
+-    raw = load_candles(repository.resolve_stock_dir(code))
+-    source_hash = canonical_candle_content_hash(raw) if raw else ""
+-    forming = None
+-    if projection == "FORMING_BASE_BAR":
+-        current_reader = getattr(api, "current_realtime_shadow_bar", None)
+-        forming = current_reader(code) if callable(current_reader) else None
++            def received(result: dict[str, Any]) -> None:
++                try:
++                    current_identity = identity_reader(code)
++                except Exception:
++                    return
++                if (current_identity != identity
++                    or cache.get(key, {}).get("request_minute") != minute_key):
++                    return
++                pending.discard(key)
++                if (
++                    not isinstance(result, dict)
++                    or result.get("ok") is not True
++                    or result.get("code") != code
++                    or result.get("market_data_identity", code) != code
++                    or result.get("interval") != interval
++                    or result.get("market_source") != "KRX"
++                ):
++                    return
++                cache[key] = {
++                    "identity": identity,
++                    "request_minute": minute_key,
++                    "rows": normalize_opt10080_rows(result.get("rows")),
++                }
+@@ -102,12 +142,58 @@ def project_mock_routine_candles(
+-    now = as_of or datetime.now(SEOUL_TIMEZONE)
+-    result = project_candle_supply(
+-        raw,
+-        rules,
+-        request,
+-        now=now,
+-        session_windows=session_windows,
+-        forming_minute=forming if isinstance(forming, dict) else None,
+-    )
+-    source_rows = list(raw)
+-    if isinstance(forming, dict):
+-        source_rows.append(dict(forming))
++            try:
++                response = reader(
++                    code, interval=interval,
++                    count=min(max(int(request.get("history_target_bars", request.get("warmup_bars", 1))) + 2, 3), DEFAULT_CANDLES_MAX_COUNT),
++                    callback=received,
++                )
++                if isinstance(response, dict) and response.get("ok") is False:
++                    pending.discard(key)
++            except Exception:
++                pending.discard(key)
++    raw = cache.get(key, {}).get("rows", ())
++    completed: list[dict[str, Any]] = []
++    forming: dict[str, Any] | None = None
++    for row in raw:
++        bar_time = candle_market_datetime(row)
++        if bar_time is None:
++            continue
++        minute_of_day = bar_time.hour * 60 + bar_time.minute
++        session = next(
++            (name for name, start, end in windows if start <= minute_of_day < end),
++            "" if windows else "regular",
++        )
++        if not session:
++            continue
++        bar = {
++            "bar_time": bar_time.isoformat(timespec="seconds"),
++            "open": row.get("open"), "high": row.get("high"),
++            "low": row.get("low"), "close": row.get("close"),
++            "volume": row.get("volume"), "timeframe_minutes": interval,
++            "trade_date": bar_time.date().isoformat(), "session": session,
++        }
++        if now >= bar_time + timedelta(minutes=interval) or (
++            now.date() == bar_time.date()
++            and now.hour * 60 + now.minute >= 930
++            and 540 <= bar_time.hour * 60 + bar_time.minute < 930
++        ):
++            completed.append({**bar, "is_complete": True})
++        elif bar_time <= now:
++            forming = {**bar, "is_complete": False}
++    target_count = int(request.get("history_target_bars", 0) or 0)
++    if target_count:
++        completed = completed[-target_count:]
++    if forming is not None and latest_trade is not None:
++        trade_time = candle_market_datetime({"time": getattr(latest_trade, "market_datetime", "")})
++        price = getattr(latest_trade, "current_price", None)
++        start = candle_market_datetime(forming)
++        if (start is not None and trade_time is not None
++            and start <= trade_time < start + timedelta(minutes=interval)
++            and isinstance(price, (int, float))
++            and isinstance(forming["high"], (int, float))
++            and isinstance(forming["low"], (int, float))):
++            forming["close"] = price
++            forming["high"] = max(forming["high"], price)
++            forming["low"] = min(forming["low"], price)
++    candles = completed + ([forming] if request["projection"] == "FORMING_BASE_BAR" and forming else [])
++    warmup = int(request.get("warmup_bars", 0) or 0)
++    forming_required = request["projection"] == "FORMING_BASE_BAR" and warmup > 0
++    available = len(completed) >= warmup and bool(candles) and (not forming_required or forming is not None)
+@@ -115,6 +201,5 @@ def project_mock_routine_candles(
+-        **result,
+-        "stock_code": code,
+-        "source_identity": (
+-            canonical_candle_content_hash(source_rows)
+-            if source_rows
+-            else source_hash
++        **base, "available": available,
++        "availability_state": (
++            "AVAILABLE" if available else
++            "FORMING_SOURCE_UNAVAILABLE" if forming_required and forming is None else
++            "DIRECT_TIMEFRAME_HISTORY_INSUFFICIENT"
+@@ -121,0 +207,3 @@ def project_mock_routine_candles(
++        "candles": candles if available else [],
++        "available_timeframe_bars": len(completed),
++        "source_identity": canonical_candle_content_hash(candles) if candles else "",
+diff --git a/mock_validation_host.py b/mock_validation_host.py
+index 7b219c2..13852db 100644
+--- a/mock_validation_host.py
++++ b/mock_validation_host.py
+@@ -169 +212,3 @@ class MockValidationHost:
+-        if is_production_market_data_callback(candles_provider):
++        self._mock_candle_cache: dict[tuple[str, int], dict[str, Any]] = {}
++        self._mock_candle_pending: set[tuple[str, int]] = set()
++        if candles_provider is None or is_production_market_data_callback(candles_provider):
+@@ -172,0 +218,4 @@ class MockValidationHost:
++                cache=self._mock_candle_cache,
++                pending=self._mock_candle_pending,
++                identity_reader=self._mock_candle_identity,
++                latest_trade=self.market_store.latest_trade(kwargs["stock_code"]),
+@@ -242,0 +293,23 @@ class MockValidationHost:
++    def _mock_candle_identity(self, stock_code: str) -> tuple[str, int, str, str]:
++        if self._disposed:
++            return "", 0, "", ""
++        reader = getattr(self.api, "broker_session_snapshot", None)
++        broker = reader() if callable(reader) else None
++        if broker is None or not getattr(broker, "connected", False):
++            return "", 0, "", ""
++        registration_reader = getattr(self.api, "mock_orderbook_registration_snapshot", None)
++        registration = registration_reader() if callable(registration_reader) else None
++        if (
++            not getattr(registration, "active", False)
++            or stock_code not in getattr(registration, "target_stock_codes", ())
++            or getattr(registration, "connection_epoch", None) != getattr(broker, "connection_epoch", None)
++            or getattr(registration, "login_session_id", None) != getattr(broker, "login_session_id", None)
++        ):
++            return "", 0, "", ""
++        return (
++            self.repository.current_session_id(stock_code),
++            int(getattr(broker, "connection_epoch", 0) or 0),
++            str(getattr(broker, "login_session_id", "") or ""),
++            str(getattr(registration, "registration_id", "") or ""),
++        )
++
+@@ -298,0 +372,6 @@ class MockValidationHost:
++        trade_signal = (
++            "mock_execution_tick_received"
++            if getattr(self.api, "mock_execution_tick_received", None) is not None
++            else "realtime_shadow_tick_received"
++        )
++        self._trade_signal_name = trade_signal
+@@ -301 +380 @@ class MockValidationHost:
+-            ("realtime_shadow_tick_received", self.accept_trade),
++            (trade_signal, self.accept_trade),
+@@ -316 +395 @@ class MockValidationHost:
+-                ("realtime_shadow_tick_received", self.accept_trade),
++                (getattr(self, "_trade_signal_name", "realtime_shadow_tick_received"), self.accept_trade),
+@@ -339,0 +419,2 @@ class MockValidationHost:
++        self._mock_candle_cache.clear()
++        self._mock_candle_pending.clear()
+@@ -361,0 +443,2 @@ class MockValidationHost:
++        self._mock_candle_cache.clear()
++        self._mock_candle_pending.clear()
+@@ -394,0 +478,21 @@ class MockValidationHost:
++    def forget_stock(self, stock_code: str, *, session_ids: tuple[str, ...] = ()) -> None:
++        code = normalized_stock_code(stock_code)
++        self._restart_recovery_blocked_session_ids = frozenset(
++            value for value in self._restart_recovery_blocked_session_ids
++            if value not in session_ids
++        )
++        for key in tuple(self._mock_candle_cache):
++            if key[0] == code:
++                self._mock_candle_cache.pop(key, None)
++        for key in tuple(self._mock_candle_pending):
++            if key[0] == code:
++                self._mock_candle_pending.discard(key)
++        self.market_store.forget_stock(code)
++        self._buffers.pop(code, None)
++        self._arrival_by_stock.pop(code, None)
++        self._last_processed_arrival.pop(code, None)
++        self._integrity_errors.pop(code, None)
++        for key in tuple(self._last_received):
++            if key[0] == code:
++                self._last_received.pop(key, None)
++
+@@ -541,0 +646,8 @@ class MockValidationHost:
++        if snapshot.registration_id:
++            snapshot_reader = getattr(self.api, "mock_orderbook_registration_snapshot", None)
++            registration = snapshot_reader() if callable(snapshot_reader) else None
++            if (
++                not getattr(registration, "active", False)
++                or getattr(registration, "registration_id", "") != snapshot.registration_id
++            ):
++                return False
+@@ -565,0 +678,9 @@ class MockValidationHost:
++        registration_id = str(payload.get("mock_registration_id") or "")
++        if registration_id:
++            snapshot_reader = getattr(self.api, "mock_orderbook_registration_snapshot", None)
++            snapshot = snapshot_reader() if callable(snapshot_reader) else None
++            if (
++                not getattr(snapshot, "active", False)
++                or getattr(snapshot, "registration_id", "") != registration_id
++            ):
++                return False
+diff --git a/mock_validation_market_data.py b/mock_validation_market_data.py
+index 796e1c4..0bed8ea 100644
+--- a/mock_validation_market_data.py
++++ b/mock_validation_market_data.py
+@@ -107,0 +108 @@ class MockOrderbookSnapshot:
++    registration_id: str = ""
+@@ -127,0 +129,6 @@ class MockTradeSnapshot:
++    open_price: int | float | None = None
++    high_price: int | float | None = None
++    low_price: int | float | None = None
++    change_rate: int | float | None = None
++    previous_day_volume_rate: int | float | None = None
++    execution_strength: int | float | None = None
+@@ -154,0 +162 @@ def normalize_mock_orderbook_snapshot(
++    registration_id: str = "",
+@@ -234,0 +243 @@ def normalize_mock_orderbook_snapshot(
++        registration_id=str(registration_id or ""),
+@@ -283,0 +293,6 @@ def normalize_mock_trade_snapshot(payload: Mapping[str, Any]) -> MockTradeSnapsh
++        open_price=_price(payload.get("open_price")),
++        high_price=_price(payload.get("high_price")),
++        low_price=_price(payload.get("low_price")),
++        change_rate=_number(payload.get("change_rate")),
++        previous_day_volume_rate=_number(payload.get("previous_day_volume_rate")),
++        execution_strength=_number(payload.get("execution_strength")),
+@@ -349,0 +365,5 @@ class MockValidationMarketDataStore:
++    def forget_stock(self, stock_code: str) -> None:
++        code = normalized_stock_code(stock_code)
++        self._orderbooks.pop(code, None)
++        self._trades.pop(code, None)
++
+diff --git a/mock_validation_repository.py b/mock_validation_repository.py
+index 411bfab..4c06eb4 100644
+--- a/mock_validation_repository.py
++++ b/mock_validation_repository.py
+@@ -577,0 +628,53 @@ class MockValidationRepository:
++    def purge_stock_lifecycles(
++        self, stock_code: str, *, expected_current_session_id: str
++    ) -> dict[str, Any]:
++        """Purge every Mock lifecycle for one stock, regardless of its state."""
++        code = normalized_stock_code(stock_code)
++        with self._lock:
++            if self.current_session_id(code) != expected_current_session_id:
++                raise MockValidationError("MOCK_PURGE_CURRENT_IDENTITY_STALE")
++            session_ids: set[str] = set()
++            for path in self._target("runtime/sessions").glob("*.json"):
++                document = self.read_session(path.stem)
++                if document["session"]["stock_code"] == code:
++                    session_ids.add(path.stem)
++            for path in self._target("history").glob("*.json"):
++                history = self.read_history(path.stem)
++                if history["session_document"]["session"]["stock_code"] == code:
++                    session_ids.add(path.stem)
++            for path in self._target("events").glob("*.json"):
++                if path.stem in session_ids:
++                    continue
++                event_codes = {
++                    normalized_stock_code(event.get("stock_code"))
++                    for event in self.read_events(path.stem)
++                }
++                if code in event_codes:
++                    if event_codes != {code}:
++                        raise MockValidationError("MOCK_PURGE_EVENT_STOCK_IDENTITY_MISMATCH")
++                    session_ids.add(path.stem)
++            if expected_current_session_id and expected_current_session_id not in session_ids:
++                raise MockValidationError("MOCK_PURGE_CURRENT_SESSION_MISSING")
++            for session_id in session_ids:
++                session_path = self._target(self._session_relative(session_id))
++                history_path = self._target(Path("history") / f"{session_id}.json")
++                if session_path.exists() and self.read_session(session_id)["session"]["stock_code"] != code:
++                    raise MockValidationError("MOCK_PURGE_STOCK_IDENTITY_MISMATCH")
++                if history_path.exists() and self.read_history(session_id)["session_document"]["session"]["stock_code"] != code:
++                    raise MockValidationError("MOCK_PURGE_HISTORY_IDENTITY_MISMATCH")
++                self.read_events(session_id)
++            removed: list[str] = []
++            self._write_current_index(code, None)
++            for session_id in sorted(session_ids):
++                for relative in (
++                    self._session_relative(session_id),
++                    Path("history") / f"{session_id}.json",
++                    Path("events") / f"{session_id}.json",
++                ):
++                    target = self._target(relative)
++                    if target.exists():
++                        target.unlink()
++                        removed.append(str(relative).replace("\\", "/"))
++            self._session_cache.cache_clear()
++            return {"stock_code": code, "session_ids": tuple(sorted(session_ids)), "removed": tuple(removed)}
++
+diff --git a/mock_validation_ui_actions.py b/mock_validation_ui_actions.py
+index 3fbf8a4..fd0e5ee 100644
+--- a/mock_validation_ui_actions.py
++++ b/mock_validation_ui_actions.py
+@@ -269,0 +270,6 @@ class MockValidationUIActions:
++        past_purge = self.repository.purge_stock_lifecycles(
++            stock_code, expected_current_session_id=""
++        )
++        self.host.forget_stock(
++            stock_code, session_ids=(session_id, *past_purge["session_ids"])
++        )
+@@ -278,0 +285,17 @@ class MockValidationUIActions:
++    def force_unregister_for_stock_reset(
++        self, stock_code: str, *, expected_validation_session_id: str
++    ) -> dict[str, Any]:
++        """Central stock reset only; ordinary Mock unregister retains its guards."""
++        current_id = self.repository.current_session_id(stock_code)
++        if not current_id or current_id != expected_validation_session_id:
++            raise MockValidationError("MOCK_CONTEXT_TARGET_STALE")
++        purged = self.repository.purge_stock_lifecycles(
++            stock_code, expected_current_session_id=current_id
++        )
++        self.host.forget_stock(stock_code, session_ids=purged["session_ids"])
++        registration = self.host.sync_registration()
++        if registration.get("ok") is not True and self.host.server_authenticated():
++            raise MockValidationError("MOCK_REGISTRATION_AFTER_PURGE_FAILED")
++        self.host._publish_projection_if_changed()
++        return {"ok": True, "purge": purged}
++
+diff --git a/tests/test_auto_trade_setting_routine_tree.py b/tests/test_auto_trade_setting_routine_tree.py
+index 0436240..7e1c8e5 100644
+--- a/tests/test_auto_trade_setting_routine_tree.py
++++ b/tests/test_auto_trade_setting_routine_tree.py
+@@ -8308,0 +8309,160 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
++    def test_stock_register_reset_mock_no_has_no_delete_or_purge(self) -> None:
++        import gui_stock_register_window as stock_register_window
++
++        with TemporaryDirectory() as tmpdir:
++            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
++            mock_host = MagicMock()
++            mock_host.repository.current_session_id.return_value = "MV-current"
++            mock_host.repository.read_session.return_value = {
++                "session": {"validation_session_id": "MV-current", "stock_code": "111111"}
++            }
++            mock_actions = MagicMock()
++            def reject_mock_reset(decision):
++                self.assertEqual("⚠ 종목초기화 확인", decision.windowTitle())
++                self.assertEqual(
++                    stock_register_window._stock_reset_confirmation_text(
++                        [("\uBAA8\uC758\uAC80\uC99D/111111", "대상")]
++                    ),
++                    decision.text(),
++                )
++                self.assertEqual(QMessageBox.Yes | QMessageBox.No, decision.standardButtons())
++                self.assertEqual("\uB124", decision.button(QMessageBox.Yes).text())
++                self.assertEqual("\uC544\uB2C8\uC624", decision.button(QMessageBox.No).text())
++                self.assertEqual(QMessageBox.No, decision.standardButton(decision.defaultButton()))
++                self.assertEqual(QMessageBox.No, decision.standardButton(decision.escapeButton()))
++                return QMessageBox.No
++            with (
++                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
++                patch.object(stock_register_window, "active_routine_for_stock", return_value=""),
++                patch.object(stock_register_window, "stock_reset_eligibility", return_value={
++                    "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
++                    "stock_dir": stock_dir,
++                }),
++                patch.object(stock_register_window.QMessageBox, "exec_", reject_mock_reset),
++                patch.object(stock_register_window, "confirm_stock_reset") as confirm,
++                patch.object(stock_register_window, "delete_stock_project_data") as delete,
++            ):
++                window = stock_register_window.StockRegisterWindow(
++                    mock_validation_host=mock_host, mock_validation_actions=mock_actions
++                )
++                self.addCleanup(window.close)
++                window.stock_table.setRowCount(1)
++                window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
++                window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
++                window.stock_table.selectRow(0)
++                window.delete_selected_stock()
++            self.assertTrue(stock_dir.exists())
++            confirm.assert_not_called()
++            delete.assert_not_called()
++            mock_actions.force_unregister_for_stock_reset.assert_not_called()
++            mock_host.repository.read_session.assert_called_once_with("MV-current")
++
++    def test_stock_register_reset_assigned_routine_blocks_before_mock_prompt(self) -> None:
++        import gui_stock_register_window as stock_register_window
++
++        mock_host = MagicMock()
++        mock_actions = MagicMock()
++        with (
++            patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
++            patch.object(stock_register_window, "active_routine_for_stock", return_value="Routine A"),
++            patch.object(stock_register_window, "stock_reset_eligibility") as eligibility,
++            patch.object(stock_register_window, "confirm_stock_reset") as confirm,
++            patch.object(stock_register_window, "show_toast"),
++        ):
++            window = stock_register_window.StockRegisterWindow(
++                mock_validation_host=mock_host, mock_validation_actions=mock_actions
++            )
++            self.addCleanup(window.close)
++            window.stock_table.setRowCount(1)
++            window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
++            window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
++            window.stock_table.selectRow(0)
++            window.delete_selected_stock()
++        eligibility.assert_not_called()
++        confirm.assert_not_called()
++        mock_host.repository.current_session_id.assert_not_called()
++        mock_actions.force_unregister_for_stock_reset.assert_not_called()
++
++    def test_stock_register_reset_mock_purge_error_preserves_central_stock(self) -> None:
++        import gui_stock_register_window as stock_register_window
++
++        with TemporaryDirectory() as tmpdir:
++            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
++            mock_host = MagicMock()
++            mock_host.repository.current_session_id.return_value = "MV-current"
++            mock_host.repository.read_session.return_value = {
++                "session": {"validation_session_id": "MV-current", "stock_code": "111111"}
++            }
++            mock_actions = MagicMock()
++            mock_actions.force_unregister_for_stock_reset.side_effect = RuntimeError("purge failed")
++            with (
++                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
++                patch.object(stock_register_window, "active_routine_for_stock", return_value=""),
++                patch.object(stock_register_window, "stock_reset_eligibility", return_value={
++                    "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
++                    "stock_dir": stock_dir,
++                }),
++                patch.object(stock_register_window.QMessageBox, "exec_", return_value=stock_register_window.QMessageBox.Yes),
++                patch.object(stock_register_window, "confirm_stock_reset", return_value=True),
++                patch.object(stock_register_window, "delete_stock_project_data") as delete,
++                patch.object(stock_register_window, "show_toast"),
++            ):
++                window = stock_register_window.StockRegisterWindow(
++                    mock_validation_host=mock_host, mock_validation_actions=mock_actions
++                )
++                self.addCleanup(window.close)
++                window.stock_table.setRowCount(1)
++                window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
++                window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
++                window.stock_table.selectRow(0)
++                window.delete_selected_stock()
++            self.assertTrue(stock_dir.exists())
++            delete.assert_not_called()
++            mock_actions.force_unregister_for_stock_reset.assert_called_once_with(
++                "111111", expected_validation_session_id="MV-current"
++            )
++
++    def test_stock_register_reset_mock_yes_purges_before_central_delete(self) -> None:
++        import gui_stock_register_window as stock_register_window
++
++        with TemporaryDirectory() as tmpdir:
++            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
++            mock_host = MagicMock()
++            mock_host.repository.current_session_id.return_value = "MV-current"
++            mock_host.repository.read_session.return_value = {
++                "session": {"validation_session_id": "MV-current", "stock_code": "111111"}
++            }
++            order = []
++            mock_actions = MagicMock()
++            def purge_before_delete(*_args, **_kwargs):
++                order.append("mock")
++                return {"ok": True}
++            mock_actions.force_unregister_for_stock_reset.side_effect = purge_before_delete
++            def delete_after_mock(*_args):
++                order.append("central")
++                return {"status": "DELETED"}
++            with (
++                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
++                patch.object(stock_register_window, "active_routine_for_stock", return_value=""),
++                patch.object(stock_register_window, "stock_reset_eligibility", return_value={
++                    "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
++                    "stock_dir": stock_dir,
++                }),
++                patch.object(stock_register_window.QMessageBox, "exec_", return_value=stock_register_window.QMessageBox.Yes),
++                patch.object(stock_register_window, "confirm_stock_reset", return_value=True),
++                patch.object(stock_register_window, "delete_stock_project_data", side_effect=delete_after_mock),
++                patch.object(stock_register_window, "sync_auto_trade_monitoring_universe"),
++                patch.object(stock_register_window, "refresh_auto_trade_views"),
++                patch.object(stock_register_window, "show_toast"),
++            ):
++                window = stock_register_window.StockRegisterWindow(
++                    mock_validation_host=mock_host, mock_validation_actions=mock_actions
++                )
++                self.addCleanup(window.close)
++                window.stock_table.setRowCount(1)
++                window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
++                window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
++                window.stock_table.selectRow(0)
++                window.delete_selected_stock()
++            self.assertEqual(["mock", "central"], order)
++
+diff --git a/tests/test_mock_market_data_boundary_normalization.py b/tests/test_mock_market_data_boundary_normalization.py
+index a3d447d..776372a 100644
+--- a/tests/test_mock_market_data_boundary_normalization.py
++++ b/tests/test_mock_market_data_boundary_normalization.py
+@@ -6 +5,0 @@ from datetime import datetime, timedelta, timezone
+-import json
+@@ -8,0 +8 @@ import tempfile
++from types import SimpleNamespace
+@@ -9,0 +10 @@ import unittest
++from unittest.mock import patch
+@@ -12 +12,0 @@ from mock_validation_candle_provider import project_mock_routine_candles
+-from mock_validation_host import MockValidationHost
+@@ -72,0 +73,2 @@ class MockMarketDataBoundaryNormalizationTest(unittest.TestCase):
++        from mock_validation_host import MockValidationHost
++
+@@ -99 +101 @@ class MockMarketDataBoundaryNormalizationTest(unittest.TestCase):
+-    def test_mock_owned_candle_projection_reads_without_production_host(self) -> None:
++    def test_mock_owned_candle_projection_uses_direct_read_only_source(self) -> None:
+@@ -102,29 +104,21 @@ class MockMarketDataBoundaryNormalizationTest(unittest.TestCase):
+-            stock_dir = root / "stocks" / "005930_TEST"
+-            stock_dir.mkdir(parents=True)
+-            (stock_dir / "candles.json").write_text(
+-                json.dumps(
+-                    [
+-                        {
+-                            "timestamp": "2026-09-12T09:00:00+09:00",
+-                            "open": 100,
+-                            "high": 101,
+-                            "low": 99,
+-                            "close": 100,
+-                            "volume": 10,
+-                        }
+-                    ],
+-                    ensure_ascii=False,
+-                ),
+-                encoding="utf-8",
+-            )
+-            result = project_mock_routine_candles(
+-                project_root=root,
+-                api=_Api(),
+-                stock_code="005930",
+-                rules={"bar": {"bar_minutes": 1}},
+-                projection_request={"projection": "COMPLETED_TIMEFRAME"},
+-                as_of=datetime(2026, 9, 12, 9, 2, tzinfo=SEOUL),
+-                session_windows=(
+-                    {"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"},
+-                ),
+-            )
++            class ReadOnlyApi(_Api):
++                def request_minute_candles_read_only(self, code, *, interval, count, callback):
++                    self.request = (code, interval, count)
++                    callback({"ok": True, "code": code, "interval": interval, "market_source": "KRX", "rows": [{}]})
++                    return {"ok": True}
++
++            api = ReadOnlyApi()
++            with patch(
++                "mock_validation_candle_provider.normalize_opt10080_rows",
++                return_value=[{"time": "20260912090000", "open": 100, "high": 101,
++                               "low": 99, "close": 100, "volume": 10}],
++            ):
++                result = project_mock_routine_candles(
++                    project_root=root, api=api, stock_code="005930",
++                    rules={"bar": {"bar_minutes": 5}},
++                    projection_request={"projection": "COMPLETED_TIMEFRAME", "warmup_bars": 1},
++                    as_of=datetime(2026, 9, 12, 9, 7, tzinfo=SEOUL),
++                    session_windows=({"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"},),
++                    identity_reader=lambda _code: ("MV-current", 1, "SESSION-1", "1:1"),
++                )
++            self.assertEqual(("005930", 5, 3), api.request)
+@@ -133,0 +128,54 @@ class MockMarketDataBoundaryNormalizationTest(unittest.TestCase):
++            self.assertEqual(5, result["candles"][0]["timeframe_minutes"])
++
++    def test_direct_candle_callback_rejects_replaced_mock_session(self) -> None:
++        class DelayedApi(_Api):
++            def request_minute_candles_read_only(self, code, *, interval, count, callback):
++                self.callback = callback
++                return {"ok": True}
++
++        api = DelayedApi()
++        identity = ["MV-old", 1, "SESSION-1", "1:1"]
++        cache, pending = {}, set()
++        kwargs = dict(
++            project_root=".", api=api, stock_code="122350",
++            rules={"bar": {"bar_minutes": 5}},
++            projection_request={"projection": "COMPLETED_TIMEFRAME", "warmup_bars": 1},
++            as_of=datetime(2026, 9, 12, 9, 7, tzinfo=SEOUL),
++            cache=cache, pending=pending,
++            identity_reader=lambda _code: tuple(identity),
++        )
++        self.assertFalse(project_mock_routine_candles(**kwargs)["available"])
++        identity[0] = "MV-new"
++        api.callback({"ok": True, "code": "122350", "interval": 5,
++                      "market_source": "KRX", "rows": [{}]})
++        self.assertFalse(project_mock_routine_candles(**kwargs)["available"])
++        self.assertNotIn("rows", cache[("122350", 5)])
++
++    def test_direct_forming_bar_uses_source_row_and_mock_trade(self) -> None:
++        class ReadOnlyApi(_Api):
++            def request_minute_candles_read_only(self, code, *, interval, count, callback):
++                callback({"ok": True, "code": code, "interval": interval,
++                          "market_source": "KRX", "rows": [{}, {}]})
++                return {"ok": True}
++
++        rows = [
++            {"time": "20260912090000", "open": 100, "high": 101,
++             "low": 99, "close": 100, "volume": 10},
++            {"time": "20260912090500", "open": 102, "high": 103,
++             "low": 101, "close": 102, "volume": 5},
++        ]
++        with patch("mock_validation_candle_provider.normalize_opt10080_rows", return_value=rows):
++            result = project_mock_routine_candles(
++                project_root=".", api=ReadOnlyApi(), stock_code="122350",
++                rules={"bar": {"bar_minutes": 5}},
++                projection_request={"projection": "FORMING_BASE_BAR", "warmup_bars": 1},
++                as_of=datetime(2026, 9, 12, 9, 7, tzinfo=SEOUL),
++                identity_reader=lambda _code: ("MV-current", 1, "SESSION-1", "1:1"),
++                latest_trade=SimpleNamespace(
++                    market_datetime="2026-09-12T09:07:00+09:00", current_price=105
++                ),
++            )
++        self.assertTrue(result["available"])
++        self.assertEqual([True, False], [bar["is_complete"] for bar in result["candles"]])
++        self.assertEqual(105, result["candles"][-1]["close"])
++        self.assertEqual(5, result["candles"][-1]["timeframe_minutes"])
+diff --git a/tests/test_mock_orderbook_realtime_subscription.py b/tests/test_mock_orderbook_realtime_subscription.py
+index 1e42e61..3e33c1e 100644
+--- a/tests/test_mock_orderbook_realtime_subscription.py
++++ b/tests/test_mock_orderbook_realtime_subscription.py
+@@ -13 +13 @@ from PyQt5.QtCore import QObject
+-from kiwoom_api import KiwoomApi
++from kiwoom_api import KiwoomApi, REALTIME_EXECUTION_TYPE
+@@ -92,0 +93 @@ def _api(*, connected: bool = True) -> KiwoomApi:
++    api.mock_execution_tick_received = _Signal()
+@@ -127,0 +129,34 @@ class MockOrderbookRealtimeSubscriptionTest(unittest.TestCase):
++        self.assertEqual(
++            tuple(dict.fromkeys((*REALTIME_ORDERBOOK_FIDS, *REALTIME_SHADOW_FIDS))),
++            result["snapshot"].fid_list,
++        )
++
++    def test_mock_only_trade_is_independent_of_production_and_stale_login(self) -> None:
++        api = _api()
++        api.sync_mock_orderbook_registration(["122350"])
++        production_before = api.realtime_shadow_registration_snapshot()
++        api._on_receive_real_data("122350", REALTIME_EXECUTION_TYPE, "")
++        self.assertEqual([], api.realtime_shadow_tick_received.values)
++        self.assertEqual(1, len(api.mock_execution_tick_received.values))
++        self.assertEqual(production_before, api.realtime_shadow_registration_snapshot())
++        old_id = api.mock_execution_tick_received.values[0]["mock_registration_id"]
++        api.sync_mock_orderbook_registration(["005930"])
++        api._on_receive_real_data("122350", REALTIME_EXECUTION_TYPE, "")
++        self.assertEqual(1, len(api.mock_execution_tick_received.values))
++        api.sync_mock_orderbook_registration(["122350"])
++        self.assertNotEqual(old_id, api.mock_orderbook_registration_snapshot().registration_id)
++        api._invalidate_login_session(reason="test", emit=True, increment_epoch=True)
++        api._on_receive_real_data("122350", REALTIME_EXECUTION_TYPE, "")
++        self.assertEqual(1, len(api.mock_execution_tick_received.values))
++
++    def test_dual_trade_emits_one_signal_per_domain(self) -> None:
++        api = _api()
++        api.sync_realtime_monitoring_registration(["005930"])
++        api.sync_mock_orderbook_registration(["005930"])
++        api._on_receive_real_data("005930", REALTIME_EXECUTION_TYPE, "")
++        self.assertEqual(1, len(api.realtime_shadow_tick_received.values))
++        self.assertEqual(1, len(api.mock_execution_tick_received.values))
++        api.clear_mock_orderbook_registration(remove_from_broker=True)
++        api._on_receive_real_data("005930", REALTIME_EXECUTION_TYPE, "")
++        self.assertEqual(2, len(api.realtime_shadow_tick_received.values))
++        self.assertEqual(1, len(api.mock_execution_tick_received.values))
+@@ -180,0 +216,4 @@ class MockOrderbookRealtimeSubscriptionTest(unittest.TestCase):
++        self.assertEqual(
++            api.mock_orderbook_registration_snapshot().registration_id,
++            api.mock_orderbook_received.values[0].registration_id,
++        )
+diff --git a/tests/test_mock_validation_foundation.py b/tests/test_mock_validation_foundation.py
+index 60c0fb6..5a32ead 100644
+--- a/tests/test_mock_validation_foundation.py
++++ b/tests/test_mock_validation_foundation.py
+@@ -6,0 +7 @@ import json
++import os
+@@ -9,0 +11 @@ import tempfile
++import threading
+@@ -10,0 +13,3 @@ import unittest
++from unittest.mock import patch
++
++import mock_validation_repository as repository_module
+@@ -15,0 +21 @@ from mock_validation_contract import (
++    initial_session_document,
+@@ -18,0 +25 @@ from mock_validation_contract import (
++    validate_session_document,
+@@ -103,0 +111,47 @@ class MockValidationFoundationTest(unittest.TestCase):
++    def test_force_stock_purge_removes_running_and_past_lifecycles_only(self) -> None:
++        old_id = self.session_id
++        self.create()
++        self.service.end_stock_session(old_id, command_id="MC-end-old")
++        current_id = "MV-00000000000000000000000000000002"
++        self.create(current_id)
++        self.service.start_stock_mock_session(current_id, command_id="MC-start-current")
++        other_id = "MV-00000000000000000000000000000003"
++        other_reference = build_mock_reference_snapshot(
++            stock={"code": "000660", "name": "Other", "stock_path": "stocks/000660_Other"},
++            routine_instances=[{
++                "instance_id": "A", "definition_id": "indicator-follow",
++                "routine_type": "INDICATOR_FOLLOW", "display_name": "Other A",
++                "group_id": "group-1",
++            }],
++            rules_by_instance_id={"A": {"version": 1}},
++            created_at="2026-09-03T08:59:00+09:00",
++        )
++        self.service.create_stock_session(
++            reference_snapshot=other_reference, validation_session_id=other_id,
++            command_id="MC-create-other",
++        )
++        other_before = self.repository.read_session(other_id)
++
++        purged = self.repository.purge_stock_lifecycles(
++            "005930", expected_current_session_id=current_id
++        )
++
++        self.assertEqual({old_id, current_id}, set(purged["session_ids"]))
++        self.assertEqual("", self.repository.current_session_id("005930"))
++        for session_id in (old_id, current_id):
++            self.assertFalse((self.root / "runtime" / "sessions" / f"{session_id}.json").exists())
++            self.assertFalse((self.root / "events" / f"{session_id}.json").exists())
++            self.assertFalse((self.root / "history" / f"{session_id}.json").exists())
++        self.assertEqual(other_before, self.repository.read_session(other_id))
++        self.assertEqual(other_id, self.repository.current_session_id("000660"))
++
++    def test_force_stock_purge_stale_identity_has_no_mutation(self) -> None:
++        self.create()
++        before = self.repository.read_session(self.session_id)
++        with self.assertRaisesRegex(MockValidationError, "MOCK_PURGE_CURRENT_IDENTITY_STALE"):
++            self.repository.purge_stock_lifecycles(
++                "005930", expected_current_session_id="MV-stale"
++            )
++        self.assertEqual(before, self.repository.read_session(self.session_id))
++        self.assertEqual(self.session_id, self.repository.current_session_id("005930"))
++
+@@ -834,0 +889,206 @@ class MockValidationFoundationTest(unittest.TestCase):
++class MockSessionReadCacheTest(unittest.TestCase):
++    def setUp(self) -> None:
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.repository = MockValidationRepository(Path(self.temporary.name) / "mock_validation")
++        self.session_id = "MV-read-cache"
++        document = initial_session_document(
++            validation_session_id=self.session_id,
++            reference_snapshot=_reference(),
++            created_at="2026-10-03T10:50:00+09:00",
++        )
++        self.repository.create_session(document)
++        self.path = self.repository.root / self.repository._session_relative(self.session_id)
++        self.raw = self.path.read_bytes()
++        self.expected = validate_session_document(json.loads(self.raw))
++        cache = self.repository._session_cache
++        cache.cache_clear()
++        self.addCleanup(cache.cache_clear)
++
++    def assert_detached(self, first, second) -> None:
++        self.assertEqual(first, second)
++        if isinstance(first, (dict, list)):
++            self.assertIsNot(first, second)
++            pairs = ((value, second[key]) for key, value in first.items()) if isinstance(first, dict) else zip(first, second)
++            for left, right in pairs:
++                self.assert_detached(left, right)
++
++    def test_unchanged_reads_disk_twice_but_decodes_and_validates_once(self) -> None:
++        with patch.object(Path, "read_bytes", autospec=True, side_effect=Path.read_bytes) as read, patch.object(
++            MockValidationRepository, "_decode_object", wraps=MockValidationRepository._decode_object
++        ) as decode, patch.object(
++            repository_module, "validate_session_document", wraps=validate_session_document
++        ) as validate:
++            first = self.repository.read_session(self.session_id)
++            second = self.repository.read_session(self.session_id)
++        self.assertEqual([self.path, self.path], [call.args[0] for call in read.call_args_list])
++        self.assertEqual(1, decode.call_count)
++        self.assertEqual(1, validate.call_count)
++        self.assertEqual(self.expected, first)
++        self.assert_detached(first, second)
++
++    def test_returned_mutations_do_not_leak_into_later_reads(self) -> None:
++        first = self.repository.read_session(self.session_id)
++        first["session"]["state"] = "BROKEN"
++        first["positions"][0]["holding_qty"] = 999
++        first["reference_snapshot"]["routine_instances"][0]["rules_snapshot"]["version"] = 999
++        first["orders"].append({"unvalidated": True})
++        self.assertEqual(self.expected, self.repository.read_session(self.session_id))
++
++    def test_same_mtime_overwrite_and_atomic_replacement_are_revalidated(self) -> None:
++        with patch.object(repository_module, "validate_session_document", wraps=validate_session_document) as validate:
++            self.repository.read_session(self.session_id)
++            timestamp = self.path.stat()
++            changed = json.loads(self.raw)
++            changed["revision"] += 1
++            changed_raw = self.raw.replace(b'"revision":0', b'"revision":1', 1)
++            self.assertNotEqual(self.raw, changed_raw)
++            self.assertEqual(len(self.raw), len(changed_raw))
++            self.path.write_bytes(changed_raw)
++            os.utime(self.path, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
++            self.assertEqual(timestamp.st_mtime_ns, self.path.stat().st_mtime_ns)
++            self.assertEqual(changed["revision"], self.repository.read_session(self.session_id)["revision"])
++            changed["revision"] += 1
++            replacement = self.path.with_suffix(".replacement")
++            replacement.write_bytes(json.dumps(changed).encode("utf-8"))
++            os.replace(replacement, self.path)
++            self.assertEqual(changed["revision"], self.repository.read_session(self.session_id)["revision"])
++            self.assertEqual(3, validate.call_count)
++
++    def test_invalid_overwrites_match_original_errors_and_valid_restore_works(self) -> None:
++        self.repository.read_session(self.session_id)
++        for raw in (b"{", b"\xff", b"[]", b"{}", b'{"schema_version":"broken"}'):
++            with self.subTest(raw=raw):
++                self.path.write_bytes(raw)
++                with self.assertRaises(MockValidationError) as original:
++                    document = self.repository.read_object(self.repository._session_relative(self.session_id))
++                    if not document:
++                        raise MockValidationError("MOCK_SESSION_NOT_FOUND")
++                    validate_session_document(document)
++                for _ in range(2):
++                    with self.assertRaises(MockValidationError) as cached:
++                        self.repository.read_session(self.session_id)
++                    self.assertEqual(str(original.exception), str(cached.exception))
++                self.path.write_bytes(self.raw)
++                self.assertEqual(self.expected, self.repository.read_session(self.session_id))
++
++    def test_delete_after_warm_read_and_restore(self) -> None:
++        self.repository.read_session(self.session_id)
++        self.path.unlink()
++        with self.assertRaisesRegex(MockValidationError, "^MOCK_SESSION_NOT_FOUND$"):
++            self.repository.read_session(self.session_id)
++        self.path.write_bytes(self.raw)
++        self.assertEqual(self.expected, self.repository.read_session(self.session_id))
++
++    def test_warm_cache_cannot_bypass_session_id_or_path_validation(self) -> None:
++        self.repository.read_session(self.session_id)
++        with self.assertRaisesRegex(MockValidationError, "^MOCK_VALIDATION_SESSION_ID_INVALID$"):
++            self.repository.read_session("MV-../read-cache")
++        with patch.object(self.repository, "_session_relative", return_value=Path("../outside.json")):
++            with self.assertRaisesRegex(MockValidationError, "^MOCK_WRITE_PATH_OUTSIDE_ROOT$"):
++                self.repository.read_session(self.session_id)
++
++    def test_cache_is_bounded_evicts_and_can_be_cleared(self) -> None:
++        cache = self.repository._session_cache
++        self.assertEqual(8, cache.cache_info().maxsize)
++        self.repository.read_session(self.session_id)
++        for revision in range(1, 9):
++            changed = json.loads(self.raw)
++            changed["revision"] = revision
++            self.path.write_bytes(json.dumps(changed).encode("utf-8"))
++            self.repository.read_session(self.session_id)
++        self.assertEqual(8, cache.cache_info().currsize)
++        self.path.write_bytes(self.raw)
++        with patch.object(repository_module, "validate_session_document", wraps=validate_session_document) as validate:
++            self.repository.read_session(self.session_id)
++            self.assertEqual(1, validate.call_count)
++        cache.cache_clear()
++        self.assertEqual(0, cache.cache_info().currsize)
++
++    def test_cache_is_owned_by_each_repository(self) -> None:
++        other = MockValidationRepository(self.repository.root)
++        with patch.object(repository_module, "validate_session_document", wraps=validate_session_document) as validate:
++            first = self.repository.read_session(self.session_id)
++            second = other.read_session(self.session_id)
++            self.assertEqual(2, validate.call_count)
++        self.assertEqual(self.expected, first)
++        self.assert_detached(first, second)
++        self.repository._session_cache.cache_clear()
++        self.assertEqual(0, self.repository._session_cache.cache_info().currsize)
++        self.assertEqual(1, other._session_cache.cache_info().currsize)
++
++    def test_oversized_document_bypasses_cache_without_changing_semantics(self) -> None:
++        with patch.object(repository_module, "_MAX_CACHED_SESSION_BYTES", len(self.raw)):
++            self.assertEqual(self.expected, self.repository.read_session(self.session_id))
++        self.assertEqual(1, self.repository._session_cache.cache_info().currsize)
++        before = self.repository._session_cache.cache_info()
++        with patch.object(repository_module, "_MAX_CACHED_SESSION_BYTES", len(self.raw) - 1), patch.object(
++            MockValidationRepository, "_decode_object", wraps=MockValidationRepository._decode_object
++        ) as decode, patch.object(
++            repository_module, "validate_session_document", wraps=validate_session_document
++        ) as validate:
++            first = self.repository.read_session(self.session_id)
++            first["positions"][0]["holding_qty"] = 999
++            second = self.repository.read_session(self.session_id)
++        self.assertEqual(2, decode.call_count)
++        self.assertEqual(2, validate.call_count)
++        self.assertEqual(self.expected, second)
++        self.assertEqual(before, self.repository._session_cache.cache_info())
++
++    def test_read_holds_repository_rlock_through_every_stage(self) -> None:
++        stages = []
++        original_clone = repository_module._clone_session_value
++
++        def guarded(name, operation):
++            def run(*args, **kwargs):
++                acquired = []
++
++                def probe():
++                    locked = self.repository._lock.acquire(blocking=False)
++                    acquired.append(locked)
++                    if locked:
++                        self.repository._lock.release()
++
++                thread = threading.Thread(target=probe, daemon=True)
++                thread.start()
++                thread.join(timeout=5)
++                self.assertFalse(thread.is_alive(), name)
++                self.assertEqual([False], acquired, name)
++                stages.append(name)
++                return operation(*args, **kwargs)
++            return run
++
++        def guarded_clone(value, memo=None):
++            if memo is None:
++                guarded("copy", lambda: None)()
++            return original_clone(value, memo)
++
++        with patch.object(self.repository, "_session_relative", side_effect=guarded("relative", self.repository._session_relative)), patch.object(
++            self.repository, "_target", side_effect=guarded("target", self.repository._target)
++        ), patch.object(Path, "exists", autospec=True, side_effect=guarded("exists", Path.exists)), patch.object(
++            Path, "read_bytes", autospec=True, side_effect=guarded("bytes", Path.read_bytes)
++        ), patch.object(self.repository, "_session_cache", side_effect=guarded("cache", self.repository._session_cache)), patch.object(
++            MockValidationRepository, "_decode_object", side_effect=guarded("decode", MockValidationRepository._decode_object)
++        ), patch.object(repository_module, "_clone_session_value", side_effect=guarded_clone):
++            self.assertEqual(self.expected, self.repository.read_session(self.session_id))
++            with patch.object(repository_module, "_MAX_CACHED_SESSION_BYTES", 0):
++                self.assertEqual(self.expected, self.repository.read_session(self.session_id))
++        self.assertEqual(
++            ["relative", "target", "exists", "bytes", "cache", "decode", "copy", "relative", "target", "exists", "bytes", "decode", "copy"],
++            stages,
++        )
++        result = self.repository.mutate_session(self.session_id, lambda document: document)
++        self.assertFalse(result["changed"])
++        self.assertEqual(self.expected, result["document"])
++
++    def test_current_sessions_matches_original_and_returns_detached_documents(self) -> None:
++        first = self.repository.current_sessions()
++        second = self.repository.current_sessions()
++        self.assertIsInstance(first, tuple)
++        self.assertEqual((self.expected,), first)
++        self.assert_detached(first[0], second[0])
++        self.path.write_bytes(b"{")
++        with self.assertRaisesRegex(MockValidationError, "^MOCK_DOCUMENT_MALFORMED$"):
++            self.repository.current_sessions()
++
++
+diff --git a/tests/test_mock_validation_host_ui.py b/tests/test_mock_validation_host_ui.py
+index e4a1694..df8e46f 100644
+--- a/tests/test_mock_validation_host_ui.py
++++ b/tests/test_mock_validation_host_ui.py
+@@ -4505,0 +4506,60 @@ class MockValidationHostUiTest(unittest.TestCase):
++    def test_mock_only_trade_populates_its_parent_tooltip_without_other_stock_data(self):
++        self.actions.create_waiting_session(
++            _reference("122350", ("A",), stock_name="Mock only")
++        )
++        self.actions.create_waiting_session(
++            _reference("000660", ("B",), stock_name="Other")
++        )
++        self.assertTrue(self.host.market_store.accept_trade({
++            **_trade_payload(),
++            "stock_code": "122350",
++            "current_price": 100,
++            "open_price": -90,
++            "high_price": 110,
++            "low_price": 80,
++            "change_rate": -1.25,
++            "previous_day_volume_rate": 2.5,
++            "execution_strength": 117.2,
++        }))
++        table = QTableWidget(0, len(main_table_loader.ROUTINE_MONITORING_HEADERS))
++        self.addCleanup(table.close)
++        window = SimpleNamespace(routine_table=table, mock_validation_host=self.host)
++        with patch.object(
++            main_table_loader,
++            "_stock_library_tooltip_metadata_by_code",
++            return_value={},
++        ):
++            main_table_loader._load_mock_routine_table(window)
++
++        parents = {}
++        for row in range(table.rowCount()):
++            item = table.item(row, 0)
++            if item.data(main_table_loader.ROUTINE_ROW_KIND_ROLE) == main_table_loader.ROUTINE_ROW_MOCK_STOCK:
++                parents[item.data(main_table_loader.ROUTINE_STOCK_CODE_ROLE)] = item
++        self.assertEqual({"122350", "000660"}, set(parents))
++        mock_projection = parents["122350"].data(
++            main_table_loader.ROUTINE_STOCK_TOOLTIP_DATA_ROLE
++        )
++        self.assertEqual(100, mock_projection["current_price"])
++        self.assertEqual({
++            "open_price": 90,
++            "high_price": 110,
++            "low_price": 80,
++            "change_rate": -1.25,
++            "previous_day_volume_rate": 2.5,
++            "execution_strength": 117.2,
++        }, mock_projection["stock_state"])
++        tooltip = parents["122350"].toolTip()
++        for value in ("100", "90", "110", "80", "-1.25%", "+2.50%", "117.2"):
++            self.assertIn(value, tooltip)
++        other_projection = parents["000660"].data(
++            main_table_loader.ROUTINE_STOCK_TOOLTIP_DATA_ROLE
++        )
++        self.assertIsNone(other_projection["current_price"])
++        self.assertEqual({}, other_projection["stock_state"])
++        self.assertEqual(
++            main_table_loader.main_stock_row_tooltip_from_projection(other_projection),
++            parents["000660"].toolTip(),
++        )
++        self.assertNotIn("117.2", parents["000660"].toolTip())
++
+@@ -6925,0 +6986,23 @@ class MockValidationHostUiTest(unittest.TestCase):
++    def test_ordinary_unregister_purges_past_sessions_and_target_cache(self):
++        old_id = self.create()["document"]["session"]["validation_session_id"]
++        self.host.session_service.end_stock_session(old_id, command_id="MC-end-past")
++        current_id = self.create()["document"]["session"]["validation_session_id"]
++        other_id = self.create("000660")["document"]["session"]["validation_session_id"]
++        self.host._buffers["005930"].append(object())
++        self.host._arrival_by_stock["005930"] = 9
++        self.host._integrity_errors["005930"] = "OLD"
++        self.assertTrue(self.host.market_store.accept_trade(_trade_payload()))
++
++        completed = self.actions.unregister("005930")
++
++        self.assertTrue(completed["ok"])
++        for session_id in (old_id, current_id):
++            self.assertFalse((self.host.repository.root / "runtime" / "sessions" / f"{session_id}.json").exists())
++            self.assertFalse((self.host.repository.root / "history" / f"{session_id}.json").exists())
++            self.assertFalse((self.host.repository.root / "events" / f"{session_id}.json").exists())
++        self.assertNotIn("005930", self.host._buffers)
++        self.assertNotIn("005930", self.host._arrival_by_stock)
++        self.assertNotIn("005930", self.host._integrity_errors)
++        self.assertIsNone(self.host.market_store.latest_trade("005930"))
++        self.assertIsNotNone(self.host.repository.read_session(other_id))
++
+diff --git a/tests/test_mock_validation_market_data.py b/tests/test_mock_validation_market_data.py
+index ea5927d..9c5fdf7 100644
+--- a/tests/test_mock_validation_market_data.py
++++ b/tests/test_mock_validation_market_data.py
+@@ -151,0 +152,55 @@ class MockValidationMarketDataTest(unittest.TestCase):
++    def test_trade_preserves_optional_tooltip_fields_with_guarded_numbers(self) -> None:
++        store = MockValidationMarketDataStore()
++        store.apply_registration_snapshot(_registration())
++        self.assertTrue(store.accept_trade({
++            **_trade_payload(),
++            "open_price": "-90",
++            "high_price": "110",
++            "low_price": "0",
++            "change_rate": "-1.25",
++            "previous_day_volume_rate": "2.5",
++            "execution_strength": "117.2",
++        }))
++        trade = store.latest_trade("005930")
++        self.assertEqual((90, 110, None), (
++            trade.open_price, trade.high_price, trade.low_price,
++        ))
++        self.assertEqual((-1.25, 2.5, 117.2), (
++            trade.change_rate, trade.previous_day_volume_rate,
++            trade.execution_strength,
++        ))
++        self.assertEqual(100, trade.current_price)
++
++    def test_trade_missing_or_invalid_tooltip_fields_remain_unavailable(self) -> None:
++        store = MockValidationMarketDataStore()
++        store.apply_registration_snapshot(_registration())
++        self.assertTrue(store.accept_trade({
++            **_trade_payload(),
++            "open_price": "bad",
++            "change_rate": float("nan"),
++            "execution_strength": True,
++        }))
++        trade = store.latest_trade("005930")
++        self.assertEqual((None,) * 6, (
++            trade.open_price, trade.high_price, trade.low_price,
++            trade.change_rate, trade.previous_day_volume_rate,
++            trade.execution_strength,
++        ))
++
++    def test_forget_stock_clears_only_target_market_cache(self) -> None:
++        store = MockValidationMarketDataStore()
++        store.apply_registration_snapshot(_registration(targets=("005930", "000660")))
++        first = _book()
++        second = normalize_mock_orderbook_snapshot(
++            stock_code="000660", raw_values=_raw_orderbook(),
++            connection_epoch=1, login_session_id="SESSION-1",
++            receive_sequence=2, received_at=RECEIVED_AT,
++        )
++        self.assertTrue(store.accept_orderbook(first))
++        self.assertTrue(store.accept_orderbook(second))
++        self.assertTrue(store.accept_trade(_trade_payload()))
++        store.forget_stock("005930")
++        self.assertIsNone(store.latest_orderbook("005930"))
++        self.assertIsNone(store.latest_trade("005930"))
++        self.assertIs(second, store.latest_orderbook("000660"))
++
