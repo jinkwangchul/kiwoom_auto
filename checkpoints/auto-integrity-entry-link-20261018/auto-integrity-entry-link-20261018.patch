@@ -1,0 +1,580 @@
+diff --git a/gui_stock_register_window.py b/gui_stock_register_window.py
+index 7dd1e2a..512bde1 100644
+--- a/gui_stock_register_window.py
++++ b/gui_stock_register_window.py
+@@ -1357,0 +1362,3 @@ class StockRegisterWindow(QDialog):
++        self._local_integrity_summary = ""
++        self._entry_review_targets: set[Path] = set()
++        self._entry_review_count = 0
+@@ -1365,0 +1373,4 @@ class StockRegisterWindow(QDialog):
++        self.integrity_status_label.setTextFormat(Qt.RichText)
++        self.integrity_status_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
++        self.integrity_status_label.setOpenExternalLinks(False)
++        self.integrity_status_label.linkActivated.connect(self._open_entry_review_management)
+@@ -1862 +1873 @@ class StockRegisterWindow(QDialog):
+-        text = "서버/로컬 상태 : 서버 정합성 미확인"
++        text = "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 완료 · 검토관리 9999건"
+@@ -1891 +1902,6 @@ class StockRegisterWindow(QDialog):
+-        self.integrity_status_label.setText(display_message)
++        link_text = f"검토관리 {self._entry_review_count}건" if self._entry_review_count else ""
++        full_message = f"{display_message} · {link_text}" if link_text else display_message
++        self.integrity_status_label.setText(
++            f'{display_message} · <a href="review" style="color: #1769aa; text-decoration: underline;">{link_text}</a>'
++            if link_text else display_message
++        )
+@@ -1893,2 +1909,2 @@ class StockRegisterWindow(QDialog):
+-            self.integrity_status_label.fontMetrics().horizontalAdvance(display_message) + 4
+-            if display_message
++            self.integrity_status_label.fontMetrics().horizontalAdvance(full_message) + 4
++            if full_message
+@@ -1900 +1916 @@ class StockRegisterWindow(QDialog):
+-        tooltip = f"{dot} {display_message}".strip()
++        tooltip = f"{dot} {full_message}".strip()
+@@ -1913 +1929,2 @@ class StockRegisterWindow(QDialog):
+-            f"서버/로컬 상태 : {display_status}",
++            f"서버/로컬 상태 : {display_status}"
++            + (f" | {self._local_integrity_summary}" if self._local_integrity_summary else ""),
+@@ -1916,0 +1934,53 @@ class StockRegisterWindow(QDialog):
++    def _refresh_local_integrity_summary(self) -> bool:
++        result = self._last_integrity_check_result or {}
++        local_status = str(result.get("local_status", "") or "").strip().upper()
++        self._entry_review_count = 0
++        if local_status not in {
++            LOCAL_STATUS_PASS,
++            LOCAL_STATUS_REVIEW_REQUIRED,
++            LOCAL_STATUS_INTEGRITY_ISSUE,
++            LOCAL_STATUS_CHECK_ERROR,
++        }:
++            self._local_integrity_summary = "로컬 검사 오류"
++        else:
++            try:
++                from gui_review_required_window import collect_global_review_required_rows
++
++                records = stock_repository_factory().list_stocks()
++                stocks = [
++                    {
++                        "code": record.code,
++                        "name": record.name,
++                        "stock_path": record.stock_path,
++                        "routines": [record.routine] if record.routine else [],
++                    }
++                    for record in records
++                ]
++                rows = collect_global_review_required_rows(preloaded_stocks=stocks)
++                self._entry_review_count = len({
++                    Path(row["stock_dir"]) for row in rows
++                    if Path(row["stock_dir"]) in self._entry_review_targets
++                })
++            except Exception:
++                LOGGER.exception("Stock register Review summary collection failed")
++                self._local_integrity_summary = "로컬 검토 현황 확인 실패"
++            else:
++                self._local_integrity_summary = (
++                    "로컬 검사 오류" if local_status == LOCAL_STATUS_CHECK_ERROR
++                    else "로컬 검사 완료"
++                )
++        self._set_server_local_integrity_status(result.get("server_status"))
++        return self._local_integrity_summary.startswith("로컬 검사 완료")
++
++    def _open_entry_review_management(self, link: str) -> None:
++        if link != "review" or self._entry_review_count <= 0:
++            return
++        try:
++            opener = getattr(persistent_feature_owner(self), "open_review_required_window", None)
++            if not callable(opener):
++                raise RuntimeError("Review Management opener unavailable")
++            opener()
++        except Exception:
++            LOGGER.exception("Stock register Review Management open failed")
++            self._show_integrity_toast("검토관리 열기 오류")
++
+@@ -1928,0 +1999,6 @@ class StockRegisterWindow(QDialog):
++        if not callable(writer):
++            host_getter = getattr(parent, "main_monitoring_auto_trade_operation_host", None)
++            host = host_getter() if callable(host_getter) else getattr(
++                parent, "_main_monitoring_auto_trade_operation_host", None
++            )
++            writer = getattr(host, "mark_review_required", None)
+@@ -1942,0 +2019,2 @@ class StockRegisterWindow(QDialog):
++        self._entry_review_targets = set()
++        self._entry_review_count = 0
+@@ -1945,2 +2023,11 @@ class StockRegisterWindow(QDialog):
+-            self._set_server_local_integrity_status(result.get("server_status"))
+-            checked_count = int(result.get("checked_stock_count", 0) or 0)
++            for issue in result.get("issues", []):
++                if not isinstance(issue, dict):
++                    continue
++                if (str(issue.get("issue_code", "")) in {
++                    "REQUIRED_PATH_MISSING", "JSON_READ_ERROR", "JSON_ROOT_TYPE_INVALID"
++                } and Path(str(issue.get("source_path", ""))).name == "state.json"):
++                    stock_dir = Path(str(issue.get("stock_dir", "")))
++                    if str(stock_dir) != ".":
++                        self._entry_review_targets.add(
++                            stock_dir if stock_dir.is_absolute() else PROJECT_ROOT / stock_dir
++                        )
+@@ -1948,6 +2034,0 @@ class StockRegisterWindow(QDialog):
+-
+-            if checked_count == 0:
+-                self._last_integrity_check_result = result
+-                self._show_integrity_toast("검사 대상 종목이 없습니다.")
+-                return
+-
+@@ -1956,4 +2037,7 @@ class StockRegisterWindow(QDialog):
+-                if writer is None:
+-                    self._last_integrity_check_result = result
+-                    self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
+-                    return
++
++                def track_review_writer(stock_dir, code, name, item, *, source):
++                    was_review = is_review_required_state(read_json_dict(Path(stock_dir) / "state.json"))
++                    written = writer(stock_dir, code, name, item, source=source) if writer else False
++                    if written and not was_review:
++                        self._entry_review_targets.add(Path(stock_dir))
++                    return written
+@@ -1964 +2048 @@ class StockRegisterWindow(QDialog):
+-                    review_writer=writer,
++                    review_writer=track_review_writer,
+@@ -1967 +2050,0 @@ class StockRegisterWindow(QDialog):
+-                self._last_integrity_check_result = result
+@@ -1969,6 +2051,0 @@ class StockRegisterWindow(QDialog):
+-                if self._integrity_writer_failed(result):
+-                    self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
+-                    return
+-                self._show_integrity_toast("무결성 검사 완료 | 검토관리 대상 종목이 있습니다.")
+-                return
+-
+@@ -1976,13 +2053,7 @@ class StockRegisterWindow(QDialog):
+-            if local_status == LOCAL_STATUS_CHECK_ERROR:
+-                self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
+-                return
+-
+-            if local_status == LOCAL_STATUS_INTEGRITY_ISSUE:
+-                self._show_integrity_toast("로컬 의미 무결성 검사 완료 | 종목 상태값을 확인하세요.")
+-                return
+-
+-            if local_status == LOCAL_STATUS_PASS:
+-                self._show_integrity_toast("로컬 무결성 검사 완료 | 서버 정합성 검사는 실행하지 않았습니다.")
+-                return
+-
+-            self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
++            summary_ok = self._refresh_local_integrity_summary()
++            inspection_failed = (
++                str(result.get("local_status", "") or "").strip().upper() == LOCAL_STATUS_CHECK_ERROR
++                or self._integrity_writer_failed(result)
++                or not summary_ok
++            )
++            self._show_integrity_toast("무결성 검사 오류" if inspection_failed else "무결성 검사 완료")
+@@ -1991 +2062,5 @@ class StockRegisterWindow(QDialog):
+-            self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
++            self._entry_review_targets = set()
++            self._entry_review_count = 0
++            self._local_integrity_summary = "로컬 검사 오류"
++            self._set_server_local_integrity_status(SERVER_STATUS_NOT_CHECKED)
++            self._show_integrity_toast("무결성 검사 오류")
+diff --git a/gui_review_required_window.py b/gui_review_required_window.py
+index 75b8068..0a89256 100644
+--- a/gui_review_required_window.py
++++ b/gui_review_required_window.py
+@@ -973,2 +972,0 @@ def collect_global_review_required_rows(
+-            if not routine_name_source:
+-                continue
+diff --git a/integrity_checker.py b/integrity_checker.py
+index 2ddb244..258cc01 100644
+--- a/integrity_checker.py
++++ b/integrity_checker.py
+@@ -384,0 +385 @@ def apply_integrity_review_required_issues(
++    unwritable: list[dict[str, object]] = []
+@@ -414,0 +416,13 @@ def apply_integrity_review_required_issues(
++        state_path = stock_dir / "state.json"
++        state_ok, state_data, _ = read_json_safely(state_path)
++        if not state_path.is_file() or not state_ok or not isinstance(state_data, dict):
++            unwritable.append({
++                "stock_code": bucket["stock_code"],
++                "stock_name": bucket["stock_name"],
++                "missing_files": tuple(
++                    name for name in ("config.json", "state.json", "orders.json")
++                    if not (stock_dir / name).is_file()
++                ),
++                "reason": "STATE_MISSING_OR_UNREADABLE",
++            })
++            continue
+@@ -478 +492,3 @@ def apply_integrity_review_required_issues(
+-    return _result_with_recalculated_counts(result, issues)
++    updated = _result_with_recalculated_counts(result, issues)
++    updated["review_unwritable"] = tuple(unwritable)
++    return updated
+diff --git a/tests/test_integrity_check_focus.py b/tests/test_integrity_check_focus.py
+index 8c19818..3e65a03 100644
+--- a/tests/test_integrity_check_focus.py
++++ b/tests/test_integrity_check_focus.py
+@@ -10,0 +11 @@ import integrity_checker
++import gui_review_required_window as review_window
+@@ -11,0 +13 @@ from gui_auto_trade_operation_host import AutoTradeOperationHost
++from stock_repository import StockRepository
+@@ -382,0 +385,16 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
++    def test_missing_unassigned_state_is_diagnostic_without_review_write(self) -> None:
++        stock_dir = self.root / "stocks" / "0162Z0_RISE"
++        (stock_dir / "logs").mkdir(parents=True)
++        before = tuple(path.relative_to(stock_dir) for path in stock_dir.rglob("*"))
++        writer = mock.Mock(return_value=True)
++
++        result = integrity_checker.apply_integrity_review_required_issues(
++            self._result(), project_root=self.root, review_writer=writer,
++        )
++
++        writer.assert_not_called()
++        self.assertEqual(before, tuple(path.relative_to(stock_dir) for path in stock_dir.rglob("*")))
++        self.assertEqual(("config.json", "state.json", "orders.json"),
++                         result["review_unwritable"][0]["missing_files"])
++        self.assertNotIn("CHECK_ERROR", self._issue_codes(result))
++
+@@ -539,0 +558,3 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
++            mock.patch("gui_stock_register_window.stock_repository_factory", return_value=StockRepository(self.root)),
++            mock.patch.object(review_window, "PROJECT_ROOT", self.root),
++            mock.patch.object(review_window, "stock_repository_factory", return_value=StockRepository(self.root)),
+@@ -577,0 +599,134 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
++    def _stock_state(self, code: str, name: str, status: str) -> Path:
++        stock_dir = self.root / "stocks" / f"{code}_{name}"
++        stock_dir.mkdir(parents=True, exist_ok=True)
++        (stock_dir / "state.json").write_text(
++            json.dumps({"status": status, "review_required": status == "REVIEW_REQUIRED"}),
++            encoding="utf-8",
++        )
++        return stock_dir
++
++    def _prior_review_stocks(self) -> None:
++        for index in range(10):
++            self._stock_state(f"{100000 + index}", f"기존{index}", "REVIEW_REQUIRED")
++
++    def _status_text(self, window) -> str:
++        return window.integrity_status_label.text()
++
++    def _write_review(self, stock_dir, _code, _name, _item, **_kwargs) -> bool:
++        (stock_dir / "state.json").write_text(
++            json.dumps({"status": "REVIEW_REQUIRED", "review_required": True}), encoding="utf-8"
++        )
++        return True
++
++    def test_entry_summary_ignores_ten_prior_review_stocks(self) -> None:
++        self._prior_review_stocks()
++        window = self._window()
++        with mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=self._result("PASS", issues=[])):
++            window.run_initial_integrity_check()
++
++        self.assertEqual(10, len(review_window.collect_global_review_required_rows()))
++        self.assertNotIn("검토관리", self._status_text(window))
++        self.assertNotIn("href=", self._status_text(window))
++        self.assertEqual("무결성 검사 완료", self.parent.popup_messages[-1])
++
++    def test_entry_summary_counts_two_new_writer_transfers_once_amid_prior_reviews(self) -> None:
++        self._prior_review_stocks()
++        for code, name in (("200001", "신규하나"), ("200002", "신규둘")):
++            self._stock_state(code, name, "STOPPED")
++        issues = [
++            self._review_issue("200001", "신규하나"),
++            self._review_issue("200001", "신규하나"),
++            self._review_issue("200002", "신규둘"),
++        ]
++        window = self._window()
++
++        with (
++            mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=self._result("REVIEW_REQUIRED", issues=issues)),
++            mock.patch.object(self.parent, "mark_review_required", side_effect=self._write_review),
++        ):
++            window.run_initial_integrity_check()
++
++        self.assertEqual(12, len(review_window.collect_global_review_required_rows()))
++        self.assertIn("검토관리 2건", self._status_text(window))
++        self.assertNotIn("12건", self._status_text(window))
++        self.assertIn('href="review"', self._status_text(window))
++
++    def test_preexisting_persisted_review_is_not_a_fresh_transfer(self) -> None:
++        self._stock_state("200005", "기존검토", "REVIEW_REQUIRED")
++        window = self._window()
++        with mock.patch(
++            "gui_stock_register_window.run_local_stock_integrity_check",
++            return_value=self._result("REVIEW_REQUIRED", issues=[self._review_issue("200005", "기존검토")]),
++        ):
++            window.run_initial_integrity_check()
++
++        self.assertEqual(1, len(review_window.collect_global_review_required_rows()))
++        self.assertNotIn("검토관리", self._status_text(window))
++
++    def test_failed_writer_does_not_count_or_link(self) -> None:
++        self._stock_state("200006", "실패", "STOPPED")
++        window = self._window()
++        with (
++            mock.patch(
++                "gui_stock_register_window.run_local_stock_integrity_check",
++                return_value=self._result("REVIEW_REQUIRED", issues=[self._review_issue("200006", "실패")]),
++            ),
++            mock.patch.object(self.parent, "mark_review_required", return_value=False),
++        ):
++            window.run_initial_integrity_check()
++
++        self.assertEqual([], review_window.collect_global_review_required_rows())
++        self.assertNotIn("검토관리", self._status_text(window))
++        self.assertNotIn("href=", self._status_text(window))
++        self.assertEqual("무결성 검사 오류", self.parent.popup_messages[-1])
++
++    def test_detected_unreadable_state_counts_without_writing_and_links_only_review(self) -> None:
++        self._prior_review_stocks()
++        stock_dir = self.root / "stocks" / "200003_읽기불가"
++        stock_dir.mkdir(parents=True)
++        state_path = stock_dir / "state.json"
++        state_path.write_text("{", encoding="utf-8")
++        window = self._window()
++        with mock.patch("gui_stock_register_window.run_local_stock_integrity_check", wraps=integrity_checker.run_local_stock_integrity_check):
++            window.run_initial_integrity_check()
++
++        self.assertEqual("{", state_path.read_text(encoding="utf-8"))
++        self.assertEqual(11, len(review_window.collect_global_review_required_rows()))
++        self.assertIn("검토관리 1건", self._status_text(window))
++        self.assertEqual("무결성 검사 오류", self.parent.popup_messages[-1])
++        self.assertIn('href="review"', self._status_text(window))
++
++    def test_review_fragment_click_uses_existing_owner_opener(self) -> None:
++        from PyQt5.QtCore import QPoint, Qt
++        from PyQt5.QtTest import QTest
++
++        self._stock_state("200004", "전환", "STOPPED")
++        window = self._window()
++
++        with (
++            mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=self._result("REVIEW_REQUIRED", issues=[self._review_issue("200004", "전환")])),
++            mock.patch.object(self.parent, "mark_review_required", side_effect=self._write_review),
++        ):
++            window.run_initial_integrity_check()
++
++        self.parent.open_review_required_window = mock.Mock()
++        window._integrity_auto_check_started = True
++        window.show()
++        self.app.processEvents()
++        label = window.integrity_status_label
++        y = label.height() // 2
++        prefix = "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 완료 · "
++        link_x = label.fontMetrics().horizontalAdvance(prefix) + 4
++        QTest.mouseClick(label, Qt.LeftButton, pos=QPoint(2, y))
++        self.parent.open_review_required_window.assert_not_called()
++        QTest.mouseClick(label, Qt.LeftButton, pos=QPoint(link_x, y))
++        self.parent.open_review_required_window.assert_called_once_with()
++
++    def test_review_opener_failure_is_contained(self) -> None:
++        window = self._window()
++        window._entry_review_count = 1
++        self.parent.open_review_required_window = mock.Mock(side_effect=RuntimeError("unavailable"))
++        with mock.patch("gui_stock_register_window.LOGGER.exception"):
++            window._open_entry_review_management("review")
++        self.assertEqual("검토관리 열기 오류", self.parent.popup_messages[-1])
++
+@@ -699 +854 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            "서버/로컬 상태 : 서버 정합성 미확인",
++            "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 완료",
+@@ -713 +868 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-        self.assertEqual("서버/로컬 상태 : 서버 정합성 미확인", window.integrity_status_label.text())
++        self.assertEqual("서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 완료", window.integrity_status_label.text())
+@@ -723 +878,22 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-        self.assertIn("로컬 무결성 검사 완료 | 서버 정합성 검사는 실행하지 않았습니다.", self.parent.popup_messages)
++        self.assertEqual(["무결성 검사 완료"], self.parent.popup_messages)
++
++    def test_zero_review_rows_complete_without_review_link(self) -> None:
++        window = self._window()
++        with mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=self._result("PASS")):
++            window.run_initial_integrity_check()
++        self.assertEqual(["무결성 검사 완료"], self.parent.popup_messages)
++        self.assertNotIn("검토관리", window.integrity_status_label.text())
++        self.assertNotIn("href=", window.integrity_status_label.text())
++        self.assertIn("서버 정합성 미확인", window.integrity_status_label.text())
++
++    def test_unavailable_review_collector_never_claims_local_success(self) -> None:
++        window = self._window()
++        with (
++            mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=self._result("PASS")),
++            mock.patch.object(review_window, "collect_global_review_required_rows", side_effect=RuntimeError("unavailable")),
++            mock.patch("gui_stock_register_window.LOGGER.exception"),
++        ):
++            window.run_initial_integrity_check()
++        self.assertEqual(["무결성 검사 오류"], self.parent.popup_messages)
++        self.assertIn("로컬 검토 현황 확인 실패", window.integrity_status_label.text())
++        self.assertIn("서버 정합성 미확인", window.integrity_status_label.text())
+@@ -727,0 +904 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
++        self._stock_state("005930", "삼성전자", "STOPPED")
+@@ -731 +908 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            mock.patch("gui_stock_register_window.apply_integrity_review_required_issues", return_value=result),
++            mock.patch.object(self.parent, "mark_review_required", side_effect=self._write_review),
+@@ -736,4 +913 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-        self.assertEqual(
+-            "서버/로컬 상태 : 서버 정합성 미확인",
+-            window.integrity_status_label.text(),
+-        )
++        self.assertIn("검토관리 1건", window.integrity_status_label.text())
+@@ -743,0 +918,2 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
++        self._stock_state("005930", "삼성전자", "STOPPED")
++        self._stock_state("000660", "SK하이닉스", "STOPPED")
+@@ -751 +927 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            mock.patch("gui_stock_register_window.apply_integrity_review_required_issues", return_value=result),
++            mock.patch.object(self.parent, "mark_review_required", side_effect=self._write_review),
+@@ -756,4 +932 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-        self.assertEqual(
+-            "서버/로컬 상태 : 서버 정합성 미확인",
+-            window.integrity_status_label.text(),
+-        )
++        self.assertIn("검토관리 2건", window.integrity_status_label.text())
+@@ -763,0 +937 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
++        self._stock_state("005930", "삼성전자", "STOPPED")
+@@ -769 +943 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            mock.patch("gui_stock_register_window.apply_integrity_review_required_issues", return_value=result),
++            mock.patch.object(self.parent, "mark_review_required", side_effect=self._write_review),
+@@ -774,4 +948 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-        self.assertEqual(
+-            "서버/로컬 상태 : 서버 정합성 미확인",
+-            window.integrity_status_label.text(),
+-        )
++        self.assertIn("검토관리 1건", window.integrity_status_label.text())
+@@ -800,0 +972,81 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
++    def test_main_like_owner_uses_official_operation_host_writer(self) -> None:
++        window = self._window()
++        self.parent.review_writer.reset_mock()
++        with mock.patch.object(self.parent, "mark_review_required", None):
++            writer = window._review_writer_callback()
++            self.assertEqual(self.operation_host.mark_review_required, writer)
++
++    def test_present_review_issue_calls_main_operation_host_writer(self) -> None:
++        window = self._window()
++        stock_dir = self.root / "stocks" / "005930_삼성전자"
++        stock_dir.mkdir(parents=True)
++        (stock_dir / "state.json").write_text(
++            json.dumps({"status": "STOPPED"}), encoding="utf-8"
++        )
++        result = self._result("REVIEW_REQUIRED", issues=[self._review_issue()])
++        with (
++            mock.patch.object(self.parent, "mark_review_required", None),
++            mock.patch.object(self.operation_host, "mark_review_required", return_value=True) as writer,
++            mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=result),
++        ):
++            window.run_initial_integrity_check()
++        writer.assert_called_once()
++        self.assertNotIn("검토관리 반영에 실패", self.parent.popup_messages[-1])
++
++    def test_missing_state_uses_generic_toast_and_automatic_review_row(self) -> None:
++        window = self._window()
++        stock_dir = self.root / "stocks" / "0162Z0_RISE"
++        (stock_dir / "logs").mkdir(parents=True)
++        with mock.patch("gui_stock_register_window.run_local_stock_integrity_check",
++                        return_value=integrity_checker.run_local_stock_integrity_check(self.root)):
++            window.run_initial_integrity_check()
++        self.parent.review_writer.assert_not_called()
++        self.assertEqual("무결성 검사 완료", self.parent.popup_messages[-1])
++        rows = review_window.collect_global_review_required_rows()
++        self.assertEqual(1, len(rows))
++        self.assertEqual("0162Z0", rows[0]["code"])
++        self.assertEqual("운영 데이터 없음", rows[0]["review_reason"])
++        self.assertEqual("미해결", rows[0]["display_status"])
++        self.assertEqual("BLOCKED", rows[0]["return_availability"])
++        self.assertIn("검토관리 1건", window.integrity_status_label.text())
++        self.assertIn("서버 정합성 미확인", window.integrity_status_label.text())
++        self.assertFalse((stock_dir / "state.json").exists())
++
++    def test_many_missing_states_keep_toast_bounded_and_rows_unique(self) -> None:
++        window = self._window()
++        for index in range(20):
++            (self.root / "stocks" / f"{100000 + index}_긴종목이름{index:04d}").mkdir(parents=True)
++        window.run_initial_integrity_check()
++        rows = review_window.collect_global_review_required_rows()
++        self.assertEqual(20, len(rows))
++        self.assertEqual(20, len({row["code"] for row in rows}))
++        self.assertTrue(all(row["display_status"] == "미해결" for row in rows))
++        self.assertTrue(all(row["return_availability"] == "BLOCKED" for row in rows))
++        self.assertEqual("무결성 검사 완료", self.parent.popup_messages[-1])
++        self.assertIn("검토관리 20건", window.integrity_status_label.text())
++        self.assertLess(len(window.integrity_status_label.toolTip()), 90)
++        self.assertNotIn("긴종목이름", self.parent.popup_messages[-1])
++        self.parent.review_writer.assert_not_called()
++
++    def test_reentry_keeps_entry_count_without_duplicate_check(self) -> None:
++        from PyQt5.QtGui import QShowEvent
++
++        window = self._window()
++        (self.root / "stocks" / "100001_첫종목").mkdir(parents=True)
++        with mock.patch("gui_stock_register_window.QTimer.singleShot", side_effect=lambda _ms, fn: fn()):
++            window.showEvent(QShowEvent())
++            self.assertIn("검토관리 1건", window.integrity_status_label.text())
++            (self.root / "stocks" / "100002_둘째종목").mkdir(parents=True)
++            window.showEvent(QShowEvent())
++        self.assertIn("검토관리 1건", window.integrity_status_label.text())
++        self.assertNotIn("검토관리 2건", window.integrity_status_label.text())
++        rows = review_window.collect_global_review_required_rows()
++        self.assertEqual(2, len({row["code"] for row in rows}))
++        self.assertEqual(1, len(self.parent.popup_messages))
++
++        new_window = self._window()
++        with mock.patch("gui_stock_register_window.QTimer.singleShot", side_effect=lambda _ms, fn: fn()):
++            new_window.showEvent(QShowEvent())
++        self.assertIn("검토관리 2건", new_window.integrity_status_label.text())
++        self.assertEqual(2, len(self.parent.popup_messages))
++
+@@ -835 +1087 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            "서버/로컬 상태 : 서버 정합성 미확인",
++            "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 완료",
+@@ -886 +1138 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            "서버/로컬 상태 : 서버 정합성 미확인",
++            "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 오류",
+@@ -903 +1155 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-        self.assertIn("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.", self.parent.popup_messages)
++        self.assertEqual(["무결성 검사 오류"], self.parent.popup_messages)
+@@ -916 +1168 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            "서버/로컬 상태 : 서버 정합성 미확인",
++            "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 오류",
+@@ -935 +1187 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
+-            "서버/로컬 상태 : 서버 정합성 미확인",
++            "서버/로컬 상태 : 서버 정합성 미확인 | 로컬 검사 오류",
+diff --git a/tests/test_review_required_transition_time.py b/tests/test_review_required_transition_time.py
+index 771e0cc..521202e 100644
+--- a/tests/test_review_required_transition_time.py
++++ b/tests/test_review_required_transition_time.py
+@@ -538,0 +539,2 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
++                SimpleNamespace(code="100011", name="읽기실패미연결", routine=""),
++                SimpleNamespace(code="100009", name="정상미연결", routine=""),
+@@ -545,0 +548,2 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
++                elif record.code == "100011":
++                    (stock_dir / "state.json").write_text("{ invalid json", encoding="utf-8")
+@@ -564,0 +569,5 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
++                elif record.code == "100009":
++                    (stock_dir / "state.json").write_text(
++                        json.dumps({"status": "STOPPED"}, ensure_ascii=False),
++                        encoding="utf-8",
++                    )
+@@ -592 +601,32 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
+-        self.assertNotIn("100006", by_code)
++        self.assertEqual("운영 데이터 없음", by_code["100006"]["review_reason"])
++        self.assertEqual("종목관리", by_code["100006"]["review_location"])
++        self.assertEqual("미해결", by_code["100006"]["display_status"])
++        self.assertEqual("BLOCKED", by_code["100006"]["return_availability"])
++        self.assertEqual("운영 데이터 읽기 오류", by_code["100011"]["review_reason"])
++        self.assertEqual("미해결", by_code["100011"]["display_status"])
++        self.assertEqual("BLOCKED", by_code["100011"]["return_availability"])
++        self.assertNotIn("100009", by_code)
++
++    def test_unassigned_missing_state_preloaded_snapshot_is_read_only_review(self) -> None:
++        with TemporaryDirectory() as temp:
++            root = Path(temp)
++            stock_dir = root / "stocks" / "100010_미연결"
++            stock_dir.mkdir(parents=True)
++            record = {"code": "100010", "name": "미연결", "stock_path": "stocks/100010_미연결", "routines": []}
++            with patch.object(review_window, "PROJECT_ROOT", root):
++                rows = review_window.collect_global_review_required_rows(
++                    preloaded_stocks=[record],
++                    preloaded_stock_data_by_dir={
++                        str(stock_dir): {
++                            "state": {},
++                            "config": {},
++                            "state_issue_reason": "운영 데이터 없음",
++                        }
++                    },
++                )
++
++            self.assertEqual(1, len(rows))
++            self.assertEqual("100010", rows[0]["code"])
++            self.assertEqual("미해결", rows[0]["display_status"])
++            self.assertEqual("BLOCKED", rows[0]["return_availability"])
++            self.assertFalse((stock_dir / "state.json").exists())

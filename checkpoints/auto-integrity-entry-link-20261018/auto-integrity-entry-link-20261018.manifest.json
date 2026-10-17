@@ -1,0 +1,139 @@
+{
+  "actual_stocks": "not modified",
+  "approved_scope": "Earlier auto-integrity inspection / Review-collector normalization plus this entry-only Review count and clickable Review link; exclude unrelated Mock reset WIP.",
+  "branch": "recovery/auto-integrity-entry-link-20261018",
+  "checkpoint_kind": "NONEXECUTABLE_APPROVED_CUMULATIVE_INTEGRITY_PATCH",
+  "created_at_KST": "2026-10-18T08:01:13+09:00",
+  "operational_note": "Never replay directly onto current dirty worktree; standalone patch on BASE depends on other unrelated protected WIP and is not an independently verified runnable version.",
+  "parent": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "parent_branch": "feat/restore-auto-trade-setting-ui",
+  "patch_file": "auto-integrity-entry-link-20261018.patch",
+  "patch_sha256": "760431ce857424f1a7df9a2799ca704bd4a208ca0c2a16c68f67e540f26e916d",
+  "physical_window": "not verified",
+  "real_broker": "not invoked",
+  "reverse_check": "PASS",
+  "selected_files": 5,
+  "selected_hunks": 49,
+  "source_files": {
+    "gui_review_required_window.py": {
+      "excluded_protected_hunks": [
+        {
+          "old_line": 2247,
+          "sha256": "6eb8b856019533d0d37e4c0f6a79d4e858343797982d449840d29a438c791923"
+        }
+      ],
+      "selected_hunks": 1,
+      "selected_old_lines": [
+        973
+      ],
+      "selected_patch_sha256": "515ae6b29f5a43a73a8a76a72480669fb2aa9567d8b3feac359a4eec105324e8",
+      "source_sha256": "bd75ff407b317645e96b02dc11adf7f83bb170a7154bd87fe08fa16e9a9e61b9"
+    },
+    "gui_stock_register_window.py": {
+      "excluded_protected_hunks": [
+        {
+          "old_line": 1338,
+          "sha256": "965835932106897b6f25842f39087ac6a7d53e79a21e68084beaac08a1075e9d"
+        },
+        {
+          "old_line": 1343,
+          "sha256": "94f998bfb98e9e9d0b4fab92cc3111e68f34fa4d8131e4f701e5a657b1acfb95"
+        },
+        {
+          "old_line": 2522,
+          "sha256": "c48fc4b4e74382974597e83a940b1b49b31b37f91969905729602e3279de5adf"
+        },
+        {
+          "old_line": 2532,
+          "sha256": "a5db4f7f569328736b2001963471612fd6836eafee1f8581bbb5b6f1b81e495c"
+        },
+        {
+          "old_line": 2544,
+          "sha256": "b3eaf0088f9f01684dd929a3cc294a22cd3a392a70f2a2dfc6510ba3ffaeeebd"
+        },
+        {
+          "old_line": 2553,
+          "sha256": "57820f7e3def2e839c192598a6ffc2c6786aa8999d42d488365f6e0a17a3e60a"
+        }
+      ],
+      "selected_hunks": 18,
+      "selected_old_lines": [
+        1357,
+        1365,
+        1862,
+        1891,
+        1893,
+        1900,
+        1913,
+        1916,
+        1928,
+        1942,
+        1945,
+        1948,
+        1956,
+        1964,
+        1967,
+        1969,
+        1976,
+        1991
+      ],
+      "selected_patch_sha256": "e862391f0df34ed44e4f07d5c4023441c45dd89d0085b1742c79eb4cf0fc4e6c",
+      "source_sha256": "ae1435e7e929afe308d8c68d2796f465aeeec124e9224cf7f0ac004ceaef5aa2"
+    },
+    "integrity_checker.py": {
+      "excluded_protected_hunks": [],
+      "selected_hunks": 3,
+      "selected_old_lines": [
+        384,
+        414,
+        478
+      ],
+      "selected_patch_sha256": "deabca4ef0418f21bdcacce33a532e21586519e0e952ba01169a950ca73cef66",
+      "source_sha256": "11fd741a517312ffb820acb911647f662a725fa8393c5087594de358c1571f78"
+    },
+    "tests/test_integrity_check_focus.py": {
+      "excluded_protected_hunks": [],
+      "selected_hunks": 23,
+      "selected_old_lines": [
+        10,
+        11,
+        382,
+        539,
+        577,
+        699,
+        713,
+        723,
+        727,
+        731,
+        736,
+        743,
+        751,
+        756,
+        763,
+        769,
+        774,
+        800,
+        835,
+        886,
+        903,
+        916,
+        935
+      ],
+      "selected_patch_sha256": "b56e031d52f6c0c3b6a3e4ad11982d184d29cfaa1728e94ddd751cb2a3fa7d43",
+      "source_sha256": "f6f679452e25dda9a3a3387d24aab1cfeeb6597bf24a2f42fddea4d9d230fef7"
+    },
+    "tests/test_review_required_transition_time.py": {
+      "excluded_protected_hunks": [],
+      "selected_hunks": 4,
+      "selected_old_lines": [
+        538,
+        545,
+        564,
+        592
+      ],
+      "selected_patch_sha256": "e9c3b791c6d19b5159cb15e7d2616eb89f1f4624cc69685f6445619d7b82a7f5",
+      "source_sha256": "454b3b39cc2ad38c7aa624f7d1ab2b684e93a7f3f1f7c8bca7836e2c67964b20"
+    }
+  },
+  "tests_native_x86_offscreen": "147 PASS independently rerun, exit 0"
+}
