@@ -1,0 +1,392 @@
+diff --git a/gui_windows.py b/gui_windows.py
+index 790948b..a59a9f4 100644
+--- a/gui_windows.py
++++ b/gui_windows.py
+@@ -20,6 +20,8 @@ from __future__ import annotations
+ import json
+ import logging
+ import re
++import weakref
++from concurrent.futures import ThreadPoolExecutor
+ from dataclasses import asdict
+ from datetime import datetime
+ from decimal import Decimal
+@@ -37,6 +39,7 @@ from PyQt5.QtCore import (
+     Qt,
+     QTimer,
+     pyqtSignal,
++    pyqtSlot,
+ )
+ from PyQt5.QtGui import (
+     QBrush,
+@@ -1435,6 +1438,7 @@ from gui_main_table_loader import (
+     routine_aggregate_label_width,
+     routine_aggregate_number_slot_width,
+     routine_instance_number_widths,
++    _main_routine_effective_stock_scope,
+     main_refresh_market_information_only,
+     main_refresh_pnl_only,
+     build_main_refresh_read_context,
+@@ -1740,7 +1744,7 @@ from mock_validation_context_menu import (
+     show_mock_registration_context_menu,
+     show_mock_monitoring_context_menu,
+ )
+-from mock_validation_host import MockValidationHost
++from mock_validation_host import MockValidationHost, compute_mock_ui_projection_hash
+ from mock_validation_operation_lifecycle import mock_validation_end_eligibility
+ from mock_validation_reference_snapshot import build_mock_reference_snapshot
+ from mock_validation_ui_actions import MockValidationUIActions
+@@ -1871,7 +1875,7 @@ MAIN_STOCK_METRIC_LAYOUT = {
+         },
+     ),
+ }
+-MAIN_MARKET_INFORMATION_REFRESH_INTERVAL_MS = 100
++MAIN_MARKET_INFORMATION_REFRESH_INTERVAL_MS = 250
+ ROUTINE_STOCK_METRIC_SEPARATOR_GAP = int(
+     MAIN_STOCK_METRIC_LAYOUT["separator_spacing"]
+ )
+@@ -4284,13 +4288,32 @@ def _record_kiwoom_order_transport_evidence(
+     return result
+ 
+ 
++def _emit_mock_projection_completion(window_ref, generation, future) -> None:
++    """Future callback only transports a result; acceptance belongs to Qt."""
++
++    try:
++        projection_hash, error = future.result(), None
++    except Exception as exc:
++        projection_hash, error = None, str(exc) or type(exc).__name__
++    window = window_ref()
++    if window is not None:
++        try:
++            window._mock_projection_completed.emit(generation, projection_hash, error)
++        except RuntimeError:
++            # The QObject may have been destroyed while pure work was running.
++            pass
++
++
+ class MainWindow(QMainWindow):
+     """
+     키움 자동매매 시스템 메인 윈도우
+     """
+ 
++    _mock_projection_completed = pyqtSignal(object, object, object)
++
+     def __init__(self) -> None:
+         super().__init__()
++        self._initialize_mock_projection_worker()
+ 
+         self._raw_chejan_evidence_bound = False
+         self._raw_order_tr_evidence_bound = False
+@@ -4359,6 +4382,7 @@ class MainWindow(QMainWindow):
+         self.account_label = QLabel("계좌정보 :")
+         self.account_combo = _AccountInfoComboBox()
+         self.account_combo.setObjectName("kiwoomAccountCombo")
++        self.account_combo.setPlaceholderText("계좌 선택")
+         self.account_combo.setEnabled(False)
+         self.account_type_label = QLabel("계좌 구분: -")
+         self.account_type_label.hide()
+@@ -4573,8 +4597,6 @@ class MainWindow(QMainWindow):
+             self.kiwoom_api,
+             project_root=PROJECT_ROOT,
+             projection_changed=self._on_mock_validation_projection_changed,
+-            candles_provider=getattr(market_host, "project_routine_candles", None),
+-            candle_observation_updater=getattr(market_host, "sync_candle_observation_targets", None),
+         )
+         self.mock_validation_ui_actions = MockValidationUIActions(
+             self.mock_validation_host
+@@ -6365,22 +6387,118 @@ class MainWindow(QMainWindow):
+         if not hasattr(self, "routine_table"):
+             return
+         try:
++            if _main_routine_effective_stock_scope(self) != "mock":
++                main_refresh_pnl_only(self)
++                return
+             self.load_routine_table()
+             MainWindow._apply_mock_scope_button_isolation(self)
+         except Exception:
+             LOGGER.exception("Mock validation projection refresh failed")
+ 
+     def _process_mock_validation_host_cycle(self) -> None:
++        if getattr(self, "_mock_projection_closed", False):
++            return
+         host = getattr(self, "mock_validation_host", None)
+         processor = getattr(host, "process_due_cycles", None)
+         if not callable(processor):
+             return
+         try:
+-            processor()
++            result = processor(defer_projection=True)
++            projection_input = result.get("projection_input")
++            if projection_input is not None:
++                self._mock_projection_generation += 1
++                snapshot = (
++                    self._mock_projection_generation, host, projection_input,
++                    host._projection_publication_epoch,
++                )
++                if self._mock_projection_active is not None:
++                    self._mock_projection_pending = snapshot
++                else:
++                    self._submit_mock_projection(snapshot)
+         except Exception:
+             # A Mock failure must never escape the shared UI timer callback.
+             LOGGER.exception("Mock validation host cycle failed")
+ 
++    def _initialize_mock_projection_worker(self) -> None:
++        self._mock_projection_closed = False
++        self._mock_projection_generation = 0
++        self._mock_projection_active = None
++        self._mock_projection_pending = None
++        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mock-projection")
++        self._mock_projection_executor = executor
++        self._mock_projection_completed.connect(
++            self._accept_mock_projection_completion, Qt.QueuedConnection
++        )
++        # No MainWindow reference is retained by destruction cleanup.
++        self.destroyed.connect(lambda _obj: executor.shutdown(wait=False, cancel_futures=True))
++
++    def _submit_mock_projection(self, snapshot) -> None:
++        if self._mock_projection_closed:
++            return
++        generation, _host, projection_input, _publication_epoch = snapshot
++        self._mock_projection_active = snapshot
++        try:
++            future = self._mock_projection_executor.submit(
++                compute_mock_ui_projection_hash, *projection_input
++            )
++            window_ref = weakref.ref(self)
++            future.add_done_callback(
++                lambda completed: _emit_mock_projection_completion(
++                    window_ref, generation, completed
++                )
++            )
++        except Exception:
++            self._mock_projection_active = None
++            LOGGER.exception("Mock validation projection submission failed")
++
++    @pyqtSlot(object, object, object)
++    def _accept_mock_projection_completion(self, generation, projection_hash, error) -> None:
++        active = self._mock_projection_active
++        if self._mock_projection_closed or active is None or generation != active[0]:
++            return
++        _generation, host, _projection_input, publication_epoch = active
++        accepted_epoch = None
++        try:
++            if error is not None:
++                LOGGER.error("Mock validation projection worker failed: %s", error)
++            elif (
++                not getattr(self, "_main_window_closing", False)
++                and host is getattr(self, "mock_validation_host", None)
++                and not host._disposed
++                and host._projection_publication_epoch == publication_epoch
++            ):
++                # Record the expected increment before refresh can reenter and
++                # publish synchronously; those newer publications win.
++                accepted_epoch = publication_epoch + 1
++                host.apply_ui_projection_hash(projection_hash)
++        except Exception:
++            LOGGER.exception("Mock validation projection acceptance failed")
++        finally:
++            # Keep the active slot occupied through refresh callbacks: a nested
++            # timer cycle must replace pending display work rather than submit.
++            self._mock_projection_active = None
++            pending, self._mock_projection_pending = self._mock_projection_pending, None
++            if accepted_epoch is not None and pending is not None and pending[1] is host and pending[3] == publication_epoch:
++                pending = (*pending[:3], accepted_epoch)
++            if (
++                pending is not None and not self._mock_projection_closed
++                and not getattr(self, "_main_window_closing", False)
++                and pending[1] is getattr(self, "mock_validation_host", None)
++                and not pending[1]._disposed
++                and pending[1]._projection_publication_epoch == pending[3]
++            ):
++                self._submit_mock_projection(pending)
++
++    def _shutdown_mock_projection_worker(self) -> None:
++        self._mock_projection_closed = True
++        self._mock_projection_generation = getattr(self, "_mock_projection_generation", 0) + 1
++        self._mock_projection_pending = None
++        self._mock_projection_active = None
++        executor = getattr(self, "_mock_projection_executor", None)
++        self._mock_projection_executor = None
++        if executor is not None:
++            executor.shutdown(wait=False, cancel_futures=True)
++
+     def _select_mock_validation_instances(
+         self,
+         target,
+@@ -8845,12 +8963,28 @@ class MainWindow(QMainWindow):
+     def _continue_login_after_pending_budget_projection(
+         self,
+         login_identity: tuple[int, str],
++        account_retry_attempt: int = 0,
+     ) -> None:
+         if (
+             getattr(self, "_handled_kiwoom_login_identity", None) != login_identity
+             or not bool(getattr(self, "_event_journal_kiwoom_connected", False))
+         ):
+             return
++
++        accounts = self.refresh_kiwoom_accounts()
++        if not accounts:
++            if account_retry_attempt < 5:
++                QTimer.singleShot(
++                    500,
++                    lambda identity=login_identity, attempt=account_retry_attempt + 1: MainWindow._continue_login_after_pending_budget_projection(
++                        self,
++                        identity,
++                        attempt,
++                    ),
++                )
++            return
++
++        self.sync_account_funds_selection(connected=True)
+         self.request_account_funds()
+         self.start_production_recovery()
+         QTimer.singleShot(0, self.start_stock_library_sync_for_current_session)
+@@ -8940,7 +9074,7 @@ class MainWindow(QMainWindow):
+         )
+         query_state = str(self._account_query_states.get(account, "") or "")
+         normal = authenticated and query_state == ACCOUNT_FUNDS_READY
+-        retryable = authenticated and query_state == ACCOUNT_FUNDS_FAILED
++        retryable = visible and query_state == ACCOUNT_FUNDS_FAILED
+         neutral = not normal and not retryable
+         self.account_query_status_label.show()
+         self.account_query_normal_label.setVisible(normal)
+@@ -8978,15 +9112,14 @@ class MainWindow(QMainWindow):
+             self.statusBar().showMessage("계좌비밀번호 입력창을 열지 못했습니다.")
+             self.refresh_account_authentication_ui()
+             return
+-        if self._displayed_active_account_no() == account:
+-            self.request_account_funds()
++        self.statusBar().showMessage(
++            "계좌비밀번호 등록을 완료한 뒤 재조회를 눌러 계좌정보를 확인하십시오."
++        )
+ 
+     def requery_current_account_funds(self) -> None:
+         account = self._displayed_active_account_no()
+         if (
+             not account
+-            or self._account_authentication_states.get(account)
+-            != ACCOUNT_FUNDS_READY
+             or self._account_query_states.get(account) != ACCOUNT_FUNDS_FAILED
+         ):
+             self.refresh_account_query_status_ui()
+@@ -13480,6 +13613,8 @@ class MainWindow(QMainWindow):
+             self,
+             stock_search_register_opener=open_instance_stock_search_register_dialog,
+             mock_validation_opener=self.begin_registered_stock_mock_validation,
++            mock_validation_host=self.mock_validation_host,
++            mock_validation_actions=self.mock_validation_ui_actions,
+         )
+         window.setAttribute(Qt.WA_DeleteOnClose, True)
+         self.stock_register_window = window
+@@ -13792,6 +13927,7 @@ class MainWindow(QMainWindow):
+         return accepted
+ 
+     def _shutdown_mock_validation_host(self) -> None:
++        MainWindow._shutdown_mock_projection_worker(self)
+         mock_host = getattr(self, "mock_validation_host", None)
+         shutdown_mock = getattr(mock_host, "shutdown", None)
+         if callable(shutdown_mock):
+diff --git a/tests/test_mock_validation_host_ui.py b/tests/test_mock_validation_host_ui.py
+index e4a1694..df8e46f 100644
+--- a/tests/test_mock_validation_host_ui.py
++++ b/tests/test_mock_validation_host_ui.py
+@@ -4503,6 +4503,66 @@ class MockValidationHostUiTest(unittest.TestCase):
+             rows_by_code["000660"][0].toolTip(),
+         )
+ 
++    def test_mock_only_trade_populates_its_parent_tooltip_without_other_stock_data(self):
++        self.actions.create_waiting_session(
++            _reference("122350", ("A",), stock_name="Mock only")
++        )
++        self.actions.create_waiting_session(
++            _reference("000660", ("B",), stock_name="Other")
++        )
++        self.assertTrue(self.host.market_store.accept_trade({
++            **_trade_payload(),
++            "stock_code": "122350",
++            "current_price": 100,
++            "open_price": -90,
++            "high_price": 110,
++            "low_price": 80,
++            "change_rate": -1.25,
++            "previous_day_volume_rate": 2.5,
++            "execution_strength": 117.2,
++        }))
++        table = QTableWidget(0, len(main_table_loader.ROUTINE_MONITORING_HEADERS))
++        self.addCleanup(table.close)
++        window = SimpleNamespace(routine_table=table, mock_validation_host=self.host)
++        with patch.object(
++            main_table_loader,
++            "_stock_library_tooltip_metadata_by_code",
++            return_value={},
++        ):
++            main_table_loader._load_mock_routine_table(window)
++
++        parents = {}
++        for row in range(table.rowCount()):
++            item = table.item(row, 0)
++            if item.data(main_table_loader.ROUTINE_ROW_KIND_ROLE) == main_table_loader.ROUTINE_ROW_MOCK_STOCK:
++                parents[item.data(main_table_loader.ROUTINE_STOCK_CODE_ROLE)] = item
++        self.assertEqual({"122350", "000660"}, set(parents))
++        mock_projection = parents["122350"].data(
++            main_table_loader.ROUTINE_STOCK_TOOLTIP_DATA_ROLE
++        )
++        self.assertEqual(100, mock_projection["current_price"])
++        self.assertEqual({
++            "open_price": 90,
++            "high_price": 110,
++            "low_price": 80,
++            "change_rate": -1.25,
++            "previous_day_volume_rate": 2.5,
++            "execution_strength": 117.2,
++        }, mock_projection["stock_state"])
++        tooltip = parents["122350"].toolTip()
++        for value in ("100", "90", "110", "80", "-1.25%", "+2.50%", "117.2"):
++            self.assertIn(value, tooltip)
++        other_projection = parents["000660"].data(
++            main_table_loader.ROUTINE_STOCK_TOOLTIP_DATA_ROLE
++        )
++        self.assertIsNone(other_projection["current_price"])
++        self.assertEqual({}, other_projection["stock_state"])
++        self.assertEqual(
++            main_table_loader.main_stock_row_tooltip_from_projection(other_projection),
++            parents["000660"].toolTip(),
++        )
++        self.assertNotIn("117.2", parents["000660"].toolTip())
++
+     def test_authenticated_live_stock_tooltip_matches_parent_and_excludes_child(self):
+         self.actions.create_waiting_session(
+             _reference("0009K0", ("A",), stock_name="에임드바이오")
+@@ -6923,6 +6983,29 @@ class MockValidationHostUiTest(unittest.TestCase):
+         ):
+             self.host.repository.read_history(session_id)
+ 
++    def test_ordinary_unregister_purges_past_sessions_and_target_cache(self):
++        old_id = self.create()["document"]["session"]["validation_session_id"]
++        self.host.session_service.end_stock_session(old_id, command_id="MC-end-past")
++        current_id = self.create()["document"]["session"]["validation_session_id"]
++        other_id = self.create("000660")["document"]["session"]["validation_session_id"]
++        self.host._buffers["005930"].append(object())
++        self.host._arrival_by_stock["005930"] = 9
++        self.host._integrity_errors["005930"] = "OLD"
++        self.assertTrue(self.host.market_store.accept_trade(_trade_payload()))
++
++        completed = self.actions.unregister("005930")
++
++        self.assertTrue(completed["ok"])
++        for session_id in (old_id, current_id):
++            self.assertFalse((self.host.repository.root / "runtime" / "sessions" / f"{session_id}.json").exists())
++            self.assertFalse((self.host.repository.root / "history" / f"{session_id}.json").exists())
++            self.assertFalse((self.host.repository.root / "events" / f"{session_id}.json").exists())
++        self.assertNotIn("005930", self.host._buffers)
++        self.assertNotIn("005930", self.host._arrival_by_stock)
++        self.assertNotIn("005930", self.host._integrity_errors)
++        self.assertIsNone(self.host.market_store.latest_trade("005930"))
++        self.assertIsNotNone(self.host.repository.read_session(other_id))
++
+     def test_unregister_purges_only_target_stock_lifecycle_and_all_instance_events(self):
+         first = self.actions.create_waiting_session(
+             _reference("005380", ("A", "B", "C"), stock_name="현대차")
