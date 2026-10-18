@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from multiprocessing import get_context
 from datetime import datetime, timedelta
 import json
 import math
 import re
+import time
 from typing import Any, Callable
 
 from candle_timeframe_aggregation import MARKET_BUCKET_ANCHOR, SEOUL_TIMEZONE
@@ -16,13 +19,21 @@ from indicator_follow_validation_timeframe import validation_timeframe_for_reque
 from indicator_follow_signal_validation_projection import (
     build_validation_average_price_context,
 )
+from indicator_follow_signal_validation_runtime_trace import (
+    signal_validation_trace_enabled,
+    trace_signal_validation_event,
+)
 
 from .routine_macd_engine import (
-    build_indicator_follow_base_series,
+    _validation_minimal_series_targets,
+    build_indicator_follow_validation_series as build_indicator_follow_base_series,
     evaluate_indicator_follow_routine,
 )
 from .routine_validation_batch import (
+    _IncrementalAverageContext,
+    _SeriesPrefixView,
     _evaluation_prefix_series_map,
+    _prepare_indicator_follow_validation_batch,
 )
 from .routine_validation_contract import ValidationStockRef
 from .routine_validation_historical import ValidationHistoricalSnapshot
@@ -36,6 +47,69 @@ REASON_NO_VALID_CANDLES = "NO_VALID_CANDLES"
 REASON_INVALID_EVALUATION_RANGE = "INVALID_EVALUATION_RANGE"
 REASON_EVALUATOR_ERROR = "EVALUATOR_ERROR"
 REASON_INVALID_ROUTINE_SIGNAL = "INVALID_ROUTINE_SIGNAL"
+REASON_REPLAY_CANCELLED = "VALIDATION_REPLAY_CANCELLED"
+
+
+class ValidationReplayCancelled(RuntimeError):
+    """Raised only when an optional replay cancellation predicate fires."""
+
+
+class _ReplayLocalBollinger:
+    """Reuse canonical points with identical ordered dependencies in one replay."""
+
+    def __init__(self) -> None:
+        self._memo: dict[tuple, tuple[float | None, float | None, float | None]] = {}
+
+    def __call__(
+        self,
+        values: list[float | None],
+        period: int = 20,
+        std_multiplier: float = 2.0,
+    ) -> tuple[list[float | None], list[float | None], list[float | None]]:
+        from engines.indicator_engine import bollinger_band
+
+        # Only normalized replay inputs are eligible. Preserve canonical errors
+        # and arithmetic for everything else, without caching exceptional results.
+        if (
+            type(period) is not int or period <= 0
+            or type(std_multiplier) is not float
+            or not math.isfinite(std_multiplier) or std_multiplier <= 0
+            or any(value is not None and (
+                type(value) is not float or not math.isfinite(value) or value <= 0
+            ) for value in values)
+        ):
+            return bollinger_band(values, period, std_multiplier)
+        lower, middle, upper = [], [], []
+        local = []
+        for value in values:
+            if value is None:
+                lower.append(None)
+                middle.append(None)
+                upper.append(None)
+                continue
+            local.append(value)
+            if len(local) > period:
+                local.pop(0)
+            if len(local) < period:
+                lower.append(None)
+                middle.append(None)
+                upper.append(None)
+                continue
+            key = (period, type(std_multiplier), std_multiplier, tuple(local))
+            point = self._memo.get(key)
+            if point is None:
+                try:
+                    bands = bollinger_band(list(local), period, std_multiplier)
+                except Exception:
+                    return bollinger_band(values, period, std_multiplier)
+                point = (bands[0][-1], bands[1][-1], bands[2][-1])
+                if any(value is not None and not math.isfinite(value) for value in point):
+                    return bollinger_band(values, period, std_multiplier)
+                self._memo[key] = point
+            lower.append(point[0])
+            middle.append(point[1])
+            upper.append(point[2])
+        return lower, middle, upper
 
 
 def _canonical_json(value: Any) -> str:
@@ -45,6 +119,18 @@ def _canonical_json(value: Any) -> str:
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
+    )
+
+
+def _fresh_full_replay_context(context_provider: Any) -> bool:
+    if context_provider is None or context_provider is build_validation_average_price_context:
+        return True
+    # Import locally: the execution projection also consumes replay entries.
+    from indicator_follow_signal_validation_execution import ValidationVirtualPositionTracker
+
+    return (
+        type(context_provider) is ValidationVirtualPositionTracker
+        and vars(context_provider) == vars(ValidationVirtualPositionTracker(context_provider.policy))
     )
 
 
@@ -75,6 +161,121 @@ def _indicator_history_prefix(
         len(full_prefix) - max(int(history_target_bars), 1),
     )
     return full_prefix[start:], start
+
+
+def _minimum_stable_indicator_prefix_length(rules: dict[str, Any]) -> int:
+    """Match build_indicator_series MACD normalization and EMA warm backfill."""
+    indicators = rules.get("indicators")
+    if not isinstance(indicators, dict):
+        indicators = rules
+    macd = indicators.get("macd")
+    if not isinstance(macd, dict):
+        macd = {}
+    return max(
+        1,
+        int(macd.get("fast", 12) or 12),
+        int(macd.get("slow", 26) or 26),
+        int(macd.get("signal", 9) or 9),
+    )
+
+
+def _replay_prefix_series_map(
+    base_series: dict[str, Any],
+    prefix_length: int,
+) -> dict[str, Any]:
+    """Bound every list series to the current replay prefix, including -1 reads."""
+    return {
+        key: _SeriesPrefixView(values, prefix_length)
+        if isinstance(values, list)
+        else values
+        for key, values in base_series.items()
+    }
+
+
+_PARALLEL_BASE_CANDLES: list[dict[str, Any]] | None = None
+_PARALLEL_BASE_RULES: dict[str, Any] | None = None
+_PARALLEL_BASE_HISTORY_TARGET = 0
+
+
+def _parallel_base_series_worker_init(
+    candles: list[dict[str, Any]],
+    rules: dict[str, Any],
+    history_target_bars: int,
+) -> None:
+    global _PARALLEL_BASE_CANDLES, _PARALLEL_BASE_RULES, _PARALLEL_BASE_HISTORY_TARGET
+    _PARALLEL_BASE_CANDLES = candles
+    _PARALLEL_BASE_RULES = rules
+    _PARALLEL_BASE_HISTORY_TARGET = max(int(history_target_bars), 1)
+
+
+def _parallel_base_series_worker(
+    evaluation_index: int,
+) -> tuple[int, dict[str, list[float | None]]]:
+    candles = _PARALLEL_BASE_CANDLES
+    rules = _PARALLEL_BASE_RULES
+    if candles is None or rules is None:
+        raise RuntimeError("parallel replay base-series worker is not initialized")
+    start = max(0, evaluation_index - _PARALLEL_BASE_HISTORY_TARGET + 1)
+    return (
+        evaluation_index,
+        build_indicator_follow_base_series(candles[start:evaluation_index + 1], rules),
+    )
+
+
+class _ParallelBaseSeriesPrefetch:
+    """Bounded ordered prefetch of the exact canonical sliding-window builder."""
+
+    def __init__(
+        self,
+        candles: list[dict[str, Any]],
+        rules: dict[str, Any],
+        history_target_bars: int,
+        start_index: int,
+        end_index: int,
+        workers: int,
+    ) -> None:
+        self._next_submit = int(start_index)
+        self._end_index = int(end_index)
+        self._limit = max(2, int(workers) * 2)
+        self._pending: dict[int, Any] = {}
+        self._closed = False
+        self._executor = ProcessPoolExecutor(
+            max_workers=int(workers),
+            mp_context=get_context("spawn"),
+            initializer=_parallel_base_series_worker_init,
+            initargs=(candles, rules, history_target_bars),
+        )
+        self._fill()
+
+    def _fill(self) -> None:
+        while (
+            not self._closed
+            and len(self._pending) < self._limit
+            and self._next_submit <= self._end_index
+        ):
+            index = self._next_submit
+            self._pending[index] = self._executor.submit(
+                _parallel_base_series_worker,
+                index,
+            )
+            self._next_submit += 1
+
+    def result_for(self, evaluation_index: int) -> dict[str, list[float | None]]:
+        future = self._pending.pop(int(evaluation_index))
+        returned_index, result = future.result()
+        if returned_index != evaluation_index or not isinstance(result, dict):
+            raise RuntimeError("parallel replay base-series identity mismatch")
+        self._fill()
+        return result
+
+    def close(self, *, wait: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for future in self._pending.values():
+            future.cancel()
+        self._pending.clear()
+        self._executor.shutdown(wait=bool(wait), cancel_futures=True)
 
 
 def _remap_trace_indexes(
@@ -159,6 +360,8 @@ def _normalized_time(value: Any) -> str | None:
 
 
 _VALIDATION_REGULAR_SESSION_END_MINUTE = 15 * 60 + 30
+_VALIDATION_AFTER_SESSION_START_MINUTE = 15 * 60 + 40
+_VALIDATION_AFTER_SESSION_END_MINUTE = 20 * 60
 
 
 def _latest_candle_is_forming(
@@ -168,7 +371,7 @@ def _latest_candle_is_forming(
     timeframe_key: str | None = None,
     as_of: datetime | None = None,
 ) -> bool:
-    """Return True when the latest row belongs to a still-forming Validation period."""
+    """Exclude only a currently forming M1; retain direct higher-period snapshots."""
     try:
         candle_start = datetime.strptime(candle_time, "%Y%m%d%H%M%S").replace(
             tzinfo=SEOUL_TIMEZONE
@@ -188,28 +391,28 @@ def _latest_candle_is_forming(
     key = str(timeframe["key"])
     current_minute = current.hour * 60 + current.minute
 
-    if key == "D1":
-        return (
-            candle_start.date() == current.date()
-            and current_minute < _VALIDATION_REGULAR_SESSION_END_MINUTE
-        )
-    if key == "W1":
-        if candle_start.isocalendar()[:2] != current.isocalendar()[:2]:
-            return False
-        weekday = current.weekday()
-        return weekday < 4 or (
-            weekday == 4
-            and current_minute < _VALIDATION_REGULAR_SESSION_END_MINUTE
-        )
-    if key == "MO1":
-        return (
-            candle_start.year == current.year
-            and candle_start.month == current.month
-        )
-    if key == "Y1":
-        return candle_start.year == current.year
+    # D/W/MO/Y historical requests return their OWN target-period OHLCV
+    # as a query-time snapshot. A current period is not an M1 forming bar:
+    # dropping it would discard the current day/week/month or entire year.
+    # Only the separately defined M1 forming rule applies to M1 itself.
+    if key in ("D1", "W1", "MO1", "Y1"):
+        return False
+    if key != "M1":
+        # A directly requested M3..M240 candle is the current
+        # selected-timeframe snapshot, not an M1 tick/forming candle.
+        return False
     if candle_start.date() != current.date():
         return False
+
+    # After-hours M1 is also incomplete until its own minute closes.
+    # The gap from 15:30 to 15:40 and the time after 20:00 are not
+    # active after-hours buckets. Higher timeframes stay unchanged.
+    if (
+        _VALIDATION_AFTER_SESSION_START_MINUTE
+        <= current_minute
+        < _VALIDATION_AFTER_SESSION_END_MINUTE
+    ):
+        return candle_start == current.replace(second=0, microsecond=0)
 
     anchor_minute = MARKET_BUCKET_ANCHOR.hour * 60 + MARKET_BUCKET_ANCHOR.minute
     if current_minute < anchor_minute or current_minute >= _VALIDATION_REGULAR_SESSION_END_MINUTE:
@@ -227,12 +430,42 @@ def _latest_candle_is_forming(
     return candle_start == bucket_start and current < bucket_end
 
 
+def _validated_projected_candles_override(
+    value: object,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("projected_candles_override must be a sequence")
+    normalized = []
+    seen = set()
+    previous_time = None
+    for item in value:
+        if not isinstance(item, dict):
+            raise TypeError("projected candle must be a mapping")
+        candle_time = _normalized_time(item.get("time"))
+        if candle_time is None or candle_time in seen:
+            raise ValueError("projected candle timestamp is invalid or duplicated")
+        if previous_time is not None and candle_time <= previous_time:
+            raise ValueError("projected candles must be strictly chronological")
+        values = {
+            key: _normalized_number(item.get(key))
+            for key in ("open", "high", "low", "close", "volume")
+        }
+        if any(number is None for number in values.values()):
+            raise ValueError("projected candle OHLCV is invalid")
+        normalized.append({"time": candle_time, **values})
+        seen.add(candle_time)
+        previous_time = candle_time
+    if not normalized:
+        raise ValueError("projected_candles_override is empty")
+    return _fresh_json(_canonical_json(normalized))
+
+
 def project_validation_candles(
     historical_snapshot: ValidationHistoricalSnapshot,
     *,
     as_of: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Project detached broker rows into closed chronological Validation candles."""
+    """Project selected-timeframe query snapshots; omit only the forming M1."""
     if not isinstance(historical_snapshot, ValidationHistoricalSnapshot):
         raise TypeError("historical_snapshot must be ValidationHistoricalSnapshot")
 
@@ -255,6 +488,17 @@ def project_validation_candles(
         }
 
     candles = [candles_by_time[key] for key in sorted(candles_by_time)]
+    # A delayed TR callback must not change the forming status of the
+    # immutable query-time M1 snapshot. Explicit test as_of still takes priority.
+    if as_of is None and historical_snapshot.request_as_of is not None:
+        as_of = datetime.fromisoformat(historical_snapshot.request_as_of)
+    if candles and _latest_candle_is_forming(
+        str(candles[-1].get("time") or ""),
+        historical_snapshot.timeframe_minutes,
+        timeframe_key=historical_snapshot.timeframe_key,
+        as_of=as_of,
+    ):
+        candles.pop()
     detached = _fresh_json(_canonical_json(candles))
     return detached, len(raw_rows) - len(detached)
 
@@ -521,6 +765,31 @@ class ValidationHistoricalReplay:
             raise TypeError("evaluator must be callable")
         self.session = session
         self._evaluator = evaluator
+        self._cancel_predicate: Callable[[], bool] | None = None
+        self._parallel_base_series_workers = 0
+
+    def set_parallel_base_series_workers(self, workers: int) -> None:
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, int)
+            or workers < 0
+            or workers > 8
+        ):
+            raise ValueError("parallel base-series workers must be 0..8")
+        self._parallel_base_series_workers = workers
+
+    def set_cancel_predicate(
+        self,
+        predicate: Callable[[], bool] | None,
+    ) -> None:
+        if predicate is not None and not callable(predicate):
+            raise TypeError("cancel predicate must be callable")
+        self._cancel_predicate = predicate
+
+    def _check_cancelled(self) -> None:
+        predicate = self._cancel_predicate
+        if predicate is not None and predicate():
+            raise ValidationReplayCancelled(REASON_REPLAY_CANCELLED)
 
     def evaluate(
         self,
@@ -530,7 +799,29 @@ class ValidationHistoricalReplay:
         end_index: int | None = None,
         context_provider: Callable[..., dict[str, Any]] | None = None,
         display_count: int | None = None,
+        projected_candles_override: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     ) -> ValidationReplayResult:
+        trace_timing = signal_validation_trace_enabled()
+        replay_started = time.perf_counter() if trace_timing else 0.0
+        timing_ms = {
+            "project": 0.0,
+            "initial_base_series": 0.0,
+            "sliding_base_series": 0.0,
+            "context": 0.0,
+            "evaluator": 0.0,
+            "entry_trace": 0.0,
+            "snapshot": 0.0,
+        }
+        sliding_base_series_calls = 0
+        evaluator_calls = 0
+
+        def timing_start() -> float:
+            return time.perf_counter() if trace_timing else 0.0
+
+        def timing_add(name: str, started: float) -> None:
+            if trace_timing:
+                timing_ms[name] += (time.perf_counter() - started) * 1000.0
+
         availability = self.session.readiness()
         if not availability.allowed:
             return ValidationReplayResult(False, reason=availability.reason)
@@ -556,7 +847,20 @@ class ValidationHistoricalReplay:
             )
 
         try:
-            candles, dropped_count = project_validation_candles(historical_snapshot)
+            self._check_cancelled()
+            project_started = timing_start()
+            if projected_candles_override is None:
+                candles, dropped_count = project_validation_candles(historical_snapshot)
+            else:
+                candles = _validated_projected_candles_override(projected_candles_override)
+                dropped_count = 0
+            timing_add("project", project_started)
+        except ValidationReplayCancelled as exc:
+            return ValidationReplayResult(
+                False,
+                reason=REASON_REPLAY_CANCELLED,
+                error=str(exc),
+            )
         except (TypeError, ValueError, OverflowError):
             return ValidationReplayResult(
                 False,
@@ -588,16 +892,107 @@ class ValidationHistoricalReplay:
         history_target_bars = _required_validation_history_context_bars(rules)
         entries: list[ValidationReplayEntry] = []
         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
+        # Never retain this on the replay/session or pass it to process workers.
+        bollinger_calculator = (
+            _ReplayLocalBollinger()
+            if reuse_default_base_series and self._parallel_base_series_workers <= 1
+            else None
+        )
+        original_context_provider = context_provider
+        if (
+            reuse_default_base_series
+            and context_provider is build_validation_average_price_context
+        ):
+            context_provider = _IncrementalAverageContext()
         use_read_only_fast_path = reuse_default_base_series and (
             context_provider is None
-            or context_provider is build_validation_average_price_context
             or getattr(context_provider, "validation_read_only_fast_path", False) is True
         )
         rules_json = None if use_read_only_fast_path else _canonical_json(rules)
+        parallel_prefetch: _ParallelBaseSeriesPrefetch | None = None
+        parallel_completed = False
         try:
+            authoritative_base_series = None
+            if (
+                reuse_default_base_series
+                and start_index == 0
+                and final_index >= 2
+                and self._parallel_base_series_workers <= 1
+            ):
+                # Speculation ends before the first evaluator/context call.
+                # Once the loop starts, errors must never retry the replay.
+                self._check_cancelled()
+                try:
+                    if (
+                        _fresh_full_replay_context(original_context_provider)
+                        and _validation_minimal_series_targets(rules) is not None
+                    ):
+                        full_prefix = candles[:final_index + 1]
+                        initial_base_started = timing_start()
+                        rsi_provenance = []
+                        prepared_series = build_indicator_follow_base_series(
+                            full_prefix, rules, _rsi_provenance_out=rsi_provenance,
+                        )
+                        timing_add("initial_base_series", initial_base_started)
+                        self._check_cancelled()
+                        _prepare_indicator_follow_validation_batch(
+                            full_prefix, rules, prepared_series,
+                            _rsi_provenance=rsi_provenance,
+                        )
+                        self._check_cancelled()
+                        authoritative_base_series = prepared_series
+                except ValidationReplayCancelled:
+                    raise
+                except Exception:
+                    # Unsupported/configuration/build failures retain the exact
+                    # bounded canonical path and its existing error classification.
+                    pass
+            sliding_start = max(start_index, history_target_bars)
+            if (
+                reuse_default_base_series
+                and self._parallel_base_series_workers > 1
+                and sliding_start <= final_index
+            ):
+                try:
+                    parallel_prefetch = _ParallelBaseSeriesPrefetch(
+                        candles,
+                        rules,
+                        history_target_bars,
+                        sliding_start,
+                        final_index,
+                        self._parallel_base_series_workers,
+                    )
+                except Exception:
+                    parallel_prefetch = None
+            initial_base_series = None
+            initial_window_length = min(history_target_bars, len(candles), final_index + 1)
+            stable_prefix_length = 1
+            if (
+                authoritative_base_series is None
+                and reuse_default_base_series
+                and final_index >= 2
+                and start_index < initial_window_length
+            ):
+                self._check_cancelled()
+                stable_prefix_length = _minimum_stable_indicator_prefix_length(rules)
+                if max(start_index, 2, stable_prefix_length - 1) <= min(
+                    final_index, initial_window_length - 1,
+                ):
+                    # Only the original retained window has exact stabilized
+                    # prefixes. A sliding window must rebuild its local history.
+                    initial_base_started = timing_start()
+                    initial_base_series = build_indicator_follow_base_series(
+                        candles[:initial_window_length], rules,
+                        _bollinger_calculator=bollinger_calculator,
+                    )
+                    timing_add("initial_base_series", initial_base_started)
             for evaluation_index in range(start_index, final_index + 1):
+                self._check_cancelled()
                 context_prefix = candles[: evaluation_index + 1]
-                if reuse_default_base_series:
+                if authoritative_base_series is not None:
+                    prefix = context_prefix
+                    history_index_offset = 0
+                elif reuse_default_base_series:
                     prefix, history_index_offset = _indicator_history_prefix(
                         candles,
                         evaluation_index,
@@ -609,18 +1004,54 @@ class ValidationHistoricalReplay:
                 prefix_json = (
                     None if use_read_only_fast_path else _canonical_json(prefix)
                 )
-                base_series_map = (
-                    build_indicator_follow_base_series(
-                        prefix
-                        if use_read_only_fast_path
-                        else _fresh_json(prefix_json),
-                        rules
-                        if use_read_only_fast_path
-                        else _fresh_json(rules_json),
+                base_series_map = None
+                if authoritative_base_series is not None:
+                    base_series_map = _replay_prefix_series_map(
+                        authoritative_base_series, evaluation_index + 1,
                     )
-                    if reuse_default_base_series and evaluation_index >= 2
-                    else None
-                )
+                elif reuse_default_base_series and evaluation_index >= 2:
+                    if (
+                        initial_base_series is not None
+                        and history_index_offset == 0
+                        and stable_prefix_length <= len(prefix) <= initial_window_length
+                    ):
+                        base_series_map = _replay_prefix_series_map(
+                            initial_base_series, len(prefix),
+                        )
+                    else:
+                        if (
+                            parallel_prefetch is not None
+                            and history_index_offset > 0
+                        ):
+                            try:
+                                base_series_map = parallel_prefetch.result_for(
+                                    evaluation_index
+                                )
+                            except Exception:
+                                parallel_prefetch.close(wait=False)
+                                parallel_prefetch = None
+                        if base_series_map is None:
+                            sliding_base_started = timing_start()
+                            base_series_map = build_indicator_follow_base_series(
+                                prefix
+                                if use_read_only_fast_path
+                                else _fresh_json(prefix_json),
+                                rules
+                                if use_read_only_fast_path
+                                else _fresh_json(rules_json),
+                                _bollinger_calculator=bollinger_calculator,
+                            )
+                            sliding_base_series_calls += 1
+                            timing_add("sliding_base_series", sliding_base_started)
+                # One detached prefix list per authoritative evaluation, never
+                # retained on the replay or shared with the next index.
+                signal_price_kwargs = {}
+                if (
+                    authoritative_base_series is not None
+                    and evaluation_index >= 2
+                    and rules.get("enabled", True)
+                ):
+                    signal_price_kwargs["_signal_price_series"] = list(base_series_map["CLOSE"])
                 for side in ("SELL", "BUY"):
                     observer = ValidationTraceObserver()
                     context = {
@@ -630,6 +1061,7 @@ class ValidationHistoricalReplay:
                     if reuse_default_base_series:
                         context["_indicator_follow_validation_current_price"] = context_prefix[-1].get("close")
                     if context_provider is not None:
+                        context_started = timing_start()
                         fast_context = getattr(
                             context_provider,
                             "context_for_fast",
@@ -665,6 +1097,8 @@ class ValidationHistoricalReplay:
                             if use_read_only_fast_path
                             else _fresh_json(_canonical_json(supplied))
                         )
+                        timing_add("context", context_started)
+                    evaluator_started = timing_start()
                     if base_series_map is None:
                         signal = self._evaluator(
                             prefix
@@ -685,7 +1119,11 @@ class ValidationHistoricalReplay:
                             else _fresh_json(rules_json),
                             context,
                             _base_series_map=base_series_map,
+                            **signal_price_kwargs,
                         )
+                    evaluator_calls += 1
+                    timing_add("evaluator", evaluator_started)
+                    entry_started = timing_start()
                     entries.append(
                         self._entry_from_signal(
                             side,
@@ -696,7 +1134,9 @@ class ValidationHistoricalReplay:
                             else _fresh_json(prefix_json),
                             signal,
                             self._trace_with_context(
-                                _remap_trace_indexes(
+                                observer.snapshot()
+                                if authoritative_base_series is not None
+                                else _remap_trace_indexes(
                                     observer.snapshot(),
                                     history_index_offset,
                                 ),
@@ -706,6 +1146,14 @@ class ValidationHistoricalReplay:
                             signal_index_offset=history_index_offset,
                         )
                     )
+                    timing_add("entry_trace", entry_started)
+            parallel_completed = True
+        except ValidationReplayCancelled as exc:
+            return ValidationReplayResult(
+                False,
+                reason=REASON_REPLAY_CANCELLED,
+                error=str(exc),
+            )
         except Exception as exc:
             reason = (
                 REASON_INVALID_ROUTINE_SIGNAL
@@ -713,12 +1161,24 @@ class ValidationHistoricalReplay:
                 else REASON_EVALUATOR_ERROR
             )
             return ValidationReplayResult(False, reason=reason, error=str(exc))
+        finally:
+            if parallel_prefetch is not None:
+                parallel_prefetch.close(wait=parallel_completed)
 
+        try:
+            self._check_cancelled()
+        except ValidationReplayCancelled as exc:
+            return ValidationReplayResult(
+                False,
+                reason=REASON_REPLAY_CANCELLED,
+                error=str(exc),
+            )
         availability = self.session.readiness()
         if not availability.allowed:
             return ValidationReplayResult(False, reason=availability.reason)
 
         try:
+            snapshot_started = timing_start()
             snapshot = ValidationReplaySnapshot(
                 stock=request.stock,
                 timeframe_minutes=request.timeframe_minutes,
@@ -731,11 +1191,35 @@ class ValidationHistoricalReplay:
                 candles=candles,
                 entries=entries,
             )
+            timing_add("snapshot", snapshot_started)
         except (TypeError, ValueError, OverflowError) as exc:
             return ValidationReplayResult(
                 False,
                 reason=REASON_INVALID_ROUTINE_SIGNAL,
                 error=str(exc),
+            )
+        if trace_timing:
+            trace_signal_validation_event(
+                "replay.evaluate.phase_timing",
+                stock=request.stock.code,
+                timeframe=historical_snapshot.timeframe_key,
+                candle_count=len(candles),
+                start_index=start_index,
+                end_index=final_index,
+                display_count=display_count,
+                history_target_bars=history_target_bars,
+                read_only_fast_path=use_read_only_fast_path,
+                parallel_workers=self._parallel_base_series_workers,
+                sliding_base_series_calls=sliding_base_series_calls,
+                evaluator_calls=evaluator_calls,
+                phase_ms={
+                    key: round(value, 3)
+                    for key, value in timing_ms.items()
+                },
+                total_ms=round(
+                    (time.perf_counter() - replay_started) * 1000.0,
+                    3,
+                ),
             )
         return ValidationReplayResult(True, snapshot=snapshot)
 
@@ -764,6 +1248,7 @@ class ValidationHistoricalReplay:
         ):
             raise ValueError("historical snapshot identity mismatch")
 
+        self._check_cancelled()
         candles, _dropped_count = project_validation_candles(historical_snapshot)
         if not candles:
             return []
@@ -775,6 +1260,7 @@ class ValidationHistoricalReplay:
         history_target_bars = _required_validation_history_context_bars(rules)
         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
         if reuse_default_base_series:
+            self._check_cancelled()
             try:
                 from .routine_validation_batch import (
                     scan_indicator_follow_validation_batch,
@@ -789,6 +1275,7 @@ class ValidationHistoricalReplay:
                 )
             except Exception:
                 batch_result = None
+            self._check_cancelled()
             if batch_result is not None and batch_result.supported is True:
                 return [
                     self._entry_from_signal(
@@ -805,6 +1292,7 @@ class ValidationHistoricalReplay:
                     )
                     for record in batch_result.records
                 ]
+        self._check_cancelled()
         base_series_map = (
             build_indicator_follow_base_series(candles, rules)
             if reuse_default_base_series
@@ -812,6 +1300,7 @@ class ValidationHistoricalReplay:
         )
         entries: list[ValidationReplayEntry] = []
         for evaluation_index in range(start_index, final_index + 1):
+            self._check_cancelled()
             context_prefix = candles[: evaluation_index + 1]
             if reuse_default_base_series:
                 prefix, history_index_offset = _indicator_history_prefix(
@@ -899,6 +1388,7 @@ class ValidationHistoricalReplay:
                         signal_index_offset=history_index_offset,
                     )
                 )
+        self._check_cancelled()
         return entries
 
     def evaluate_with_context(

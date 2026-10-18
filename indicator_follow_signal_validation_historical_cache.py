@@ -390,6 +390,42 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 market_source=market_source,
             )
 
+    def capture_store_lease(self, stock_code: object) -> tuple[str, str]:
+        """Capture the current per-stock cache state for a guarded later write."""
+        code = str(stock_code or "").strip()
+        if not code:
+            raise ValueError("stock_code is required")
+        with _CACHE_WRITE_LOCK:
+            state = self._read_cache_state_unlocked(code)
+            if state is None:
+                return ("ABSENT", "")
+            return (str(state["state"]), str(state["generation"]))
+
+    def store_if_lease_current(
+        self, *, cache_lease: object, stock_code: object, stock_name: object,
+        timeframe_minutes: object, requested_count: object, candles: object,
+        timeframe_key: object | None = None, market_data_identity: object = "",
+        market_source: object = "", after_store: object = None,
+    ) -> bool:
+        """Store data and its source marker in one lease-checked transaction."""
+        code = str(stock_code or "").strip()
+        if not code or not isinstance(cache_lease, tuple) or len(cache_lease) != 2:
+            return False
+        expected = (str(cache_lease[0]), str(cache_lease[1]))
+        with _CACHE_WRITE_LOCK:
+            state = self._read_cache_state_unlocked(code)
+            current = (("ABSENT", "") if state is None
+                       else (str(state["state"]), str(state["generation"])))
+            if expected != current or current[0] == _CACHE_STATE_INVALIDATED:
+                return False
+            stored = self.store(stock_code=code, stock_name=stock_name,
+                timeframe_minutes=timeframe_minutes, requested_count=requested_count,
+                candles=candles, timeframe_key=timeframe_key,
+                market_data_identity=market_data_identity, market_source=market_source)
+            if not stored:
+                return False
+            return after_store() is True if callable(after_store) else True
+
     def _store_unlocked(
         self,
         *,

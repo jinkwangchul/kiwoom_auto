@@ -13,7 +13,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from engines.condition_engine import (
     evaluate_condition,
@@ -1612,7 +1613,10 @@ def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested
     return None
 
 
-def _enrich_price_compare_series(series_map: dict[str, list[float | None]], context: dict[str, Any] | None) -> None:
+def _enrich_price_compare_series(
+    series_map: dict[str, list[float | None]], context: dict[str, Any] | None,
+    *, _signal_price_series: list[float | None] | None = None,
+) -> None:
     close_series = series_map.get("CLOSE")
     length = len(close_series) if isinstance(close_series, list) else 0
     current_price = _context_float(
@@ -1660,7 +1664,14 @@ def _enrich_price_compare_series(series_map: dict[str, list[float | None]], cont
     # candidate signal point. Once the signal is emitted, the same value is
     # persisted as signal_bar_close/signal_price by the execution boundary.
     if isinstance(close_series, list):
-        series_map["SIGNAL_PRICE"] = list(close_series)
+        # Private replay-owned, detached list; generic callers still materialize.
+        series_map["SIGNAL_PRICE"] = (
+            _signal_price_series
+            if type(_signal_price_series) is list
+            and _signal_price_series is not close_series
+            and len(_signal_price_series) == length
+            else list(close_series)
+        )
     # CURRENT_PRICE is an evaluation-time strategy axis. It must remain the
     # same fresh value even when a condition belongs to a delayed signal bar.
     # Keep the axis present with None when fresh evidence is unavailable so
@@ -1854,12 +1865,420 @@ def build_indicator_follow_base_series(
     return series_map
 
 
+_VALIDATION_DIRECT_SERIES = {
+    "CLOSE",
+    "VOLUME",
+    "MACD",
+    "SIGNAL",
+    "OSC",
+    "RSI",
+}
+_VALIDATION_DYNAMIC_SERIES = {
+    "AVG_PRICE",
+    "SIGNAL_PRICE",
+    "CURRENT_PRICE",
+}
+
+
+def _validation_minimal_series_targets(
+    config: dict[str, Any],
+) -> set[str] | None:
+    """Return exact replay dependencies, or None for a safe full fallback."""
+    buy_cfg = _section(config, "buy")
+    indicator_cfg = (
+        config.get("indicators")
+        if isinstance(config.get("indicators"), dict)
+        else config
+    )
+    filters = buy_cfg.get("filters")
+    if filters is not None and not isinstance(filters, dict):
+        return None
+    if isinstance(filters, dict):
+        supported_filter_names = set(BUY_FILTER_ORDER) | {"composite"}
+        for raw_name, filter_cfg in filters.items():
+            name = str(raw_name or "").strip().lower()
+            if name not in supported_filter_names:
+                if filter_cfg:
+                    return None
+                continue
+            if not isinstance(filter_cfg, dict):
+                return None
+    targets: set[str] = {"CLOSE", "VOLUME"}
+
+    def add_condition(
+        condition: Any,
+        *,
+        include_disabled: bool = False,
+    ) -> bool:
+        if not isinstance(condition, dict):
+            return False
+        if not include_disabled and not bool(condition.get("enabled", True)):
+            return True
+        for field in ("target", "compare_target"):
+            raw = condition.get(field)
+            if raw is None or not str(raw).strip():
+                if field == "target":
+                    return False
+                continue
+            key = str(raw).strip().upper()
+            if key in _VALIDATION_DYNAMIC_SERIES:
+                continue
+            if key not in _VALIDATION_DIRECT_SERIES:
+                return False
+            targets.add(key)
+        return True
+
+    groups = buy_cfg.get("groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                return None
+            if not bool(group.get("enabled", True)):
+                continue
+            conditions = group.get("conditions")
+            if not isinstance(conditions, list):
+                return None
+            if any(not add_condition(condition) for condition in conditions):
+                return None
+
+    rsi_filter = _buy_rsi_filter_config(config, buy_cfg)
+    if rsi_filter and bool(rsi_filter.get("enabled", True)):
+        rsi_condition = _first_rsi_condition(rsi_filter)
+        indicator_rsi = _indicator_rsi_config(config)
+        rsi_period = _safe_int(
+            rsi_condition.get("period", indicator_rsi.get("period", 14))
+        )
+        rsi_operator = _normalize_rsi_operator(
+            rsi_condition.get(
+                "operator",
+                rsi_condition.get(
+                    "compare_operator",
+                    rsi_condition.get("compare"),
+                ),
+            )
+        )
+        rsi_threshold = _safe_float(
+            rsi_condition.get("threshold", rsi_condition.get("value"))
+        )
+        if (
+            rsi_period is None
+            or rsi_period <= 0
+            or rsi_operator is None
+            or rsi_threshold is None
+        ):
+            return None
+        targets.add(f"_VALIDATION_RSI_{rsi_period}")
+
+    moving_average_filter = _buy_moving_average_filter_config(config, buy_cfg)
+    if moving_average_filter and bool(
+        moving_average_filter.get("enabled", True)
+    ):
+        ma_condition = _first_moving_average_condition(moving_average_filter)
+        ma_period = _safe_int(
+            ma_condition.get(
+                "period",
+                moving_average_filter.get("period", 60),
+            )
+        )
+        configured_ma_periods: set[int] = set()
+        raw_ma_periods = indicator_cfg.get("moving_averages", [5, 20, 60])
+        if not isinstance(raw_ma_periods, list):
+            raw_ma_periods = [5, 20, 60]
+        for raw_period in raw_ma_periods:
+            try:
+                configured_period = int(raw_period)
+            except (TypeError, ValueError):
+                continue
+            if configured_period > 0:
+                configured_ma_periods.add(configured_period)
+        if (
+            ma_period is None
+            or ma_period <= 0
+            or ma_period not in configured_ma_periods
+            or ma_condition.get("target", "CLOSE") != "CLOSE"
+            or ma_condition.get("compare_target", "MA") != "MA"
+        ):
+            return None
+        targets.add(f"MA{ma_period}")
+
+    price_compare_filter = canonicalize_buy_strategy_price_compare_filter(
+        _buy_price_compare_filter_config(config, buy_cfg)
+    )
+    if price_compare_filter and bool(
+        price_compare_filter.get("enabled", True)
+    ):
+        price_conditions = price_compare_filter.get("conditions")
+        if not isinstance(price_conditions, list) or not price_conditions:
+            return None
+        for condition in price_conditions:
+            if not isinstance(condition, dict):
+                return None
+            for field in ("target", "compare_target"):
+                key = str(condition.get(field) or "").strip().upper()
+                if not key:
+                    return None
+                if key in _VALIDATION_DYNAMIC_SERIES:
+                    continue
+                if key not in _VALIDATION_DIRECT_SERIES:
+                    return None
+                targets.add(key)
+
+    bollinger_filter = _buy_bollinger_filter_config(config, buy_cfg)
+    if bollinger_filter and bool(bollinger_filter.get("enabled", True)):
+        bollinger_conditions = bollinger_filter.get("conditions")
+        if (
+            not isinstance(bollinger_conditions, list)
+            or not bollinger_conditions
+            or not isinstance(bollinger_conditions[0], dict)
+        ):
+            return None
+        bollinger_condition = bollinger_conditions[0]
+        compare_target = str(
+            bollinger_condition.get("compare_target") or ""
+        ).strip().upper()
+        if compare_target == "BOLLINGER":
+            compare_target = "BOLLINGER_LOWER"
+        if compare_target not in {
+            "BOLLINGER_LOWER",
+            "BOLLINGER_UPPER",
+        }:
+            return None
+        targets.update({"BOLLINGER_LOWER", "BOLLINGER_UPPER"})
+
+    ocr_filter = _buy_ocr_filter_config(config, buy_cfg)
+    if ocr_filter and bool(ocr_filter.get("enabled", True)):
+        ocr_conditions = ocr_filter.get("conditions")
+        if not isinstance(ocr_conditions, list) or not ocr_conditions:
+            return None
+        for condition in ocr_conditions:
+            if not isinstance(condition, dict):
+                return None
+            runtime_condition = dict(condition)
+            runtime_condition.setdefault("target", "OSC")
+            if not add_condition(
+                runtime_condition,
+                include_disabled=True,
+            ):
+                return None
+
+    sell_cfg = _section(config, "sell")
+    for signal_cfg in _condition_sell_signals(sell_cfg).values():
+        if not isinstance(signal_cfg, dict):
+            return None
+        if not bool(signal_cfg.get("enabled", True)):
+            continue
+        groups = signal_cfg.get("groups")
+        if not isinstance(groups, list):
+            return None
+        for group in groups:
+            if not isinstance(group, dict):
+                return None
+            if not bool(group.get("enabled", True)):
+                continue
+            conditions = group.get("conditions")
+            if not isinstance(conditions, list):
+                return None
+            if any(not add_condition(condition) for condition in conditions):
+                return None
+
+    # The canonical full builder always parses MACD, RSI, and Bollinger
+    # parameters even when a particular replay rule does not consume them.
+    # Preserve its fail-closed errors instead of silently substituting defaults.
+    macd_cfg = (
+        indicator_cfg.get("macd")
+        if isinstance(indicator_cfg.get("macd"), dict)
+        else {}
+    )
+    rsi_cfg = (
+        indicator_cfg.get("rsi")
+        if isinstance(indicator_cfg.get("rsi"), dict)
+        else {}
+    )
+    bollinger_cfg = (
+        indicator_cfg.get("bollinger")
+        if isinstance(indicator_cfg.get("bollinger"), dict)
+        else {}
+    )
+    try:
+        int(macd_cfg.get("fast", 12) or 12)
+        int(macd_cfg.get("slow", 26) or 26)
+        int(macd_cfg.get("signal", 9) or 9)
+        int(rsi_cfg.get("period", 14) or 14)
+        int(bollinger_cfg.get("period", 20) or 20)
+    except (TypeError, ValueError):
+        return None
+
+    return targets
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _ValidationRSIProvenance:
+    """Ephemeral evidence from one minimal build, never a cross-replay cache."""
+
+    key: str
+    period: int
+    history_window: int
+    candles: list[dict[str, Any]]
+    candle_snapshot: list[dict[str, Any]]
+    series: list[float | None]
+    values: tuple[float | None, ...]
+
+    def matches(self, candles, key, period, history_window, series) -> bool:
+        try:
+            return (
+                self.key == key
+                and self.period == period
+                and self.history_window == history_window
+                and self.candles is candles
+                and self.series is series
+                and len(series) == len(candles) == len(self.values)
+                and candles == self.candle_snapshot
+                and tuple(series) == self.values
+            )
+        except Exception:
+            return False
+
+
+def build_indicator_follow_validation_series(
+    candles: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+    *,
+    _bollinger_calculator: Callable[
+        [list[float | None], int, float],
+        tuple[list[float | None], list[float | None], list[float | None]],
+    ] | None = None,
+    _rsi_provenance_out: list[_ValidationRSIProvenance] | None = None,
+) -> dict[str, list[float | None]]:
+    """Build only series proven necessary for exact validation replay.
+
+    Unsupported or filter-rich configurations fail safely to the canonical
+    full builder instead of guessing dependencies.
+    """
+    cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
+    targets = _validation_minimal_series_targets(cfg)
+    if targets is None:
+        return build_indicator_follow_base_series(candles, cfg)
+
+    history_window = indicator_history_target_bars_from_rules(cfg)
+    closes = close_prices(candles)
+    series_map: dict[str, list[float | None]] = {
+        "CLOSE": closes,
+    }
+    if "VOLUME" in targets:
+        from engines.indicator_engine import volumes
+        series_map["VOLUME"] = volumes(candles)
+
+    indicator_cfg = (
+        cfg.get("indicators")
+        if isinstance(cfg.get("indicators"), dict)
+        else cfg
+    )
+
+    validation_rsi_periods = sorted(
+        int(target.removeprefix("_VALIDATION_RSI_"))
+        for target in targets
+        if target.startswith("_VALIDATION_RSI_")
+        and target.removeprefix("_VALIDATION_RSI_").isdigit()
+    )
+    for period in validation_rsi_periods:
+        series_map[f"_VALIDATION_RSI_{period}"] = rsi_causal_history(
+            closes,
+            period,
+            history_window,
+        )
+        if _rsi_provenance_out is not None:
+            # Capture only the result just calculated here. If evidence cannot
+            # be detached, admission retains its canonical recalculation path.
+            try:
+                key = f"_VALIDATION_RSI_{period}"
+                _rsi_provenance_out.append(_ValidationRSIProvenance(
+                    key, period, history_window, candles, deepcopy(candles),
+                    series_map[key], tuple(series_map[key]),
+                ))
+            except Exception:
+                pass
+
+    moving_average_periods = sorted(
+        int(target[2:])
+        for target in targets
+        if target.startswith("MA") and target[2:].isdigit()
+    )
+    if moving_average_periods:
+        from engines.indicator_engine import simple_ma
+
+        for period in moving_average_periods:
+            series_map[f"MA{period}"] = simple_ma(closes, period)
+
+    if targets & {"BOLLINGER_LOWER", "BOLLINGER_UPPER"}:
+        from engines.indicator_engine import bollinger_band
+
+        bollinger_cfg = (
+            indicator_cfg.get("bollinger")
+            if isinstance(indicator_cfg.get("bollinger"), dict)
+            else {}
+        )
+        bollinger_period = _safe_int(bollinger_cfg.get("period")) or 20
+        bollinger_std = _safe_float(bollinger_cfg.get("std", 2.0)) or 2.0
+        calculate_bollinger = (
+            bollinger_band if _bollinger_calculator is None else _bollinger_calculator
+        )
+        lower, _middle, upper = calculate_bollinger(
+            closes,
+            bollinger_period,
+            bollinger_std,
+        )
+        series_map["BOLLINGER_LOWER"] = lower
+        series_map["BOLLINGER_UPPER"] = upper
+
+    if targets & {"MACD", "SIGNAL", "OSC"}:
+        macd_cfg = (
+            indicator_cfg.get("macd")
+            if isinstance(indicator_cfg.get("macd"), dict)
+            else {}
+        )
+        fast = _safe_int(macd_cfg.get("fast")) or 12
+        slow = _safe_int(macd_cfg.get("slow")) or 26
+        signal_period = _safe_int(macd_cfg.get("signal")) or 9
+        macd_line, signal_line, osc = macd_series_causal_history(
+            closes,
+            fast,
+            slow,
+            signal_period,
+            history_window,
+        )
+        series_map["MACD"] = macd_line
+        series_map["SIGNAL"] = signal_line
+        series_map["OSC"] = osc
+
+    rsi_cfg = (
+        indicator_cfg.get("rsi")
+        if isinstance(indicator_cfg.get("rsi"), dict)
+        else {}
+    )
+    rsi_period = _safe_int(rsi_cfg.get("period")) or 14
+    if "RSI" in targets:
+        series_map["RSI"] = rsi_causal_history(
+            closes,
+            rsi_period,
+            history_window,
+        )
+
+    for period in _configured_sell_rsi_periods(cfg):
+        series_map[_rsi_runtime_series_key(period)] = rsi_causal_history(
+            closes,
+            period,
+            history_window,
+        )
+    return series_map
+
+
 def evaluate_indicator_follow_routine(
     candles: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
     *,
     _base_series_map: dict[str, list[float | None]] | None = None,
+    _signal_price_series: list[float | None] | None = None,
 ) -> RoutineSignal:
     """MACD 루틴을 평가한다.
 
@@ -1891,7 +2310,11 @@ def evaluate_indicator_follow_routine(
         ):
             raise TypeError("_base_series_map must be an indicator series mapping")
         series_map = dict(_base_series_map)
-    _enrich_price_compare_series(series_map, context)
+    _enrich_price_compare_series(
+        series_map, context,
+        **({"_signal_price_series": _signal_price_series}
+           if _signal_price_series is not None else {}),
+    )
 
     buy_cfg = _section(cfg, "buy")
     sell_cfg = _section(cfg, "sell")

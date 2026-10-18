@@ -28,6 +28,7 @@ from indicator_follow_strategy_price_contract import (
 
 from .routine_macd_engine import (
     BUY_FILTER_ORDER,
+    _ValidationRSIProvenance,
     _buy_composite_filter_config,
     _buy_filter_config_map,
     _buy_ocr_filter_config,
@@ -1023,6 +1024,91 @@ def _authoritative_record(side: str, evaluation_index: int, expected_index: int,
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedValidationBatch:
+    rules: dict[str, Any]
+    evaluation_maps: tuple[dict[str, Any], ...]
+    buy_cfg: dict[str, Any]
+    sell_cfg: dict[str, Any]
+    buy_groups: _CompiledGroups
+    sell_signals: tuple[_CompiledSellSignal, ...]
+    buy_delay: int
+    sell_delay: int
+    expression_mode: bool
+    composite_cfg: dict[str, Any]
+    compiled_filters: dict[str, tuple[bool, ...] | None]
+    profit_cfg: dict[str, Any]
+
+
+def _prepare_indicator_follow_validation_batch(
+    candles: list[dict[str, Any]],
+    rules: dict[str, Any],
+    base_series: dict[str, list[float | None]],
+    *,
+    _rsi_provenance: list[_ValidationRSIProvenance] | None = None,
+) -> _PreparedValidationBatch:
+    """Compile supported rules without evaluating signals or advancing context.
+
+    The scanner consumes the prepared values; authoritative replay uses only
+    admission. Keep caller-owned rules and series untouched in both cases.
+    """
+    rules = canonicalize_buy_strategy_price_comparison_rules(rules)
+    base_series = dict(base_series)
+    rsi_period = _buy_rsi_period(rules)
+    if rsi_period is not None:
+        key = f"_VALIDATION_RSI_{rsi_period}"
+        history_window = indicator_history_target_bars_from_rules(rules)
+        reusable = isinstance(_rsi_provenance, list) and any(
+            type(evidence) is _ValidationRSIProvenance
+            and evidence.matches(candles, key, rsi_period, history_window, base_series.get(key))
+            for evidence in _rsi_provenance
+        )
+        if not reusable:
+            base_series[key] = rsi_causal_history(
+                close_prices(candles), rsi_period, history_window,
+            )
+    evaluation_maps = _evaluation_series_maps(base_series)
+    buy_cfg = rules.get("buy") if isinstance(rules.get("buy"), dict) else {}
+    sell_cfg = rules.get("sell") if isinstance(rules.get("sell"), dict) else {}
+    buy_ocr_cfg = _buy_ocr_filter_config(rules, buy_cfg)
+    buy_delay = int(buy_ocr_cfg.get("order_delay_bars", buy_cfg.get("delay_bar", 1)) or 0)
+    macd_sell_cfg = _macd_sell_section(sell_cfg)
+    sell_delay = int(macd_sell_cfg.get("delay_bar", sell_cfg.get("delay_bar", 1)) or 0)
+    if buy_delay < 0 or sell_delay < 0:
+        raise _Unsupported("BATCH_DELAY_UNSUPPORTED")
+    buy_groups = _compile_groups(buy_cfg.get("groups", []), buy_delay, evaluation_maps, base_series)
+    condition_signals = _condition_sell_signals(sell_cfg)
+    sell_signals: list[_CompiledSellSignal] = []
+    for name, cfg in condition_signals.items():
+        delay = int(cfg.get("order_delay_bars", sell_delay) or 0)
+        if delay < 0:
+            raise _Unsupported("BATCH_DELAY_UNSUPPORTED")
+        sell_signals.append(_CompiledSellSignal(
+            name,
+            bool(cfg.get("enabled", True)),
+            _compile_groups(cfg.get("groups", []), delay, evaluation_maps, base_series),
+            cfg.get("signal_expression"),
+        ))
+    composite_cfg = _buy_composite_filter_config(rules, buy_cfg)
+    expression_mode = _is_buy_expression_mode(composite_cfg)
+    _validate_filters(
+        rules,
+        buy_cfg,
+        base_series,
+        expression_mode=expression_mode,
+    )
+    compiled_filters = {
+        name: _compile_filter_values(name, candles, rules, buy_cfg, buy_delay, evaluation_maps)
+        for name in BUY_FILTER_ORDER
+    }
+    profit_cfg = _profit_rate_sell_section(sell_cfg)
+    return _PreparedValidationBatch(
+        rules, evaluation_maps, buy_cfg, sell_cfg, buy_groups,
+        tuple(sell_signals), buy_delay, sell_delay, expression_mode,
+        composite_cfg, compiled_filters, profit_cfg,
+    )
+
+
 def scan_indicator_follow_validation_batch(candles: list[dict[str, Any]], rules: dict[str, Any], *, start_index: int = 0, end_index: int | None = None, context_provider: Callable[..., dict[str, Any]] | None = None) -> ValidationBatchScanResult:
     """Return a detached prototype scan, or unsupported for legacy fallback."""
     if not isinstance(candles, list) or not candles:
@@ -1044,48 +1130,14 @@ def scan_indicator_follow_validation_batch(candles: list[dict[str, Any]], rules:
 
     try:
         base_series = build_indicator_follow_base_series(candles, rules)
-        rsi_period = _buy_rsi_period(rules)
-        if rsi_period is not None:
-            base_series[f"_VALIDATION_RSI_{rsi_period}"] = rsi_causal_history(
-                close_prices(candles),
-                rsi_period,
-                indicator_history_target_bars_from_rules(rules),
-            )
-        evaluation_maps = _evaluation_series_maps(base_series)
-        buy_cfg = rules.get("buy") if isinstance(rules.get("buy"), dict) else {}
-        sell_cfg = rules.get("sell") if isinstance(rules.get("sell"), dict) else {}
-        buy_ocr_cfg = _buy_ocr_filter_config(rules, buy_cfg)
-        buy_delay = int(buy_ocr_cfg.get("order_delay_bars", buy_cfg.get("delay_bar", 1)) or 0)
-        macd_sell_cfg = _macd_sell_section(sell_cfg)
-        sell_delay = int(macd_sell_cfg.get("delay_bar", sell_cfg.get("delay_bar", 1)) or 0)
-        if buy_delay < 0 or sell_delay < 0:
-            raise _Unsupported("BATCH_DELAY_UNSUPPORTED")
-        buy_groups = _compile_groups(buy_cfg.get("groups", []), buy_delay, evaluation_maps, base_series)
-        condition_signals = _condition_sell_signals(sell_cfg)
-        sell_signals: list[_CompiledSellSignal] = []
-        for name, cfg in condition_signals.items():
-            delay = int(cfg.get("order_delay_bars", sell_delay) or 0)
-            if delay < 0:
-                raise _Unsupported("BATCH_DELAY_UNSUPPORTED")
-            sell_signals.append(_CompiledSellSignal(
-                name,
-                bool(cfg.get("enabled", True)),
-                _compile_groups(cfg.get("groups", []), delay, evaluation_maps, base_series),
-                cfg.get("signal_expression"),
-            ))
-        composite_cfg = _buy_composite_filter_config(rules, buy_cfg)
-        expression_mode = _is_buy_expression_mode(composite_cfg)
-        _validate_filters(
-            rules,
-            buy_cfg,
-            base_series,
-            expression_mode=expression_mode,
-        )
-        compiled_filters = {
-            name: _compile_filter_values(name, candles, rules, buy_cfg, buy_delay, evaluation_maps)
-            for name in BUY_FILTER_ORDER
-        }
-        profit_cfg = _profit_rate_sell_section(sell_cfg)
+        prepared = _prepare_indicator_follow_validation_batch(candles, rules, base_series)
+        rules = prepared.rules
+        evaluation_maps = prepared.evaluation_maps
+        buy_cfg, sell_cfg = prepared.buy_cfg, prepared.sell_cfg
+        buy_groups, sell_signals = prepared.buy_groups, prepared.sell_signals
+        sell_delay = prepared.sell_delay
+        expression_mode, composite_cfg = prepared.expression_mode, prepared.composite_cfg
+        compiled_filters, profit_cfg = prepared.compiled_filters, prepared.profit_cfg
     except _Unsupported as exc:
         return ValidationBatchScanResult(False, fallback_reason=str(exc))
     except (TypeError, ValueError, OverflowError, KeyError):

@@ -652,6 +652,8 @@ class IndicatorFollowRoutineSettingsDialog(
     """
 
     signal_validation_requested = pyqtSignal(object)
+    signal_validation_v4_requested = pyqtSignal(object)
+    signal_validation_v5_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -736,8 +738,33 @@ class IndicatorFollowRoutineSettingsDialog(
                 raise
             self.signal_validation_button.setEnabled(False)
             self.signal_validation_button.setToolTip("검증차트2를 사용할 수 없습니다.")
-            return None
-        return bind_indicator_follow_signal_validation_flow(owner, self)
+            v2_flow = None
+        else:
+            v2_flow = bind_indicator_follow_signal_validation_flow(owner, self)
+
+        try:
+            from gui_indicator_follow_signal_validation_v4_flow import (
+                bind_indicator_follow_signal_validation_v4_flow,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "gui_indicator_follow_signal_validation_v4_flow":
+                raise
+            self.signal_validation_v4_button.setEnabled(False)
+        else:
+            bind_indicator_follow_signal_validation_v4_flow(owner, self)
+
+        try:
+            from gui_indicator_follow_signal_validation_v5_flow import (
+                bind_indicator_follow_signal_validation_v5_flow,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "gui_indicator_follow_signal_validation_v5_flow":
+                raise
+            self.signal_validation_v5_button.setEnabled(False)
+        else:
+            bind_indicator_follow_signal_validation_v5_flow(owner, self)
+
+        return v2_flow
 
     def _show_with_initial_control_section_state(self):
         self.showNormal()
@@ -814,6 +841,8 @@ class IndicatorFollowRoutineSettingsDialog(
         button_row = QHBoxLayout()
         self.reload_button = QPushButton("되돌리기")
         self.signal_validation_button = QPushButton("검증차트2")
+        self.signal_validation_v4_button = QPushButton("검증차트4")
+        self.signal_validation_v5_button = QPushButton("검증차트5")
         if self.settings_mode == "edit":
             self.save_button = QPushButton("변경")
         else:
@@ -828,6 +857,12 @@ class IndicatorFollowRoutineSettingsDialog(
         self.signal_validation_button.clicked.connect(
             self._handle_signal_validation_clicked
         )
+        self.signal_validation_v4_button.clicked.connect(
+            self._handle_signal_validation_v4_clicked
+        )
+        self.signal_validation_v5_button.clicked.connect(
+            self._handle_signal_validation_v5_clicked
+        )
         if self.settings_mode == "edit":
             self.save_button.clicked.connect(self.save_edit_settings_and_close)
         else:
@@ -837,6 +872,8 @@ class IndicatorFollowRoutineSettingsDialog(
         button_row.addWidget(self.reload_button)
         button_row.addStretch(1)
         button_row.addWidget(self.signal_validation_button)
+        button_row.addWidget(self.signal_validation_v4_button)
+        button_row.addWidget(self.signal_validation_v5_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
         root.addLayout(button_row)
@@ -1514,6 +1551,76 @@ class IndicatorFollowRoutineSettingsDialog(
             )
             return None
         self.signal_validation_requested.emit(seed)
+        return seed
+
+    def _handle_signal_validation_v4_clicked(self):
+        try:
+            from indicator_follow_signal_validation_projection import (
+                IndicatorFollowSignalValidationSeed,
+            )
+            from routines.지표추종매매.routine_validation_contract import (
+                ValidationSettingsSnapshot,
+            )
+
+            snapshot = self.build_signal_validation_entry_snapshot_from_current_ui_state()
+            preview_rules = snapshot.to_dict()
+            source_rules = getattr(self, "rules", None)
+            if not isinstance(source_rules, dict):
+                source_rules = getattr(self, "rules_data", {})
+            source_bar = source_rules.get("bar") if isinstance(source_rules, dict) else None
+            preview_bar = preview_rules.get("bar")
+            if isinstance(source_bar, dict) and isinstance(preview_bar, dict):
+                for key in ("buy_delay_bar", "sell_delay_bar"):
+                    if key in source_bar and key not in preview_bar:
+                        preview_bar[key] = deepcopy(source_bar[key])
+            snapshot = ValidationSettingsSnapshot(preview_rules)
+            seed = IndicatorFollowSignalValidationSeed(
+                snapshot,
+                self.collect_indicator_follow_ui_state(),
+            )
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "검증차트4",
+                "현재 편집 설정으로 V4 신호검증 데이터를 만들 수 없습니다.",
+            )
+            return None
+        self.signal_validation_v4_requested.emit(seed)
+        return seed
+
+    def _handle_signal_validation_v5_clicked(self):
+        try:
+            from indicator_follow_signal_validation_projection import (
+                IndicatorFollowSignalValidationSeed,
+            )
+            from routines.지표추종매매.routine_validation_contract import (
+                ValidationSettingsSnapshot,
+            )
+
+            snapshot = self.build_signal_validation_entry_snapshot_from_current_ui_state()
+            preview_rules = snapshot.to_dict()
+            source_rules = getattr(self, "rules", None)
+            if not isinstance(source_rules, dict):
+                source_rules = getattr(self, "rules_data", {})
+            source_bar = source_rules.get("bar") if isinstance(source_rules, dict) else None
+            preview_bar = preview_rules.get("bar")
+            if isinstance(source_bar, dict) and isinstance(preview_bar, dict):
+                for key in ("buy_delay_bar", "sell_delay_bar"):
+                    if key in source_bar and key not in preview_bar:
+                        preview_bar[key] = deepcopy(source_bar[key])
+            snapshot = ValidationSettingsSnapshot(preview_rules)
+            seed = IndicatorFollowSignalValidationSeed(
+                snapshot,
+                self.collect_indicator_follow_ui_state(),
+            )
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "검증차트5",
+                "현재 편집 설정으로 V5 신호검증 데이터를 만들 수 없습니다.",
+            )
+            return None
+        self.signal_validation_v5_requested.emit(seed)
         return seed
 
     @staticmethod

@@ -220,6 +220,34 @@ def require_signal_replay_parity(
 
 
 
+def signal_replay_entries_cache_signature(entries: Any) -> tuple[Any, ...] | None:
+    """Capture parity dependencies without decoding immutable entry JSON.
+
+    Only exact replay entries containing builtin immutable scalars qualify.
+    Field edits and tuple replacements are checked by content on every request.
+    Mappings, subclasses and mutable payloads retain the full comparator.
+    Reuse requires a successful normal parity gate for this exact signature.
+    """
+    from routines.지표추종매매.routine_validation_replay import ValidationReplayEntry
+
+    if type(entries) is not tuple:
+        return None
+    result = []
+    scalar_types = (str, int, type(None))
+    for entry in entries:
+        if type(entry) is not ValidationReplayEntry:
+            return None
+        values = (
+            entry.evaluation_side, entry.evaluation_index, entry.evaluation_time,
+            entry.signal, entry.signal_index, entry.signal_time, entry.delay_bar,
+            entry._matched_groups_json, entry._details_json,
+        )
+        if not all(type(value) in scalar_types for value in values):
+            return None
+        result.append(values)
+    return tuple(result)
+
+
 _UI_SELL_SIGNAL_NAMES = frozenset({
     "ui_condition_a",
     "ui_condition_b",
@@ -389,6 +417,67 @@ def execution_model_report(rules: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _production_snapshot_has_closed_rows(
+    historical_snapshot: Any,
+    as_of: datetime | None,
+) -> bool:
+    """Validate canonical projected rows without rebuilding their OHLCV values.
+
+    Only exact snapshot/string-row inputs take this gate. Anything outside that
+    representation retains the replay normalizer, including malformed rows.
+    """
+    from routines.지표추종매매.routine_validation_historical import ValidationHistoricalSnapshot
+    from routines.지표추종매매.routine_validation_replay import (
+        _latest_candle_is_forming,
+        _normalized_number,
+    )
+
+    if type(historical_snapshot) is not ValidationHistoricalSnapshot:
+        return False
+    latest = previous = ""
+    for row in historical_snapshot.to_rows():
+        if type(row) is not dict or any(
+            type(row.get(field)) is not str
+            for field in ("체결시간", "현재가", "시가", "고가", "저가", "거래량")
+        ):
+            return False
+        stamp = row["체결시간"]
+        if len(stamp) != 14 or not stamp.isascii() or not stamp.isdigit():
+            return False
+        try:
+            # The strict ASCII shape above makes ISO parsing equivalent to the
+            # replay boundary's strptime, without its per-row format overhead.
+            datetime.fromisoformat(
+                f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}T"
+                f"{stamp[8:10]}:{stamp[10:12]}:{stamp[12:14]}"
+            )
+        except ValueError:
+            return False
+        if _normalized_number(row["현재가"]) is None:
+            return False
+        if stamp > latest:
+            previous, latest = latest, stamp
+        elif previous < stamp < latest:
+            previous = stamp
+    if not latest:
+        raise ValueError("NO_VALID_VALIDATION_CANDLES")
+    if _latest_candle_is_forming(
+        latest, historical_snapshot.timeframe_minutes,
+        timeframe_key=historical_snapshot.timeframe_key, as_of=as_of,
+    ):
+        latest = previous
+    if not latest:
+        # This input is proven invalid after removing its only forming time.
+        # Do not normalize again and observe a later clock across the boundary.
+        raise ValueError("NO_VALID_VALIDATION_CANDLES")
+    # Preserve the legacy report's second forming check (and its exceptions).
+    _latest_candle_is_forming(
+        latest, historical_snapshot.timeframe_minutes,
+        timeframe_key=historical_snapshot.timeframe_key, as_of=as_of,
+    )
+    return True
+
+
 def candle_projection_parity_report(
     historical_snapshot: Any,
     *,
@@ -412,19 +501,27 @@ def candle_projection_parity_report(
             project_validation_candles,
         )
 
-        candles, _dropped_count = project_validation_candles(
-            historical_snapshot,
-            as_of=as_of,
+        production_rows_valid = (
+            type(calculation_provenance) is dict
+            and type(calculation_provenance.get("calculation_source")) is str
+            and calculation_provenance["calculation_source"]
+            == "PRODUCTION_M1_SESSION_AGGREGATION"
+            and _production_snapshot_has_closed_rows(historical_snapshot, as_of)
         )
-        if not candles:
-            raise ValueError("NO_VALID_VALIDATION_CANDLES")
-        latest_time = str(candles[-1].get("time") or "")
-        latest_row_forming = _latest_candle_is_forming(
-            latest_time,
-            historical_snapshot.timeframe_minutes,
-            timeframe_key=historical_snapshot.timeframe_key,
-            as_of=as_of,
-        )
+        if not production_rows_valid:
+            candles, _dropped_count = project_validation_candles(
+                historical_snapshot,
+                as_of=as_of,
+            )
+            if not candles:
+                raise ValueError("NO_VALID_VALIDATION_CANDLES")
+            latest_time = str(candles[-1].get("time") or "")
+            latest_row_forming = _latest_candle_is_forming(
+                latest_time,
+                historical_snapshot.timeframe_minutes,
+                timeframe_key=historical_snapshot.timeframe_key,
+                as_of=as_of,
+            )
     except (AttributeError, TypeError, ValueError):
         return {
             "status": CANDLE_PROJECTION_PARITY_UNKNOWN_INVALID,

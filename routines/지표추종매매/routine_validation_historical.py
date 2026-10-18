@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import json
 from typing import Any, Protocol
 
+from candle_timeframe_aggregation import SEOUL_TIMEZONE
 from .routine_validation_contract import ValidationStockRef
 from .routine_validation_session import ValidationSession
 from indicator_follow_validation_timeframe import normalize_validation_timeframe
@@ -33,6 +35,7 @@ class ValidationHistoricalSnapshot:
     raw_rows_json: str
     market_data_identity: str
     market_source: str
+    request_as_of: str | None
 
     def __init__(
         self,
@@ -45,6 +48,7 @@ class ValidationHistoricalSnapshot:
         rows: list[dict[str, Any]],
         market_data_identity: str | None = None,
         market_source: str | None = None,
+        request_as_of: str | None = None,
     ) -> None:
         if not isinstance(stock, ValidationStockRef):
             raise TypeError("stock must be ValidationStockRef")
@@ -96,6 +100,15 @@ class ValidationHistoricalSnapshot:
             str(market_data_identity or "").strip(),
         )
         object.__setattr__(self, "market_source", str(market_source or "").strip())
+        if request_as_of is not None:
+            try:
+                requested_at = datetime.fromisoformat(request_as_of)
+                if requested_at.tzinfo is None or requested_at.utcoffset() is None:
+                    raise ValueError("request_as_of must have a timezone offset")
+                request_as_of = requested_at.astimezone(SEOUL_TIMEZONE).isoformat()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("request_as_of must be an offset-aware ISO timestamp") from exc
+        object.__setattr__(self, "request_as_of", request_as_of)
 
     def to_rows(self) -> list[dict[str, Any]]:
         rows = json.loads(self.raw_rows_json)
@@ -239,6 +252,8 @@ class ValidationHistoricalProvider:
                 ),
             )
 
+        # Capture the immutable query-time bound before dispatch, never at callback.
+        request_as_of = datetime.now(SEOUL_TIMEZONE).isoformat()
         completed = False
 
         def receive_response(response: object) -> None:
@@ -246,7 +261,12 @@ class ValidationHistoricalProvider:
             if completed:
                 return
             completed = True
-            self._finish(callback, self._process_response(response, count))
+            self._finish(
+                callback,
+                self._process_response(
+                    response, count, request_as_of=request_as_of,
+                ),
+            )
 
         try:
             if timeframe["kind"] == "MINUTE":
@@ -290,6 +310,8 @@ class ValidationHistoricalProvider:
         self,
         response: object,
         requested_count: int,
+        *,
+        request_as_of: str | None = None,
     ) -> ValidationHistoricalResult:
         if not isinstance(response, dict):
             return ValidationHistoricalResult(
@@ -355,6 +377,7 @@ class ValidationHistoricalProvider:
                 rows=rows,
                 market_data_identity=response.get("market_data_identity"),
                 market_source=response.get("market_source"),
+                request_as_of=request_as_of,
             )
         except (TypeError, ValueError, OverflowError):
             return ValidationHistoricalResult(
