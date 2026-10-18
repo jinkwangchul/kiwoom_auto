@@ -42,6 +42,7 @@ from gui_main_emergency_ops import (
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
+    auto_trade_selected_manual_ats_enable_availability,
     auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
     auto_trade_set_selected_manual_ats_flag,
@@ -679,6 +680,9 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
             flag_key,
             enabled,
             label,
+        ),
+        ats_can_enable=lambda key: auto_trade_selected_manual_ats_enable_availability(
+            adapter.selected_stock_infos(), key
         ),
         ats_liquidation_available=(
             lambda: auto_trade_selected_manual_ats_liquidation_available(

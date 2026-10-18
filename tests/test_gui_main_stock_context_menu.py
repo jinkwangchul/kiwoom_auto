@@ -1639,6 +1639,79 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         menu.close()
         root.close()
 
+    def test_main_monitoring_ats_menu_disables_nxt_session_for_krx_only_stock(self) -> None:
+        other_row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="122350",
+            name="삼기",
+            instance_id="instance-b",
+        )
+        self._write_stock_config(other_row, mode="CONTINUOUS")
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="012210",
+            name="삼미금속",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="CONTINUOUS")
+        self._select_rows(other_row)
+        self.app.processEvents()
+        position = self.window.routine_table.visualItemRect(
+            self.window.routine_table.item(row, 0)
+        ).center()
+
+        with patch.object(
+            monitoring_menu, "show_monitor_stock_context_menu"
+        ) as show_menu:
+            self.assertTrue(
+                monitoring_menu.show_main_monitoring_stock_context_menu(
+                    self.window, position
+                )
+            )
+        callbacks = show_menu.call_args.kwargs["callbacks"]
+        self.assertEqual(
+            [(stock_dir, "012210", "삼미금속")],
+            show_menu.call_args.kwargs["selected_targets"],
+        )
+
+        import gui_auto_trade_ats_ops as ats_ops
+
+        state = {"extra1": False, "extra2": False}
+        root = QMenu()
+        with (
+            patch.object(
+                ats_ops, "stock_nxt_availability", return_value=False
+            ) as nxt_availability,
+            patch.object(
+                ats_ops, "stock_krx_after_structural_candidate", return_value=True
+            ),
+            patch.object(
+                common_menu,
+                "manual_ats_visible_session_keys",
+                return_value=("extra1", "extra2"),
+            ),
+        ):
+            ats = common_menu._add_ats_settings_menu(
+                root,
+                has_selection=True,
+                state_getter=lambda: dict(state),
+                toggle=lambda key, enabled, _label: state.__setitem__(key, enabled),
+                enable_availability_getter=callbacks.ats_can_enable,
+            )
+            actions = {key: action for key, _label, action in ats["session_actions"]}
+            self.assertFalse(actions["extra1"].isEnabled())
+            self.assertTrue(actions["extra2"].isEnabled())
+            state["extra1"] = True
+            ats["refresh"]()
+            self.assertTrue(actions["extra1"].isEnabled())
+            ats["toggle_session"]("extra1", "장전프리")
+            self.assertFalse(state["extra1"])
+            self.assertFalse(actions["extra1"].isEnabled())
+            nxt_availability.return_value = True
+            ats["refresh"]()
+            self.assertTrue(actions["extra1"].isEnabled())
+        root.close()
+
     def test_stock_early_close_menu_uses_deep_green_text_only(self) -> None:
         root = QMenu()
         actions = common_menu._add_early_close_menu(
