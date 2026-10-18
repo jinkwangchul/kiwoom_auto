@@ -414,6 +414,9 @@ def _latest_candle_is_forming(
     ):
         return candle_start == current.replace(second=0, microsecond=0)
 
+    if 8 * 60 <= current_minute < 8 * 60 + 50:
+        return candle_start == current.replace(second=0, microsecond=0)
+
     anchor_minute = MARKET_BUCKET_ANCHOR.hour * 60 + MARKET_BUCKET_ANCHOR.minute
     if current_minute < anchor_minute or current_minute >= _VALIDATION_REGULAR_SESSION_END_MINUTE:
         return False

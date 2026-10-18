@@ -3437,12 +3437,52 @@ class KiwoomApi(QObject):
         screen_no: str | None = None,
         callback: Opt10080Callback | None = None,
     ) -> dict[str, Any]:
+        return self._request_period_candles_read_only_common(
+            code, name, timeframe_key=timeframe_key, count=count,
+            screen_no=screen_no, callback=callback,
+        )
+
+    def request_period_candles_read_only_integrated(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        timeframe_key: str,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+        nxt_available: bool | None = None,
+    ) -> dict[str, Any]:
+        clean_code = normalize_stock_code(code)
+        if not is_broker_action_stock_code(clean_code) or nxt_available is not True:
+            return self._finish_callback(callback, {
+                "ok": False, "code": clean_code,
+                "reason_code": "INTEGRATED_SOURCE_NOT_VERIFIED",
+                "error": "canonical stock code and verified NXT eligibility are required",
+            })
+        return self._request_period_candles_read_only_common(
+            clean_code, name, timeframe_key=timeframe_key, count=count,
+            screen_no=screen_no, callback=callback, integrated=True,
+        )
+
+    def _request_period_candles_read_only_common(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        timeframe_key: str,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+        integrated: bool = False,
+    ) -> dict[str, Any]:
         """Request day/week/month/year candles for Validation without Production mutation."""
         clean_code = normalize_stock_code(code)
         market_data_identity = (
-            clean_code if is_broker_action_stock_code(clean_code) else ""
+            (f"{clean_code}_AL" if integrated else clean_code)
+            if is_broker_action_stock_code(clean_code) else ""
         )
-        market_source = "KRX"
+        market_source = "INTEGRATED" if integrated else "KRX"
         key = str(timeframe_key or "").strip().upper()
         trcode = self.VALIDATION_PERIOD_TR_CODES.get(key)
         if not clean_code:

@@ -259,6 +259,101 @@ _MARKET_SNAPSHOT_FIELDS = (
 )
 
 
+class _V5SelectedSourceRequester:
+    """Bind one selected timeframe to one broker request and response."""
+
+    def __init__(self, broker, stock: ValidationStockRef, timeframe_key: str, integrated: bool):
+        self.broker = broker
+        self.stock = stock
+        self.timeframe_key = timeframe_key
+        self.integrated = integrated
+
+    def _request(self, method_name: str, code: str, name: str, count: int,
+                 callback, *, interval: int | None = None) -> object:
+        minute = self.timeframe_key.startswith("M")
+        if (code != self.stock.code or name != self.stock.name
+                or minute != (interval is not None)
+                or (minute and self.timeframe_key != f"M{interval}")):
+            callback({"ok": False, "error": "V5_BROKER_REQUEST_IDENTITY_INVALID"})
+            return None
+        method = getattr(self.broker, method_name, None)
+        if not callable(method):
+            callback({"ok": False, "error": "V5_BROKER_REQUESTER_UNAVAILABLE"})
+            return None
+        started = None
+        buffered = []
+        completed = False
+        expected_identity = f"{code}_AL" if self.integrated else code
+        expected_source = "INTEGRATED" if self.integrated else "KRX"
+        expected_trcode = (
+            "opt10080" if minute else {
+                "D1": "opt10081", "W1": "opt10082",
+                "MO1": "opt10083", "Y1": "opt10094",
+            }.get(self.timeframe_key)
+        )
+
+        def receive(response):
+            nonlocal completed
+            if started is None:
+                buffered.append(response)
+                return
+            if completed:
+                return
+            completed = True
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                callback(response if isinstance(response, dict) else
+                         {"ok": False, "error": "V5_BROKER_RESPONSE_INVALID"})
+                return
+            request_id = str(started.get("rqname") or "") if isinstance(started, dict) else ""
+            valid = (
+                isinstance(started, dict) and started.get("ok") is True
+                and bool(request_id)
+                and response.get("request_id") == request_id
+                and response.get("rqname") == request_id
+                and response.get("code") == code
+                and response.get("market_data_identity") == expected_identity
+                and response.get("market_source") == expected_source
+                and response.get("trcode") == expected_trcode
+                and response.get("type") == ("minute_candles" if minute else "period_candles")
+                and (response.get("interval") == interval if minute else
+                     response.get("timeframe_key") == self.timeframe_key)
+            )
+            callback(response if valid else
+                     {"ok": False, "error": "V5_BROKER_SOURCE_PROVENANCE_INVALID"})
+
+        kwargs = {"count": count, "callback": receive}
+        if minute:
+            kwargs["interval"] = interval
+            if self.integrated:
+                kwargs["nxt_available"] = True
+        else:
+            kwargs["timeframe_key"] = self.timeframe_key
+            if self.integrated:
+                kwargs["nxt_available"] = True
+        try:
+            started = method(code, name, **kwargs)
+        except Exception as exc:
+            started = {"ok": False, "error": str(exc)}
+        for response in buffered:
+            receive(response)
+        if not completed and (not isinstance(started, dict) or started.get("ok") is not True):
+            receive(started)
+        return started
+
+    def request_minute_candles_read_only(self, code, name, *, interval, count, callback):
+        method = ("request_minute_candles_display_only_integrated"
+                  if self.integrated else "request_minute_candles_read_only")
+        return self._request(method, code, name, count, callback, interval=interval)
+
+    def request_period_candles_read_only(self, code, name, *, timeframe_key, count, callback):
+        if timeframe_key != self.timeframe_key:
+            callback({"ok": False, "error": "V5_BROKER_REQUEST_IDENTITY_INVALID"})
+            return None
+        method = ("request_period_candles_read_only_integrated"
+                  if self.integrated else "request_period_candles_read_only")
+        return self._request(method, code, name, count, callback)
+
+
 class IndicatorFollowSignalValidationV5Flow(QObject):
     """Own V5 picker/window lifetime and fresh read-only replay requests."""
 
@@ -306,6 +401,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if not callable(factory):
                 raise TypeError(f"{name} must be callable")
         self._broker = broker
+        self._validation_source_by_code: dict[str, bool] = {}
         self._operation_active_reader = operation_active_reader
         self._historical_count = historical_count
         self._historical_provider_factory = historical_provider_factory
@@ -1345,8 +1441,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         )
 
     def _validation_market_data_identity(self, stock: ValidationStockRef) -> str:
-        """Validation Historical remains canonical KRX regardless of ATS eligibility."""
-        return stock.code
+        eligibility = getattr(self, "_validation_source_by_code", {}).get(stock.code)
+        if type(eligibility) is not bool:
+            raise ValueError("NXT_ELIGIBILITY_NOT_VERIFIED")
+        return f"{stock.code}_AL" if eligibility else stock.code
 
     def _historical_result_matches_validation_source(
         self,
@@ -1362,8 +1460,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         expected_identity = self._validation_market_data_identity(stock)
         response_identity = str(result.snapshot.market_data_identity or "").strip()
         response_source = str(result.snapshot.market_source or "").strip().upper()
+        if expected_identity.endswith("_AL"):
+            return response_identity == expected_identity and response_source == "INTEGRATED"
         if result.snapshot.timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES:
-            # Every selected minute response must prove its own KRX authority.
             return response_identity == expected_identity and response_source == "KRX"
         return (
             (response_identity or expected_identity) == expected_identity
@@ -1398,6 +1497,24 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         )
 
     @staticmethod
+    def _verified_nxt_validation_stock(stock: ValidationStockRef) -> bool | None:
+        try:
+            snapshot = load_stock_library_snapshot()
+        except Exception:
+            return None
+        if getattr(snapshot, "state", None) != STOCK_LIBRARY_READY:
+            return None
+        matches = [
+            record for record in tuple(getattr(snapshot, "records", ()) or ())
+            if isinstance(record, dict)
+            and str(record.get("code") or "") == stock.code
+        ]
+        if len(matches) != 1:
+            return None
+        eligibility = matches[0].get("nxt_available")
+        return eligibility if type(eligibility) is bool else None
+
+    @staticmethod
     def _verified_nxt_display_stock(stock: ValidationStockRef) -> bool:
         try:
             snapshot = load_stock_library_snapshot()
@@ -1430,6 +1547,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         window: object,
         session: ValidationSession,
     ) -> None:
+        if self._validation_source_by_code.get(session.request.stock.code) is True:
+            return
         candles = self._integrated_display_candles_for_session(session)
         apply_display = getattr(
             window,
@@ -1975,6 +2094,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         session: ValidationSession,
         target_count: int,
     ) -> None:
+        if self._validation_source_by_code.get(session.request.stock.code) is True:
+            return
         timeframe = normalize_validation_timeframe(
             session.request.timeframe_key,
             fallback_minutes=session.request.timeframe_minutes,
@@ -2230,6 +2351,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             and pool.get("timeframe_key") == str(timeframe_key)
             and pool.get("market_data_identity")
             == self._validation_market_data_identity(stock)
+            and (
+                self._validation_source_by_code.get(stock.code) is not True
+                or pool.get("market_source") == "INTEGRATED"
+            )
             and isinstance(pool.get("requested_count"), int)
             and int(pool["requested_count"]) >= required_count
             and isinstance(pool.get("candles"), list)
@@ -2255,6 +2380,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return "timeframe"
         if pool.get("market_data_identity") != self._validation_market_data_identity(stock):
             return "market_identity"
+        if (self._validation_source_by_code.get(stock.code) is True
+                and pool.get("market_source") != "INTEGRATED"):
+            return "market_source"
         requested_count = pool.get("requested_count")
         if not isinstance(requested_count, int) or requested_count < required_count:
             return "requested_count"
@@ -2380,6 +2508,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if not callable(load_covering) and not callable(load):
             return None
         expected_identity = self._validation_market_data_identity(stock)
+        source_kwargs = ({"market_data_identity": expected_identity}
+                         if expected_identity.endswith("_AL") else {})
         try:
             entry = (
                 load_covering(
@@ -2387,6 +2517,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     timeframe_minutes,
                     fetch_count,
                     timeframe_key,
+                    **source_kwargs,
                 )
                 if callable(load_covering)
                 else load(
@@ -2394,6 +2525,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     timeframe_minutes,
                     fetch_count,
                     timeframe_key,
+                    **source_kwargs,
                 )
             )
         except Exception:
@@ -2409,6 +2541,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         marker_identity = ""
         marker_source = ""
         marker_stock = ""
+        marker_hash = ""
         if marker_path is not None:
             try:
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -2416,19 +2549,27 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     marker_identity = str(marker.get("market_data_identity") or "").strip()
                     marker_source = str(marker.get("market_source") or "").strip().upper()
                     marker_stock = str(marker.get("canonical_stock_code") or "").strip()
+                    marker_hash = str(marker.get("candle_content_sha256") or "").strip()
             except (OSError, ValueError, TypeError):
                 pass
         entry_identity = str(entry.market_data_identity or "").strip()
-        if timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES:
-            # Canonical source and its independent marker must both prove KRX.
+        if expected_identity.endswith("_AL") or timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES:
+            expected_source = "INTEGRATED" if expected_identity.endswith("_AL") else "KRX"
             if not (
                 entry_identity == expected_identity
-                and str(entry.market_source or "").strip().upper() == "KRX"
+                and str(entry.market_source or "").strip().upper() == expected_source
                 and marker_identity == expected_identity
-                and marker_stock == expected_identity
-                and marker_source == "KRX"
+                and marker_stock == stock.code
+                and marker_source == expected_source
             ):
                 return None
+            if expected_identity.endswith("_AL"):
+                content = json.dumps(
+                    list(entry.candles), ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")
+                if marker_hash != hashlib.sha256(content).hexdigest():
+                    return None
         elif (
             entry_identity and entry_identity != expected_identity
             or marker_identity and marker_identity != expected_identity
@@ -2448,12 +2589,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if not callable(load):
             return None
         try:
+            identity = self._validation_market_data_identity(stock)
+            source_kwargs = ({"market_data_identity": identity}
+                             if identity.endswith("_AL") else {})
             payloads = load(
                 stock.code,
                 timeframe_minutes,
                 fetch_count,
                 settings_hash,
                 timeframe_key,
+                **source_kwargs,
             )
         except Exception:
             return None
@@ -2489,6 +2634,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 return False
             payloads.append(payload)
         try:
+            identity = self._validation_market_data_identity(stock)
+            source_kwargs = ({"market_data_identity": identity}
+                             if identity.endswith("_AL") else {})
             return store(
                 stock_code=stock.code,
                 timeframe_minutes=timeframe_minutes,
@@ -2496,6 +2644,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 settings_hash=settings_hash,
                 entries=payloads,
                 timeframe_key=timeframe_key,
+                **source_kwargs,
             ) is True
         except Exception:
             return False
@@ -2522,12 +2671,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return False
         persisted_identity = str(market_data_identity or "").strip()
         persisted_source = str(market_source or "").strip()
-        if timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES and not (
-            persisted_identity == self._validation_market_data_identity(stock)
-            and persisted_source == "KRX"
-        ):
-            # Never manufacture KRX authority while persisting minute data.
-            return False
+        expected_identity = self._validation_market_data_identity(stock)
+        if expected_identity.endswith("_AL") or timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES:
+            expected_source = "INTEGRATED" if expected_identity.endswith("_AL") else "KRX"
+            if persisted_identity != expected_identity or persisted_source != expected_source:
+                return False
         if not persisted_identity:
             persisted_identity = self._validation_market_data_identity(stock)
         if not persisted_source:
@@ -2555,6 +2703,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             "canonical_stock_code": stock.code,
                             "market_data_identity": persisted_identity,
                             "market_source": persisted_source,
+                            **({"candle_content_sha256": hashlib.sha256(
+                                json.dumps(
+                                    candles,
+                                    ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False,
+                                ).encode("utf-8")
+                            ).hexdigest()} if persisted_source == "INTEGRATED" else {}),
                         },
                         handle,
                         ensure_ascii=False,
@@ -2603,12 +2758,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if not callable(path_builder):
             return None
         try:
+            identity = self._validation_market_data_identity(stock)
+            source_kwargs = ({"market_data_identity": identity}
+                             if identity.endswith("_AL") else {})
             cache_path = Path(
                 path_builder(
                     stock.code,
                     timeframe_minutes,
                     fetch_count,
                     timeframe_key,
+                    **source_kwargs,
                 )
             )
         except Exception:
@@ -2629,11 +2788,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         timeframe_key = session.request.timeframe_key
         pool_identity = str(market_data_identity or "").strip()
         pool_source = str(market_source or "").strip()
-        if timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES and not (
-            pool_identity == self._validation_market_data_identity(session.request.stock)
-            and pool_source == "KRX"
-        ):
-            raise ValueError("MARKET_SOURCE_IDENTITY_INVALID")
+        expected_identity = self._validation_market_data_identity(session.request.stock)
+        if expected_identity.endswith("_AL") or timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES:
+            expected_source = "INTEGRATED" if expected_identity.endswith("_AL") else "KRX"
+            if pool_identity != expected_identity or pool_source != expected_source:
+                raise ValueError("MARKET_SOURCE_IDENTITY_INVALID")
         if not pool_identity:
             pool_identity = self._validation_market_data_identity(session.request.stock)
         if not pool_source:
@@ -2879,10 +3038,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             or pool.get("timeframe_minutes") != session.request.timeframe_minutes
         ):
             raise ValueError("VALIDATION_POOL_TIMEFRAME_MISMATCH")
-        if (
-            str(pool.get("market_source") or "").upper() == "KRX"
-            and str(pool.get("market_data_identity") or "")
-            != session.request.stock.code
+        source = str(pool.get("market_source") or "").upper()
+        identity = str(pool.get("market_data_identity") or "")
+        if (source == "KRX" and identity != session.request.stock.code) or (
+            source == "INTEGRATED" and identity != f"{session.request.stock.code}_AL"
         ):
             raise ValueError("VALIDATION_POOL_MARKET_IDENTITY_MISMATCH")
 
@@ -2941,6 +3100,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         raw_candles = pool.get("candles")
         if not isinstance(raw_candles, list):
             return pool
+        if pool.get("market_source") == "INTEGRATED":
+            if pool.get("market_data_identity") != f"{session.request.stock.code}_AL":
+                raise ValueError("VALIDATION_POOL_MARKET_IDENTITY_MISMATCH")
+            sidecar_override = None
         if (
             isinstance(target_count, bool)
             or not isinstance(target_count, int)
@@ -5012,7 +5175,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             publish()
             return True
         try:
-            provider = self._historical_provider_factory(session, self._broker)
+            requester = _V5SelectedSourceRequester(
+                self._broker, session.request.stock, session.request.timeframe_key,
+                self._validation_source_by_code[session.request.stock.code],
+            )
+            provider = self._historical_provider_factory(session, requester)
             request_latest = provider.request_latest
         except Exception:
             publish()
@@ -6390,6 +6557,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     "상단 종목명을 더블클릭하여 검증 종목을 선택하세요.",
                 )
                 return
+            eligibility = self._verified_nxt_validation_stock(stock)
+            if type(eligibility) is not bool:
+                self._validation_source_by_code.pop(stock.code, None)
+                self._invalidate_window_requests(window_key)
+                self._fail_window(window, "NXT_ELIGIBILITY_NOT_VERIFIED")
+                return
+            self._validation_source_by_code[stock.code] = eligibility
             snapshot_rules = snapshot.to_dict()
             target_timeframe_minutes = snapshot_rules["bar"]["bar_minutes"]
             warmup_bars = required_validation_history_context_bars(snapshot_rules)
@@ -6864,9 +7038,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return
 
         try:
-            provider = self._historical_provider_factory(fetch_session, self._broker)
+            requester = _V5SelectedSourceRequester(
+                self._broker, stock, timeframe_key,
+                self._validation_source_by_code[stock.code],
+            )
+            provider = self._historical_provider_factory(fetch_session, requester)
         except Exception as exc:
-            if persistent is None:
+            if persistent is None or self._validation_source_by_code.get(stock.code) is True:
                 self._fail_window(window, f"HISTORICAL_PROVIDER_ERROR: {exc}")
             else:
                 install_cached_pool()
@@ -6874,7 +7052,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
         request_latest = getattr(provider, "request_latest", None)
         if not callable(request_latest):
-            if persistent is None:
+            if persistent is None or self._validation_source_by_code.get(stock.code) is True:
                 self._fail_window(window, "HISTORICAL_PROVIDER_UNAVAILABLE")
             else:
                 install_cached_pool()
@@ -7112,17 +7290,26 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     result,
                     fetch_session.request.stock,
                 ):
-                    install_cached_pool()
+                    if self._validation_source_by_code.get(stock.code) is True:
+                        self._fail_window(refresh_target, "HISTORICAL: MARKET_SOURCE_IDENTITY_INVALID")
+                    else:
+                        install_cached_pool()
                     return
                 try:
                     incoming, _dropped_count = project_validation_candles(
                         result.snapshot
                     )
-                except Exception:
-                    install_cached_pool()
+                except Exception as exc:
+                    if self._validation_source_by_code.get(stock.code) is True:
+                        self._fail_window(refresh_target, f"HISTORICAL_PROJECTION_ERROR: {exc}")
+                    else:
+                        install_cached_pool()
                     return
                 if not incoming:
-                    install_cached_pool()
+                    if self._validation_source_by_code.get(stock.code) is True:
+                        self._fail_window(refresh_target, "HISTORICAL: NO_VALID_CANDLES")
+                    else:
+                        install_cached_pool()
                     return
 
                 newest_time = str(incoming[-1].get("time") or "")
@@ -7234,9 +7421,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         probe_count=count,
                     )
                 request_latest(count, refresh_completed)
-            except Exception:
+            except Exception as exc:
                 self._active_providers.pop(request_key, None)
-                install_cached_pool()
+                if self._validation_source_by_code.get(stock.code) is True:
+                    self._fail_window(target, f"HISTORICAL_REQUEST_ERROR: {exc}")
+                else:
+                    install_cached_pool()
 
         request_refresh(min(_PERSISTENT_REFRESH_PROBE_COUNT, fetch_count))
 
