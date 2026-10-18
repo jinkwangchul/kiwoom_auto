@@ -93,7 +93,7 @@ from gui_ats_utils import (
     auto_trade_operation_session_phase,
     manual_ats_session_definition,
 )
-from gui_stock_data import stock_nxt_availability
+from gui_stock_data import stock_krx_after_structural_candidate, stock_nxt_availability
 from gui_routine_registry import get_group_records
 from main_group_projection import (
     build_main_group_projection,
@@ -816,7 +816,10 @@ def auto_trade_final_session_phase(
         operation_policy_reader=read_operation_policy,
         ats_session_reader=manual_ats_session_definition,
         **(
-            {"nxt_available": stock_nxt_availability(stock_code)}
+            {
+                "nxt_available": stock_nxt_availability(stock_code),
+                "krx_after_candidate": stock_krx_after_structural_candidate(stock_code),
+            }
             if str(stock_code or "").strip()
             else {}
         ),

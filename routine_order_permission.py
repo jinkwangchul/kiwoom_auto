@@ -15,7 +15,7 @@ from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_close_routine_order_allowed,
 )
-from gui_stock_data import stock_nxt_availability
+from gui_stock_data import stock_krx_after_structural_candidate, stock_nxt_availability
 from operation_policy_gate import is_emergency_stop
 from state_policy import (
     in_manual_trading_session,
@@ -140,7 +140,10 @@ def canonical_stock_trading_time_status(
                 config=config,
             )
             nxt_kwargs = (
-                {"nxt_available": stock_nxt_availability(stock_code)}
+                {
+                    "nxt_available": stock_nxt_availability(stock_code),
+                    "krx_after_candidate": stock_krx_after_structural_candidate(stock_code),
+                }
                 if str(stock_code or "").strip()
                 else {}
             )
@@ -183,7 +186,10 @@ def canonical_stock_trading_time_status(
             state if isinstance(state, dict) else {},
             now_dt=current,
             **(
-                {"nxt_available": stock_nxt_availability(stock_code)}
+                {
+                    "nxt_available": stock_nxt_availability(stock_code),
+                    "krx_after_candidate": stock_krx_after_structural_candidate(stock_code),
+                }
                 if str(stock_code or "").strip()
                 else {}
             ),
@@ -246,6 +252,19 @@ def canonical_routine_order_permission(
 
     if signal not in {"BUY", "SELL"}:
         return blocked("지원하지 않는 루틴 신호")
+    if (
+        isinstance(config, dict)
+        and normalize_operation_mode(config.get("operation_mode", "SCHEDULED")) == "CONTINUOUS"
+        and current.hour >= 16
+        and str(stock_code or "").strip()
+        and stock_nxt_availability(stock_code) is not True
+        and stock_krx_after_structural_candidate(stock_code)
+        and manual_ats_active_now(
+            config, runtime_state, current,
+            nxt_available=False, krx_after_candidate=True,
+        )
+    ):
+        return blocked("KRX_AFTER_NEW_ORDER_UNVERIFIED")
     if _today_normal_ended(global_state, current):
         return blocked("당일 정상운영 종료 상태")
     if is_emergency_stop(global_state) or is_emergency_stopped_state(runtime_state):

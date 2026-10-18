@@ -333,6 +333,7 @@ class WaitingReentryContractTest(unittest.TestCase):
 
         with (
             patch.object(policy, "stock_nxt_availability", return_value=False),
+            patch.object(policy, "stock_krx_after_structural_candidate", return_value=False),
             patch.object(ats_utils, "read_operation_policy", return_value=self.policy),
         ):
             decision = policy.auto_trade_setting_start_target_decision(
@@ -381,6 +382,7 @@ class WaitingReentryContractTest(unittest.TestCase):
             patch.object(ats_utils, "read_operation_policy", return_value=self.policy),
             patch.object(state_policy, "read_operation_policy", return_value=self.policy),
             patch.object(order_permission, "stock_nxt_availability", return_value=False),
+            patch.object(order_permission, "stock_krx_after_structural_candidate", return_value=False),
         ):
             blocked = order_permission.canonical_stock_trading_time_status(
                 config=config,
@@ -406,6 +408,7 @@ class WaitingReentryContractTest(unittest.TestCase):
             patch.object(run_control, "read_operation_policy", return_value=self.policy),
             patch.object(ats_utils, "read_operation_policy", return_value=self.policy),
             patch.object(run_control, "stock_nxt_availability", return_value=False),
+            patch.object(run_control, "stock_krx_after_structural_candidate", return_value=False),
         ):
             phase = run_control.auto_trade_final_session_phase(
                 config,

@@ -270,6 +270,47 @@ def stock_nxt_availability(
     return _STOCK_NXT_CACHE.get(normalized_code)
 
 
+_STOCK_KRX_AFTER_CACHE_SIGNATURE: tuple[object, ...] | None = None
+_STOCK_KRX_AFTER_CACHE: dict[str, bool] = {}
+
+
+def stock_krx_after_structural_candidate(
+    code: object,
+    project_root: Path | None = None,
+) -> bool:
+    """Read a verified library's ordinary-share structure for UI time projection.
+
+    This does not establish that the stock traded today or admit a broker order.
+    """
+    normalized_code = normalize_stock_code(str(code or ""))
+    if not normalized_code:
+        return False
+    global _STOCK_KRX_AFTER_CACHE_SIGNATURE, _STOCK_KRX_AFTER_CACHE
+    signature = _stock_library_runtime_signature(project_root)
+    if signature != _STOCK_KRX_AFTER_CACHE_SIGNATURE:
+        _STOCK_KRX_AFTER_CACHE = {
+            str(item.get("code")): _krx_after_structural_record(item)
+            for item in load_stock_library_snapshot(project_root).records
+        }
+        _STOCK_KRX_AFTER_CACHE_SIGNATURE = signature
+    return _STOCK_KRX_AFTER_CACHE.get(normalized_code, False)
+
+
+def _krx_after_structural_record(item: dict[str, object]) -> bool:
+    if item.get("market") not in {"KOSPI", "KOSDAQ"}:
+        return False
+    if item.get("classification") != "일반종목" or item.get("master_construction") != "정상":
+        return False
+    state_parts = str(item.get("master_stock_state") or "").split("|")
+    if not state_parts or any(
+        part not in {"담보대출", "신용가능"}
+        and not (part.startswith("증거금") and part[3:-1].isdigit() and part.endswith("%"))
+        for part in state_parts
+    ):
+        return False
+    return str(item.get("status") or "").split(" | ") == ["정상", *state_parts]
+
+
 def find_library_stock_by_code(code: str) -> dict[str, object] | None:
     """
     종목코드 기준으로 stock_library.json 의 종목을 찾는다.

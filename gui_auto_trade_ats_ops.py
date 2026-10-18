@@ -30,6 +30,7 @@ from close_liquidation_command import (
 from gui_auto_trade_runtime import now_text
 from gui_ats_utils import (
     manual_ats_active_now,
+    manual_ats_session_has_effective_range,
     manual_ats_session_labels,
 )
 from gui_auto_trade_policy import (
@@ -51,7 +52,7 @@ from operation_close_completion_evaluator import resolve_liquidation_holding_qua
 from event_journal_trade_observer import observe_manual_ats_liquidation_outcome
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
-from gui_stock_data import stock_nxt_availability
+from gui_stock_data import stock_krx_after_structural_candidate, stock_nxt_availability
 from manual_ats_runtime import (
     manual_ats_runtime_selected_keys,
     write_manual_ats_runtime_selection,
@@ -90,6 +91,22 @@ def auto_trade_selected_manual_ats_state(
         for key in result:
             result[key] = result[key] or key in sessions
     return result
+
+
+def auto_trade_selected_manual_ats_enable_availability(
+    selected: list[tuple[Path, str, str]], key: str,
+) -> tuple[bool, str]:
+    """Read-only per-target eligibility for the ATS submenu."""
+    if not selected:
+        return False, "종목을 선택하세요."
+    for _stock_dir, code, _name in selected:
+        if not manual_ats_session_has_effective_range(
+            key,
+            nxt_available=stock_nxt_availability(code),
+            krx_after_candidate=stock_krx_after_structural_candidate(code),
+        ):
+            return False, "선택한 종목의 거래 가능 시간과 추가시간이 겹치지 않습니다."
+    return True, ""
 
 
 def auto_trade_selected_manual_ats_liquidation_available(
@@ -243,15 +260,32 @@ def auto_trade_save_manual_ats_state_for_targets(
             key: bool(ats_state.get(key, False)) if key in editable else key in current_keys
             for key in all_keys
         }
-        if any(normalized.values()) and stock_nxt_availability(code) is not True:
+        newly_selected = [
+            key for key in all_keys
+            if normalized[key] and key not in current_keys
+        ]
+        nxt_available = stock_nxt_availability(code)
+        krx_candidate = stock_krx_after_structural_candidate(code)
+        if any(
+            not manual_ats_session_has_effective_range(
+                key,
+                nxt_available=nxt_available,
+                krx_after_candidate=krx_candidate,
+            )
+            for key in newly_selected
+        ):
             target_results.append(
                 {
                     "stock_code": code,
                     "stock_name": name,
                     "stock_dir": str(stock_dir),
                     "success": None,
-                    "status": "NXT_NOT_AVAILABLE",
-                    "reason": "NXT 거래 가능 종목이 아니거나 거래자격 확인이 완료되지 않았습니다.",
+                    "status": (
+                        "NXT_NOT_AVAILABLE"
+                        if nxt_available is not True and all(key != "extra2" for key in newly_selected)
+                        else "ATS_SESSION_UNAVAILABLE"
+                    ),
+                    "reason": "선택한 추가시간과 종목별 거래 가능 구간이 겹치지 않습니다.",
                 }
             )
             result["excluded"] = int(result["excluded"]) + 1

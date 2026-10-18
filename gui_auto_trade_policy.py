@@ -41,7 +41,7 @@ from gui_ats_utils import (
     manual_ats_enabled_labels,
 )
 from stock_code_contract import normalize_stock_code
-from gui_stock_data import stock_nxt_availability
+from gui_stock_data import stock_krx_after_structural_candidate, stock_nxt_availability
 from gui_window_policy import persistent_feature_owner
 from operation_command_service import (
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
@@ -392,6 +392,7 @@ def auto_trade_stock_operation_category(
                 state if isinstance(state, dict) else {},
                 now_dt=now_dt,
                 nxt_available=stock_nxt_availability(stock_code),
+                krx_after_candidate=stock_krx_after_structural_candidate(stock_code),
             )
         except Exception:
             phase = {}
@@ -484,7 +485,10 @@ def auto_trade_setting_row_projection(
     category = str(operation_category or "waiting").strip().lower() or "waiting"
     inactive_bucket = category in {"waiting", "ended", "review", "excluded"}
     nxt_kwargs = (
-        {"nxt_available": stock_nxt_availability(stock_code)}
+        {
+            "nxt_available": stock_nxt_availability(stock_code),
+            "krx_after_candidate": stock_krx_after_structural_candidate(stock_code),
+        }
         if str(stock_code or "").strip()
         else {}
     )
@@ -741,6 +745,7 @@ def auto_trade_setting_start_target_decision(
             state or {},
             now_dt=now_dt,
             nxt_available=stock_nxt_availability(stock_code),
+            krx_after_candidate=stock_krx_after_structural_candidate(stock_code),
         )
     except Exception:
         session_phase = {}

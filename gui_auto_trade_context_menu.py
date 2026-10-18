@@ -27,6 +27,7 @@ from gui_ats_utils import (
     manual_ats_session_labels,
     manual_ats_visible_session_keys,
 )
+from gui_auto_trade_ats_ops import auto_trade_selected_manual_ats_enable_availability
 from gui_operation_environment import OPERATION_POLICY_PATH
 from gui_stock_data import is_valid_stock_code, normalize_stock_code
 from runtime_io import read_json_dict
@@ -99,6 +100,7 @@ class StockContextMenuCallbacks:
     time_reset: Callable[[], None] | None = None
     ats_state: Callable[[], dict[str, bool]] | None = None
     ats_toggle: Callable[[str, bool, str], None] | None = None
+    ats_can_enable: Callable[[str], tuple[bool, str]] | None = None
     ats_liquidation_available: Callable[[], bool] | None = None
     ats_liquidation: Callable[
         [str, dict[str, bool], tuple[str, ...], tuple[str, ...]],
@@ -453,15 +455,24 @@ def _add_ats_settings_menu(
     state_getter: Callable[[], dict[str, bool]] | None,
     toggle: Callable[[str, bool, str], None] | None,
     liquidation_available_getter: Callable[[], bool] | None = None,
+    enable_availability_getter: Callable[[str], tuple[bool, str]] | None = None,
 ):
+    visible_keys = manual_ats_visible_session_keys()
+    selected_state = state_getter() if state_getter is not None else {}
+    if isinstance(selected_state, dict):
+        visible_keys = tuple(
+            key for key in ("extra1", "extra2", "extra3")
+            if key in visible_keys or selected_state.get(key) is True
+        )
     return _build_ats_settings_menu(
         menu,
         has_selection=has_selection,
-        visible_keys=manual_ats_visible_session_keys(),
+        visible_keys=visible_keys,
         labels=manual_ats_session_labels(),
         state_getter=state_getter,
         toggle=toggle,
         liquidation_available_getter=liquidation_available_getter,
+        enable_availability_getter=enable_availability_getter,
     )
 
 
@@ -854,6 +865,7 @@ def show_monitor_stock_context_menu(
             state_getter=callbacks.ats_state,
             toggle=callbacks.ats_toggle,
             liquidation_available_getter=callbacks.ats_liquidation_available,
+            enable_availability_getter=callbacks.ats_can_enable,
         )
         ats_settings["menu"].setEnabled(
             availability.ats_settings_allowed
@@ -1295,7 +1307,7 @@ def show_monitor_stock_context_menu(
         and _menu_entry_enabled(ats_settings["menu"])
     ):
         for _key, _label, action in ats_settings["session_actions"]:
-            allow(action, True)
+            allow(action, _menu_entry_enabled(action))
         allow(ats_settings["market"], True)
         allow(ats_settings["current"], True)
     if chosen not in allowed_actions:
@@ -1468,6 +1480,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         time_reset=window_callback("reset_selected_schedule_to_global"),
         ats_state=lambda: window_callback("selected_manual_ats_state")(selected),
         ats_toggle=window_callback("set_selected_manual_ats_flag"),
+        ats_can_enable=lambda key: auto_trade_selected_manual_ats_enable_availability(selected, key),
         ats_liquidation_available=lambda: (
             window_callback("selected_manual_ats_liquidation_available")(selected)
         ),

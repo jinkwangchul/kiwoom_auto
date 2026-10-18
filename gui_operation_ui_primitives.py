@@ -66,7 +66,7 @@ def ats_session_ui_options(
         if isinstance(session, dict):
             name = str(session.get("name", "")).strip()
             if name:
-                labels[key] = name
+                labels[key] = "장후거래" if key == "extra2" and name == "장마감NTX" else name
             if not bool(session.get("enabled", True)):
                 continue
         visible.append(key)
@@ -355,6 +355,8 @@ class _PersistentAtsToggleFilter(QObject):
         handler = self._handlers.get(id(action))
         if handler is None:
             return super().eventFilter(watched, event)
+        if not action.isEnabled():
+            return True
         handler()
         set_active_action = getattr(watched, "setActiveAction", None)
         if callable(set_active_action):
@@ -577,6 +579,7 @@ def _add_ats_settings_menu(
     state_getter: Callable[[], dict[str, bool]] | None,
     toggle: Callable[[str, bool, str], None] | None,
     liquidation_available_getter: Callable[[], bool] | None = None,
+    enable_availability_getter: Callable[[str], tuple[bool, str]] | None = None,
 ):
     initial_state = state_getter() if state_getter is not None else {}
     current_state = dict(initial_state) if isinstance(initial_state, dict) else {}
@@ -614,10 +617,24 @@ def _add_ats_settings_menu(
             selected = bool(current_state.get(action_key, False))
             action.setIcon(_menu_status_icon(selected))
             action.setProperty("atsSessionCurrent", selected)
+            can_enable, reason = (
+                enable_availability_getter(action_key)
+                if enable_availability_getter is not None else (True, "")
+            )
+            action.setEnabled(selected or can_enable)
+            set_tooltip = getattr(action, "setToolTip", None)
+            if callable(set_tooltip):
+                set_tooltip("선택 해제 가능" if selected and not can_enable else reason)
         refresh_liquidation_actions()
 
     def toggle_session(key: str, label: str) -> None:
         if toggle is None:
+            return
+        action = next((item for item_key, _label, item in session_actions if item_key == key), None)
+        if action is None or not bool(
+            action.isEnabled() if callable(getattr(action, "isEnabled", None))
+            else getattr(action, "enabled", True)
+        ):
             return
         toggle(key, not bool(current_state.get(key, False)), label)
         refresh_session_status()
@@ -633,7 +650,7 @@ def _add_ats_settings_menu(
         install_event_filter(toggle_filter)
         ats_menu._ats_toggle_filter = toggle_filter
 
-    refresh_liquidation_actions()
+    refresh_session_status()
     return {
         "menu": ats_menu,
         "visible_keys": visible_keys,
@@ -656,6 +673,11 @@ def _dispatch_ats_settings_action(
     current_state = dict(actions["current_state"])
     for key, label, action in actions["session_actions"]:
         if chosen == action:
+            if not bool(
+                action.isEnabled() if callable(getattr(action, "isEnabled", None))
+                else getattr(action, "enabled", True)
+            ):
+                return True
             toggle_session = actions.get("toggle_session")
             if callable(toggle_session):
                 toggle_session(key, label)
