@@ -15,6 +15,7 @@ gui_operation_environment.py
 from __future__ import annotations
 
 import json
+import weakref
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -49,6 +50,12 @@ from event_journal_production import append_production_event
 from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
+)
+from manual_ats_runtime import (
+    MANUAL_ATS_SELECTION_KEY,
+    clear_manual_ats_runtime_selection,
+    manual_ats_runtime_selected_keys,
+    write_manual_ats_runtime_selection,
 )
 
 
@@ -228,14 +235,99 @@ def read_operation_policy(*, path: Path | None = None) -> dict[str, object]:
     return merged
 
 
+def _prune_stock_ats_selections(stock_dirs: list[Path], keys_to_remove: set[str]) -> None:
+    for stock_dir in stock_dirs:
+        state_path = stock_dir / "state.json"
+        try:
+            before_state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(before_state, dict):
+                raise ValueError("state must be an object")
+            selected = manual_ats_runtime_selected_keys(before_state)
+            if not keys_to_remove.intersection(selected):
+                continue
+            remaining = tuple(key for key in selected if key not in keys_to_remove)
+            ok = (
+                write_manual_ats_runtime_selection(stock_dir, remaining)
+                if remaining else clear_manual_ats_runtime_selection(stock_dir)
+            )
+            after_state = json.loads(state_path.read_text(encoding="utf-8")) if ok else None
+        except Exception as exc:
+            raise RuntimeError(f"ATS selection cleanup failed: {state_path}: {exc}") from exc
+        before_other = dict(before_state)
+        before_other.pop(MANUAL_ATS_SELECTION_KEY, None)
+        after_other = dict(after_state) if isinstance(after_state, dict) else {}
+        after_other.pop(MANUAL_ATS_SELECTION_KEY, None)
+        if (
+            not ok
+            or not isinstance(after_state, dict)
+            or before_other != after_other
+            or manual_ats_runtime_selected_keys(after_state) != remaining
+            or (not remaining and MANUAL_ATS_SELECTION_KEY in after_state)
+        ):
+            raise RuntimeError(f"ATS selection cleanup failed read-back: {state_path}")
+
+
 def write_operation_policy(
     policy: dict[str, object],
     *,
     path: Path | None = None,
     preserve_buffer_response: bool = True,
+    prune_disabled_ats: bool = False,
 ) -> None:
     policy = dict(policy)
     target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
+    previous_policy = read_operation_policy(path=target_path)
+    extra_sessions = policy.get("extra_sessions")
+    previous_sessions = previous_policy.get("extra_sessions", [])
+    disabled_keys: set[str] = set()
+    reenabled_keys: set[str] = set()
+    if isinstance(extra_sessions, list):
+        for index, key in enumerate(("extra1", "extra2", "extra3")):
+            if index >= len(extra_sessions) or not isinstance(extra_sessions[index], dict):
+                continue
+            previous = (
+                previous_sessions[index]
+                if isinstance(previous_sessions, list) and index < len(previous_sessions)
+                else {}
+            )
+            was_enabled = isinstance(previous, dict) and bool(previous.get("enabled", True))
+            if bool(extra_sessions[index].get("enabled", True)):
+                if not was_enabled:
+                    reenabled_keys.add(key)
+            elif prune_disabled_ats or (
+                isinstance(previous, dict) and bool(previous.get("enabled", True))
+            ):
+                disabled_keys.add(key)
+
+    # Preflight every existing stock state before changing the global policy.
+    # If a later atomic per-stock write fails, the saved OFF policy still keeps
+    # stale selections inactive; the caller receives a precise failure.
+    cleanup_targets: list[Path] = []
+    if disabled_keys or reenabled_keys:
+        stocks_path = target_path.parent / "stocks"
+        if stocks_path.exists():
+            for stock_dir in sorted(stocks_path.iterdir()):
+                if stock_dir.is_symlink():
+                    raise RuntimeError(f"ATS selection cleanup refuses linked stock directory: {stock_dir}")
+                if not stock_dir.is_dir():
+                    continue
+                state_path = stock_dir / "state.json"
+                if state_path.is_symlink():
+                    raise RuntimeError(f"ATS selection cleanup refuses linked state: {state_path}")
+                if not state_path.exists():
+                    continue
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise RuntimeError(f"ATS selection cleanup cannot read {state_path}: {exc}") from exc
+                if not isinstance(state, dict):
+                    raise RuntimeError(f"ATS selection cleanup requires an object: {state_path}")
+                selection = state.get(MANUAL_ATS_SELECTION_KEY)
+                if selection is not None and not isinstance(selection, dict):
+                    raise RuntimeError(f"ATS selection cleanup has invalid selection: {state_path}")
+                selected = manual_ats_runtime_selected_keys(state)
+                if (disabled_keys | reenabled_keys).intersection(selected):
+                    cleanup_targets.append(stock_dir)
     existing: dict[str, object] | None = None
     if (
         "system_budget" not in policy
@@ -274,10 +366,21 @@ def write_operation_policy(
             if key != "after_buy_end_status"
         }
     policy["updated_at"] = now_text()
+    if cleanup_targets and reenabled_keys:
+        _prune_stock_ats_selections(cleanup_targets, reenabled_keys)
     target_path.write_text(
         json.dumps(policy, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    if cleanup_targets:
+        try:
+            saved = json.loads(target_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"ATS policy read-back failed: {target_path}: {exc}") from exc
+        if not isinstance(saved, dict) or saved.get("extra_sessions") != extra_sessions:
+            raise RuntimeError(f"ATS policy read-back mismatch: {target_path}")
+        if disabled_keys:
+            _prune_stock_ats_selections(cleanup_targets, disabled_keys)
 
 
 def stock_registration_policy(
@@ -909,6 +1012,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
     ) -> None:
         super().__init__(None)
         configure_persistent_feature_window(self, parent)
+        self._settings_view_ref = weakref.ref(parent) if parent is not None else lambda: None
         self._factory_reset_validator = factory_reset_validator
         self._factory_reset_executor = factory_reset_executor
         self.setWindowTitle("환경설정")
@@ -1216,12 +1320,23 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self._sync_close_checkboxes_to_combo()
         policy = self.build_policy_from_widgets()
         try:
-            write_operation_policy(policy)
-            self.policy = policy
+            write_operation_policy(policy, prune_disabled_ats=True)
+            saved_policy = read_operation_policy()
+            if saved_policy.get("extra_sessions") != policy.get("extra_sessions"):
+                raise RuntimeError("extra session policy read-back verification failed")
+            self.policy = saved_policy
             append_changelog("UPDATE", "operation_policy.json", "추가시간 설정 저장")
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"추가시간 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
+        view = self._settings_view_ref()
+        refresh = getattr(view, "_handle_operation_environment_settings_saved", None)
+        if callable(refresh):
+            try:
+                refresh(self)
+            except Exception as exc:
+                QMessageBox.warning(self, "화면 갱신 오류", f"환경설정 저장 완료, 화면 갱신 실패:\n\n{exc}")
+                return
         logical_owner = persistent_feature_owner(self)
         toast_parent = logical_owner if logical_owner is not None else self
         show_toast(
@@ -1955,7 +2070,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
             starting_budget_defaults(before_policy) != budget_defaults
         )
         try:
-            write_operation_policy(policy)
+            write_operation_policy(policy, prune_disabled_ats=True)
             saved_policy = read_operation_policy()
             expected_policy = dict(policy)
             expected_policy["system_budget"] = system_budget_policy(policy)

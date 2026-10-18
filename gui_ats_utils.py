@@ -26,11 +26,11 @@ from manual_ats_runtime import manual_ats_runtime_selected_keys
 _NXT_ELIGIBILITY_UNSPECIFIED = object()
 
 
-def manual_ats_session_labels() -> dict[str, str]:
+def manual_ats_session_labels(policy: dict[str, object] | None = None) -> dict[str, str]:
     """환경설정(operation_policy.json)의 추가시간 이름을 ATS 표시명으로 사용한다."""
     fallback = {"extra1": "추가1", "extra2": "추가2", "extra3": "추가3"}
     try:
-        policy = read_operation_policy()
+        policy = read_operation_policy() if policy is None else policy
         sessions = policy.get("extra_sessions", []) if isinstance(policy, dict) else []
         if not isinstance(sessions, list):
             return fallback
@@ -98,9 +98,23 @@ def manual_ats_enabled_labels(
     if not selected_keys:
         return []
 
-    label_map = manual_ats_session_labels()
+    policy = read_operation_policy()
+    sessions = policy.get("extra_sessions", []) if isinstance(policy, dict) else []
+    label_map = manual_ats_session_labels(policy)
     fallback = {"extra1": "추가1", "extra2": "추가2", "extra3": "추가3"}
-    return [str(label_map.get(key, fallback.get(key, key))) for key in selected_keys]
+    labels: list[str] = []
+    for key in selected_keys:
+        index = ("extra1", "extra2", "extra3").index(key)
+        session = sessions[index] if isinstance(sessions, list) and index < len(sessions) else None
+        if not isinstance(session, dict) or not bool(session.get("enabled", True)):
+            continue
+        seconds = operation_policy_time_range_seconds(
+            session, default_start="00:00:00", default_end="00:00:00"
+        )
+        if seconds is None or seconds[0] >= seconds[1]:
+            continue
+        labels.append(str(label_map.get(key, fallback.get(key, key))))
+    return labels
 
 
 def operation_policy_time_range_seconds(
@@ -230,7 +244,9 @@ def auto_trade_operation_session_phase(
         selected_keys, _source = manual_ats_selected_keys_and_source(config, state)
         for key in selected_keys:
             session = session_reader(key)
-            if not session or not bool(session.get("enabled", True)):
+            if isinstance(session, dict) and not bool(session.get("enabled", True)):
+                continue
+            if not session:
                 invalid_sessions.append(str(key))
                 continue
             seconds = operation_policy_time_range_seconds(
@@ -579,7 +595,7 @@ def manual_ats_active_now(
 
     for key in selected_keys:
         session = manual_ats_session_definition(key)
-        if not session:
+        if not session or not bool(session.get("enabled", True)):
             continue
 
         seconds = operation_policy_time_range_seconds(
