@@ -1,0 +1,31 @@
+Mock to Production participation UI final recovery artifact
+baseline_repo_branch=feat/restore-auto-trade-setting-ui
+baseline_repo_head=4579864b40243310a383b2f7503dcda57c7961d7
+recovery_parent=a9c9e03352749ea7f954c01efbce0a1a3ad44ff1
+original_worktree_status_entries=681
+original_staged_entries=0
+patch_file=participation-implemented.patch
+patch_scope=baseline_files/ byte-for-byte snapshots to current original working-tree copies, exactly the three paths below
+patch_applicability=only against the exact baseline snapshots listed below; not standalone against HEAD or arbitrary WIP
+
+gui_windows.py
+  baseline_sha256=3F29CC678FD8561F6A5580EE5735DCB779480A63DB260C5A8F40EDD61F1C8A7E
+  final_sha256=B626BE19465E439CFCA863E9AABF4CC7A4C2FE4C0551769B2271C8B7B70C08EA
+mock_validation_context_menu.py
+  baseline_sha256=A8EC0203099FC894C5F4D190A36E8867CF724CA799D779475D3F4B7514EAE6E1
+  final_sha256=4CBA5642C353A22DBB5A2BE469BF14FDFFB34EF3B8A8FE8F8A734C0636A172D3
+tests/test_mock_validation_host_ui.py
+  baseline_sha256=AFC82D124C1F19CD7928C359F206D30848B62449FB48DF40EBC6D4B5568705FB
+  final_sha256=5966C9B29DFB7DF860CDAC1C9B5D2AD2D4E536B1E06C360AA4CEF31B71B6DB1F
+
+Prior source validation reported by user (not rerun here):
+Mock UI=145 PASS
+Production assignment=59 PASS
+Independent focused=4 PASS
+Total=208 PASS
+Syntax=PASS
+git diff --check=PASS
+
+Runtime acceptance: not verified. Running GUI uses older loaded code and requires a separate restart and acceptance check.
+No Mock or Production data mutation was performed for this recovery checkpoint.
+No automatic operation start is intended; approved Mock parent label ???? keeps Mock and one Production routine registration.
