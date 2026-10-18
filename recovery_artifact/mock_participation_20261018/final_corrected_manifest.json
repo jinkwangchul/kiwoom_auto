@@ -1,0 +1,39 @@
+{
+  "artifact": "final corrected Mock to Production participation recovery patch",
+  "branch": "recovery/mock-participation-20261018",
+  "parent_recovery_commit": "27143170330f901ad15914248d814d904b207ac1",
+  "original_baseline_recovery_commit": "a9c9e03352749ea7f954c01efbce0a1a3ad44ff1",
+  "source_branch": "feat/restore-auto-trade-setting-ui",
+  "source_head": "4579864b40243310a383b2f7503dcda57c7961d7",
+  "protected_wip_entries": 681,
+  "source_staged_entries": 0,
+  "files": [
+    {
+      "path": "gui_windows.py",
+      "baseline_sha256": "3F29CC678FD8561F6A5580EE5735DCB779480A63DB260C5A8F40EDD61F1C8A7E",
+      "final_sha256": "E89F828642FE3D51F70F0CD22C304A0A71CF81C02207CB279F3FEE3480F001F5"
+    },
+    {
+      "path": "mock_validation_context_menu.py",
+      "baseline_sha256": "A8EC0203099FC894C5F4D190A36E8867CF724CA799D779475D3F4B7514EAE6E1",
+      "final_sha256": "7D25945E7D7EFB801E580807989577646564088D7BDB19EE291F040C4DA27921"
+    },
+    {
+      "path": "tests/test_mock_validation_host_ui.py",
+      "baseline_sha256": "AFC82D124C1F19CD7928C359F206D30848B62449FB48DF40EBC6D4B5568705FB",
+      "final_sha256": "CD3B19FF932E567EE2AA5645BE4F01A3097E254244EACC2318A52A5970F9F0BB"
+    }
+  ],
+  "verification": {
+    "independent_x86_pyqt5_tests": {
+      "result": "PASS",
+      "count": 207,
+      "provenance": "prior completed run reported by orchestrator; not rerun for publication"
+    },
+    "ast_parse": "PASS",
+    "diff_check": "PASS: git apply --reverse --check on exact final source files",
+    "real_gui_acceptance": "PENDING: GUI PID 29620 was running old loaded code at prior assessment"
+  },
+  "recovery_note": "This patch supersedes the content of historic participation-implemented.patch; preserve that file and final_manifest.txt.",
+  "scope": "Baseline full copies to actual final source bytes; existing source WIP retained."
+}
