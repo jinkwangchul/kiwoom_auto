@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
+from threading import Barrier, BrokenBarrierError
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +38,103 @@ class EventJournalTradeConnectionTest(unittest.TestCase):
     def events(self) -> list[dict]:
         newest_first = EventJournalReader(self.journal_dir).read_events()["events"]
         return list(reversed(newest_first))
+
+    @staticmethod
+    def observe_signal(signal_id: str) -> dict:
+        return trade_observer.observe_signal_created(
+            {"signal": "BUY"},
+            {"status": "queued", "id": signal_id, "signal_committed": True, "post_write_verified": True},
+            routine_name="test-routine",
+            stock_code="005930",
+            stock_name="test-stock",
+        )
+
+    def test_write_failed_signal_retries_and_then_dedupes(self) -> None:
+        real_append = production._WRITER.append_event
+        attempts = 0
+
+        def fail_once(**fields):
+            nonlocal attempts
+            attempts += 1
+            return {"appended": False, "write_failed": True} if attempts == 1 else real_append(**fields)
+
+        with patch.object(production._WRITER, "append_event", side_effect=fail_once):
+            first = self.observe_signal("SIGNAL-RETRY-WRITE")
+            second = self.observe_signal("SIGNAL-RETRY-WRITE")
+            third = self.observe_signal("SIGNAL-RETRY-WRITE")
+
+        self.assertTrue(first["write_failed"])
+        self.assertTrue(second["appended"])
+        self.assertTrue(third["duplicate"])
+        self.assertEqual(2, attempts)
+        self.assertEqual(["SIGNAL-RETRY-WRITE"], [event["signal_id"] for event in self.events()])
+
+    def test_raised_append_retries_and_then_dedupes(self) -> None:
+        real_append = production._WRITER.append_event
+        attempts = 0
+
+        def raise_once(**fields):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary journal failure")
+            return real_append(**fields)
+
+        with patch.object(production._WRITER, "append_event", side_effect=raise_once):
+            first = self.observe_signal("SIGNAL-RETRY-RAISE")
+            second = self.observe_signal("SIGNAL-RETRY-RAISE")
+            third = self.observe_signal("SIGNAL-RETRY-RAISE")
+
+        self.assertTrue(first["write_failed"])
+        self.assertTrue(second["appended"])
+        self.assertTrue(third["duplicate"])
+        self.assertEqual(2, attempts)
+        self.assertEqual(["SIGNAL-RETRY-RAISE"], [event["signal_id"] for event in self.events()])
+
+    def test_invalid_append_result_does_not_poison_signal_key(self) -> None:
+        real_append = production._WRITER.append_event
+        attempts = 0
+
+        def invalid_once(**fields):
+            nonlocal attempts
+            attempts += 1
+            return {"appended": False, "invalid": True} if attempts == 1 else real_append(**fields)
+
+        with patch.object(production._WRITER, "append_event", side_effect=invalid_once):
+            first = self.observe_signal("SIGNAL-RETRY-INVALID")
+            second = self.observe_signal("SIGNAL-RETRY-INVALID")
+            third = self.observe_signal("SIGNAL-RETRY-INVALID")
+
+        self.assertTrue(first["invalid"])
+        self.assertTrue(second["appended"])
+        self.assertTrue(third["duplicate"])
+        self.assertEqual(2, attempts)
+        self.assertEqual(["SIGNAL-RETRY-INVALID"], [event["signal_id"] for event in self.events()])
+
+    def test_concurrent_same_signal_appends_once(self) -> None:
+        class RacingKeys(OrderedDict):
+            def __init__(self):
+                super().__init__()
+                self.barrier = Barrier(2)
+                self.lookups = 0
+
+            def __contains__(self, key):
+                present = super().__contains__(key)
+                self.lookups += 1
+                if self.lookups <= 2:
+                    try:
+                        self.barrier.wait(timeout=1)
+                    except BrokenBarrierError:
+                        pass
+                return present
+
+        with patch.object(trade_observer, "_SEEN_EVENT_KEYS", RacingKeys()):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(self.observe_signal, ["SIGNAL-CONCURRENT"] * 2))
+
+        self.assertEqual(1, sum(result.get("appended") is True for result in results))
+        self.assertEqual(1, sum(result.get("duplicate") is True for result in results))
+        self.assertEqual(["SIGNAL-CONCURRENT"], [event["signal_id"] for event in self.events()])
 
     @staticmethod
     def order(number: str = "ORDER-1", code: str = "005930", name: str = "삼성전자") -> dict:

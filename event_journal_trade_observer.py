@@ -8,6 +8,7 @@ from functools import wraps
 import json
 import logging
 from pathlib import Path
+import threading
 from typing import Any
 
 from event_journal_production import append_production_event
@@ -16,6 +17,7 @@ from event_journal_production import append_production_event
 LOGGER = logging.getLogger(__name__)
 _MAX_DEDUPE_KEYS = 4096
 _SEEN_EVENT_KEYS: OrderedDict[tuple[str, ...], None] = OrderedDict()
+_SEEN_EVENT_KEYS_LOCK = threading.RLock()
 
 
 def _fail_open_observer(function):
@@ -113,9 +115,19 @@ def _remember(key: tuple[str, ...]) -> bool:
 
 
 def _append_once(key: tuple[str, ...], event_type: str, **fields: Any) -> dict[str, Any]:
-    if not _remember(key):
-        return {"appended": False, "duplicate": True, "event_type": event_type}
-    return append_production_event(event_type, **fields)
+    with _SEEN_EVENT_KEYS_LOCK:
+        if key in _SEEN_EVENT_KEYS:
+            _remember(key)
+            return {"appended": False, "duplicate": True, "event_type": event_type}
+        result = append_production_event(event_type, **fields)
+        if (
+            isinstance(result, dict)
+            and (result.get("appended") is True or result.get("duplicate") is True)
+            and result.get("write_failed") is not True
+            and result.get("invalid") is not True
+        ):
+            _remember(key)
+        return result
 
 
 def _target_fields(identity: dict[str, str]) -> dict[str, Any]:
@@ -795,4 +807,5 @@ def observe_pnl_cycle_boundaries(boundary_results: Any) -> list[dict[str, Any]]:
 
 
 def reset_trade_event_dedupe_for_tests() -> None:
-    _SEEN_EVENT_KEYS.clear()
+    with _SEEN_EVENT_KEYS_LOCK:
+        _SEEN_EVENT_KEYS.clear()
