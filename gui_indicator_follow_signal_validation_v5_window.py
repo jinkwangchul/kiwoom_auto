@@ -15358,10 +15358,138 @@ class IndicatorFollowSignalValidationV5Window(
             result_summary=self.result_summary_label.text(),
             financial_summary=self.estimated_return_label.text(),
         )
+        try:
+            if signal_validation_trace_enabled():
+                self._trace_range_replay_parity_evidence(
+                    replay_snapshot, calculation_bounds
+                )
+        except Exception:
+            # Optional diagnostics cannot affect an accepted replay.
+            pass
         self.validation_status_label.setText("")
         self.fixed_price_axis.refresh_scale()
         if defer_visualization:
             self._refresh_filter_display_projection()
+
+    def _trace_range_replay_parity_evidence(
+        self,
+        replay_snapshot: ValidationReplaySnapshot,
+        calculation_bounds: tuple[int, int],
+    ) -> None:
+        settings = (
+            self._range_replay_settings_snapshot
+            if self._range_replay_settings_snapshot is not None
+            else self._result_settings_snapshot
+        )
+        bounds = self._effective_validation_range()
+        source = self._calculation_candles
+        range_times = self._validation_range_times
+        if (
+            not self._range_replay_entries_available
+            or self._range_replay_revalidation_pending
+            or not isinstance(settings, ValidationSettingsSnapshot)
+            or not settings.rules_hash
+            or settings.rules_hash != replay_snapshot.settings_hash
+            or hashlib.sha256(settings.canonical_json.encode("utf-8")).hexdigest()
+            != settings.rules_hash
+            or not replay_snapshot.historical_request_id
+            or replay_snapshot.timeframe_key != self._normal_base_timeframe_key
+            or bounds is None
+            or not isinstance(range_times, tuple)
+            or len(range_times) != 2
+            or not source
+        ):
+            return
+        start, end = bounds
+        calc_start, calc_end = calculation_bounds
+        if (
+            not 0 <= calc_start <= calc_end < len(source)
+            or range_times
+            != (
+                str(self._candles[start].get("time") or ""),
+                str(self._candles[end].get("time") or ""),
+            )
+            or not all(range_times)
+            or not all(
+                isinstance(candle, dict) and str(candle.get("time") or "")
+                for candle in source
+            )
+            or replay_snapshot.to_candles() != source
+            or self._mapped_replay_entries(replay_snapshot)[1]
+            != self._range_replay_entries
+        ):
+            return
+        calc_times = (
+            str(source[calc_start]["time"]),
+            str(source[calc_end]["time"]),
+        )
+        signals = []
+        seen = set()
+        for entry in self._marker_entries_for_display():
+            evaluation_index = entry.evaluation_index
+            signal_index = entry.signal_index
+            key = (evaluation_index, entry.evaluation_side)
+            if (
+                entry.signal not in {"BUY", "SELL"}
+                or entry.signal != entry.evaluation_side
+                or key in seen
+                or isinstance(evaluation_index, bool)
+                or not isinstance(evaluation_index, int)
+                or not start <= evaluation_index <= end
+                or isinstance(signal_index, bool)
+                or not isinstance(signal_index, int)
+                or not 0 <= signal_index < len(self._candles)
+                or self._candles[evaluation_index].get("time") != entry.evaluation_time
+                or self._candles[signal_index].get("time") != entry.signal_time
+            ):
+                return
+            seen.add(key)
+            signals.append({
+                "side": entry.signal,
+                "evaluation_index": evaluation_index,
+                "evaluation_time": entry.evaluation_time,
+                "signal_index": signal_index,
+                "signal_time": entry.signal_time,
+                "delay_bar": entry.delay_bar,
+            })
+        signals.sort(key=lambda row: (row["evaluation_index"], row["side"]))
+        source_json = json.dumps(
+            source, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        trace_signal_validation_event(
+            "window.range_replay.parity_evidence_v1",
+            schema_version=1,
+            stock_code=self.stock.code,
+            timeframe_key=replay_snapshot.timeframe_key,
+            window_key=id(self),
+            historical_request_id=replay_snapshot.historical_request_id,
+            rules_hash=settings.rules_hash,
+            rules_canonical_json=settings.canonical_json,
+            source_calculation_candles={
+                "count": len(source),
+                "first_time": str(source[0]["time"]),
+                "last_time": str(source[-1]["time"]),
+                "sha256": hashlib.sha256(source_json.encode("utf-8")).hexdigest(),
+            },
+            display_range={
+                "start_index": start,
+                "end_index": end,
+                "start_time": range_times[0],
+                "end_time": range_times[1],
+            },
+            calculation_range={
+                "start_index": calc_start,
+                "end_index": calc_end,
+                "start_time": calc_times[0],
+                "end_time": calc_times[1],
+            },
+            signals=signals,
+            signal_counts={
+                "BUY": sum(row["side"] == "BUY" for row in signals),
+                "SELL": sum(row["side"] == "SELL" for row in signals),
+            },
+        )
 
     @property
     def validation_range(self) -> tuple[int, int] | None:
