@@ -7341,7 +7341,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 period_overlap = False
                 if (
                     len(merged) < fetch_count
-                    and timeframe_key in {"D1", "W1", "MO1", "Y1"}
+                    and timeframe_key in {"M240", "D1", "W1", "MO1", "Y1"}
                 ):
                     cached_times = {
                         str(candle.get("time") or "")
