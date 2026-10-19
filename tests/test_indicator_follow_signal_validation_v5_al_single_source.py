@@ -74,6 +74,120 @@ def test_selected_minute_request_uses_one_broker_source(integrated):
     assert results[0]["ok"] is True
 
 
+@pytest.mark.parametrize("integrated", [False, True])
+@pytest.mark.parametrize(
+    ("timeframe", "interval", "trcode"),
+    [
+        ("M1", 1, "opt10080"), ("M3", 3, "opt10080"),
+        ("M5", 5, "opt10080"), ("M10", 10, "opt10080"),
+        ("M15", 15, "opt10080"), ("M30", 30, "opt10080"),
+        ("M60", 60, "opt10080"), ("M120", 120, "opt10080"),
+        ("M240", 240, "opt10080"), ("D1", None, "opt10081"),
+        ("W1", None, "opt10082"), ("MO1", None, "opt10083"),
+        ("Y1", None, "opt10094"),
+    ],
+)
+def test_selected_timeframe_routes_once_and_checks_broker_provenance(
+    timeframe, interval, trcode, integrated
+):
+    calls = []
+    response_override = {}
+    expected_method = (
+        ("request_minute_candles_display_only_integrated" if integrated else
+         "request_minute_candles_read_only") if interval is not None else
+        ("request_period_candles_read_only_integrated" if integrated else
+         "request_period_candles_read_only")
+    )
+    identity = "005930_AL" if integrated else "005930"
+    source = "INTEGRATED" if integrated else "KRX"
+
+    def broker_request(method_name):
+        def request(code, name, **kwargs):
+            calls.append((method_name, code, name, dict(kwargs)))
+            response = {
+                "ok": True, "type": "minute_candles" if interval is not None else "period_candles",
+                "code": code, "request_id": "req-1", "rqname": "req-1",
+                "market_data_identity": identity, "market_source": source,
+                "rows": [], "rows_count": 0, "trcode": trcode,
+            }
+            response["interval" if interval is not None else "timeframe_key"] = timeframe if interval is None else interval
+            response.update(response_override)
+            kwargs["callback"](response)
+            return {"ok": True, "rqname": "req-1"}
+        return request
+
+    broker = SimpleNamespace(**{
+        method_name: broker_request(method_name) for method_name in (
+            "request_minute_candles_display_only_integrated",
+            "request_minute_candles_read_only",
+            "request_period_candles_read_only_integrated",
+            "request_period_candles_read_only",
+        )
+    })
+    requester = flow_module._V5SelectedSourceRequester(
+        broker, ValidationStockRef("005930", "Samsung"), timeframe, integrated
+    )
+    results = []
+    if interval is None:
+        request = lambda **kwargs: requester.request_period_candles_read_only(
+            "005930", "Samsung", timeframe_key=timeframe, count=120,
+            callback=results.append, **kwargs
+        )
+    else:
+        request = lambda **kwargs: requester.request_minute_candles_read_only(
+            "005930", "Samsung", interval=interval, count=120,
+            callback=results.append, **kwargs
+        )
+
+    assert request() == {"ok": True, "rqname": "req-1"}
+    assert len(calls) == 1
+    method_name, code, name, kwargs = calls[0]
+    assert (method_name, code, name) == (expected_method, "005930", "Samsung")
+    assert {key: value for key, value in kwargs.items() if key != "callback"} == {
+        "count": 120,
+        "interval" if interval is not None else "timeframe_key":
+            interval if interval is not None else timeframe,
+        **({"nxt_available": True} if integrated else {}),
+    }
+    assert results[-1]["ok"] is True
+    assert (results[-1]["type"], results[-1]["trcode"],
+            results[-1]["market_data_identity"], results[-1]["market_source"],
+            results[-1]["request_id"]) == (
+                "minute_candles" if interval is not None else "period_candles",
+                trcode, identity, source, "req-1")
+
+    response_override["request_id"] = "wrong"
+    request()
+    assert len(calls) == 2
+    assert results[-1] == {"ok": False, "error": "V5_BROKER_SOURCE_PROVENANCE_INVALID"}
+
+
+@pytest.mark.parametrize("integrated", [False, True])
+def test_mo1_rejects_wrong_request_identity_before_broker(integrated):
+    calls = []
+    broker = SimpleNamespace(
+        request_period_candles_read_only=lambda *args, **kwargs: calls.append("KRX"),
+        request_period_candles_read_only_integrated=lambda *args, **kwargs: calls.append("AL"),
+        request_minute_candles_read_only=lambda *args, **kwargs: calls.append("minute"),
+        request_minute_candles_display_only_integrated=lambda *args, **kwargs: calls.append("minute_AL"),
+    )
+    requester = flow_module._V5SelectedSourceRequester(
+        broker, ValidationStockRef("005930", "Samsung"), "MO1", integrated
+    )
+    results = []
+    requester.request_period_candles_read_only(
+        "005930", "Samsung", timeframe_key="Y1", count=120, callback=results.append
+    )
+    requester.request_minute_candles_read_only(
+        "005930", "Samsung", interval=1, count=120, callback=results.append
+    )
+    assert calls == []
+    assert results == [
+        {"ok": False, "error": "V5_BROKER_REQUEST_IDENTITY_INVALID"},
+        {"ok": False, "error": "V5_BROKER_REQUEST_IDENTITY_INVALID"},
+    ]
+
+
 def _response(source, kind, timeframe, request_id):
     return {
         "ok": True, "type": "minute_candles", "code": "005930",

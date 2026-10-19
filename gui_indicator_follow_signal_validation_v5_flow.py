@@ -270,7 +270,7 @@ class _V5SelectedSourceRequester:
 
     def _request(self, method_name: str, code: str, name: str, count: int,
                  callback, *, interval: int | None = None) -> object:
-        minute = self.timeframe_key.startswith("M")
+        minute = self.timeframe_key in ("M1", "M3", "M5", "M10", "M15", "M30", "M60", "M120", "M240")
         if (code != self.stock.code or name != self.stock.name
                 or minute != (interval is not None)
                 or (minute and self.timeframe_key != f"M{interval}")):
