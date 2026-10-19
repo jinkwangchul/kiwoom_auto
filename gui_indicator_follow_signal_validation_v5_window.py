@@ -15383,6 +15383,7 @@ class IndicatorFollowSignalValidationV5Window(
         )
         bounds = self._effective_validation_range()
         source = self._calculation_candles
+        snapshot_candles = replay_snapshot.to_candles()
         range_times = self._validation_range_times
         if (
             not self._range_replay_entries_available
@@ -15414,7 +15415,11 @@ class IndicatorFollowSignalValidationV5Window(
                 isinstance(candle, dict) and str(candle.get("time") or "")
                 for candle in source
             )
-            or replay_snapshot.to_candles() != source
+            or replay_snapshot.evaluated_start_index != calc_start
+            or replay_snapshot.evaluated_end_index != calc_end
+            or not snapshot_candles
+            or len(snapshot_candles) != calc_end + 1
+            or snapshot_candles != source[:calc_end + 1]
             or self._mapped_replay_entries(replay_snapshot)[1]
             != self._range_replay_entries
         ):

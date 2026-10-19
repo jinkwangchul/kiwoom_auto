@@ -38,7 +38,6 @@ def _prepared(case):
         _entry(rows, 31, "SELL"),
         _entry(rows, 27, "BUY", signal=False),
         _entry(rows, 26, "BUY"),
-        _entry(rows, 34, "BUY"),
     ]
     snapshot = window_module.ValidationReplaySnapshot(
         stock=window.stock,
@@ -49,10 +48,25 @@ def _prepared(case):
         evaluated_start_index=25,
         evaluated_end_index=32,
         dropped_raw_rows_count=0,
-        candles=rows,
+        candles=rows[:33],
         entries=entries,
     )
     return window, rows, settings, snapshot
+
+
+def _with_candles(snapshot, candles):
+    return window_module.ValidationReplaySnapshot(
+        stock=snapshot.stock,
+        timeframe_minutes=snapshot.timeframe_minutes,
+        timeframe_key=snapshot.timeframe_key,
+        settings_hash=snapshot.settings_hash,
+        historical_request_id=snapshot.historical_request_id,
+        evaluated_start_index=snapshot.evaluated_start_index,
+        evaluated_end_index=snapshot.evaluated_end_index,
+        dropped_raw_rows_count=snapshot.dropped_raw_rows_count,
+        candles=candles,
+        entries=snapshot.to_entries(),
+    )
 
 
 def _parity(events):
@@ -114,7 +128,7 @@ def test_enabled_emits_exact_source_rules_ranges_and_sorted_signals(case, monkey
     assert evidence["signal_counts"] == {"BUY": 1, "SELL": 1}
 
 
-@pytest.mark.parametrize("invalid", ["hash", "time", "range_time", "pending", "canceled", "duplicate"])
+@pytest.mark.parametrize("invalid", ["hash", "time", "range_time", "pending", "canceled", "duplicate", "evaluation_start", "evaluation_end"])
 def test_bad_identity_or_duplicate_suppresses_success(case, monkeypatch, invalid):
     window, rows, settings, snapshot = _prepared(case)
     events = []
@@ -135,9 +149,38 @@ def test_bad_identity_or_duplicate_suppresses_success(case, monkeypatch, invalid
         window._range_replay_revalidation_pending = True
     elif invalid == "canceled":
         window._clear_range_replay_override()
+    elif invalid == "evaluation_start":
+        object.__setattr__(snapshot, "evaluated_start_index", 24)
+    elif invalid == "evaluation_end":
+        object.__setattr__(snapshot, "evaluated_end_index", 31)
     else:
         window._range_replay_entries.append(window._range_replay_entries[0])
     window._trace_range_replay_parity_evidence(snapshot, (25, 32))
+    assert _parity(events) == []
+
+
+@pytest.mark.parametrize("invalid", ["ohlcv", "timestamp", "short_tail", "empty"])
+def test_snapshot_prefix_mismatch_suppresses_success(case, monkeypatch, invalid):
+    window, rows, settings, snapshot = _prepared(case)
+    events = []
+    monkeypatch.setattr(window_module, "signal_validation_trace_enabled", lambda: True)
+    monkeypatch.setattr(window_module, "trace_signal_validation_event", lambda event, **payload: events.append((event, payload)))
+    window.apply_range_replay_snapshot(snapshot, settings_snapshot=settings)
+    assert len(_parity(events)) == 1
+    events.clear()
+
+    altered = snapshot.to_candles()
+    if invalid == "ohlcv":
+        altered[10]["close"] += 1
+    elif invalid == "timestamp":
+        altered[10]["time"] = "20000101000000"
+    elif invalid == "short_tail":
+        altered.pop()
+    else:
+        altered.clear()
+    window._trace_range_replay_parity_evidence(
+        _with_candles(snapshot, altered), (25, 32)
+    )
     assert _parity(events) == []
 
 
