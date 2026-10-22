@@ -18,8 +18,11 @@ Windows GUI 창 클래스 정의 파일.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import logging
 import re
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal
@@ -37,6 +40,7 @@ from PyQt5.QtCore import (
     Qt,
     QTimer,
     pyqtSignal,
+    pyqtSlot,
 )
 from PyQt5.QtGui import (
     QBrush,
@@ -71,6 +75,7 @@ from PyQt5.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QComboBox,
     QSizePolicy,
     QTableWidget,
@@ -1375,6 +1380,12 @@ class _AccountComboPopupInteractionController(QObject):
 
 from gui_stock_register_window import StockRegisterWindow
 from gui_stock_data import append_base_stock as append_central_base_stock
+from gui_stock_data import find_library_stock_by_code, read_base_stocks
+from assignment_authorization_service import (
+    ASSIGNMENT_INTENT_ASSIGN,
+    execute_assignment_change,
+    inspect_assignment_authorization,
+)
 from gui_review_required_window import (
     GlobalReviewRequiredWindow,
     collect_global_review_required_rows,
@@ -1435,6 +1446,7 @@ from gui_main_table_loader import (
     routine_aggregate_label_width,
     routine_aggregate_number_slot_width,
     routine_instance_number_widths,
+    _main_routine_effective_stock_scope,
     main_refresh_market_information_only,
     main_refresh_pnl_only,
     build_main_refresh_read_context,
@@ -1740,7 +1752,7 @@ from mock_validation_context_menu import (
     show_mock_registration_context_menu,
     show_mock_monitoring_context_menu,
 )
-from mock_validation_host import MockValidationHost
+from mock_validation_host import MockValidationHost, compute_mock_ui_projection_hash
 from mock_validation_operation_lifecycle import mock_validation_end_eligibility
 from mock_validation_reference_snapshot import build_mock_reference_snapshot
 from mock_validation_ui_actions import MockValidationUIActions
@@ -1871,7 +1883,7 @@ MAIN_STOCK_METRIC_LAYOUT = {
         },
     ),
 }
-MAIN_MARKET_INFORMATION_REFRESH_INTERVAL_MS = 100
+MAIN_MARKET_INFORMATION_REFRESH_INTERVAL_MS = 250
 ROUTINE_STOCK_METRIC_SEPARATOR_GAP = int(
     MAIN_STOCK_METRIC_LAYOUT["separator_spacing"]
 )
@@ -2580,8 +2592,10 @@ class _RoutineTreeInteractionController(QObject):
                     return super().eventFilter(watched, event)
                 expand_left = cell_rect.left() + ROUTINE_PARENT_EXPAND_OFFSET
                 expand_right = expand_left + ROUTINE_PARENT_EXPAND_WIDTH
+                # Right-clicks on expand arrows must reach the table context menu.
                 if (
                     row_kind == ROUTINE_ROW_PARENT
+                    and event.button() == Qt.LeftButton
                     and expand_left <= event.pos().x() <= expand_right
                 ):
                     if event.type() == QEvent.MouseButtonPress:
@@ -2590,6 +2604,7 @@ class _RoutineTreeInteractionController(QObject):
                     return True
                 if (
                     row_kind == ROUTINE_ROW_CHILD
+                    and event.button() == Qt.LeftButton
                     and self._child_expand_rect(index).contains(event.pos())
                 ):
                     if event.type() == QEvent.MouseButtonPress:
@@ -4284,13 +4299,32 @@ def _record_kiwoom_order_transport_evidence(
     return result
 
 
+def _emit_mock_projection_completion(window_ref, generation, future) -> None:
+    """Future callback only transports a result; acceptance belongs to Qt."""
+
+    try:
+        projection_hash, error = future.result(), None
+    except Exception as exc:
+        projection_hash, error = None, str(exc) or type(exc).__name__
+    window = window_ref()
+    if window is not None:
+        try:
+            window._mock_projection_completed.emit(generation, projection_hash, error)
+        except RuntimeError:
+            # The QObject may have been destroyed while pure work was running.
+            pass
+
+
 class MainWindow(QMainWindow):
     """
     키움 자동매매 시스템 메인 윈도우
     """
 
+    _mock_projection_completed = pyqtSignal(object, object, object)
+
     def __init__(self) -> None:
         super().__init__()
+        self._initialize_mock_projection_worker()
 
         self._raw_chejan_evidence_bound = False
         self._raw_order_tr_evidence_bound = False
@@ -4359,6 +4393,7 @@ class MainWindow(QMainWindow):
         self.account_label = QLabel("계좌정보 :")
         self.account_combo = _AccountInfoComboBox()
         self.account_combo.setObjectName("kiwoomAccountCombo")
+        self.account_combo.setPlaceholderText("계좌 선택")
         self.account_combo.setEnabled(False)
         self.account_type_label = QLabel("계좌 구분: -")
         self.account_type_label.hide()
@@ -4569,12 +4604,24 @@ class MainWindow(QMainWindow):
         operation_host = self.main_monitoring_auto_trade_operation_host()
         market_host_getter = getattr(operation_host, "market_data_host", None)
         market_host = market_host_getter() if callable(market_host_getter) else None
+        def read_mock_sor_calculation_value(**kwargs):
+            projector = getattr(market_host, "project_routine_candles", None)
+            if not callable(projector) or kwargs.get("consumer_scope") != "SOR_CALCULATION_ONLY":
+                return None
+            value = deepcopy(projector(**kwargs))
+            if isinstance(value, dict):
+                value["calculation_as_of"] = kwargs["as_of"].isoformat()
+            return value
+
+        def update_mock_candle_observations(requirements):
+            return market_host.sync_candle_observation_targets(requirements)
+
         self.mock_validation_host = MockValidationHost(
             self.kiwoom_api,
             project_root=PROJECT_ROOT,
             projection_changed=self._on_mock_validation_projection_changed,
-            candles_provider=getattr(market_host, "project_routine_candles", None),
-            candle_observation_updater=getattr(market_host, "sync_candle_observation_targets", None),
+            candle_observation_updater=update_mock_candle_observations,
+            sor_calculation_value_reader=read_mock_sor_calculation_value,
         )
         self.mock_validation_ui_actions = MockValidationUIActions(
             self.mock_validation_host
@@ -6365,21 +6412,117 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "routine_table"):
             return
         try:
+            if _main_routine_effective_stock_scope(self) != "mock":
+                main_refresh_pnl_only(self)
+                return
             self.load_routine_table()
             MainWindow._apply_mock_scope_button_isolation(self)
         except Exception:
             LOGGER.exception("Mock validation projection refresh failed")
 
     def _process_mock_validation_host_cycle(self) -> None:
+        if getattr(self, "_mock_projection_closed", False):
+            return
         host = getattr(self, "mock_validation_host", None)
         processor = getattr(host, "process_due_cycles", None)
         if not callable(processor):
             return
         try:
-            processor()
+            result = processor(defer_projection=True)
+            projection_input = result.get("projection_input")
+            if projection_input is not None:
+                self._mock_projection_generation += 1
+                snapshot = (
+                    self._mock_projection_generation, host, projection_input,
+                    host._projection_publication_epoch,
+                )
+                if self._mock_projection_active is not None:
+                    self._mock_projection_pending = snapshot
+                else:
+                    self._submit_mock_projection(snapshot)
         except Exception:
             # A Mock failure must never escape the shared UI timer callback.
             LOGGER.exception("Mock validation host cycle failed")
+
+    def _initialize_mock_projection_worker(self) -> None:
+        self._mock_projection_closed = False
+        self._mock_projection_generation = 0
+        self._mock_projection_active = None
+        self._mock_projection_pending = None
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mock-projection")
+        self._mock_projection_executor = executor
+        self._mock_projection_completed.connect(
+            self._accept_mock_projection_completion, Qt.QueuedConnection
+        )
+        # No MainWindow reference is retained by destruction cleanup.
+        self.destroyed.connect(lambda _obj: executor.shutdown(wait=False, cancel_futures=True))
+
+    def _submit_mock_projection(self, snapshot) -> None:
+        if self._mock_projection_closed:
+            return
+        generation, _host, projection_input, _publication_epoch = snapshot
+        self._mock_projection_active = snapshot
+        try:
+            future = self._mock_projection_executor.submit(
+                compute_mock_ui_projection_hash, *projection_input
+            )
+            window_ref = weakref.ref(self)
+            future.add_done_callback(
+                lambda completed: _emit_mock_projection_completion(
+                    window_ref, generation, completed
+                )
+            )
+        except Exception:
+            self._mock_projection_active = None
+            LOGGER.exception("Mock validation projection submission failed")
+
+    @pyqtSlot(object, object, object)
+    def _accept_mock_projection_completion(self, generation, projection_hash, error) -> None:
+        active = self._mock_projection_active
+        if self._mock_projection_closed or active is None or generation != active[0]:
+            return
+        _generation, host, _projection_input, publication_epoch = active
+        accepted_epoch = None
+        try:
+            if error is not None:
+                LOGGER.error("Mock validation projection worker failed: %s", error)
+            elif (
+                not getattr(self, "_main_window_closing", False)
+                and host is getattr(self, "mock_validation_host", None)
+                and not host._disposed
+                and host._projection_publication_epoch == publication_epoch
+            ):
+                # Record the expected increment before refresh can reenter and
+                # publish synchronously; those newer publications win.
+                accepted_epoch = publication_epoch + 1
+                host.apply_ui_projection_hash(projection_hash)
+        except Exception:
+            LOGGER.exception("Mock validation projection acceptance failed")
+        finally:
+            # Keep the active slot occupied through refresh callbacks: a nested
+            # timer cycle must replace pending display work rather than submit.
+            self._mock_projection_active = None
+            pending, self._mock_projection_pending = self._mock_projection_pending, None
+            if accepted_epoch is not None and pending is not None and pending[1] is host and pending[3] == publication_epoch:
+                pending = (*pending[:3], accepted_epoch)
+            if (
+                pending is not None and not self._mock_projection_closed
+                and not getattr(self, "_main_window_closing", False)
+                and pending[1] is getattr(self, "mock_validation_host", None)
+                and not pending[1]._disposed
+                and pending[1]._projection_publication_epoch == pending[3]
+            ):
+                self._submit_mock_projection(pending)
+
+    def _shutdown_mock_projection_worker(self) -> None:
+        self._mock_projection_closed = True
+        self._mock_projection_generation = getattr(self, "_mock_projection_generation", 0) + 1
+        self._mock_projection_pending = None
+        self._mock_projection_active = None
+        executor = getattr(self, "_mock_projection_executor", None)
+        self._mock_projection_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _select_mock_validation_instances(
         self,
@@ -6514,6 +6657,12 @@ class MainWindow(QMainWindow):
                 "name": target.name,
                 "stock_path": str(target.stock_dir.resolve()),
             }
+            configured_source = read_json_dict(target.stock_dir / "config.json").get(
+                "calculation_market_source", "SOR"
+            )
+            if configured_source not in ("SOR", "KRX"):
+                raise ValueError("MOCK_CALCULATION_MARKET_SOURCE_INVALID")
+            stock_reference["calculation_market_source"] = configured_source
             stock_config = default_config()
             budget_defaults = starting_budget_defaults()
             default_mode = str(
@@ -6616,6 +6765,187 @@ class MainWindow(QMainWindow):
             initial_checked_routine_ids=(),
             empty_selection_toast="모의검증할 루틴을 선택하세요.",
         )
+
+    def mock_stock_production_registration_availability(
+        self, code: str, name: str, expected_validation_session_id: str
+    ) -> tuple[bool, str]:
+        """Read current Mock and central identities before offering assignment."""
+        try:
+            host = getattr(self, "mock_validation_host", None)
+            document = host.current_session(code) if host is not None else None
+            session = document.get("session") if isinstance(document, dict) else None
+            if not (
+                code and name and expected_validation_session_id
+                and isinstance(session, dict)
+                and session.get("stock_code") == code
+                and str(session.get("stock_name") or "").strip() == name
+                and session.get("validation_session_id") == expected_validation_session_id
+            ):
+                return False, "Mock 종목 정보가 변경되었습니다."
+            central = [
+                stock for stock in read_base_stocks()
+                if isinstance(stock, dict)
+                and str(stock.get("code") or "").strip() == code
+            ]
+            if len(central) != 1 or str(central[0].get("name") or "").strip() != name:
+                return False, "중앙 종목 정보를 확인할 수 없습니다."
+            routines = central[0].get("routines")
+            if not isinstance(routines, list):
+                return False, "중앙 종목 루틴 정보를 확인할 수 없습니다."
+            if (
+                str(central[0].get("assigned_routine_instance_id") or "").strip()
+                or any(str(routine).strip() for routine in routines)
+            ):
+                return False, "이미 매매참가 중인 종목입니다."
+            return True, ""
+        except Exception:
+            return False, "중앙 종목 정보를 확인할 수 없습니다."
+
+    def register_mock_stock_to_production_routine(
+        self, code: str, name: str, expected_validation_session_id: str
+    ) -> bool:
+        def mock_is_current() -> bool:
+            host = getattr(self, "mock_validation_host", None)
+            try:
+                document = host.current_session(code) if host is not None else None
+            except Exception:
+                return False
+            session = document.get("session") if isinstance(document, dict) else None
+            return bool(
+                code and name and expected_validation_session_id
+                and isinstance(session, dict)
+                and session.get("stock_code") == code
+                and str(session.get("stock_name") or "").strip() == name
+                and session.get("validation_session_id") == expected_validation_session_id
+            )
+
+        if not mock_is_current():
+            show_toast(self, "모의검증 종목이 변경되었습니다.")
+            return False
+
+        try:
+            targets = []
+            for instance in load_persisted_routine_instances(project_root=PROJECT_ROOT):
+                definition = routine_definition_by_id(
+                    instance.definition_id, project_root=PROJECT_ROOT
+                )
+                if instance.enabled and definition is not None and definition.package_enabled:
+                    targets.append((instance, definition))
+        except Exception:
+            LOGGER.exception("Production routine selection failed")
+            show_toast(self, "실전 루틴 목록을 확인하지 못했습니다.")
+            return False
+        if not targets:
+            show_toast(self, "등록 가능한 실전 루틴이 없습니다.")
+            return False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("실전 루틴 선택")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"{code} {name}에서 매매참가할 루틴을 선택하세요."))
+        choices = QButtonGroup(dialog)
+        choices.setExclusive(True)
+        for index, (instance, _definition) in enumerate(targets):
+            checkbox = QCheckBox(instance.display_name)
+            checkbox.setToolTip(instance.instance_id)
+            choices.addButton(checkbox, index)
+            layout.addWidget(checkbox)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("확인")
+        buttons.button(QDialogButtonBox.Cancel).setText("취소")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return False
+        selected_index = choices.checkedId()
+        if selected_index < 0:
+            show_toast(self, "실전 루틴 1개를 선택하세요.")
+            return False
+        if not mock_is_current():
+            show_toast(self, "모의검증 종목이 변경되었습니다.")
+            return False
+
+        instance, definition = targets[selected_index]
+        try:
+            current_instance = next(
+                (item for item in load_persisted_routine_instances(project_root=PROJECT_ROOT)
+                 if item.instance_id == instance.instance_id),
+                None,
+            )
+            current_definition = routine_definition_by_id(
+                instance.definition_id, project_root=PROJECT_ROOT
+            )
+            if (
+                current_instance != instance
+                or current_definition != definition
+                or not current_instance.enabled
+                or not current_definition.package_enabled
+            ):
+                show_toast(self, "선택한 실전 루틴이 변경되었습니다.")
+                return False
+            central = [
+                stock for stock in read_base_stocks()
+                if str(stock.get("code") or "").strip() == code
+            ]
+            if len(central) != 1 or str(central[0].get("name") or "").strip() != name:
+                show_toast(self, "중앙 종목 등록 정보를 확인하지 못했습니다.")
+                return False
+            routines = central[0].get("routines")
+            if not isinstance(routines, list):
+                show_toast(self, "중앙 종목 루틴 정보를 확인하지 못했습니다.")
+                return False
+            if (
+                str(central[0].get("assigned_routine_instance_id") or "").strip()
+                or any(str(routine).strip() for routine in routines)
+            ):
+                show_toast(self, "이미 실전 루틴이 등록된 종목입니다.")
+                return False
+            library_stock = find_library_stock_by_code(code)
+            if library_stock is None or str(library_stock.get("name") or "").strip() != name:
+                show_toast(self, "종목 라이브러리 확인에 실패했습니다.")
+                return False
+            authorization = inspect_assignment_authorization(
+                self, PROJECT_ROOT, code, name,
+                intent=ASSIGNMENT_INTENT_ASSIGN,
+                target_instance_id=instance.instance_id,
+                expected_instance_id="",
+            )
+            if not authorization.allowed:
+                show_toast(self, f"실전 루틴 등록 불가: {authorization.reason_code}")
+                return False
+            if not mock_is_current():
+                show_toast(self, "모의검증 종목이 변경되었습니다.")
+                return False
+            result = execute_assignment_change(
+                self, PROJECT_ROOT, code, name,
+                instance_id=instance.instance_id,
+                instance_name=instance.display_name,
+                definition_id=definition.definition_id,
+                routine_type=definition.display_name,
+                expected_instance_id="",
+                intent=ASSIGNMENT_INTENT_ASSIGN,
+            )
+        except Exception:
+            LOGGER.exception("Production routine assignment failed")
+            show_toast(self, "실전 루틴 등록을 완료하지 못했습니다. 상태를 확인하세요.")
+            return False
+        if not result.ok or not result.changed or result.reconciliation_required:
+            show_toast(self, f"실전 루틴 등록 불가: {result.reason_code or '저장 실패'}")
+            return False
+        try:
+            sync_result = sync_auto_trade_monitoring_universe(self)
+            refresh_auto_trade_views(self)
+        except Exception:
+            LOGGER.exception("Production assignment view refresh failed")
+            show_toast(self, "실전 루틴은 등록됐지만 화면 갱신에 실패했습니다. 상태를 확인하세요.")
+            return True
+        if not sync_result.get("ok"):
+            show_toast(self, "실전 루틴은 등록됐지만 시세 구독 동기화에 실패했습니다. 상태를 확인하세요.")
+            return True
+        show_toast(self, "실전 루틴을 등록했습니다. 모의검증은 유지되며 운영은 시작되지 않았습니다.")
+        return True
 
     def _begin_mock_validation_for_selected_stock(
         self,
@@ -8845,12 +9175,28 @@ class MainWindow(QMainWindow):
     def _continue_login_after_pending_budget_projection(
         self,
         login_identity: tuple[int, str],
+        account_retry_attempt: int = 0,
     ) -> None:
         if (
             getattr(self, "_handled_kiwoom_login_identity", None) != login_identity
             or not bool(getattr(self, "_event_journal_kiwoom_connected", False))
         ):
             return
+
+        accounts = self.refresh_kiwoom_accounts()
+        if not accounts:
+            if account_retry_attempt < 5:
+                QTimer.singleShot(
+                    500,
+                    lambda identity=login_identity, attempt=account_retry_attempt + 1: MainWindow._continue_login_after_pending_budget_projection(
+                        self,
+                        identity,
+                        attempt,
+                    ),
+                )
+            return
+
+        self.sync_account_funds_selection(connected=True)
         self.request_account_funds()
         self.start_production_recovery()
         QTimer.singleShot(0, self.start_stock_library_sync_for_current_session)
@@ -8940,7 +9286,7 @@ class MainWindow(QMainWindow):
         )
         query_state = str(self._account_query_states.get(account, "") or "")
         normal = authenticated and query_state == ACCOUNT_FUNDS_READY
-        retryable = authenticated and query_state == ACCOUNT_FUNDS_FAILED
+        retryable = visible and query_state == ACCOUNT_FUNDS_FAILED
         neutral = not normal and not retryable
         self.account_query_status_label.show()
         self.account_query_normal_label.setVisible(normal)
@@ -8978,15 +9324,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("계좌비밀번호 입력창을 열지 못했습니다.")
             self.refresh_account_authentication_ui()
             return
-        if self._displayed_active_account_no() == account:
-            self.request_account_funds()
+        self.statusBar().showMessage(
+            "계좌비밀번호 등록을 완료한 뒤 재조회를 눌러 계좌정보를 확인하십시오."
+        )
 
     def requery_current_account_funds(self) -> None:
         account = self._displayed_active_account_no()
         if (
             not account
-            or self._account_authentication_states.get(account)
-            != ACCOUNT_FUNDS_READY
             or self._account_query_states.get(account) != ACCOUNT_FUNDS_FAILED
         ):
             self.refresh_account_query_status_ui()
@@ -12955,11 +13300,6 @@ class MainWindow(QMainWindow):
             show_main_monitoring_stock_context_menu(self, position)
             return
         if row_kind == ROUTINE_ROW_PARENT:
-            index = self.routine_table.model().index(item.row(), 0)
-            if not self._routine_tree_interaction_controller._parent_name_rect(index).contains(
-                position
-            ):
-                return
             group_id = str(first_item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
             group_path = str(first_item.data(ROUTINE_GROUP_PATH_ROLE) or "").strip()
             group_name = str(first_item.data(ROUTINE_PARENT_NAME_ROLE) or "").strip()
@@ -13480,6 +13820,8 @@ class MainWindow(QMainWindow):
             self,
             stock_search_register_opener=open_instance_stock_search_register_dialog,
             mock_validation_opener=self.begin_registered_stock_mock_validation,
+            mock_validation_host=self.mock_validation_host,
+            mock_validation_actions=self.mock_validation_ui_actions,
         )
         window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.stock_register_window = window
@@ -13528,6 +13870,13 @@ class MainWindow(QMainWindow):
             window.show()
         window.raise_()
         window.activateWindow()
+
+    def existing_market_data_host(self):
+        """Return the already owned market host without starting an operation host."""
+
+        host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
+        getter = getattr(host, "market_data_host", None)
+        return getter() if callable(getter) else None
 
     def main_monitoring_auto_trade_operation_host(self) -> AutoTradeOperationHost:
         """Return the widget-free production operation host for monitoring."""
@@ -13792,6 +14141,7 @@ class MainWindow(QMainWindow):
         return accepted
 
     def _shutdown_mock_validation_host(self) -> None:
+        MainWindow._shutdown_mock_projection_worker(self)
         mock_host = getattr(self, "mock_validation_host", None)
         shutdown_mock = getattr(mock_host, "shutdown", None)
         if callable(shutdown_mock):

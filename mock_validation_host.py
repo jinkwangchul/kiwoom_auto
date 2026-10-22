@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
+from types import FunctionType
 from typing import Any, Callable, Mapping
 
 from ats_session_contract import PROGRAM_SESSION_ID, VALID_SESSION_KEYS
@@ -50,6 +51,7 @@ from mock_validation_contract import (
 from mock_validation_candle_provider import (
     is_production_market_data_callback,
     project_mock_routine_candles,
+    project_mock_sor_calculation_snapshot,
 )
 from mock_validation_indicator_follow_adapter import MockIndicatorFollowRoutineAdapter
 from mock_validation_market_data import (
@@ -75,6 +77,7 @@ from mock_validation_session_service import (
     mock_instance_error_recovery_reset_allowed,
 )
 from mock_validation_ui_projection import mock_monitoring_tree_projection
+import mock_validation_ui_projection as _ui_projection
 from mock_validation_virtual_execution import MockExecutionPolicy, MockVirtualExecutionEngine
 from routine_instance_registry import routine_instance_by_id
 
@@ -140,6 +143,47 @@ def _close_method(value: Any) -> str:
     raise MockValidationError("MOCK_CLOSE_POLICY_METHOD_UNSUPPORTED")
 
 
+def compute_mock_ui_projection_hash(
+    documents: tuple[dict[str, Any], ...],
+    current_prices: Mapping[str, int | float | None],
+    as_of: datetime,
+) -> str:
+    """Pure hash of owner-captured documents/prices/time, without live reads.
+
+    The shared operation formatter reads global schedule/ATS policy. Bind its
+    captured result in private function namespaces, never patch shared globals.
+    The existing tree/instance projection code otherwise runs unchanged.
+    """
+
+    operation_displays: dict[str, Any] = {}
+    namespace = dict(mock_monitoring_tree_projection.__globals__)
+    namespace["_mock_operation_display"] = lambda settings: operation_displays[payload_hash(settings)]
+    for name in ("mock_instance_projection", "mock_monitoring_tree_projection"):
+        original = namespace[name]
+        detached = FunctionType(original.__code__, namespace, name, original.__defaults__)
+        detached.__kwdefaults__ = original.__kwdefaults__
+        namespace[name] = detached
+    project_tree = namespace["mock_monitoring_tree_projection"]
+
+    trees: list[dict[str, Any]] = []
+    for document in documents:
+        operation_displays = document.get("_captured_mock_operation_displays", {})
+        stock_code = document["session"]["stock_code"]
+        tree = project_tree(
+            document, current_price=current_prices.get(stock_code), as_of=as_of,
+        )
+        tree.pop("revision", None)
+        for child in tree.get("children", ()):
+            if not isinstance(child, dict):
+                continue
+            child.pop("cycle_state", None)
+            child.pop("progression", None)
+            child.pop("rules_snapshot", None)
+        trees.append(tree)
+    trees.sort(key=lambda tree: tree.get("stock_code", ""))
+    return payload_hash(trees)
+
+
 class MockValidationHost:
     """Stock-isolated Mock runtime host owned by one MainWindow."""
 
@@ -154,6 +198,7 @@ class MockValidationHost:
         operation_policy_provider: Callable[[], dict[str, Any]] | None = None,
         candles_provider: Callable[..., Any] | None = None,
         candle_observation_updater: Callable[[object], Any] | None = None,
+        sor_calculation_value_reader: Callable[..., Any] | None = None,
         sor_realtime_source_verifier: Callable[[MockMarketSnapshot], bool] | None = None,
         max_buffered_evidence_per_stock: int = 10000,
         program_session_id: str | None = None,
@@ -167,10 +212,16 @@ class MockValidationHost:
         self._now = now_factory or (lambda: datetime.now().astimezone())
         self._projection_changed = projection_changed
         self._operation_policy_provider = operation_policy_provider or self._read_operation_policy
-        if is_production_market_data_callback(candles_provider):
+        self._mock_candle_cache: dict[tuple[str, int], dict[str, Any]] = {}
+        self._mock_candle_pending: set[tuple[str, int]] = set()
+        if candles_provider is None or is_production_market_data_callback(candles_provider):
             self._candles_provider = lambda **kwargs: project_mock_routine_candles(
                 project_root=self.project_root,
                 api=self.api,
+                cache=self._mock_candle_cache,
+                pending=self._mock_candle_pending,
+                identity_reader=self._mock_candle_identity,
+                latest_trade=self.market_store.latest_trade(kwargs["stock_code"]),
                 **kwargs,
             )
         else:
@@ -180,7 +231,17 @@ class MockValidationHost:
             if is_production_market_data_callback(candle_observation_updater)
             else candle_observation_updater
         )
-        self._sor_realtime_source_verifier = sor_realtime_source_verifier
+        self._sor_calculation_value_reader = (
+            None if is_production_market_data_callback(sor_calculation_value_reader)
+            else sor_calculation_value_reader
+        )
+        self._sor_realtime_source_verifier = (
+            sor_realtime_source_verifier
+            if sor_realtime_source_verifier is not None
+            else getattr(api, "verify_mock_sor_market_pair", None)
+        )
+        self._sor_stock_codes: frozenset[str] = frozenset()
+        self._registration_session_ids: dict[str, str] = {}
         self.max_buffered_evidence_per_stock = max(1, int(max_buffered_evidence_per_stock))
         self._program_session_id = clean_text(
             program_session_id or PROGRAM_SESSION_ID
@@ -220,6 +281,7 @@ class MockValidationHost:
         self._connected = False
         self._disposed = False
         self._projection_hash = ""
+        self._projection_publication_epoch = 0
         self.connect()
         self.sync_registration()
         self._publish_projection_if_changed()
@@ -241,6 +303,29 @@ class MockValidationHost:
             return checker() is True
         except Exception:
             return False
+
+    def _mock_candle_identity(self, stock_code: str) -> tuple[str, int, str, str]:
+        if self._disposed:
+            return "", 0, "", ""
+        reader = getattr(self.api, "broker_session_snapshot", None)
+        broker = reader() if callable(reader) else None
+        if broker is None or not getattr(broker, "connected", False):
+            return "", 0, "", ""
+        registration_reader = getattr(self.api, "mock_orderbook_registration_snapshot", None)
+        registration = registration_reader() if callable(registration_reader) else None
+        if (
+            not getattr(registration, "active", False)
+            or stock_code not in getattr(registration, "target_stock_codes", ())
+            or getattr(registration, "connection_epoch", None) != getattr(broker, "connection_epoch", None)
+            or getattr(registration, "login_session_id", None) != getattr(broker, "login_session_id", None)
+        ):
+            return "", 0, "", ""
+        return (
+            self.repository.current_session_id(stock_code),
+            int(getattr(broker, "connection_epoch", 0) or 0),
+            str(getattr(broker, "login_session_id", "") or ""),
+            str(getattr(registration, "registration_id", "") or ""),
+        )
 
     def _require_server_authenticated(self) -> None:
         if not self.server_authenticated():
@@ -298,9 +383,16 @@ class MockValidationHost:
     def connect(self) -> None:
         if self._connected or self._disposed or self.api is None:
             return
+        trade_signal = (
+            "mock_execution_tick_received"
+            if getattr(self.api, "mock_execution_tick_received", None) is not None
+            else "realtime_shadow_tick_received"
+        )
+        self._trade_signal_name = trade_signal
         for name, callback in (
             ("mock_orderbook_received", self.accept_orderbook),
-            ("realtime_shadow_tick_received", self.accept_trade),
+            (trade_signal, self.accept_trade),
+            ("mock_sor_trade_received", self.accept_trade),
             ("login_state_changed", self._on_login_state_changed),
         ):
             signal = getattr(self.api, name, None)
@@ -315,7 +407,8 @@ class MockValidationHost:
         if self._connected and self.api is not None:
             for name, callback in (
                 ("mock_orderbook_received", self.accept_orderbook),
-                ("realtime_shadow_tick_received", self.accept_trade),
+                (getattr(self, "_trade_signal_name", "realtime_shadow_tick_received"), self.accept_trade),
+                ("mock_sor_trade_received", self.accept_trade),
                 ("login_state_changed", self._on_login_state_changed),
             ):
                 signal = getattr(self.api, name, None)
@@ -339,6 +432,8 @@ class MockValidationHost:
         self._connected = False
         self._disposed = True
         self._buffers.clear()
+        self._mock_candle_cache.clear()
+        self._mock_candle_pending.clear()
 
     def shutdown(self) -> dict[str, Any]:
         if self._disposed:
@@ -361,6 +456,8 @@ class MockValidationHost:
 
     def _on_login_state_changed(self, _payload: Any = None) -> None:
         self._buffers.clear()
+        self._mock_candle_cache.clear()
+        self._mock_candle_pending.clear()
         self._last_received.clear()
         self._last_processed_arrival.clear()
         self.sync_registration()
@@ -394,8 +491,42 @@ class MockValidationHost:
             return None
         return self.repository.read_session(session_id) if session_id else None
 
+    def forget_stock(self, stock_code: str, *, session_ids: tuple[str, ...] = ()) -> None:
+        code = normalized_stock_code(stock_code)
+        self._restart_recovery_blocked_session_ids = frozenset(
+            value for value in self._restart_recovery_blocked_session_ids
+            if value not in session_ids
+        )
+        for key in tuple(self._mock_candle_cache):
+            if key[0] == code:
+                self._mock_candle_cache.pop(key, None)
+        for key in tuple(self._mock_candle_pending):
+            if key[0] == code:
+                self._mock_candle_pending.discard(key)
+        self.market_store.forget_stock(code)
+        self._buffers.pop(code, None)
+        self._arrival_by_stock.pop(code, None)
+        self._last_processed_arrival.pop(code, None)
+        self._integrity_errors.pop(code, None)
+        for key in tuple(self._last_received):
+            if key[0] == code:
+                self._last_received.pop(key, None)
+
     def sync_registration(self) -> dict[str, Any]:
-        targets = tuple(sorted(self.current_stock_codes()))
+        session_ids = dict(self.current_session_ids())
+        targets = tuple(sorted(session_ids))
+        if session_ids != self._registration_session_ids:
+            sor_codes: set[str] = set()
+            for code, session_id in session_ids.items():
+                try:
+                    reference = self.repository.read_session(session_id).get("reference_snapshot", {})
+                except Exception:
+                    continue
+                if isinstance(reference, dict) and reference.get("calculation_market_source") == "SOR":
+                    sor_codes.add(code)
+            self._sor_stock_codes = frozenset(sor_codes)
+            self._registration_session_ids = session_ids
+        sor_targets = tuple(sorted(self._sor_stock_codes))
         if callable(self._candle_observation_updater):
             requirements: list[dict[str, Any]] = []
             for session_id in self.current_session_ids().values():
@@ -414,6 +545,9 @@ class MockValidationHost:
                         "stock_code": code,
                         "rules": rules,
                         "projection_request": self.routine_adapter.market_bar_projection_request(rules),
+                        "calculation_market_source": document.get(
+                            "reference_snapshot", {}
+                        ).get("calculation_market_source", "SOR"),
                     })
             self._candle_observation_updater(requirements or targets)
         sync = getattr(self.api, "sync_mock_orderbook_registration", None)
@@ -421,7 +555,7 @@ class MockValidationHost:
             self.market_store.apply_registration_snapshot({"active": False})
             return {"ok": False, "active": False, "reason_code": "MOCK_BROKER_API_UNAVAILABLE"}
         try:
-            result = sync(targets)
+            result = sync(targets, sor_stock_codes=sor_targets) if sor_targets else sync(targets)
         except Exception as exc:
             self.market_store.apply_registration_snapshot({"active": False})
             return {"ok": False, "active": False, "reason_code": "MOCK_REGISTRATION_FAILED", "error": str(exc)}
@@ -457,6 +591,30 @@ class MockValidationHost:
             else self.routine_adapter.market_bar_projection_request(rules)
         )
         stock_code = document["session"]["stock_code"]
+        reference = document.get("reference_snapshot")
+        source = reference.get("calculation_market_source", "SOR") if isinstance(reference, dict) else "SOR"
+        if source == "SOR":
+            unavailable = {"available": False, "candles": [],
+                           "availability_state": "SOR_VALUE_UNAVAILABLE",
+                           "calculation_only": True, "execution_enabled": False,
+                           "queue_connected": False, "send_order_connected": False}
+            if not callable(self._sor_calculation_value_reader):
+                return unavailable
+            try:
+                value = self._sor_calculation_value_reader(
+                    stock_code=stock_code, rules=deepcopy(rules),
+                    projection_request=deepcopy(request), as_of=now,
+                    session_windows=self._selected_candle_sessions(settings),
+                    consumer_scope="SOR_CALCULATION_ONLY",
+                )
+            except Exception:
+                return unavailable
+            return project_mock_sor_calculation_snapshot(
+                value, stock_code=stock_code, rules=rules,
+                projection_request=request, as_of=now,
+            )
+        if source != "KRX":
+            return {"available": False, "candles": [], "availability_state": "SOURCE_INVALID"}
         value = self._candles_provider(
             stock_code=stock_code,
             rules=rules,
@@ -541,6 +699,16 @@ class MockValidationHost:
     def accept_orderbook(self, snapshot: Any) -> bool:
         if not isinstance(snapshot, MockOrderbookSnapshot):
             return False
+        if (snapshot.stock_code in self._sor_stock_codes) != (snapshot.market_source == "SOR"):
+            return False
+        if snapshot.registration_id:
+            snapshot_reader = getattr(self.api, "mock_orderbook_registration_snapshot", None)
+            registration = snapshot_reader() if callable(snapshot_reader) else None
+            if (
+                not getattr(registration, "active", False)
+                or getattr(registration, "registration_id", "") != snapshot.registration_id
+            ):
+                return False
         acceptance = self._sequence_acceptance(
             snapshot.stock_code,
             "ORDERBOOK",
@@ -565,8 +733,19 @@ class MockValidationHost:
     def accept_trade(self, payload: Any) -> bool:
         if not isinstance(payload, Mapping):
             return False
+        registration_id = str(payload.get("mock_registration_id") or "")
+        if registration_id:
+            snapshot_reader = getattr(self.api, "mock_orderbook_registration_snapshot", None)
+            snapshot = snapshot_reader() if callable(snapshot_reader) else None
+            if (
+                not getattr(snapshot, "active", False)
+                or getattr(snapshot, "registration_id", "") != registration_id
+            ):
+                return False
         snapshot = normalize_mock_trade_snapshot(payload)
         if snapshot is None:
+            return False
+        if (snapshot.stock_code in self._sor_stock_codes) != (snapshot.market_source == "SOR"):
             return False
         acceptance = self._sequence_acceptance(
             snapshot.stock_code,
@@ -1823,7 +2002,7 @@ class MockValidationHost:
     def _process_stock(self, document: dict[str, Any], now: datetime) -> dict[str, Any]:
         stock_code = document["session"]["stock_code"]
         reference = document.get("reference_snapshot")
-        source = reference.get("calculation_market_source", "KRX") if isinstance(reference, dict) else ""
+        source = reference.get("calculation_market_source", "SOR") if isinstance(reference, dict) else ""
         if source not in {"KRX", "SOR"}:
             return document
         reason = self._integrity_errors.pop(stock_code, "")
@@ -1860,7 +2039,10 @@ class MockValidationHost:
             if self._buffers.get(stock_code):
                 self._drain_market_evidence(document, None)
             return document
-        self._drain_market_evidence(document, policy, sor_market, now)
+        self._drain_market_evidence(
+            document, policy,
+            sor_market, now,
+        )
         session_id = document["session"]["validation_session_id"]
         market = sor_market if source == "SOR" else self.market_store.market_snapshot(stock_code)
         if state == SESSION_RUNNING:
@@ -2138,7 +2320,9 @@ class MockValidationHost:
             return result.get("document", document)
         return document
 
-    def process_due_cycles(self, *, as_of: datetime | None = None) -> dict[str, Any]:
+    def process_due_cycles(
+        self, *, as_of: datetime | None = None, defer_projection: bool = False,
+    ) -> dict[str, Any]:
         if self._disposed:
             return {"processed": 0, "errors": (), "reason": "MOCK_HOST_DISPOSED"}
         if self._processing:
@@ -2173,12 +2357,18 @@ class MockValidationHost:
                         projected_documents.append(self.repository.read_session(session_id))
                     except Exception:
                         projected_documents.append(document)
+            result = {"processed": processed, "errors": tuple(errors), "reason": ""}
+            if defer_projection:
+                result["projection_input"] = self.capture_cycle_projection_input(
+                    tuple(projected_documents)
+                )
+                return result
             self._cycle_projection_documents = tuple(projected_documents)
             try:
                 self._publish_projection_if_changed()
             finally:
                 self._cycle_projection_documents = None
-            return {"processed": processed, "errors": tuple(errors), "reason": ""}
+            return result
         finally:
             self._processing = False
 
@@ -2207,34 +2397,67 @@ class MockValidationHost:
         """Hash only the current user-visible Mock monitoring projection."""
 
         now = self._now()
-        trees: list[dict[str, Any]] = []
         source = documents
         if source is None:
             source = getattr(self, "_cycle_projection_documents", None)
         if source is None:
             source = self.current_sessions()
-        for document in source:
+        return compute_mock_ui_projection_hash(
+            *self.capture_cycle_projection_input(source, as_of=now)
+        )
+
+    def _projection_prices(
+        self, documents: tuple[dict[str, Any], ...],
+    ) -> dict[str, int | float | None]:
+        prices: dict[str, int | float | None] = {}
+        for document in documents:
             stock_code = document["session"]["stock_code"]
             trade = self.market_store.latest_trade(stock_code)
-            tree = mock_monitoring_tree_projection(
-                document,
-                current_price=(
-                    getattr(trade, "current_price", None)
-                    if trade is not None
-                    else None
-                ),
-                as_of=now,
+            prices[stock_code] = (
+                getattr(trade, "current_price", None) if trade is not None else None
             )
-            tree.pop("revision", None)
-            for child in tree.get("children", ()):
-                if not isinstance(child, dict):
+        return prices
+
+    def capture_cycle_projection_input(
+        self, documents: tuple[dict[str, Any], ...], *, as_of: datetime | None = None,
+    ) -> tuple[tuple[dict[str, Any], ...], dict[str, int | float | None], datetime]:
+        """Owner-thread transfer of already-detached cycle documents and prices.
+
+        Repository reads/runtime results own their document trees. No live host
+        state retains them, so the worker receives ownership without re-copying.
+        """
+
+        now = as_of or self._now()
+        captured = []
+        for document in documents:
+            displays = {}
+            mutable_settings = document.get("effective_settings_by_instance", {})
+            for instance_id in document.get("instance_execution", {}):
+                if not isinstance(mutable_settings, dict) or not isinstance(mutable_settings.get(instance_id), dict):
                     continue
-                child.pop("cycle_state", None)
-                child.pop("progression", None)
-                child.pop("rules_snapshot", None)
-            trees.append(tree)
-        trees.sort(key=lambda tree: tree.get("stock_code", ""))
-        return payload_hash(trees)
+                active = mock_instance_active_effective_settings(document, instance_id)
+                settings = active if isinstance(active, dict) else instance_effective_settings(document, instance_id)
+                key = payload_hash(settings)
+                if key not in displays:
+                    displays[key] = _ui_projection._mock_operation_display(settings)
+            # Shallow envelope only: nested runtime results are already detached.
+            captured.append({**document, "_captured_mock_operation_displays": displays})
+        return tuple(captured), self._projection_prices(documents), now
+
+    def apply_ui_projection_hash(self, current: str) -> bool:
+        """Owner-thread acceptance and publication of a precomputed UI hash."""
+
+        if self._disposed:
+            return False
+        # Advance even for an unchanged publication, so synchronous UI actions
+        # supersede captured work even when visible hashes return to old values.
+        self._projection_publication_epoch += 1
+        if current == self._projection_hash:
+            return False
+        self._projection_hash = current
+        if callable(self._projection_changed):
+            self._projection_changed()
+        return True
 
     def _publish_projection_if_changed(
         self, *, documents: tuple[dict[str, Any], ...] | None = None,
@@ -2244,12 +2467,7 @@ class MockValidationHost:
             if documents is None
             else self.ui_projection_hash(documents=documents)
         )
-        if current == self._projection_hash:
-            return False
-        self._projection_hash = current
-        if callable(self._projection_changed):
-            self._projection_changed()
-        return True
+        return self.apply_ui_projection_hash(current)
 
 
-__all__ = ["MockMarketEvidence", "MockValidationHost"]
+__all__ = ["MockMarketEvidence", "MockValidationHost", "compute_mock_ui_projection_hash"]

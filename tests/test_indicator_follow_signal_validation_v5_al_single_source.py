@@ -2456,3 +2456,38 @@ def test_invalid_al_refresh_fails_without_cached_or_krx_install(tmp_path, invali
         "HISTORICAL_REQUEST_ERROR: broker failed"
         if invalid_mode == "exception" else "HISTORICAL: MARKET_SOURCE_IDENTITY_INVALID",
     )
+def test_mock_sor_observation_registers_al_m1_without_losing_standby(monkeypatch):
+    from gui_market_data_host import MarketDataHost
+
+    market = SimpleNamespace(
+        _candle_observation_stock_codes=(),
+        _candle_observation_required_by_stock={},
+        _candle_observation_timeframe_requirements_by_stock={},
+        _candle_standby_stock_codes=(),
+        _sor_m1_required_by_stock={"000660": 500},
+        _sor_standby_m1_required_by_stock={"000660": 500},
+        _sor_observation_m1_required_by_stock={},
+        _production_monitoring_stock_codes=(),
+        _execution_shadow_stock_codes=(),
+        kiwoom_api=SimpleNamespace(sync_realtime_shadow_targets=lambda _targets: {"ok": True}),
+    )
+    market.sync_monitoring_targets = lambda _targets: {"shadow_sync": {"ok": True}}
+    market.refresh_operation_candles = lambda _minute: None
+    monkeypatch.setattr("gui_market_data_host.QTimer.singleShot", lambda *_args: None)
+    requirement = {"stock_code": "005930", "rules": {"bar": {"bar_minutes": 5}},
+                   "projection_request": {"projection": "FORMING_BASE_BAR", "warmup_bars": 5},
+                   "calculation_market_source": "SOR"}
+
+    MarketDataHost.sync_candle_observation_targets(market, [requirement])
+    assert "005930" in market._sor_m1_required_by_stock
+    assert market._sor_m1_required_by_stock["000660"] == 500
+    assert MarketDataHost.direct_timeframe_requirements(market, "005930")[1] > 0
+
+    MarketDataHost.sync_candle_standby_requirements(market, [{
+        **requirement, "stock_code": "000660",
+    }])
+    assert "005930" in market._sor_m1_required_by_stock
+    assert market._sor_m1_required_by_stock["000660"] >= 500
+
+    MarketDataHost.sync_candle_observation_targets(market, [])
+    assert market._sor_m1_required_by_stock == market._sor_standby_m1_required_by_stock
