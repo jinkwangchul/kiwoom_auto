@@ -1,0 +1,65 @@
+diff --git a/gui_market_data_host.py b/gui_market_data_host.py
+--- a/gui_market_data_host.py
++++ b/gui_market_data_host.py
+@@ -80,7 +80,7 @@ ExecutionEntryProvider = Callable[[str], object | None]
+ HIGH_RESOLUTION_DATA_NORMAL = "NORMAL"
+ HIGH_RESOLUTION_DATA_UNCERTAIN = "UNCERTAIN"
+ _PRICE_SIGNAL_OBSERVATION_GENERATION_KEY = "_price_signal_observation_generation"
+-_CURRENT_SOURCE_MINUTE_RETENTION = 600
++
+ _DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT = 3
+ _DISPLAY_INTEGRATED_SESSIONS = (
+     ("NXT_PRE", 8 * 60, 8 * 60 + 50),
+@@ -694,11 +694,7 @@ class MarketDataHost(QObject):
+             warmup_bars,
+         )
+         direct_bars = min(history_target_bars, DEFAULT_CANDLES_MAX_COUNT)
+-        minute_source_count = (
+-            direct_bars
+-            if interval == 1
+-            else max(_CURRENT_SOURCE_MINUTE_RETENTION, interval + 1)
+-        )
++        minute_source_count = direct_bars if interval == 1 else interval + 1
+         return interval, direct_bars, minute_source_count
+ 
+     @staticmethod
+@@ -982,7 +978,7 @@ class MarketDataHost(QObject):
+         for interval, required_count in sorted(
+             MarketDataHost.direct_timeframe_requirements(self, code).items()
+         ):
+-            display_required_count = max(
++            display_required_count = required_count if interval == 1 else max(
+                 required_count,
+                 MarketDataHost._full_day_display_count(interval),
+             )
+@@ -1282,7 +1278,8 @@ class MarketDataHost(QObject):
+             self,
+             code,
+         ).get(interval, 0)
+-        required_count = max(
++        use_declared_m1 = interval == 1 and routine_required_count > 0
++        required_count = routine_required_count if use_declared_m1 else max(
+             routine_required_count,
+             MarketDataHost._full_day_display_count(interval),
+         )
+@@ -1562,9 +1559,8 @@ class MarketDataHost(QObject):
+                     direct_bars,
+                 )
+                 if needs_sor_m1:
+-                    sor_m1_required[code] = max(
+-                        MarketDataHost._full_day_display_count(1),
+-                        min(int(minute_source_count), DEFAULT_CANDLES_MAX_COUNT),
++                    sor_m1_required[code] = min(
++                        int(minute_source_count), DEFAULT_CANDLES_MAX_COUNT
+                     )
+             except (TypeError, ValueError) as exc:
+                 failed_codes.add(code)
+@@ -1618,7 +1614,7 @@ class MarketDataHost(QObject):
+             int(self._candle_observation_required_by_stock.get(code, 0)),
+             int(getattr(self, "_candle_standby_required_by_stock", {}).get(code, 0)),
+         )
+-        return declared if declared > 0 else 600
++        return declared
+ 
+     def registered_operation_targets(self) -> tuple[tuple[Path, str, str], ...]:
+         codes = tuple(sorted(
