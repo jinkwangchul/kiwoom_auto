@@ -20,7 +20,6 @@ from typing import Any
 import json
 from pathlib import Path
 
-from engines.indicator_engine import indicator_history_target_bars_from_rules
 
 try:
     from routine_cycle_projection import project_indicator_follow_cycle  # type: ignore
@@ -595,10 +594,8 @@ def market_bar_projection_request(rules: dict[str, Any] | None) -> dict[str, Any
             else "NOT_CONFIGURED"
         ),
         "warmup_bars": warmup_bars,
-        "history_target_bars": max(
-            indicator_history_target_bars_from_rules(rules),
-            warmup_bars,
-        ),
+        # Live calculation needs a bounded warmup cache, not V5 history.
+        "history_target_bars": max(300, warmup_bars),
     }
 
 

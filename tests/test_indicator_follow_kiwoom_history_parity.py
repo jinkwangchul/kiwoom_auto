@@ -240,7 +240,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
                 },
                 require_warmup=True,
             )
-    def test_indicator_follow_declares_minimum_warmup_and_900_minute_history_target(self):
+    def test_indicator_follow_declares_minimum_warmup_and_300_live_history_target(self):
         request = market_bar_projection_request(
             {
                 "indicators": {"rsi": {"period": 14}},
@@ -266,7 +266,7 @@ class IndicatorFollowKiwoomHistoryParityTest(unittest.TestCase):
             }
         )
         self.assertEqual(15, request["warmup_bars"])
-        self.assertEqual(900, request["history_target_bars"])
+        self.assertEqual(300, request["history_target_bars"])
     def test_history_target_does_not_turn_into_availability_requirement(self):
         raw = [{"close": float(index)} for index in range(20)]
         result = project_candle_supply(
