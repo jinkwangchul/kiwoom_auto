@@ -2957,6 +2957,10 @@ class KiwoomApi(QObject):
         while len(evidence_store) > 512:
             evidence_store.pop(next(iter(evidence_store)))
 
+        if os.environ.get("KIWOOM_SOR_CAPTURE_NO_ORDERS") == "1":
+            request_evidence["send_order_blocked_reason"] = "KIWOOM_SOR_CAPTURE_NO_ORDERS"
+            raise RuntimeError("KIWOOM_SOR_CAPTURE_NO_ORDERS")
+
         try:
             raw_result = self._control.dynamicCall(
                 "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
