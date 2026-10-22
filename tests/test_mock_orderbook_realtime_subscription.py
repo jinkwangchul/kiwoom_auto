@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
+from datetime import datetime
 import hashlib
 from pathlib import Path
 import unittest
@@ -20,6 +22,9 @@ from kiwoom_realtime_fids import (
     REALTIME_SHADOW_FIDS,
     REALTIME_TOTAL_ASK_QTY_FID,
     REALTIME_TOTAL_BID_QTY_FID,
+    REALTIME_EXECUTION_TYPE,
+    REALTIME_ORDERBOOK_TYPE,
+    SOR_MOCK_EXECUTION_FIDS,
 )
 from kiwoom_realtime_shadow import RealtimeShadowBarBuilder
 from kiwoom_screen_allocator import KiwoomScreenAllocator
@@ -90,6 +95,7 @@ def _api(*, connected: bool = True) -> KiwoomApi:
     api.realtime_shadow_tick_received = _Signal()
     api.realtime_shadow_bar_completed = _Signal()
     api.mock_orderbook_received = _Signal()
+    api.mock_sor_trade_received = _Signal()
     api.login_state_changed = _Signal()
     return api
 
@@ -109,6 +115,67 @@ def _tree_hashes(*roots: Path) -> dict[str, str]:
 
 
 class MockOrderbookRealtimeSubscriptionTest(unittest.TestCase):
+    def test_sor_registration_and_broker_origin_pair(self) -> None:
+        api = _api()
+        registration = api.sync_mock_orderbook_registration(
+            ["005930"], sor_stock_codes=["005930"],
+        )["snapshot"]
+        self.assertEqual("005930_AL", _calls(api, "SetRealReg")[0][1][1])
+        self.assertEqual(("005930",), registration.sor_stock_codes)
+        self.assertEqual(
+            set(REALTIME_ORDERBOOK_FIDS) | set(SOR_MOCK_EXECUTION_FIDS),
+            set(registration.fid_list),
+        )
+        api._on_receive_real_data("005930", REALTIME_ORDERBOOK_TYPE, "")
+        api._on_receive_real_data("005930", REALTIME_EXECUTION_TYPE, "")
+        self.assertEqual([], api.mock_orderbook_received.values)
+        self.assertEqual([], api.mock_sor_trade_received.values)
+        api._on_receive_real_data("005930_AL", REALTIME_ORDERBOOK_TYPE, "")
+        api._on_receive_real_data("005930_AL", REALTIME_EXECUTION_TYPE, "")
+        book = api.mock_orderbook_received.values[0]
+        trade = api.mock_sor_trade_received.values[0]
+        self.assertEqual(("SOR", "005930_AL", "BROKER_SOR_REALTIME"), (
+            book.market_source, book.broker_market_identity, book.source_proof,
+        ))
+        self.assertEqual(("SOR", "005930_AL", "BROKER_SOR_REALTIME"), (
+            trade["market_source"], trade["broker_market_identity"], trade["source_proof"],
+        ))
+        store = MockValidationMarketDataStore()
+        store.apply_registration_snapshot(registration)
+        self.assertTrue(store.accept_orderbook(book))
+        self.assertTrue(store.accept_trade(trade))
+        market = store.sor_market_snapshot(
+            "005930", now=datetime.now().astimezone(),
+            max_orderbook_age_seconds=2, max_trade_age_seconds=2,
+        )
+        self.assertIsNotNone(market)
+        self.assertTrue(api.verify_mock_sor_market_pair(market))
+        self.assertFalse(api.verify_mock_sor_market_pair(replace(
+            market, trade=replace(market.trade, snapshot_identity="forged"),
+        )))
+        api._on_receive_real_data("005930_AL", REALTIME_ORDERBOOK_TYPE, "")
+        api._on_receive_real_data("005930_AL", REALTIME_EXECUTION_TYPE, "")
+        self.assertTrue(api.verify_mock_sor_market_pair(market))
+        self.assertEqual([], api.realtime_shadow_tick_received.values)
+        api.clear_mock_orderbook_registration(remove_from_broker=True)
+        self.assertFalse(api.verify_mock_sor_market_pair(market))
+
+    def test_sor_and_krx_mock_targets_keep_distinct_broker_identities(self) -> None:
+        api = _api()
+        api.sync_mock_orderbook_registration(
+            ["005930", "000660"], sor_stock_codes=["005930"],
+        )
+        self.assertEqual(
+            {"000660", "005930_AL"},
+            set(_calls(api, "SetRealReg")[0][1][1].split(";")),
+        )
+        api._on_receive_real_data("000660", REALTIME_ORDERBOOK_TYPE, "")
+        api._on_receive_real_data("005930_AL", REALTIME_ORDERBOOK_TYPE, "")
+        self.assertEqual(
+            ["", "SOR"],
+            [book.market_source for book in api.mock_orderbook_received.values],
+        )
+
     def test_official_fids_are_separate_and_shadow_fids_unchanged(self) -> None:
         self.assertEqual(ORIGINAL_SHADOW_FIDS, REALTIME_SHADOW_FIDS)
         self.assertEqual(tuple(range(41, 51)), REALTIME_ASK_PRICE_FIDS)

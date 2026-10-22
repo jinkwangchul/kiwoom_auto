@@ -29,7 +29,7 @@ class _Api:
         self.realtime_shadow_tick_received = _Signal()
         self.login_state_changed = _Signal()
 
-    def sync_mock_orderbook_registration(self, targets):
+    def sync_mock_orderbook_registration(self, targets, *, sor_stock_codes=()):
         return {
             "ok": True,
             "snapshot": {

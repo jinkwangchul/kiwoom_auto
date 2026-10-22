@@ -68,8 +68,12 @@ from kiwoom_realtime_fids import (
     REALTIME_PREVIOUS_DAY_VOLUME_RATE_FID,
     REALTIME_SHADOW_FIDS,
     REALTIME_TRADE_VOLUME_FID,
+    SOR_MOCK_EXECUTION_FIDS,
 )
-from mock_validation_market_data import normalize_mock_orderbook_snapshot
+from mock_validation_market_data import (
+    normalize_mock_orderbook_snapshot,
+    normalize_mock_trade_snapshot,
+)
 from kiwoom_realtime_shadow import (
     RealtimeShadowBar,
     RealtimeShadowBarBuilder,
@@ -192,6 +196,7 @@ class MockOrderbookRegistrationSnapshot:
     fid_list: tuple[int, ...]
     screen_batches: tuple[MockOrderbookScreenBatch, ...]
     last_error: str
+    sor_stock_codes: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -447,6 +452,7 @@ class KiwoomApi(QObject):
     realtime_shadow_bar_completed = pyqtSignal(object)
     nxt_display_tick_received = pyqtSignal(object)
     mock_orderbook_received = pyqtSignal(object)
+    mock_sor_trade_received = pyqtSignal(object)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
@@ -648,6 +654,8 @@ class KiwoomApi(QObject):
         self._nxt_display_receive_sequence = 0
         self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot()
         self._mock_orderbook_receive_sequence = 0
+        self._mock_sor_trade_receive_sequence = 0
+        self._mock_sor_receipts: dict[str, dict[str, dict[str, None]]] = {}
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -1046,6 +1054,10 @@ class KiwoomApi(QObject):
             self._screen_allocator = KiwoomScreenAllocator()
         if "_mock_orderbook_receive_sequence" not in state:
             self._mock_orderbook_receive_sequence = 0
+        if "_mock_sor_trade_receive_sequence" not in state:
+            self._mock_sor_trade_receive_sequence = 0
+        if "_mock_sor_receipts" not in state:
+            self._mock_sor_receipts = {}
         if not isinstance(
             state.get("_mock_orderbook_registration"),
             MockOrderbookRegistrationSnapshot,
@@ -1056,6 +1068,13 @@ class KiwoomApi(QObject):
         self._ensure_mock_orderbook_state()
         self._mock_orderbook_receive_sequence += 1
         return self._mock_orderbook_receive_sequence
+
+    def _record_mock_sor_receipt(self, code: str, kind: str, identity: str) -> None:
+        receipts = self._mock_sor_receipts.setdefault(code, {})
+        identities = receipts.setdefault(kind, {})
+        identities[identity] = None
+        if len(identities) > 10000:
+            del identities[next(iter(identities))]
 
     def mock_orderbook_registration_snapshot(
         self,
@@ -1415,8 +1434,10 @@ class KiwoomApi(QObject):
             self._screen_allocator.release(batch.owner, batch.screen_no)
         return errors
 
-    def sync_mock_orderbook_registration(self, stock_codes: object) -> dict[str, Any]:
-        """Synchronize one Mock-only orderbook subscription per stock code."""
+    def sync_mock_orderbook_registration(
+        self, stock_codes: object, *, sor_stock_codes: object = (),
+    ) -> dict[str, Any]:
+        """Synchronize Mock quote identities, using broker _AL only for SOR stocks."""
 
         self._ensure_mock_orderbook_state()
         session = self.broker_session_snapshot()
@@ -1461,13 +1482,29 @@ class KiwoomApi(QObject):
                 if code not in unsupported_targets
             )
         )
+        sor_candidates = (
+            sor_stock_codes
+            if isinstance(sor_stock_codes, (list, tuple, set, frozenset))
+            else ()
+        )
+        sor_targets = tuple(sorted(
+            {normalize_stock_code(code) for code in sor_candidates} & set(targets)
+        ))
+        broker_targets = tuple(
+            f"{code}_AL" if code in sor_targets else code for code in targets
+        )
+        fids = tuple(dict.fromkeys((
+            *REALTIME_ORDERBOOK_FIDS,
+            *(SOR_MOCK_EXECUTION_FIDS if sor_targets else ()),
+        )))
         current = self._mock_orderbook_registration
         if (
             current.active
             and current.connection_epoch == session.connection_epoch
             and current.login_session_id == session.login_session_id
             and current.target_stock_codes == targets
-            and current.fid_list == tuple(REALTIME_ORDERBOOK_FIDS)
+            and current.sor_stock_codes == sor_targets
+            and current.fid_list == fids
         ):
             return {
                 "ok": True,
@@ -1503,11 +1540,11 @@ class KiwoomApi(QObject):
                 "snapshot": self._mock_orderbook_registration,
             }
 
-        fid_text = ";".join(str(fid) for fid in REALTIME_ORDERBOOK_FIDS)
+        fid_text = ";".join(str(fid) for fid in fids)
         registered: list[MockOrderbookScreenBatch] = []
         try:
-            for offset in range(0, len(targets), 100):
-                codes = targets[offset:offset + 100]
+            for offset in range(0, len(broker_targets), 100):
+                codes = broker_targets[offset:offset + 100]
                 owner = f"mock_orderbook:{session.connection_epoch}:{offset // 100}"
                 lease = self._screen_allocator.claim(REALTIME, owner)
                 batch = MockOrderbookScreenBatch(
@@ -1553,9 +1590,10 @@ class KiwoomApi(QObject):
             connection_epoch=session.connection_epoch,
             login_session_id=session.login_session_id,
             target_stock_codes=targets,
-            fid_list=tuple(REALTIME_ORDERBOOK_FIDS),
+            fid_list=fids,
             screen_batches=tuple(registered),
             last_error="",
+            sor_stock_codes=sor_targets,
         )
         return {
             "ok": True,
@@ -1573,6 +1611,7 @@ class KiwoomApi(QObject):
         reason: str = "MOCK_ORDERBOOK_CLEARED",
     ) -> dict[str, Any]:
         self._ensure_mock_orderbook_state()
+        self._mock_sor_receipts.clear()
         current = self._mock_orderbook_registration
         batches = list(current.screen_batches)
         if remove_from_broker is None:
@@ -4078,6 +4117,9 @@ class KiwoomApi(QObject):
         if real_type == REALTIME_ORDERBOOK_TYPE:
             self._on_receive_mock_orderbook(stock_code)
             return
+        if real_type == REALTIME_EXECUTION_TYPE and stock_code.endswith("_AL"):
+            self._on_receive_mock_sor_trade(stock_code)
+            return
         if real_type == NXT_REALTIME_EXECUTION_TYPE:
             self._on_receive_nxt_display_tick(stock_code)
             return
@@ -4243,12 +4285,16 @@ class KiwoomApi(QObject):
         """Emit a Mock-only immutable orderbook without Production mutation."""
 
         self._ensure_mock_orderbook_state()
-        code = normalize_stock_code(stock_code)
+        broker_identity = normalize_stock_code(stock_code)
+        sor = broker_identity.endswith("_AL")
+        code = broker_identity[:-3] if sor else broker_identity
         registration = self._mock_orderbook_registration
         if (
             not registration.active
             or not code
             or code not in registration.target_stock_codes
+            or (code in registration.sor_stock_codes) != sor
+            or broker_identity != (f"{code}_AL" if sor else code)
         ):
             return
         session = self.broker_session_snapshot()
@@ -4274,14 +4320,87 @@ class KiwoomApi(QObject):
                 login_session_id=session.login_session_id,
                 receive_sequence=self._next_mock_orderbook_receive_sequence(),
                 received_at=datetime.now().astimezone(),
+                market_source="SOR" if sor else "",
+                broker_market_identity=broker_identity if sor else "",
+                source_proof="BROKER_SOR_REALTIME" if sor else "",
             )
             if snapshot is not None:
+                if sor:
+                    self._record_mock_sor_receipt(code, "orderbook", snapshot.snapshot_identity)
                 self.mock_orderbook_received.emit(snapshot)
         except Exception as exc:
             self._mock_orderbook_registration = replace(
                 registration,
                 last_error=str(exc),
             )
+
+    def _on_receive_mock_sor_trade(self, broker_identity: str) -> None:
+        self._ensure_mock_orderbook_state()
+        identity = normalize_stock_code(broker_identity)
+        code = identity[:-3]
+        registration = self._mock_orderbook_registration
+        if identity != f"{code}_AL" or not registration.active or code not in registration.sor_stock_codes:
+            return
+        session = self.broker_session_snapshot()
+        if (
+            not session.connected
+            or session.connection_epoch != registration.connection_epoch
+            or session.login_session_id != registration.login_session_id
+        ):
+            return
+        try:
+            values = {
+                fid: self._control.dynamicCall("GetCommRealData(QString, int)", identity, fid)
+                for fid in SOR_MOCK_EXECUTION_FIDS
+            }
+            self._mock_sor_trade_receive_sequence += 1
+            tick = normalize_realtime_shadow_tick(
+                stock_code=code, real_type=REALTIME_EXECUTION_TYPE,
+                execution_time_raw=values[REALTIME_EXECUTION_TIME_FID],
+                current_price_raw=values[REALTIME_CURRENT_PRICE_FID],
+                cumulative_volume_raw=values[REALTIME_CUMULATIVE_VOLUME_FID],
+                trade_volume_raw=values[REALTIME_TRADE_VOLUME_FID],
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                receive_sequence=self._mock_sor_trade_receive_sequence,
+                received_monotonic=monotonic(),
+                received_at=datetime.now().astimezone(),
+            )
+            if tick is None:
+                return
+            payload = {
+                **tick.to_payload(), "market_source": "SOR",
+                "broker_market_identity": identity,
+                "source_proof": "BROKER_SOR_REALTIME",
+            }
+            snapshot = normalize_mock_trade_snapshot(payload)
+            if snapshot is not None:
+                self._record_mock_sor_receipt(code, "trade", snapshot.snapshot_identity)
+                self.mock_sor_trade_received.emit(payload)
+        except Exception as exc:
+            self._mock_orderbook_registration = replace(registration, last_error=str(exc))
+
+    def verify_mock_sor_market_pair(self, market: Any) -> bool:
+        """Attest pairs emitted from this API's registered _AL callbacks."""
+        self._ensure_mock_orderbook_state()
+        registration = self._mock_orderbook_registration
+        book = getattr(market, "orderbook", None)
+        trade = getattr(market, "trade", None)
+        code = getattr(market, "stock_code", "")
+        receipt = self._mock_sor_receipts.get(code, {})
+        return bool(
+            registration.active and code in registration.sor_stock_codes
+            and book is not None and trade is not None
+            and book.connection_epoch == registration.connection_epoch
+            and trade.connection_epoch == registration.connection_epoch
+            and book.login_session_id == registration.login_session_id
+            and trade.login_session_id == registration.login_session_id
+            and book.market_source == trade.market_source == "SOR"
+            and book.broker_market_identity == trade.broker_market_identity == f"{code}_AL"
+            and book.source_proof == trade.source_proof == "BROKER_SOR_REALTIME"
+            and book.snapshot_identity in receipt.get("orderbook", {})
+            and trade.snapshot_identity in receipt.get("trade", {})
+        )
 
     def _on_receive_msg(self, *args: Any) -> None:
         """Preserve raw broker messages, then project verified account-auth evidence."""

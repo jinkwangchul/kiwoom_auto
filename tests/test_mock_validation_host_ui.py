@@ -91,7 +91,7 @@ class _Api:
     def is_connected(self):
         return True
 
-    def sync_mock_orderbook_registration(self, stock_codes):
+    def sync_mock_orderbook_registration(self, stock_codes, *, sor_stock_codes=()):
         self.targets = tuple(sorted(set(stock_codes)))
         self.sync_calls.append(self.targets)
         self.registration = SimpleNamespace(

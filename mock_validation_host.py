@@ -180,7 +180,13 @@ class MockValidationHost:
             if is_production_market_data_callback(candle_observation_updater)
             else candle_observation_updater
         )
-        self._sor_realtime_source_verifier = sor_realtime_source_verifier
+        self._sor_realtime_source_verifier = (
+            sor_realtime_source_verifier
+            if sor_realtime_source_verifier is not None
+            else getattr(api, "verify_mock_sor_market_pair", None)
+        )
+        self._sor_stock_codes: frozenset[str] = frozenset()
+        self._registration_session_ids: dict[str, str] = {}
         self.max_buffered_evidence_per_stock = max(1, int(max_buffered_evidence_per_stock))
         self._program_session_id = clean_text(
             program_session_id or PROGRAM_SESSION_ID
@@ -301,6 +307,7 @@ class MockValidationHost:
         for name, callback in (
             ("mock_orderbook_received", self.accept_orderbook),
             ("realtime_shadow_tick_received", self.accept_trade),
+            ("mock_sor_trade_received", self.accept_trade),
             ("login_state_changed", self._on_login_state_changed),
         ):
             signal = getattr(self.api, name, None)
@@ -316,6 +323,7 @@ class MockValidationHost:
             for name, callback in (
                 ("mock_orderbook_received", self.accept_orderbook),
                 ("realtime_shadow_tick_received", self.accept_trade),
+                ("mock_sor_trade_received", self.accept_trade),
                 ("login_state_changed", self._on_login_state_changed),
             ):
                 signal = getattr(self.api, name, None)
@@ -395,7 +403,20 @@ class MockValidationHost:
         return self.repository.read_session(session_id) if session_id else None
 
     def sync_registration(self) -> dict[str, Any]:
-        targets = tuple(sorted(self.current_stock_codes()))
+        session_ids = dict(self.current_session_ids())
+        targets = tuple(sorted(session_ids))
+        if session_ids != self._registration_session_ids:
+            sor_codes: set[str] = set()
+            for code, session_id in session_ids.items():
+                try:
+                    reference = self.repository.read_session(session_id).get("reference_snapshot", {})
+                except Exception:
+                    continue
+                if isinstance(reference, dict) and reference.get("calculation_market_source") == "SOR":
+                    sor_codes.add(code)
+            self._sor_stock_codes = frozenset(sor_codes)
+            self._registration_session_ids = session_ids
+        sor_targets = tuple(sorted(self._sor_stock_codes))
         if callable(self._candle_observation_updater):
             requirements: list[dict[str, Any]] = []
             for session_id in self.current_session_ids().values():
@@ -421,7 +442,7 @@ class MockValidationHost:
             self.market_store.apply_registration_snapshot({"active": False})
             return {"ok": False, "active": False, "reason_code": "MOCK_BROKER_API_UNAVAILABLE"}
         try:
-            result = sync(targets)
+            result = sync(targets, sor_stock_codes=sor_targets) if sor_targets else sync(targets)
         except Exception as exc:
             self.market_store.apply_registration_snapshot({"active": False})
             return {"ok": False, "active": False, "reason_code": "MOCK_REGISTRATION_FAILED", "error": str(exc)}
@@ -541,6 +562,8 @@ class MockValidationHost:
     def accept_orderbook(self, snapshot: Any) -> bool:
         if not isinstance(snapshot, MockOrderbookSnapshot):
             return False
+        if (snapshot.stock_code in self._sor_stock_codes) != (snapshot.market_source == "SOR"):
+            return False
         acceptance = self._sequence_acceptance(
             snapshot.stock_code,
             "ORDERBOOK",
@@ -567,6 +590,8 @@ class MockValidationHost:
             return False
         snapshot = normalize_mock_trade_snapshot(payload)
         if snapshot is None:
+            return False
+        if (snapshot.stock_code in self._sor_stock_codes) != (snapshot.market_source == "SOR"):
             return False
         acceptance = self._sequence_acceptance(
             snapshot.stock_code,

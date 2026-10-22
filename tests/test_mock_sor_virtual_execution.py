@@ -4,14 +4,16 @@ from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from mock_validation_contract import payload_hash
 from mock_validation_host import MockValidationHost
 from mock_validation_market_data import normalize_mock_orderbook_snapshot
 from mock_validation_ui_actions import MockValidationUIActions
 from kiwoom_api import REALTIME_EXECUTION_TYPE
-from kiwoom_realtime_fids import REALTIME_ASK_PRICE_FIDS, REALTIME_BID_PRICE_FIDS
+from kiwoom_realtime_fids import (
+    REALTIME_ASK_PRICE_FIDS, REALTIME_BID_PRICE_FIDS, REALTIME_ORDERBOOK_TYPE,
+)
 from tests.test_mock_indicator_follow_adapter import _buy_rules, _sell_rules
 from tests.test_mock_validation_host_ui import NOW, _Api, _reference
 from tests.test_mock_orderbook_realtime_subscription import _api
@@ -92,10 +94,11 @@ class MockSorVirtualExecutionTest(TestCase):
             "source_proof": ("BROKER_SOR_REALTIME" if trade_source == "SOR" else "")
             if trade_proof is None else trade_proof,
         }
-        self.assertTrue(self.host.accept_orderbook(book))
-        self.assertTrue(self.host.accept_trade(trade))
+        self.assertEqual(book_source == "SOR", self.host.accept_orderbook(book))
+        self.assertEqual(trade_source == "SOR", self.host.accept_trade(trade))
         market = self.host.market_store.market_snapshot("005930")
-        self.verified_receipts.add((market.orderbook.snapshot_identity, market.trade.snapshot_identity))
+        if market is not None and market.trade is not None:
+            self.verified_receipts.add((market.orderbook.snapshot_identity, market.trade.snapshot_identity))
 
     def _assert_fill(self, side, expected_price):
         session_id = self._start(side=side)
@@ -111,6 +114,32 @@ class MockSorVirtualExecutionTest(TestCase):
 
     def test_attested_sor_sell_uses_sor_bid(self):
         self._assert_fill("SELL", 100)
+
+    def test_broker_sor_callbacks_reach_virtual_fill_without_external_verifier(self):
+        self.host.dispose()
+        api = _api()
+        api.send_order = Mock(side_effect=AssertionError("real order reached"))
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.api = api
+        self.host = MockValidationHost(
+            api, project_root=Path(temporary.name), now_factory=lambda: NOW,
+            candles_provider=lambda **_: {"available": False, "candles": []},
+        )
+        self.addCleanup(self.host.dispose)
+        self.actions = MockValidationUIActions(self.host)
+        session_id = self._start()
+        self.assertEqual(("005930",), api.mock_orderbook_registration_snapshot().sor_stock_codes)
+        api._control.real_values[REALTIME_ASK_PRICE_FIDS[0]] = "99"
+        api._control.real_values[REALTIME_BID_PRICE_FIDS[0]] = "98"
+        with patch("kiwoom_api.datetime") as clock:
+            clock.now.return_value = NOW
+            api._on_receive_real_data("005930_AL", REALTIME_ORDERBOOK_TYPE, "")
+            api._on_receive_real_data("005930_AL", REALTIME_EXECUTION_TYPE, "")
+        self.host.process_due_cycles(as_of=NOW)
+        document = self.host.repository.read_session(session_id)
+        self.assertEqual({99}, {fill["price"] for fill in document["fills"]})
+        api.send_order.assert_not_called()
 
     def test_no_verifier_stays_closed_even_with_sor_labels(self):
         session_id = self._start()
