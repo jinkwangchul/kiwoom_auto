@@ -105,6 +105,9 @@ class MockOrderbookSnapshot:
     total_bid_qty: int | float | None
     content_hash: str
     snapshot_identity: str
+    market_source: str = ""
+    broker_market_identity: str = ""
+    source_proof: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -125,6 +128,9 @@ class MockTradeSnapshot:
     login_session_id: str
     receive_sequence: int
     snapshot_identity: str
+    market_source: str = ""
+    broker_market_identity: str = ""
+    source_proof: str = ""
 
 
 @dataclass(frozen=True)
@@ -152,6 +158,9 @@ def normalize_mock_orderbook_snapshot(
     login_session_id: Any,
     receive_sequence: Any,
     received_at: datetime | str | None = None,
+    market_source: str = "",
+    broker_market_identity: str = "",
+    source_proof: str = "",
 ) -> MockOrderbookSnapshot | None:
     """Normalize one official 10-level orderbook event.
 
@@ -208,6 +217,11 @@ def normalize_mock_orderbook_snapshot(
     }
     content_hash = payload_hash(normalized_content)
     received_text = observed.isoformat(timespec="microseconds")
+    provenance = {
+        "market_source": str(market_source or ""),
+        "broker_market_identity": str(broker_market_identity or ""),
+        "source_proof": str(source_proof or ""),
+    }
     identity = "MOB-" + payload_hash(
         {
             "stock_code": code,
@@ -216,6 +230,7 @@ def normalize_mock_orderbook_snapshot(
             "receive_sequence": sequence,
             "received_at": received_text,
             "content_hash": content_hash,
+            **(provenance if any(provenance.values()) else {}),
         }
     )
     return MockOrderbookSnapshot(
@@ -232,6 +247,7 @@ def normalize_mock_orderbook_snapshot(
         total_bid_qty=normalized_content["total_bid_qty"],
         content_hash=content_hash,
         snapshot_identity=identity,
+        **provenance,
     )
 
 
@@ -278,9 +294,17 @@ def normalize_mock_trade_snapshot(payload: Mapping[str, Any]) -> MockTradeSnapsh
         "login_session_id": session_id,
         "receive_sequence": sequence,
     }
+    provenance = {
+        "market_source": str(payload.get("market_source") or ""),
+        "broker_market_identity": str(payload.get("broker_market_identity") or ""),
+        "source_proof": str(payload.get("source_proof") or ""),
+    }
     return MockTradeSnapshot(
         **normalized,
-        snapshot_identity="MTR-" + payload_hash(normalized),
+        **provenance,
+        snapshot_identity="MTR-" + payload_hash({
+            **normalized, **(provenance if any(provenance.values()) else {}),
+        }),
     )
 
 
@@ -402,6 +426,39 @@ class MockValidationMarketDataStore:
             trade=trade,
             snapshot_identity=identity,
         )
+
+    def sor_market_snapshot(
+        self, stock_code: Any, *, now: datetime,
+        max_orderbook_age_seconds: float, max_trade_age_seconds: float,
+    ) -> MockMarketSnapshot | None:
+        """Admit only a fresh, same-source pair supplied by a broker-attested SOR producer."""
+
+        market = self.market_snapshot(stock_code)
+        if market is None or market.trade is None:
+            return None
+        book, trade = market.orderbook, market.trade
+        if (
+            book.stock_code != trade.stock_code
+            or book.connection_epoch != trade.connection_epoch
+            or book.login_session_id != trade.login_session_id
+            or book.market_source != "SOR" or trade.market_source != "SOR"
+            or not book.broker_market_identity.strip()
+            or book.broker_market_identity != trade.broker_market_identity
+            or book.source_proof != "BROKER_SOR_REALTIME"
+            or trade.source_proof != "BROKER_SOR_REALTIME"
+        ):
+            return None
+        current = _aware_datetime(now)
+        book_time = _aware_datetime(book.received_at)
+        trade_time = _aware_datetime(trade.received_at)
+        if current is None or book_time is None or trade_time is None:
+            return None
+        if not (
+            0 <= (current - book_time).total_seconds() <= max_orderbook_age_seconds
+            and 0 <= (current - trade_time).total_seconds() <= max_trade_age_seconds
+        ):
+            return None
+        return market
 
     def freshness(
         self,

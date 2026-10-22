@@ -154,6 +154,7 @@ class MockValidationHost:
         operation_policy_provider: Callable[[], dict[str, Any]] | None = None,
         candles_provider: Callable[..., Any] | None = None,
         candle_observation_updater: Callable[[object], Any] | None = None,
+        sor_realtime_source_verifier: Callable[[MockMarketSnapshot], bool] | None = None,
         max_buffered_evidence_per_stock: int = 10000,
         program_session_id: str | None = None,
     ) -> None:
@@ -179,6 +180,7 @@ class MockValidationHost:
             if is_production_market_data_callback(candle_observation_updater)
             else candle_observation_updater
         )
+        self._sor_realtime_source_verifier = sor_realtime_source_verifier
         self.max_buffered_evidence_per_stock = max(1, int(max_buffered_evidence_per_stock))
         self._program_session_id = clean_text(
             program_session_id or PROGRAM_SESSION_ID
@@ -626,6 +628,8 @@ class MockValidationHost:
         self,
         document: dict[str, Any],
         policy: MockExecutionPolicy | None,
+        sor_market: MockMarketSnapshot | None = None,
+        as_of: datetime | None = None,
     ) -> None:
         stock_code = document["session"]["stock_code"]
         queue = self._buffers.get(stock_code)
@@ -641,6 +645,36 @@ class MockValidationHost:
             self._last_processed_arrival[stock_code] = evidence.arrival_sequence
             if policy is None:
                 continue
+            if sor_market is not None:
+                item = evidence.payload
+                if (
+                    item.stock_code != sor_market.stock_code
+                    or item.connection_epoch != policy.connection_epoch
+                    or item.login_session_id != policy.login_session_id
+                    or item.market_source != "SOR"
+                    or item.source_proof != "BROKER_SOR_REALTIME"
+                    or item.broker_market_identity != sor_market.trade.broker_market_identity
+                    or not 0 <= ((as_of or self._now()) - datetime.fromisoformat(item.received_at)).total_seconds()
+                       <= (policy.max_orderbook_age_seconds if evidence.kind == "ORDERBOOK"
+                           else policy.max_trade_age_seconds)
+                ):
+                    continue
+                candidate = (
+                    self._market_for_orderbook(item)
+                    if evidence.kind == "ORDERBOOK"
+                    else MockMarketSnapshot(
+                        item.stock_code, sor_market.orderbook, item,
+                        "MMK-" + payload_hash({
+                            "orderbook": sor_market.orderbook.snapshot_identity,
+                            "trade": item.snapshot_identity,
+                        }),
+                    )
+                )
+                try:
+                    if self._sor_realtime_source_verifier(candidate) is not True:
+                        continue
+                except Exception:
+                    continue
             current = self.repository.read_session(document["session"]["validation_session_id"])
             live_orders = [
                 deepcopy(item)
@@ -1788,6 +1822,10 @@ class MockValidationHost:
 
     def _process_stock(self, document: dict[str, Any], now: datetime) -> dict[str, Any]:
         stock_code = document["session"]["stock_code"]
+        reference = document.get("reference_snapshot")
+        source = reference.get("calculation_market_source", "KRX") if isinstance(reference, dict) else ""
+        if source not in {"KRX", "SOR"}:
+            return document
         reason = self._integrity_errors.pop(stock_code, "")
         if reason:
             self._review_error(document, reason)
@@ -1801,9 +1839,30 @@ class MockValidationHost:
             self._drain_market_evidence(document, None)
             return document
         policy = self._policy()
-        self._drain_market_evidence(document, policy)
+        sor_market = (
+            self.market_store.sor_market_snapshot(
+                stock_code, now=now,
+                max_orderbook_age_seconds=policy.max_orderbook_age_seconds,
+                max_trade_age_seconds=policy.max_trade_age_seconds,
+            ) if source == "SOR" and policy is not None else None
+        )
+        if sor_market is not None:
+            # The existing plain-code broker callback cannot attest SOR source.
+            try:
+                if (
+                    not callable(self._sor_realtime_source_verifier)
+                    or self._sor_realtime_source_verifier(sor_market) is not True
+                ):
+                    sor_market = None
+            except Exception:
+                sor_market = None
+        if source == "SOR" and sor_market is None:
+            if self._buffers.get(stock_code):
+                self._drain_market_evidence(document, None)
+            return document
+        self._drain_market_evidence(document, policy, sor_market, now)
         session_id = document["session"]["validation_session_id"]
-        market = self.market_store.market_snapshot(stock_code)
+        market = sor_market if source == "SOR" else self.market_store.market_snapshot(stock_code)
         if state == SESSION_RUNNING:
             current = self.repository.read_session(session_id)
             root = current.get("mock_operation_lifecycle")
