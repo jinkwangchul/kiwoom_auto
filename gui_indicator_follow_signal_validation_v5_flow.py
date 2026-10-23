@@ -1043,8 +1043,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
     def _handle_sor_m1_snapshot_accepted(self, event: object) -> None:
         if (not isinstance(event, dict) or event.get("source") not in
-                {"SOR_AL_M1_SNAPSHOT_ACCEPTED", "SOR_AL_NATIVE_M1_PARITY_ACCEPTED"}):
+                {"SOR_AL_M1_SNAPSHOT_ACCEPTED", "SOR_AL_NATIVE_M1_PARITY_ACCEPTED",
+                 "SOR_AL_M3_GAP_PROOF_ACCEPTED"}):
             return
+        gap_proof = event["source"] == "SOR_AL_M3_GAP_PROOF_ACCEPTED"
         owner = self.parent()
         getter = getattr(owner, "existing_market_data_host", None)
         market = getter() if callable(getter) else None
@@ -1052,7 +1054,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if not isinstance(code, str):
             return
         identity = (event.get("connection_epoch"), event.get("login_session_id"))
-        snapshot_key = (*identity, event.get("forming_minute"), event.get("snapshot_received_at"))
+        snapshot_key = (*identity, event.get(
+            "missing_minute" if gap_proof else "forming_minute"),
+            event.get("snapshot_received_at"))
         current_session = getattr(market, "_current_display_session_identity", None)
         forming_by_stock = getattr(market, "_sor_forming_m1_by_stock", None)
         required_by_stock = getattr(market, "_sor_m1_required_by_stock", None)
@@ -1065,12 +1069,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             or not isinstance(required_by_stock, dict) or code not in required_by_stock
             or not callable(current_session)
             or current_session() != identity
-            or not isinstance(forming, dict)
-            or forming.get("session_identity") != identity
-            or not isinstance(candle, dict)
-            or candle.get("snapshot_source") not in _V5_SOR_FORMING_SOURCES
             or not all(isinstance(value, str) and value for value in snapshot_key[2:])
-            or snapshot_key[2:] != (candle.get("bar_time"), candle.get("snapshot_received_at"))
+            or (not gap_proof and (
+                not isinstance(forming, dict)
+                or forming.get("session_identity") != identity
+                or not isinstance(candle, dict)
+                or candle.get("snapshot_source") not in _V5_SOR_FORMING_SOURCES
+                or snapshot_key[2:] != (candle.get("bar_time"),
+                                        candle.get("snapshot_received_at"))))
         ):
             return
         for key, window in tuple(self._open_windows.items()):
@@ -1099,10 +1105,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or key in self._range_replay_active
                 or key in self._history_browse_active
                 or getattr(window, "_marking_pool_publication_pending", False)
-                or self._sor_m1_last_snapshot.get(key) == snapshot_key
+                or (not gap_proof and self._sor_m1_last_snapshot.get(key) == snapshot_key)
             ):
                 continue
             try:
+                if gap_proof:
+                    projected = self._sor_m1_calculation_snapshot(session, pool)
+                    if (not isinstance(projected, tuple) or len(projected) != 3
+                            or event.get("missing_minute") not in
+                            projected[2].get("verified_no_trade_minutes", ())):
+                        continue
                 view, deficit = self._normal_base_history_view(
                     session, pool, self._history_targets.get(key, self._historical_count),
                 )
@@ -1111,11 +1123,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 self._use_pool_for_window(
                     window, session, pool, evaluation_count=100,
                     _normal_view=view,
-                    live_m1_snapshot_key=snapshot_key,
+                    live_m1_snapshot_key=None if gap_proof else snapshot_key,
                 )
             except ValueError:
                 continue
-            self._sor_m1_last_snapshot[key] = snapshot_key
+            if not gap_proof:
+                self._sor_m1_last_snapshot[key] = snapshot_key
 
     def _live_sor_snapshot_is_current(self, window, session, pool, snapshot_key):
         code = session.request.stock.code
@@ -6250,6 +6263,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 target = candle_market_datetime(candidates[-1]) if candidates else None
                 source = MarketDataHost._current_display_candles(market, code, 1)
                 covered = {candle_market_datetime(row) for row in source}
+                covered.update(datetime.fromisoformat(stamp) for stamp in
+                               projected.get("verified_no_trade_minutes", ()))
                 expected_day = set()
                 target_starts = set()
                 day_start = cutoff.replace(hour=0, minute=0)
@@ -6538,6 +6553,29 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                                today_candidates[stamp] if stamp.startswith(today) else row
                                for stamp, row in zip(source_times, source)
                            ])
+            verified_no_trade = projected.get("verified_no_trade_minutes", ())
+            if timeframe_key == "M1" and verified_no_trade:
+                try:
+                    derived_times = [datetime.fromisoformat(stamp).strftime("%Y%m%d%H%M%S")
+                                     for stamp in verified_no_trade]
+                except (TypeError, ValueError):
+                    raise ValueError("SOR_M1_BLOCKED:NO_TRADE_PROOF_INVALID") from None
+                latest_plus_one = (datetime.strptime(today_source_times[-1], "%Y%m%d%H%M%S")
+                                   + timedelta(minutes=1)).strftime("%Y%m%d%H%M%S") if today_source_times else ""
+                if (not today_source_times
+                        or any(stamp not in today_candidates
+                               or not today_source_times[0] < stamp <= latest_plus_one
+                               or today_candidates[stamp]["volume"] != 0
+                               or len({today_candidates[stamp][field] for field in
+                                       ("open", "high", "low", "close")}) != 1
+                               for stamp in derived_times)
+                        or any(row != today_candidates[row["time"]]
+                               for row in source if row.get("time") in derived_times)):
+                    raise ValueError("SOR_M1_BLOCKED:NO_TRADE_PROOF_INVALID")
+                calculation = ([row for row in source
+                                if not str(row.get("time") or "").startswith(today)] +
+                               [today_candidates[stamp] for stamp in sorted(
+                                   set(today_source_times) | set(derived_times))])
             if live_minute_forming:
                 try:
                     received = datetime.fromisoformat(projected["forming_snapshot_received_at"])
@@ -6613,8 +6651,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                      or expected_calculation != calculation[-len(expected_calculation):])):
             raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
         display_calculation = (calculation[-min(5000, max(
-            len(display), len(projected["today_target_starts"])
-        )):] if live_higher_forming
+            len(display) + len(projected.get("verified_no_trade_minutes", ())),
+            len(projected.get("today_target_starts", ()))
+        )):] if live_higher_forming or (
+            timeframe_key == "M1" and projected.get("verified_no_trade_minutes"))
                                else list(display))
         if live_calendar and (d1 or period):
             if (not display_calculation or display_calculation[-1]["time"]
