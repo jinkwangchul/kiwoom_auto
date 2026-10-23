@@ -132,6 +132,72 @@ def _registered_m1_calculation_case():
     return flow, session, pool, market, original_cache
 
 
+def test_off_session_v5_lease_fetches_missing_al_m1_once_and_retries_after_verified_install():
+    flow, session, pool, market, cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(
+        2026, 10, 20, 23, 6, tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    requests = []
+    retries = []
+    window = SimpleNamespace(
+        stock=session.request.stock,
+        _normal_base_requested=True,
+        request_initial_validation=lambda: retries.append("history-revalidated"),
+    )
+    flow._open_windows[id(window)] = window
+
+    def capture_request(**kwargs):
+        requests.append(kwargs)
+        return {"ok": True}
+
+    with patch(
+        "auto_candle_refresh.request_display_timeframe_candles_for_stock",
+        side_effect=capture_request,
+    ), patch.object(flow_module.QTimer, "singleShot", side_effect=lambda _ms, callback: callback()):
+        flow._sync_v5_observation_lease(window)
+        flow._sync_v5_observation_lease(window)
+        assert len(requests) == 1
+        assert requests[0]["code"] == "005930"
+        assert requests[0]["timeframe_minutes"] == 1
+        assert requests[0]["nxt_available"] is True
+        assert retries == []
+
+        market._display_timeframe_candles[("005930", 1)] = cached[("005930", 1)]
+        market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
+        requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
+    assert retries == ["history-revalidated"]
+
+
+def test_weekend_v5_history_uses_last_verified_al_minute_not_weekend_clock():
+    flow, session, pool, _market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(
+        2026, 10, 24, 5, 25, tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    assert frozen is not None
+    assert frozen[1].date().isoformat() == "2026-10-20"
+    assert frozen[2]["available"] is True
+
+
+def test_active_session_v5_lease_does_not_start_parallel_al_m1_request():
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(
+        2026, 10, 20, 9, 6, tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    market._display_timeframe_candles.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    with patch(
+        "auto_candle_refresh.request_display_timeframe_candles_for_stock",
+    ) as request:
+        flow._sync_v5_observation_lease(window)
+    request.assert_not_called()
+
+
 def test_v5_gap_error_names_stock_session_and_missing_minute():
     flow, session, pool, market, _ = _registered_m1_calculation_case()
     key = ("005930", 1)

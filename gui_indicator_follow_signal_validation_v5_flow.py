@@ -669,6 +669,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._sor_m1_observed_host = None
         self._sor_m1_last_snapshot: dict[int, tuple[object, ...]] = {}
         self._v5_lease_hosts: dict[int, object] = {}
+        self._offsession_sor_m1_requests: dict[int, tuple[object, ...]] = {}
         self._now_factory = lambda: datetime.now(SEOUL_TIMEZONE)
         take_evicted = getattr(self._recent_stock_store, "take_startup_evicted_codes", None)
         startup_evicted = (
@@ -1102,8 +1103,93 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._v5_lease_hosts[key] = market
         if isinstance(result, dict) and result.get("ok") is True and code:
             self._bind_sor_m1_observations()
+            self._request_offsession_sor_m1_once(window, market, code)
+
+    def _request_offsession_sor_m1_once(
+        self, window: object, market: object, code: str,
+    ) -> None:
+        """Fill a missing V5 display snapshot once outside live SOR sessions."""
+        from gui_market_data_host import MarketDataHost
+
+        key = id(window)
+        if (self._open_windows.get(key) is not window
+                or self._validation_source_by_code.get(code) is not True):
+            return
+        try:
+            now = self._now_factory()
+            now = (
+                now.replace(tzinfo=SEOUL_TIMEZONE)
+                if now.tzinfo is None else now.astimezone(SEOUL_TIMEZONE)
+            )
+            active = MarketDataHost._display_session_for_time(now) in {
+                "NXT_PRE", "KRX", "NXT_AFTER",
+            }
+            if now.weekday() < 5 and active:
+                return
+            identity = MarketDataHost._current_display_session_identity(market)
+            if identity is None:
+                return
+            if MarketDataHost._current_display_candles(market, code, 1):
+                return
+            token = (code, id(market), identity)
+            if self._offsession_sor_m1_requests.get(key) == token:
+                return
+            if code not in MarketDataHost._nxt_eligible_targets((code,)):
+                return
+            required = getattr(market, "_sor_m1_required_by_stock", None)
+            required_count = (
+                int(required.get(code, 0)) if isinstance(required, dict) else 0
+            )
+            count = min(
+                DEFAULT_CANDLES_MAX_COUNT,
+                max(MarketDataHost._full_day_display_count(1), required_count),
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return
+
+        self._offsession_sor_m1_requests[key] = token
+
+        def terminal(result: object) -> None:
+            if (not isinstance(result, dict)
+                    or result.get("ok") is not True
+                    or not isinstance(result.get("install_result"), dict)
+                    or result["install_result"].get("ok") is not True
+                    or self._offsession_sor_m1_requests.get(key) != token
+                    or self._open_windows.get(key) is not window
+                    or getattr(getattr(window, "stock", None), "code", None) != code
+                    or MarketDataHost._current_display_session_identity(market) != identity
+                    or not MarketDataHost._current_display_candles(market, code, 1)):
+                return
+            if not getattr(window, "_normal_base_requested", False):
+                return
+
+            def retry() -> None:
+                if (self._offsession_sor_m1_requests.get(key) == token
+                        and self._open_windows.get(key) is window
+                        and getattr(getattr(window, "stock", None), "code", None) == code):
+                    self._request_initial_validation(window)
+
+            QTimer.singleShot(0, retry)
+
+        try:
+            from auto_candle_refresh import request_display_timeframe_candles_for_stock
+
+            request_display_timeframe_candles_for_stock(
+                window=market,
+                code=code,
+                name=getattr(getattr(window, "stock", None), "name", ""),
+                operation_cycle_minute_key=now.strftime("%Y-%m-%d %H:%M"),
+                timeframe_minutes=1,
+                count=count,
+                nxt_available=True,
+                on_terminal=terminal,
+            )
+        except Exception:
+            # Retain the original fail-closed calculation error if no proof arrives.
+            return
 
     def _release_v5_observation_lease(self, key: int) -> None:
+        self._offsession_sor_m1_requests.pop(key, None)
         market = self._v5_lease_hosts.pop(key, None)
         setter = getattr(market, "set_v5_observation_lease", None)
         if callable(setter):
@@ -1299,6 +1385,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._history_extension_inflight.pop(window_key, None)
         self._history_extension_pending.pop(window_key, None)
         self._last_run_requests.pop(window_key, None)
+        self._offsession_sor_m1_requests.pop(window_key, None)
         if set_stock(selected) is not True:
             return
         self._sync_v5_observation_lease(window)
@@ -6235,6 +6322,31 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         as_of = (as_of.replace(tzinfo=SEOUL_TIMEZONE) if as_of.tzinfo is None
                  else as_of.astimezone(SEOUL_TIMEZONE))
         try:
+            if not live_forming:
+                from gui_market_data_host import MarketDataHost
+
+                live_session = (
+                    as_of.weekday() < 5
+                    and MarketDataHost._display_session_for_time(as_of)
+                    in {"NXT_PRE", "KRX", "NXT_AFTER"}
+                )
+                if not live_session:
+                    verified_m1 = MarketDataHost._current_display_candles(
+                        market, code, 1,
+                    )
+                    newest = verified_m1[-1] if verified_m1 else None
+                    latest = candle_market_datetime(newest) if newest else None
+                    if (isinstance(newest, dict)
+                            and newest.get("market_data_identity") == f"{code}_AL"
+                            and newest.get("market_source") == "INTEGRATED"
+                            and newest.get("display_only") is True
+                            and newest.get("is_complete") is True
+                            and latest is not None
+                            and latest.utcoffset() == timedelta(hours=9)
+                            and latest.date() < as_of.date()):
+                        # Replay only the independently verified last trading day.
+                        # This does not change any live trading-time projection.
+                        as_of = latest.replace(second=0, microsecond=0) + timedelta(minutes=1)
             period = session.request.timeframe_key in {"W1", "MO1", "Y1"}
             higher_live = (live_forming and session.request.timeframe_key in
                            _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"})
@@ -8043,7 +8155,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if not eligibility:
                 self._fail_window(window, "SOR_SOURCE_UNAVAILABLE")
                 return
+            first_source_verification = self._validation_source_by_code.get(stock.code) is not True
             self._validation_source_by_code[stock.code] = eligibility
+            if first_source_verification:
+                self._sync_v5_observation_lease(window)
             snapshot_rules = snapshot.to_dict()
             target_timeframe_minutes = snapshot_rules["bar"]["bar_minutes"]
             warmup_bars = required_validation_history_context_bars(snapshot_rules)
