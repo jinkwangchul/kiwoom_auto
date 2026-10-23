@@ -8248,7 +8248,7 @@ class IndicatorFollowSignalValidationV5Window(
         self._price_scale_manually_adjusted = False
         super().__init__(
             rules_path=__file__,
-            routine_name="지표추종매매 신호검증 V2",
+            routine_name="지표추종매매 신호검증 V5",
             definition_id="indicator_follow_signal_validation_v2",
             settings_mode="registration",
             parent=parent,
@@ -8343,7 +8343,7 @@ class IndicatorFollowSignalValidationV5Window(
         return self._price_scale_manually_adjusted
 
     def _update_window_title(self) -> None:
-        self.setWindowTitle("지표추종매매 - 독립 신호검증 V2")
+        self.setWindowTitle("지표추종매매 - 독립 신호검증 V5")
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -13378,7 +13378,7 @@ class IndicatorFollowSignalValidationV5Window(
             )
             pending_fingerprint = self._signal_ui_fingerprint(entry_ui_state)
         except (TypeError, ValueError):
-            self.show_validation_error("V2 진입 설정으로 검증 데이터를 만들 수 없습니다.")
+            self.show_validation_error("V5 진입 설정으로 검증 데이터를 만들 수 없습니다.")
             return None
         self._pending_result_ui_state = deepcopy(entry_ui_state)
         self._pending_result_settings_snapshot = run_request.settings_snapshot

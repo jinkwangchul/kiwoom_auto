@@ -2044,7 +2044,18 @@ class MarketDataHost(QObject):
                             and MarketDataHost._display_session_for_time(time)
                             != "AL_TRANSITION"
                             and time - previous != timedelta(minutes=1)):
-                        return blocked("SOR_M1_INTERNAL_COVERAGE_GAP")
+                        return {
+                            **blocked("SOR_M1_INTERNAL_COVERAGE_GAP"),
+                            "gap_detail": {
+                                "stock_code": code,
+                                "session": MarketDataHost._display_session_for_time(time),
+                                "previous_available": previous.isoformat(timespec="seconds"),
+                                "next_available": time.isoformat(timespec="seconds"),
+                                "missing_from": (previous + timedelta(minutes=1)).isoformat(timespec="seconds"),
+                                "missing_through": (time - timedelta(minutes=1)).isoformat(timespec="seconds"),
+                                "missing_minute_slots": int((time - previous) / timedelta(minutes=1)) - 1,
+                            },
+                        }
                 rows.append(dict(item))
         if not rows:
             return blocked("SOR_M1_COMPLETED_BARS_UNAVAILABLE")

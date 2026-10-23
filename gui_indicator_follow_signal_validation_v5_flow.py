@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Independent entry and replay flow for indicator signal Validation V2."""
+"""Independent entry and replay flow for indicator signal Validation V5."""
 
 from __future__ import annotations
 
@@ -6399,7 +6399,21 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     != as_of.isoformat(timespec="seconds"))):
             state = (projected.get("availability_state")
                      if isinstance(projected, dict) else "INVALID_PROJECTION")
-            raise ValueError(f"SOR_M1_BLOCKED:{state or 'INCOMPLETE_PROJECTION'}")
+            message = f"SOR_M1_BLOCKED:{state or 'INCOMPLETE_PROJECTION'}"
+            detail = projected.get("gap_detail") if isinstance(projected, dict) else None
+            if (state == "SOR_M1_INTERNAL_COVERAGE_GAP" and isinstance(detail, dict)
+                    and all(key in detail for key in (
+                        "stock_code", "session", "previous_available",
+                        "next_available", "missing_from", "missing_through",
+                        "missing_minute_slots",
+                    ))):
+                message += (
+                    f" [stock={detail['stock_code']}, session={detail['session']}, "
+                    f"between={detail['previous_available']}..{detail['next_available']}, "
+                    f"missing={detail['missing_from']}..{detail['missing_through']}, "
+                    f"slots={detail['missing_minute_slots']}]"
+                )
+            raise ValueError(message)
         source = view.get("candles")
         display = view.get("display_candles", source)
         candidates = projected.get("candles")
