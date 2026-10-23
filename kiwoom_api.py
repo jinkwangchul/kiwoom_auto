@@ -32,7 +32,7 @@ from kiwoom_candle_adapter import (
 )
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
-from event_journal_production import observe_production_exception
+from event_journal_production import append_production_event, observe_production_exception
 from stock_library_master_diagnostics import build_master_code_diagnostic_projection
 from stock_code_contract import (
     is_broker_action_stock_code,
@@ -68,8 +68,9 @@ from kiwoom_realtime_fids import (
     REALTIME_PREVIOUS_DAY_VOLUME_RATE_FID,
     REALTIME_SHADOW_FIDS,
     REALTIME_TRADE_VOLUME_FID,
+    SOR_MOCK_EXECUTION_FIDS,
 )
-from mock_validation_market_data import normalize_mock_orderbook_snapshot
+from mock_validation_market_data import normalize_mock_orderbook_snapshot, normalize_mock_trade_snapshot
 from kiwoom_realtime_shadow import (
     RealtimeShadowBar,
     RealtimeShadowBarBuilder,
@@ -81,6 +82,16 @@ from kiwoom_initial_market_snapshot import (
     normalize_optkwfid_market_row,
 )
 from historical_candle_row_normalizer import normalize_date_based_candle_row
+from indicator_follow_signal_validation_runtime_trace import (
+    signal_validation_trace_enabled,
+    trace_signal_validation_event,
+)
+from opt10080_al_m1_page_diagnostic import AlM1PageDiagnostic
+
+V5_AL_EXECUTION_FIDS = (
+    REALTIME_EXECUTION_TIME_FID, REALTIME_CURRENT_PRICE_FID,
+    REALTIME_CUMULATIVE_VOLUME_FID, REALTIME_TRADE_VOLUME_FID,
+)
 
 
 Opt10080Callback = Callable[[dict[str, Any]], None]
@@ -88,6 +99,41 @@ RecoverySnapshotCallback = Callable[[dict[str, Any]], None]
 AccountFundsCallback = Callable[[dict[str, Any]], None]
 InitialMarketSnapshotCallback = Callable[[dict[str, Any]], None]
 StockRankingSnapshotCallback = Callable[[dict[str, Any]], None]
+
+
+def _trace_validation_readonly_callback(result: dict[str, Any]) -> None:
+    """Opt-in, bounded provenance for exactly the two approved KRX TRs."""
+    if not signal_validation_trace_enabled() or result.get("code") != "005930":
+        return
+    timeframe = (
+        "Y1" if result.get("type") == "period_candles"
+        and result.get("timeframe_key") == "Y1"
+        else "M120" if result.get("type") == "minute_candles"
+        and result.get("interval") == 120 else ""
+    )
+    if not timeframe:
+        return
+    rows = result.get("rows")
+    times = (
+        [str(row.get("체결시간") or "") for row in rows if isinstance(row, dict)]
+        if isinstance(rows, list) else []
+    )
+    trace_signal_validation_event(
+        "broker.validation.readonly.callback",
+        stock_code="005930",
+        timeframe=timeframe,
+        trcode=str(result.get("trcode") or ""),
+        request_id=str(result.get("request_id") or result.get("rqname") or ""),
+        market_source=str(result.get("market_source") or ""),
+        market_data_identity=str(result.get("market_data_identity") or ""),
+        ok=result.get("ok") is True,
+        rows_count=len(times),
+        first_row_time=times[0] if times else "",
+        latest_row_time=max(times, default=""),
+        contains_2026=any(stamp.startswith("2026") for stamp in times),
+        has_more=result.get("has_more"),
+        error=str(result.get("error") or ""),
+    )
 
 
 def _decode_legacy_koa_text(value: object) -> str:
@@ -192,6 +238,8 @@ class MockOrderbookRegistrationSnapshot:
     fid_list: tuple[int, ...]
     screen_batches: tuple[MockOrderbookScreenBatch, ...]
     last_error: str
+    registration_id: str = ""
+    sor_stock_codes: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -447,6 +495,9 @@ class KiwoomApi(QObject):
     realtime_shadow_bar_completed = pyqtSignal(object)
     nxt_display_tick_received = pyqtSignal(object)
     mock_orderbook_received = pyqtSignal(object)
+    mock_execution_tick_received = pyqtSignal(object)
+    mock_sor_trade_received = pyqtSignal(object)
+    v5_al_tick_received = pyqtSignal(object)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
@@ -595,6 +646,7 @@ class KiwoomApi(QObject):
         self._login_requested = False
         self._login_session_id = ""
         self._connection_epoch = 0
+        self._al_m1_page_diagnostic = AlM1PageDiagnostic.from_environment()
         self._login_bootstrap_timer = QTimer(self)
         self._login_bootstrap_timer.setInterval(200)
         self._login_bootstrap_timer.timeout.connect(
@@ -648,6 +700,11 @@ class KiwoomApi(QObject):
         self._nxt_display_receive_sequence = 0
         self._mock_orderbook_registration = self._empty_mock_orderbook_snapshot()
         self._mock_orderbook_receive_sequence = 0
+        self._mock_sor_trade_receive_sequence = 0
+        self._mock_sor_receipts: dict[str, dict[str, dict[str, None]]] = {}
+        self._v5_al_registration: dict[str, Any] = {}
+        self._v5_al_receive_sequence = 0
+        self._v5_al_receive_sequence_by_code: dict[str, int] = {}
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -1046,6 +1103,14 @@ class KiwoomApi(QObject):
             self._screen_allocator = KiwoomScreenAllocator()
         if "_mock_orderbook_receive_sequence" not in state:
             self._mock_orderbook_receive_sequence = 0
+        if "_mock_execution_receive_sequence" not in state:
+            self._mock_execution_receive_sequence = 0
+        if "_mock_registration_generation" not in state:
+            self._mock_registration_generation = 0
+        if "_mock_sor_trade_receive_sequence" not in state:
+            self._mock_sor_trade_receive_sequence = 0
+        if "_mock_sor_receipts" not in state:
+            self._mock_sor_receipts = {}
         if not isinstance(
             state.get("_mock_orderbook_registration"),
             MockOrderbookRegistrationSnapshot,
@@ -1056,6 +1121,12 @@ class KiwoomApi(QObject):
         self._ensure_mock_orderbook_state()
         self._mock_orderbook_receive_sequence += 1
         return self._mock_orderbook_receive_sequence
+
+    def _record_mock_sor_receipt(self, code: str, kind: str, identity: str) -> None:
+        identities = self._mock_sor_receipts.setdefault(code, {}).setdefault(kind, {})
+        identities[identity] = None
+        if len(identities) > 10000:
+            del identities[next(iter(identities))]
 
     def mock_orderbook_registration_snapshot(
         self,
@@ -1415,8 +1486,10 @@ class KiwoomApi(QObject):
             self._screen_allocator.release(batch.owner, batch.screen_no)
         return errors
 
-    def sync_mock_orderbook_registration(self, stock_codes: object) -> dict[str, Any]:
-        """Synchronize one Mock-only orderbook subscription per stock code."""
+    def sync_mock_orderbook_registration(
+        self, stock_codes: object, *, sor_stock_codes: object = (),
+    ) -> dict[str, Any]:
+        """Synchronize Mock quotes, using broker _AL identity for SOR stocks."""
 
         self._ensure_mock_orderbook_state()
         session = self.broker_session_snapshot()
@@ -1461,13 +1534,24 @@ class KiwoomApi(QObject):
                 if code not in unsupported_targets
             )
         )
+        sor_candidates = (
+            sor_stock_codes if isinstance(sor_stock_codes, (list, tuple, set, frozenset)) else ()
+        )
+        sor_targets = tuple(sorted(
+            {normalize_stock_code(code) for code in sor_candidates} & set(targets)
+        ))
+        broker_targets = tuple(
+            f"{code}_AL" if code in sor_targets else code for code in targets
+        )
+        mock_fids = tuple(dict.fromkeys((*REALTIME_ORDERBOOK_FIDS, *REALTIME_SHADOW_FIDS)))
         current = self._mock_orderbook_registration
         if (
             current.active
             and current.connection_epoch == session.connection_epoch
             and current.login_session_id == session.login_session_id
             and current.target_stock_codes == targets
-            and current.fid_list == tuple(REALTIME_ORDERBOOK_FIDS)
+            and current.sor_stock_codes == sor_targets
+            and current.fid_list == mock_fids
         ):
             return {
                 "ok": True,
@@ -1503,11 +1587,11 @@ class KiwoomApi(QObject):
                 "snapshot": self._mock_orderbook_registration,
             }
 
-        fid_text = ";".join(str(fid) for fid in REALTIME_ORDERBOOK_FIDS)
+        fid_text = ";".join(str(fid) for fid in mock_fids)
         registered: list[MockOrderbookScreenBatch] = []
         try:
-            for offset in range(0, len(targets), 100):
-                codes = targets[offset:offset + 100]
+            for offset in range(0, len(broker_targets), 100):
+                codes = broker_targets[offset:offset + 100]
                 owner = f"mock_orderbook:{session.connection_epoch}:{offset // 100}"
                 lease = self._screen_allocator.claim(REALTIME, owner)
                 batch = MockOrderbookScreenBatch(
@@ -1548,14 +1632,17 @@ class KiwoomApi(QObject):
                 "snapshot": self._mock_orderbook_registration,
             }
 
+        self._mock_registration_generation += 1
         self._mock_orderbook_registration = MockOrderbookRegistrationSnapshot(
             active=True,
             connection_epoch=session.connection_epoch,
             login_session_id=session.login_session_id,
             target_stock_codes=targets,
-            fid_list=tuple(REALTIME_ORDERBOOK_FIDS),
+            fid_list=mock_fids,
             screen_batches=tuple(registered),
             last_error="",
+            registration_id=f"{session.connection_epoch}:{self._mock_registration_generation}",
+            sor_stock_codes=sor_targets,
         )
         return {
             "ok": True,
@@ -1573,6 +1660,7 @@ class KiwoomApi(QObject):
         reason: str = "MOCK_ORDERBOOK_CLEARED",
     ) -> dict[str, Any]:
         self._ensure_mock_orderbook_state()
+        self._mock_sor_receipts.clear()
         current = self._mock_orderbook_registration
         batches = list(current.screen_batches)
         if remove_from_broker is None:
@@ -1653,6 +1741,9 @@ class KiwoomApi(QObject):
         message: str = "kiwoom api disconnected",
     ) -> None:
         had_session = bool(self._connected or self._login_session_id)
+        self.clear_v5_al_realtime_targets(
+            remove_from_broker=False, reason="V5_AL_SESSION_INVALIDATED",
+        )
         reset_shadow = getattr(self, "clear_realtime_shadow_registration", None)
         if callable(reset_shadow):
             reset_shadow(
@@ -2418,6 +2509,43 @@ class KiwoomApi(QObject):
                 continue
             accounts.append(account)
             seen.add(account)
+
+        if not accounts:
+            session_id = str(self.login_session_id() or "").strip()
+            if getattr(self, "_empty_account_diagnostic_session_id", None) != session_id:
+                diagnostic: dict[str, object] = {
+                    "accno_present": bool(str(raw_value or "").strip()),
+                    "accno_text_length": len(str(raw_value or "")),
+                    "parsed_account_count": 0,
+                }
+                for tag, key in (
+                    ("ACCOUNT_CNT", "reported_account_count"),
+                    ("USER_ID", "user_id_present"),
+                    ("KEY_BSECGB", "keyboard_security_state"),
+                    ("FIREW_SECGB", "firewall_state"),
+                    ("GetServerGubun", "server_gubun"),
+                ):
+                    try:
+                        value = self._control.dynamicCall("GetLoginInfo(QString)", tag)
+                    except Exception as exc:
+                        diagnostic[f"{key}_error"] = type(exc).__name__
+                        continue
+                    if tag == "USER_ID":
+                        diagnostic[key] = bool(str(value or "").strip())
+                    else:
+                        diagnostic[key] = str(value or "").strip()
+                append_production_event(
+                    "RUNTIME_WARNING",
+                    severity="WARNING",
+                    result="BLOCKED",
+                    source="kiwoom_api.KiwoomApi.account_numbers",
+                    template_args={"target": "Kiwoom account discovery"},
+                    target_type="BROKER_CONNECTION",
+                    target_id="kiwoom_openapi",
+                    reason_code="LOGIN_ACCOUNT_LIST_EMPTY",
+                    details=diagnostic,
+                )
+                self._empty_account_diagnostic_session_id = session_id
         return accounts
 
     @staticmethod
@@ -2514,7 +2642,7 @@ class KiwoomApi(QObject):
                 "error": str(exc),
                 "reason": "MASTER_NAME_CALL_FAILED",
             }
-        name = str(raw_value or "").strip()
+        name = _decode_legacy_koa_text(raw_value)
         if not name:
             return {
                 "ok": False,
@@ -2556,7 +2684,7 @@ class KiwoomApi(QObject):
                 "error": str(exc),
                 "reason": failure_reason,
             }
-        value = str(raw_value or "").strip()
+        value = _decode_legacy_koa_text(raw_value)
         return {
             "ok": True,
             "value": value,
@@ -2840,6 +2968,10 @@ class KiwoomApi(QObject):
         evidence_store[request_key] = request_evidence
         while len(evidence_store) > 512:
             evidence_store.pop(next(iter(evidence_store)))
+
+        if os.environ.get("KIWOOM_SOR_CAPTURE_NO_ORDERS") == "1":
+            request_evidence["send_order_blocked_reason"] = "KIWOOM_SOR_CAPTURE_NO_ORDERS"
+            raise RuntimeError("KIWOOM_SOR_CAPTURE_NO_ORDERS")
 
         try:
             raw_result = self._control.dynamicCall(
@@ -3200,6 +3332,82 @@ class KiwoomApi(QObject):
             commit_to_production=False,
         )
 
+    def request_minute_candles_display_only_integrated(
+        self,
+        code: str,
+        name: str = "",
+        interval: int = 1,
+        count: int = 300,
+        max_count: int = DEFAULT_CANDLES_MAX_COUNT,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+        *,
+        nxt_available: bool | None = None,
+    ) -> dict[str, Any]:
+        """Request verified ``<code>_AL`` history without Production commit."""
+        clean_code = normalize_stock_code(code)
+        if not is_broker_action_stock_code(clean_code):
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": False,
+                    "code": clean_code,
+                    "display_only": True,
+                    "reason_code": "DISPLAY_INTEGRATED_CODE_INVALID",
+                    "error": "canonical six-digit stock code is required",
+                },
+            )
+        if nxt_available is not True:
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": False,
+                    "code": clean_code,
+                    "display_only": True,
+                    "reason_code": "NXT_ELIGIBILITY_NOT_VERIFIED",
+                    "error": "verified NXT eligibility is required",
+                },
+            )
+
+        market_data_identity = f"{clean_code}_AL"
+
+        def display_callback(result: dict[str, Any]) -> None:
+            payload = dict(result) if isinstance(result, dict) else {"ok": False}
+            payload.update(
+                display_only=True,
+                market_data_identity=market_data_identity,
+                market_source="INTEGRATED",
+            )
+            diagnostic = getattr(self, "_al_m1_page_diagnostic", None)
+            if diagnostic is not None:
+                try:
+                    diagnostic.finish_request(str(payload.get("rqname") or ""), payload)
+                except Exception as exc:  # Diagnostic failure must not change the display callback.
+                    diagnostic.last_error = type(exc).__name__
+            if callable(callback):
+                callback(payload)
+
+        started = self._request_minute_candles_common(
+            clean_code,
+            name,
+            interval,
+            count,
+            max_count,
+            screen_no,
+            display_callback,
+            commit_to_production=False,
+            market_data_identity=market_data_identity,
+            market_source="INTEGRATED",
+            display_only=True,
+        )
+        result = dict(started) if isinstance(started, dict) else {"ok": False}
+        result.update(
+            display_only=True,
+            market_data_identity=market_data_identity,
+            market_source="INTEGRATED",
+        )
+        return result
+
     def request_day_candles_read_only(
         self,
         code: str,
@@ -3282,12 +3490,52 @@ class KiwoomApi(QObject):
         screen_no: str | None = None,
         callback: Opt10080Callback | None = None,
     ) -> dict[str, Any]:
+        return self._request_period_candles_read_only_common(
+            code, name, timeframe_key=timeframe_key, count=count,
+            screen_no=screen_no, callback=callback,
+        )
+
+    def request_period_candles_read_only_integrated(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        timeframe_key: str,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+        nxt_available: bool | None = None,
+    ) -> dict[str, Any]:
+        clean_code = normalize_stock_code(code)
+        if not is_broker_action_stock_code(clean_code) or nxt_available is not True:
+            return self._finish_callback(callback, {
+                "ok": False, "code": clean_code,
+                "reason_code": "INTEGRATED_SOURCE_NOT_VERIFIED",
+                "error": "canonical stock code and verified NXT eligibility are required",
+            })
+        return self._request_period_candles_read_only_common(
+            clean_code, name, timeframe_key=timeframe_key, count=count,
+            screen_no=screen_no, callback=callback, integrated=True,
+        )
+
+    def _request_period_candles_read_only_common(
+        self,
+        code: str,
+        name: str = "",
+        *,
+        timeframe_key: str,
+        count: int = 300,
+        screen_no: str | None = None,
+        callback: Opt10080Callback | None = None,
+        integrated: bool = False,
+    ) -> dict[str, Any]:
         """Request day/week/month/year candles for Validation without Production mutation."""
         clean_code = normalize_stock_code(code)
         market_data_identity = (
-            clean_code if is_broker_action_stock_code(clean_code) else ""
+            (f"{clean_code}_AL" if integrated else clean_code)
+            if is_broker_action_stock_code(clean_code) else ""
         )
-        market_source = "KRX"
+        market_source = "INTEGRATED" if integrated else "KRX"
         key = str(timeframe_key or "").strip().upper()
         trcode = self.VALIDATION_PERIOD_TR_CODES.get(key)
         if not clean_code:
@@ -3417,6 +3665,9 @@ class KiwoomApi(QObject):
         callback: Opt10080Callback | None,
         *,
         commit_to_production: bool,
+        market_data_identity: str = "",
+        market_source: str = "KRX",
+        display_only: bool = False,
     ) -> dict[str, Any]:
         clean_code = normalize_stock_code(code)
         if not clean_code:
@@ -3444,12 +3695,21 @@ class KiwoomApi(QObject):
                 callback,
                 {"ok": False, "code": clean_code, "error": "kiwoom api is not connected"},
             )
+        request_as_of = (
+            datetime.now().astimezone().isoformat(timespec="microseconds")
+            if display_only else None
+        )
         request_identity = self._capture_broker_request_identity()
         if request_identity is None:
             result = self._broker_request_not_ready_error()
             result["code"] = clean_code
             return self._finish_callback(callback, result)
 
+        if display_only:
+            request_identity["request_as_of"] = request_as_of
+            request_identity["started_at"] = datetime.now().astimezone().isoformat(
+                timespec="microseconds"
+            )
         try:
             clean_interval = max(int(interval), 1)
         except (TypeError, ValueError):
@@ -3490,8 +3750,16 @@ class KiwoomApi(QObject):
             **request_identity,
         }
         if not commit_to_production:
-            pending["market_data_identity"] = clean_code
-            pending["market_source"] = "KRX"
+            pending["market_data_identity"] = (
+                str(market_data_identity or "").strip() or clean_code
+            )
+            pending["market_source"] = str(market_source or "KRX").strip()
+            if display_only:
+                pending["display_only"] = True
+                if (getattr(self, "_al_m1_page_diagnostic", None) is not None
+                        and clean_interval == 1
+                        and pending["market_data_identity"] == f"{clean_code}_AL"):
+                    pending["al_m1_diag_requested_stock_code"] = pending["market_data_identity"]
         self._pending_tr[rqname] = pending
 
         def start_timeout(_result: Any) -> None:
@@ -3517,7 +3785,7 @@ class KiwoomApi(QObject):
             prev_next=0,
             screen_no=claimed_screen_no,
             inputs=(
-                ("종목코드", clean_code),
+                ("종목코드", str(pending.get("market_data_identity") or clean_code)),
                 ("틱범위", str(clean_interval)),
                 ("수정주가구분", "1"),
             ),
@@ -3527,7 +3795,7 @@ class KiwoomApi(QObject):
         )
         if not dispatched.get("ok"):
             return dispatched
-        return {
+        result = {
             "ok": True,
             "status": dispatched.get("status", "REQUESTED"),
             "code": clean_code,
@@ -3535,6 +3803,17 @@ class KiwoomApi(QObject):
             "screen_no": claimed_screen_no,
             "result": dispatched.get("result"),
         }
+        if display_only:
+            result.update(
+                display_only=True,
+                market_data_identity=str(pending["market_data_identity"]),
+                market_source=str(pending["market_source"]),
+                connection_epoch=pending["request_connection_epoch"],
+                login_session_id=pending["request_login_session_id"],
+                request_as_of=pending["request_as_of"],
+                started_at=pending["started_at"],
+            )
+        return result
 
     def _arm_minute_candle_timeout(
         self,
@@ -3588,6 +3867,12 @@ class KiwoomApi(QObject):
             payload["timeframe_key"] = str(pending.get("timeframe_key") or "")
         else:
             payload.update(_empty_candle_commit_projection())
+            if pending.get("display_only") is True:
+                payload.update(
+                    display_only=True,
+                    market_data_identity=pending.get("market_data_identity", ""),
+                    market_source=pending.get("market_source", ""),
+                )
         self._finish_callback(
             callback if callable(callback) else None,
             payload,
@@ -3967,6 +4252,9 @@ class KiwoomApi(QObject):
 
         self.last_login_error = code
         if code == 0:
+            self.clear_v5_al_realtime_targets(
+                remove_from_broker=False, reason="V5_AL_NEW_SESSION",
+            )
             self.clear_realtime_shadow_registration(
                 remove_from_broker=False,
                 reason="REALTIME_SHADOW_NEW_SESSION",
@@ -4061,27 +4349,142 @@ class KiwoomApi(QObject):
                 pass
         self.raw_chejan_received.emit(raw_event)
 
+    def clear_v5_al_realtime_targets(
+        self, *, remove_from_broker: bool = True, reason: str = "V5_AL_CLEARED",
+    ) -> dict[str, Any]:
+        registration = getattr(self, "_v5_al_registration", {})
+        batches = registration.get("batches", ())
+        errors = self._clear_realtime_shadow_batches(
+            list(batches), remove_from_broker=remove_from_broker,
+        ) if batches else []
+        self._v5_al_registration = {}
+        self._v5_al_receive_sequence = 0
+        self._v5_al_receive_sequence_by_code = {}
+        return {"ok": not errors, "changed": bool(batches),
+                "reason_code": reason if not errors else "V5_AL_CLEAR_FAILED",
+                "errors": tuple(errors)}
+
+    def sync_v5_al_realtime_targets(self, stock_codes: object) -> dict[str, Any]:
+        """Own V5-only broker _AL screens, independently of Mock and shadow."""
+        try:
+            requested = tuple(stock_codes)
+        except TypeError:
+            return {"ok": False, "reason_code": "V5_AL_CODES_INVALID"}
+        if any(not isinstance(code, str) or not is_broker_action_stock_code(code)
+               or len(code) != 6 or not code.isascii() or not code.isdigit()
+               for code in requested):
+            return {"ok": False, "reason_code": "V5_AL_CODES_INVALID"}
+        targets = tuple(sorted(set(requested)))
+        session = self.broker_session_snapshot()
+        current = getattr(self, "_v5_al_registration", {})
+        identity = (session.connection_epoch, session.login_session_id)
+        if (current.get("identity") == identity
+                and current.get("targets") == targets):
+            return {"ok": True, "changed": False, "active": bool(targets)}
+        cleared = self.clear_v5_al_realtime_targets(
+            remove_from_broker=bool(session.connected and current.get("identity") == identity),
+        )
+        if not cleared["ok"]:
+            return cleared
+        if not targets:
+            return {"ok": True, "changed": bool(current.get("batches")), "active": False}
+        if not (session.api_available and session.connected and session.login_session_id):
+            return {"ok": False, "reason_code": "V5_AL_SESSION_NOT_READY"}
+        batches: list[RealtimeShadowScreenBatch] = []
+        try:
+            for offset in range(0, len(targets), 100):
+                codes = tuple(f"{code}_AL" for code in targets[offset:offset + 100])
+                owner = f"v5_al:{identity[0]}:{offset // 100}"
+                lease = self._screen_allocator.claim(REALTIME, owner)
+                batch = RealtimeShadowScreenBatch(lease.screen_no, owner, codes)
+                batches.append(batch)
+                raw = self._control.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    lease.screen_no, ";".join(codes),
+                    ";".join(str(fid) for fid in V5_AL_EXECUTION_FIDS), "0",
+                )
+                if raw not in (None, 0, "0"):
+                    raise RuntimeError(f"SetRealReg failed: {raw}")
+        except Exception as exc:
+            self._clear_realtime_shadow_batches(batches, remove_from_broker=True)
+            return {"ok": False, "reason_code": "V5_AL_REGISTRATION_FAILED",
+                    "error": str(exc)}
+        if identity != (self._connection_epoch, self._login_session_id):
+            self._clear_realtime_shadow_batches(batches, remove_from_broker=True)
+            return {"ok": False, "reason_code": "V5_AL_SESSION_CHANGED"}
+        self._v5_al_registration = {"identity": identity, "targets": targets,
+                                    "batches": tuple(batches)}
+        return {"ok": True, "changed": True, "active": True}
+
+    def _on_receive_v5_al_tick(self, broker_identity: str) -> None:
+        identity = str(broker_identity or "").strip()
+        if (len(identity) != 9 or not identity.endswith("_AL")
+                or not identity[:6].isascii() or not identity[:6].isdigit()):
+            return
+        code = identity[:6]
+        registration = getattr(self, "_v5_al_registration", {})
+        session = self.broker_session_snapshot()
+        if (code not in registration.get("targets", ())
+                or not session.connected
+                or registration.get("identity") != (session.connection_epoch, session.login_session_id)):
+            return
+        by_code = getattr(self, "_v5_al_receive_sequence_by_code", {})
+        sequence = by_code.get(code, 0) + 1
+        by_code[code] = sequence
+        self._v5_al_receive_sequence_by_code = by_code
+        try:
+            values = {fid: self._control.dynamicCall(
+                "GetCommRealData(QString, int)", identity, fid,
+            ) for fid in V5_AL_EXECUTION_FIDS}
+            tick = normalize_realtime_shadow_tick(
+                stock_code=code, real_type=REALTIME_EXECUTION_TYPE,
+                execution_time_raw=values[REALTIME_EXECUTION_TIME_FID],
+                current_price_raw=values[REALTIME_CURRENT_PRICE_FID],
+                cumulative_volume_raw=values[REALTIME_CUMULATIVE_VOLUME_FID],
+                trade_volume_raw=values[REALTIME_TRADE_VOLUME_FID],
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                receive_sequence=sequence, received_monotonic=monotonic(),
+                received_at=datetime.now().astimezone(),
+            )
+            if tick is None or tick.stock_code != code:
+                return
+            self._v5_al_receive_sequence = sequence
+            self.v5_al_tick_received.emit({
+                **tick.to_payload(), "broker_market_identity": identity,
+                "market_source": "SOR", "v5_only": True,
+            })
+        except Exception:
+            return  # A malformed broker callback cannot enter another consumer.
+
     def _on_receive_real_data(self, *args: Any) -> None:
         """Read the verified 주식체결 FIDs into process-local shadow state."""
 
         if len(args) < 2:
             return
-        self._ensure_realtime_shadow_state()
         stock_code = str(args[0] or "").strip()
         real_type = str(args[1] or "").strip()
-        self._observe_realtime_boundary(
-            "REAL_CALLBACK_RECEIVED",
-            stock_code,
-            channel=real_type,
-            real_type=real_type,
-        )
+        if real_type not in {REALTIME_EXECUTION_TYPE, REALTIME_ORDERBOOK_TYPE}:
+            self._ensure_realtime_shadow_state()
+            self._observe_realtime_boundary(
+                "REAL_CALLBACK_RECEIVED",
+                stock_code,
+                channel=real_type,
+                real_type=real_type,
+            )
         if real_type == REALTIME_ORDERBOOK_TYPE:
             self._on_receive_mock_orderbook(stock_code)
+            return
+        if real_type == REALTIME_EXECUTION_TYPE and stock_code.endswith("_AL"):
+            self._on_receive_mock_sor_trade(stock_code)
+            self._on_receive_v5_al_tick(stock_code)
             return
         if real_type == NXT_REALTIME_EXECUTION_TYPE:
             self._on_receive_nxt_display_tick(stock_code)
             return
-        registration = self._realtime_shadow_registration
+        registration = getattr(self, "_realtime_shadow_registration", None)
+        if registration is None:
+            registration = self._empty_realtime_shadow_snapshot()
         if real_type != REALTIME_EXECUTION_TYPE:
             self._observe_realtime_boundary(
                 "REGISTRATION_IDENTITY_REJECTED",
@@ -4091,35 +4494,37 @@ class KiwoomApi(QObject):
                 real_type=real_type,
             )
             return
-        if not registration.active:
-            self._observe_realtime_boundary(
-                "REGISTRATION_IDENTITY_REJECTED",
-                stock_code,
-                reason="REGISTRATION_INACTIVE",
-                channel=real_type,
-            )
-            return
-        if stock_code not in registration.target_stock_codes:
-            self._observe_realtime_boundary(
-                "REGISTRATION_IDENTITY_REJECTED",
-                stock_code,
-                reason="STOCK_NOT_EXPECTED",
-                channel=real_type,
-            )
-            return
+        self._ensure_mock_orderbook_state()
+        mock_registration = self._mock_orderbook_registration
         session = self.broker_session_snapshot()
-        if (
-            not session.connected
-            or session.connection_epoch != registration.connection_epoch
-            or session.login_session_id != registration.login_session_id
-        ):
+        production_target = bool(
+            registration.active
+            and stock_code in registration.target_stock_codes
+            and session.connected
+            and session.connection_epoch == registration.connection_epoch
+            and session.login_session_id == registration.login_session_id
+        )
+        mock_target = bool(
+            mock_registration.active
+            and stock_code in mock_registration.target_stock_codes
+            and stock_code not in mock_registration.sor_stock_codes
+            and session.connected
+            and session.connection_epoch == mock_registration.connection_epoch
+            and session.login_session_id == mock_registration.login_session_id
+        )
+        if not production_target and not mock_target:
             self._observe_realtime_boundary(
                 "REGISTRATION_IDENTITY_REJECTED",
                 stock_code,
-                reason="SESSION_IDENTITY_MISMATCH",
+                reason="STOCK_OR_SESSION_NOT_EXPECTED",
                 channel=real_type,
             )
             return
+        if production_target:
+            self._observe_realtime_boundary(
+                "REAL_CALLBACK_RECEIVED", stock_code,
+                channel=real_type, real_type=real_type,
+            )
         try:
             values = {
                 fid: self._control.dynamicCall(
@@ -4129,7 +4534,7 @@ class KiwoomApi(QObject):
                 )
                 for fid in REALTIME_SHADOW_FIDS
             }
-            tick = normalize_realtime_shadow_tick(
+            tick_args = dict(
                 stock_code=stock_code,
                 real_type=real_type,
                 execution_time_raw=values[REALTIME_EXECUTION_TIME_FID],
@@ -4146,51 +4551,60 @@ class KiwoomApi(QObject):
                 execution_strength_raw=values[REALTIME_EXECUTION_STRENGTH_FID],
                 connection_epoch=session.connection_epoch,
                 login_session_id=session.login_session_id,
-                receive_sequence=self._next_realtime_receive_sequence(),
                 received_monotonic=monotonic(),
             )
+            tick = normalize_realtime_shadow_tick(
+                **tick_args,
+                receive_sequence=(
+                    self._next_realtime_receive_sequence()
+                    if production_target
+                    else self._mock_execution_receive_sequence + 1
+                ),
+            )
             if tick is None:
-                self._observe_realtime_boundary(
-                    "RAW_TICK_REJECTED",
-                    stock_code,
-                    reason="PAYLOAD_UNAVAILABLE",
-                    channel=real_type,
-                )
+                if production_target:
+                    self._observe_realtime_boundary(
+                        "RAW_TICK_REJECTED", stock_code,
+                        reason="PAYLOAD_UNAVAILABLE", channel=real_type,
+                    )
                 return
-            self._observe_realtime_boundary(
-                "RAW_TICK_ACCEPTED",
-                stock_code,
-                channel=real_type,
-                current_price=tick.current_price,
-                market_datetime=tick.market_datetime,
-                receive_sequence=tick.receive_sequence,
-            )
-            self.realtime_shadow_tick_received.emit(tick.to_payload())
-            if stock_code in self._registration_shadow_targets(registration):
-                _status, completed = self._realtime_shadow_builder.accept_tick(tick)
-                if completed is not None:
-                    self.realtime_shadow_bar_completed.emit(completed.to_payload())
+            if production_target:
+                self._observe_realtime_boundary(
+                    "RAW_TICK_ACCEPTED", stock_code,
+                    channel=real_type,
+                    current_price=tick.current_price,
+                    market_datetime=tick.market_datetime,
+                    receive_sequence=tick.receive_sequence,
+                )
+            if production_target:
+                self.realtime_shadow_tick_received.emit(tick.to_payload())
+                if stock_code in self._registration_shadow_targets(registration):
+                    _status, completed = self._realtime_shadow_builder.accept_tick(tick)
+                    if completed is not None:
+                        self.realtime_shadow_bar_completed.emit(completed.to_payload())
+            if mock_target:
+                self._mock_execution_receive_sequence += 1
+                self.mock_execution_tick_received.emit({
+                    **replace(tick, receive_sequence=self._mock_execution_receive_sequence).to_payload(),
+                    "mock_registration_id": mock_registration.registration_id,
+                })
         except Exception as exc:
-            self._observe_realtime_boundary(
-                "RAW_TICK_REJECTED",
-                stock_code,
-                reason="PAYLOAD_UNAVAILABLE",
-                channel=real_type,
-                exception_type=type(exc).__name__,
-            )
-            observe_production_exception(
-                type(exc),
-                exc,
-                exc.__traceback__,
-                component="realtime_shadow",
-                operation="receive_realtime_tick",
-                source="kiwoom_api.KiwoomApi._on_receive_real_data",
-                target_type="MARKET_DATA",
-                target_id=stock_code,
-                target_name=stock_code,
-                reason_code="REALTIME_SHADOW_TICK_FAILED",
-                failure_scope=f"realtime_shadow_tick:{stock_code}",
-            )
+            if production_target:
+                self._observe_realtime_boundary(
+                    "RAW_TICK_REJECTED", stock_code,
+                    reason="PAYLOAD_UNAVAILABLE", channel=real_type,
+                    exception_type=type(exc).__name__,
+                )
+                observe_production_exception(
+                    type(exc), exc, exc.__traceback__,
+                    component="realtime_shadow",
+                    operation="receive_realtime_tick",
+                    source="kiwoom_api.KiwoomApi._on_receive_real_data",
+                    target_type="MARKET_DATA", target_id=stock_code,
+                    target_name=stock_code,
+                    reason_code="REALTIME_SHADOW_TICK_FAILED",
+                    failure_scope=f"realtime_shadow_tick:{stock_code}",
+                )
 
     def _on_receive_nxt_display_tick(self, broker_code_identity: str) -> None:
         """Emit one registered ECN execution tick to the display-only path."""
@@ -4243,12 +4657,16 @@ class KiwoomApi(QObject):
         """Emit a Mock-only immutable orderbook without Production mutation."""
 
         self._ensure_mock_orderbook_state()
-        code = normalize_stock_code(stock_code)
+        broker_identity = normalize_stock_code(stock_code)
+        sor = broker_identity.endswith("_AL")
+        code = broker_identity[:-3] if sor else broker_identity
         registration = self._mock_orderbook_registration
         if (
             not registration.active
             or not code
             or code not in registration.target_stock_codes
+            or (code in registration.sor_stock_codes) != sor
+            or broker_identity != (f"{code}_AL" if sor else code)
         ):
             return
         session = self.broker_session_snapshot()
@@ -4274,14 +4692,88 @@ class KiwoomApi(QObject):
                 login_session_id=session.login_session_id,
                 receive_sequence=self._next_mock_orderbook_receive_sequence(),
                 received_at=datetime.now().astimezone(),
+                registration_id=registration.registration_id,
+                market_source="SOR" if sor else "",
+                broker_market_identity=broker_identity if sor else "",
+                source_proof="BROKER_SOR_REALTIME" if sor else "",
             )
             if snapshot is not None:
+                if sor:
+                    self._record_mock_sor_receipt(code, "orderbook", snapshot.snapshot_identity)
                 self.mock_orderbook_received.emit(snapshot)
         except Exception as exc:
             self._mock_orderbook_registration = replace(
                 registration,
                 last_error=str(exc),
             )
+
+    def _on_receive_mock_sor_trade(self, broker_identity: str) -> None:
+        self._ensure_mock_orderbook_state()
+        identity = normalize_stock_code(broker_identity)
+        code = identity[:-3]
+        registration = self._mock_orderbook_registration
+        if identity != f"{code}_AL" or not registration.active or code not in registration.sor_stock_codes:
+            return
+        session = self.broker_session_snapshot()
+        if (
+            not session.connected
+            or session.connection_epoch != registration.connection_epoch
+            or session.login_session_id != registration.login_session_id
+        ):
+            return
+        try:
+            values = {
+                fid: self._control.dynamicCall("GetCommRealData(QString, int)", identity, fid)
+                for fid in SOR_MOCK_EXECUTION_FIDS
+            }
+            self._mock_sor_trade_receive_sequence += 1
+            tick = normalize_realtime_shadow_tick(
+                stock_code=code, real_type=REALTIME_EXECUTION_TYPE,
+                execution_time_raw=values[REALTIME_EXECUTION_TIME_FID],
+                current_price_raw=values[REALTIME_CURRENT_PRICE_FID],
+                cumulative_volume_raw=values[REALTIME_CUMULATIVE_VOLUME_FID],
+                trade_volume_raw=values[REALTIME_TRADE_VOLUME_FID],
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                receive_sequence=self._mock_sor_trade_receive_sequence,
+                received_monotonic=monotonic(),
+                received_at=datetime.now().astimezone(),
+            )
+            if tick is None:
+                return
+            payload = {
+                **tick.to_payload(), "market_source": "SOR",
+                "broker_market_identity": identity,
+                "source_proof": "BROKER_SOR_REALTIME",
+                "mock_registration_id": registration.registration_id,
+            }
+            snapshot = normalize_mock_trade_snapshot(payload)
+            if snapshot is not None:
+                self._record_mock_sor_receipt(code, "trade", snapshot.snapshot_identity)
+                self.mock_sor_trade_received.emit(payload)
+        except Exception as exc:
+            self._mock_orderbook_registration = replace(registration, last_error=str(exc))
+
+    def verify_mock_sor_market_pair(self, market: Any) -> bool:
+        """Attest pairs emitted by this API's registered _AL callbacks."""
+        self._ensure_mock_orderbook_state()
+        registration = self._mock_orderbook_registration
+        book = getattr(market, "orderbook", None)
+        trade = getattr(market, "trade", None)
+        code = getattr(market, "stock_code", "")
+        receipt = self._mock_sor_receipts.get(code, {})
+        return bool(
+            registration.active and code in registration.sor_stock_codes
+            and book is not None and trade is not None
+            and book.registration_id == registration.registration_id
+            and book.connection_epoch == trade.connection_epoch == registration.connection_epoch
+            and book.login_session_id == trade.login_session_id == registration.login_session_id
+            and book.market_source == trade.market_source == "SOR"
+            and book.broker_market_identity == trade.broker_market_identity == f"{code}_AL"
+            and book.source_proof == trade.source_proof == "BROKER_SOR_REALTIME"
+            and book.snapshot_identity in receipt.get("orderbook", {})
+            and trade.snapshot_identity in receipt.get("trade", {})
+        )
 
     def _on_receive_msg(self, *args: Any) -> None:
         """Preserve raw broker messages, then project verified account-auth evidence."""
@@ -4533,16 +5025,52 @@ class KiwoomApi(QObject):
                     "trcode": str(trcode),
                     "error": str(exc),
                 }
+            _trace_validation_readonly_callback(result)
             self._finish_callback(callback if callable(callback) else None, result)
             return
         if pending.get("type") != "minute_candles":
             return
+        received_at = (
+            datetime.now().astimezone().isoformat(timespec="microseconds")
+            if pending.get("display_only") is True else None
+        )
         callback = pending.get("callback")
         try:
             requested_count = int(pending.get("count") or 300)
             accumulated = pending.setdefault("rows", [])
             remaining = max(requested_count - len(accumulated), 1)
-            accumulated.extend(self._read_opt10080_rows(str(trcode), str(rqname), remaining))
+            page_rows = self._read_opt10080_rows(str(trcode), str(rqname), remaining)
+            accumulated.extend(page_rows)
+            diagnostic = getattr(self, "_al_m1_page_diagnostic", None)
+            if (diagnostic is not None and pending.get("display_only") is True
+                    and pending.get("commit_to_production") is False
+                    and pending.get("market_source") == "INTEGRATED"
+                    and pending.get("market_data_identity") == f"{pending.get('code')}_AL"
+                    and pending.get("interval") == 1
+                    and str(trcode).lower() == "opt10080"):
+                if "al_m1_diag_request_number" not in pending:
+                    diagnostic.request_number += 1
+                    pending["al_m1_diag_request_number"] = diagnostic.request_number
+                pending["al_m1_diag_page_count"] = int(pending.get("al_m1_diag_page_count") or 0) + 1
+                try:
+                    diagnostic.capture(
+                        code=pending.get("code"),
+                        request_number=pending["al_m1_diag_request_number"],
+                        page_number=pending["al_m1_diag_page_count"],
+                        prev_next=str(prev_next).strip(),
+                        requested_count=requested_count,
+                        rows=page_rows,
+                        timestamp_field=self.OPT10080_FIELDS[0],
+                        request_id=request_name,
+                        ohlcv_fields=self.OPT10080_FIELDS,
+                        requested_stock_code=pending.get("al_m1_diag_requested_stock_code", ""),
+                        timeframe="M1",
+                        request_connection_epoch=pending.get("request_connection_epoch"),
+                        request_login_session_id=pending.get("request_login_session_id", ""),
+                        callback_metadata=(_screen_no, rqname, trcode, _record_name, prev_next),
+                    )
+                except Exception as exc:  # Diagnostic failure must not change a broker callback.
+                    diagnostic.last_error = type(exc).__name__
             if str(prev_next).strip() == "2" and len(accumulated) < requested_count:
                 pending["timeout_generation"] = int(pending.get("timeout_generation") or 0) + 1
                 dispatched = self._submit_governed_tr_request(
@@ -4551,7 +5079,14 @@ class KiwoomApi(QObject):
                     prev_next=2,
                     screen_no=str(pending.get("screen_no") or ""),
                     inputs=(
-                        ("종목코드", str(pending.get("code") or "")),
+                        (
+                            "종목코드",
+                            str(
+                                pending.get("market_data_identity")
+                                or pending.get("code")
+                                or ""
+                            ),
+                        ),
                         ("틱범위", str(pending.get("interval") or 1)),
                         ("수정주가구분", "1"),
                     ),
@@ -4587,6 +5122,12 @@ class KiwoomApi(QObject):
                     "has_more": str(prev_next).strip() == "2",
                     "warning": "additional pages available" if str(prev_next).strip() == "2" else "",
                 }
+                if pending.get("display_only") is True:
+                    result["display_only"] = True
+                    result["connection_epoch"] = pending["request_connection_epoch"]
+                    result["login_session_id"] = pending["request_login_session_id"]
+                    result["received_at"] = received_at
+                    result["request_as_of"] = pending.get("request_as_of")
             else:
                 commit = commit_minute_candles_for_stock(
                     str(pending.get("code", "")),
@@ -4636,6 +5177,8 @@ class KiwoomApi(QObject):
                 **_empty_candle_commit_projection(),
             }
 
+        if pending.get("commit_to_production") is False:
+            _trace_validation_readonly_callback(result)
         self._finish_callback(callback if callable(callback) else None, result)
 
     def _on_receive_initial_market_snapshot(
@@ -4995,6 +5538,12 @@ class KiwoomApi(QObject):
         )
         limit = min(max(int(count or 0), 0), repeat_count) if count else repeat_count
         rows: list[dict[str, Any]] = []
+        trace_year = (
+            signal_validation_trace_enabled()
+            and str(trcode).lower() == "opt10094"
+            and str(rqname).startswith("opt10094_005930_")
+        )
+        raw_dates: list[str] = []
         for index in range(limit):
             raw: dict[str, str] = {}
             for field in self.PERIOD_CANDLE_FIELDS:
@@ -5006,9 +5555,25 @@ class KiwoomApi(QObject):
                     field,
                 )
                 raw[field] = str(value or "").strip()
+            if trace_year:
+                raw_dates.append(str(raw.get("일자") or ""))
             normalized = normalize_date_based_candle_row(raw)
             if normalized is not None:
                 rows.append(normalized)
+        if trace_year:
+            normalized_times = [str(row.get("체결시간") or "") for row in rows]
+            trace_signal_validation_event(
+                "broker.validation.raw_normalized.page",
+                stock_code="005930", timeframe="Y1",
+                request_id=str(rqname), trcode=str(trcode),
+                broker_repeat_count=repeat_count, requested_page_count=limit,
+                raw_read_count=len(raw_dates), normalized_count=len(rows),
+                rejected_count=len(raw_dates) - len(rows),
+                raw_first_date=raw_dates[0] if raw_dates else "",
+                raw_latest_date=max(raw_dates, default=""),
+                normalized_latest_time=max(normalized_times, default=""),
+                raw_contains_2026=any(date.startswith("2026") for date in raw_dates),
+            )
         return rows
 
     def _read_opt10080_rows(self, trcode: str, rqname: str, count: int) -> list[dict[str, Any]]:
@@ -5032,6 +5597,25 @@ class KiwoomApi(QObject):
                 )
                 row[field] = str(value or "").strip()
             rows.append(row)
+        if signal_validation_trace_enabled() and str(rqname).startswith("opt10080_005930_"):
+            pending = getattr(self, "_pending_tr", {}).get(str(rqname)) or {}
+            if (
+                str(trcode).lower() == "opt10080"
+                and pending.get("interval") == 120
+                and pending.get("commit_to_production") is False
+            ):
+                times = [str(row.get("체결시간") or "") for row in rows]
+                trace_signal_validation_event(
+                    "broker.validation.raw_normalized.page",
+                    stock_code="005930", timeframe="M120",
+                    request_id=str(rqname), trcode=str(trcode),
+                    broker_repeat_count=repeat_count, requested_page_count=limit,
+                    raw_read_count=len(rows), normalized_count=len(rows),
+                    rejected_count=0,
+                    raw_first_time=times[0] if times else "",
+                    raw_latest_time=max(times, default=""),
+                    raw_contains_2026=any(time.startswith("2026") for time in times),
+                )
         return rows
 
     @staticmethod
