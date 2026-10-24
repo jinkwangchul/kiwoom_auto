@@ -669,7 +669,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._sor_m1_observed_host = None
         self._sor_m1_last_snapshot: dict[int, tuple[object, ...]] = {}
         self._v5_lease_hosts: dict[int, object] = {}
-        self._offsession_sor_m1_requests: dict[int, tuple[object, ...]] = {}
+        self._offsession_sor_m1_requests: dict[int, dict[str, object]] = {}
         self._now_factory = lambda: datetime.now(SEOUL_TIMEZONE)
         take_evicted = getattr(self._recent_stock_store, "take_startup_evicted_codes", None)
         startup_evicted = (
@@ -1108,7 +1108,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     def _request_offsession_sor_m1_once(
         self, window: object, market: object, code: str,
     ) -> None:
-        """Fill a missing V5 display snapshot once outside live SOR sessions."""
+        """Try the governed AL M1 request at most twice outside live sessions."""
         from gui_market_data_host import MarketDataHost
 
         key = id(window)
@@ -1127,12 +1127,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if now.weekday() < 5 and active:
                 return
             identity = MarketDataHost._current_display_session_identity(market)
-            if identity is None:
-                return
             if MarketDataHost._current_display_candles(market, code, 1):
-                return
-            token = (code, id(market), identity)
-            if self._offsession_sor_m1_requests.get(key) == token:
                 return
             if code not in MarketDataHost._nxt_eligible_targets((code,)):
                 return
@@ -1147,24 +1142,76 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return
 
-        self._offsession_sor_m1_requests[key] = token
+        state = self._offsession_sor_m1_requests.get(key)
+        if (not isinstance(state, dict)
+                or state.get("code") != code or state.get("market") is not market
+                or (state.get("identity") is not None and identity is not None
+                    and state["identity"] != identity)):
+            state = {"code": code, "market": market, "identity": identity,
+                     "requests": 0, "polls": 0, "pending": False, "scheduled": False}
+            self._offsession_sor_m1_requests[key] = state
+        if state["pending"] or state["scheduled"]:
+            return
+
+        def schedule() -> None:
+            if state["scheduled"]:
+                return
+            state["scheduled"] = True
+
+            def retry() -> None:
+                if self._offsession_sor_m1_requests.get(key) is not state:
+                    return
+                state["scheduled"] = False
+                if (self._open_windows.get(key) is window
+                        and getattr(getattr(window, "stock", None), "code", None) == code):
+                    self._request_offsession_sor_m1_once(window, market, code)
+
+            QTimer.singleShot(1000, retry)
+
+        if identity is None:
+            if state["polls"] < 3:
+                state["polls"] += 1
+                schedule()
+            elif state.get("reason") is None:
+                state["reason"] = "SESSION_UNAVAILABLE"
+                self.validation_failed.emit("SOR_M1_ACQUISITION_FAILED:SESSION_UNAVAILABLE")
+            return
+        if state["identity"] is None:
+            state["identity"] = identity
+        if state["requests"] >= 2:
+            return
+        state["requests"] += 1
+        state["pending"] = True
 
         def terminal(result: object) -> None:
-            if (not isinstance(result, dict)
-                    or result.get("ok") is not True
-                    or not isinstance(result.get("install_result"), dict)
-                    or result["install_result"].get("ok") is not True
-                    or self._offsession_sor_m1_requests.get(key) != token
+            if (self._offsession_sor_m1_requests.get(key) is not state
+                    or not state["pending"]
                     or self._open_windows.get(key) is not window
                     or getattr(getattr(window, "stock", None), "code", None) != code
-                    or MarketDataHost._current_display_session_identity(market) != identity
-                    or not MarketDataHost._current_display_candles(market, code, 1)):
+                    or MarketDataHost._current_display_session_identity(market) != identity):
+                return
+            state["pending"] = False
+            install_result = result.get("install_result") if isinstance(result, dict) else None
+            installed = (isinstance(result, dict) and result.get("ok") is True
+                         and isinstance(install_result, dict)
+                         and install_result.get("ok") is True
+                         and bool(MarketDataHost._current_display_candles(market, code, 1)))
+            if not installed:
+                state["reason"] = (str(result.get("reason_code") or result.get("error")
+                                       or (install_result.get("reason_code")
+                                           if isinstance(install_result, dict) else None)
+                                       or "M1_NOT_INSTALLED")
+                                   if isinstance(result, dict) else "M1_REQUEST_FAILED")
+                if state["requests"] < 2:
+                    schedule()
+                else:
+                    self.validation_failed.emit(f"SOR_M1_ACQUISITION_FAILED:{state['reason']}")
                 return
             if not getattr(window, "_normal_base_requested", False):
                 return
 
             def retry() -> None:
-                if (self._offsession_sor_m1_requests.get(key) == token
+                if (self._offsession_sor_m1_requests.get(key) is state
                         and self._open_windows.get(key) is window
                         and getattr(getattr(window, "stock", None), "code", None) == code):
                     self._request_initial_validation(window)
@@ -1174,7 +1221,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         try:
             from auto_candle_refresh import request_display_timeframe_candles_for_stock
 
-            request_display_timeframe_candles_for_stock(
+            started = request_display_timeframe_candles_for_stock(
                 window=market,
                 code=code,
                 name=getattr(getattr(window, "stock", None), "name", ""),
@@ -1184,9 +1231,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 nxt_available=True,
                 on_terminal=terminal,
             )
-        except Exception:
-            # Retain the original fail-closed calculation error if no proof arrives.
-            return
+            if isinstance(started, dict) and started.get("ok") is not True:
+                terminal(started)
+        except Exception as exc:
+            terminal({"ok": False, "reason_code": f"REQUEST_{type(exc).__name__}"})
 
     def _release_v5_observation_lease(self, key: int) -> None:
         self._offsession_sor_m1_requests.pop(key, None)
@@ -5875,6 +5923,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         view = self._sor_m1_calculation_view(
                             session, detached_pool, view, frozen,
                             live_calendar=live_calendar,
+                            normal_base_only=request.get("normal_base_only") is True,
                         )
                     except (KeyError, TypeError, ValueError):
                         payload["live_sor_signal"] = {"unavailable": True}
@@ -5882,6 +5931,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     view = self._sor_m1_calculation_view(
                         session, detached_pool, view,
                         request.get("sor_m1_calculation_snapshot"),
+                        normal_base_only=request.get("normal_base_only") is True,
                     )
                 if self._verified_sor_tail_provider is not None:
                     now = self._now_factory()
@@ -6445,7 +6495,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
     def _sor_m1_calculation_view(
         self, session, source_pool, view, frozen, expected_calculation=None,
-        *, live_calendar=False,
+        *, live_calendar=False, normal_base_only=False,
     ):
         if (frozen is not None and isinstance(view, dict)
                 and view.get("validation_composite_calculation") is True):
@@ -6454,7 +6504,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 raise ValueError("SOR_M1_BLOCKED:COMPOSITE_SOURCE_UNAVAILABLE")
             projected = self._sor_m1_calculation_view(
                 session, source_pool, unmixed, frozen, expected_calculation,
-                live_calendar=live_calendar,
+                live_calendar=live_calendar, normal_base_only=normal_base_only,
             )
             sidecar = self._integrated_display_sidecars.get(
                 self._integrated_display_sidecar_key(session)
@@ -6492,6 +6542,43 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         forming = d1 or period or live_minute_forming
         if self._pool_computation_source_identity(source_pool) != source_identity:
             raise ValueError("SOR_M1_BLOCKED:SOURCE_CHANGED_AFTER_SNAPSHOT")
+        if (normal_base_only and timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}
+                and isinstance(projected, dict)
+                and projected.get("availability_state") == "SOR_M1_SOURCE_UNAVAILABLE"
+                and isinstance(view, dict)
+                and source_pool.get("market_source") == "INTEGRATED"
+                and source_pool.get("market_data_identity") ==
+                    f"{session.request.stock.code}_AL"
+                and view.get("market_source") == "INTEGRATED"
+                and view.get("market_data_identity") ==
+                    source_pool.get("market_data_identity")
+                and source_pool.get("timeframe_key") == timeframe_key
+                and view.get("timeframe_key") == timeframe_key
+                and source_pool.get("timeframe_minutes") == session.request.timeframe_minutes
+                and view.get("timeframe_minutes") == session.request.timeframe_minutes
+                and view.get("source_coverage_sufficient") is not False
+                and view.get("display_only_integrated") is not True):
+            from gui_market_data_host import MarketDataHost
+
+            now = self._now_factory()
+            now = (now.replace(tzinfo=SEOUL_TIMEZONE) if now.tzinfo is None
+                   else now.astimezone(SEOUL_TIMEZONE))
+            historical = view.get("candles")
+            display = view.get("display_candles", historical)
+            if (now.weekday() >= 5 or MarketDataHost._display_session_for_time(now)
+                    not in {"NXT_PRE", "KRX", "NXT_AFTER"}):
+                if (isinstance(historical, list) and historical
+                        and isinstance(display, list) and display
+                        and all(isinstance(row, dict) and row.get("is_complete") is not False
+                                for row in historical)
+                        and all(isinstance(row, dict) and row.get("is_complete") is not False
+                                for row in display)):
+                    stamps = [str(row.get("time") or "") for row in historical]
+                    if (all(len(stamp) == 14 and stamp.isdigit() for stamp in stamps)
+                            and stamps == sorted(set(stamps))
+                            and stamps[-1][:8] < now.strftime("%Y%m%d")
+                            and display == historical[-len(display):]):
+                        return view
         if (timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}
                 and isinstance(projected, dict)
                 and projected.get("projection") == "COMPLETED_TIMEFRAME"
@@ -6944,7 +7031,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         request["sor_m1_calculation_snapshot"] = self._sor_m1_calculation_snapshot(
             session, pool, live_forming=request.get("live_m1_snapshot_key") is not None,
         )
-        if getattr(window, "_normal_base_requested", False):
+        frozen = request["sor_m1_calculation_snapshot"]
+        proof = frozen[2] if isinstance(frozen, tuple) and len(frozen) == 3 else None
+        if (isinstance(proof, dict)
+                and proof.get("availability_state") == "SOR_M1_SOURCE_UNAVAILABLE"
+                and session.request.timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}):
+            request["normal_base_only"] = True
+        if getattr(window, "_normal_base_requested", False) or request.get("normal_base_only"):
             self._start_normal_base_prepare(request, history_target)
             return
         settings_hash = session.request.settings_snapshot.rules_hash

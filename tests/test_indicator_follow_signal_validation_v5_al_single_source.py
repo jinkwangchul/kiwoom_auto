@@ -171,6 +171,204 @@ def test_off_session_v5_lease_fetches_missing_al_m1_once_and_retries_after_verif
     assert retries == ["history-revalidated"]
 
 
+def test_cold_weekend_m3_displays_completed_direct_al_without_m1_signal_proof():
+    flow, _window, pool, _event = _observed_v5_case("M3", 3)
+    session = flow._validation_sessions[id(_window)]
+    market = flow.parent().existing_market_data_host()
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    pool["candles"] = [
+        dict(row, time=f"2026102319{45 + 3 * i:02d}00", is_complete=True)
+        for i, row in enumerate(pool["candles"])
+    ]
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    assert frozen[2]["availability_state"] == "SOR_M1_SOURCE_UNAVAILABLE"
+    view = dict(pool, display_candles=list(pool["candles"]))
+    assert flow._sor_m1_calculation_view(
+        session, pool, view, frozen, normal_base_only=True,
+    ) is view
+    with pytest.raises(ValueError, match="SOR_M1_BLOCKED:SOR_M1_SOURCE_UNAVAILABLE"):
+        flow._sor_m1_calculation_view(session, pool, view, frozen)
+
+
+def test_cold_weekend_m3_routes_validation_to_indicator_only_prepare():
+    flow, window, pool, _event = _observed_v5_case("M3", 3)
+    market = flow.parent().existing_market_data_host()
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    pool["candles"] = [
+        dict(row, time=f"2026102319{45 + 3 * i:02d}00", is_complete=True)
+        for i, row in enumerate(pool["candles"])
+    ]
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    key = id(window)
+    flow._historical_pools[key] = pool
+    flow._request_generation[key] = 0
+    window._normal_base_requested = False
+    request = {
+        "window": window, "session": flow._validation_sessions[key], "pool": pool,
+        "evaluation_count": 5, "generation": 0, "token": object(),
+    }
+    with patch.object(flow, "_start_normal_base_prepare") as normal, patch.object(
+        flow, "_replay_factory", side_effect=AssertionError("signal replay started")
+    ):
+        flow._start_pool_prepare(request)
+    normal.assert_called_once()
+    assert request["normal_base_only"] is True
+
+
+@pytest.mark.parametrize("invalid", ["identity", "forming", "today", "display", "coverage"])
+def test_cold_weekend_m3_rejects_unproven_direct_history(invalid):
+    flow, window, pool, _event = _observed_v5_case("M3", 3)
+    session = flow._validation_sessions[id(window)]
+    market = flow.parent().existing_market_data_host()
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    pool["candles"] = [
+        dict(row, time=f"2026102319{45 + 3 * i:02d}00", is_complete=True)
+        for i, row in enumerate(pool["candles"])
+    ]
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    view = dict(pool, display_candles=list(pool["candles"]))
+    if invalid == "identity":
+        view["market_data_identity"] = "005930"
+    elif invalid == "forming":
+        view["candles"] = [*view["candles"][:-1], dict(view["candles"][-1], is_complete=False)]
+    elif invalid == "today":
+        view["candles"] = [*view["candles"][:-1], dict(view["candles"][-1], time="20261024100000")]
+    elif invalid == "display":
+        view["display_candles"] = view["display_candles"][:-1]
+    else:
+        view["source_coverage_sufficient"] = False
+    with pytest.raises(ValueError, match="SOR_M1_BLOCKED"):
+        flow._sor_m1_calculation_view(
+            session, pool, view, frozen, normal_base_only=True,
+        )
+
+
+def test_offsession_m1_failure_retries_once_then_stops():
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    window = SimpleNamespace(stock=session.request.stock, _normal_base_requested=True)
+    flow._open_windows[id(window)] = window
+    requests, timers = [], []
+    reasons = []
+    flow.validation_failed.connect(reasons.append)
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        requests[0]["on_terminal"]({"ok": False, "reason_code": "DISPLAY_TIMEFRAME_SESSION_UNAVAILABLE"})
+        assert len(timers) == 1
+        delay, retry = timers.pop()
+        assert delay > 0
+        flow._sync_v5_observation_lease(window)
+        assert len(requests) == 1
+        retry()
+        assert len(requests) == 2
+        requests[1]["on_terminal"]({"ok": False, "reason_code": "BROKER_FAILED"})
+        assert timers == []
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        assert len(requests) == 2
+    assert reasons == ["SOR_M1_ACQUISITION_FAILED:BROKER_FAILED"]
+
+
+def test_offsession_m1_absent_broker_session_has_finite_diagnostic_poll():
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    market._display_timeframe_candles.pop(("005930", 1))
+    market.kiwoom_api.broker_session_snapshot = lambda: None
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    reasons, timers = [], []
+    flow.validation_failed.connect(reasons.append)
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock") as request, patch.object(
+        flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))
+    ):
+        flow._sync_v5_observation_lease(window)
+        for _ in range(3):
+            assert len(timers) == 1
+            timers.pop()[1]()
+        request.assert_not_called()
+    assert reasons == ["SOR_M1_ACQUISITION_FAILED:SESSION_UNAVAILABLE"]
+
+
+def test_offsession_m1_late_session_and_cancellation_guards():
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    identity = market.kiwoom_api.broker_session_snapshot
+    market.kiwoom_api.broker_session_snapshot = lambda: None
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    requests, timers = [], []
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        assert requests == [] and len(timers) == 1
+        market.kiwoom_api.broker_session_snapshot = identity
+        timers.pop()[1]()
+        assert len(requests) == 1
+        requests[0]["on_terminal"]({"ok": False, "reason_code": "BROKER_FAILED"})
+        assert len(timers) == 1
+        flow._open_windows.pop(id(window))
+        timers.pop()[1]()
+        assert len(requests) == 1
+
+
+@pytest.mark.parametrize("change", ["stock", "session"])
+def test_offsession_m1_stale_request_cannot_revalidate_new_stock_or_session(change):
+    flow, session, _pool, market, cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    published = []
+    window = SimpleNamespace(
+        stock=session.request.stock, _normal_base_requested=True,
+        request_initial_validation=lambda: published.append("revalidated"),
+    )
+    flow._open_windows[id(window)] = window
+    requests, timers = [], []
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        if change == "stock":
+            window.stock = ValidationStockRef("000660", "SK Hynix")
+        else:
+            market.kiwoom_api.broker_session_snapshot = lambda: SimpleNamespace(
+                connected=True, connection_epoch=2, login_session_id="SESSION-2",
+            )
+        market._display_timeframe_candles[("005930", 1)] = cached[("005930", 1)]
+        market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
+        requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
+    assert timers == []
+    assert published == []
+
+
+def test_offsession_m1_invalid_al_eligibility_does_not_request():
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    market._display_timeframe_candles.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    flow._validation_source_by_code["005930"] = False
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock") as request:
+        flow._sync_v5_observation_lease(window)
+    request.assert_not_called()
+
+
 def test_weekend_v5_history_uses_last_verified_al_minute_not_weekend_clock():
     flow, session, pool, _market, _cached = _registered_m1_calculation_case()
     flow._now_factory = lambda: datetime(
