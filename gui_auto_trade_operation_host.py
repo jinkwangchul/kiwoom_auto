@@ -137,6 +137,12 @@ class AutoTradeOperationHost(QObject):
             self._kiwoom_api(),
             self._market_data_execution_entry,
         )
+        self._no_order_sor_monitor = None
+        try:
+            from sor_no_order_monitor import NoOrderSorMonitor
+            self._no_order_sor_monitor = NoOrderSorMonitor(self._market_data_host, self)
+        except Exception:
+            pass  # Optional evidence cannot prevent operation host creation.
         self._market_data_ready_signal_bound = False
         self._market_data_comparison_signal_bound = False
         self._bind_market_data_host_signals_once()
@@ -269,6 +275,11 @@ class AutoTradeOperationHost(QObject):
 
     def shutdown(self) -> dict[str, object]:
         self._shutting_down = True
+        if self._no_order_sor_monitor is not None:
+            try:
+                self._no_order_sor_monitor.shutdown()
+            except Exception:
+                pass
         self._market_data_host.shutdown()
         self._bar_commit_trigger_queue.clear()
         return self.stop_operation_timers()

@@ -278,6 +278,7 @@ class MarketDataHost(QObject):
     realtime_shadow_comparison_completed = pyqtSignal(object)
     market_data_observed = pyqtSignal(object)
     high_resolution_price_observed = pyqtSignal(object)
+    direct_sor_completed = pyqtSignal(object)
 
     MAX_PENDING_SHADOW_COMPARISONS = 512
     MAX_RAW_TICK_QUEUE_DEPTH = 512
@@ -1403,6 +1404,28 @@ class MarketDataHost(QObject):
             object.__setattr__(self, "_display_timeframe_session_identity", identities)
         cache[(code, interval)] = tuple(ordered)
         identities[(code, interval)] = (connection_epoch, login_session_id)
+        if ordered and code in _host_attr(self, "_monitoring_target_stock_codes", ()):
+            last = ordered[-1]
+            try:
+                bar_time = datetime.fromisoformat(last["bar_time"])
+                session_end = next(end for name, _start, end in
+                                   _DISPLAY_INTEGRATED_SESSIONS
+                                   if name == last["session"])
+                completed_at = min(bar_time + timedelta(minutes=interval),
+                                   bar_time.replace(hour=session_end // 60,
+                                                    minute=session_end % 60,
+                                                    second=0, microsecond=0))
+                if (last.get("is_complete") is True
+                        and timedelta(0) <= current - completed_at <= timedelta(seconds=30)):
+                    self.direct_sor_completed.emit({
+                        "stock_code": code, "timeframe_minutes": interval,
+                        "bar_time": last["bar_time"],
+                        "connection_epoch": connection_epoch,
+                        "login_session_id": login_session_id,
+                        "observed_at": current.isoformat(),
+                    })
+            except Exception:
+                pass  # Optional evidence cannot interrupt accepted market data.
         if interval == 1:
             MarketDataHost._v5_al_consider_parity(self, code, ordered)
             forming_cache = _host_attr(self, "_sor_forming_m1_by_stock", None)

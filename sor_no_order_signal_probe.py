@@ -179,3 +179,80 @@ def capture_direct_sor_signal(
         return output
     except Exception:
         return _blocked("DIRECT_SOR_CAPTURE_EXCEPTION")
+
+
+def capture_prepared_direct_sor_signal(
+    *, stock_code: str, routine_instance_id: str, observed_cycle: dict[str, Any],
+    observed_at: datetime, rules: dict[str, Any], selector: Any,
+    source: dict[str, Any], session_identity: tuple[int, str],
+    enqueue: bool = True,
+) -> dict[str, Any]:
+    """Evaluate a detached, GUI-thread MarketDataHost projection on a worker."""
+    try:
+        instant = _time(observed_at)
+        if (instant is None or not timedelta(0) <= datetime.now(instant.tzinfo) - instant
+                <= timedelta(seconds=30)):
+            return _blocked("OBSERVATION_TIME_INVALID")
+        if (not isinstance(observed_cycle, dict)
+                or observed_cycle.get("status") != "resolved"
+                or type(observed_cycle.get("holding_qty")) is not int
+                or observed_cycle["holding_qty"] < 0
+                or (observed_cycle["holding_qty"] and (
+                    type(observed_cycle.get("avg_price")) not in (int, float)
+                    or not isfinite(observed_cycle["avg_price"])
+                    or observed_cycle["avg_price"] <= 0))):
+            return _blocked("ACTUAL_CYCLE_UNRESOLVED")
+        receipt = source.get("direct_source_receipt") if isinstance(source, dict) else None
+        candles = source.get("candles") if isinstance(source, dict) else None
+        if (not isinstance(receipt, dict) or not isinstance(candles, list) or not candles
+                or source.get("projection") != "COMPLETED_TIMEFRAME"
+                or source.get("complete") is not True
+                or source.get("forming_included") is not False
+                or receipt.get("connection_epoch") != session_identity[0]
+                or receipt.get("session_sha256") != hashlib.sha256(
+                    session_identity[1].encode("utf-8")).hexdigest()
+                or _time(receipt.get("source_as_of")) != instant):
+            return _blocked("DIRECT_SOR_PROOF_UNAVAILABLE")
+        last_bar = _time(candles[-1].get("bar_time"))
+        if last_bar is None or last_bar > instant or last_bar.date() != instant.date():
+            return _blocked("DIRECT_SOR_TIME_UNPROVEN")
+        preliminary = build_source_marker(
+            stock=stock_code, rules=rules, candles=candles, source=source, side="NONE")
+        if preliminary is None or "receipt_hash" not in preliminary:
+            return _blocked("DIRECT_SOR_PROOF_INVALID")
+        cycle = deepcopy(observed_cycle)
+        preview = selector(deepcopy(candles), deepcopy(rules), {
+            "cycle": cycle, "routine_instance_id": routine_instance_id,
+            "code": stock_code, "rules": deepcopy(rules), "probe_only": True,
+        })
+        if not isinstance(preview, dict) or preview.get("signal") not in {
+                "BUY", "SELL", "NONE", None}:
+            return _blocked("PURE_SIGNAL_INVALID")
+        side = preview.get("signal") or "NONE"
+        activation = _time(preview.get("signal_activation_bar_time")) if side != "NONE" else None
+        if side != "NONE" and activation != last_bar:
+            return _blocked("SIGNAL_ACTIVATION_UNPROVEN")
+        marker = build_source_marker(
+            stock=stock_code, rules=rules, candles=candles, source=source, side=side)
+        if marker is None or {k: v for k, v in marker.items() if k != "side"} != {
+                k: v for k, v in preliminary.items() if k != "side"}:
+            return _blocked("DIRECT_SOR_PROOF_INVALID")
+        output = {
+            "status": "OBSERVED", "signal": "SKIP",
+            "reason": "SOR_CALCULATION_ONLY_NO_ORDER", "code": stock_code,
+            "sor_preview_signal": side, "sor_preview_evidence": marker,
+            "sor_preview_activation_time": activation.isoformat() if activation else None,
+            "sor_preview_cycle_hash": _hash(cycle),
+            "sor_preview_cycle_status": cycle["status"],
+            "sor_preview_routine_instance_id": routine_instance_id,
+            "sor_preview_observed_at": instant.isoformat(),
+            "sor_preview_evaluated_at": datetime.now(instant.tzinfo).isoformat(),
+            **_NO_ORDER,
+        }
+        if enqueue:
+            from sor_m3_production_capture import enqueue_preview
+            if not enqueue_preview(output):
+                return _blocked("EVIDENCE_CAPTURE_UNAVAILABLE")
+        return output
+    except Exception:
+        return _blocked("DIRECT_SOR_CAPTURE_EXCEPTION")

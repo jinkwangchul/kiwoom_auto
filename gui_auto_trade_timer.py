@@ -174,13 +174,22 @@ def _process_pending_signal_pipeline(
             if callable(getattr(window, "current_orderable_cash_for_budget", None))
             else None
         )
-        return capture_routine_main_facts(
+        facts = capture_routine_main_facts(
             stock_dirs=stock_dirs,
             selected_account_no=selected_account_no,
             allowed_stock_codes=allowed_stock_codes,
             actionable_prices_by_code=current_prices,
             current_orderable_cash=current_cash,
         ).to_payload()
+        try:
+            host_reader = getattr(window, "main_monitoring_auto_trade_operation_host", None)
+            host = host_reader() if callable(host_reader) else None
+            monitor = getattr(host, "_no_order_sor_monitor", None)
+            if monitor is not None:
+                monitor.accept_main_facts(facts)
+        except Exception:
+            pass  # Optional evidence cannot alter operation decisions.
+        return facts
 
     try:
         main_facts = capture_current_facts()

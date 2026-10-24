@@ -144,6 +144,7 @@ def enqueue_preview(output: Any) -> bool:
         key = (record["code"], record["sor_preview_routine_instance_sha256"],
                marker["timeframe"], marker["evaluation_time"],
                marker["source_identity"], marker["rules_hash"],
+               marker["source_session_sha256"], marker["source_connection_epoch"],
                record["sor_preview_cycle_hash"])
         line = json.dumps(record, ensure_ascii=True, sort_keys=True,
                           separators=(",", ":"), allow_nan=False) + "\n"
