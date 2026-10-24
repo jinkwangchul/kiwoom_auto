@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -65,6 +66,64 @@ def _valid_evidence(source: Any, consumer: str) -> bool:
             return False
         previous = event["time"]
     return True
+
+
+def extract_v5_replay_evidence(
+    snapshot: Any, source_view: Any, *, cutoff: str,
+) -> dict[str, Any] | None:
+    """Adapt a complete V5 M1 replay; caller source view is not broker attestation."""
+    from routines.지표추종매매.routine_validation_replay import ValidationReplaySnapshot
+
+    if (not isinstance(snapshot, ValidationReplaySnapshot)
+            or not isinstance(source_view, dict)
+            or snapshot.stock.code != "005930"
+            or snapshot.timeframe_key != "M1" or snapshot.timeframe_minutes != 1
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot.settings_hash)
+            or not snapshot.historical_request_id
+            or source_view.get("market_source") != "INTEGRATED"
+            or source_view.get("market_data_identity") != "005930_AL"
+            or not _valid_time(cutoff)):
+        return None
+    candles = snapshot.to_candles()
+    if (not candles or snapshot.evaluated_start_index != 0
+            or snapshot.evaluated_end_index != len(candles) - 1
+            or source_view.get("candles") != candles
+            or any(not isinstance(row, dict) or not _valid_time(row.get("time"))
+                   for row in candles)
+            or [row["time"] for row in candles] != sorted({row["time"] for row in candles})
+            or candles[-1]["time"] != cutoff):
+        return None
+    entries = snapshot.to_entries()
+    if len(entries) != 2 * len(candles):
+        return None
+    seen: set[tuple[int, str]] = set()
+    events: list[dict[str, str]] = []
+    for entry in entries:
+        index = entry.evaluation_index
+        key = (index, entry.evaluation_side)
+        if (not 0 <= index < len(candles) or key in seen
+                or entry.evaluation_time != candles[index]["time"]):
+            return None
+        seen.add(key)
+        if entry.signal is not None:
+            signal_index = entry.signal_index
+            if (entry.signal != entry.evaluation_side
+                    or signal_index is None or not 0 <= signal_index <= index
+                    or entry.signal_time != candles[signal_index]["time"]):
+                return None
+            events.append({"time": entry.evaluation_time, "side": entry.signal})
+    events.sort(key=lambda event: (event["time"], 0 if event["side"] == "SELL" else 1))
+    proof = hashlib.sha256(json.dumps(
+        [snapshot.historical_request_id, snapshot.settings_hash, candles,
+         [entry.to_dict() for entry in entries]],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    return {
+        "consumer": "V5", "origin_proof": f"V5_REPLAY:{proof}",
+        "stock": "005930", "timeframe": "M1",
+        "rules_hash": snapshot.settings_hash, "cutoff": cutoff,
+        "market_data_identity": "005930_AL", "events": events,
+    }
 
 
 def compare_three_consumer_signals(

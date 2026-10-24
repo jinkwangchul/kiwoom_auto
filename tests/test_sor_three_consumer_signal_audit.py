@@ -5,7 +5,12 @@ import json
 
 import pytest
 
+import sor_three_consumer_signal_audit as audit
 from sor_three_consumer_signal_audit import compare_three_consumer_signals, main
+from routines.지표추종매매.routine_validation_contract import ValidationStockRef
+from routines.지표추종매매.routine_validation_replay import (
+    ValidationReplayEntry, ValidationReplaySnapshot,
+)
 
 
 def evidence(consumer, events=None):
@@ -27,6 +32,59 @@ def three(events=None):
 
 def event(time, side):
     return {"time": time, "side": side}
+
+
+def v5_replay(*, complete=True):
+    candles = [
+        {"time": time, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+        for time in ("20261023090000", "20261023090100")
+    ]
+    entries = [
+        ValidationReplayEntry(
+            evaluation_side=side, evaluation_index=index,
+            evaluation_time=candles[index]["time"],
+            signal=side if (index, side) in ((0, "BUY"), (1, "SELL")) else None,
+            reason="", signal_index=index if (index, side) in ((0, "BUY"), (1, "SELL")) else None,
+            signal_time=candles[index]["time"] if (index, side) in ((0, "BUY"), (1, "SELL")) else None,
+            delay_bar=0, matched_groups=[], details=[], trace={},
+        )
+        for index in range(2) for side in ("SELL", "BUY")
+    ]
+    if not complete:
+        entries.pop()
+    snapshot = ValidationReplaySnapshot(
+        stock=ValidationStockRef("005930", "Samsung"), timeframe_minutes=1,
+        settings_hash="a" * 64, historical_request_id="v5-request-1",
+        evaluated_start_index=0, evaluated_end_index=1,
+        dropped_raw_rows_count=0, candles=candles, entries=entries,
+    )
+    view = {"market_source": "INTEGRATED", "market_data_identity": "005930_AL",
+            "candles": candles}
+    return snapshot, view
+
+
+def test_v5_adapter_extracts_only_actual_replay_signals_and_audit_stays_blocked():
+    snapshot, view = v5_replay()
+    record = audit.extract_v5_replay_evidence(snapshot, view, cutoff="20261023090100")
+    assert record["events"] == [
+        event("20261023090000", "BUY"), event("20261023090100", "SELL")]
+    assert record["rules_hash"] == snapshot.settings_hash
+    assert record["origin_proof"].startswith("V5_REPLAY:")
+    assert compare_three_consumer_signals(record, None, None) == {
+        "status": "BLOCKED", "scope": "READ_ONLY_RECORDED_SIGNAL_COMPARISON",
+        "broker_attested": False, "live_gui_parity": False,
+        "reason": "MISSING_EVIDENCE", "consumer": "PRODUCTION",
+    }
+
+
+def test_v5_adapter_rejects_incomplete_or_wrong_source_context():
+    snapshot, view = v5_replay(complete=False)
+    assert audit.extract_v5_replay_evidence(snapshot, view, cutoff="20261023090100") is None
+    snapshot, view = v5_replay()
+    for altered in ({**view, "market_data_identity": "005930"},
+                    {**view, "candles": view["candles"][:-1]}):
+        assert audit.extract_v5_replay_evidence(snapshot, altered, cutoff="20261023090100") is None
+    assert audit.extract_v5_replay_evidence(snapshot, view, cutoff="20261023090000") is None
 
 
 def test_equal_buy_sell_sequences_match_without_claiming_external_parity():
