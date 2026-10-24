@@ -9,6 +9,30 @@ from unittest.mock import patch
 import pytest
 
 import gui_indicator_follow_signal_validation_v5_flow as flow_module
+
+
+@pytest.fixture(autouse=True)
+def _scoped_m1_diagnostic_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(flow_module, "_SOR_AL_M1_DIAGNOSTIC_PATH",
+                        tmp_path / "v5_sor_al_m1.jsonl", raising=False)
+
+
+def _m1_events():
+    path = flow_module._SOR_AL_M1_DIAGNOSTIC_PATH
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_m1_diagnostic_scrubs_session_and_untrusted_reason():
+    flow_module._trace_sor_al_m1(
+        "callback_terminal", "005930", login_session_id="secret-session",
+        reason="BROKER_FAILED secret-session", connection_epoch=7,
+    )
+    record = _m1_events()[0]
+    assert record["event"] == "callback_terminal"
+    assert record["code"] == "005930"
+    assert record["connection_epoch"] == 7
+    assert record["reason"] == "UNCLASSIFIED"
+    assert "secret-session" not in json.dumps(record)
 from candle_timeframe_aggregation import candle_market_datetime
 from kiwoom_api import KiwoomApi
 from indicator_follow_signal_validation_historical_cache import IndicatorFollowSignalValidationHistoricalCache
@@ -169,6 +193,68 @@ def test_off_session_v5_lease_fetches_missing_al_m1_once_and_retries_after_verif
         market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
         requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
     assert retries == ["history-revalidated"]
+
+
+def test_offsession_m1_diagnostic_records_skip_dispatch_and_timeout():
+    flow, window, market, _cached, requests, timers, _reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    flow._validation_source_by_code["005930"] = False
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        flow._sync_v5_observation_lease(window)
+        assert requests == []
+        flow._validation_source_by_code["005930"] = True
+        flow._sync_v5_observation_lease(window)
+        timers.pop()[1]()
+    events = _m1_events()
+    assert [(e["event"], e.get("reason")) for e in events if e["event"] == "request_skipped"] == [
+        ("request_skipped", "SOURCE_UNVERIFIED")]
+    assert any(e["event"] == "request_dispatched" and e["count"] > 0 for e in events)
+    assert any(e["event"] == "callback_timeout" and e["attempt"] == 1 for e in events)
+
+
+def test_m1_diagnostic_records_missing_stock_prerequisite():
+    flow, window, market, _cached, _requests, _timers, _reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    window.stock = None
+    flow._sync_v5_observation_lease(window)
+    assert any(e["event"] == "request_skipped" and e["reason"] == "NO_STOCK"
+               for e in _m1_events())
+
+
+def test_offsession_m1_diagnostic_records_rejection_and_callback_terminal():
+    flow, window, market, _cached, requests, timers, _reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": False, "reason_code": "BROKER_FAILED"}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        assert len(requests) == 1
+    events = _m1_events()
+    assert any(e["event"] == "immediate_rejection" and e["reason"] == "BROKER_FAILED"
+               for e in events)
+    assert any(e["event"] == "callback_terminal" and e["installed"] is False
+               for e in events)
+
+
+def test_offsession_m1_invalid_immediate_result_finishes_attempt():
+    flow, window, market, _cached, requests, timers, _reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or None), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+    assert len(requests) == 1
+    assert flow._offsession_sor_m1_requests[id(window)]["pending"] is False
+    assert [ms for ms, _ in timers] == [1000]
+    assert any(e["event"] == "immediate_rejection" and e["reason"] == "INVALID_START_RESULT"
+               for e in _m1_events())
 
 
 def test_cold_weekend_m3_displays_completed_direct_al_without_m1_signal_proof():
@@ -354,6 +440,9 @@ def test_offsession_m1_stale_request_cannot_revalidate_new_stock_or_session(chan
         requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
     assert [ms for ms, _ in timers] == [30000]
     assert published == []
+    if change == "session":
+        assert any(e["event"] == "callback_ignored" and e["epoch_match"] is False
+                   for e in _m1_events())
 
 
 def _offsession_accepted_request_case():
@@ -446,6 +535,15 @@ def test_offsession_direct_al_m1_persists_full_completed_broker_history(tmp_path
     ]
     assert entry.candles[-1]["close"] == 111.0
     assert reasons == []
+    events = _m1_events()
+    assert any(e["event"] == "callback_terminal" and e["installed"] is True
+               and e["source_match"] is True and e["epoch_match"] is True
+               and e["received_count"] == 2
+               and e["last_minute"] == "2026-10-23T19:59+09:00" for e in events)
+    assert any(e["event"] == "persist_result" and e["persisted"] is True
+               and e["count"] == 2 and e["last_minute"] == "2026-10-23T19:59+09:00"
+               for e in events)
+    assert "SESSION-1" not in flow_module._SOR_AL_M1_DIAGNOSTIC_PATH.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("invalid", ["source", "session", "failed", "forming"])
@@ -484,6 +582,16 @@ def test_offsession_m1_unverified_terminal_does_not_persist(tmp_path, invalid):
         market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
         requests[0]["on_terminal"](terminal)
     assert flow._cached_history(window.stock, 1, "M1", requests[0]["count"]) is None
+    if invalid in {"source", "session", "forming"}:
+        events = _m1_events()
+        assert any(e["event"] == "persist_result" and e["persisted"] is False
+                   for e in events)
+        if invalid == "source":
+            assert any(e["event"] == "callback_terminal" and e["source_match"] is False
+                       for e in events)
+        if invalid == "session":
+            assert any(e["event"] == "callback_terminal" and e["epoch_match"] is False
+                       for e in events)
 
 
 def test_offsession_m1_late_terminal_after_timeout_cannot_revalidate():

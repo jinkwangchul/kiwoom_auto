@@ -21,7 +21,7 @@ import pickle
 import re
 import tempfile
 import time
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import weakref
 
 from PyQt5 import sip
@@ -97,6 +97,45 @@ from indicator_follow_signal_validation_runtime_trace import (
     trace_production_contract_summary,
     trace_signal_validation_event,
 )
+
+_SOR_AL_M1_DIAGNOSTIC_PATH = (
+    Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_sor_al_m1.jsonl"
+)
+_SOR_AL_M1_DIAGNOSTIC_LOCK = Lock()
+
+
+def _trace_sor_al_m1(event: str, code: str, **fields: object) -> None:
+    """Write bounded M1 lifecycle evidence without broker payloads or session IDs."""
+    if not isinstance(code, str) or (code and not re.fullmatch(r"[0-9]{6}", code)):
+        return
+    record = {
+        "time": datetime.now(SEOUL_TIMEZONE).isoformat(),
+        "pid": os.getpid(), "event": event, "code": code,
+    }
+    for key in ("attempt", "count", "required_count", "connection_epoch",
+                "received_count", "installed_count", "persisted_count"):
+        value = fields.get(key)
+        if type(value) is int and value >= 0:
+            record[key] = value
+    for key in ("response_ok", "install_ok", "installed", "source_match",
+                "epoch_match", "persisted", "cache_lease_present"):
+        if type(fields.get(key)) is bool:
+            record[key] = fields[key]
+    reason = fields.get("reason")
+    if reason is not None:
+        record["reason"] = (reason if isinstance(reason, str) and re.fullmatch(
+            r"[A-Z][A-Z0-9_]{0,79}", reason) else "UNCLASSIFIED")
+    last_minute = fields.get("last_minute")
+    if isinstance(last_minute, str) and re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}\+09:00", last_minute):
+        record["last_minute"] = last_minute
+    try:
+        with _SOR_AL_M1_DIAGNOSTIC_LOCK:
+            _SOR_AL_M1_DIAGNOSTIC_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _SOR_AL_M1_DIAGNOSTIC_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        pass  # Diagnostics cannot change acquisition behavior.
 from indicator_follow_signal_validation_projection import (
     IndicatorFollowSignalValidationApplyPayload,
     IndicatorFollowSignalValidationRunRequest,
@@ -670,6 +709,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._sor_m1_last_snapshot: dict[int, tuple[object, ...]] = {}
         self._v5_lease_hosts: dict[int, object] = {}
         self._offsession_sor_m1_requests: dict[int, dict[str, object]] = {}
+        self._sor_m1_diagnostic_skips: dict[int, tuple[str, str]] = {}
         self._now_factory = lambda: datetime.now(SEOUL_TIMEZONE)
         take_evicted = getattr(self._recent_stock_store, "take_startup_evicted_codes", None)
         startup_evicted = (
@@ -1072,6 +1112,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         except (AttributeError, RuntimeError, TypeError):
             return
 
+    def _note_sor_m1_skip(self, key: int, code: str, reason: str) -> None:
+        marker = (code, reason)
+        if self._sor_m1_diagnostic_skips.get(key) != marker:
+            self._sor_m1_diagnostic_skips[key] = marker
+            _trace_sor_al_m1("request_skipped", code, reason=reason)
+
     def _sync_v5_observation_lease(self, window: object) -> None:
         key = id(window)
         if self._open_windows.get(key) is not window:
@@ -1081,9 +1127,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         try:
             market = getter() if callable(getter) else None
         except (AttributeError, RuntimeError, TypeError):
+            self._note_sor_m1_skip(key, getattr(getattr(window, "stock", None), "code", ""),
+                                   "MARKET_HOST_ERROR")
             return
         setter = getattr(market, "set_v5_observation_lease", None)
         if not callable(setter):
+            self._note_sor_m1_skip(key, getattr(getattr(window, "stock", None), "code", ""),
+                                   "LEASE_API_UNAVAILABLE")
             return
         previous = self._v5_lease_hosts.get(key)
         if previous is not None and previous is not market:
@@ -1098,12 +1148,17 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         except (AttributeError, RuntimeError, TypeError, ValueError):
             if code:
                 self._v5_lease_hosts[key] = market
+                self._note_sor_m1_skip(key, code, "LEASE_ERROR")
             return
         if code:
             self._v5_lease_hosts[key] = market
         if isinstance(result, dict) and result.get("ok") is True and code:
             self._bind_sor_m1_observations()
             self._request_offsession_sor_m1_once(window, market, code)
+        elif code:
+            self._note_sor_m1_skip(key, code, "LEASE_REJECTED")
+        else:
+            self._note_sor_m1_skip(key, "", "NO_STOCK")
 
     def _request_offsession_sor_m1_once(
         self, window: object, market: object, code: str,
@@ -1114,6 +1169,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         key = id(window)
         if (self._open_windows.get(key) is not window
                 or self._validation_source_by_code.get(code) is not True):
+            self._note_sor_m1_skip(key, code, "SOURCE_UNVERIFIED")
             return
         try:
             now = self._now_factory()
@@ -1125,11 +1181,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 "NXT_PRE", "KRX", "NXT_AFTER",
             }
             if now.weekday() < 5 and active:
+                self._note_sor_m1_skip(key, code, "ACTIVE_SESSION")
                 return
             identity = MarketDataHost._current_display_session_identity(market)
             if MarketDataHost._current_display_candles(market, code, 1):
+                self._note_sor_m1_skip(key, code, "SESSION_M1_PRESENT")
                 return
             if code not in MarketDataHost._nxt_eligible_targets((code,)):
+                self._note_sor_m1_skip(key, code, "NXT_INELIGIBLE")
                 return
             required = getattr(market, "_sor_m1_required_by_stock", None)
             required_count = (
@@ -1140,6 +1199,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 max(MarketDataHost._full_day_display_count(1), required_count),
             )
         except (AttributeError, RuntimeError, TypeError, ValueError):
+            self._note_sor_m1_skip(key, code, "PREREQUISITE_ERROR")
             return
 
         state = self._offsession_sor_m1_requests.get(key)
@@ -1151,6 +1211,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                      "requests": 0, "polls": 0, "pending": False, "scheduled": False}
             self._offsession_sor_m1_requests[key] = state
         if state["pending"] or state["scheduled"]:
+            self._note_sor_m1_skip(key, code, "REQUEST_IN_FLIGHT")
             return
 
         def schedule() -> None:
@@ -1169,6 +1230,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             QTimer.singleShot(1000, retry)
 
         if identity is None:
+            self._note_sor_m1_skip(key, code, "SESSION_UNAVAILABLE")
             if state["polls"] < 3:
                 state["polls"] += 1
                 schedule()
@@ -1179,7 +1241,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if state["identity"] is None:
             state["identity"] = identity
         if state["requests"] >= 2:
+            self._note_sor_m1_skip(key, code, "ATTEMPTS_EXHAUSTED")
             return
+        self._sor_m1_diagnostic_skips.pop(key, None)
+        _trace_sor_al_m1("request_ready", code, count=count,
+                         required_count=required_count, connection_epoch=identity[0],
+                         attempt=state["requests"] + 1)
         state["requests"] += 1
         state["pending"] = True
         attempt = object()
@@ -1193,19 +1260,52 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 pass
 
         def terminal(result: object) -> None:
+            current_identity = MarketDataHost._current_display_session_identity(market)
             if (self._offsession_sor_m1_requests.get(key) is not state
                     or state.get("attempt") is not attempt
                     or not state["pending"]
                     or self._open_windows.get(key) is not window
                     or getattr(getattr(window, "stock", None), "code", None) != code
-                    or MarketDataHost._current_display_session_identity(market) != identity):
+                    or current_identity != identity):
+                _trace_sor_al_m1("callback_ignored", code, reason="CONTEXT_CHANGED",
+                                 attempt=state["requests"],
+                                 epoch_match=current_identity == identity)
                 return
             state["pending"] = False
             install_result = result.get("install_result") if isinstance(result, dict) else None
+            installed_candles = MarketDataHost._current_display_candles(market, code, 1)
+            last_installed = (candle_market_datetime(installed_candles[-1])
+                              if installed_candles else None)
             installed = (isinstance(result, dict) and result.get("ok") is True
                          and isinstance(install_result, dict)
                          and install_result.get("ok") is True
-                         and bool(MarketDataHost._current_display_candles(market, code, 1)))
+                          and bool(installed_candles))
+            source_match = (isinstance(result, dict)
+                            and result.get("code") == code
+                            and result.get("interval") == 1
+                            and result.get("market_data_identity") == f"{code}_AL"
+                            and result.get("market_source") == "INTEGRATED"
+                            and result.get("display_only") is True)
+            epoch_match = (isinstance(result, dict)
+                           and (result.get("connection_epoch"),
+                                result.get("login_session_id")) == identity)
+            rows = result.get("rows") if isinstance(result, dict) else None
+            _trace_sor_al_m1("callback_terminal", code, attempt=state["requests"],
+                             response_ok=isinstance(result, dict) and result.get("ok") is True,
+                             install_ok=isinstance(install_result, dict)
+                             and install_result.get("ok") is True,
+                             installed=installed, source_match=source_match,
+                             epoch_match=epoch_match, received_count=len(rows)
+                             if isinstance(rows, list) else 0,
+                             installed_count=len(installed_candles),
+                             last_minute=last_installed.isoformat(timespec="minutes")
+                             if last_installed else "",
+                             reason=(result.get("reason_code") or
+                                     (install_result.get("reason_code")
+                                      if isinstance(install_result, dict) else None)
+                                     or ("OK" if result.get("ok") is True
+                                         else "BROKER_RESPONSE_FAILED"))
+                             if isinstance(result, dict) else "INVALID_RESULT")
             if not installed:
                 state["reason"] = (str(result.get("reason_code") or result.get("error")
                                        or (install_result.get("reason_code")
@@ -1244,8 +1344,15 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 nxt_available=True,
                 on_terminal=terminal,
             )
-            if isinstance(started, dict) and started.get("ok") is not True:
-                terminal(started)
+            if isinstance(started, dict) and started.get("ok") is True:
+                _trace_sor_al_m1("request_dispatched", code, attempt=state["requests"],
+                                 count=count, response_ok=True)
+            if (not isinstance(started, dict) or started.get("ok") is not True) and state["pending"]:
+                _trace_sor_al_m1("immediate_rejection", code, attempt=state["requests"],
+                                 reason=(started.get("reason_code") or "REQUEST_REJECTED")
+                                 if isinstance(started, dict) else "INVALID_START_RESULT")
+                terminal(started if isinstance(started, dict) else
+                         {"ok": False, "reason_code": "INVALID_START_RESULT"})
             elif isinstance(started, dict) and started.get("ok") is True and state["pending"]:
                 def callback_timeout() -> None:
                     if (self._offsession_sor_m1_requests.get(key) is not state
@@ -1257,18 +1364,32 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             or MarketDataHost._current_display_candles(market, code, 1)):
                         return
                     state["pending"] = False
+                    timed_out_attempt = state["requests"]
                     state["requests"] = 2
                     state["reason"] = "CALLBACK_TIMEOUT"
+                    _trace_sor_al_m1("callback_timeout", code, attempt=timed_out_attempt,
+                                     count=count, connection_epoch=identity[0])
                     self.validation_failed.emit("SOR_M1_ACQUISITION_FAILED:CALLBACK_TIMEOUT")
 
                 QTimer.singleShot(30000, callback_timeout)
         except Exception as exc:
+            _trace_sor_al_m1("immediate_rejection", code, attempt=state["requests"],
+                             reason=f"REQUEST_{type(exc).__name__.upper()}")
             terminal({"ok": False, "reason_code": f"REQUEST_{type(exc).__name__}"})
 
     def _persist_offsession_sor_m1(
         self, stock, market, identity, result, count, as_of, cache_lease,
     ) -> None:
         """Persist only completed rows from the accepted direct AL M1 terminal."""
+        def diagnostic(reason: str, *, persisted: bool = False,
+                       candles: object = None) -> None:
+            rows = candles if isinstance(candles, list) else []
+            last = candle_market_datetime(rows[-1]) if rows else None
+            _trace_sor_al_m1("persist_result", stock.code, reason=reason,
+                             persisted=persisted, count=len(rows),
+                             last_minute=last.isoformat(timespec="minutes") if last else "",
+                             cache_lease_present=cache_lease is not _CACHE_LEASE_UNSET)
+
         if (cache_lease is _CACHE_LEASE_UNSET
                 or not callable(getattr(self._historical_cache, "store_if_lease_current", None))
                 or not isinstance(result, dict)
@@ -1279,6 +1400,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or result.get("display_only") is not True
                 or (result.get("connection_epoch"), result.get("login_session_id")) != identity
                 or not isinstance(result.get("rows"), list)):
+            diagnostic("EVIDENCE_INVALID")
             return
         try:
             from gui_market_data_host import MarketDataHost
@@ -1291,6 +1413,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or row.get("market_source") != "INTEGRATED"
                 for row in installed
             ):
+                diagnostic("INSTALLED_M1_INVALID")
                 return
             snapshot = ValidationHistoricalSnapshot(
                 stock=stock, timeframe_minutes=1, timeframe_key="M1",
@@ -1310,24 +1433,30 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     or candle_market_datetime(completed[-1]) != candle_market_datetime(latest)
                     or any(completed[-1].get(field) != latest.get(field)
                            for field in ("open", "high", "low", "close", "volume"))):
+                diagnostic("LAST_MINUTE_MISMATCH", candles=completed)
                 return
             previous = self._cached_history(stock, 1, "M1", count)
             if previous is not None and previous.candles[-1]["time"] > completed[-1]["time"]:
+                diagnostic("CACHE_NEWER", candles=completed)
                 return
             capacity = max(count, previous.requested_count) if previous else count
             merged = merge_validation_candles(
                 previous.candles if previous else (), completed, capacity,
             )
-            self._persist_history(
+            persisted = self._persist_history(
                 stock, 1, "M1", capacity, merged,
                 market_data_identity=f"{stock.code}_AL", market_source="INTEGRATED",
                 cache_lease=cache_lease,
             )
-        except Exception:
+            diagnostic("OK" if persisted else "STORE_REJECTED",
+                       persisted=persisted, candles=completed)
+        except Exception as exc:
+            diagnostic(f"EXCEPTION_{type(exc).__name__.upper()}")
             return
 
     def _release_v5_observation_lease(self, key: int) -> None:
         self._offsession_sor_m1_requests.pop(key, None)
+        self._sor_m1_diagnostic_skips.pop(key, None)
         market = self._v5_lease_hosts.pop(key, None)
         setter = getattr(market, "set_v5_observation_lease", None)
         if callable(setter):
