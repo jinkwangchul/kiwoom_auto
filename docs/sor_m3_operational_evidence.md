@@ -17,8 +17,12 @@ background sink retains source hashes, receipt, cycle status and hash, a hashed
 routine identity, side, and observation time, without account, position, or
 order queue data. It drops evidence if the
 queue is full, the file reaches 4 MiB, or I/O fails. An older manually captured
-JSON array is also accepted. Supply an existing Mock Validation
-`mock_validation_event_v1` session journal as JSON.
+JSON array is also accepted. Newly appended, source-bound Mock Validation
+`ROUTINE_EVALUATED` decisions are captured in
+`runtime/diagnostics/sor_m3_mock_events.jsonl` by the same bounded background
+writer. A missing direct M3 receipt, duplicate event, or failed write provides
+no operational proof. The existing `mock_validation_event_v1` session journal
+remains accepted for read-only comparison.
 The Production result has `SKIP / SOR_CALCULATION_ONLY_NO_ORDER`; Mock uses its
 existing `ROUTINE_EVALUATED` events, including a direct-M3 `NONE` decision after
 a successful no-signal cycle. Both carry the direct source session receipt.
@@ -28,12 +32,13 @@ Neither path enables a queue, order, broker registration, or scheduler.
 Run the bounded, read-only comparison with three explicit files:
 
 ```powershell
-python sor_m3_operational_evidence.py --v5 runtime/diagnostics/v5_sor_m3_operational.jsonl --production runtime/diagnostics/sor_m3_production_outputs.jsonl --mock captured_mock_session.json --cutoff 20261024090000
+python sor_m3_operational_evidence.py --v5 runtime/diagnostics/v5_sor_m3_operational.jsonl --production runtime/diagnostics/sor_m3_production_outputs.jsonl --mock runtime/diagnostics/sor_m3_mock_events.jsonl --cutoff 20261024090000
 ```
 
 The collector requires the same M3 bar receipt, prefix hash, rules hash, and
 cutoff in every origin. It reports the first differing BUY/SELL/NONE decision.
-`MATCH` describes only the recorded selections; overall status stays `BLOCKED`
+`MATCH` describes only the recorded selections; order/cycle status stays `UNKNOWN`
+and overall status stays `BLOCKED`
 until a V5 operational cycle link exists. Missing, stale, duplicate, or mixed
 records also yield `BLOCKED`. The CLI reads at most 4 MiB and inspects the
 latest 256 lines from each JSONL file. It

@@ -25,9 +25,12 @@ def _records(side="BUY"):
     mock = {"schema_version": "mock_validation_event_v1",
             "validation_session_id": "MV-1", "events": [{
                 "event_id": "ME-1", "validation_session_id": "MV-1",
+                "routine_instance_id": "RI-1",
                 "stock_code": "005930", "event_type": "ROUTINE_EVALUATED",
                 "timestamp": "2026-10-24T09:03:00+09:00",
                 "payload": {"signal": side, "rules_hash": marker["rules_hash"],
+                            **({"signal_bar_time": "2026-10-24T09:00:00+09:00"}
+                               if side in {"BUY", "SELL"} else {}),
                             "evaluation_cycle_id": "MC-1",
                             "operation_identity": "C-1", "sor_source_evidence": deepcopy(marker)}}]}
     return [v5], [production], mock
@@ -40,6 +43,33 @@ def test_collector_compares_independent_decisions_and_none():
                                  cutoff="20261024090000")
         assert result["comparison"] == "MATCH"
         assert result["matched_bars"] == 1
+
+
+def test_collector_blocks_missing_or_false_mock_signal_activation():
+    for activation_time in ("2026-10-24T08:59:00+09:00", None,
+                            "2026-10-24T09:00:00",
+                            "2026-10-24T09:00:00.500000+09:00"):
+        v5, production, mock = _records()
+        event = mock["events"][0]
+        event.update(origin="MOCK", activation_time=activation_time)
+        assert compare_records(v5, production, [event],
+                               cutoff="20261024090000")["reason"] == "MOCK_JOURNAL_BINDING_UNPROVEN"
+    v5, production, mock = _records()
+    del mock["events"][0]["payload"]["signal_bar_time"]
+    assert compare_records(v5, production, mock,
+                           cutoff="20261024090000")["reason"] == "MOCK_JOURNAL_BINDING_UNPROVEN"
+    v5, production, mock = _records()
+    mock["events"][0]["payload"]["signal_bar_time"] = "2026-10-24T09:00:00"
+    assert compare_records(v5, production, mock,
+                           cutoff="20261024090000")["reason"] == "MOCK_JOURNAL_BINDING_UNPROVEN"
+    v5, production, mock = _records("NONE")
+    event = mock["events"][0]
+    event.update(origin="MOCK", activation_time=None)
+    assert compare_records(v5, production, [event],
+                           cutoff="20261024090000")["comparison"] == "MATCH"
+    event["activation_time"] = "2026-10-24T09:00:00+09:00"
+    assert compare_records(v5, production, [event],
+                           cutoff="20261024090000")["reason"] == "MOCK_JOURNAL_BINDING_UNPROVEN"
 
 
 def test_collector_reports_first_difference_and_blocks_mixed_context():
@@ -104,6 +134,38 @@ def test_cli_reads_production_jsonl_and_rejects_duplicate_cutoff(tmp_path, capsy
         handle.write(json.dumps(production[0]) + "\n")
     assert main(argv) == 2
     assert json.loads(capsys.readouterr().out)["reason"] == "PRODUCTION_DUPLICATE_EVALUATION"
+
+
+def test_cli_compares_three_independent_jsonl_routes(tmp_path, capsys):
+    v5, production, mock = _records()
+    event = mock["events"][0]
+    event.update(origin="MOCK", routine_instance_id="RI-1",
+                 activation_time="2026-10-24T09:00:00+09:00")
+    paths = [tmp_path / name for name in ("v5.jsonl", "production.jsonl", "mock.jsonl")]
+    for path, row in zip(paths, (v5[0], production[0], event)):
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    argv = ["--v5", str(paths[0]), "--production", str(paths[1]),
+            "--mock", str(paths[2]), "--cutoff", "20261024090000"]
+    assert main(argv) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["comparison"] == "MATCH"
+    assert result["order_cycle_status"] == "UNKNOWN"
+    event["payload"]["signal"] = "SELL"
+    event["payload"]["sor_source_evidence"]["side"] = "SELL"
+    paths[2].write_text(json.dumps(event) + "\n", encoding="utf-8")
+    assert main(argv) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["first_difference"]["time"] == "20261024090000"
+    assert result["order_cycle_status"] == "UNKNOWN"
+    event["routine_instance_id"] = "OTHER"
+    paths[2].write_text(json.dumps(event) + "\n", encoding="utf-8")
+    assert main(argv) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "ROUTINE_INSTANCE_MISMATCH"
+    event["routine_instance_id"] = "RI-1"
+    v5[0]["input_hash"] = "d" * 64
+    paths[0].write_text(json.dumps(v5[0]) + "\n", encoding="utf-8")
+    assert main(argv) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "SOURCE_RULES_OR_PREFIX_MISMATCH"
 
 
 def test_v5_record_requires_verified_cache_and_evaluated_snapshot():

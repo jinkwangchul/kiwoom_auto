@@ -48,6 +48,7 @@ from mock_validation_virtual_execution import (
 )
 from routine_main_facts import build_routine_main_facts_from_projection
 from sor_routine_signal_evidence import build_source_marker
+from sor_m3_mock_capture import enqueue_event as _enqueue_sor_m3_event
 
 
 RESULT_NO_SIGNAL = "NO_SIGNAL"
@@ -487,7 +488,17 @@ class MockIndicatorFollowRoutineAdapter:
             "reason_code": reason,
             "payload": deepcopy(payload) if isinstance(payload, dict) else {},
         }
-        self.repository.append_event(event)
+        appended = self.repository.append_event(event)
+        if appended.get("appended") and event_type == "ROUTINE_EVALUATED":
+            try:
+                cycle = document["cycle_state_by_instance"].get(instance_id, {})
+                _enqueue_sor_m3_event(
+                    event,
+                    cycle_identity=cycle.get("cycle_identity"),
+                    cycle_status=cycle.get("status"),
+                )
+            except Exception:
+                pass  # Optional evidence cannot alter a completed Mock evaluation.
 
     @staticmethod
     def _operation_identity(document: dict[str, Any], instance_id: str) -> str:

@@ -91,6 +91,20 @@ def _write_loop() -> None:
             _QUEUE.task_done()
 
 
+def enqueue_line(path: Path, line: str) -> bool:
+    """Share the bounded background writer with other M3 evidence routes."""
+    global _STARTED
+    try:
+        with _LOCK:
+            if not _STARTED:
+                Thread(target=_write_loop, name="sor-m3-production-evidence", daemon=True).start()
+                _STARTED = True
+            _QUEUE.put_nowait((path, line))
+        return True
+    except Exception:
+        return False
+
+
 def enqueue_preview(output: Any) -> bool:
     """Queue only a sanitized marker; failures silently drop optional evidence."""
     global _STARTED

@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
+import json
 
 from sor_routine_signal_evidence import build_source_marker
 
@@ -135,5 +136,143 @@ def test_mock_existing_journal_records_direct_m3_no_signal():
         assert len(events) == 1
         assert events[0]["payload"]["signal"] == "NONE"
         assert events[0]["payload"]["sor_source_evidence"]["timeframe"] == "M3"
+    finally:
+        case.doCleanups()
+
+
+def test_mock_direct_m3_event_is_captured_once_without_changing_cycle(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    import sor_m3_mock_capture as capture
+    from mock_validation_virtual_execution import MockExecutionPolicy
+    from tests.test_mock_indicator_follow_adapter import (
+        MockIndicatorFollowAdapterTest, NOW, SESSION_ID, _buy_rules, _market,
+    )
+
+    monkeypatch.setattr(capture, "_PATH", tmp_path / "mock_m3.jsonl")
+    case = MockIndicatorFollowAdapterTest("runTest")
+    try:
+        rules = _buy_rules()
+        rules["bar"] = {"bar_minutes": 3}
+        repository, _service, _engine, adapter, _selected = case.build({"A": rules})
+        candle = dict(CANDLE, bar_time=NOW.isoformat(), trade_date=NOW.date().isoformat())
+        source = deepcopy(SOURCE)
+        source["candles"] = [candle]
+        with patch("mock_validation_indicator_follow_adapter._pure_signal_selection",
+                   return_value=lambda *_a, **_k: {"signal": None, "reason": "NO_SIGNAL"}):
+            def evaluate():
+                return adapter.evaluate_cycle(
+                    SESSION_ID, routine_instance_id="A", candles=[candle],
+                    market=_market(), policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+                    evaluation_cycle_id="MC-m3-captured", evaluated_at=NOW,
+                    candle_availability=source)
+            assert evaluate()["status"] == "NO_SIGNAL"
+            assert evaluate()["reason"] == "MOCK_EVALUATION_CYCLE_ALREADY_PROCESSED"
+        capture._QUEUE.join()
+        records = [json.loads(line) for line in capture._PATH.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["payload"]["signal"] == "NONE"
+        assert records[0]["payload"]["sor_source_evidence"]["source_identity"] == "a" * 64
+        assert records[0]["activation_time"] is None
+        assert len([e for e in repository.read_events(SESSION_ID)
+                    if e["event_type"] == "ROUTINE_EVALUATED"]) == 1
+    finally:
+        case.doCleanups()
+
+
+def test_mock_m3_capture_uses_signal_bar_index_and_missing_bar_only_drops_evidence(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    import sor_m3_mock_capture as capture
+    from mock_validation_virtual_execution import MockExecutionPolicy
+    from tests.test_mock_indicator_follow_adapter import (
+        MockIndicatorFollowAdapterTest, NOW, SESSION_ID, _buy_rules, _market,
+    )
+
+    monkeypatch.setattr(capture, "_PATH", tmp_path / "mock_m3.jsonl")
+    case = MockIndicatorFollowAdapterTest("runTest")
+    try:
+        rules = _buy_rules()
+        rules["bar"] = {"bar_minutes": 3}
+        rules["safety"] = {"mock_allowed": False}
+        repository, _service, _engine, adapter, _selected = case.build({"A": rules})
+        candles = [
+            dict(CANDLE, bar_time="2026-09-03T09:57:00+09:00", trade_date="2026-09-03"),
+            dict(CANDLE, bar_time="2026-09-03T10:00:00+09:00", trade_date="2026-09-03"),
+        ]
+        source = deepcopy(SOURCE)
+        source["candles"] = candles
+        for cycle_id, signal in (
+            ("MC-m3-index", {"signal": "BUY", "signal_activation_index": 0}),
+            ("MC-m3-no-index", {"signal": "BUY"}),
+        ):
+            with patch("mock_validation_indicator_follow_adapter._pure_signal_selection",
+                       return_value=lambda *_a, **_k: signal):
+                result = adapter.evaluate_cycle(
+                    SESSION_ID, routine_instance_id="A", candles=candles,
+                    market=_market(), policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+                    evaluation_cycle_id=cycle_id, evaluated_at=NOW,
+                    candle_availability=source)
+            assert result["orders"] == []
+        capture._QUEUE.join()
+        events = [event for event in repository.read_events(SESSION_ID)
+                  if event["event_type"] == "ROUTINE_EVALUATED"]
+        assert len(events) == 2
+        assert events[0]["payload"]["signal_bar_time"] == "2026-09-03T09:57:00+09:00"
+        assert "signal_bar_time" not in events[1]["payload"]
+        invalid = deepcopy(events[0])
+        invalid["event_id"] = "ME-invalid-time"
+        invalid["payload"]["signal_bar_time"] = "2026-09-03T09:57:00"
+        assert capture.enqueue_event(invalid) is False
+        records = [json.loads(line) for line in capture._PATH.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["activation_time"] == "2026-09-03T09:57:00+09:00"
+        assert records[0]["payload"]["signal_bar_time"] == "2026-09-03T09:57:00+09:00"
+        assert records[0]["timestamp"] == NOW.isoformat(timespec="microseconds")
+    finally:
+        case.doCleanups()
+
+
+def test_mock_missing_m3_receipt_blocks_capture_and_sink_failure_is_isolated(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    import sor_m3_mock_capture as capture
+    from mock_validation_virtual_execution import MockExecutionPolicy
+    from tests.test_mock_indicator_follow_adapter import (
+        MockIndicatorFollowAdapterTest, NOW, SESSION_ID, _buy_rules, _market,
+    )
+
+    monkeypatch.setattr(capture, "_PATH", tmp_path / "mock_m3.jsonl")
+    case = MockIndicatorFollowAdapterTest("runTest")
+    try:
+        rules = _buy_rules()
+        rules["bar"] = {"bar_minutes": 3}
+        repository, _service, _engine, adapter, _selected = case.build({"A": rules})
+        candle = dict(CANDLE, bar_time=NOW.isoformat(), trade_date=NOW.date().isoformat())
+        source = deepcopy(SOURCE)
+        source["candles"] = [candle]
+        source["source_identity"] = ""
+        no_signal = lambda *_a, **_k: {"signal": None, "reason": "NO_SIGNAL"}
+        with patch("mock_validation_indicator_follow_adapter._pure_signal_selection",
+                   return_value=no_signal):
+            result = adapter.evaluate_cycle(
+                SESSION_ID, routine_instance_id="A", candles=[candle],
+                market=_market(), policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+                evaluation_cycle_id="MC-m3-missing", evaluated_at=NOW,
+                candle_availability=source)
+            assert result["status"] == "NO_SIGNAL"
+            assert not capture._PATH.exists()
+            assert not any(e["event_type"] == "ROUTINE_EVALUATED"
+                           for e in repository.read_events(SESSION_ID))
+            source = deepcopy(SOURCE)
+            source["candles"] = [candle]
+            with patch("mock_validation_indicator_follow_adapter._enqueue_sor_m3_event",
+                       side_effect=OSError("sink unavailable")):
+                result = adapter.evaluate_cycle(
+                    SESSION_ID, routine_instance_id="A", candles=[candle],
+                    market=_market(), policy=MockExecutionPolicy(1, "LOGIN-1", 2, 2),
+                    evaluation_cycle_id="MC-m3-failed-sink", evaluated_at=NOW,
+                    candle_availability=source)
+            assert result["status"] == "NO_SIGNAL"
+            assert len([e for e in repository.read_events(SESSION_ID)
+                        if e["event_type"] == "ROUTINE_EVALUATED"]) == 1
+            assert not capture._PATH.exists()
     finally:
         case.doCleanups()
