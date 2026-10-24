@@ -117,6 +117,20 @@ _V5_MARKING_DIAGNOSTIC_STARTED = False
 _V5_MARKING_DIAGNOSTIC_MAX_BYTES = 4 * 1024 * 1024
 
 
+def _queue_v5_m3_evidence(lines: str) -> bool:
+    global _V5_MARKING_DIAGNOSTIC_STARTED
+    try:
+        with _V5_MARKING_DIAGNOSTIC_LOCK:
+            if not _V5_MARKING_DIAGNOSTIC_STARTED:
+                _DiagnosticThread(target=_write_v5_marking_diagnostics,
+                                  name="v5-marking-diagnostic", daemon=True).start()
+                _V5_MARKING_DIAGNOSTIC_STARTED = True
+        _V5_MARKING_DIAGNOSTIC_QUEUE.put_nowait((_V5_M3_OPERATIONAL_PATH, lines))
+        return True
+    except (Full, RuntimeError, OSError):
+        return False
+
+
 def _write_v5_marking_diagnostics() -> None:
     while True:
         path, line = _V5_MARKING_DIAGNOSTIC_QUEUE.get()
@@ -753,6 +767,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         # One accepted, source-bound full indicator cache per live V5 window.
         self._history_browse_indicator_cache: dict[int, tuple[object, ...]] = {}
         self._sor_m3_marking_published: dict[int, tuple[object, ...]] = {}
+        self._sor_m3_replay_published: dict[int, tuple[object, ...]] = {}
         self._history_browse_deferred: dict[int, tuple[int, dict[str, object]]] = {}
         self._market_snapshot_generation: dict[int, int] = {}
         self._market_snapshot_metadata: dict[int, tuple[str, dict[str, object]]] = {}
@@ -8273,6 +8288,28 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 )
                 payload["backtest_trust_metadata"] = trust_metadata
                 payload["error"] = ""
+                if (session.request.stock.code == "005930"
+                        and session.request.timeframe_key == "M3"
+                        and current()):
+                    try:
+                        marker_path = self._validation_cache_source_marker_path(
+                            session.request.stock, 3, "M3",
+                            int(pool.get("requested_count") or 0))
+                        if (marker_path is not None and marker_path.is_file()
+                                and marker_path.stat().st_size <= 4096):
+                            source_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                            evidence = build_v5_records(
+                                pool, source_marker, replay_result.snapshot,
+                                replay_result.snapshot.to_candles(),
+                                replay_result.snapshot.to_entries(),
+                                generation=generation, request_generation=generation,
+                                window_key=window_key, capture_kind="NORMAL_REPLAY")
+                            if evidence:
+                                payload["sor_m3_evidence_lines"] = "".join(
+                                    json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
+                                    for record in evidence)
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        pass  # Optional evidence cannot interrupt replay.
             except Exception as exc:
                 if not current():
                     cancel()
@@ -8615,11 +8652,28 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if applied is False:
             self._range_replay_pending.pop(window_key, None)
             return
+        self._append_accepted_m3_replay_evidence(payload)
         pending_range = self._range_replay_pending.pop(window_key, None)
         if pending_range is not None:
             self._start_range_replay(pending_range)
         else:
             self._start_pending_window_work(window_key)
+
+    def _append_accepted_m3_replay_evidence(self, payload: dict[str, object]) -> None:
+        key = payload.get("window_key")
+        generation = payload.get("generation")
+        snapshot = payload.get("replay_snapshot")
+        lines = payload.get("sor_m3_evidence_lines")
+        request_id = getattr(snapshot, "historical_request_id", None)
+        if (not isinstance(lines, str) or not lines or not request_id
+                or payload.get("normal_base") is True
+                or self._request_generation.get(key) != generation
+                or key in self._prepare_pending):
+            return
+        identity = (generation, request_id)
+        if (self._sor_m3_replay_published.get(key) != identity
+                and _queue_v5_m3_evidence(lines)):
+            self._sor_m3_replay_published[key] = identity
 
     def _validation_fetch_contract(
         self,
@@ -10363,12 +10417,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 token = (payload["generation"], payload["request_generation"], payload["key"])
                 key = payload["window_key"]
                 if self._sor_m3_marking_published.get(key) != token:
-                    try:
-                        _V5_MARKING_DIAGNOSTIC_QUEUE.put_nowait((
-                            _V5_M3_OPERATIONAL_PATH, payload["sor_m3_evidence_lines"]))
+                    if _queue_v5_m3_evidence(payload["sor_m3_evidence_lines"]):
                         self._sor_m3_marking_published[key] = token
-                    except Full:
-                        pass
             _trace_v5_marking("marking_published" if published else "marking_stale",
                               payload["window_key"], payload["generation"],
                               payload["request_generation"])

@@ -66,6 +66,7 @@ from running_budget_adjustment import (
 )
 from state_policy import read_operation_policy
 from sor_routine_signal_evidence import build_source_marker, _hash as _evidence_hash
+from sor_m3_production_capture import enqueue_preview as _enqueue_sor_m3_preview
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -823,7 +824,7 @@ def probe_routine_for_stock(
                         cycle_hash = _evidence_hash(context.get("cycle"))
                     except (TypeError, ValueError, OverflowError):
                         pass
-                return {
+                output = {
                     "signal": "SKIP",
                     "reason": "SOR_CALCULATION_ONLY_NO_ORDER",
                     "routine": routine_name,
@@ -839,6 +840,9 @@ def probe_routine_for_stock(
                     "sor_preview_evidence": source_marker,
                     **({"sor_preview_cycle_hash": cycle_hash,
                         "sor_preview_routine_instance_id": routine_instance_id,
+                        "sor_preview_cycle_status": (
+                            context.get("cycle", {}).get("status")
+                            if isinstance(context.get("cycle"), dict) else None),
                         "sor_preview_observed_at": tick_key}
                        if source_marker and source_marker.get("timeframe") == "M3"
                        else {}),
@@ -847,6 +851,9 @@ def probe_routine_for_stock(
                     "queue_connected": False,
                     "send_order_connected": False,
                 }
+                if source_marker and source_marker.get("timeframe") == "M3":
+                    _enqueue_sor_m3_preview(output)
+                return output
             try:
                 if isinstance(main_facts, dict) and not callable(cycle_projector):
                     raise ValueError("ROUTINE_CYCLE_PROJECTION_UNAVAILABLE")

@@ -94,7 +94,8 @@ def test_real_probe_accepts_direct_m3_without_order_or_m1_fallback(tmp_path):
          patch.object(routine_signal_probe, "read_reference_price", return_value=None), \
          patch.object(routine_signal_probe, "find_library_stock_by_code", return_value=None), \
          patch.object(routine_signal_probe, "observe_owner_failure_transition"), \
-         patch.object(routine_signal_probe, "_append_log"):
+         patch.object(routine_signal_probe, "_append_log"), \
+         patch.object(routine_signal_probe, "_enqueue_sor_m3_preview") as capture:
         output = routine_signal_probe.probe_routine_for_stock(
             routine, "isolated", tmp_path / "005930_Test",
             NOW.isoformat(timespec="seconds"), decision_trace_observer=None,
@@ -104,6 +105,7 @@ def test_real_probe_accepts_direct_m3_without_order_or_m1_fallback(tmp_path):
     assert output["sor_preview_evidence"]["receipt_hash"]
     assert output["send_order_connected"] is False
     assert selected.call_count == 1
+    capture.assert_called_once()
 
 
 def test_mock_existing_journal_records_direct_m3_no_signal():

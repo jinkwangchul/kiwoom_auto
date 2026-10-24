@@ -88,6 +88,24 @@ def test_missing_or_stale_v5_and_bounded_cli_block(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["reason"] == "V5_ACCEPTED_M3_FILE_UNAVAILABLE"
 
 
+def test_cli_reads_production_jsonl_and_rejects_duplicate_cutoff(tmp_path, capsys):
+    v5, production, mock = _records()
+    v5_path = tmp_path / "v5.jsonl"
+    production_path = tmp_path / "production.jsonl"
+    mock_path = tmp_path / "mock.json"
+    v5_path.write_text(json.dumps(v5[0]) + "\n", encoding="utf-8")
+    production_path.write_text(json.dumps(production[0]) + "\n", encoding="utf-8")
+    mock_path.write_text(json.dumps(mock), encoding="utf-8")
+    argv = ["--v5", str(v5_path), "--production", str(production_path),
+            "--mock", str(mock_path), "--cutoff", "20261024090000"]
+    assert main(argv) == 2
+    assert json.loads(capsys.readouterr().out)["comparison"] == "MATCH"
+    with production_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(production[0]) + "\n")
+    assert main(argv) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "PRODUCTION_DUPLICATE_EVALUATION"
+
+
 def test_v5_record_requires_verified_cache_and_evaluated_snapshot():
     from hashlib import sha256
     from types import SimpleNamespace
@@ -115,6 +133,8 @@ def test_v5_record_requires_verified_cache_and_evaluated_snapshot():
                             [row], [], generation=1, request_generation=1) == []
     assert build_v5_records(pool, marker, snapshot, [dict(row, close=99)], [],
                             generation=1, request_generation=1) == []
+    assert build_v5_records(dict(pool, request_id="ANOTHER"), marker, snapshot,
+                            [row], [], generation=1, request_generation=1) == []
 
 
 def test_v5_publish_queues_once_and_stale_publish_is_ignored(tmp_path, monkeypatch):
@@ -137,3 +157,28 @@ def test_v5_publish_queues_once_and_stale_publish_is_ignored(tmp_path, monkeypat
     module.IndicatorFollowSignalValidationV5Flow._on_marking_completed(flow, payload)
     module._V5_MARKING_DIAGNOSTIC_QUEUE.join()
     assert path.read_text(encoding="utf-8").splitlines() == ['{"origin":"V5"}']
+
+
+def test_normal_replay_publish_queues_once_after_current_accepted_result(monkeypatch):
+    from types import SimpleNamespace
+    import gui_indicator_follow_signal_validation_v5_flow as module
+
+    queued = []
+    monkeypatch.setattr(module, "_queue_v5_m3_evidence",
+                        lambda line: queued.append(line) or True)
+    flow = SimpleNamespace(_request_generation={7: 4}, _prepare_pending={},
+                           _sor_m3_replay_published={})
+    payload = {"window_key": 7, "generation": 4,
+               "replay_snapshot": SimpleNamespace(historical_request_id="AL-M3-4"),
+               "sor_m3_evidence_lines": '{"origin":"V5"}\n'}
+    publish = module.IndicatorFollowSignalValidationV5Flow._append_accepted_m3_replay_evidence
+    publish(flow, payload)
+    publish(flow, payload)
+    assert queued == [payload["sor_m3_evidence_lines"]]
+    flow._prepare_pending[7] = object()
+    publish(flow, dict(payload, generation=5))
+    assert len(queued) == 1
+    flow._prepare_pending.clear()
+    publish(flow, dict(payload, generation=3))
+    publish(flow, dict(payload, normal_base=True))
+    assert len(queued) == 1

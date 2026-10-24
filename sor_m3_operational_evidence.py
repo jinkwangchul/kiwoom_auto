@@ -31,7 +31,8 @@ def _digest(value: Any) -> str:
 
 def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                      rows: Any, entries: Any, *, generation: int,
-                     request_generation: int, window_key: int = 0) -> list[dict[str, Any]]:
+                     request_generation: int, window_key: int = 0,
+                     capture_kind: str = "MARKING") -> list[dict[str, Any]]:
     """Run on the replay worker; return only source-bound evaluated M3 rows."""
     try:
         source = pool["candles"]
@@ -56,9 +57,12 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                 or not isinstance(snapshot.settings_hash, str)
                 or not _HEX.fullmatch(snapshot.settings_hash)
                 or not snapshot.historical_request_id
+                or (pool.get("request_id")
+                    and pool["request_id"] != snapshot.historical_request_id)
                 or type(generation) is not int
                 or type(request_generation) is not int
-                or type(window_key) is not int):
+                or type(window_key) is not int
+                or capture_kind not in {"MARKING", "NORMAL_REPLAY"}):
             return []
         pool_positions = {row["time"]: i for i, row in enumerate(source)}
         first_position = pool_positions.get(rows[0]["time"], -1)
@@ -110,7 +114,8 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                 closed.update(b"]")
                 prefix_hashes[i] = closed.hexdigest()
                 receipt_hashes[i] = hashlib.sha256(encoded).hexdigest()
-        return [{"origin": "V5", "source_verified": True,
+        return [{"origin": "V5", "capture_kind": capture_kind,
+                 "source_verified": True,
                  "verification_kind": "CACHE_SIDECAR_CONTENT_MATCH_ONLY",
                  "stock": stock, "timeframe": "M3", "rules_hash": snapshot.settings_hash,
                  "evaluation_time": rows[i]["time"],
@@ -206,7 +211,9 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
                         or type(record.get("request_generation")) is not int
                         or type(record.get("window_key")) is not int
                         or not record.get("historical_request_id")
-                        or record.get("activation_time") != t):
+                        or record.get("activation_time") != t
+                        or record.get("capture_kind", "MARKING")
+                        not in {"MARKING", "NORMAL_REPLAY"}):
                     return _blocked("V5_ACCEPTED_SOURCE_UNPROVEN")
             elif origin == "PRODUCTION":
                 if (record.get("code") != "005930" or record.get("signal") != "SKIP"
@@ -218,7 +225,14 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
                                ("execution_enabled", "queue_connected", "send_order_connected"))
                         or str(record.get("sor_preview_signal") or "NONE").upper()
                         != marker["side"]
-                        or not record.get("sor_preview_routine_instance_id")
+                        or not (record.get("sor_preview_routine_instance_id")
+                                or (record.get("origin") == "PRODUCTION"
+                                    and isinstance(record.get(
+                                        "sor_preview_routine_instance_sha256"), str)
+                                    and _HEX.fullmatch(record[
+                                        "sor_preview_routine_instance_sha256"])
+                                    and record.get("sor_preview_cycle_status")
+                                    in {"resolved", "unresolved", "UNKNOWN"}))
                         or (_observation_time(record.get("sor_preview_observed_at")) or "") < t
                         or not isinstance(record.get("sor_preview_cycle_hash"), str)
                         or not _HEX.fullmatch(record["sor_preview_cycle_hash"])):
@@ -299,6 +313,19 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             for line in lines[-_MAX_RECORDS:]]
 
 
+def _read_production(path: Path) -> list[dict[str, Any]]:
+    if path.stat().st_size > _MAX_BYTES:
+        raise ValueError("file bound exceeded")
+    raw = path.read_text(encoding="utf-8")
+    if raw.lstrip().startswith("["):
+        value = json.loads(raw, object_pairs_hook=_unique_pairs)
+        if not isinstance(value, list) or len(value) > _MAX_RECORDS:
+            raise ValueError("production array bound exceeded")
+        return value
+    return [json.loads(line, object_pairs_hook=_unique_pairs)
+            for line in raw.splitlines()[-_MAX_RECORDS:]]
+
+
 def _latest_v5_batch(records: list[dict[str, Any]], cutoff: str) -> list[dict[str, Any]]:
     latest = next((row for row in reversed(records)
                    if isinstance(row, dict) and row.get("evaluation_time") == cutoff), None)
@@ -306,11 +333,19 @@ def _latest_v5_batch(records: list[dict[str, Any]], cutoff: str) -> list[dict[st
         return []
     identity = tuple(latest.get(key) for key in
                      ("window_key", "generation", "request_generation",
-                      "historical_request_id", "source_identity"))
+                      "historical_request_id", "source_identity", "capture_kind"))
     return [row for row in records if isinstance(row, dict) and
             tuple(row.get(key) for key in
                   ("window_key", "generation", "request_generation",
-                   "historical_request_id", "source_identity")) == identity]
+                   "historical_request_id", "source_identity", "capture_kind")) == identity
+            and row.get("evaluation_time", "") <= cutoff]
+
+
+def _latest_production_batch(records: list[dict[str, Any]],
+                             cutoff: str, times: set[str]) -> list[dict[str, Any]]:
+    return [row for row in records if isinstance(row, dict)
+            and isinstance(row.get("sor_preview_evidence"), dict)
+            and row["sor_preview_evidence"].get("evaluation_time") in times]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -324,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     result = None
     for path, reader, reason in (
         (args.v5, _read_jsonl, "V5_ACCEPTED_M3_FILE_UNAVAILABLE"),
-        (args.production, _read_json, "PRODUCTION_PREVIEW_M3_FILE_UNAVAILABLE"),
+        (args.production, _read_production, "PRODUCTION_PREVIEW_M3_FILE_UNAVAILABLE"),
         (args.mock, _read_json, "MOCK_SESSION_JOURNAL_FILE_UNAVAILABLE"),
     ):
         try:
@@ -334,6 +369,9 @@ def main(argv: list[str] | None = None) -> int:
             break
     if result is None:
         sources[0] = _latest_v5_batch(sources[0], args.cutoff)
+        sources[1] = _latest_production_batch(
+            sources[1], args.cutoff,
+            {row["evaluation_time"] for row in sources[0]})
         result = compare_records(*sources, cutoff=args.cutoff)
     print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     return 1 if result["status"] == "MISMATCH" else 2
