@@ -2377,6 +2377,23 @@ class MarketDataHost(QObject):
                 forming_minute.get("snapshot_received_at") if forming_minute else ""
             ),
         }
+        if interval == 1 and projection == "COMPLETED_TIMEFRAME":
+            identity = MarketDataHost._current_display_session_identity(self)
+            if identity is not None and identity == _host_attr(
+                self, "_display_timeframe_session_identity", {}
+            ).get((code, 1)) and projected.get("forming_included") is not True:
+                direct_rows = [{
+                    "time": candle_market_datetime(row).strftime("%Y%m%d%H%M%S"),
+                    **{key: float(row[key]) for key in
+                       ("open", "high", "low", "close", "volume")},
+                } for row in rows]
+                result["direct_source_receipt"] = {
+                    "stock_code": code, "timeframe_key": "M1",
+                    "source_content_sha256": canonical_candle_content_hash(direct_rows),
+                    "connection_epoch": identity[0],
+                    "session_sha256": sha256(identity[1].encode("utf-8")).hexdigest(),
+                    "source_as_of": as_of.isoformat(),
+                }
         if forming_minute is not None:
             identity = MarketDataHost._current_display_session_identity(self)
             sealed_identity = sealed.get("session_identity")

@@ -94,12 +94,14 @@ def build_source_marker(
                               or not re.fullmatch(r"[0-9a-f]{64}", source["source_identity"])
                               or source.get("forming_included") is True):
             return None
-        if interval > 1:
-            receipt = source.get("direct_source_receipt")
+        receipt = source.get("direct_source_receipt")
+        if interval > 1 or (interval == 1 and receipt is not None):
             if (not isinstance(receipt, dict)
                     or receipt.get("stock_code") != stock
                     or receipt.get("timeframe_key") != f"M{interval}"
-                    or receipt.get("source_content_sha256") != source["source_identity"]
+                    or not isinstance(receipt.get("source_content_sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", receipt["source_content_sha256"])
+                    or (interval > 1 and receipt["source_content_sha256"] != source["source_identity"])
                     or type(receipt.get("connection_epoch")) is not int
                     or receipt["connection_epoch"] <= 0
                     or not isinstance(receipt.get("session_sha256"), str)
@@ -112,10 +114,11 @@ def build_source_marker(
                 or any(row.get("timeframe_minutes") != interval for row in candles)
                 or times != sorted(set(times))):
             return None
-        if interval > 1 and any(
-            row.get("market_data_identity") != f"{stock}_AL"
-            or row.get("market_source") != "INTEGRATED"
-            or row.get("display_only") is not True
+        if (interval > 1 or receipt is not None) and any(
+            (interval > 1 and (
+                row.get("market_data_identity") != f"{stock}_AL"
+                or row.get("market_source") != "INTEGRATED"
+                or row.get("display_only") is not True))
             or row.get("is_complete") is not True
             or any(type(row.get(key)) not in (int, float) for key in
                    ("open", "high", "low", "close", "volume"))
@@ -127,28 +130,42 @@ def build_source_marker(
             return None
         direct_rows = ([{
             "time": time.strftime("%Y%m%d%H%M%S"),
-            **{key: row[key] for key in ("open", "high", "low", "close", "volume")},
-        } for time, row in zip(times, candles)] if interval > 1 else None)
+            **{key: (float(row[key]) if interval == 1 else row[key])
+               for key in ("open", "high", "low", "close", "volume")},
+        } for time, row in zip(times, candles)] if interval > 1 or receipt is not None else None)
+        if interval == 1 and receipt is not None:
+            as_of = _bar_time({"bar_time": receipt["source_as_of"]})
+            if (source.get("projection") != "COMPLETED_TIMEFRAME"
+                    or source.get("forming_included") is True
+                    or as_of is None or times[-1] + timedelta(minutes=1) > as_of):
+                return None
         marker = {
             "stock": stock, "timeframe": f"M{interval}", "rules_hash": _hash(rules),
             "evaluation_time": times[-1].strftime("%Y%m%d%H%M%S"),
             "market_data_identity": f"{stock}_AL", "source_proof": _SOURCE_PROOF,
-            "input_hash": _hash(candles if interval == 1 else direct_rows),
+            "input_hash": _hash(candles if direct_rows is None else direct_rows),
             "side": side_text,
         }
-        if interval > 1:
-            marker["source_identity"] = source["source_identity"]
+        if direct_rows is not None:
+            marker["source_identity"] = (source["source_identity"] if interval > 1
+                                         else receipt["source_content_sha256"])
             marker["receipt_hash"] = _hash(direct_rows[-1])
             marker["source_session_sha256"] = receipt["session_sha256"]
             marker["source_connection_epoch"] = receipt["connection_epoch"]
+            if interval == 1:
+                marker["direct_m1_source_proof"] = "BROKER_SESSION_BOUND_COMPLETED_M1"
         return marker
     except (TypeError, ValueError, OverflowError):
         return None
 
 
 def _valid_marker(marker: Any) -> bool:
+    direct_fields = _MARKER_FIELDS | {
+        "source_identity", "receipt_hash", "source_session_sha256",
+        "source_connection_epoch", "direct_m1_source_proof",
+    }
     return bool(
-        isinstance(marker, dict) and set(marker) == _MARKER_FIELDS
+        isinstance(marker, dict) and set(marker) in (_MARKER_FIELDS, direct_fields)
         and _valid_stock(marker["stock"]) and marker["timeframe"] == "M1"
         and marker["market_data_identity"] == f"{marker['stock']}_AL"
         and marker["source_proof"] == _SOURCE_PROOF
@@ -157,6 +174,13 @@ def _valid_marker(marker: Any) -> bool:
         and all(isinstance(marker[key], str)
                 and re.fullmatch(r"[0-9a-f]{64}", marker[key])
                 for key in ("rules_hash", "input_hash"))
+        and (set(marker) == _MARKER_FIELDS or (
+            all(isinstance(marker[key], str)
+                and re.fullmatch(r"[0-9a-f]{64}", marker[key])
+                for key in ("source_identity", "receipt_hash", "source_session_sha256"))
+            and type(marker["source_connection_epoch"]) is int
+            and marker["source_connection_epoch"] > 0
+            and marker["direct_m1_source_proof"] == "BROKER_SESSION_BOUND_COMPLETED_M1"))
     )
 
 

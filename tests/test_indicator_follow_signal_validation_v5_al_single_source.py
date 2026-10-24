@@ -3436,7 +3436,7 @@ def test_v5_collection_retains_only_opted_in_broker_al_m1_envelopes(
     else:
         assert retained == ()
     assert handle.call_args.args[2].broker_al_request_receipt == (
-        (started, receipt) if retained else None
+        (started, receipt) if integrated and timeframe == 1 and complete_metadata else None
     )
 
 

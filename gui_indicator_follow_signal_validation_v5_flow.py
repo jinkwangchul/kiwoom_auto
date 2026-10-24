@@ -123,7 +123,7 @@ _V5_MARKING_DIAGNOSTIC_MAX_BYTES = 4 * 1024 * 1024
 def _queue_v5_m3_evidence(lines: str, *, timeframe: str = "M3") -> bool:
     global _V5_MARKING_DIAGNOSTIC_STARTED
     try:
-        if timeframe not in {f"M{n}" for n in SUPPORTED_BAR_MINUTES if n > 1}:
+        if timeframe not in {f"M{n}" for n in SUPPORTED_BAR_MINUTES}:
             return False
         with _V5_MARKING_DIAGNOSTIC_LOCK:
             if not _V5_MARKING_DIAGNOSTIC_STARTED:
@@ -3665,6 +3665,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         market_data_identity: str = "",
         market_source: str = "",
         cache_lease: object = _CACHE_LEASE_UNSET,
+        direct_m1_receipt: dict[str, object] | None = None,
     ) -> bool:
         store = getattr(self._historical_cache, "store", None)
         guarded_store = getattr(
@@ -3702,6 +3703,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             "canonical_stock_code": stock.code,
                             "market_data_identity": persisted_identity,
                             "market_source": persisted_source,
+                            **({"direct_m1_receipt": direct_m1_receipt}
+                               if timeframe_key == "M1" and direct_m1_receipt else {}),
                             **({"candle_content_sha256": hashlib.sha256(
                                 json.dumps(
                                     candles,
@@ -8296,7 +8299,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 payload["backtest_trust_metadata"] = trust_metadata
                 payload["error"] = ""
                 if (session.request.timeframe_minutes in SUPPORTED_BAR_MINUTES
-                        and session.request.timeframe_minutes > 1
                         and session.request.timeframe_key == f"M{session.request.timeframe_minutes}"
                         and current()):
                     try:
@@ -9911,12 +9913,56 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
     def _broker_al_m1_provider_options(self, session: ValidationSession) -> dict[str, bool]:
         if (
-            self._retain_broker_al_m1_evidence
-            and session.request.timeframe_key == "M1"
+            session.request.timeframe_key == "M1"
             and self._validation_source_by_code.get(session.request.stock.code) is True
         ):
             return {"retain_broker_al_m1_evidence": True}
         return {}
+
+    @staticmethod
+    def _direct_m1_cache_receipt(result: object, candles: list[dict]) -> dict[str, object] | None:
+        """Bind the accepted completed rows to the broker request and callback session."""
+        try:
+            snapshot = result.snapshot
+            started, received = result.broker_al_request_receipt
+            request_at = datetime.fromisoformat(started["request_as_of"])
+            callback_at = datetime.fromisoformat(received["received_at"])
+            epoch = started["connection_epoch"]
+            login = started["login_session_id"]
+            if (snapshot.timeframe_key != "M1"
+                    or snapshot.market_data_identity != f"{snapshot.stock.code}_AL"
+                    or snapshot.market_source != "INTEGRATED"
+                    or received.get("rows") != snapshot.to_rows()
+                    or started.get("rqname") != snapshot.request_id
+                    or received.get("request_id") != snapshot.request_id
+                    or received.get("trcode") != "opt10080"
+                    or received.get("code") != snapshot.stock.code
+                    or type(epoch) is not int or epoch <= 0
+                    or not isinstance(login, str) or not login
+                    or received.get("connection_epoch") != epoch
+                    or received.get("login_session_id") != login
+                    or request_at.utcoffset() != timedelta(hours=9)
+                    or callback_at.utcoffset() != timedelta(hours=9)
+                    or request_at > callback_at
+                    or not candles):
+                return None
+            times = [datetime.strptime(row["time"], "%Y%m%d%H%M%S").replace(
+                tzinfo=SEOUL_TIMEZONE) for row in candles]
+            if (times != sorted(set(times))
+                    or any(time + timedelta(minutes=1) > request_at for time in times)):
+                return None
+            return {
+                "stock_code": snapshot.stock.code, "timeframe_key": "M1",
+                "source_content_sha256": hashlib.sha256(json.dumps(
+                    candles, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")).hexdigest(),
+                "connection_epoch": epoch,
+                "session_sha256": hashlib.sha256(login.encode("utf-8")).hexdigest(),
+                "source_as_of": request_at.isoformat(),
+            }
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return None
 
     def _retain_broker_al_m1_result(self, window_key: int, result: object) -> None:
         if not self._retain_broker_al_m1_evidence or not isinstance(result, ValidationHistoricalResult):
@@ -9982,6 +10028,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
         requested_count = int(cache_requested_count or result.snapshot.requested_count)
         candles = merge_validation_candles([], candles, requested_count)
+        direct_m1_receipt = self._direct_m1_cache_receipt(result, candles)
         pool = self._pool_from_candles(
             persistence_session,
             candles,
@@ -10001,6 +10048,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 candles,
                 market_data_identity=result.snapshot.market_data_identity,
                 market_source=result.snapshot.market_source,
+                direct_m1_receipt=direct_m1_receipt,
             )
         return self._install_acquired_pool(
             window,
@@ -10360,7 +10408,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     cancel_predicate=lambda: not current())
                 payload["snapshot"] = snapshot
                 payload["comparison"] = (tuple(c["time"] for c in rows), cache)
-                if (minutes in SUPPORTED_BAR_MINUTES and minutes > 1
+                if (minutes in SUPPORTED_BAR_MINUTES
                         and session.request.timeframe_key == f"M{minutes}"
                         and not detached_premarket):
                     try:

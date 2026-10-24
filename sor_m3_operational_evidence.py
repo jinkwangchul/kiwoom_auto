@@ -42,7 +42,7 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
         minutes = pool.get("timeframe_minutes")
         if (not _valid_stock(stock) or pool["stock"].code != stock
                 or type(minutes) is not int or minutes not in SUPPORTED_BAR_MINUTES
-                or minutes == 1 or timeframe != f"M{minutes}"
+                or timeframe != f"M{minutes}"
                 or snapshot.timeframe_key != timeframe
                 or snapshot.timeframe_minutes != minutes
                 or pool.get("market_source") != "INTEGRATED"
@@ -67,6 +67,23 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                 or type(window_key) is not int
                 or capture_kind not in {"MARKING", "NORMAL_REPLAY"}):
             return []
+        direct_m1 = cache_marker.get("direct_m1_receipt") if minutes == 1 else None
+        if minutes == 1:
+            if (not isinstance(direct_m1, dict)
+                    or direct_m1.get("stock_code") != stock
+                    or direct_m1.get("timeframe_key") != "M1"
+                    or direct_m1.get("source_content_sha256") != cache_marker["candle_content_sha256"]
+                    or type(direct_m1.get("connection_epoch")) is not int
+                    or direct_m1["connection_epoch"] <= 0
+                    or not isinstance(direct_m1.get("session_sha256"), str)
+                    or not _HEX.fullmatch(direct_m1["session_sha256"])):
+                return []
+            source_as_of = datetime.fromisoformat(direct_m1["source_as_of"])
+            if (source_as_of.utcoffset() != timedelta(hours=9)
+                    or any(datetime.strptime(row["time"], "%Y%m%d%H%M%S").replace(
+                        tzinfo=source_as_of.tzinfo) + timedelta(minutes=1) > source_as_of
+                        for row in source)):
+                return []
         pool_positions = {row["time"]: i for i, row in enumerate(source)}
         first_position = pool_positions.get(rows[0]["time"], -1)
         if (len(pool_positions) != len(source) or first_position < 0
@@ -119,13 +136,19 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                 receipt_hashes[i] = hashlib.sha256(encoded).hexdigest()
         return [{"origin": "V5", "capture_kind": capture_kind,
                  "source_verified": True,
-                 "verification_kind": "CACHE_SIDECAR_CONTENT_MATCH_ONLY",
+                 "verification_kind": ("BROKER_SESSION_BOUND_DIRECT_M1_CONTENT_MATCH"
+                                       if minutes == 1 else "CACHE_SIDECAR_CONTENT_MATCH_ONLY"),
                  "stock": stock, "timeframe": timeframe, "rules_hash": snapshot.settings_hash,
                  "evaluation_time": rows[i]["time"],
                  "activation_time": rows[i]["time"],
                  "signal_time": signal_times.get(i),
                  "market_data_identity": f"{stock}_AL", "source_proof": _SOURCE_PROOF,
                  "source_identity": cache_marker["candle_content_sha256"],
+                 **({"direct_m1_source_proof": "BROKER_SESSION_BOUND_COMPLETED_M1"}
+                    if minutes == 1 else {}),
+                 **({"source_session_sha256": direct_m1["session_sha256"],
+                     "source_connection_epoch": direct_m1["connection_epoch"]}
+                    if minutes == 1 else {}),
                  "input_hash": prefix_hashes[i],
                  "receipt_hash": receipt_hashes[i],
                  "side": next(iter(decisions[i]), "NONE"),
@@ -140,7 +163,7 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
 def _marker(value: Any, cutoff: str, *, timeframe: str = "M3",
             stock: str | None = None) -> bool:
     return bool(
-        timeframe in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
+        timeframe in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES}
         and
         isinstance(value, dict)
         and _valid_stock(value.get("stock"))
@@ -148,6 +171,8 @@ def _marker(value: Any, cutoff: str, *, timeframe: str = "M3",
         and value.get("timeframe") == timeframe
         and value.get("market_data_identity") == f"{value['stock']}_AL"
         and value.get("source_proof") == _SOURCE_PROOF
+        and (timeframe != "M1" or value.get("direct_m1_source_proof")
+             == "BROKER_SESSION_BOUND_COMPLETED_M1")
         and value.get("side") in {"BUY", "SELL", "NONE"}
         and _valid_cutoff(value.get("evaluation_time"))
         and value["evaluation_time"] <= cutoff
@@ -183,14 +208,14 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
         return _blocked("INVALID_STOCK")
     if not _valid_cutoff(cutoff):
         return _blocked("INVALID_CUTOFF")
-    if timeframe == "M1":
-        return _blocked("M1_DIRECT_SOURCE_RECEIPT_MISSING")
-    if timeframe not in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}:
+    if timeframe not in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES}:
         return _blocked("DIRECT_PERIOD_SOURCE_SCHEMA_UNPROVEN")
     if not isinstance(v5, list) or not v5:
-        return _blocked("V5_ACCEPTED_M3_MISSING")
+        return _blocked("V5_ACCEPTED_DIRECT_M1_MISSING" if timeframe == "M1"
+                        else "V5_ACCEPTED_M3_MISSING")
     if not isinstance(production, list) or not production:
-        return _blocked("PRODUCTION_PREVIEW_M3_MISSING")
+        return _blocked("PRODUCTION_PREVIEW_DIRECT_M1_MISSING" if timeframe == "M1"
+                        else "PRODUCTION_PREVIEW_M3_MISSING")
     captured_mock = isinstance(mock, list)
     if captured_mock:
         mock_events = mock
@@ -229,7 +254,7 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
             if (isinstance(marker, dict) and _valid_stock(marker.get("stock"))
                     and marker.get("market_data_identity") == f"{marker['stock']}_AL"
                     and marker.get("timeframe") in {
-                        f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
+                        f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES}
                     and (origin != "PRODUCTION" or record.get("code") == marker["stock"])
                     and (origin != "MOCK" or record.get("stock_code") == marker["stock"])
                     and (marker["stock"] != stock or marker["timeframe"] != timeframe)):
@@ -244,7 +269,13 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                 if (record.get("origin") != "V5"
                         or record.get("source_verified") is not True
                         or record.get("verification_kind")
-                        != "CACHE_SIDECAR_CONTENT_MATCH_ONLY"
+                        != ("BROKER_SESSION_BOUND_DIRECT_M1_CONTENT_MATCH" if timeframe == "M1"
+                            else "CACHE_SIDECAR_CONTENT_MATCH_ONLY")
+                        or (timeframe == "M1" and (
+                            not isinstance(marker.get("source_session_sha256"), str)
+                            or not _HEX.fullmatch(marker["source_session_sha256"])
+                            or type(marker.get("source_connection_epoch")) is not int
+                            or marker["source_connection_epoch"] <= 0))
                         or type(record.get("generation")) is not int
                         or type(record.get("request_generation")) is not int
                         or type(record.get("window_key")) is not int
@@ -264,6 +295,11 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                                ("execution_enabled", "queue_connected", "send_order_connected"))
                         or str(record.get("sor_preview_signal") or "NONE").upper()
                         != marker["side"]
+                        or (timeframe == "M1" and (
+                            (_observation_time(record.get("sor_preview_activation_time"))
+                             if marker["side"] in {"BUY", "SELL"} else
+                             record.get("sor_preview_activation_time"))
+                            != (t if marker["side"] in {"BUY", "SELL"} else None)))
                         or not (record.get("sor_preview_routine_instance_id")
                                 or (record.get("origin") == "PRODUCTION"
                                     and isinstance(record.get(
@@ -302,7 +338,10 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                         or (observed_time or "") < t
                         or (marker["side"] in {"BUY", "SELL"} and (
                             not signal_instant
-                            or signal_instant.strftime("%Y%m%d%H%M%S") > t
+                            or signal_instant.strftime("%Y%m%d%H%M%S")
+                               > t
+                            or (timeframe == "M1" and
+                                signal_instant.strftime("%Y%m%d%H%M%S") != t)
                             or signal_instant > observed_instant
                             or ((captured_mock or "activation_time" in record)
                                 and _qualified_time(activation_time) != signal_instant)))
@@ -339,6 +378,12 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                for key in ("source_identity", "source_session_sha256",
                            "source_connection_epoch")):
             return _blocked("PRODUCTION_MOCK_SOURCE_RECEIPT_MISMATCH",
+                            first_differing_time=t)
+        if timeframe == "M1" and any(
+                selected[origin][t][key] != selected["V5"][t][key]
+                for origin in ("PRODUCTION", "MOCK")
+                for key in ("source_session_sha256", "source_connection_epoch")):
+            return _blocked("V5_DIRECT_M1_SESSION_RECEIPT_MISMATCH",
                             first_differing_time=t)
     first = next((t for t in times if len({selected[origin][t]["side"] for origin
                                           in selected}) > 1), None)

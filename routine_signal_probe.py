@@ -821,7 +821,7 @@ def probe_routine_for_stock(
                     source=candle_projection_evidence, side=preview_side,
                 )
                 cycle_hash = None
-                if source_marker and source_marker.get("timeframe") != "M1":
+                if source_marker and "receipt_hash" in source_marker:
                     try:
                         cycle_hash = _evidence_hash(context.get("cycle"))
                     except (TypeError, ValueError, OverflowError):
@@ -839,6 +839,10 @@ def probe_routine_for_stock(
                     "sor_preview_source_index": (
                         preview.get("signal_source_index") if isinstance(preview, dict) else None
                     ),
+                    "sor_preview_activation_time": (
+                        preview.get("signal_activation_bar_time")
+                        if isinstance(preview, dict) else None
+                    ),
                     "sor_preview_evidence": source_marker,
                     **({"sor_preview_cycle_hash": cycle_hash,
                         "sor_preview_routine_instance_id": routine_instance_id,
@@ -846,14 +850,14 @@ def probe_routine_for_stock(
                             context.get("cycle", {}).get("status")
                             if isinstance(context.get("cycle"), dict) else None),
                         "sor_preview_observed_at": tick_key}
-                       if source_marker and source_marker.get("timeframe") != "M1"
+                       if source_marker and "receipt_hash" in source_marker
                        else {}),
                     "candles": len(candles),
                     "execution_enabled": False,
                     "queue_connected": False,
                     "send_order_connected": False,
                 }
-                if source_marker and source_marker.get("timeframe") != "M1":
+                if source_marker and "receipt_hash" in source_marker:
                     _enqueue_sor_m3_preview(output)
                 return output
             try:

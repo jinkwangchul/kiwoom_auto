@@ -62,7 +62,11 @@ def enqueue_event(event: Any, *, cycle_identity: Any = None,
                         **({"signal_bar_time": activation_time} if activated else {}),
                         "evaluation_cycle_id": payload["evaluation_cycle_id"],
                         "operation_identity": payload["operation_identity"],
-                        "sor_source_evidence": {key: marker[key] for key in _MARKER_KEYS}},
+                        "sor_source_evidence": {
+                            **{key: marker[key] for key in _MARKER_KEYS},
+                            **({"direct_m1_source_proof": marker["direct_m1_source_proof"]}
+                               if marker["timeframe"] == "M1" else {}),
+                        }},
         }
         if isinstance(cycle_identity, str) and cycle_identity:
             record["cycle_identity"] = cycle_identity

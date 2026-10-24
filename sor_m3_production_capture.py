@@ -43,9 +43,11 @@ def _safe_record(output: Any) -> dict[str, Any] | None:
             or not isinstance(marker, dict)
             or marker.get("stock") != output["code"]
             or marker.get("timeframe") not in {
-                f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
+                f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES}
             or marker.get("market_data_identity") != f"{output['code']}_AL"
             or marker.get("source_proof") != _SOURCE_PROOF
+            or (marker.get("timeframe") == "M1" and marker.get("direct_m1_source_proof")
+                != "BROKER_SESSION_BOUND_COMPLETED_M1")
             or marker.get("side") not in {"BUY", "SELL", "NONE"}
             or not _valid_cutoff(marker.get("evaluation_time"))
             or any(not _hex(marker.get(key)) for key in
@@ -65,7 +67,13 @@ def _safe_record(output: Any) -> dict[str, Any] | None:
         "execution_enabled": False, "queue_connected": False,
         "send_order_connected": False,
         "sor_preview_signal": marker["side"],
-        "sor_preview_evidence": {key: marker[key] for key in _MARKER_KEYS},
+        **({"sor_preview_activation_time": output.get("sor_preview_activation_time")}
+           if marker["timeframe"] == "M1" else {}),
+        "sor_preview_evidence": {
+            **{key: marker[key] for key in _MARKER_KEYS},
+            **({"direct_m1_source_proof": marker["direct_m1_source_proof"]}
+               if marker["timeframe"] == "M1" else {}),
+        },
         "sor_preview_cycle_hash": output["sor_preview_cycle_hash"],
         "sor_preview_routine_instance_sha256": hashlib.sha256(
             output["sor_preview_routine_instance_id"].encode("utf-8")).hexdigest(),

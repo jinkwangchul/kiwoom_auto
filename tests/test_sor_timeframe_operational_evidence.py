@@ -296,3 +296,154 @@ def test_v5_worker_accepts_other_stock_only_with_matching_direct_cache():
     assert build_v5_records(pool, dict(marker, market_data_identity="005930_AL"),
                             snapshot, [row], [], generation=1,
                             request_generation=1) == []
+
+
+def test_direct_m1_host_receipt_uses_completed_broker_rows():
+    from tests.test_sor_core_m1_input import _installed_host, _project
+    from tests.test_display_only_integrated_history import _opt10080_row
+    from routines.지표추종매매.routine_validation_contract import ValidationStockRef
+    from routines.지표추종매매.routine_validation_historical import ValidationHistoricalSnapshot
+    from routines.지표추종매매.routine_validation_replay import project_validation_candles
+    from tests.test_sor_core_m1_input import NOW
+
+    projected = _project(_installed_host(), 1)
+    receipt = projected["direct_source_receipt"]
+    assert projected["available"] is True
+    assert receipt["stock_code"] == "005930"
+    assert receipt["timeframe_key"] == "M1"
+    assert receipt["connection_epoch"] == 1
+    assert receipt["session_sha256"] == sha256(b"SESSION-1").hexdigest()
+    assert all(row["is_complete"] is True for row in projected["candles"])
+    snapshot = ValidationHistoricalSnapshot(
+        stock=ValidationStockRef("005930", "Samsung"), timeframe_minutes=1,
+        requested_count=5, request_id="AL-1",
+        rows=[_opt10080_row(f"20261020090{i}00", 100 + i) for i in range(5)],
+        market_data_identity="005930_AL", market_source="INTEGRATED")
+    normalized, _ = project_validation_candles(snapshot, as_of=NOW)
+    assert receipt["source_content_sha256"] == sha256(json.dumps(normalized,
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+@pytest.mark.parametrize("current_session", [None, (2, "SESSION-2")])
+def test_direct_m1_session_receipt_failure_keeps_calculation_available(current_session):
+    from unittest.mock import patch
+
+    from gui_market_data_host import MarketDataHost
+    from tests.test_sor_core_m1_input import _installed_host, _project
+
+    host = _installed_host()
+    expected = _project(host, 1)
+    with patch.object(MarketDataHost, "_current_display_session_identity",
+                      side_effect=[(1, "SESSION-1"), current_session]):
+        projected = _project(host, 1)
+
+    assert projected["available"] is True
+    assert projected["candles"] == expected["candles"]
+    assert "direct_source_receipt" not in projected
+    marker = build_source_marker(stock="005930", rules={"bar": {"bar_minutes": 1}},
+                                 candles=projected["candles"], source=projected, side="BUY")
+    assert marker is not None
+    assert "direct_m1_source_proof" not in marker
+    assert _safe_record({"code": "005930", "signal": "SKIP",
+                         "reason": "SOR_CALCULATION_ONLY_NO_ORDER",
+                         "execution_enabled": False, "queue_connected": False,
+                         "send_order_connected": False,
+                         "sor_preview_evidence": marker}) is None
+    v5, production, mock = _records()
+    production[0]["sor_preview_evidence"] = marker
+    assert compare_records(v5, production, mock, cutoff=marker["evaluation_time"],
+                           timeframe="M1")["status"] == "BLOCKED"
+
+
+def test_direct_m1_three_consumer_receipt_and_decision_gate():
+    row = {"time": "20261024090000", "open": 100.0, "high": 101.0,
+           "low": 99.0, "close": 100.0, "volume": 10.0}
+    content_hash = sha256(json.dumps([row], sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    candle = dict(CANDLE, timeframe_minutes=1)
+    source = deepcopy(SOURCE)
+    source.update(candles=[candle], timeframe_minutes=1,
+                  calculation_source="BROKER_AL_CONFIRMED_M1",
+                  projection="COMPLETED_TIMEFRAME", forming_included=False,
+                  direct_source_receipt={
+                      "stock_code": "005930", "timeframe_key": "M1",
+                      "source_content_sha256": content_hash,
+                      "connection_epoch": 1,
+                      "session_sha256": sha256(b"SESSION-1").hexdigest(),
+                      "source_as_of": "2026-10-24T09:02:00+09:00"})
+    rules = {"bar": {"bar_minutes": 1}}
+    marker = build_source_marker(stock="005930", rules=rules,
+                                 candles=[candle], source=source, side="BUY")
+    assert marker is not None and marker["source_identity"] == content_hash
+    assert _safe_record({"code": "005930", "signal": "SKIP",
+        "reason": "SOR_CALCULATION_ONLY_NO_ORDER", "execution_enabled": False,
+        "queue_connected": False, "send_order_connected": False,
+        "sor_preview_signal": "BUY", "sor_preview_evidence": marker,
+        "sor_preview_cycle_hash": "a" * 64,
+        "sor_preview_routine_instance_id": "RI-1",
+        "sor_preview_observed_at": "2026-10-24T09:03:00+09:00",
+        "sor_preview_activation_time": "2026-10-24T09:00:00+09:00"}) is not None
+    stock = SimpleNamespace(code="005930")
+    pool = {"stock": stock, "timeframe_key": "M1", "timeframe_minutes": 1,
+            "market_source": "INTEGRATED", "market_data_identity": "005930_AL",
+            "candles": [row]}
+    cache_marker = {"canonical_stock_code": "005930",
+                    "market_source": "INTEGRATED", "market_data_identity": "005930_AL",
+                    "candle_content_sha256": content_hash,
+                    "direct_m1_receipt": source["direct_source_receipt"]}
+    snapshot = SimpleNamespace(stock=stock, timeframe_key="M1",
+        timeframe_minutes=1, settings_hash=marker["rules_hash"],
+        historical_request_id="AL-1", evaluated_start_index=0,
+        evaluated_end_index=0)
+    entry = SimpleNamespace(signal="BUY", evaluation_index=0,
+                            evaluation_time=row["time"], signal_time=row["time"])
+    v5 = build_v5_records(pool, cache_marker, snapshot, [row], [entry],
+                          generation=1, request_generation=1)
+    assert len(v5) == 1
+    assert build_v5_records(pool, dict(cache_marker, direct_m1_receipt=None),
+                            snapshot, [row], [], generation=1,
+                            request_generation=1) == []
+    base_v5, production, mock = _records()
+    production[0]["sor_preview_evidence"] = marker
+    production[0]["sor_preview_activation_time"] = "2026-10-24T09:00:00+09:00"
+    mock["events"][0]["payload"]["sor_source_evidence"] = marker
+    mock["events"][0]["payload"]["rules_hash"] = marker["rules_hash"]
+    result = compare_records(v5, production, mock, cutoff="20261024090000",
+                             timeframe="M1")
+    assert result["comparison"] == "MATCH"
+    assert result["status"] == "BLOCKED"  # Operational cycle remains unproven.
+    production[0]["sor_preview_evidence"] = dict(marker, source_connection_epoch=2)
+    assert compare_records(v5, production, mock, cutoff="20261024090000",
+                           timeframe="M1")["comparison"] == "UNAVAILABLE"
+
+
+def test_v5_direct_m1_cache_receipt_requires_matching_broker_session_and_closed_row():
+    from gui_indicator_follow_signal_validation_v5_flow import (
+        IndicatorFollowSignalValidationV5Flow,
+    )
+
+    row = {"time": "20261024090000", "open": 100, "high": 101,
+           "low": 99, "close": 100, "volume": 10}
+    raw = [{"체결시간": "20261024090000"}]
+    snapshot = SimpleNamespace(timeframe_key="M1", stock=SimpleNamespace(code="000660"),
+        market_data_identity="000660_AL", market_source="INTEGRATED",
+        request_id="AL-1", to_rows=lambda: raw)
+    started = {"rqname": "AL-1", "request_as_of": "2026-10-24T09:02:00+09:00",
+               "connection_epoch": 3, "login_session_id": "SESSION-3"}
+    received = {"request_id": "AL-1", "trcode": "opt10080", "code": "000660",
+                "rows": raw, "received_at": "2026-10-24T09:02:10+09:00",
+                "connection_epoch": 3, "login_session_id": "SESSION-3"}
+    result = SimpleNamespace(snapshot=snapshot,
+        broker_al_request_receipt=(started, received))
+    receipt = IndicatorFollowSignalValidationV5Flow._direct_m1_cache_receipt(
+        result, [row])
+    assert receipt["stock_code"] == "000660"
+    assert receipt["connection_epoch"] == 3
+    assert receipt["source_content_sha256"] == sha256(json.dumps([row],
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert IndicatorFollowSignalValidationV5Flow._direct_m1_cache_receipt(
+        SimpleNamespace(snapshot=snapshot,
+            broker_al_request_receipt=(started, dict(received, connection_epoch=4))),
+        [row]) is None
+    assert IndicatorFollowSignalValidationV5Flow._direct_m1_cache_receipt(
+        result, [dict(row, time="20261024090200")]) is None
