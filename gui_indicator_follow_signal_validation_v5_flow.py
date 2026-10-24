@@ -1184,6 +1184,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         state["pending"] = True
         attempt = object()
         state["attempt"] = attempt
+        cache_lease = _CACHE_LEASE_UNSET
+        capture_lease = getattr(self._historical_cache, "capture_store_lease", None)
+        if callable(capture_lease):
+            try:
+                cache_lease = capture_lease(code)
+            except Exception:
+                pass
 
         def terminal(result: object) -> None:
             if (self._offsession_sor_m1_requests.get(key) is not state
@@ -1210,6 +1217,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 else:
                     self.validation_failed.emit(f"SOR_M1_ACQUISITION_FAILED:{state['reason']}")
                 return
+            self._persist_offsession_sor_m1(
+                window.stock, market, identity, result, count, now, cache_lease,
+            )
             if not getattr(window, "_normal_base_requested", False):
                 return
 
@@ -1254,6 +1264,67 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 QTimer.singleShot(30000, callback_timeout)
         except Exception as exc:
             terminal({"ok": False, "reason_code": f"REQUEST_{type(exc).__name__}"})
+
+    def _persist_offsession_sor_m1(
+        self, stock, market, identity, result, count, as_of, cache_lease,
+    ) -> None:
+        """Persist only completed rows from the accepted direct AL M1 terminal."""
+        if (cache_lease is _CACHE_LEASE_UNSET
+                or not callable(getattr(self._historical_cache, "store_if_lease_current", None))
+                or not isinstance(result, dict)
+                or result.get("code") != stock.code
+                or result.get("interval") != 1
+                or result.get("market_data_identity") != f"{stock.code}_AL"
+                or result.get("market_source") != "INTEGRATED"
+                or result.get("display_only") is not True
+                or (result.get("connection_epoch"), result.get("login_session_id")) != identity
+                or not isinstance(result.get("rows"), list)):
+            return
+        try:
+            from gui_market_data_host import MarketDataHost
+
+            installed = MarketDataHost._current_display_candles(market, stock.code, 1)
+            if not installed or any(
+                row.get("is_complete") is not True
+                or row.get("display_only") is not True
+                or row.get("market_data_identity") != f"{stock.code}_AL"
+                or row.get("market_source") != "INTEGRATED"
+                for row in installed
+            ):
+                return
+            snapshot = ValidationHistoricalSnapshot(
+                stock=stock, timeframe_minutes=1, timeframe_key="M1",
+                requested_count=count, request_id="SOR_AL_M1_DISPLAY_TERMINAL",
+                rows=result["rows"], market_data_identity=f"{stock.code}_AL",
+                market_source="INTEGRATED", request_as_of=as_of.isoformat(),
+            )
+            projected, _ = project_validation_candles(snapshot)
+            completed = [
+                row for row in projected
+                if (bar_time := candle_market_datetime(row)) is not None
+                and MarketDataHost._display_session_for_time(bar_time)
+                and bar_time + timedelta(minutes=1) <= as_of
+            ]
+            latest = installed[-1]
+            if (not completed
+                    or candle_market_datetime(completed[-1]) != candle_market_datetime(latest)
+                    or any(completed[-1].get(field) != latest.get(field)
+                           for field in ("open", "high", "low", "close", "volume"))):
+                return
+            previous = self._cached_history(stock, 1, "M1", count)
+            if previous is not None and previous.candles[-1]["time"] > completed[-1]["time"]:
+                return
+            capacity = max(count, previous.requested_count) if previous else count
+            merged = merge_validation_candles(
+                previous.candles if previous else (), completed, capacity,
+            )
+            self._persist_history(
+                stock, 1, "M1", capacity, merged,
+                market_data_identity=f"{stock.code}_AL", market_source="INTEGRATED",
+                cache_lease=cache_lease,
+            )
+        except Exception:
+            return
 
     def _release_v5_observation_lease(self, key: int) -> None:
         self._offsession_sor_m1_requests.pop(key, None)

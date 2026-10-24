@@ -412,6 +412,80 @@ def test_offsession_m1_terminal_before_watchdog_revalidates_once():
     assert len(requests) == 1
 
 
+def test_offsession_direct_al_m1_persists_full_completed_broker_history(tmp_path):
+    from tests.test_display_only_integrated_history import _opt10080_row
+
+    flow, window, market, _cached, requests, timers, reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    rows = [_opt10080_row("20261023195800", 100),
+            _opt10080_row("20261023195900", 110)]
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        # The display host may retain only its last required M1 bar.
+        market._display_timeframe_candles[("005930", 1)] = ({
+            "bar_time": "2026-10-23T19:59:00+09:00", "open": 110.0,
+            "high": 112.0, "low": 108.0, "close": 111.0, "volume": 10.0,
+            "is_complete": True, "display_only": True,
+            "market_data_identity": "005930_AL", "market_source": "INTEGRATED",
+        },)
+        market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
+        requests[0]["on_terminal"]({
+            "ok": True, "code": "005930", "interval": 1, "rows": rows,
+            "market_data_identity": "005930_AL", "market_source": "INTEGRATED",
+            "display_only": True, "connection_epoch": 1,
+            "login_session_id": "SESSION-1", "install_result": {"ok": True},
+        })
+    entry = flow._cached_history(window.stock, 1, "M1", requests[0]["count"])
+    assert entry is not None
+    assert [row["time"] for row in entry.candles] == [
+        "20261023195800", "20261023195900",
+    ]
+    assert entry.candles[-1]["close"] == 111.0
+    assert reasons == []
+
+
+@pytest.mark.parametrize("invalid", ["source", "session", "failed", "forming"])
+def test_offsession_m1_unverified_terminal_does_not_persist(tmp_path, invalid):
+    from tests.test_display_only_integrated_history import _opt10080_row
+
+    flow, window, market, _cached, requests, timers, _reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    terminal = {
+        "ok": True, "code": "005930", "interval": 1,
+        "rows": [_opt10080_row("20261023195900", 110)],
+        "market_data_identity": "005930_AL", "market_source": "INTEGRATED",
+        "display_only": True, "connection_epoch": 1,
+        "login_session_id": "SESSION-1", "install_result": {"ok": True},
+    }
+    if invalid == "source":
+        terminal["market_data_identity"] = "005930"
+    elif invalid == "session":
+        terminal["login_session_id"] = "SESSION-2"
+    elif invalid == "failed":
+        terminal["ok"] = False
+    else:
+        terminal["rows"] = [_opt10080_row("20261024100300", 110)]
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        market._display_timeframe_candles[("005930", 1)] = ({
+            "bar_time": "2026-10-23T19:59:00+09:00", "open": 110.0,
+            "high": 112.0, "low": 108.0, "close": 111.0, "volume": 10.0,
+            "is_complete": True, "display_only": True,
+            "market_data_identity": "005930_AL", "market_source": "INTEGRATED",
+        },)
+        market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
+        requests[0]["on_terminal"](terminal)
+    assert flow._cached_history(window.stock, 1, "M1", requests[0]["count"]) is None
+
+
 def test_offsession_m1_late_terminal_after_timeout_cannot_revalidate():
     flow, window, market, cached, requests, timers, reasons, revalidated = (
         _offsession_accepted_request_case()
