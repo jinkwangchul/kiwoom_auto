@@ -1167,7 +1167,8 @@ def test_live_m1_projection_appends_forming_bar_without_changing_direct_history(
         "20261020090400", "20261020090500",
     ]
     assert view["candles"][-1]["close"] == 111
-    assert view["display_candles"] == before["candles"]
+    assert view["display_candles"] == view["candles"][-len(before["candles"]):]
+    assert view["display_candles"][-1]["time"] == "20261020090500"
     assert pool == before
 
 
@@ -2478,10 +2479,14 @@ def test_registered_m1_handoff_skips_krx_and_unregistered_al():
     flow, session, pool, market, _ = _registered_m1_calculation_case()
     krx = dict(pool, market_source="KRX", market_data_identity="005930")
     assert flow._sor_m1_calculation_snapshot(session, krx) is None
-    assert flow._validation_pool_for_session(session, krx, target_count=5)["candles"] == krx["candles"]
+    with pytest.raises(ValueError, match="VALIDATION_POOL_MARKET_IDENTITY_MISMATCH"):
+        flow._validation_pool_for_session(session, krx, target_count=5)
     market._sor_m1_required_by_stock.clear()
     assert flow._sor_m1_calculation_snapshot(session, pool) is None
-    assert flow._validation_pool_for_session(session, pool, target_count=5)["candles"] == pool["candles"]
+    selected = flow._validation_pool_for_session(session, pool, target_count=5)
+    assert selected["candles"] == pool["candles"]
+    with pytest.raises(ValueError, match="SOR_M1_BLOCKED:SOURCE_UNAVAILABLE"):
+        flow._sor_m1_calculation_view(session, pool, selected, None)
 
 
 @pytest.mark.parametrize("gap", ["target_time", "missing_m1"])
@@ -3511,8 +3516,10 @@ def test_invalid_al_refresh_fails_without_cached_or_krx_install(tmp_path, invali
         patch.object(flow, "_install_acquired_pool") as install,
         patch.object(flow, "_fail_window") as fail,
     ):
-        flow._run_validation(window, IndicatorFollowSignalValidationRunRequest(settings, 10))
-    assert calls == [300]
+        flow._run_validation(window, IndicatorFollowSignalValidationRunRequest(
+            settings, 10, force_historical_refresh=True,
+        ))
+    assert calls == [requested]
     install.assert_not_called()
     fail.assert_called_once_with(
         window,
