@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Read-only projection from raw Kiwoom one-minute candles to engine bars.
+"""Read-only current forming projection from Kiwoom one-minute candles.
 
 The raw ``candles.json`` timestamp is the start time of the one-minute bar.
-Buckets are anchored to the 09:00 Asia/Seoul market clock for each trade date;
-they are never anchored to the first row in the available rolling window.
+Buckets use the session clock, or its explicit broker bucket anchor; they are
+never anchored to the first row in the available rolling window.
 """
 
 from __future__ import annotations
@@ -261,11 +261,10 @@ def aggregate_minute_candles(
     now: datetime | None = None,
     session_windows: Any = None,
 ) -> list[dict[str, Any]]:
-    """Aggregate raw minutes and label structural/time completion per bucket.
+    """Project only today's current forming higher-timeframe bucket from M1.
 
-    A bucket is complete only when every expected one-minute slot exists and the
-    bucket end has been reached. Incomplete edge buckets remain visible to
-    callers with ``is_complete=False`` but must not be evaluated by the engine.
+    Completed higher-timeframe bars must come from independent direct SOR _AL
+    receipts. An old incomplete bucket is not a current forming bar.
     """
     if timeframe_minutes not in SUPPORTED_BAR_MINUTES:
         raise ValueError(f"unsupported timeframe_minutes: {timeframe_minutes}")
@@ -276,19 +275,35 @@ def aggregate_minute_candles(
         current_time = current_time.astimezone(SEOUL_TIMEZONE)
 
     sessions = normalize_candle_sessions(session_windows)
+    bucket_anchors: dict[tuple[str, int, int], int] = {}
+    for index, item in enumerate(session_windows if isinstance(session_windows, (list, tuple)) else ()):
+        if not isinstance(item, dict) or "bucket_anchor_time" not in item:
+            continue
+        session = (str(item.get("name") or item.get("key") or f"session{index}"),
+                   _clock_minutes(item.get("start_time")), _clock_minutes(item.get("end_time")))
+        if session not in sessions:
+            raise ValueError("bucket_anchor_time needs a valid session")
+        anchor = _clock_minutes(item["bucket_anchor_time"])
+        if (anchor is None or anchor > session[1]
+                or session[1] - anchor >= timeframe_minutes
+                or any(other[2] > anchor and other[1] < session[1]
+                       for other in sessions if other != session)):
+            raise ValueError("bucket_anchor_time crosses or misses its session")
+        bucket_anchors[session] = anchor
     raw_by_minute = _normalized_raw_minutes(raw_candles)
-    buckets: dict[tuple[str, datetime, int], list[tuple[datetime, dict[str, Any]]]] = {}
+    buckets: dict[tuple[str, datetime, int, int], list[tuple[datetime, dict[str, Any]]]] = {}
     for bar_time, candle in raw_by_minute.items():
         session = _session_for_bar(bar_time, sessions)
         if session is None:
             continue
         session_name, session_start, session_end = session
-        start = _bucket_start(bar_time, timeframe_minutes, session_start)
-        buckets.setdefault((session_name, start, session_end), []).append((bar_time, candle))
+        start = _bucket_start(bar_time, timeframe_minutes,
+                              bucket_anchors.get(session, session_start))
+        buckets.setdefault((session_name, start, session_start, session_end), []).append((bar_time, candle))
 
     projected: list[dict[str, Any]] = []
-    for session_name, start, session_end in sorted(buckets, key=lambda item: item[1]):
-        rows = sorted(buckets[(session_name, start, session_end)], key=lambda item: item[0])
+    for session_name, start, session_start, session_end in sorted(buckets, key=lambda item: item[1]):
+        rows = sorted(buckets[(session_name, start, session_start, session_end)], key=lambda item: item[0])
         row_times = {bar_time for bar_time, _candle in rows}
         session_end_time = datetime.combine(
             start.date(), time(session_end // 60, session_end % 60), tzinfo=SEOUL_TIMEZONE
@@ -296,13 +311,19 @@ def aggregate_minute_candles(
             start.date() + timedelta(days=1), time(0, 0), tzinfo=SEOUL_TIMEZONE
         )
         bucket_end = min(start + timedelta(minutes=timeframe_minutes), session_end_time)
+        expected_start = max(start, datetime.combine(
+            start.date(), time(session_start // 60, session_start % 60), tzinfo=SEOUL_TIMEZONE
+        ))
         expected_times = {
-            start + timedelta(minutes=offset)
-            for offset in range(int((bucket_end - start).total_seconds() // 60))
+            expected_start + timedelta(minutes=offset)
+            for offset in range(int((bucket_end - expected_start).total_seconds() // 60))
         }
         is_complete = row_times == expected_times and current_time >= bucket_end
         first = rows[0][1]
         last = rows[-1][1]
+        if timeframe_minutes > 1 and (is_complete or not start <= current_time < bucket_end
+                                      or start.date() != current_time.date()):
+            continue
         projected.append(
             {
                 "bar_time": start.isoformat(timespec="seconds"),
@@ -327,8 +348,10 @@ def completed_timeframe_candles(
     now: datetime | None = None,
     session_windows: Any = None,
 ) -> list[dict[str, Any]]:
-    """Return only completed bars for the canonical applied instance rule."""
+    """Return completed M1 only; higher completed bars require direct SOR."""
     timeframe_minutes = read_canonical_bar_minutes(rules)
+    if timeframe_minutes > 1:
+        return []
     return [
         candle
         for candle in aggregate_minute_candles(
@@ -380,6 +403,7 @@ def project_candle_supply(
     session_windows: Any = None,
     forming_minute: dict[str, Any] | None = None,
     completed_projector: Any = None,
+    direct_timeframe_candles: Any = None,
 ) -> dict[str, Any]:
     """Project one applied Routine request through the common Main contract."""
     interval = read_canonical_bar_minutes(rules)
@@ -409,6 +433,11 @@ def project_candle_supply(
         interval,
         history_target_bars,
     )
+    if interval > 1:
+        warmup = {**warmup, "required_minute_candles": 0,
+                  "within_limit": True, "reason": ""}
+        history_target = {**history_target, "required_minute_candles": 0,
+                          "requested_minute_candles": 0, "capped": False}
     if not warmup_declared:
         warmup = {**warmup, "required_minute_candles": 0}
     base = {
@@ -454,6 +483,57 @@ def project_candle_supply(
         None,
     )
     raw = [item for item in raw if item.get("is_complete") is not False]
+    if interval > 1:
+        direct = direct_timeframe_candles
+        if (not isinstance(direct, list)
+                or (not direct and projection != "FORMING_BASE_BAR")
+                or any(not isinstance(row, dict)
+                       or row.get("is_complete") is not True
+                       or row.get("timeframe_minutes") != interval
+                       or row.get("market_source") != "INTEGRATED"
+                       or not str(row.get("market_data_identity") or "").endswith("_AL")
+                       or row.get("display_only") is not True
+                       for row in direct)):
+            return {**base, "available": False, "candles": [],
+                    "availability_state": "DIRECT_TIMEFRAME_SOURCE_UNAVAILABLE",
+                    "reason": "DIRECT_TIMEFRAME_SOURCE_UNAVAILABLE"}
+        candles = [dict(row) for row in direct]
+        forming_included = False
+        if projection == "FORMING_BASE_BAR":
+            forming = forming_minute if isinstance(forming_minute, dict) else embedded_forming
+            if isinstance(forming, dict):
+                current = now or datetime.now(SEOUL_TIMEZONE)
+                today = [row for row in raw if (candle_market_datetime(row) is not None
+                         and candle_market_datetime(row).date() == current.date())]
+                projected = aggregate_minute_candles(
+                    [*today, forming], interval, now=current,
+                    session_windows=session_windows,
+                )
+                if projected and (not candles or str(projected[-1]["bar_time"])
+                                  > str(candles[-1]["bar_time"])):
+                    candles.append(projected[-1])
+                    forming_included = True
+            if not forming_included:
+                return {**base, "available": False, "candles": [],
+                        "availability_state": "FORMING_SOURCE_UNAVAILABLE",
+                        "reason": "FORMING_SOURCE_UNAVAILABLE"}
+        if history_target_declared:
+            candles = candles[-history_target_bars:]
+        if ((warmup_declared and len(candles) < warmup_bars)
+                or (history_target_declared and len(candles) < history_target_bars)):
+            return {**base, "available": False, "candles": [],
+                    "availability_state": "HISTORY_INSUFFICIENT",
+                    "reason": "HISTORY_INSUFFICIENT"}
+        return {**base, "available": True, "availability_state": "AVAILABLE",
+                "candles": candles, "complete": not forming_included,
+                "forming_included": forming_included,
+                "completeness": {"completed_only": not forming_included,
+                                 "forming_included": forming_included},
+                "freshness": {"as_of": now.isoformat(timespec="seconds")
+                              if isinstance(now, datetime) else ""},
+                "available_minute_candles": len(raw),
+                "available_timeframe_bars": len(candles),
+                "reason": ""}
     history_insufficient = bool(
         warmup_declared and len(raw) < int(warmup["required_minute_candles"])
     )

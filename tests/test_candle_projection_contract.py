@@ -59,7 +59,8 @@ class CandleProjectionContractTests(unittest.TestCase):
             {"bar": {"bar_minutes": 5}},
             request,
         )
-        self.assertTrue(result["available"])
+        self.assertFalse(result["available"])
+        self.assertEqual("DIRECT_TIMEFRAME_SOURCE_UNAVAILABLE", result["availability_state"])
         self.assertEqual(0, result["required_minute_candles"])
 
     def test_supply_fails_closed_for_invalid_optional_warmup(self) -> None:

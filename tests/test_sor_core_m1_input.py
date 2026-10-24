@@ -264,7 +264,7 @@ def test_sor_m3_target_900_blocks_without_direct_al_history():
 
 
 @pytest.mark.parametrize("target", (900, 5000))
-def test_sor_m3_target_uses_direct_prior_day_and_only_today_m1_for_calculation(target):
+def test_sor_m3_target_uses_direct_completed_bars_only(target):
     cache = Path(__file__).resolve().parents[1] / "runtime/signal_validation_v2_history_cache"
     as_of = datetime(2026, 10, 21, 15, 20, tzinfo=SEOUL_TIMEZONE)
     host = DisplayOnlyMarketDataHostTest()._host()
@@ -334,15 +334,14 @@ def test_sor_m3_target_uses_direct_prior_day_and_only_today_m1_for_calculation(t
         assert result["available"] is True, (result.get("availability_state"),
                                                result.get("available_timeframe_bars"))
         assert len(result["candles"]) == target
-        assert result["candles"][:len(direct_prior)] == direct_prior
-        assert all(row["trade_date"] == "2026-10-21"
-                   for row in result["candles"][len(direct_prior):])
+        assert result["candles"] == list(original_direct[-target:])
         assert result["market_data_identity"] == "005930_AL"
         assert result["calculation_only"] is True
         assert result["queue_connected"] is result["send_order_connected"] is False
     assert production_preview["candles"] == mock_preview["candles"]
     assert wrong_direct_source["availability_state"] == "SOR_DIRECT_HISTORY_PROVENANCE_INVALID"
-    assert missing_open_minute["availability_state"] == "SOR_M1_INITIAL_COVERAGE_GAP"
+    assert missing_open_minute["available"] is True
+    assert missing_open_minute["candles"] == production_preview["candles"]
 
 
 def test_v5_and_market_host_agree_on_same_broker_m1_ohlcv():
@@ -404,17 +403,12 @@ def test_actual_buy_filter_matches_v5_from_same_broker_rows():
     assert from_v5.get("signal_activation_index") == from_live.get("signal_activation_index")
 
 
-def test_higher_timeframe_is_aggregated_from_same_m1_source():
+def test_higher_timeframe_blocks_without_direct_sor_source():
     host = _installed_host()
-    one = _project(host, 1)
     five = _project(host, 5)
-    assert five["available"] is True, five
-    assert len(five["candles"]) == 1
-    assert five["candles"][0]["open"] == one["candles"][0]["open"]
-    assert five["candles"][0]["high"] == max(row["high"] for row in one["candles"])
-    assert five["candles"][0]["low"] == min(row["low"] for row in one["candles"])
-    assert five["candles"][0]["close"] == one["candles"][-1]["close"]
-    assert five["candles"][0]["volume"] == sum(row["volume"] for row in one["candles"])
+    assert five["available"] is False
+    assert five["candles"] == []
+    assert five["availability_state"] == "SOR_DIRECT_HISTORY_UNAVAILABLE"
 
 
 def test_warmup_failure_does_not_fallback_to_krx():
@@ -709,7 +703,9 @@ def test_existing_display_tr_callback_publishes_snapshot_without_extra_request()
     assert started["ok"] is True
     assert seen[0]["ok"] is True
     assert issued == [("005930", 1, 2, True)]
-    assert _project(host, 5, projection="FORMING_BASE_BAR")["available"] is True
+    forming = _project(host, 5, projection="FORMING_BASE_BAR")
+    assert forming["available"] is True
+    assert forming["candles"][-1]["is_complete"] is False
 
 
 def test_missing_or_stale_session_refuses_integrated_calculation():
@@ -736,7 +732,7 @@ def test_stale_current_minute_and_previous_day_cannot_be_traded():
     assert previous_day["availability_state"] == "SOR_M1_TRADE_DATE_STALE"
 
 
-def test_missing_active_m1_inside_same_session_blocks_calculation():
+def test_missing_direct_m5_blocks_regardless_of_m1_gap():
     host = _installed_host()
     key = ("005930", 1)
     original = host._display_timeframe_candles[key]
@@ -746,16 +742,8 @@ def test_missing_active_m1_inside_same_session_blocks_calculation():
     )
     result = _project(host, 5)
     assert result["available"] is False
-    assert result["availability_state"] == "SOR_M1_INTERNAL_COVERAGE_GAP"
-    assert result["reason"] == "SOR_M1_INTERNAL_COVERAGE_GAP"
-    assert result["gap_detail"] == {
-        "stock_code": "005930", "session": "KRX",
-        "previous_available": "2026-10-20T09:01:00+09:00",
-        "next_available": "2026-10-20T09:03:00+09:00",
-        "missing_from": "2026-10-20T09:02:00+09:00",
-        "missing_through": "2026-10-20T09:02:00+09:00",
-        "missing_minute_slots": 1,
-    }
+    assert result["availability_state"] == "SOR_DIRECT_HISTORY_UNAVAILABLE"
+    assert result["reason"] == "SOR_DIRECT_HISTORY_UNAVAILABLE"
 
 
 def test_legacy_production_scope_cannot_use_stored_krx():

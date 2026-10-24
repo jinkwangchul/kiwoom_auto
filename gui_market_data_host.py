@@ -25,7 +25,6 @@ from candle_manager import (
 )
 from candle_timeframe_aggregation import (
     SEOUL_TIMEZONE,
-    aggregate_minute_candles,
     candle_market_datetime,
     normalize_candle_sessions,
     parse_market_datetime,
@@ -1906,78 +1905,7 @@ class MarketDataHost(QObject):
                     self._v5_watch_inflight = False
 
             def terminal(result: object) -> None:
-                if (generation != self._v5_watch_generation
-                        or identity != self._current_display_session_identity()
-                        or not isinstance(result, dict) or result.get("ok") is not True):
-                    finish()
-                    return
-                try:
-                    projected = MarketDataHost.project_broker_sor_m1_calculation(
-                        self, stock_code=code, rules={"bar": {"bar_minutes": 1}},
-                        projection_request={"projection": "COMPLETED_TIMEFRAME"},
-                        as_of=current,
-                    )
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    finish()
-                    return
-                gap = projected.get("gap_detail")
-                if (projected.get("availability_state") not in
-                        {"SOR_M1_INTERNAL_COVERAGE_GAP",
-                         "SOR_M1_LAST_COMPLETED_MINUTE_MISSING"}
-                        or not isinstance(gap, dict)
-                        or gap.get("missing_minute_slots") != 1):
-                    finish()
-                    return
-                attempt = (identity, code, gap.get("missing_from"), minute_key)
-                attempts = _host_attr(self, "_v5_m3_gap_proof_attempts", None)
-                if not isinstance(attempts, set):
-                    attempts = set()
-                    object.__setattr__(self, "_v5_m3_gap_proof_attempts", attempts)
-                attempts.intersection_update({entry for entry in attempts
-                                              if entry[-1] == minute_key})
-                if attempt in attempts:
-                    finish()
-                    return
-                attempts.add(attempt)
-
-                def m3_terminal(receipt: object) -> None:
-                    try:
-                        if (generation == self._v5_watch_generation
-                                and identity == self._current_display_session_identity()
-                                and code in self._v5_observation_leases.values()
-                                and isinstance(receipt, dict) and receipt.get("ok") is True):
-                            verified = MarketDataHost.project_broker_sor_m1_calculation(
-                                self, stock_code=code, rules={"bar": {"bar_minutes": 1}},
-                                projection_request={"projection": "COMPLETED_TIMEFRAME"},
-                                as_of=current,
-                            )
-                            if (verified.get("available") is True
-                                    and gap["missing_from"] in
-                                    verified.get("verified_no_trade_minutes", ())):
-                                self.market_data_observed.emit({
-                                    "source": "SOR_AL_M3_GAP_PROOF_ACCEPTED",
-                                    "stock_code": code,
-                                    "market_data_identity": f"{code}_AL",
-                                    "connection_epoch": identity[0],
-                                    "login_session_id": identity[1],
-                                    "missing_minute": gap["missing_from"],
-                                    "snapshot_received_at": current.isoformat(timespec="seconds"),
-                                })
-                    except Exception:
-                        pass  # A failed proof observer cannot interrupt the M1 watch.
-                    finally:
-                        finish()
-
-                try:
-                    request_display_timeframe_candles_for_stock(
-                        window=self, code=code, name="",
-                        operation_cycle_minute_key=minute_key,
-                        timeframe_minutes=3,
-                        count=MarketDataHost._full_day_display_count(3),
-                        nxt_available=True, on_terminal=m3_terminal,
-                    )
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    finish()
+                finish()
 
             try:
                 request_display_timeframe_candles_for_stock(
@@ -2129,73 +2057,6 @@ class MarketDataHost(QObject):
         ))
         return tuple((StockRepository().resolve_stock_dir(code), code, "") for code in codes)
 
-    @staticmethod
-    def _sor_m3_proves_no_trade_m1(
-        code: str, missing: datetime, cutoff: datetime,
-        native_m1: list[dict[str, Any]], direct_m3: list[dict[str, Any]],
-    ) -> bool:
-        """Accept one absent M1 only when an independent complete M3 has no residual trades."""
-        session = MarketDataHost._display_session_for_time(missing)
-        if session not in {"NXT_PRE", "KRX", "NXT_AFTER"}:
-            return False
-        matching = []
-        for row in direct_m3:
-            start = candle_market_datetime(row) if isinstance(row, dict) else None
-            if (start is not None and start <= missing < start + timedelta(minutes=3)
-                    and start + timedelta(minutes=3) <= cutoff):
-                matching.append((start, row))
-        if len(matching) != 1:
-            return False
-        start, broker = matching[0]
-        minutes = [start + timedelta(minutes=i) for i in range(3)]
-        if (start.date() != missing.date()
-                or any(minute.date() != missing.date()
-                       or MarketDataHost._display_session_for_time(minute) != session
-                       for minute in minutes)
-                or broker.get("market_data_identity") != f"{code}_AL"
-                or broker.get("market_source") != "INTEGRATED"
-                or broker.get("display_only") is not True
-                or broker.get("is_complete") is not True
-                or broker.get("timeframe_minutes") != 3
-                or broker.get("trade_date") != missing.date().isoformat()
-                or broker.get("session") != session):
-            return False
-        known = []
-        for minute in minutes:
-            found = [row for row in native_m1 if isinstance(row, dict)
-                     and candle_market_datetime(row) == minute]
-            if minute == missing:
-                if found:
-                    return False
-                continue
-            if len(found) != 1:
-                return False
-            row = found[0]
-            values = tuple(row.get(field) for field in
-                           ("open", "high", "low", "close", "volume"))
-            if (row.get("market_data_identity") != f"{code}_AL"
-                    or row.get("market_source") != "INTEGRATED"
-                    or row.get("display_only") is not True
-                    or row.get("is_complete") is not True
-                    or row.get("timeframe_minutes") != 1
-                    or row.get("session") != session
-                    or row.get("trade_date") != missing.date().isoformat()
-                    or any(type(value) not in (int, float) or not isfinite(value)
-                           for value in values)
-                    or values[2] <= 0 or values[4] < 0
-                    or not values[2] <= values[0] <= values[1]
-                    or not values[2] <= values[3] <= values[1]):
-                return False
-            known.append(row)
-        if len(known) != 2:
-            return False
-        aggregate = (known[0]["open"], max(row["high"] for row in known),
-                     min(row["low"] for row in known), known[-1]["close"],
-                     sum(row["volume"] for row in known))
-        broker_values = tuple(broker.get(field) for field in
-                              ("open", "high", "low", "close", "volume"))
-        return broker_values == aggregate
-
     def project_broker_sor_m1_calculation(
         self, *, stock_code: str, rules: dict[str, Any] | None,
         projection_request: dict[str, Any], as_of: datetime,
@@ -2241,15 +2102,63 @@ class MarketDataHost(QObject):
                 )
             except (TypeError, ValueError):
                 return blocked("SOR_REQUEST_INVALID")
+        if interval > 1 and projection == "COMPLETED_TIMEFRAME":
+            cutoff = as_of.replace(second=0, microsecond=0)
+            direct = MarketDataHost._current_display_candles(self, code, interval)
+            completed = []
+            last_time = None
+            for item in direct:
+                if not isinstance(item, dict):
+                    return blocked("SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
+                time = candle_market_datetime(item)
+                values = tuple(item.get(key) for key in
+                               ("open", "high", "low", "close", "volume"))
+                if (time is None or time.utcoffset() != timedelta(hours=9)
+                        or (last_time is not None and time <= last_time)
+                        or item.get("market_data_identity") != f"{code}_AL"
+                        or item.get("market_source") != "INTEGRATED"
+                        or item.get("display_only") is not True
+                        or item.get("is_complete") is not True
+                        or item.get("timeframe_minutes") != interval
+                        or item.get("session") != MarketDataHost._display_session_for_time(time)
+                        or any(type(value) not in (int, float) or not isfinite(value)
+                               for value in values)
+                        or values[2] <= 0 or values[4] < 0
+                        or not values[2] <= values[0] <= values[1]
+                        or not values[2] <= values[3] <= values[1]):
+                    return blocked("SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
+                last_time = time
+                session_end = next((end for name, _start, end in
+                                    _DISPLAY_INTEGRATED_SESSIONS
+                                    if name == item["session"]), None)
+                completed_at = time + timedelta(minutes=interval)
+                if session_end is not None:
+                    completed_at = min(completed_at, time.replace(
+                        hour=session_end // 60, minute=session_end % 60,
+                        second=0, microsecond=0,
+                    ))
+                if completed_at <= cutoff:
+                    completed.append(dict(item))
+            if not completed:
+                return blocked("SOR_DIRECT_HISTORY_UNAVAILABLE")
+            projected = project_candle_supply(
+                [], rules, projection_request, now=as_of,
+                direct_timeframe_candles=completed,
+            )
+            if projected.get("available") is not True:
+                return {**base, **projected}
+            return {
+                **base, **projected,
+                "source_identity": canonical_candle_content_hash(completed),
+                "direct_history_source": "BROKER_AL_CONFIRMED_DIRECT",
+            }
         # This cache is session-bound and was installed only after broker
         # _AL identity, epoch, login, and NXT eligibility checks.
         supplied = MarketDataHost._current_display_candles(self, code, 1)
         if not supplied:
             return blocked("SOR_M1_SOURCE_UNAVAILABLE")
-        direct_m3 = MarketDataHost._current_display_candles(self, code, 3)
         cutoff = as_of.replace(second=0, microsecond=0)
         rows: list[dict[str, Any]] = []
-        verified_no_trade_minutes: list[str] = []
         last_time = None
         for item in supplied:
             if (not isinstance(item, dict)
@@ -2281,24 +2190,7 @@ class MarketDataHost(QObject):
                             != "AL_TRANSITION"
                             and time - previous != timedelta(minutes=1)):
                         missing = previous + timedelta(minutes=1)
-                        if (time - previous == timedelta(minutes=2)
-                                and MarketDataHost._sor_m3_proves_no_trade_m1(
-                                    code, missing, cutoff, supplied, direct_m3)):
-                            flat = dict(rows[-1])
-                            flat.update({
-                                "bar_time": missing.isoformat(timespec="seconds"),
-                                "open": rows[-1]["close"],
-                                "high": rows[-1]["close"],
-                                "low": rows[-1]["close"],
-                                "close": rows[-1]["close"],
-                                "volume": 0,
-                                "calculation_only": True,
-                                "snapshot_source": "BROKER_AL_M3_NO_TRADE_PROOF",
-                            })
-                            rows.append(flat)
-                            verified_no_trade_minutes.append(flat["bar_time"])
-                        else:
-                            return {
+                        return {
                                 **blocked("SOR_M1_INTERNAL_COVERAGE_GAP"),
                                 "gap_detail": {
                                     "stock_code": code,
@@ -2309,7 +2201,7 @@ class MarketDataHost(QObject):
                                     "missing_through": (time - timedelta(minutes=1)).isoformat(timespec="seconds"),
                                     "missing_minute_slots": int((time - previous) / timedelta(minutes=1)) - 1,
                                 },
-                            }
+                        }
                 rows.append(dict(item))
         if not rows:
             return blocked("SOR_M1_COMPLETED_BARS_UNAVAILABLE")
@@ -2323,51 +2215,31 @@ class MarketDataHost(QObject):
                     hour=0, minute=0
                 ) + timedelta(minutes=current_minute - 1)
                 if latest < expected_latest:
+                    result = blocked("SOR_M1_LAST_COMPLETED_MINUTE_MISSING")
                     if (expected_latest - latest == timedelta(minutes=1)
                             and MarketDataHost._display_session_for_time(latest)
-                            == MarketDataHost._display_session_for_time(expected_latest)
-                            and MarketDataHost._sor_m3_proves_no_trade_m1(
-                                code, expected_latest, cutoff, supplied, direct_m3)):
-                        flat = dict(rows[-1])
-                        flat.update({
-                            "bar_time": expected_latest.isoformat(timespec="seconds"),
-                            "open": rows[-1]["close"],
-                            "high": rows[-1]["close"],
-                            "low": rows[-1]["close"],
-                            "close": rows[-1]["close"],
-                            "volume": 0,
-                            "calculation_only": True,
-                            "snapshot_source": "BROKER_AL_M3_NO_TRADE_PROOF",
-                        })
-                        rows.append(flat)
-                        verified_no_trade_minutes.append(flat["bar_time"])
-                        latest = expected_latest
-                    else:
-                        result = blocked("SOR_M1_LAST_COMPLETED_MINUTE_MISSING")
-                        if (expected_latest - latest == timedelta(minutes=1)
-                                and MarketDataHost._display_session_for_time(latest)
-                                == MarketDataHost._display_session_for_time(expected_latest)):
-                            result["gap_detail"] = {
-                                "missing_from": expected_latest.isoformat(timespec="seconds"),
-                                "missing_minute_slots": 1,
-                            }
-                        try:
-                            _trace_sor_block(
-                                self, self, stock=code,
-                                reason="SOR_M1_LAST_COMPLETED_MINUTE_MISSING",
-                                as_of=as_of, cutoff=cutoff,
-                                expected_latest=expected_latest,
-                                source_starts=[candle_market_datetime(row).strftime("%Y%m%d%H%M%S")
-                                               for row in supplied],
-                                candidate_starts=[candle_market_datetime(row).strftime("%Y%m%d%H%M%S")
-                                                  for row in rows],
-                                target_starts=[], stage="PROJECTION",
-                                branch="LAST_COMPLETED_MINUTE",
-                                timeframe_minutes=interval,
-                            )
-                        except Exception:
-                            pass
-                        return result
+                            == MarketDataHost._display_session_for_time(expected_latest)):
+                        result["gap_detail"] = {
+                            "missing_from": expected_latest.isoformat(timespec="seconds"),
+                            "missing_minute_slots": 1,
+                        }
+                    try:
+                        _trace_sor_block(
+                            self, self, stock=code,
+                            reason="SOR_M1_LAST_COMPLETED_MINUTE_MISSING",
+                            as_of=as_of, cutoff=cutoff,
+                            expected_latest=expected_latest,
+                            source_starts=[candle_market_datetime(row).strftime("%Y%m%d%H%M%S")
+                                           for row in supplied],
+                            candidate_starts=[candle_market_datetime(row).strftime("%Y%m%d%H%M%S")
+                                              for row in rows],
+                            target_starts=[], stage="PROJECTION",
+                            branch="LAST_COMPLETED_MINUTE",
+                            timeframe_minutes=interval,
+                        )
+                    except Exception:
+                        pass
+                    return result
                 break
         forming_minute = None
         if projection == "FORMING_BASE_BAR":
@@ -2402,7 +2274,7 @@ class MarketDataHost(QObject):
                     or request_time.replace(second=0, microsecond=0) != cutoff
                     or received_time.replace(second=0, microsecond=0) != cutoff):
                 return blocked("SOR_FORMING_SNAPSHOT_TIME_INVALID")
-        prior_direct: list[dict[str, Any]] = []
+        direct_completed: list[dict[str, Any]] = []
         projection_rows = rows
         projection_only_request = projection_request
         if interval > 1:
@@ -2423,7 +2295,7 @@ class MarketDataHost(QObject):
                         or item.get("session") != MarketDataHost._display_session_for_time(time)):
                     return blocked("SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
                 last_direct_time = time
-                if time.date() >= cutoff.date():
+                if time + timedelta(minutes=interval) > cutoff:
                     continue
                 numbers = tuple(item.get(k) for k in ("open", "high", "low", "close", "volume"))
                 if (any(type(v) not in (int, float) or not isfinite(v) for v in numbers)
@@ -2431,31 +2303,17 @@ class MarketDataHost(QObject):
                         or not numbers[2] <= numbers[0] <= numbers[1]
                         or not numbers[2] <= numbers[3] <= numbers[1]):
                     return blocked("SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
-                prior_direct.append(dict(item))
-            if not prior_direct and "history_target_bars" in projection_request:
+                direct_completed.append(dict(item))
+            if not direct_completed and projection != "FORMING_BASE_BAR":
                 return blocked("SOR_DIRECT_HISTORY_UNAVAILABLE")
-            if prior_direct and today_rows:
-                sessions = normalize_candle_sessions(session_windows)
-                if sessions:
-                    earliest = min(start for _name, start, _end in sessions)
-                    first = candle_market_datetime(today_rows[0])
-                    if first.hour * 60 + first.minute > earliest:
-                        return blocked("SOR_M1_INITIAL_COVERAGE_GAP")
             projection_rows = today_rows
             projection_only_request = {"projection": projection}
-        if interval == 1 and verified_no_trade_minutes and session_windows is None:
-            session_windows = tuple({
-                "name": name,
-                "start_time": f"{start // 60:02d}:{start % 60:02d}",
-                "end_time": f"{end // 60:02d}:{end % 60:02d}",
-            } for name, start, end in (*_DISPLAY_INTEGRATED_SESSIONS,
-                                       ("AL_TRANSITION", 15 * 60 + 30,
-                                        15 * 60 + 40)))
         projected = project_candle_supply(
             projection_rows, rules, projection_only_request,
             now=(received_time if forming_minute is not None else as_of),
             session_windows=session_windows,
             forming_minute=forming_minute,
+            direct_timeframe_candles=direct_completed if interval > 1 else None,
         )
         if (projection == "FORMING_BASE_BAR"
                 and projected.get("forming_included") is not True):
@@ -2470,12 +2328,10 @@ class MarketDataHost(QObject):
         candles = projected.get("candles")
         if not isinstance(candles, list):
             return blocked("SOR_PROJECTION_INVALID")
-        if interval > 1:
-            candles = prior_direct + candles
-            if "warmup_bars" in projection_request:
-                warmup = projection_request["warmup_bars"]
-                if type(warmup) is not int or warmup <= 0 or len(candles) < warmup:
-                    return blocked("SOR_HISTORY_INSUFFICIENT")
+        if interval > 1 and "warmup_bars" in projection_request:
+            warmup = projection_request["warmup_bars"]
+            if type(warmup) is not int or warmup <= 0 or len(candles) < warmup:
+                return blocked("SOR_HISTORY_INSUFFICIENT")
         if "history_target_bars" in projection_request:
             target = projection_request["history_target_bars"]
             if type(target) is not int or target <= 0:
@@ -2497,11 +2353,10 @@ class MarketDataHost(QObject):
             "available": True, "candles": candles,
             "source_identity": source_identity,
             "available_minute_candles": len(rows),
-            "verified_no_trade_minutes": tuple(verified_no_trade_minutes),
             "available_timeframe_bars": len(candles),
             "history_target_bars": projection_request.get("history_target_bars", 0),
             "direct_history_source": (
-                "BROKER_AL_CONFIRMED_DIRECT" if prior_direct else ""
+                "BROKER_AL_CONFIRMED_DIRECT" if direct_completed else ""
             ),
             "forming_snapshot_source": (
                 forming_minute.get("snapshot_source") if forming_minute else ""

@@ -1636,10 +1636,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
     def _handle_sor_m1_snapshot_accepted(self, event: object) -> None:
         if (not isinstance(event, dict) or event.get("source") not in
-                {"SOR_AL_M1_SNAPSHOT_ACCEPTED", "SOR_AL_NATIVE_M1_PARITY_ACCEPTED",
-                 "SOR_AL_M3_GAP_PROOF_ACCEPTED"}):
+                {"SOR_AL_M1_SNAPSHOT_ACCEPTED", "SOR_AL_NATIVE_M1_PARITY_ACCEPTED"}):
             return
-        gap_proof = event["source"] == "SOR_AL_M3_GAP_PROOF_ACCEPTED"
         owner = self.parent()
         getter = getattr(owner, "existing_market_data_host", None)
         market = getter() if callable(getter) else None
@@ -1647,9 +1645,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if not isinstance(code, str):
             return
         identity = (event.get("connection_epoch"), event.get("login_session_id"))
-        snapshot_key = (*identity, event.get(
-            "missing_minute" if gap_proof else "forming_minute"),
-            event.get("snapshot_received_at"))
+        snapshot_key = (*identity, event.get("forming_minute"),
+                        event.get("snapshot_received_at"))
         current_session = getattr(market, "_current_display_session_identity", None)
         forming_by_stock = getattr(market, "_sor_forming_m1_by_stock", None)
         required_by_stock = getattr(market, "_sor_m1_required_by_stock", None)
@@ -1663,13 +1660,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             or not callable(current_session)
             or current_session() != identity
             or not all(isinstance(value, str) and value for value in snapshot_key[2:])
-            or (not gap_proof and (
-                not isinstance(forming, dict)
+            or (not isinstance(forming, dict)
                 or forming.get("session_identity") != identity
                 or not isinstance(candle, dict)
                 or candle.get("snapshot_source") not in _V5_SOR_FORMING_SOURCES
                 or snapshot_key[2:] != (candle.get("bar_time"),
-                                        candle.get("snapshot_received_at"))))
+                                        candle.get("snapshot_received_at")))
         ):
             return
         for key, window in tuple(self._open_windows.items()):
@@ -1698,16 +1694,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or key in self._range_replay_active
                 or key in self._history_browse_active
                 or getattr(window, "_marking_pool_publication_pending", False)
-                or (not gap_proof and self._sor_m1_last_snapshot.get(key) == snapshot_key)
+                or self._sor_m1_last_snapshot.get(key) == snapshot_key
             ):
                 continue
             try:
-                if gap_proof:
-                    projected = self._sor_m1_calculation_snapshot(session, pool)
-                    if (not isinstance(projected, tuple) or len(projected) != 3
-                            or event.get("missing_minute") not in
-                            projected[2].get("verified_no_trade_minutes", ())):
-                        continue
                 view, deficit = self._normal_base_history_view(
                     session, pool, self._history_targets.get(key, self._historical_count),
                 )
@@ -1716,12 +1706,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 self._use_pool_for_window(
                     window, session, pool, evaluation_count=100,
                     _normal_view=view,
-                    live_m1_snapshot_key=None if gap_proof else snapshot_key,
+                    live_m1_snapshot_key=snapshot_key,
                 )
             except ValueError:
                 continue
-            if not gap_proof:
-                self._sor_m1_last_snapshot[key] = snapshot_key
+            self._sor_m1_last_snapshot[key] = snapshot_key
 
     def _live_sor_snapshot_is_current(self, window, session, pool, snapshot_key):
         code = session.request.stock.code
@@ -6815,36 +6804,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             )
             if higher_live and projected.get("available") is True:
                 cutoff = as_of.replace(second=0, microsecond=0)
-                clock = cutoff.hour * 60 + cutoff.minute
                 candidates = projected.get("candles")
                 target = candle_market_datetime(candidates[-1]) if candidates else None
                 source = MarketDataHost._current_display_candles(market, code, 1)
                 covered = {candle_market_datetime(row) for row in source}
-                covered.update(datetime.fromisoformat(stamp) for stamp in
-                               projected.get("verified_no_trade_minutes", ()))
-                expected_day = set()
-                target_starts = set()
-                day_start = cutoff.replace(hour=0, minute=0)
-                for _name, start, end in _DISPLAY_INTEGRATED_SESSIONS:
-                    for minute in range(start, min(end, clock + 1)):
-                        if minute < clock:
-                            expected_day.add(day_start + timedelta(minutes=minute))
-                        anchor = (939 if m3_after_anchor else 930 if m15_after_anchor
-                                  else start) if start == 940 else start
-                        target_minute = (anchor + (minute - anchor)
-                                          // session.request.timeframe_minutes
-                                          * session.request.timeframe_minutes)
-                        target_starts.add(
-                            (day_start + timedelta(minutes=target_minute))
-                            .strftime("%Y%m%d%H%M%S")
-                        )
-                # An _AL stock has verified NXT eligibility; prove its morning
-                # session as well as KRX before filling any absent direct bars.
-                projected["today_m1_source_covered"] = (
-                    bool(target_starts) and expected_day.issubset(covered)
-                )
-                projected["today_target_starts"] = sorted(target_starts)
-                # Require every completed M1 component of the open bucket.
                 expected_start = (max(target, cutoff.replace(hour=15, minute=40))
                                   if (m3_after_anchor or m15_after_anchor)
                                   and target is not None
@@ -6853,21 +6816,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                                 range(int((cutoff - expected_start).total_seconds() // 60)))
                              if target is not None and target <= cutoff else set())
                 projected["forming_target_source_covered"] = (
-                    (8 * 60 <= clock < 8 * 60 + 50 or
-                     9 * 60 <= clock < 15 * 60 + 30 or
-                      (session.request.timeframe_key in
-                       {"M5", "M10", "M30", "M60", "M120", "M240"}
-                       or m3_after_anchor or m15_after_anchor)
-                      and 15 * 60 + 40 <= clock < 20 * 60)
-                    and target is not None and target.date() == cutoff.date()
-                    and (target.hour * 60 + target.minute == 8 * 60 or
-                         9 * 60 <= target.hour * 60 + target.minute < 15 * 60 + 30 or
-                          ((15 * 60 + 40 <= target.hour * 60 + target.minute < 20 * 60
-                            or m3_after_anchor and target.hour * 60 + target.minute == 939
-                            or m15_after_anchor and target.hour * 60 + target.minute == 930)
-                           and target <= cutoff < target + timedelta(
-                               minutes=session.request.timeframe_minutes)))
-                    and expected.issubset(covered)
+                    target is not None and target.date() == cutoff.date()
+                    and target <= cutoff and expected.issubset(covered)
                 )
         except Exception as exc:
             projected = {"available": False,
@@ -6924,6 +6874,92 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         forming = d1 or period or live_minute_forming
         if self._pool_computation_source_identity(source_pool) != source_identity:
             raise ValueError("SOR_M1_BLOCKED:SOURCE_CHANGED_AFTER_SNAPSHOT")
+        if timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}:
+            if (live_higher_forming and timeframe_key == "M3"
+                    and 15 * 60 + 40 <= as_of.hour * 60 + as_of.minute < 20 * 60
+                    and not self._sor_m3_after_anchor_verified(source_pool, as_of)):
+                raise ValueError("SOR_M1_BLOCKED:BROKER_AFTER_ANCHOR_UNVERIFIED")
+            if (live_higher_forming and timeframe_key == "M15"
+                    and 15 * 60 + 40 <= as_of.hour * 60 + as_of.minute < 20 * 60
+                    and not self._sor_m15_after_anchor_verified(source_pool, as_of)):
+                raise ValueError("SOR_M1_BLOCKED:BROKER_AFTER_ANCHOR_UNVERIFIED")
+            code = session.request.stock.code
+            historical = view.get("candles") if isinstance(view, dict) else None
+            display = view.get("display_candles", historical) if isinstance(view, dict) else None
+            if (not isinstance(view, dict)
+                    or source_pool.get("market_source") != "INTEGRATED"
+                    or source_pool.get("market_data_identity") != f"{code}_AL"
+                    or view.get("market_source") != "INTEGRATED"
+                    or view.get("market_data_identity") != f"{code}_AL"
+                    or not isinstance(historical, list) or not historical
+                    or not isinstance(display, list) or not display
+                    or view.get("source_coverage_sufficient") is False
+                    or view.get("display_only_integrated") is True):
+                raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_UNAVAILABLE")
+            stamps = [str(row.get("time") or "") for row in historical
+                      if isinstance(row, dict)]
+            if (len(stamps) != len(historical)
+                    or any(len(stamp) != 14 or not stamp.isdigit() for stamp in stamps)
+                    or stamps != sorted(set(stamps))
+                    or any(row.get("is_complete") is False for row in historical)
+                    or display != historical[-len(display):]):
+                raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
+            if not live_higher_forming:
+                if (expected_calculation is not None
+                        and expected_calculation != historical[-len(expected_calculation):]):
+                    raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
+                return view
+            candidates = projected.get("candles") if isinstance(projected, dict) else None
+            if (not isinstance(projected, dict)
+                    or projected.get("available") is not True
+                    or projected.get("forming_included") is not True
+                    or projected.get("forming_target_source_covered") is not True
+                    or not isinstance(candidates, list) or not candidates
+                    or candidates[-1].get("is_complete") is not False
+                    or projected.get("forming_snapshot_source")
+                    not in _V5_SOR_FORMING_SOURCES):
+                raise ValueError("SOR_M1_BLOCKED:SOR_FORMING_SOURCE_UNAVAILABLE")
+            forming_stamp = candle_market_datetime(candidates[-1])
+            if (forming_stamp is None or forming_stamp.date() != as_of.date()
+                    or forming_stamp > as_of
+                    or forming_stamp.strftime("%Y%m%d%H%M%S") <= stamps[-1]):
+                raise ValueError("SOR_M1_BLOCKED:SOR_FORMING_SOURCE_UNAVAILABLE")
+            from gui_market_data_host import MarketDataHost
+            latest_direct = MarketDataHost._expected_latest_completed_display_start(
+                as_of, session.request.timeframe_minutes,
+            )
+            if (latest_direct is not None
+                    and latest_direct < forming_stamp
+                    and stamps[-1] < latest_direct.strftime("%Y%m%d%H%M%S")):
+                raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_UNAVAILABLE")
+            forming_row = {"time": forming_stamp.strftime("%Y%m%d%H%M%S"),
+                           **{field: candidates[-1][field] for field in
+                              ("open", "high", "low", "close", "volume")}}
+            calculation = [*historical, forming_row]
+            if (expected_calculation is not None
+                    and expected_calculation != calculation[-len(expected_calculation):]):
+                raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
+            result = dict(view, candles=calculation,
+                          display_candles=([*display, forming_row])[-5000:],
+                          calculation_source="SELECTED_DIRECT_AL_WITH_LIVE_SOR_FORMING",
+                          sor_m1_calculation_complete=True,
+                          production_calculation_cache_identity=(
+                              "SOR_DIRECT_FORMING", projected.get("source_identity"),
+                              as_of.isoformat()),
+                          snapshot=ValidationHistoricalSnapshot(
+                              stock=session.request.stock,
+                              timeframe_minutes=session.request.timeframe_minutes,
+                              timeframe_key=timeframe_key,
+                              requested_count=len(calculation),
+                              request_id=f"{view.get('request_id') or 'POOL'}:SOR_FORMING",
+                              rows=self._historical_rows_from_candles(calculation),
+                              market_data_identity=f"{code}_AL",
+                              market_source="INTEGRATED",
+                              request_as_of=projected["forming_snapshot_received_at"],
+                          ))
+            if isinstance(projected.get("sor_source_receipt"), dict):
+                result["sor_source_receipt"] = deepcopy(projected["sor_source_receipt"])
+            return result
         if (normal_base_only and timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
                 and isinstance(projected, dict)
                 and projected.get("availability_state") == "SOR_M1_SOURCE_UNAVAILABLE"
@@ -7416,7 +7452,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         frozen = request["sor_m1_calculation_snapshot"]
         proof = frozen[2] if isinstance(frozen, tuple) and len(frozen) == 3 else None
         if (isinstance(proof, dict)
-                and proof.get("availability_state") == "SOR_M1_SOURCE_UNAVAILABLE"
+                and proof.get("availability_state") in
+                    {"SOR_M1_SOURCE_UNAVAILABLE", "SOR_DIRECT_HISTORY_UNAVAILABLE"}
                 and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}):
             request["normal_base_only"] = True
         if getattr(window, "_normal_base_requested", False) or request.get("normal_base_only"):

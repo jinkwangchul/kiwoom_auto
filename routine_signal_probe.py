@@ -516,6 +516,9 @@ def probe_routine_for_stock(
             and evidence.get("market_source") == "INTEGRATED"
             and evidence.get("market_data_identity") == f"{code}_AL"
             and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1"
+            and (evidence.get("timeframe_minutes") == 1
+                 or evidence.get("direct_history_source")
+                 == "BROKER_AL_CONFIRMED_DIRECT")
             and evidence.get("source_proof")
             == "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
             and evidence.get("stock_code") == code

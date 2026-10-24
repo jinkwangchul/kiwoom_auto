@@ -269,13 +269,12 @@ def test_cold_weekend_m3_displays_completed_direct_al_without_m1_signal_proof():
     ]
     flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
     frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    assert frozen[2]["availability_state"] == "SOR_M1_SOURCE_UNAVAILABLE"
+    assert frozen[2]["availability_state"] == "SOR_DIRECT_HISTORY_UNAVAILABLE"
     view = dict(pool, display_candles=list(pool["candles"]))
     assert flow._sor_m1_calculation_view(
         session, pool, view, frozen, normal_base_only=True,
     ) is view
-    with pytest.raises(ValueError, match="SOR_M1_BLOCKED:SOR_M1_SOURCE_UNAVAILABLE"):
-        flow._sor_m1_calculation_view(session, pool, view, frozen)
+    assert flow._sor_m1_calculation_view(session, pool, view, frozen) is view
 
 
 def test_cold_weekend_m3_routes_validation_to_indicator_only_prepare():
@@ -1496,6 +1495,13 @@ def test_live_higher_minute_reuses_host_and_preserves_5000_direct_prior_bars(
     assert frozen[2]["forming_target_source_covered"] is True
     assert frozen[2]["today_m1_source_covered"] is True
     assert frozen[2]["projection"] == "FORMING_BASE_BAR"
+    if direct_target_present:
+        with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_UNAVAILABLE"):
+            flow._sor_m1_calculation_view(
+                session, pool, dict(pool, display_candles=list(direct)), frozen,
+            )
+        assert pool == original
+        return
     view = flow._sor_m1_calculation_view(
         session, pool, dict(pool, display_candles=list(direct)), frozen,
     )
@@ -1514,9 +1520,9 @@ def test_live_higher_minute_reuses_host_and_preserves_5000_direct_prior_bars(
 
 
 @pytest.mark.parametrize("today_direct_stamps", [
-    [], ["20261020090000", "20261020091000"],
+    [], ["20261020090000", "20261020090500"],
 ])
-def test_live_higher_minute_fills_every_verified_today_target(today_direct_stamps):
+def test_live_higher_minute_keeps_direct_today_and_forms_only_current_target(today_direct_stamps):
     from copy import deepcopy
 
     flow, base_session, _pool, _market, _ = _registered_m1_calculation_case()
@@ -1555,14 +1561,12 @@ def test_live_higher_minute_fills_every_verified_today_target(today_direct_stamp
         for row in frozen[2]["candles"]
         if row["bar_time"].startswith("2026-10-20")
     ]
-    assert [row["time"] for row in projected_today[-3:]] == [
-        "20261020090000", "20261020090500", "20261020091000",
-    ]
+    assert [row["time"] for row in projected_today] == ["20261020091000"]
     view = flow._sor_m1_calculation_view(
         session, pool, dict(pool, display_candles=list(direct)), frozen,
     )
-    assert view["candles"] == prior + projected_today
-    assert view["display_candles"] == projected_today
+    assert view["candles"] == direct + projected_today
+    assert view["display_candles"] == direct + projected_today
     assert view["snapshot"].to_rows() == flow._historical_rows_from_candles(view["candles"])
     assert pool == original
 

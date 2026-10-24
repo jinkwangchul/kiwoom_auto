@@ -70,12 +70,12 @@ class IndicatorFollowValidationProductionSessionTest(unittest.TestCase):
         )
 
         self.assertIsNotNone(plan)
-        self.assertEqual("CANDLE_WARMUP_LIMIT_EXCEEDED", plan["reason"])
+        self.assertEqual("DIRECT_SOR_TIMEFRAME_REQUIRED", plan["reason"])
         self.assertFalse(plan["ready"])
-        self.assertEqual(237_600, plan["requested_source_count"])
+        self.assertEqual(900, plan["requested_source_count"])
         self.assertEqual(200_000, plan["maximum_source_count"])
 
-    def test_production_minute_projection_uses_session_anchors_and_closed_bars(self):
+    def test_production_minute_projection_blocks_completed_higher_bars(self):
         policy = _operation_policy()
         policy["extra_sessions"][1]["start_time"] = "15:40:00"
         contract = production_session.production_session_contract(
@@ -100,11 +100,9 @@ class IndicatorFollowValidationProductionSessionTest(unittest.TestCase):
         result = project(raw, 3, contract, as_of=datetime.fromisoformat("2026-09-21T16:00:00+09:00"))
 
         self.assertIsNotNone(result)
-        self.assertEqual(
-            ["20260921090000", "20260921090300", "20260921154000", "20260921154300"],
-            [candle["time"] for candle in result["candles"]],
-        )
-        self.assertTrue(all(candle["is_complete"] for candle in result["candles"]))
+        self.assertFalse(result["ready"])
+        self.assertEqual([], result["candles"])
+        self.assertEqual("DIRECT_SOR_TIMEFRAME_REQUIRED", result["reason"])
         self.assertEqual("FORMING_BAR_PARITY_NOT_VERIFIED", result["forming_bar_status"])
 
     def test_pure_contract_projects_runtime_ats_and_session_windows(self):
