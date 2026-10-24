@@ -27,10 +27,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from candle_manager import canonical_candle_content_hash
 from candle_timeframe_aggregation import (
     candle_session_windows,
     candle_market_datetime,
     completed_timeframe_candles,
+    normalize_candle_sessions,
     parse_market_datetime,
     project_candle_supply,
     read_canonical_bar_minutes,
@@ -63,6 +65,7 @@ from running_budget_adjustment import (
     transition_running_budget_adjustment_for_signal,
 )
 from state_policy import read_operation_policy
+from sor_routine_signal_evidence import build_source_marker
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -490,6 +493,45 @@ def probe_routine_for_stock(
         }
     else:
         facts_market = main_facts.get("market", {}) if isinstance(main_facts, dict) else {}
+        sor_selected = (
+            str(stock_config.get("calculation_market_source", "SOR")).strip().upper()
+            != "KRX"
+        )
+        if sor_selected:
+            # The Main-owned SOR calculation is preview-only. An absent or
+            # untrusted projection must NEVER fall back to the stored KRX
+            # candles and then enter the production order queue.
+            sources = (
+                facts_market.get("candle_supply_by_code")
+                if isinstance(facts_market, dict) else None
+            )
+            evidence = sources.get(code) if isinstance(sources, dict) else None
+            trusted = (
+                isinstance(evidence, dict)
+                and evidence.get("calculation_only") is True
+                and evidence.get("execution_enabled") is False
+                and evidence.get("queue_connected") is False
+                and evidence.get("send_order_connected") is False
+                and evidence.get("market_source") == "INTEGRATED"
+                and evidence.get("market_data_identity") == f"{code}_AL"
+                and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1"
+                and evidence.get("source_proof")
+                == "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
+                and evidence.get("stock_code") == code
+            )
+            if not trusted or evidence.get("available") is not True:
+                return {
+                    "signal": "SKIP",
+                    "reason": (
+                        str(evidence.get("availability_state") or "SOR_SOURCE_UNAVAILABLE")
+                        if trusted else "SOR_CALCULATION_SOURCE_UNAVAILABLE"
+                    ),
+                    "routine": routine_name,
+                    "code": code, "name": name,
+                    "execution_enabled": False,
+                    "queue_connected": False,
+                    "send_order_connected": False,
+                }
         facts_candles = (
             facts_market.get("raw_candles_by_code", {}).get(code)
             if isinstance(facts_market, dict)
@@ -540,13 +582,48 @@ def probe_routine_for_stock(
                     if "warmup_bars" in projection_request
                     else {"required_minute_candles": 0}
                 )
-                if (
+                forming_by_code = facts_market.get("forming_minute_by_code")
+                forming_minute = (
+                    forming_by_code.get(code)
+                    if isinstance(forming_by_code, dict)
+                    else None
+                )
+                same_m1_capture = True
+                if isinstance(preprojected, dict) and requested_interval == 1:
+                    source_rows = list(raw_candles)
+                    if (
+                        projection_request["projection"] == "FORMING_BASE_BAR"
+                        and isinstance(forming_minute, dict)
+                    ):
+                        source_rows.append(forming_minute)
+                    same_m1_capture = (
+                        preprojected.get("stock_code") == code
+                        and preprojected.get("direct_timeframe_source") is False
+                        and bool(preprojected.get("source_identity"))
+                        and preprojected["source_identity"]
+                        == canonical_candle_content_hash(source_rows)
+                        and preprojected.get("session_windows_identity")
+                        == normalize_candle_sessions(facts_market.get("candle_session_windows"))
+                        and isinstance(preprojected.get("freshness"), dict)
+                        and isinstance(tick_time, datetime)
+                        and preprojected["freshness"].get("as_of")
+                        == tick_time.isoformat(timespec="seconds")
+                        and int(preprojected.get("history_target_bars") or 0)
+                        == int(projection_request.get("history_target_bars") or 0)
+                    )
+                if (isinstance(preprojected, dict)
+                        and preprojected.get("calculation_only") is True):
+                    # Preserve source selection and its fail-closed verdict.
+                    # A missing SOR input must not fall back to stored KRX.
+                    supply = deepcopy(preprojected)
+                elif (
                     isinstance(preprojected, dict)
                     and str(preprojected.get("projection") or "").upper()
                     == str(projection_request.get("projection") or "").upper()
                     and int(preprojected.get("timeframe_minutes") or 0) == requested_interval
                     and int(preprojected.get("required_minute_candles") or 0)
                     == int(requested_warmup["required_minute_candles"])
+                    and same_m1_capture
                 ):
                     supply = deepcopy(preprojected)
                 else:
@@ -556,9 +633,7 @@ def probe_routine_for_stock(
                         projection_request,
                         now=tick_time,
                         session_windows=facts_market.get("candle_session_windows"),
-                        forming_minute=(facts_market.get("forming_minute_by_code") or {}).get(code)
-                        if isinstance(facts_market.get("forming_minute_by_code"), dict)
-                        else None,
+                        forming_minute=forming_minute,
                         completed_projector=completed_timeframe_candles,
                     )
                 candles = list(supply.get("candles") or ())
@@ -714,6 +789,42 @@ def probe_routine_for_stock(
                         "cycle_ended": False,
                         "unresolved_reason": f"CYCLE_PROJECTION_ERROR:{type(exc).__name__}",
                     }
+            if (isinstance(candle_projection_evidence, dict)
+                    and candle_projection_evidence.get("calculation_only") is True):
+                # Real operation caller may inspect BUY/SELL calculation, but
+                # this migration path must never create a queue or order.
+                selector = getattr(routine_module, "evaluate_signal_selection", None)
+                try:
+                    preview = (
+                        selector(candles, instance_rules, context)
+                        if callable(selector) else {}
+                    )
+                except Exception:
+                    preview = {}
+                preview_side = preview.get("signal") if isinstance(preview, dict) else None
+                source_marker = build_source_marker(
+                    stock=code, rules=instance_rules, candles=candles,
+                    source=candle_projection_evidence, side=preview_side,
+                )
+                return {
+                    "signal": "SKIP",
+                    "reason": "SOR_CALCULATION_ONLY_NO_ORDER",
+                    "routine": routine_name,
+                    "code": code,
+                    "name": name,
+                    "calculation_source": candle_projection_evidence.get("calculation_source"),
+                    "sor_preview_signal": (
+                        preview.get("signal") if isinstance(preview, dict) else None
+                    ),
+                    "sor_preview_source_index": (
+                        preview.get("signal_source_index") if isinstance(preview, dict) else None
+                    ),
+                    "sor_preview_evidence": source_marker,
+                    "candles": len(candles),
+                    "execution_enabled": False,
+                    "queue_connected": False,
+                    "send_order_connected": False,
+                }
             try:
                 if isinstance(main_facts, dict) and not callable(cycle_projector):
                     raise ValueError("ROUTINE_CYCLE_PROJECTION_UNAVAILABLE")
@@ -1288,6 +1399,10 @@ def probe_execution_stock_for_committed_bar(
             if callable(provider) and callable(projection_reader)
             else None
         )
+        calculation_source = str(
+            projected_config.get("calculation_market_source", "SOR")
+        ).strip().upper()
+        sor_preview_requested = calculation_source != "KRX"
         candle_supply = (
             provider(
                 stock_code=code,
@@ -1295,11 +1410,25 @@ def probe_execution_stock_for_committed_bar(
                 projection_request=projection_request,
                 as_of=parse_market_datetime(tick_key),
                 session_windows=sessions,
-                consumer_scope="PRODUCTION",
+                consumer_scope=(
+                    "SOR_CALCULATION_ONLY" if sor_preview_requested
+                    else "PRODUCTION"
+                ),
             )
             if callable(provider) and isinstance(projection_request, dict)
             else None
         )
+        if sor_preview_requested and not isinstance(candle_supply, dict):
+            # Never substitute stored KRX history for a selected SOR source.
+            candle_supply = {
+                "stock_code": code,
+                "available": False,
+                "candles": [],
+                "calculation_only": True,
+                "calculation_source": "BROKER_AL_CONFIRMED_M1",
+                "availability_state": "SOR_SOURCE_UNAVAILABLE",
+                "reason": "SOR_SOURCE_UNAVAILABLE",
+            }
         return capture_routine_main_facts(
             stock_dirs={code: target_dir},
             selected_account_no=account_no,
@@ -1312,7 +1441,12 @@ def probe_execution_stock_for_committed_bar(
                 "raw_candles_by_code": {code: _load_candles_from_stock_dir(target_dir)},
                 "forming_minute_by_code": {code: forming} if isinstance(forming, dict) else {},
                 "candle_session_windows": sessions,
-                "candle_supply_by_code": {code: candle_supply}
+                "candle_supply_by_code": {
+                    code: {
+                        **candle_supply,
+                        "session_windows_identity": normalize_candle_sessions(sessions),
+                    }
+                }
                 if isinstance(candle_supply, dict)
                 else {},
                 "reference_prices_by_code": {code: read_reference_price(code, name)},

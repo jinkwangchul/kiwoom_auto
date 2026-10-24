@@ -47,6 +47,7 @@ from mock_validation_virtual_execution import (
     RESULT_BLOCKED,
 )
 from routine_main_facts import build_routine_main_facts_from_projection
+from sor_routine_signal_evidence import build_source_marker
 
 
 RESULT_NO_SIGNAL = "NO_SIGNAL"
@@ -77,9 +78,19 @@ def _load_file_module(filename: str, module_name: str) -> Any:
     if spec is None or spec.loader is None:
         raise MockValidationError(f"MOCK_ROUTINE_PURE_MODULE_UNAVAILABLE:{filename}")
     module = importlib.util.module_from_spec(spec)
+    missing = object()
+    previous = sys.modules.get(spec.name, missing)
     sys.path.insert(0, str(_ROUTINE_DIR))
+    sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(spec.name) is module:
+            if previous is missing:
+                sys.modules.pop(spec.name, None)
+            else:
+                sys.modules[spec.name] = previous
+        raise
     finally:
         sys.path.remove(str(_ROUTINE_DIR))
     return module
@@ -1957,6 +1968,10 @@ class MockIndicatorFollowRoutineAdapter:
                 signal, _build_result = self._final_routine_signal(signal, context)
                 side = clean_text(signal.get("signal")).upper()
                 if side in {"BUY", "SELL"}:
+                    source_marker = build_source_marker(
+                        stock=document["session"]["stock_code"], rules=rules,
+                        candles=evaluation.candles, source=availability, side=side,
+                    ) if pending_signal is None else None
                     self._event(
                         document,
                         instance_id=instance_id,
@@ -1969,6 +1984,7 @@ class MockIndicatorFollowRoutineAdapter:
                             "operation_identity": self._operation_identity(document, instance_id),
                             "evaluation_cycle_id": cycle_id,
                             **_signal_marker_payload(signal, evaluation.candles),
+                            **({"sor_source_evidence": source_marker} if source_marker else {}),
                         },
                     )
                 elif not active_plans and not progression["plans"]:
@@ -2095,6 +2111,10 @@ class MockIndicatorFollowRoutineAdapter:
             signal, build_result = self._final_routine_signal(signal, context)
             side = clean_text(signal.get("signal")).upper()
             if side in {"BUY", "SELL"}:
+                source_marker = build_source_marker(
+                    stock=document["session"]["stock_code"], rules=rules,
+                    candles=evaluation.candles, source=availability, side=side,
+                ) if pending_signal is None else None
                 self._event(
                     document,
                     instance_id=instance_id,
@@ -2107,6 +2127,7 @@ class MockIndicatorFollowRoutineAdapter:
                         "operation_identity": self._operation_identity(document, instance_id),
                         "evaluation_cycle_id": cycle_id,
                         **_signal_marker_payload(signal, evaluation.candles),
+                        **({"sor_source_evidence": source_marker} if source_marker else {}),
                     },
                 )
             if side not in {"BUY", "SELL"}:

@@ -1,0 +1,236 @@
+"""Read-only SOR routine output evidence for the three-consumer audit.
+
+Markers bind an actual routine output to its admitted candle supply. They
+repeat the source's provenance claim; they do not attest a broker or GUI.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta
+import hashlib
+import json
+from pathlib import Path
+import re
+from typing import Any
+
+
+_SOURCE_PROOF = "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
+_MARKER_FIELDS = frozenset({
+    "stock", "timeframe", "rules_hash", "evaluation_time",
+    "market_data_identity", "source_proof", "input_hash", "side",
+})
+
+
+def _hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _bar_time(candle: Any) -> datetime | None:
+    if not isinstance(candle, dict):
+        return None
+    try:
+        value = datetime.fromisoformat(str(
+            candle.get("bar_time") or candle.get("time") or ""
+        ))
+    except ValueError:
+        return None
+    return value if value.utcoffset() == timedelta(hours=9) else None
+
+
+def _valid_cutoff(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{14}", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y%m%d%H%M%S")
+    except ValueError:
+        return False
+    return True
+
+
+def build_source_marker(
+    *, stock: str, rules: Any, candles: Any, source: Any, side: Any,
+) -> dict[str, str] | None:
+    """Bind one actual BUY/SELL/NONE output to the exact admitted AL rows."""
+    if (stock != "005930" or not isinstance(rules, dict) or not rules
+            or not isinstance(source, dict) or source.get("available") is not True
+            or source.get("stock_code") != stock
+            or not isinstance(source.get("candles"), (list, tuple))
+            or list(source["candles"]) != list(candles)
+            or source.get("timeframe_minutes") != 1
+            or source.get("market_source") != "INTEGRATED"
+            or source.get("market_data_identity") != "005930_AL"
+            or source.get("calculation_source") != "BROKER_AL_CONFIRMED_M1"
+            or source.get("source_proof") != _SOURCE_PROOF
+            or source.get("calculation_only") is not True
+            or source.get("execution_enabled") is not False
+            or source.get("queue_connected") is not False
+            or source.get("send_order_connected") is not False
+            or not isinstance(candles, (list, tuple)) or not candles):
+        return None
+    from candle_timeframe_aggregation import read_canonical_bar_minutes
+
+    try:
+        bar = rules.get("bar") if isinstance(rules.get("bar"), dict) else {}
+        if "bar_minutes" not in bar and "bar_minutes" not in rules:
+            return None
+        if read_canonical_bar_minutes(rules) != 1:
+            return None
+        times = [_bar_time(row) for row in candles]
+        if (any(value is None for value in times)
+                or any(row.get("timeframe_minutes") != 1 for row in candles)
+                or times != sorted(set(times))):
+            return None
+        side_text = str(side or "NONE").strip().upper()
+        if side_text not in {"BUY", "SELL", "NONE"}:
+            return None
+        return {
+            "stock": stock, "timeframe": "M1", "rules_hash": _hash(rules),
+            "evaluation_time": times[-1].strftime("%Y%m%d%H%M%S"),
+            "market_data_identity": "005930_AL", "source_proof": _SOURCE_PROOF,
+            "input_hash": _hash(candles), "side": side_text,
+        }
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _valid_marker(marker: Any) -> bool:
+    return bool(
+        isinstance(marker, dict) and set(marker) == _MARKER_FIELDS
+        and marker["stock"] == "005930" and marker["timeframe"] == "M1"
+        and marker["market_data_identity"] == "005930_AL"
+        and marker["source_proof"] == _SOURCE_PROOF
+        and marker["side"] in {"BUY", "SELL", "NONE"}
+        and _valid_cutoff(marker["evaluation_time"])
+        and all(isinstance(marker[key], str)
+                and re.fullmatch(r"[0-9a-f]{64}", marker[key])
+                for key in ("rules_hash", "input_hash"))
+    )
+
+
+def _extract(marked: list[tuple[Any, Any]], *, consumer: str,
+             cutoff: str, proof_data: Any) -> dict[str, Any] | None:
+    if not marked or not _valid_cutoff(cutoff):
+        return None
+    first = marked[0][0]
+    previous = ""
+    events = []
+    for marker, side in marked:
+        if (not _valid_marker(marker) or side != marker["side"]
+                or marker["side"] not in {"BUY", "SELL", "NONE"}
+                or marker["evaluation_time"] <= previous
+                or marker["evaluation_time"] > cutoff
+                or any(marker[key] != first[key] for key in (
+                    "stock", "timeframe", "rules_hash", "market_data_identity",
+                    "source_proof"))):
+            return None
+        previous = marker["evaluation_time"]
+        if side in {"BUY", "SELL"}:
+            events.append({"time": previous, "side": side})
+    if previous != cutoff or not events:
+        return None
+    return {
+        "consumer": consumer,
+        "origin_proof": f"{consumer}_{'ROUTINE_EVALUATED' if consumer == 'MOCK' else 'ROUTINE_OUTPUT'}:{_hash(proof_data)}",
+        "stock": "005930", "timeframe": "M1",
+        "rules_hash": first["rules_hash"], "cutoff": cutoff,
+        "market_data_identity": "005930_AL", "events": events,
+    }
+
+
+def extract_production_evidence(outputs: Any, *, cutoff: str) -> dict[str, Any] | None:
+    """Adapt captured calculation-only outputs from routine_signal_probe."""
+    if not isinstance(outputs, list) or not outputs:
+        return None
+    marked = []
+    for output in outputs:
+        if (not isinstance(output, dict) or output.get("code") != "005930"
+                or output.get("signal") != "SKIP"
+                or output.get("reason") != "SOR_CALCULATION_ONLY_NO_ORDER"
+                or output.get("execution_enabled") is not False
+                or output.get("queue_connected") is not False
+                or output.get("send_order_connected") is not False):
+            return None
+        side = str(output.get("sor_preview_signal") or "NONE").strip().upper()
+        marked.append((output.get("sor_preview_evidence"), side))
+    return _extract(marked, consumer="PRODUCTION", cutoff=cutoff,
+                    proof_data=outputs)
+
+
+def extract_mock_evidence(journal: Any, *, cutoff: str) -> dict[str, Any] | None:
+    """Adapt an existing Mock Validation ROUTINE_EVALUATED journal."""
+    if (not isinstance(journal, dict)
+            or journal.get("schema_version") != "mock_validation_event_v1"
+            or not isinstance(journal.get("validation_session_id"), str)
+            or not journal["validation_session_id"].startswith("MV-")
+            or not isinstance(journal.get("events"), list)):
+        return None
+    selected = [event for event in journal["events"]
+                if isinstance(event, dict)
+                and event.get("event_type") == "ROUTINE_EVALUATED"]
+    marked = []
+    event_ids = set()
+    cycle_ids = set()
+    for event in selected:
+        payload = event.get("payload")
+        if (not isinstance(payload, dict) or event.get("stock_code") != "005930"
+                or event.get("validation_session_id") != journal["validation_session_id"]
+                or not isinstance(event.get("event_id"), str)
+                or not event["event_id"].startswith("ME-")
+                or event["event_id"] in event_ids
+                or not isinstance(payload.get("evaluation_cycle_id"), str)
+                or not payload["evaluation_cycle_id"].startswith("MC-")
+                or payload["evaluation_cycle_id"] in cycle_ids):
+            return None
+        marker = payload.get("sor_source_evidence")
+        if (not _valid_marker(marker) or payload.get("rules_hash") != marker["rules_hash"]
+                or payload.get("signal") != marker["side"]):
+            return None
+        timestamp = _bar_time({"bar_time": event.get("timestamp")})
+        if timestamp is None or timestamp.strftime("%Y%m%d%H%M%S") < marker["evaluation_time"]:
+            return None
+        event_ids.add(event["event_id"])
+        cycle_ids.add(payload["evaluation_cycle_id"])
+        marked.append((marker, marker["side"]))
+    return _extract(marked, consumer="MOCK", cutoff=cutoff,
+                    proof_data=[journal["validation_session_id"], selected])
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print evidence for redirection to the three-consumer audit CLI."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("consumer", choices=("PRODUCTION", "MOCK"))
+    parser.add_argument("source", type=Path)
+    parser.add_argument("cutoff", help="last evaluated M1 bar, YYYYMMDDHHMMSS")
+    args = parser.parse_args(argv)
+    try:
+        with args.source.open("r", encoding="utf-8") as stream:
+            source = json.load(stream, object_pairs_hook=_unique_keys)
+        evidence = (
+            extract_production_evidence(source, cutoff=args.cutoff)
+            if args.consumer == "PRODUCTION"
+            else extract_mock_evidence(source, cutoff=args.cutoff)
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        evidence = None
+    if evidence is None:
+        print(json.dumps({"status": "BLOCKED", "reason": "SOURCE_EVIDENCE_UNPROVEN"}))
+        return 2
+    print(json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
