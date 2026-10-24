@@ -24,6 +24,7 @@ import tempfile
 import time
 from threading import Event, Lock, Thread
 from threading import Thread as _DiagnosticThread
+from sor_m3_operational_evidence import build_v5_records
 import weakref
 
 from PyQt5 import sip
@@ -106,6 +107,9 @@ _SOR_AL_M1_DIAGNOSTIC_PATH = (
 _SOR_AL_M1_DIAGNOSTIC_LOCK = Lock()
 _V5_MARKING_DIAGNOSTIC_PATH = (
     Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_marking_signal.jsonl"
+)
+_V5_M3_OPERATIONAL_PATH = (
+    Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_sor_m3_operational.jsonl"
 )
 _V5_MARKING_DIAGNOSTIC_QUEUE = Queue(maxsize=256)
 _V5_MARKING_DIAGNOSTIC_LOCK = Lock()
@@ -748,6 +752,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._history_browse_active: dict[int, object] = {}
         # One accepted, source-bound full indicator cache per live V5 window.
         self._history_browse_indicator_cache: dict[int, tuple[object, ...]] = {}
+        self._sor_m3_marking_published: dict[int, tuple[object, ...]] = {}
         self._history_browse_deferred: dict[int, tuple[int, dict[str, object]]] = {}
         self._market_snapshot_generation: dict[int, int] = {}
         self._market_snapshot_metadata: dict[int, tuple[str, dict[str, object]]] = {}
@@ -10281,12 +10286,33 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 snapshot = result.snapshot
                 # Build only marking comparisons; normal filters retain their original cache.
                 rows = snapshot.to_candles()
+                replay_entries = snapshot.to_entries()
                 cache, _ = _build_validation_projection_data(
-                    rows, snapshot.to_entries(), [], tuple(range(len(rows))),
+                    rows, replay_entries, [], tuple(range(len(rows))),
                     settings.to_dict(), request["descriptors"],
                     cancel_predicate=lambda: not current())
                 payload["snapshot"] = snapshot
                 payload["comparison"] = (tuple(c["time"] for c in rows), cache)
+                if (minutes == 3 and session.request.stock.code == "005930"
+                        and not detached_premarket):
+                    try:
+                        marker_path = self._validation_cache_source_marker_path(
+                            session.request.stock, 3, "M3",
+                            int(pool.get("requested_count") or 0))
+                        if (marker_path is not None and marker_path.is_file()
+                                and marker_path.stat().st_size <= 4096):
+                            source_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                            evidence = build_v5_records(
+                                pool, source_marker, snapshot, rows, replay_entries,
+                                generation=generation,
+                                request_generation=request_generation,
+                                window_key=key)
+                            if evidence:
+                                payload["sor_m3_evidence_lines"] = "".join(
+                                    json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
+                                    for record in evidence)
+                    except (OSError, ValueError, TypeError):
+                        pass  # Optional evidence cannot interrupt marking.
             except Exception as exc:
                 payload["error"] = str(exc)
             if current():
@@ -10333,6 +10359,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             published = window.apply_marking_snapshot(
                 payload["generation"], payload["key"], payload["snapshot"],
                 payload["comparison"])
+            if published and payload.get("sor_m3_evidence_lines"):
+                token = (payload["generation"], payload["request_generation"], payload["key"])
+                key = payload["window_key"]
+                if self._sor_m3_marking_published.get(key) != token:
+                    try:
+                        _V5_MARKING_DIAGNOSTIC_QUEUE.put_nowait((
+                            _V5_M3_OPERATIONAL_PATH, payload["sor_m3_evidence_lines"]))
+                        self._sor_m3_marking_published[key] = token
+                    except Full:
+                        pass
             _trace_v5_marking("marking_published" if published else "marking_stale",
                               payload["window_key"], payload["generation"],
                               payload["request_generation"])

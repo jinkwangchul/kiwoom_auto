@@ -1988,6 +1988,10 @@ class MockIndicatorFollowRoutineAdapter:
                         },
                     )
                 elif not active_plans and not progression["plans"]:
+                    source_marker = build_source_marker(
+                        stock=document["session"]["stock_code"], rules=rules,
+                        candles=evaluation.candles, source=availability, side="NONE",
+                    ) if pending_signal is None and side in {"", "NONE"} else None
                     def no_signal_mark(document_value: dict[str, Any]) -> dict[str, Any]:
                         self._progression(document_value, instance_id)["evaluation_cycles"][cycle_id] = {
                             "result": RESULT_NO_SIGNAL, "recorded_at": timestamp,
@@ -1997,6 +2001,16 @@ class MockIndicatorFollowRoutineAdapter:
                     marked = self.repository.mutate_session(
                         session_id, no_signal_mark, expected_revision=document["revision"]
                     )["document"]
+                    if source_marker and source_marker["timeframe"] == "M3":
+                        self._event(
+                            marked, instance_id=instance_id,
+                            event_type="ROUTINE_EVALUATED", identity=cycle_id,
+                            timestamp=timestamp,
+                            payload={"signal": "NONE", "rules_hash": reference["rules_hash"],
+                                     "operation_identity": self._operation_identity(marked, instance_id),
+                                     "evaluation_cycle_id": cycle_id,
+                                     "sor_source_evidence": source_marker},
+                        )
                     return {
                         "status": RESULT_NO_SIGNAL,
                         "reason": clean_text(signal.get("reason")),
@@ -2131,6 +2145,10 @@ class MockIndicatorFollowRoutineAdapter:
                     },
                 )
             if side not in {"BUY", "SELL"}:
+                source_marker = build_source_marker(
+                    stock=document["session"]["stock_code"], rules=rules,
+                    candles=evaluation.candles, source=availability, side="NONE",
+                ) if pending_signal is None and side in {"", "NONE"} else None
                 def no_signal_mark(document_value: dict[str, Any]) -> dict[str, Any]:
                     self._progression(document_value, instance_id)["evaluation_cycles"][cycle_id] = {
                         "result": RESULT_NO_SIGNAL, "recorded_at": timestamp,
@@ -2140,6 +2158,16 @@ class MockIndicatorFollowRoutineAdapter:
                 marked = self.repository.mutate_session(
                     session_id, no_signal_mark, expected_revision=document["revision"]
                 )["document"]
+                if source_marker and source_marker["timeframe"] == "M3":
+                    self._event(
+                        marked, instance_id=instance_id,
+                        event_type="ROUTINE_EVALUATED", identity=cycle_id,
+                        timestamp=timestamp,
+                        payload={"signal": "NONE", "rules_hash": reference["rules_hash"],
+                                 "operation_identity": self._operation_identity(marked, instance_id),
+                                 "evaluation_cycle_id": cycle_id,
+                                 "sor_source_evidence": source_marker},
+                    )
                 return {
                     "status": RESULT_NO_SIGNAL,
                     "reason": clean_text(signal.get("reason")),

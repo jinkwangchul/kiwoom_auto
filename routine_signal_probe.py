@@ -65,7 +65,7 @@ from running_budget_adjustment import (
     transition_running_budget_adjustment_for_signal,
 )
 from state_policy import read_operation_policy
-from sor_routine_signal_evidence import build_source_marker
+from sor_routine_signal_evidence import build_source_marker, _hash as _evidence_hash
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -515,10 +515,17 @@ def probe_routine_for_stock(
             and evidence.get("send_order_connected") is False
             and evidence.get("market_source") == "INTEGRATED"
             and evidence.get("market_data_identity") == f"{code}_AL"
-            and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1"
-            and (evidence.get("timeframe_minutes") == 1
-                 or evidence.get("direct_history_source")
-                 == "BROKER_AL_CONFIRMED_DIRECT")
+            and (
+                (evidence.get("timeframe_minutes") == 1
+                 and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1")
+                or (evidence.get("timeframe_minutes") == 3
+                    and evidence.get("calculation_source")
+                    == "BROKER_AL_CONFIRMED_DIRECT"
+                    and evidence.get("direct_history_source")
+                    == "BROKER_AL_CONFIRMED_DIRECT"
+                    and evidence.get("projection") == "COMPLETED_TIMEFRAME"
+                    and evidence.get("complete") is True)
+            )
             and evidence.get("source_proof")
             == "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
             and evidence.get("stock_code") == code
@@ -810,6 +817,12 @@ def probe_routine_for_stock(
                     stock=code, rules=instance_rules, candles=candles,
                     source=candle_projection_evidence, side=preview_side,
                 )
+                cycle_hash = None
+                if source_marker and source_marker.get("timeframe") == "M3":
+                    try:
+                        cycle_hash = _evidence_hash(context.get("cycle"))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
                 return {
                     "signal": "SKIP",
                     "reason": "SOR_CALCULATION_ONLY_NO_ORDER",
@@ -824,6 +837,11 @@ def probe_routine_for_stock(
                         preview.get("signal_source_index") if isinstance(preview, dict) else None
                     ),
                     "sor_preview_evidence": source_marker,
+                    **({"sor_preview_cycle_hash": cycle_hash,
+                        "sor_preview_routine_instance_id": routine_instance_id,
+                        "sor_preview_observed_at": tick_key}
+                       if source_marker and source_marker.get("timeframe") == "M3"
+                       else {}),
                     "candles": len(candles),
                     "execution_enabled": False,
                     "queue_connected": False,

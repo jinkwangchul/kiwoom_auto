@@ -2147,10 +2147,22 @@ class MarketDataHost(QObject):
             )
             if projected.get("available") is not True:
                 return {**base, **projected}
+            session_identity = MarketDataHost._current_display_session_identity(self)
+            if session_identity is None:
+                return blocked("SOR_DIRECT_SESSION_UNAVAILABLE")
+            source_identity = canonical_candle_content_hash(completed)
             return {
                 **base, **projected,
-                "source_identity": canonical_candle_content_hash(completed),
+                "source_identity": source_identity,
+                "calculation_source": "BROKER_AL_CONFIRMED_DIRECT",
                 "direct_history_source": "BROKER_AL_CONFIRMED_DIRECT",
+                "direct_source_receipt": {
+                    "stock_code": code, "timeframe_key": f"M{interval}",
+                    "source_content_sha256": source_identity,
+                    "connection_epoch": session_identity[0],
+                    "session_sha256": sha256(session_identity[1].encode("utf-8")).hexdigest(),
+                    "source_as_of": as_of.isoformat(),
+                },
             }
         # This cache is session-bound and was installed only after broker
         # _AL identity, epoch, login, and NXT eligibility checks.

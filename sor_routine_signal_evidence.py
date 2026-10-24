@@ -60,10 +60,8 @@ def build_source_marker(
             or source.get("stock_code") != stock
             or not isinstance(source.get("candles"), (list, tuple))
             or list(source["candles"]) != list(candles)
-            or source.get("timeframe_minutes") != 1
             or source.get("market_source") != "INTEGRATED"
             or source.get("market_data_identity") != "005930_AL"
-            or source.get("calculation_source") != "BROKER_AL_CONFIRMED_M1"
             or source.get("source_proof") != _SOURCE_PROOF
             or source.get("calculation_only") is not True
             or source.get("execution_enabled") is not False
@@ -77,22 +75,69 @@ def build_source_marker(
         bar = rules.get("bar") if isinstance(rules.get("bar"), dict) else {}
         if "bar_minutes" not in bar and "bar_minutes" not in rules:
             return None
-        if read_canonical_bar_minutes(rules) != 1:
+        interval = read_canonical_bar_minutes(rules)
+        if interval not in (1, 3) or source.get("timeframe_minutes") != interval:
             return None
+        if interval == 1 and source.get("calculation_source") != "BROKER_AL_CONFIRMED_M1":
+            return None
+        if interval == 3 and (source.get("direct_history_source")
+                              != "BROKER_AL_CONFIRMED_DIRECT"
+                              or source.get("calculation_source")
+                              != "BROKER_AL_CONFIRMED_DIRECT"
+                              or source.get("projection") != "COMPLETED_TIMEFRAME"
+                              or source.get("complete") is not True
+                              or not isinstance(source.get("source_identity"), str)
+                              or not re.fullmatch(r"[0-9a-f]{64}", source["source_identity"])
+                              or source.get("forming_included") is True):
+            return None
+        if interval == 3:
+            receipt = source.get("direct_source_receipt")
+            if (not isinstance(receipt, dict)
+                    or receipt.get("stock_code") != stock
+                    or receipt.get("timeframe_key") != "M3"
+                    or receipt.get("source_content_sha256") != source["source_identity"]
+                    or type(receipt.get("connection_epoch")) is not int
+                    or receipt["connection_epoch"] <= 0
+                    or not isinstance(receipt.get("session_sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", receipt["session_sha256"])
+                    or not isinstance(receipt.get("source_as_of"), str)
+                    or _bar_time({"bar_time": receipt["source_as_of"]}) is None):
+                return None
         times = [_bar_time(row) for row in candles]
         if (any(value is None for value in times)
-                or any(row.get("timeframe_minutes") != 1 for row in candles)
+                or any(row.get("timeframe_minutes") != interval for row in candles)
                 or times != sorted(set(times))):
+            return None
+        if interval == 3 and any(
+            row.get("market_data_identity") != "005930_AL"
+            or row.get("market_source") != "INTEGRATED"
+            or row.get("display_only") is not True
+            or row.get("is_complete") is not True
+            or any(type(row.get(key)) not in (int, float) for key in
+                   ("open", "high", "low", "close", "volume"))
+            for row in candles
+        ):
             return None
         side_text = str(side or "NONE").strip().upper()
         if side_text not in {"BUY", "SELL", "NONE"}:
             return None
-        return {
-            "stock": stock, "timeframe": "M1", "rules_hash": _hash(rules),
+        direct_rows = ([{
+            "time": time.strftime("%Y%m%d%H%M%S"),
+            **{key: row[key] for key in ("open", "high", "low", "close", "volume")},
+        } for time, row in zip(times, candles)] if interval == 3 else None)
+        marker = {
+            "stock": stock, "timeframe": f"M{interval}", "rules_hash": _hash(rules),
             "evaluation_time": times[-1].strftime("%Y%m%d%H%M%S"),
             "market_data_identity": "005930_AL", "source_proof": _SOURCE_PROOF,
-            "input_hash": _hash(candles), "side": side_text,
+            "input_hash": _hash(candles if interval == 1 else direct_rows),
+            "side": side_text,
         }
+        if interval == 3:
+            marker["source_identity"] = source["source_identity"]
+            marker["receipt_hash"] = _hash(direct_rows[-1])
+            marker["source_session_sha256"] = receipt["session_sha256"]
+            marker["source_connection_epoch"] = receipt["connection_epoch"]
+        return marker
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -137,7 +182,8 @@ def _extract(marked: list[tuple[Any, Any]], *, consumer: str,
         "origin_proof": f"{consumer}_{'ROUTINE_EVALUATED' if consumer == 'MOCK' else 'ROUTINE_OUTPUT'}:{_hash(proof_data)}",
         "stock": "005930", "timeframe": "M1",
         "rules_hash": first["rules_hash"], "cutoff": cutoff,
-        "market_data_identity": "005930_AL", "events": events,
+        "market_data_identity": "005930_AL", "source_proof": _SOURCE_PROOF,
+        "events": events,
     }
 
 
