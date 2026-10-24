@@ -2098,6 +2098,7 @@ class MarketDataHost(QObject):
             "stock_code": code,
             "timeframe_minutes": interval,
             "projection": projection,
+            "calculation_as_of": as_of.isoformat() if isinstance(as_of, datetime) else "",
             "available": False,
             "candles": [],
             "market_source": "INTEGRATED",
@@ -2173,7 +2174,7 @@ class MarketDataHost(QObject):
             session_identity = MarketDataHost._current_display_session_identity(self)
             if session_identity is None:
                 return blocked("SOR_DIRECT_SESSION_UNAVAILABLE")
-            source_identity = canonical_candle_content_hash(completed)
+            source_identity = canonical_candle_content_hash(projected["candles"])
             return {
                 **base, **projected,
                 "source_identity": source_identity,
@@ -2400,6 +2401,21 @@ class MarketDataHost(QObject):
                 forming_minute.get("snapshot_received_at") if forming_minute else ""
             ),
         }
+        if interval > 1 and direct_completed:
+            identity = MarketDataHost._current_display_session_identity(self)
+            if identity is None:
+                return blocked("SOR_DIRECT_SESSION_UNAVAILABLE")
+            direct_identity = canonical_candle_content_hash(
+                [row for row in candles if row.get("is_complete") is True]
+            )
+            result["direct_source_identity"] = direct_identity
+            result["direct_source_receipt"] = {
+                "stock_code": code, "timeframe_key": f"M{interval}",
+                "source_content_sha256": direct_identity,
+                "connection_epoch": identity[0],
+                "session_sha256": sha256(identity[1].encode("utf-8")).hexdigest(),
+                "source_as_of": as_of.isoformat(),
+            }
         if interval == 1 and projection == "COMPLETED_TIMEFRAME":
             identity = MarketDataHost._current_display_session_identity(self)
             if identity is not None and identity == _host_attr(

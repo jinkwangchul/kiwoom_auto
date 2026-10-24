@@ -20,6 +20,13 @@ from candle_timeframe_aggregation import (
 from kiwoom_candle_adapter import normalize_opt10080_rows
 
 
+_DIRECT_SESSION_MINUTES = {
+    "NXT_PRE": (8 * 60, 8 * 60 + 50),
+    "KRX": (9 * 60, 15 * 60 + 30),
+    "NXT_AFTER": (15 * 60 + 40, 20 * 60),
+}
+
+
 def is_production_market_data_callback(callback: Callable[..., Any] | None) -> bool:
     """Return True for callbacks owned by Production MarketDataHost."""
 
@@ -232,13 +239,17 @@ def project_mock_sor_calculation_snapshot(
         if (not isinstance(value, dict)
                 or value.get("calculation_as_of") != as_of.isoformat()):
             return blocked
+        direct_completed = interval > 1 and request["projection"] == "COMPLETED_TIMEFRAME"
+        direct_forming = interval > 1 and request["projection"] == "FORMING_BASE_BAR"
         if (not isinstance(value, dict) or value.get("available") is not True
                 or value.get("stock_code") != stock_code
                 or value.get("timeframe_minutes") != interval
                 or value.get("projection") != request["projection"]
                 or value.get("market_source") != "INTEGRATED"
                 or value.get("market_data_identity") != f"{stock_code}_AL"
-                or value.get("calculation_source") != "BROKER_AL_CONFIRMED_M1"
+                or value.get("calculation_source") != (
+                    "BROKER_AL_CONFIRMED_DIRECT" if direct_completed
+                    else "BROKER_AL_CONFIRMED_M1")
                 or value.get("source_proof") != "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
                 or value.get("calculation_only") is not True
                 or value.get("execution_enabled") is not False
@@ -247,6 +258,40 @@ def project_mock_sor_calculation_snapshot(
             return blocked
         rows = value.get("candles")
         if not isinstance(rows, list) or not 0 < len(rows) <= 10000:
+            return blocked
+        direct = direct_completed or direct_forming
+        if direct:
+            if (value.get("direct_timeframe_source") is not True
+                    or value.get("available_timeframe_bars") != len(rows)
+                    or value.get("direct_history_source") != "BROKER_AL_CONFIRMED_DIRECT"
+                    or value.get("complete") is not (not direct_forming)
+                    or value.get("forming_included") is not direct_forming):
+                return blocked
+            receipt = value.get("direct_source_receipt")
+            source_identity = (value.get("source_identity") if direct_completed
+                               else value.get("direct_source_identity"))
+            if (not isinstance(receipt, dict)
+                    or set(receipt) != {"stock_code", "timeframe_key",
+                                            "source_content_sha256", "connection_epoch",
+                                            "session_sha256", "source_as_of"}
+                    or receipt.get("stock_code") != stock_code
+                    or receipt.get("timeframe_key") != f"M{interval}"
+                    or receipt.get("source_as_of") != as_of.isoformat()
+                    or type(receipt.get("connection_epoch")) is not int
+                    or receipt["connection_epoch"] <= 0
+                    or not isinstance(source_identity, str)
+                    or receipt.get("source_content_sha256") != source_identity
+                    or (direct_forming and (
+                        not isinstance(value.get("source_identity"), str)
+                        or len(value["source_identity"]) != 64
+                        or any(ch not in "0123456789abcdef"
+                               for ch in value["source_identity"])))
+                    or any(not isinstance(receipt.get(key), str)
+                           or len(receipt[key]) != 64
+                           or any(ch not in "0123456789abcdef" for ch in receipt[key])
+                           for key in ("source_content_sha256", "session_sha256"))):
+                return blocked
+        elif interval == 1 and value.get("direct_history_source") == "BROKER_AL_CONFIRMED_DIRECT":
             return blocked
         previous = None
         completed = 0
@@ -271,25 +316,49 @@ def project_mock_sor_calculation_snapshot(
                 return blocked
             complete = row.get("is_complete")
             if complete is True:
-                if stamp + timedelta(minutes=interval) > as_of:
+                if not direct and stamp + timedelta(minutes=interval) > as_of:
                     return blocked
+                if direct:
+                    window = _DIRECT_SESSION_MINUTES.get(row["session"])
+                    minute = stamp.hour * 60 + stamp.minute
+                    if (window is None or not window[0] <= minute < window[1]
+                            or min(stamp + timedelta(minutes=interval),
+                                   stamp.replace(hour=window[1] // 60,
+                                                 minute=window[1] % 60,
+                                                 second=0, microsecond=0))
+                            > as_of.replace(second=0, microsecond=0)):
+                        return blocked
                 completed += 1
             elif (complete is not False or request["projection"] != "FORMING_BASE_BAR"
                   or index != len(rows) - 1 or stamp.date() != as_of.date()):
                 return blocked
-            detached.append({key: row[key] for key in (
+            if direct and complete is True and (
+                row.get("market_source") != "INTEGRATED"
+                or row.get("market_data_identity") != f"{stock_code}_AL"
+                or row.get("display_only") is not True
+            ):
+                return blocked
+            detached.append(deepcopy(row) if direct else {key: row[key] for key in (
                 "bar_time", "open", "high", "low", "close", "volume",
                 "timeframe_minutes", "is_complete", "trade_date", "session",
             )})
+        if direct and (completed == 0 or canonical_candle_content_hash(
+            detached if direct_completed else detached[:-1]
+        ) != source_identity):
+            return blocked
         if (previous.date() != as_of.date()
                 or as_of - previous > timedelta(minutes=interval + 1)
                 or completed < request.get("warmup_bars", 0)
+                or ("history_target_bars" in request
+                    and len(rows) < request["history_target_bars"])
                 or (request["projection"] == "FORMING_BASE_BAR"
                     and rows[-1].get("is_complete") is not False)):
             return blocked
         if request["projection"] == "FORMING_BASE_BAR":
             received = datetime.fromisoformat(value["forming_snapshot_received_at"])
-            if (value.get("forming_snapshot_source") != "BROKER_AL_TR_FORMING_M1"
+            if (value.get("forming_snapshot_source") not in (
+                    {"BROKER_AL_TR_FORMING_M1", "BROKER_AL_PARITY_NATIVE_FORMING_M1"}
+                    if direct_forming else {"BROKER_AL_TR_FORMING_M1"})
                     or received.utcoffset() != timedelta(hours=9)
                     or received.replace(second=0, microsecond=0)
                        != as_of.replace(second=0, microsecond=0)
@@ -325,12 +394,22 @@ def project_mock_sor_calculation_snapshot(
                 "stock_code": stock_code, "timeframe_minutes": interval,
                 "projection": request["projection"], "market_source": "INTEGRATED",
                 "market_data_identity": f"{stock_code}_AL",
-                "calculation_source": "BROKER_AL_CONFIRMED_M1",
+                "calculation_source": value["calculation_source"],
                 "source_proof": "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION",
                 "calculation_only": True, "execution_enabled": False,
                 "queue_connected": False, "send_order_connected": False}
         if receipt_present:
             result["sor_source_receipt"] = deepcopy(receipt)
+        if direct:
+            result.update(
+                direct_history_source="BROKER_AL_CONFIRMED_DIRECT",
+                direct_source_receipt=deepcopy(value["direct_source_receipt"]),
+                source_identity=value["source_identity"],
+                complete=value["complete"],
+                forming_included=value["forming_included"],
+            )
+            if direct_forming:
+                result["direct_source_identity"] = value["direct_source_identity"]
         return result
     except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
         return blocked
