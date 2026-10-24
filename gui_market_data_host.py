@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from hashlib import sha256
+import json
 import logging
 from math import isfinite
 import os
@@ -15,17 +18,22 @@ from typing import Any, Callable
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
-from candle_manager import canonical_candle_content_hash, load_candles
+from candle_manager import (
+    DEFAULT_CANDLES_MAX_COUNT,
+    canonical_candle_content_hash,
+    load_candles,
+)
 from candle_timeframe_aggregation import (
     SEOUL_TIMEZONE,
+    aggregate_minute_candles,
     candle_market_datetime,
-    effective_history_target_minute_candles,
+    normalize_candle_sessions,
     parse_market_datetime,
     project_candle_supply,
     read_canonical_bar_minutes,
-    required_minute_candles,
     validate_market_bar_projection_request,
 )
+from kiwoom_candle_adapter import normalize_opt10080_rows
 from event_journal_production import observe_production_exception
 from gui_stock_data import (
     STOCK_LIBRARY_READY,
@@ -55,8 +63,14 @@ from production_current_price_authority import (
     select_production_current_price_evidence,
 )
 from stock_repository import StockRepository
+from sor_confirmed_m1_registration import ConfirmedSorM1Registration
+from indicator_follow_validation_v5_sor_tail_bridge import apply_verified_sor_tail
+from indicator_follow_signal_validation_runtime_trace import (
+    trace_signal_validation_event,
+)
 from stock_code_contract import (
     canonical_stock_code_from_market_data_identity,
+    is_broker_action_stock_code,
     market_source_for_identity,
 )
 
@@ -69,6 +83,92 @@ ExecutionEntryProvider = Callable[[str], object | None]
 HIGH_RESOLUTION_DATA_NORMAL = "NORMAL"
 HIGH_RESOLUTION_DATA_UNCERTAIN = "UNCERTAIN"
 _PRICE_SIGNAL_OBSERVATION_GENERATION_KEY = "_price_signal_observation_generation"
+
+_DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT = 3
+_DISPLAY_INTEGRATED_SESSIONS = (
+    ("NXT_PRE", 8 * 60, 8 * 60 + 50),
+    ("KRX", 9 * 60, 15 * 60 + 30),
+    ("NXT_AFTER", 15 * 60 + 40, 20 * 60),
+)
+
+
+def _trace_sor_block(
+    owner: object, market: object, *, stock: str, reason: str,
+    as_of: datetime, cutoff: datetime, expected_latest: datetime | None,
+    source_starts: list[str], candidate_starts: list[str],
+    target_starts: list[str], stage: str, branch: str,
+    timeframe_minutes: int,
+) -> None:
+    """Record bounded, session-scoped evidence without affecting the block."""
+    try:
+        key = (stock, reason, cutoff.isoformat(), stage, branch)
+        seen = _host_attr(owner, "_sor_block_diagnostic_keys")
+        if not isinstance(seen, dict):
+            seen = {}
+            object.__setattr__(owner, "_sor_block_diagnostic_keys", seen)
+        if key in seen:
+            return
+        native = _host_attr(market, "_v5_al_native_minutes", {}).get(stock, {})
+        current = native.get("current") if isinstance(native, dict) else None
+        previous = native.get("closed") if isinstance(native, dict) else None
+        direct = _host_attr(market, "_display_timeframe_candles", {}).get((stock, 3), ())
+        identities = _host_attr(market, "_display_timeframe_session_identity", {})
+        identity = identities.get((stock, 3)) if isinstance(identities, dict) else None
+        def summary(starts: list[str]) -> dict[str, object]:
+            return {"count": len(starts), "first": starts[0] if starts else "",
+                    "last": starts[-1] if starts else ""}
+        left, right = ((candidate_starts, target_starts)
+                       if branch == "PROJECTED_TARGET" else
+                       (source_starts, candidate_starts))
+        difference = sorted(set(left) ^ set(right))
+        record = {
+            "kst_time": datetime.now(SEOUL_TIMEZONE).isoformat(timespec="seconds"),
+            "stock": stock, "reason": reason,
+            "as_of": as_of.isoformat(timespec="seconds"),
+            "cutoff": cutoff.isoformat(timespec="seconds"),
+            "expected_latest": (expected_latest.isoformat(timespec="seconds")
+                                if expected_latest else ""),
+            "native_m1": {
+                "current": current.get("minute", "") if isinstance(current, dict) else "",
+                "previous": previous.get("minute", "") if isinstance(previous, dict) else "",
+                "count": sum(isinstance(row, dict) for row in (previous, current)),
+            },
+            "direct_al_m3": {
+                "last": (str(direct[-1].get("bar_time") or "")
+                         if direct and isinstance(direct[-1], dict) else ""),
+                "session_id_sha256": (sha256(identity[1].encode("utf-8")).hexdigest()
+                                      if isinstance(identity, tuple) and len(identity) == 2
+                                      and isinstance(identity[1], str) else ""),
+            },
+            "source": summary(source_starts),
+            "candidate": summary(candidate_starts),
+            "today_target_starts": summary(target_starts),
+            "difference": {"count": len(difference), "sample": difference[:8]},
+            "stage": stage, "branch": branch,
+            "time_unit": "KST", "start_format": "YYYYMMDDHHMMSS",
+            "timeframe_minutes": timeframe_minutes,
+            "session_identity": {
+                "connection_epoch": identity[0] if isinstance(identity, tuple) else None,
+                "login_session_id_sha256": (
+                    sha256(identity[1].encode("utf-8")).hexdigest()
+                    if isinstance(identity, tuple) and len(identity) == 2
+                    and isinstance(identity[1], str) else ""),
+            },
+        }
+        if len(seen) >= 128:
+            seen.pop(next(iter(seen)))
+        seen[key] = None
+        trace_signal_validation_event("v5_sor_block", **record)
+    except Exception:
+        return
+
+
+def _host_attr(host: object, name: str, default: Any = None) -> Any:
+    """Read host state without invoking PyQt's uninitialized QObject fallback."""
+    try:
+        return object.__getattribute__(host, name)
+    except (AttributeError, RuntimeError, TypeError):
+        return default
 
 
 @dataclass(frozen=True)
@@ -182,6 +282,8 @@ class MarketDataHost(QObject):
 
     MAX_PENDING_SHADOW_COMPARISONS = 512
     MAX_RAW_TICK_QUEUE_DEPTH = 512
+    MAX_RAW_TICK_DRAIN_BATCH = 32
+    MAX_NXT_DISPLAY_TICK_DRAIN_BATCH = 32
     MAX_INITIAL_SNAPSHOT_ATTEMPTS_PER_SESSION = 2
 
     @staticmethod
@@ -201,7 +303,38 @@ class MarketDataHost(QObject):
         self._owner = owner
         self.kiwoom_api = kiwoom_api
         self._execution_entry_provider = execution_entry_provider
+        self._sor_m1_registration = ConfirmedSorM1Registration()
         self._shutting_down = False
+        self._sor_tick_evidence_enabled = (
+            os.environ.get("KIWOOM_V5_SOR_TICK_EVIDENCE") == "1"
+        )
+        self._sor_tick_evidence = None
+        self._sor_tick_evidence_error = ""
+        if self._sor_tick_evidence_enabled:
+            try:
+                from sor_tick_evidence import TickEvidenceSampler
+
+                path = (
+                    Path(__file__).parent / "runtime" / "diagnostics"
+                    / "v5_sor_tick_evidence"
+                    / f"ticks-{os.getpid()}-{datetime.now():%Y%m%dT%H%M%S%f}.jsonl"
+                )
+                self._sor_tick_evidence = TickEvidenceSampler(path)
+            except Exception as exc:
+                self._sor_tick_evidence_error = type(exc).__name__
+
+        self._sor_diagnostic_idle_timer = None
+        self._sor_diagnostic_idle_required = False
+        self._sor_diagnostic_idle_inflight = False
+        self._sor_diagnostic_idle_request_generation = 0
+        self._sor_diagnostic_idle_last_attempt_minute = ""
+        if (self._sor_tick_evidence_enabled
+                and os.environ.get("KIWOOM_V5_SOR_DIAGNOSTIC_STOCK_CODE") == "005930"):
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._on_sor_diagnostic_idle_timeout)
+            self._sor_diagnostic_idle_timer = timer
+
 
         self._operation_candle_requests: dict[str, dict[str, object]] = {}
         self._canonical_event_queue: deque[dict[str, object]] = deque()
@@ -228,10 +361,38 @@ class MarketDataHost(QObject):
         self._production_monitoring_stock_codes: tuple[str, ...] = ()
         self._execution_shadow_stock_codes: tuple[str, ...] = ()
         self._candle_observation_stock_codes: tuple[str, ...] = ()
+        self._v5_observation_leases: dict[object, str] = {}
+        self._v5_al_native_minutes: dict[str, dict[str, object]] = {}
+        self._v5_al_parity: dict[str, tuple[int, str]] = {}
+        self._v5_al_tick_signal_bound = False
+        self._v5_watch_generation = 0
+        self._v5_watch_inflight = False
+        self._v5_m3_gap_proof_attempts: set[tuple[object, ...]] = set()
         self._candle_execution_required_by_stock: dict[str, int] = {}
         self._candle_observation_required_by_stock: dict[str, int] = {}
         self._candle_standby_stock_codes: tuple[str, ...] = ()
+        self._sor_m1_required_by_stock: dict[str, int] = {}
+        self._sor_standby_m1_required_by_stock: dict[str, int] = {}
+        self._sor_observation_m1_required_by_stock: dict[str, int] = {}
         self._candle_standby_required_by_stock: dict[str, int] = {}
+        self._candle_execution_timeframe_requirements_by_stock: dict[
+            str, dict[int, int]
+        ] = {}
+        self._candle_observation_timeframe_requirements_by_stock: dict[
+            str, dict[int, int]
+        ] = {}
+        self._candle_standby_timeframe_requirements_by_stock: dict[
+            str, dict[int, int]
+        ] = {}
+        self._direct_timeframe_candles: dict[
+            tuple[str, int], tuple[dict[str, Any], ...]
+        ] = {}
+        self._display_timeframe_candles: dict[
+            tuple[str, int], tuple[dict[str, Any], ...]
+        ] = {}
+        self._display_timeframe_session_identity: dict[
+            tuple[str, int], tuple[int, str]
+        ] = {}
         self._last_candle_observation_refresh_minute = ""
         # In-flight only.  A completed request is represented by an actual
         # valid InitialMarketSnapshotState, not by this deduplication marker.
@@ -322,6 +483,16 @@ class MarketDataHost(QObject):
                     self._observe_exception(exc, "bind_nxt_display_tick")
                 else:
                     self._nxt_display_tick_signal_bound = True
+        if not self._v5_al_tick_signal_bound:
+            signal = getattr(self.kiwoom_api, "v5_al_tick_received", None)
+            connect = getattr(signal, "connect", None)
+            if callable(connect):
+                try:
+                    connect(self._on_v5_al_tick_received)
+                except Exception as exc:
+                    self._observe_exception(exc, "bind_v5_al_tick")
+                else:
+                    self._v5_al_tick_signal_bound = True
         return bool(
             self._bar_committed_signal_bound
             and self._realtime_shadow_signal_bound
@@ -337,11 +508,22 @@ class MarketDataHost(QObject):
                 for code, count in self._candle_execution_required_by_stock.items()
                 if code in self._execution_shadow_stock_codes
             }
+            self._candle_execution_timeframe_requirements_by_stock = {
+                code: dict(values)
+                for code, values in getattr(
+                    self,
+                    "_candle_execution_timeframe_requirements_by_stock",
+                    {},
+                ).items()
+                if code in self._execution_shadow_stock_codes
+                and isinstance(values, dict)
+            }
             target_codes = tuple(
                 sorted(
                     set(self._production_monitoring_stock_codes)
                     | set(self._execution_shadow_stock_codes)
                     | set(self._candle_observation_stock_codes)
+                    | set(_host_attr(self, "_v5_observation_leases", {}).values())
                     | set(getattr(self, "_candle_standby_stock_codes", ()))
                 )
             )
@@ -353,6 +535,7 @@ class MarketDataHost(QObject):
                 # the split local-target method.
                 sync = getattr(self.kiwoom_api, "sync_realtime_shadow_registration", None)
             if not callable(sync):
+                self._sor_m1_registration.sync((), 0, "", False)
                 return {
                     "ok": False,
                     "changed": False,
@@ -370,6 +553,10 @@ class MarketDataHost(QObject):
                 self._clear_session_state()
                 self._market_data_authority.ensure_session(*identity)
                 self._realtime_shadow_session_identity = identity
+            self._sor_m1_registration.sync(
+                self._registration_shadow_targets(registration), *identity,
+                active=bool(getattr(registration, "active", False)),
+            )
             self._market_data_authority.sync_targets(target_codes)
             if not bool(getattr(registration, "active", False)):
                 for code in target_codes:
@@ -383,6 +570,7 @@ class MarketDataHost(QObject):
                     target_codes
                 )
                 return projection
+            self._sor_m1_registration.sync((), 0, "", False)
             return {
                 "ok": False,
                 "changed": False,
@@ -390,6 +578,7 @@ class MarketDataHost(QObject):
                 "reason_code": "REALTIME_SHADOW_RESULT_MALFORMED",
             }
         except Exception as exc:
+            self._sor_m1_registration.sync((), 0, "", False)
             self._observe_exception(exc, "sync_targets")
             return {
                 "ok": False,
@@ -399,40 +588,954 @@ class MarketDataHost(QObject):
                 "error": str(exc),
             }
 
+    def sor_m1_calculation_status(self, stock_code: str) -> dict[str, object]:
+        code = str(stock_code or "").strip()
+        self._sor_registration_current(code)
+        return self._sor_m1_registration.status(code)
+
+    def published_sor_day_for_native_receipt(self, stock_code: str):
+        """Read an existing verified day without any new broker request."""
+        code = str(stock_code or "").strip()
+        if not self._sor_registration_current(code):
+            return None
+        return self._sor_m1_registration.published_day_for_native_receipt(code)
+
+    def _sor_registration_current(self, stock_code: str) -> bool:
+        """Recheck the local broker epoch before exposing calculation data."""
+        try:
+            registration = self.kiwoom_api.realtime_shadow_registration_snapshot()
+            broker = self.kiwoom_api.broker_session_snapshot()
+            identity = self._realtime_shadow_session_identity
+            session_ready = (
+                getattr(registration, "active", False) is True
+                and getattr(broker, "connected", False) is True
+                and identity[0] > 0 and bool(identity[1])
+                and (getattr(registration, "connection_epoch", None),
+                     getattr(registration, "login_session_id", None)) == identity
+                and (getattr(broker, "connection_epoch", None),
+                     getattr(broker, "login_session_id", None)) == identity
+            )
+            target_ready = stock_code in self._registration_shadow_targets(registration)
+        except Exception:
+            session_ready = target_ready = False
+        if not session_ready:
+            self._sor_m1_registration.sync((), 0, "", False)
+        elif not target_ready:
+            self._sor_m1_registration.sync(
+                self._registration_shadow_targets(registration), *identity, True,
+            )
+        return session_ready and target_ready
+
+    def stage_verified_sor_m1(self, batch: object) -> dict[str, object]:
+        code = str(getattr(getattr(batch, "session", None), "stock_code", "") or "")
+        if not self._sor_registration_current(code):
+            return {"status": "BLOCKED", "reason": "REGISTRATION_INACTIVE"}
+        return self._sor_m1_registration.stage(batch)
+
+    def publish_verified_sor_m1(self, batch: object) -> dict[str, object]:
+        code = str(getattr(getattr(batch, "session", None), "stock_code", "") or "")
+        if not self._sor_registration_current(code):
+            return {"status": "BLOCKED", "reason": "REGISTRATION_INACTIVE"}
+        return self._sor_m1_registration.publish(batch)
+
+    def accept_broker_al_m1_receipt(
+        self, plan, started, receipt, *, independently_verified_day=None,
+    ) -> dict[str, object]:
+        """Admit native _AL M1 only when an independent day matches every row.
+
+        Receipt-only candidates remain pending. Never enqueue orders or start
+        a broker request from this passive calculation-input boundary.
+        """
+        from sor_broker_al_m1_handoff import prepare_broker_al_m1_handoff
+
+        code = str(getattr(plan, "stock_code", "") or "")
+        if not self._sor_registration_current(code):
+            return {"status": "BLOCKED", "reason": "REGISTRATION_INACTIVE"}
+        checked = prepare_broker_al_m1_handoff(
+            plan, started, receipt,
+            independently_verified_day=independently_verified_day,
+        )
+        if checked.status != "VERIFIED_INPUT_READY":
+            return {"status": checked.status, "reason": checked.reason,
+                    "matched_rows": checked.matched_rows}
+        existing = self._sor_m1_registration.published_day_for_native_receipt(code)
+        if existing is not None:
+            if existing is not checked.verified_day and existing != checked.verified_day:
+                return {"status": "BLOCKED", "reason": "PUBLISHED_DAY_CONFLICT",
+                        "matched_rows": checked.matched_rows}
+            # Never invalidate installed timeframe tails for the same day.
+            return {"status": "READY", "reason": "VERIFIED_DAY_ALREADY_PUBLISHED",
+                    "matched_rows": checked.matched_rows,
+                    "native_receipt_crosschecked": True}
+        outcome = self.publish_verified_sor_m1(checked.verified_day)
+        return {**outcome, "matched_rows": checked.matched_rows,
+                "native_receipt_crosschecked": outcome.get("status") == "READY"}
+
+    def install_verified_sor_tail(self, timeframe_key: str, batch: object) -> dict[str, object]:
+        code = str(getattr(getattr(batch, "session", None), "stock_code", "") or "")
+        if not self._sor_registration_current(code):
+            return {"status": "BLOCKED", "reason": "REGISTRATION_INACTIVE"}
+        return self._sor_m1_registration.install_tail(timeframe_key, batch)
+
+    def verified_sor_tail_provider(self, session, history_sha256, as_of):
+        stock = getattr(getattr(session, "request", None), "stock", None)
+        key = getattr(getattr(session, "request", None), "timeframe_key", None)
+        code = str(getattr(stock, "code", "") or "")
+        if not self._sor_registration_current(code):
+            return None
+        return self._sor_m1_registration.batch(
+            code, str(key or ""),
+            history_sha256, as_of,
+        )
+
+    def sor_calculation_view(self, view, stock_code, timeframe_key,
+                             timeframe_minutes, as_of, history_sha256):
+        batch = (self._sor_m1_registration.batch(
+            stock_code, timeframe_key, history_sha256, as_of,
+        ) if self._sor_registration_current(stock_code) else None)
+        return apply_verified_sor_tail(
+            view, stock_code=stock_code, timeframe_key=timeframe_key,
+            timeframe_minutes=timeframe_minutes, as_of=as_of,
+            history_sha256=history_sha256, batch=batch,
+        )
+
+    def calculate_verified_sor_signal(
+        self, view, *, stock_code, timeframe_key, timeframe_minutes,
+        as_of, history_sha256, evaluation_at, rules, context=None,
+    ) -> dict[str, object]:
+        """Run the existing routine filters on a detached verified tail only."""
+        if (not isinstance(as_of, datetime)
+                or as_of.tzinfo is None
+                or as_of.utcoffset() != timedelta(hours=9)
+                or not isinstance(evaluation_at, datetime)
+                or evaluation_at.tzinfo is None
+                or evaluation_at.utcoffset() != timedelta(hours=9)
+                or evaluation_at.date() != as_of.date()
+                or evaluation_at < as_of
+                or evaluation_at.replace(second=0, microsecond=0)
+                != as_of.replace(second=0, microsecond=0)
+                or type(timeframe_minutes) is not int
+                or timeframe_key != f"M{timeframe_minutes}"
+                or not isinstance(rules, dict)
+                or (context is not None and not isinstance(context, dict))):
+            raise ValueError("SOR_VERIFIED_BLOCKED:CALCULATION_INPUT")
+        try:
+            if read_canonical_bar_minutes(rules) != timeframe_minutes:
+                raise ValueError("TIMEFRAME_MISMATCH")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SOR_VERIFIED_BLOCKED:TIMEFRAME_MISMATCH") from exc
+
+        verified = self.sor_calculation_view(
+            view, stock_code, timeframe_key, timeframe_minutes,
+            as_of, history_sha256,
+        )
+        if verified.get("sor_tail_calculation_complete") is not True:
+            raise ValueError("SOR_VERIFIED_BLOCKED:TAIL_INCOMPLETE")
+
+        # The routine evaluator reads context['candles'] before its argument.
+        # Retain only calculation facts and force the verified detached series.
+        allowed = (
+            "cycle", "actionable_current_price", "current_price",
+            "average_price", "avg_price", "position_average_price",
+            "average_price_series", "position", "holding",
+        )
+        signal_context = {
+            key: deepcopy(context[key]) for key in allowed
+            if isinstance(context, dict) and key in context
+        }
+        signal_context["candles"] = deepcopy(verified["candles"])
+        from routines.지표추종매매.routine import evaluate_signal_selection
+
+        result = evaluate_signal_selection(
+            signal_context["candles"], deepcopy(rules), signal_context,
+        )
+        return {
+            **result,
+            "calculation_only": True,
+            "execution_enabled": False,
+            "queue_connected": False,
+            "execution_connected": False,
+            "send_order_connected": False,
+            "verified_tail_signature": verified["sor_tail_signature"],
+        }
+
+    def compare_verified_sor_calculations(
+        self, chart_view, live_view, *,
+        stock_code, timeframe_key, timeframe_minutes,
+        as_of, history_sha256, evaluation_at=None, rules=None, context=None,
+    ) -> dict[str, object]:
+        """Compare separately supplied verified chart/live data; no order link."""
+        from sor_calculation_parity import compare_verified_sor_calculations
+        return compare_verified_sor_calculations(
+            self, chart_view, live_view,
+            stock_code=stock_code, timeframe_key=timeframe_key,
+            timeframe_minutes=timeframe_minutes, as_of=as_of,
+            history_sha256=history_sha256, evaluation_at=evaluation_at,
+            rules=rules, context=context,
+        )
+
+    @staticmethod
+    def _direct_timeframe_requirement(
+        rules: dict[str, Any] | None,
+        request: dict[str, Any],
+    ) -> tuple[int, int, int]:
+        interval = read_canonical_bar_minutes(rules)
+        warmup_bars = max(int(request.get("warmup_bars", 1) or 1), 1)
+        history_target_bars = max(
+            int(request.get("history_target_bars", warmup_bars) or warmup_bars),
+            warmup_bars,
+        )
+        direct_bars = min(history_target_bars, DEFAULT_CANDLES_MAX_COUNT)
+        minute_source_count = direct_bars if interval == 1 else interval + 1
+        return interval, direct_bars, minute_source_count
+
+    @staticmethod
+    def _merge_timeframe_requirement(
+        target: dict[str, dict[int, int]],
+        stock_code: str,
+        interval: int,
+        count: int,
+    ) -> None:
+        per_stock = target.setdefault(stock_code, {})
+        per_stock[interval] = max(int(per_stock.get(interval, 0)), int(count))
+
+    def direct_timeframe_requirements(
+        self,
+        stock_code: object,
+    ) -> dict[int, int]:
+        code = str(stock_code or "").strip()
+        merged: dict[int, int] = {}
+        for attribute in (
+            "_candle_execution_timeframe_requirements_by_stock",
+            "_candle_observation_timeframe_requirements_by_stock",
+            "_candle_standby_timeframe_requirements_by_stock",
+        ):
+            mapping = _host_attr(self, attribute, {})
+            if not isinstance(mapping, dict):
+                continue
+            per_stock = mapping.get(code)
+            if not isinstance(per_stock, dict):
+                continue
+            for raw_interval, raw_count in per_stock.items():
+                try:
+                    interval = int(raw_interval)
+                    count = int(raw_count)
+                except (TypeError, ValueError):
+                    continue
+                if interval > 0 and count > 0:
+                    merged[interval] = max(merged.get(interval, 0), count)
+        sor_m1 = _host_attr(self, "_sor_m1_required_by_stock", {})
+        if isinstance(sor_m1, dict):
+            count = sor_m1.get(code)
+            if type(count) is int and 0 < count <= DEFAULT_CANDLES_MAX_COUNT:
+                merged[1] = max(merged.get(1, 0), count)
+        return merged
+
+    @staticmethod
+    def _expected_latest_completed_direct_start(
+        now: datetime,
+        interval: int,
+    ) -> datetime | None:
+        current = now.astimezone(SEOUL_TIMEZONE)
+        anchor = current.replace(hour=9, minute=0, second=0, microsecond=0)
+        close = current.replace(hour=15, minute=30, second=0, microsecond=0)
+        if current < anchor:
+            return None
+        if current >= close:
+            elapsed = int((close - anchor).total_seconds() // 60)
+            bucket_index = max((max(elapsed - 1, 0)) // interval, 0)
+            return anchor + timedelta(minutes=bucket_index * interval)
+        elapsed = int((current - anchor).total_seconds() // 60)
+        completed_count = elapsed // interval
+        if completed_count <= 0:
+            return None
+        return anchor + timedelta(minutes=(completed_count - 1) * interval)
+
+    def direct_timeframe_refresh_specs(
+        self,
+        stock_code: object,
+        minute_key: object,
+    ) -> tuple[dict[str, int], ...]:
+        code = str(stock_code or "").strip()
+        now = parse_market_datetime(minute_key) or datetime.now(SEOUL_TIMEZONE)
+        specs: list[dict[str, int]] = []
+        requirements = MarketDataHost.direct_timeframe_requirements(self, code)
+        sor_standby = _host_attr(self, "_sor_standby_m1_required_by_stock", {})
+        if code in sor_standby:
+            standby = _host_attr(
+                self, "_candle_standby_timeframe_requirements_by_stock", {}
+            ).get(code, {})
+            for interval in standby:
+                other = max(
+                    _host_attr(self, attribute, {}).get(code, {}).get(interval, 0)
+                    for attribute in (
+                        "_candle_execution_timeframe_requirements_by_stock",
+                        "_candle_observation_timeframe_requirements_by_stock",
+                    )
+                )
+                if other:
+                    requirements[interval] = other
+                else:
+                    requirements.pop(interval, None)
+        for interval, required_count in sorted(
+            requirements.items()
+        ):
+            if interval <= 1:
+                continue
+            cached = list(
+                _host_attr(self, "_direct_timeframe_candles", {}).get(
+                    (code, interval), ()
+                )
+            )
+            due = len(cached) < required_count
+            expected_start = MarketDataHost._expected_latest_completed_direct_start(
+                now, interval
+            )
+            if not due and expected_start is not None:
+                latest = (
+                    candle_market_datetime(cached[-1])
+                    if cached
+                    else None
+                )
+                due = latest is None or latest < expected_start
+            if due:
+                specs.append(
+                    {
+                        "timeframe_minutes": interval,
+                        "required_count": required_count,
+                        "request_count": (
+                            min(
+                                required_count + 1,
+                                DEFAULT_CANDLES_MAX_COUNT,
+                            )
+                            if len(cached) < required_count
+                            else min(
+                                _DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT,
+                                DEFAULT_CANDLES_MAX_COUNT,
+                            )
+                        ),
+                    }
+                )
+        return tuple(specs)
+
+    def operation_candle_request_cost(
+        self,
+        stock_code: object,
+        minute_key: object,
+    ) -> int:
+        return 1 + len(
+            MarketDataHost.direct_timeframe_refresh_specs(
+                self, stock_code, minute_key
+            )
+        ) + len(
+            MarketDataHost.display_timeframe_refresh_specs(
+                self, stock_code, minute_key
+            )
+        )
+
+    def install_direct_timeframe_candles(
+        self,
+        stock_code: object,
+        timeframe_minutes: object,
+        rows: object,
+        *,
+        as_of: datetime | None = None,
+    ) -> dict[str, object]:
+        code = str(stock_code or "").strip()
+        try:
+            interval = int(timeframe_minutes)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason_code": "DIRECT_TIMEFRAME_INVALID"}
+        if not code or interval <= 1 or not isinstance(rows, list):
+            return {"ok": False, "reason_code": "DIRECT_TIMEFRAME_INVALID"}
+        current = as_of or datetime.now(SEOUL_TIMEZONE)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=SEOUL_TIMEZONE)
+        else:
+            current = current.astimezone(SEOUL_TIMEZONE)
+        normalized = normalize_opt10080_rows(rows)
+        complete_by_time: dict[datetime, dict[str, Any]] = {}
+        current_minute = current.hour * 60 + current.minute
+        for candle in normalized:
+            bar_time = candle_market_datetime(candle)
+            if bar_time is None:
+                continue
+            same_day = bar_time.date() == current.date()
+            bar_minute = bar_time.hour * 60 + bar_time.minute
+            complete = (
+                bar_time.date() < current.date()
+                or current >= bar_time + timedelta(minutes=interval)
+                or (
+                    same_day
+                    and current_minute >= 15 * 60 + 30
+                    and 9 * 60 <= bar_minute < 15 * 60 + 30
+                )
+            )
+            if not complete:
+                continue
+            complete_by_time[bar_time] = {
+                "bar_time": bar_time.isoformat(timespec="seconds"),
+                "open": candle.get("open"),
+                "high": candle.get("high"),
+                "low": candle.get("low"),
+                "close": candle.get("close"),
+                "volume": candle.get("volume"),
+                "timeframe_minutes": interval,
+                "is_complete": True,
+                "trade_date": bar_time.date().isoformat(),
+                "session": "regular",
+            }
+        cache = _host_attr(self, "_direct_timeframe_candles", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            object.__setattr__(self, "_direct_timeframe_candles", cache)
+        existing = cache.get((code, interval), ())
+        for candle in existing:
+            bar_time = candle_market_datetime(candle)
+            if bar_time is not None:
+                complete_by_time.setdefault(bar_time, dict(candle))
+        required_count = MarketDataHost.direct_timeframe_requirements(
+            self, code
+        ).get(interval, len(complete_by_time))
+        ordered = [
+            complete_by_time[key]
+            for key in sorted(complete_by_time)
+        ]
+        if required_count > 0:
+            ordered = ordered[-required_count:]
+        cache[(code, interval)] = tuple(ordered)
+        return {
+            "ok": bool(ordered),
+            "reason_code": (
+                "DIRECT_TIMEFRAME_READY"
+                if ordered
+                else "DIRECT_TIMEFRAME_EMPTY"
+            ),
+            "stock_code": code,
+            "timeframe_minutes": interval,
+            "stored_count": len(ordered),
+            "latest_bar_time": (
+                str(ordered[-1].get("bar_time") or "")
+                if ordered
+                else ""
+            ),
+        }
+
+    @staticmethod
+    def _display_session_for_time(bar_time: datetime) -> str:
+        minute = bar_time.hour * 60 + bar_time.minute
+        for name, start, end in _DISPLAY_INTEGRATED_SESSIONS:
+            if start <= minute < end:
+                return name
+        if 15 * 60 + 30 <= minute < 15 * 60 + 40:
+            return "AL_TRANSITION"
+        return ""
+
+    @staticmethod
+    def _full_day_display_count(interval: int) -> int:
+        return sum(
+            (end - start + interval - 1) // interval
+            for _name, start, end in _DISPLAY_INTEGRATED_SESSIONS
+        )
+
+    @staticmethod
+    def _expected_latest_completed_display_start(
+        now: datetime,
+        interval: int,
+    ) -> datetime | None:
+        current = now.astimezone(SEOUL_TIMEZONE)
+        candidates: list[datetime] = []
+        for _name, start, end in _DISPLAY_INTEGRATED_SESSIONS:
+            session_start = current.replace(
+                hour=start // 60,
+                minute=start % 60,
+                second=0,
+                microsecond=0,
+            )
+            session_end = current.replace(
+                hour=end // 60,
+                minute=end % 60,
+                second=0,
+                microsecond=0,
+            )
+            effective_end = min(current, session_end)
+            if effective_end <= session_start:
+                continue
+            elapsed = int((effective_end - session_start).total_seconds() // 60)
+            completed_count = (
+                (end - start + interval - 1) // interval
+                if current >= session_end
+                else elapsed // interval
+            )
+            if completed_count > 0:
+                candidates.append(
+                    session_start + timedelta(
+                        minutes=(completed_count - 1) * interval
+                    )
+                )
+        return max(candidates) if candidates else None
+
+    def display_timeframe_refresh_specs(
+        self,
+        stock_code: object,
+        minute_key: object,
+    ) -> tuple[dict[str, int], ...]:
+        code = str(stock_code or "").strip()
+        if code not in MarketDataHost._nxt_eligible_targets((code,)):
+            return ()
+        now = parse_market_datetime(minute_key) or datetime.now(SEOUL_TIMEZONE)
+        specs: list[dict[str, int]] = []
+        for interval, required_count in sorted(
+            MarketDataHost.direct_timeframe_requirements(self, code).items()
+        ):
+            display_required_count = required_count if interval == 1 else max(
+                required_count,
+                MarketDataHost._full_day_display_count(interval),
+            )
+            cached = MarketDataHost._current_display_candles(self, code, interval)
+            due = len(cached) < display_required_count
+            sor_targets = _host_attr(self, "_sor_m1_required_by_stock", {})
+            if (not due and interval == 1
+                    and isinstance(sor_targets, dict)
+                    and code in sor_targets
+                    and MarketDataHost._display_session_for_time(now)
+                    in {"NXT_PRE", "KRX", "NXT_AFTER"}):
+                # Include a current-minute integrated TR snapshot in the
+                # existing once-per-minute governed request cadence.
+                forming = _host_attr(self, "_sor_forming_m1_by_stock", {})
+                entry = forming.get(code) if isinstance(forming, dict) else None
+                candle = entry.get("candle") if isinstance(entry, dict) else None
+                due = (
+                    not isinstance(entry, dict)
+                    or entry.get("session_identity")
+                    != MarketDataHost._current_display_session_identity(self)
+                    or not isinstance(candle, dict)
+                    or candle_market_datetime(candle)
+                    != now.replace(second=0, microsecond=0)
+                )
+            expected = MarketDataHost._expected_latest_completed_display_start(
+                now,
+                interval,
+            )
+            if not due and expected is not None:
+                latest = candle_market_datetime(cached[-1]) if cached else None
+                due = latest is None or latest < expected
+            if due:
+                specs.append(
+                    {
+                        "timeframe_minutes": interval,
+                        "required_count": display_required_count,
+                        "nxt_available": True,
+                        "request_count": min(
+                            display_required_count + 1
+                            if len(cached) < display_required_count
+                            else _DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT,
+                            DEFAULT_CANDLES_MAX_COUNT,
+                        ),
+                    }
+                )
+        return tuple(specs)
+
+    def _current_display_session_identity(self) -> tuple[int, str] | None:
+        try:
+            getter = getattr(_host_attr(self, "kiwoom_api"), "broker_session_snapshot", None)
+            session = getter() if callable(getter) else None
+            epoch = getattr(session, "connection_epoch", None)
+            login_id = getattr(session, "login_session_id", None)
+            if (getattr(session, "connected", None) is True
+                    and type(epoch) is int and epoch > 0
+                    and isinstance(login_id, str) and bool(login_id)):
+                return epoch, login_id
+        except Exception:
+            pass
+        return None
+
+    def _arm_sor_diagnostic_idle_timer(self, now: datetime | None = None) -> None:
+        timer = _host_attr(self, "_sor_diagnostic_idle_timer")
+        if timer is None:
+            return
+        if (self._shutting_down
+                or not _host_attr(self, "_sor_diagnostic_idle_required", False)
+                or "005930" not in _host_attr(self, "_sor_m1_required_by_stock", {})
+                or "005930" not in _host_attr(self, "_candle_standby_stock_codes", ())):
+            timer.stop()
+            return
+        current = now or datetime.now(SEOUL_TIMEZONE)
+        current = current.astimezone(SEOUL_TIMEZONE)
+        next_at = current.replace(second=10, microsecond=0)
+        if next_at <= current:
+            next_at += timedelta(minutes=1)
+        timer.start(max(1, int((next_at - current).total_seconds() * 1000)))
+
+    def _on_sor_diagnostic_idle_timeout(self, now: datetime | None = None) -> None:
+        current = (now or datetime.now(SEOUL_TIMEZONE)).astimezone(SEOUL_TIMEZONE)
+        MarketDataHost._arm_sor_diagnostic_idle_timer(self, current)
+        code = "005930"
+        if (self._shutting_down
+                or not _host_attr(self, "_sor_diagnostic_idle_required", False)
+                or code not in _host_attr(self, "_sor_m1_required_by_stock", {})
+                or code not in _host_attr(self, "_candle_standby_stock_codes", ())
+                or MarketDataHost._display_session_for_time(current)
+                not in {"NXT_PRE", "KRX", "NXT_AFTER"}
+                or _host_attr(self, "_automatic_candle_refresh_inflight", False)
+                or self._sor_diagnostic_idle_inflight):
+            return
+        operation_timer_getter = getattr(self._owner, "operation_timer", None)
+        operation_timer = (
+            operation_timer_getter()
+            if callable(operation_timer_getter)
+            else None
+        )
+        if operation_timer is None or operation_timer.isActive():
+            return
+        identity = MarketDataHost._current_display_session_identity(self)
+        if identity is None or code not in MarketDataHost._nxt_eligible_targets((code,)):
+            return
+        minute = current.replace(second=0, microsecond=0)
+        minute_key = minute.strftime("%Y-%m-%d %H:%M")
+        if self._sor_diagnostic_idle_last_attempt_minute == minute_key:
+            return
+        forming = _host_attr(self, "_sor_forming_m1_by_stock", {}).get(code)
+        if (isinstance(forming, dict)
+                and forming.get("session_identity") == identity
+                and isinstance(forming.get("candle"), dict)
+                and candle_market_datetime(forming["candle"]) == minute):
+            return
+        try:
+            specs = MarketDataHost.display_timeframe_refresh_specs(self, code, minute_key)
+            selected = next((spec for spec in specs
+                             if spec.get("timeframe_minutes") == 1
+                             and spec.get("nxt_available") is True), None)
+            if selected is None:
+                return
+            request_count = int(selected["request_count"])
+        except Exception:
+            return
+        self._sor_diagnostic_idle_last_attempt_minute = minute_key
+        self._sor_diagnostic_idle_inflight = True
+        self._sor_diagnostic_idle_request_generation += 1
+        generation = self._sor_diagnostic_idle_request_generation
+
+        def terminal(_result: object) -> None:
+            if generation == self._sor_diagnostic_idle_request_generation:
+                self._sor_diagnostic_idle_inflight = False
+
+        try:
+            from auto_candle_refresh import request_display_timeframe_candles_for_stock
+
+            request_display_timeframe_candles_for_stock(
+                window=self, code=code, name="",
+                operation_cycle_minute_key=minute_key,
+                timeframe_minutes=1, count=request_count,
+                nxt_available=True, on_terminal=terminal,
+            )
+        except Exception:
+            terminal(None)
+
+    def _current_display_candles(
+        self, stock_code: str, timeframe_minutes: int
+    ) -> list[dict[str, Any]]:
+        cache = _host_attr(self, "_display_timeframe_candles", {})
+        identities = _host_attr(self, "_display_timeframe_session_identity", {})
+        key = (stock_code, timeframe_minutes)
+        if (not isinstance(cache, dict) or not cache.get(key)
+                or not isinstance(identities, dict)):
+            return []
+        current = MarketDataHost._current_display_session_identity(self)
+        if current is None or identities.get(key) != current:
+            return []
+        return list(cache.get(key, ()))
+
+    def install_display_timeframe_candles(
+        self,
+        stock_code: object,
+        timeframe_minutes: object,
+        rows: object,
+        *,
+        as_of: datetime | None = None,
+        market_data_identity: object = "",
+        market_source: object = "",
+        display_only: object = False,
+        request_as_of: object = None,
+        received_at: object = None,
+        connection_epoch: object = None,
+        login_session_id: object = "",
+    ) -> dict[str, object]:
+        code = str(stock_code or "").strip()
+        session_identity = MarketDataHost._current_display_session_identity(self)
+        try:
+            interval = int(timeframe_minutes)
+        except (TypeError, ValueError):
+            interval = 0
+        if (
+            _host_attr(self, "_shutting_down", False)
+            or not is_broker_action_stock_code(code)
+            or interval <= 0
+            or not isinstance(rows, list)
+            or str(market_data_identity or "").strip() != f"{code}_AL"
+            or str(market_source or "").strip() != "INTEGRATED"
+            or display_only is not True
+            or session_identity is None
+            or type(connection_epoch) is not int
+            or connection_epoch <= 0
+            or not isinstance(login_session_id, str)
+            or not login_session_id
+            or (connection_epoch, login_session_id) != session_identity
+            or code not in MarketDataHost._nxt_eligible_targets((code,))
+        ):
+            return {
+                "ok": False,
+                "reason_code": "DISPLAY_TIMEFRAME_EVIDENCE_INVALID",
+            }
+
+        current = as_of or datetime.now(SEOUL_TIMEZONE)
+        current = (
+            current.replace(tzinfo=SEOUL_TIMEZONE)
+            if current.tzinfo is None
+            else current.astimezone(SEOUL_TIMEZONE)
+        )
+        complete_by_time: dict[datetime, dict[str, Any]] = {}
+        forming_cutoff = None
+        if interval == 1 and isinstance(request_as_of, str) and isinstance(received_at, str):
+            try:
+                requested = datetime.fromisoformat(request_as_of)
+                received = datetime.fromisoformat(received_at)
+                if (requested.utcoffset() == received.utcoffset() == timedelta(hours=9)
+                        and requested <= received
+                        and received - requested < timedelta(minutes=1)
+                        and requested.replace(second=0, microsecond=0)
+                        == received.replace(second=0, microsecond=0)
+                        == current.replace(second=0, microsecond=0)):
+                    forming_cutoff = received
+            except (TypeError, ValueError, OverflowError):
+                pass
+        forming_snapshot = None
+        for candle in normalize_opt10080_rows(rows):
+            bar_time = candle_market_datetime(candle)
+            if bar_time is None:
+                continue
+            session = MarketDataHost._display_session_for_time(bar_time)
+            if not session:
+                continue
+            session_end_minute = (
+                15 * 60 + 40 if session == "AL_TRANSITION" else next(
+                    end
+                    for name, _start, end in _DISPLAY_INTEGRATED_SESSIONS
+                    if name == session
+                )
+            )
+            session_end = bar_time.replace(
+                hour=session_end_minute // 60,
+                minute=session_end_minute % 60,
+                second=0,
+                microsecond=0,
+            )
+            complete_at = min(
+                bar_time + timedelta(minutes=interval),
+                session_end,
+            )
+            if bar_time.date() >= current.date() and current < complete_at:
+                if (forming_cutoff is not None and interval == 1
+                        and bar_time == forming_cutoff.replace(second=0, microsecond=0)
+                        and bar_time == current.replace(second=0, microsecond=0)):
+                    prices = tuple(candle.get(field) for field in
+                                   ("open", "high", "low", "close", "volume"))
+                    if (all(type(value) in (int, float) and isfinite(value)
+                            for value in prices)
+                            and prices[2] > 0 and prices[4] >= 0
+                            and prices[2] <= prices[0] <= prices[1]
+                            and prices[2] <= prices[3] <= prices[1]):
+                        forming_snapshot = {
+                            "bar_time": bar_time.isoformat(timespec="seconds"),
+                            "open": prices[0], "high": prices[1],
+                            "low": prices[2], "close": prices[3],
+                            "volume": prices[4], "timeframe_minutes": 1,
+                            "is_complete": False, "trade_date": bar_time.date().isoformat(),
+                            "session": session,
+                            "display_only": True,
+                            "market_data_identity": f"{code}_AL",
+                            "market_source": "INTEGRATED",
+                            "snapshot_source": "BROKER_AL_TR_FORMING_M1",
+                            "snapshot_request_as_of": request_as_of,
+                            "snapshot_received_at": received_at,
+                        }
+                continue
+            complete_by_time[bar_time] = {
+                "bar_time": bar_time.isoformat(timespec="seconds"),
+                "open": candle.get("open"),
+                "high": candle.get("high"),
+                "low": candle.get("low"),
+                "close": candle.get("close"),
+                "volume": candle.get("volume"),
+                "timeframe_minutes": interval,
+                "is_complete": True,
+                "trade_date": bar_time.date().isoformat(),
+                "session": session,
+                "display_only": True,
+                "market_data_identity": f"{code}_AL",
+                "market_source": "INTEGRATED",
+            }
+
+        cache = _host_attr(self, "_display_timeframe_candles", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            object.__setattr__(self, "_display_timeframe_candles", cache)
+        for candle in MarketDataHost._current_display_candles(self, code, interval):
+            bar_time = candle_market_datetime(candle)
+            if bar_time is not None:
+                complete_by_time.setdefault(bar_time, dict(candle))
+        routine_required_count = MarketDataHost.direct_timeframe_requirements(
+            self,
+            code,
+        ).get(interval, 0)
+        use_declared_m1 = interval == 1 and routine_required_count > 0
+        required_count = routine_required_count if use_declared_m1 else max(
+            routine_required_count,
+            MarketDataHost._full_day_display_count(interval),
+        )
+        ordered = [complete_by_time[key] for key in sorted(complete_by_time)]
+        if required_count > 0:
+            ordered = ordered[-required_count:]
+        if MarketDataHost._current_display_session_identity(self) != session_identity:
+            return {"ok": False, "reason_code": "DISPLAY_TIMEFRAME_EVIDENCE_INVALID"}
+        identities = _host_attr(self, "_display_timeframe_session_identity", None)
+        if not isinstance(identities, dict):
+            identities = {}
+            object.__setattr__(self, "_display_timeframe_session_identity", identities)
+        cache[(code, interval)] = tuple(ordered)
+        identities[(code, interval)] = (connection_epoch, login_session_id)
+        if interval == 1:
+            MarketDataHost._v5_al_consider_parity(self, code, ordered)
+            forming_cache = _host_attr(self, "_sor_forming_m1_by_stock", None)
+            if not isinstance(forming_cache, dict):
+                forming_cache = {}
+                object.__setattr__(self, "_sor_forming_m1_by_stock", forming_cache)
+            if forming_snapshot is None:
+                forming_cache.pop(code, None)
+            else:
+                forming_cache[code] = {
+                    "session_identity": session_identity,
+                    "candle": forming_snapshot,
+                }
+                MarketDataHost._v5_al_admit_forming(self, code)
+                if ordered:
+                    sampler = _host_attr(self, "_sor_tick_evidence", None)
+                    if sampler is not None:
+                        try:
+                            sampler.capture_accepted_al_m1(
+                                code, forming_snapshot,
+                                connection_epoch=connection_epoch,
+                                login_session_id=login_session_id,
+                                completed_count=len(ordered),
+                            )
+                        except Exception as exc:
+                            try:
+                                sampler.note_capture_failure(exc)
+                            except Exception:
+                                pass  # Telemetry cannot interrupt accepted market data.
+                    observed = _host_attr(self, "market_data_observed", None)
+                    emit = getattr(observed, "emit", None)
+                    if callable(emit):
+                        try:
+                            emit({
+                                "source": "SOR_AL_M1_SNAPSHOT_ACCEPTED",
+                                "stock_code": code,
+                                "market_data_identity": f"{code}_AL",
+                                "connection_epoch": connection_epoch,
+                                "login_session_id": login_session_id,
+                                "snapshot_received_at": forming_snapshot["snapshot_received_at"],
+                                "forming_minute": forming_snapshot["bar_time"],
+                            })
+                        except Exception:
+                            pass  # Optional observers cannot interrupt accepted market data.
+        return {
+            "ok": bool(ordered),
+            "reason_code": (
+                "DISPLAY_TIMEFRAME_READY"
+                if ordered
+                else "DISPLAY_TIMEFRAME_EMPTY"
+            ),
+            "stock_code": code,
+            "timeframe_minutes": interval,
+            "stored_count": len(ordered),
+            "display_only": True,
+            "market_data_identity": f"{code}_AL",
+            "market_source": "INTEGRATED",
+        }
+
+    def _display_timeframe_projection(
+        self,
+        stock_code: str,
+        timeframe_minutes: int,
+    ) -> dict[str, Any]:
+        if stock_code not in MarketDataHost._nxt_eligible_targets((stock_code,)):
+            return {"display_candles": [], "display_metadata": {"available": False}}
+        rows = MarketDataHost._current_display_candles(
+            self, stock_code, timeframe_minutes
+        )
+        return {
+            "display_candles": [dict(item) for item in rows],
+            "display_metadata": {
+                "available": bool(rows),
+                "display_only": True,
+                "market_data_identity": f"{stock_code}_AL",
+                "market_source": "INTEGRATED",
+                "timeframe_minutes": timeframe_minutes,
+                "stored_count": len(rows),
+            },
+        }
+
     def sync_candle_observation_targets(self, stock_codes: object) -> dict[str, object]:
         """Keep non-executing Candle consumers in the existing Shadow pipeline."""
         previous_codes = tuple(self._candle_observation_stock_codes)
         previous_requirements = dict(self._candle_observation_required_by_stock)
+        previous_timeframe_requirements = {
+            code: dict(values)
+            for code, values in getattr(
+                self,
+                "_candle_observation_timeframe_requirements_by_stock",
+                {},
+            ).items()
+            if isinstance(values, dict)
+        }
+        previous_sor_m1 = dict(_host_attr(self, "_sor_observation_m1_required_by_stock", {}))
         candidates = stock_codes if isinstance(stock_codes, (list, tuple, set, frozenset)) else ()
         requested: dict[str, int] = {}
+        timeframe_requested: dict[str, dict[int, int]] = {}
+        sor_m1_required: dict[str, int] = {}
         normalized_codes: set[str] = set()
         for item in candidates:
             if isinstance(item, dict):
                 code = str(item.get("stock_code") or "").strip()
                 if not code:
                     continue
+                if str(item.get("calculation_market_source", "SOR")).strip().upper() != "SOR":
+                    continue
                 try:
-                    interval = read_canonical_bar_minutes(item.get("rules"))
                     request = validate_market_bar_projection_request(
                         item.get("projection_request"),
                         require_warmup=True,
                     )
-                    warmup_requirement = required_minute_candles(
-                        interval,
-                        int(request["warmup_bars"]),
-                    )
-                    if not warmup_requirement["within_limit"]:
-                        raise ValueError(str(warmup_requirement["reason"]))
-                    if "history_target_bars" in request:
-                        requirement = effective_history_target_minute_candles(
-                            interval,
-                            int(request["history_target_bars"]),
+                    interval, direct_bars, minute_source_count = (
+                        MarketDataHost._direct_timeframe_requirement(
+                            item.get("rules"),
+                            request,
                         )
-                    else:
-                        requirement = warmup_requirement
+                    )
                     requested[code] = max(
                         requested.get(code, 0),
-                        int(requirement["required_minute_candles"]),
+                        minute_source_count,
+                    )
+                    MarketDataHost._merge_timeframe_requirement(
+                        timeframe_requested,
+                        code,
+                        interval,
+                        direct_bars,
+                    )
+                    sor_m1_required[code] = max(
+                        sor_m1_required.get(code, 0),
+                        MarketDataHost._full_day_display_count(1),
+                        min(minute_source_count, DEFAULT_CANDLES_MAX_COUNT),
                     )
                     normalized_codes.add(code)
                 except (TypeError, ValueError):
@@ -445,11 +1548,34 @@ class MarketDataHost(QObject):
             sorted(normalized_codes)
         )
         self._candle_observation_required_by_stock = requested
+        self._candle_observation_timeframe_requirements_by_stock = (
+            timeframe_requested
+        )
+        self._sor_observation_m1_required_by_stock = sor_m1_required
+        forming_cache = _host_attr(self, "_sor_forming_m1_by_stock", None)
+        standby_sor_m1 = _host_attr(self, "_sor_standby_m1_required_by_stock", {})
+        v5_codes = set(_host_attr(self, "_v5_observation_leases", {}).values())
+        if isinstance(forming_cache, dict):
+            for code in previous_sor_m1.keys() - (sor_m1_required.keys() | standby_sor_m1.keys() | v5_codes):
+                forming_cache.pop(code, None)
+        self._sor_m1_required_by_stock = dict(
+            standby_sor_m1
+        )
+        for code, count in sor_m1_required.items():
+            self._sor_m1_required_by_stock[code] = max(
+                self._sor_m1_required_by_stock.get(code, 0), count
+            )
+        for code in v5_codes:
+            self._sor_m1_required_by_stock[code] = max(
+                self._sor_m1_required_by_stock.get(code, 0),
+                MarketDataHost._full_day_display_count(1),
+            )
         targets = tuple(
             sorted(
                 set(self._production_monitoring_stock_codes)
                 | set(self._execution_shadow_stock_codes)
                 | set(self._candle_observation_stock_codes)
+                | v5_codes
                 | set(getattr(self, "_candle_standby_stock_codes", ()))
             )
         )
@@ -472,6 +1598,8 @@ class MarketDataHost(QObject):
             changed = (
                 previous_codes != self._candle_observation_stock_codes
                 or previous_requirements != requested
+                or previous_timeframe_requirements != timeframe_requested
+                or previous_sor_m1 != sor_m1_required
             )
             if changed or getattr(self, "_last_candle_observation_refresh_minute", "") != minute_key:
                 self._last_candle_observation_refresh_minute = minute_key
@@ -479,6 +1607,389 @@ class MarketDataHost(QObject):
         else:
             self._last_candle_observation_refresh_minute = ""
         return result
+
+    @staticmethod
+    def _v5_al_closed_minute_parity(
+        native: object, broker: object, identity: tuple[int, str],
+    ) -> bool:
+        if not isinstance(native, dict) or not isinstance(broker, dict):
+            return False
+        code = native.get("stock_code")
+        if (not isinstance(code, str) or len(code) != 6 or not code.isdigit()
+                or native.get("identity") != identity
+                or native.get("continuous") is not True
+                or native.get("tick_count", 0) <= 0
+                or native.get("last_sequence", 0) - native.get("first_sequence", 0) + 1
+                != native.get("tick_count")
+                or broker.get("market_data_identity") != f"{code}_AL"
+                or broker.get("market_source") != "INTEGRATED"
+                or broker.get("is_complete") is not True
+                or broker.get("bar_time") != native.get("minute")):
+            return False
+        return all(
+            type(native.get(field)) in (int, float)
+            and type(broker.get(field)) in (int, float)
+            and isfinite(native[field]) and isfinite(broker[field])
+            and native[field] == broker[field]
+            for field in ("open", "high", "low", "close")
+        )
+
+    def _on_v5_al_tick_received(self, payload: object) -> None:
+        if not isinstance(payload, dict) or self._shutting_down:
+            return
+        code = payload.get("stock_code")
+        identity = self._current_display_session_identity()
+        if (not isinstance(code, str) or len(code) != 6 or not code.isdigit()
+                or code not in self._v5_observation_leases.values()
+                or payload.get("broker_market_identity") != f"{code}_AL"
+                or payload.get("market_source") != "SOR"
+                or payload.get("v5_only") is not True
+                or identity is None
+                or (payload.get("connection_epoch"), payload.get("login_session_id")) != identity):
+            return
+        try:
+            market_time = datetime.fromisoformat(payload["market_datetime"])
+            received = datetime.fromisoformat(payload["received_at"])
+            price = payload["current_price"]
+            sequence = payload["receive_sequence"]
+        except (KeyError, TypeError, ValueError):
+            return
+        if (market_time.utcoffset() != timedelta(hours=9)
+                or received.utcoffset() != timedelta(hours=9)
+                or abs((received - market_time).total_seconds()) > 60
+                or abs((datetime.now(SEOUL_TIMEZONE) - received).total_seconds()) > 60
+                or type(price) not in (int, float) or not isfinite(price) or price <= 0
+                or type(sequence) is not int or sequence <= 0
+                or MarketDataHost._display_session_for_time(market_time) not in
+                {"NXT_PRE", "KRX", "NXT_AFTER"}):
+            return
+        minute = market_time.replace(second=0, microsecond=0)
+        native = self._v5_al_native_minutes.setdefault(code, {})
+        current = native.get("current")
+        if isinstance(current, dict) and current.get("identity") != identity:
+            native.clear()
+            current = None
+            self._v5_al_parity.pop(code, None)
+        if isinstance(current, dict):
+            previous_minute = datetime.fromisoformat(current["minute"])
+            if minute < previous_minute or sequence <= current["last_sequence"]:
+                self._v5_al_parity.pop(code, None)
+                return
+            if minute > previous_minute:
+                adjacent = (minute - previous_minute == timedelta(minutes=1)
+                            and current["last_sequence"] + 1 == sequence)
+                native["closed"] = current if adjacent else None
+                self._v5_al_parity.pop(code, None)
+                current = None
+        if current is None:
+            previous = native.get("closed")
+            continuous = bool(isinstance(previous, dict)
+                              and datetime.fromisoformat(previous["minute"])
+                              + timedelta(minutes=1) == minute)
+            current = {"stock_code": code, "identity": identity,
+                       "minute": minute.isoformat(), "open": price,
+                       "high": price, "low": price, "close": price,
+                       "first_sequence": sequence, "last_sequence": sequence,
+                       "tick_count": 1, "continuous": continuous,
+                       "last_received_at": received.isoformat()}
+            native["current"] = current
+        else:
+            current["high"] = max(current["high"], price)
+            current["low"] = min(current["low"], price)
+            current["close"] = price
+            current["continuous"] = bool(current["continuous"] and
+                                         sequence == current["last_sequence"] + 1)
+            current["last_sequence"] = sequence
+            current["tick_count"] += 1
+            current["last_received_at"] = received.isoformat()
+        if self._v5_al_parity.get(code) == identity:
+            MarketDataHost._v5_al_admit_forming(self, code)
+
+    def _v5_al_consider_parity(self, code: str, rows: list[dict[str, Any]]) -> None:
+        leases = _host_attr(self, "_v5_observation_leases", {})
+        if not isinstance(leases, dict) or code not in leases.values():
+            return
+        identity = self._current_display_session_identity()
+        native = self._v5_al_native_minutes.get(code, {})
+        closed = native.get("closed")
+        if not isinstance(closed, dict) or identity is None:
+            return
+        minute = datetime.fromisoformat(closed["minute"])
+        if not (timedelta(minutes=1) <= datetime.now(SEOUL_TIMEZONE) - minute
+                < timedelta(minutes=3)):
+            self._v5_al_parity.pop(code, None)
+            return
+        broker = next((row for row in rows if row.get("bar_time") == closed["minute"]), None)
+        if MarketDataHost._v5_al_closed_minute_parity(closed, broker, identity):
+            self._v5_al_parity[code] = identity
+        else:
+            self._v5_al_parity.pop(code, None)
+
+    def _v5_al_admit_forming(self, code: str) -> None:
+        identity = MarketDataHost._current_display_session_identity(self)
+        parity = _host_attr(self, "_v5_al_parity", {})
+        leases = _host_attr(self, "_v5_observation_leases", {})
+        if (not isinstance(parity, dict) or parity.get(code) != identity
+                or not isinstance(leases, dict) or code not in leases.values()):
+            return
+        native = self._v5_al_native_minutes.get(code, {}).get("current")
+        sealed = self._sor_forming_m1_by_stock.get(code)
+        candle = sealed.get("candle") if isinstance(sealed, dict) else None
+        if (not isinstance(native, dict) or not isinstance(candle, dict)
+                or sealed.get("session_identity") != identity
+                or candle.get("bar_time") != native.get("minute")
+                or candle.get("market_data_identity") != f"{code}_AL"
+                or candle.get("market_source") != "INTEGRATED"
+                or candle.get("display_only") is not True
+                or candle.get("is_complete") is not False
+                or candle.get("timeframe_minutes") != 1
+                or candle.get("snapshot_source") not in
+                {"BROKER_AL_TR_FORMING_M1", "BROKER_AL_PARITY_NATIVE_FORMING_M1"}):
+            return
+        received = datetime.fromisoformat(native["last_received_at"])
+        try:
+            tr_received = datetime.fromisoformat(candle.get("tr_received_at",
+                                                           candle["snapshot_received_at"]))
+        except (TypeError, ValueError, KeyError):
+            return
+        if received < tr_received or received.replace(second=0, microsecond=0) != datetime.fromisoformat(native["minute"]):
+            return
+        bucket = (received.minute, received.second // 10)
+        if (candle.get("snapshot_source") == "BROKER_AL_PARITY_NATIVE_FORMING_M1"
+                and candle.get("last_admitted_bucket") == bucket):
+            return
+        updated = dict(candle)
+        updated.update({
+            "open": candle.get("tr_open", candle["open"]),
+            "high": max(candle["high"], native["high"]),
+            "low": min(candle["low"], native["low"]),
+            "close": native["close"],
+            "volume": candle.get("tr_volume", candle["volume"]),
+            "tr_open": candle.get("tr_open", candle["open"]),
+            "tr_volume": candle.get("tr_volume", candle["volume"]),
+            "tr_received_at": tr_received.isoformat(),
+            "volume_provenance": "LAST_BROKER_AL_TR_SNAPSHOT",
+            "snapshot_source": "BROKER_AL_PARITY_NATIVE_FORMING_M1",
+            "snapshot_request_as_of": received.isoformat(),
+            "snapshot_received_at": received.isoformat(),
+            "last_admitted_bucket": bucket,
+        })
+        sealed["candle"] = updated
+        self.market_data_observed.emit({
+            "source": "SOR_AL_NATIVE_M1_PARITY_ACCEPTED", "stock_code": code,
+            "market_data_identity": f"{code}_AL", "connection_epoch": identity[0],
+            "login_session_id": identity[1], "snapshot_received_at": updated["snapshot_received_at"],
+            "forming_minute": updated["bar_time"],
+        })
+
+    def set_v5_observation_lease(self, window_key: object, stock_code: object) -> dict[str, object]:
+        """Watch one V5 window's stock through this host without replacing other consumers."""
+        leases = self._v5_observation_leases
+        code = str(stock_code or "").strip()
+        if code and (not is_broker_action_stock_code(code)
+                     or len(code) != 6 or not code.isascii() or not code.isdigit()):
+            return {"ok": False, "changed": False, "reason_code": "V5_AL_CODE_INVALID"}
+        previous_codes = set(leases.values())
+        if code:
+            leases[window_key] = code
+        else:
+            leases.pop(window_key, None)
+        current_codes = set(leases.values())
+        if current_codes == previous_codes:
+            sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
+            if callable(sync_v5):
+                sync_v5(self._nxt_eligible_targets(current_codes))
+            return {"ok": True, "changed": False}
+        standby = _host_attr(self, "_sor_standby_m1_required_by_stock", {})
+        observation = _host_attr(self, "_sor_observation_m1_required_by_stock", {})
+        self._sor_m1_required_by_stock = dict(standby)
+        for source in (observation, {item: MarketDataHost._full_day_display_count(1)
+                                     for item in current_codes}):
+            for item, count in source.items():
+                self._sor_m1_required_by_stock[item] = max(
+                    self._sor_m1_required_by_stock.get(item, 0), count
+                )
+        forming = _host_attr(self, "_sor_forming_m1_by_stock", None)
+        if isinstance(forming, dict):
+            for removed in previous_codes - current_codes - set(standby) - set(observation):
+                forming.pop(removed, None)
+        for removed in previous_codes - current_codes:
+            self._v5_al_native_minutes.pop(removed, None)
+            self._v5_al_parity.pop(removed, None)
+        result = self.sync_monitoring_targets(self._production_monitoring_stock_codes)
+        sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
+        if callable(sync_v5):
+            v5_result = sync_v5(self._nxt_eligible_targets(current_codes))
+            if isinstance(result, dict):
+                result = dict(result, v5_al_sync=v5_result)
+        if not current_codes:
+            self._v5_watch_generation += 1
+            self._v5_watch_inflight = False
+        elif isinstance(result, dict) and result.get("ok") is True:
+            if not previous_codes:
+                self._v5_watch_generation += 1
+                MarketDataHost._schedule_v5_observation_watch(self, immediate=True)
+            elif current_codes - previous_codes:
+                QTimer.singleShot(0, lambda: MarketDataHost._refresh_v5_observation(self))
+        return result
+
+    def _schedule_v5_observation_watch(self, *, immediate: bool = False) -> None:
+        if not self._v5_observation_leases or self._shutting_down:
+            return
+        now = datetime.now(SEOUL_TIMEZONE)
+        next_at = now.replace(second=10, microsecond=0)
+        if next_at <= now:
+            next_at += timedelta(minutes=1)
+        delay = 0 if immediate else max(1, int((next_at - now).total_seconds() * 1000))
+        generation = self._v5_watch_generation
+        QTimer.singleShot(delay, lambda: MarketDataHost._on_v5_observation_timeout(self, generation))
+
+    def _on_v5_observation_timeout(self, generation: int) -> None:
+        if (generation != self._v5_watch_generation
+                or not self._v5_observation_leases or self._shutting_down):
+            return
+        MarketDataHost._refresh_v5_observation(self)
+        MarketDataHost._schedule_v5_observation_watch(self)
+
+    def _refresh_v5_observation(self, now: datetime | None = None) -> None:
+        if self._v5_watch_inflight:
+            return
+        current = (now or datetime.now(SEOUL_TIMEZONE)).astimezone(SEOUL_TIMEZONE)
+        if MarketDataHost._display_session_for_time(current) not in {"NXT_PRE", "KRX", "NXT_AFTER"}:
+            return
+        identity = self._current_display_session_identity()
+        if identity is None:
+            return
+        codes = tuple(sorted(set(self._v5_observation_leases.values())))
+        codes = MarketDataHost._nxt_eligible_targets(codes)
+        sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
+        if callable(sync_v5):
+            sync_v5(codes)  # Idempotent rearm after broker reconnect.
+        if not codes:
+            return
+        minute_key = current.strftime("%Y-%m-%d %H:%M")
+        self._v5_watch_inflight = True
+        generation = self._v5_watch_generation
+
+        def request_next(index: int) -> None:
+            if generation != self._v5_watch_generation:
+                return
+            if index >= len(codes):
+                self._v5_watch_inflight = False
+                return
+            if (self._shutting_down or identity != self._current_display_session_identity()):
+                self._v5_watch_inflight = False
+                return
+            code = codes[index]
+            if code not in self._v5_observation_leases.values():
+                request_next(index + 1)
+                return
+            try:
+                specs = MarketDataHost.display_timeframe_refresh_specs(self, code, minute_key)
+                selected = next((spec for spec in specs
+                                 if spec.get("timeframe_minutes") == 1
+                                 and spec.get("nxt_available") is True), None)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._v5_watch_inflight = False
+                return
+            if selected is None:
+                request_next(index + 1)
+                return
+            from auto_candle_refresh import request_display_timeframe_candles_for_stock
+
+            def finish() -> None:
+                if generation != self._v5_watch_generation:
+                    return
+                if index + 1 < len(codes):
+                    QTimer.singleShot(1100, lambda: request_next(index + 1))
+                else:
+                    self._v5_watch_inflight = False
+
+            def terminal(result: object) -> None:
+                if (generation != self._v5_watch_generation
+                        or identity != self._current_display_session_identity()
+                        or not isinstance(result, dict) or result.get("ok") is not True):
+                    finish()
+                    return
+                try:
+                    projected = MarketDataHost.project_broker_sor_m1_calculation(
+                        self, stock_code=code, rules={"bar": {"bar_minutes": 1}},
+                        projection_request={"projection": "COMPLETED_TIMEFRAME"},
+                        as_of=current,
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    finish()
+                    return
+                gap = projected.get("gap_detail")
+                if (projected.get("availability_state") not in
+                        {"SOR_M1_INTERNAL_COVERAGE_GAP",
+                         "SOR_M1_LAST_COMPLETED_MINUTE_MISSING"}
+                        or not isinstance(gap, dict)
+                        or gap.get("missing_minute_slots") != 1):
+                    finish()
+                    return
+                attempt = (identity, code, gap.get("missing_from"), minute_key)
+                attempts = _host_attr(self, "_v5_m3_gap_proof_attempts", None)
+                if not isinstance(attempts, set):
+                    attempts = set()
+                    object.__setattr__(self, "_v5_m3_gap_proof_attempts", attempts)
+                attempts.intersection_update({entry for entry in attempts
+                                              if entry[-1] == minute_key})
+                if attempt in attempts:
+                    finish()
+                    return
+                attempts.add(attempt)
+
+                def m3_terminal(receipt: object) -> None:
+                    try:
+                        if (generation == self._v5_watch_generation
+                                and identity == self._current_display_session_identity()
+                                and code in self._v5_observation_leases.values()
+                                and isinstance(receipt, dict) and receipt.get("ok") is True):
+                            verified = MarketDataHost.project_broker_sor_m1_calculation(
+                                self, stock_code=code, rules={"bar": {"bar_minutes": 1}},
+                                projection_request={"projection": "COMPLETED_TIMEFRAME"},
+                                as_of=current,
+                            )
+                            if (verified.get("available") is True
+                                    and gap["missing_from"] in
+                                    verified.get("verified_no_trade_minutes", ())):
+                                self.market_data_observed.emit({
+                                    "source": "SOR_AL_M3_GAP_PROOF_ACCEPTED",
+                                    "stock_code": code,
+                                    "market_data_identity": f"{code}_AL",
+                                    "connection_epoch": identity[0],
+                                    "login_session_id": identity[1],
+                                    "missing_minute": gap["missing_from"],
+                                    "snapshot_received_at": current.isoformat(timespec="seconds"),
+                                })
+                    except Exception:
+                        pass  # A failed proof observer cannot interrupt the M1 watch.
+                    finally:
+                        finish()
+
+                try:
+                    request_display_timeframe_candles_for_stock(
+                        window=self, code=code, name="",
+                        operation_cycle_minute_key=minute_key,
+                        timeframe_minutes=3,
+                        count=MarketDataHost._full_day_display_count(3),
+                        nxt_available=True, on_terminal=m3_terminal,
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    finish()
+
+            try:
+                request_display_timeframe_candles_for_stock(
+                    window=self, code=code, name="",
+                    operation_cycle_minute_key=minute_key,
+                    timeframe_minutes=1, count=int(selected["request_count"]),
+                    nxt_available=True, on_terminal=terminal,
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._v5_watch_inflight = False
+
+        request_next(0)
 
     def sync_candle_standby_requirements(
         self,
@@ -493,42 +2004,63 @@ class MarketDataHost(QObject):
             else ()
         )
         previous = dict(getattr(self, "_candle_standby_required_by_stock", {}))
+        previous_sor_m1 = dict(_host_attr(self, "_sor_standby_m1_required_by_stock", {}))
+        previous_timeframe = {
+            code: dict(values)
+            for code, values in getattr(
+                self,
+                "_candle_standby_timeframe_requirements_by_stock",
+                {},
+            ).items()
+            if isinstance(values, dict)
+        }
         preserve_candidates = (
             preserve_stock_codes
             if isinstance(preserve_stock_codes, (list, tuple, set, frozenset))
             else ()
         )
         requested: dict[str, int] = {}
+        timeframe_requested: dict[str, dict[int, int]] = {}
         errors: list[dict[str, str]] = []
         failed_codes: set[str] = set()
+        invalid_source_codes: set[str] = set()
+        sor_m1_required: dict[str, int] = {}
+        diagnostic_idle_requested = False
         for item in candidates:
             if not isinstance(item, dict):
                 continue
             code = str(item.get("stock_code") or "").strip()
             if not code:
                 continue
+            if str(item.get("calculation_market_source", "SOR")).strip().upper() != "SOR":
+                invalid_source_codes.add(code)
+                errors.append({"stock_code": code, "error": "CALCULATION_MARKET_SOURCE_INVALID"})
+                continue
+            if code == "005930" and item.get("diagnostic_sor_m1") is True:
+                diagnostic_idle_requested = True
             try:
-                interval = read_canonical_bar_minutes(item.get("rules"))
                 request = validate_market_bar_projection_request(
                     item.get("projection_request"),
                     require_warmup=True,
                 )
-                warmup_requirement = required_minute_candles(
-                    interval,
-                    int(request["warmup_bars"]),
-                )
-                if not warmup_requirement["within_limit"]:
-                    raise ValueError(str(warmup_requirement["reason"]))
-                if "history_target_bars" in request:
-                    requirement = effective_history_target_minute_candles(
-                        interval,
-                        int(request["history_target_bars"]),
+                interval, direct_bars, minute_source_count = (
+                    MarketDataHost._direct_timeframe_requirement(
+                        item.get("rules"),
+                        request,
                     )
-                else:
-                    requirement = warmup_requirement
+                )
                 requested[code] = max(
                     requested.get(code, 0),
-                    int(requirement["required_minute_candles"]),
+                    minute_source_count,
+                )
+                MarketDataHost._merge_timeframe_requirement(
+                    timeframe_requested,
+                    code,
+                    interval,
+                    direct_bars,
+                )
+                sor_m1_required[code] = min(
+                    int(minute_source_count), DEFAULT_CANDLES_MAX_COUNT
                 )
             except (TypeError, ValueError) as exc:
                 failed_codes.add(code)
@@ -537,15 +2069,41 @@ class MarketDataHost(QObject):
         preserve_codes = {
             str(code or "").strip()
             for code in (*preserve_candidates, *failed_codes)
-            if str(code or "").strip()
+            if str(code or "").strip() and str(code or "").strip() not in invalid_source_codes
         }
         for code in sorted(preserve_codes):
-            if code in requested or code not in previous:
-                continue
-            requested[code] = int(previous[code])
-            preserved_codes.append(code)
+            if code not in requested and code in previous:
+                requested[code] = int(previous[code])
+                preserved_codes.append(code)
+            if code not in timeframe_requested and code in previous_timeframe:
+                timeframe_requested[code] = dict(previous_timeframe[code])
+            if code in preserved_codes and code in previous_sor_m1:
+                sor_m1_required[code] = previous_sor_m1[code]
+        observation_sor_m1 = _host_attr(self, "_sor_observation_m1_required_by_stock", {})
+        v5_codes = set(_host_attr(self, "_v5_observation_leases", {}).values())
+        forming_cache = _host_attr(self, "_sor_forming_m1_by_stock", None)
+        if isinstance(forming_cache, dict):
+            for code in previous_sor_m1.keys() - (sor_m1_required.keys() | observation_sor_m1.keys() | v5_codes):
+                forming_cache.pop(code, None)
         self._candle_standby_required_by_stock = requested
+        self._candle_standby_timeframe_requirements_by_stock = (
+            timeframe_requested
+        )
         self._candle_standby_stock_codes = tuple(sorted(requested))
+        self._sor_standby_m1_required_by_stock = sor_m1_required
+        self._sor_m1_required_by_stock = dict(sor_m1_required)
+        for code, count in observation_sor_m1.items():
+            self._sor_m1_required_by_stock[code] = max(
+                self._sor_m1_required_by_stock.get(code, 0), count
+            )
+        for code in v5_codes:
+            self._sor_m1_required_by_stock[code] = max(
+                self._sor_m1_required_by_stock.get(code, 0),
+                MarketDataHost._full_day_display_count(1),
+            )
+        if _host_attr(self, "_sor_diagnostic_idle_timer") is not None:
+            self._sor_diagnostic_idle_required = diagnostic_idle_requested
+            MarketDataHost._arm_sor_diagnostic_idle_timer(self)
         return {
             "ok": not errors,
             "standby_stock_codes": self._candle_standby_stock_codes,
@@ -561,7 +2119,7 @@ class MarketDataHost(QObject):
             int(self._candle_observation_required_by_stock.get(code, 0)),
             int(getattr(self, "_candle_standby_required_by_stock", {}).get(code, 0)),
         )
-        return declared if declared > 0 else 600
+        return declared
 
     def registered_operation_targets(self) -> tuple[tuple[Path, str, str], ...]:
         codes = tuple(sorted(
@@ -570,6 +2128,414 @@ class MarketDataHost(QObject):
             | set(getattr(self, "_candle_standby_stock_codes", ()))
         ))
         return tuple((StockRepository().resolve_stock_dir(code), code, "") for code in codes)
+
+    @staticmethod
+    def _sor_m3_proves_no_trade_m1(
+        code: str, missing: datetime, cutoff: datetime,
+        native_m1: list[dict[str, Any]], direct_m3: list[dict[str, Any]],
+    ) -> bool:
+        """Accept one absent M1 only when an independent complete M3 has no residual trades."""
+        session = MarketDataHost._display_session_for_time(missing)
+        if session not in {"NXT_PRE", "KRX", "NXT_AFTER"}:
+            return False
+        matching = []
+        for row in direct_m3:
+            start = candle_market_datetime(row) if isinstance(row, dict) else None
+            if (start is not None and start <= missing < start + timedelta(minutes=3)
+                    and start + timedelta(minutes=3) <= cutoff):
+                matching.append((start, row))
+        if len(matching) != 1:
+            return False
+        start, broker = matching[0]
+        minutes = [start + timedelta(minutes=i) for i in range(3)]
+        if (start.date() != missing.date()
+                or any(minute.date() != missing.date()
+                       or MarketDataHost._display_session_for_time(minute) != session
+                       for minute in minutes)
+                or broker.get("market_data_identity") != f"{code}_AL"
+                or broker.get("market_source") != "INTEGRATED"
+                or broker.get("display_only") is not True
+                or broker.get("is_complete") is not True
+                or broker.get("timeframe_minutes") != 3
+                or broker.get("trade_date") != missing.date().isoformat()
+                or broker.get("session") != session):
+            return False
+        known = []
+        for minute in minutes:
+            found = [row for row in native_m1 if isinstance(row, dict)
+                     and candle_market_datetime(row) == minute]
+            if minute == missing:
+                if found:
+                    return False
+                continue
+            if len(found) != 1:
+                return False
+            row = found[0]
+            values = tuple(row.get(field) for field in
+                           ("open", "high", "low", "close", "volume"))
+            if (row.get("market_data_identity") != f"{code}_AL"
+                    or row.get("market_source") != "INTEGRATED"
+                    or row.get("display_only") is not True
+                    or row.get("is_complete") is not True
+                    or row.get("timeframe_minutes") != 1
+                    or row.get("session") != session
+                    or row.get("trade_date") != missing.date().isoformat()
+                    or any(type(value) not in (int, float) or not isfinite(value)
+                           for value in values)
+                    or values[2] <= 0 or values[4] < 0
+                    or not values[2] <= values[0] <= values[1]
+                    or not values[2] <= values[3] <= values[1]):
+                return False
+            known.append(row)
+        if len(known) != 2:
+            return False
+        aggregate = (known[0]["open"], max(row["high"] for row in known),
+                     min(row["low"] for row in known), known[-1]["close"],
+                     sum(row["volume"] for row in known))
+        broker_values = tuple(broker.get(field) for field in
+                              ("open", "high", "low", "close", "volume"))
+        return broker_values == aggregate
+
+    def project_broker_sor_m1_calculation(
+        self, *, stock_code: str, rules: dict[str, Any] | None,
+        projection_request: dict[str, Any], as_of: datetime,
+        session_windows: object = None,
+    ) -> dict[str, Any]:
+        """Use the current broker _AL M1 cache as a detached SOR calculation input.
+
+        No source is relabeled as independently merged; no forming KRX tick,
+        order effect, or fallback to the old canonical KRX history is allowed.
+        The existing production routine is unchanged until explicitly routed.
+        """
+        code = str(stock_code or "").strip()
+        interval = read_canonical_bar_minutes(rules)
+        projection = str(projection_request.get("projection") or "")
+        base = {
+            "stock_code": code,
+            "timeframe_minutes": interval,
+            "projection": projection,
+            "available": False,
+            "candles": [],
+            "market_source": "INTEGRATED",
+            "market_data_identity": f"{code}_AL",
+            "calculation_source": "BROKER_AL_CONFIRMED_M1",
+            "source_proof": "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION",
+            "calculation_only": True,
+            "execution_enabled": False,
+            "queue_connected": False,
+            "send_order_connected": False,
+        }
+        def blocked(reason: str) -> dict[str, Any]:
+            return {**base, "availability_state": reason, "reason": reason}
+
+        if (not isinstance(as_of, datetime) or as_of.tzinfo is None
+                or as_of.utcoffset() != timedelta(hours=9)
+                or interval not in (1, 3, 5, 10, 15, 30, 60, 120, 240)):
+            return blocked("SOR_REQUEST_INVALID")
+        if projection not in {"COMPLETED_TIMEFRAME", "FORMING_BASE_BAR"}:
+            return blocked("SOR_PROJECTION_INVALID")
+        if interval > 1:
+            try:
+                validate_market_bar_projection_request(
+                    projection_request, require_warmup=False,
+                )
+            except (TypeError, ValueError):
+                return blocked("SOR_REQUEST_INVALID")
+        # This cache is session-bound and was installed only after broker
+        # _AL identity, epoch, login, and NXT eligibility checks.
+        supplied = MarketDataHost._current_display_candles(self, code, 1)
+        if not supplied:
+            return blocked("SOR_M1_SOURCE_UNAVAILABLE")
+        direct_m3 = MarketDataHost._current_display_candles(self, code, 3)
+        cutoff = as_of.replace(second=0, microsecond=0)
+        rows: list[dict[str, Any]] = []
+        verified_no_trade_minutes: list[str] = []
+        last_time = None
+        for item in supplied:
+            if (not isinstance(item, dict)
+                    or item.get("market_data_identity") != f"{code}_AL"
+                    or item.get("market_source") != "INTEGRATED"
+                    or item.get("display_only") is not True
+                    or item.get("is_complete") is not True
+                    or item.get("timeframe_minutes") != 1):
+                return blocked("SOR_M1_PROVENANCE_INVALID")
+            time = candle_market_datetime(item)
+            if (time is None or time.tzinfo is None
+                    or time.utcoffset() != timedelta(hours=9)
+                    or (last_time is not None and time <= last_time)):
+                return blocked("SOR_M1_TIME_INVALID")
+            last_time = time
+            numbers = tuple(item.get(k) for k in ("open", "high", "low", "close", "volume"))
+            if (any(type(v) not in (int, float) or not isfinite(v) for v in numbers)
+                    or numbers[2] <= 0 or numbers[4] < 0
+                    or not numbers[2] <= numbers[0] <= numbers[1]
+                    or not numbers[2] <= numbers[3] <= numbers[1]):
+                return blocked("SOR_M1_OHLCV_INVALID")
+            if time + timedelta(minutes=1) <= cutoff:
+                if rows:
+                    previous = candle_market_datetime(rows[-1])
+                    if (previous is not None and previous.date() == time.date()
+                            and MarketDataHost._display_session_for_time(previous)
+                            == MarketDataHost._display_session_for_time(time)
+                            and MarketDataHost._display_session_for_time(time)
+                            != "AL_TRANSITION"
+                            and time - previous != timedelta(minutes=1)):
+                        missing = previous + timedelta(minutes=1)
+                        if (time - previous == timedelta(minutes=2)
+                                and MarketDataHost._sor_m3_proves_no_trade_m1(
+                                    code, missing, cutoff, supplied, direct_m3)):
+                            flat = dict(rows[-1])
+                            flat.update({
+                                "bar_time": missing.isoformat(timespec="seconds"),
+                                "open": rows[-1]["close"],
+                                "high": rows[-1]["close"],
+                                "low": rows[-1]["close"],
+                                "close": rows[-1]["close"],
+                                "volume": 0,
+                                "calculation_only": True,
+                                "snapshot_source": "BROKER_AL_M3_NO_TRADE_PROOF",
+                            })
+                            rows.append(flat)
+                            verified_no_trade_minutes.append(flat["bar_time"])
+                        else:
+                            return {
+                                **blocked("SOR_M1_INTERNAL_COVERAGE_GAP"),
+                                "gap_detail": {
+                                    "stock_code": code,
+                                    "session": MarketDataHost._display_session_for_time(time),
+                                    "previous_available": previous.isoformat(timespec="seconds"),
+                                    "next_available": time.isoformat(timespec="seconds"),
+                                    "missing_from": missing.isoformat(timespec="seconds"),
+                                    "missing_through": (time - timedelta(minutes=1)).isoformat(timespec="seconds"),
+                                    "missing_minute_slots": int((time - previous) / timedelta(minutes=1)) - 1,
+                                },
+                            }
+                rows.append(dict(item))
+        if not rows:
+            return blocked("SOR_M1_COMPLETED_BARS_UNAVAILABLE")
+        latest = candle_market_datetime(rows[-1])
+        if latest is None or latest.date() != cutoff.date():
+            return blocked("SOR_M1_TRADE_DATE_STALE")
+        current_minute = cutoff.hour * 60 + cutoff.minute
+        for _session, first_minute, end_minute in _DISPLAY_INTEGRATED_SESSIONS:
+            if first_minute < current_minute <= end_minute:
+                expected_latest = cutoff.replace(
+                    hour=0, minute=0
+                ) + timedelta(minutes=current_minute - 1)
+                if latest < expected_latest:
+                    if (expected_latest - latest == timedelta(minutes=1)
+                            and MarketDataHost._display_session_for_time(latest)
+                            == MarketDataHost._display_session_for_time(expected_latest)
+                            and MarketDataHost._sor_m3_proves_no_trade_m1(
+                                code, expected_latest, cutoff, supplied, direct_m3)):
+                        flat = dict(rows[-1])
+                        flat.update({
+                            "bar_time": expected_latest.isoformat(timespec="seconds"),
+                            "open": rows[-1]["close"],
+                            "high": rows[-1]["close"],
+                            "low": rows[-1]["close"],
+                            "close": rows[-1]["close"],
+                            "volume": 0,
+                            "calculation_only": True,
+                            "snapshot_source": "BROKER_AL_M3_NO_TRADE_PROOF",
+                        })
+                        rows.append(flat)
+                        verified_no_trade_minutes.append(flat["bar_time"])
+                        latest = expected_latest
+                    else:
+                        result = blocked("SOR_M1_LAST_COMPLETED_MINUTE_MISSING")
+                        if (expected_latest - latest == timedelta(minutes=1)
+                                and MarketDataHost._display_session_for_time(latest)
+                                == MarketDataHost._display_session_for_time(expected_latest)):
+                            result["gap_detail"] = {
+                                "missing_from": expected_latest.isoformat(timespec="seconds"),
+                                "missing_minute_slots": 1,
+                            }
+                        try:
+                            _trace_sor_block(
+                                self, self, stock=code,
+                                reason="SOR_M1_LAST_COMPLETED_MINUTE_MISSING",
+                                as_of=as_of, cutoff=cutoff,
+                                expected_latest=expected_latest,
+                                source_starts=[candle_market_datetime(row).strftime("%Y%m%d%H%M%S")
+                                               for row in supplied],
+                                candidate_starts=[candle_market_datetime(row).strftime("%Y%m%d%H%M%S")
+                                                  for row in rows],
+                                target_starts=[], stage="PROJECTION",
+                                branch="LAST_COMPLETED_MINUTE",
+                                timeframe_minutes=interval,
+                            )
+                        except Exception:
+                            pass
+                        return result
+                break
+        forming_minute = None
+        if projection == "FORMING_BASE_BAR":
+            evidence = _host_attr(self, "_sor_forming_m1_by_stock", {})
+            sealed = evidence.get(code) if isinstance(evidence, dict) else None
+            forming_minute = sealed.get("candle") if isinstance(sealed, dict) else None
+            if (not isinstance(sealed, dict)
+                    or sealed.get("session_identity")
+                    != MarketDataHost._current_display_session_identity(self)
+                    or not isinstance(forming_minute, dict)
+                    or forming_minute.get("is_complete") is not False
+                    or forming_minute.get("snapshot_source") not in
+                    {"BROKER_AL_TR_FORMING_M1", "BROKER_AL_PARITY_NATIVE_FORMING_M1"}
+                    or forming_minute.get("market_source") != "INTEGRATED"
+                    or forming_minute.get("market_data_identity") != f"{code}_AL"
+                    or forming_minute.get("timeframe_minutes") != 1
+                    or candle_market_datetime(forming_minute) != cutoff):
+                return blocked("SOR_FORMING_SOURCE_NOT_VERIFIED")
+            try:
+                request_time = datetime.fromisoformat(
+                    forming_minute["snapshot_request_as_of"]
+                )
+                received_time = datetime.fromisoformat(
+                    forming_minute["snapshot_received_at"]
+                )
+            except (ValueError, TypeError, KeyError):
+                return blocked("SOR_FORMING_SNAPSHOT_TIME_INVALID")
+            if (request_time.utcoffset() != timedelta(hours=9)
+                    or received_time.utcoffset() != timedelta(hours=9)
+                    or not request_time <= received_time <= datetime.now(SEOUL_TIMEZONE)
+                    or received_time - request_time >= timedelta(minutes=1)
+                    or request_time.replace(second=0, microsecond=0) != cutoff
+                    or received_time.replace(second=0, microsecond=0) != cutoff):
+                return blocked("SOR_FORMING_SNAPSHOT_TIME_INVALID")
+        prior_direct: list[dict[str, Any]] = []
+        projection_rows = rows
+        projection_only_request = projection_request
+        if interval > 1:
+            today_rows = [item for item in rows
+                          if candle_market_datetime(item).date() == cutoff.date()]
+            direct = MarketDataHost._current_display_candles(self, code, interval)
+            last_direct_time = None
+            for item in direct:
+                time = candle_market_datetime(item)
+                if (not isinstance(item, dict) or time is None
+                        or time.utcoffset() != timedelta(hours=9)
+                        or (last_direct_time is not None and time <= last_direct_time)
+                        or item.get("market_data_identity") != f"{code}_AL"
+                        or item.get("market_source") != "INTEGRATED"
+                        or item.get("display_only") is not True
+                        or item.get("is_complete") is not True
+                        or item.get("timeframe_minutes") != interval
+                        or item.get("session") != MarketDataHost._display_session_for_time(time)):
+                    return blocked("SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
+                last_direct_time = time
+                if time.date() >= cutoff.date():
+                    continue
+                numbers = tuple(item.get(k) for k in ("open", "high", "low", "close", "volume"))
+                if (any(type(v) not in (int, float) or not isfinite(v) for v in numbers)
+                        or numbers[2] <= 0 or numbers[4] < 0
+                        or not numbers[2] <= numbers[0] <= numbers[1]
+                        or not numbers[2] <= numbers[3] <= numbers[1]):
+                    return blocked("SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
+                prior_direct.append(dict(item))
+            if not prior_direct and "history_target_bars" in projection_request:
+                return blocked("SOR_DIRECT_HISTORY_UNAVAILABLE")
+            if prior_direct and today_rows:
+                sessions = normalize_candle_sessions(session_windows)
+                if sessions:
+                    earliest = min(start for _name, start, _end in sessions)
+                    first = candle_market_datetime(today_rows[0])
+                    if first.hour * 60 + first.minute > earliest:
+                        return blocked("SOR_M1_INITIAL_COVERAGE_GAP")
+            projection_rows = today_rows
+            projection_only_request = {"projection": projection}
+        if interval == 1 and verified_no_trade_minutes and session_windows is None:
+            session_windows = tuple({
+                "name": name,
+                "start_time": f"{start // 60:02d}:{start % 60:02d}",
+                "end_time": f"{end // 60:02d}:{end % 60:02d}",
+            } for name, start, end in (*_DISPLAY_INTEGRATED_SESSIONS,
+                                       ("AL_TRANSITION", 15 * 60 + 30,
+                                        15 * 60 + 40)))
+        projected = project_candle_supply(
+            projection_rows, rules, projection_only_request,
+            now=(received_time if forming_minute is not None else as_of),
+            session_windows=session_windows,
+            forming_minute=forming_minute,
+        )
+        if (projection == "FORMING_BASE_BAR"
+                and projected.get("forming_included") is not True):
+            return blocked("SOR_FORMING_BASE_BAR_UNAVAILABLE")
+        if projected.get("available") is not True:
+            return {
+                **base,
+                "availability_state": str(projected.get("availability_state") or "SOR_HISTORY_INSUFFICIENT"),
+                "reason": str(projected.get("reason") or "SOR_HISTORY_INSUFFICIENT"),
+                "available_minute_candles": len(rows),
+            }
+        candles = projected.get("candles")
+        if not isinstance(candles, list):
+            return blocked("SOR_PROJECTION_INVALID")
+        if interval > 1:
+            candles = prior_direct + candles
+            if "warmup_bars" in projection_request:
+                warmup = projection_request["warmup_bars"]
+                if type(warmup) is not int or warmup <= 0 or len(candles) < warmup:
+                    return blocked("SOR_HISTORY_INSUFFICIENT")
+        if "history_target_bars" in projection_request:
+            target = projection_request["history_target_bars"]
+            if type(target) is not int or target <= 0:
+                return blocked("SOR_REQUEST_INVALID")
+            if len(candles) < target:
+                return {
+                    **base,
+                    "availability_state": "SOR_HISTORY_TARGET_NOT_MET",
+                    "reason": "SOR_HISTORY_TARGET_NOT_MET",
+                    "available_timeframe_bars": len(candles),
+                    "required_timeframe_bars": target,
+                    "available_minute_candles": len(rows),
+                }
+            if len(candles) > target:
+                candles = candles[-target:]
+        source_identity = canonical_candle_content_hash(rows)
+        result = {
+            **projected, **{k: v for k, v in base.items() if k != "candles" and k != "available"},
+            "available": True, "candles": candles,
+            "source_identity": source_identity,
+            "available_minute_candles": len(rows),
+            "verified_no_trade_minutes": tuple(verified_no_trade_minutes),
+            "available_timeframe_bars": len(candles),
+            "history_target_bars": projection_request.get("history_target_bars", 0),
+            "direct_history_source": (
+                "BROKER_AL_CONFIRMED_DIRECT" if prior_direct else ""
+            ),
+            "forming_snapshot_source": (
+                forming_minute.get("snapshot_source") if forming_minute else ""
+            ),
+            "forming_snapshot_received_at": (
+                forming_minute.get("snapshot_received_at") if forming_minute else ""
+            ),
+        }
+        if forming_minute is not None:
+            identity = MarketDataHost._current_display_session_identity(self)
+            sealed_identity = sealed.get("session_identity")
+            if identity is None or identity != sealed_identity:
+                return blocked("SOR_FORMING_SESSION_CHANGED")
+            epoch, login_id = identity
+            session_hash = sha256(login_id.encode("utf-8")).hexdigest()
+            forming_values = {key: forming_minute[key] for key in (
+                "open", "high", "low", "close", "volume")}
+            key_parts = (code, source_identity, forming_minute["bar_time"],
+                         forming_values, received_time.isoformat(), epoch, session_hash)
+            snapshot_key = sha256(json.dumps(
+                key_parts, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+            result["sor_source_receipt"] = {
+                "stock_code": code, "timeframe_key": f"M{interval}",
+                "source_base_timeframe_key": "M1",
+                "source_snapshot_key": snapshot_key,
+                "connection_epoch": epoch, "session_sha256": session_hash,
+                "source_as_of": as_of.isoformat(),
+                "received_at": received_time.isoformat(),
+                "source_proof": "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION",
+                "independent_merge_verified": False,
+            }
+        return result
 
     def project_routine_candles(
         self,
@@ -581,33 +2547,32 @@ class MarketDataHost(QObject):
         session_windows: object = None,
         consumer_scope: str = "PRODUCTION",
     ) -> dict[str, Any]:
-        """Supply one Routine Instance from Production-owned Candle facts."""
+        """Supply direct completed timeframe bars plus one live forming bar."""
         code = str(stock_code or "").strip()
         try:
             request = validate_market_bar_projection_request(
                 projection_request,
                 require_warmup=False,
             )
+            interval, direct_bars, minute_source_count = (
+                MarketDataHost._direct_timeframe_requirement(rules, request)
+            )
         except (TypeError, ValueError) as exc:
-            return {"available": False, "stock_code": code, "candles": [], "availability_state": "PROJECTION_REQUEST_INVALID", "reason": str(exc)}
+            return {
+                "available": False,
+                "stock_code": code,
+                "candles": [],
+                "availability_state": "PROJECTION_REQUEST_INVALID",
+                "reason": str(exc),
+            }
+
         projection = request["projection"]
         warmup_declared = "warmup_bars" in request
         history_target_declared = "history_target_bars" in request
-        try:
-            interval = read_canonical_bar_minutes(rules)
-            warmup_bars = int(request["warmup_bars"] if warmup_declared else 1)
-            history_target_bars = int(
-                request.get("history_target_bars", warmup_bars)
-            )
-            warmup = required_minute_candles(interval, warmup_bars)
-            history_target = effective_history_target_minute_candles(
-                interval,
-                history_target_bars,
-            )
-            if not warmup_declared:
-                warmup = {**warmup, "required_minute_candles": 0}
-        except (TypeError, ValueError) as exc:
-            return {"available": False, "stock_code": code, "candles": [], "availability_state": "INTERVAL_UNSUPPORTED", "reason": str(exc)}
+        warmup_bars = int(request.get("warmup_bars", 1) or 1)
+        history_target_bars = int(
+            request.get("history_target_bars", warmup_bars) or warmup_bars
+        )
         base = {
             "stock_code": code,
             "timeframe_minutes": interval,
@@ -615,67 +2580,34 @@ class MarketDataHost(QObject):
             "history_target_bars": (
                 history_target_bars if history_target_declared else 0
             ),
+            "history_target_timeframe_candles": (
+                direct_bars if history_target_declared else 0
+            ),
             "history_target_minute_candles": (
-                int(history_target["required_minute_candles"])
-                if history_target_declared
-                else 0
+                direct_bars if history_target_declared and interval == 1 else 0
             ),
             "history_target_requested_minute_candles": (
-                int(history_target["requested_minute_candles"])
-                if history_target_declared
-                else 0
+                direct_bars if history_target_declared and interval == 1 else 0
             ),
-            "history_target_capped": (
-                bool(history_target["capped"])
-                if history_target_declared
-                else False
+            "history_target_capped": False,
+            "required_minute_candles": (
+                minute_source_count if warmup_declared else 0
             ),
-            **warmup,
+            "maximum_minute_candles": DEFAULT_CANDLES_MAX_COUNT,
+            "within_limit": True,
+            "direct_timeframe_source": interval > 1,
         }
-        requirement_attribute = (
-            "_candle_observation_required_by_stock"
-            if str(consumer_scope or "").strip().upper() == "MOCK"
-            else "_candle_execution_required_by_stock"
-        )
-        try:
-            history_requirements = object.__getattribute__(self, requirement_attribute)
-        except (AttributeError, RuntimeError):
-            history_requirements = None
-        if warmup_declared and isinstance(history_requirements, dict):
-            retention_requirement = (
-                history_target
-                if history_target_declared
-                else warmup
+
+        if str(consumer_scope or "").strip().upper() == "SOR_CALCULATION_ONLY":
+            sor = MarketDataHost.project_broker_sor_m1_calculation(
+                self, stock_code=code, rules=rules,
+                projection_request=request, as_of=as_of or datetime.now(SEOUL_TIMEZONE),
+                session_windows=session_windows,
             )
-            history_requirements[code] = max(
-                int(history_requirements.get(code, 0)),
-                int(retention_requirement["required_minute_candles"]),
-            )
-        if not warmup["within_limit"]:
-            return {**base, "available": False, "candles": [], "availability_state": "WARMUP_LIMIT_EXCEEDED"}
-        raw = load_candles(StockRepository().resolve_stock_dir(code))
-        source_hash = canonical_candle_content_hash(raw) if raw else ""
-        forming = None
-        if projection == "FORMING_BASE_BAR":
-            current_reader = getattr(self.kiwoom_api, "current_realtime_shadow_bar", None)
-            forming = current_reader(code) if callable(current_reader) else None
-        now = as_of or datetime.now(SEOUL_TIMEZONE)
-        result = project_candle_supply(
-            raw,
-            rules,
-            request,
-            now=now,
-            session_windows=session_windows,
-            forming_minute=forming if isinstance(forming, dict) else None,
-        )
-        source_rows = list(raw)
-        if isinstance(forming, dict):
-            source_rows.append(dict(forming))
-        return {
-            **result,
-            "stock_code": code,
-            "source_identity": canonical_candle_content_hash(source_rows) if source_rows else source_hash,
-        }
+            return {**base, **sor}
+
+        return {**base, "available": False, "candles": [],
+                "availability_state": "SOR_SOURCE_UNAVAILABLE"}
 
     @staticmethod
     def _nxt_eligible_targets(stock_codes: object) -> tuple[str, ...]:
@@ -739,6 +2671,7 @@ class MarketDataHost(QObject):
                 sorted(
                     set(production_targets)
                     | set(self._candle_observation_stock_codes)
+                    | set(self._v5_observation_leases.values())
                     | set(getattr(self, "_candle_standby_stock_codes", ()))
                 )
             )
@@ -861,6 +2794,7 @@ class MarketDataHost(QObject):
                         set(self._production_monitoring_stock_codes)
                         | set(self._execution_shadow_stock_codes)
                         | set(self._candle_observation_stock_codes)
+                        | set(self._v5_observation_leases.values())
                         | set(getattr(self, "_candle_standby_stock_codes", ()))
                     )
                 )
@@ -870,6 +2804,11 @@ class MarketDataHost(QObject):
                     projection["nxt_display_sync"] = self._sync_nxt_display_targets(
                         observation_targets
                     )
+                    sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
+                    if callable(sync_v5):
+                        projection["v5_al_sync"] = sync_v5(
+                            self._nxt_eligible_targets(set(self._v5_observation_leases.values()))
+                        )
                 return projection
             return {
                 "ok": False,
@@ -1048,6 +2987,8 @@ class MarketDataHost(QObject):
         minute_key: str,
     ) -> dict[str, object]:
         code = str(stock_code or "").strip()
+        if code in _host_attr(self, "_sor_standby_m1_required_by_stock", {}):
+            return {"decision": REALTIME_PRIMARY_SKIP, "request_kind": ""}
         mode = self._market_data_authority.mode(code)
         if mode == TR_RECONCILING:
             reconciliation_minute = self._market_data_authority.snapshot(code).reconciliation_minute
@@ -1561,6 +3502,7 @@ class MarketDataHost(QObject):
                 set(self._production_monitoring_stock_codes)
                 | set(self._execution_shadow_stock_codes)
                 | set(self._candle_observation_stock_codes)
+                | set(self._v5_observation_leases.values())
                 | set(getattr(self, "_candle_standby_stock_codes", ()))
             )
         )
@@ -1617,6 +3559,10 @@ class MarketDataHost(QObject):
     def clear(self) -> dict[str, object]:
         clear = getattr(self.kiwoom_api, "clear_realtime_shadow_registration", None)
         clear_nxt = getattr(self.kiwoom_api, "clear_nxt_display_registration", None)
+        clear_v5 = getattr(self.kiwoom_api, "clear_v5_al_realtime_targets", None)
+        if callable(clear_v5):
+            clear_v5(reason="MARKET_DATA_HOST_CLEARED")
+        self._sor_m1_registration.sync((), 0, "", False)
         self._clear_all_state()
         nxt_result = None
         if callable(clear_nxt):
@@ -1650,9 +3596,20 @@ class MarketDataHost(QObject):
 
     def shutdown(self) -> dict[str, object]:
         self._shutting_down = True
+        if self._sor_tick_evidence is not None:
+            try:
+                self._sor_tick_evidence.close()
+            except Exception as exc:
+                self._sor_tick_evidence_error = type(exc).__name__
         return self.clear()
 
     def _clear_session_state(self) -> None:
+        timer = _host_attr(self, "_sor_diagnostic_idle_timer")
+        if timer is not None:
+            timer.stop()
+            self._sor_diagnostic_idle_inflight = False
+            self._sor_diagnostic_idle_request_generation += 1
+            self._sor_diagnostic_idle_last_attempt_minute = ""
         cleared_stock_codes = tuple(
             dict.fromkeys(
                 (*self._initial_market_snapshot_states, *self._high_resolution_market_states)
@@ -1668,6 +3625,9 @@ class MarketDataHost(QObject):
         self._automatic_candle_refresh_waiters = []
         self._automatic_candle_refresh_rerun_requested = False
         self._automatic_candle_refresh_rerun_minute_key = ""
+        self._v5_watch_inflight = False
+        self._v5_al_native_minutes.clear()
+        self._v5_al_parity.clear()
         self._candle_bootstrap_completed = {}
         self._candle_refresh_round_robin_offset = 0
         self._canonical_event_queue.clear()
@@ -1676,6 +3636,15 @@ class MarketDataHost(QObject):
         self._nxt_display_tick_queue.clear()
         self._high_resolution_market_states.clear()
         self._nxt_display_live_price_states.clear()
+        display_candles = _host_attr(self, "_display_timeframe_candles", None)
+        if isinstance(display_candles, dict):
+            display_candles.clear()
+        display_identities = _host_attr(self, "_display_timeframe_session_identity", None)
+        if isinstance(display_identities, dict):
+            display_identities.clear()
+        forming_cache = _host_attr(self, "_sor_forming_m1_by_stock", None)
+        if isinstance(forming_cache, dict):
+            forming_cache.clear()
         self._initial_market_snapshot_states.clear()
         self._monitoring_target_stock_codes = ()
         self._production_monitoring_stock_codes = ()
@@ -1697,10 +3666,16 @@ class MarketDataHost(QObject):
                     "source": "SESSION_CLEARED",
                 }
             )
+        if timer is not None and self._sor_diagnostic_idle_required:
+            MarketDataHost._arm_sor_diagnostic_idle_timer(self)
 
     def _clear_all_state(self) -> None:
+        self._sor_diagnostic_idle_required = False
         self._clear_session_state()
         self._last_known_market_information_states.clear()
+        sor_requirements = _host_attr(self, "_sor_m1_required_by_stock", None)
+        if isinstance(sor_requirements, dict):
+            sor_requirements.clear()
         self._raw_tick_received_count = 0
         self._raw_tick_processed_count = 0
         self._raw_tick_queue_high_watermark = 0
@@ -1774,6 +3749,27 @@ class MarketDataHost(QObject):
             return False
         return sequence > 0 and epoch >= 0 and received_monotonic >= 0
 
+    def sor_tick_evidence_snapshot(self) -> dict[str, object] | None:
+        if not self._sor_tick_evidence_enabled:
+            return None
+        if self._sor_tick_evidence is None:
+            return {"enabled": True, "initialization_error": self._sor_tick_evidence_error}
+        return self._sor_tick_evidence.snapshot()
+
+    def _sample_sor_tick(
+        self, source: str, event: dict[str, object], *, host_queue_overflow: bool
+    ) -> None:
+        sampler = self._sor_tick_evidence
+        if sampler is None:
+            return
+        try:
+            sampler.capture(source, event, host_queue_overflow=host_queue_overflow)
+        except Exception as exc:
+            try:
+                sampler.note_capture_failure(exc)
+            except Exception:
+                pass
+
     def _on_realtime_shadow_tick_received(self, payload: object) -> None:
         """Queue one normalized raw tick outside the broker callback stack."""
         if not isinstance(payload, dict):
@@ -1823,6 +3819,12 @@ class MarketDataHost(QObject):
             connection_epoch=identity[0],
             login_session_id=identity[1],
         )
+
+        if self._sor_tick_evidence is not None:
+            self._sample_sor_tick(
+                "KRX", event,
+                host_queue_overflow=len(self._raw_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH,
+            )
 
         if len(self._raw_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH:
             # Preserve the queued FIFO sequence and reject the newest event explicitly.
@@ -1886,6 +3888,14 @@ class MarketDataHost(QObject):
             connection_epoch=epoch,
             login_session_id=str(event.get("login_session_id") or ""),
         )
+        if self._sor_tick_evidence is not None:
+            self._sample_sor_tick(
+                "NXT", event,
+                host_queue_overflow=(
+                    len(self._nxt_display_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH
+                ),
+            )
+
         if len(self._nxt_display_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH:
             self._observe_realtime_boundary(
                 "MARKET_HOST_RAW_REJECTED",
@@ -1907,7 +3917,9 @@ class MarketDataHost(QObject):
             return
         self._nxt_display_tick_drain_running = True
         try:
-            while self._nxt_display_tick_queue and not self._shutting_down:
+            for _index in range(self.MAX_NXT_DISPLAY_TICK_DRAIN_BATCH):
+                if not self._nxt_display_tick_queue or self._shutting_down:
+                    break
                 self._process_nxt_display_tick(self._nxt_display_tick_queue.popleft())
         finally:
             self._nxt_display_tick_drain_running = False
@@ -2007,7 +4019,9 @@ class MarketDataHost(QObject):
             return
         self._raw_tick_drain_running = True
         try:
-            while self._raw_tick_queue and not self._shutting_down:
+            for _index in range(self.MAX_RAW_TICK_DRAIN_BATCH):
+                if not self._raw_tick_queue or self._shutting_down:
+                    break
                 payload = self._raw_tick_queue.popleft()
                 try:
                     self._process_raw_realtime_tick(payload)

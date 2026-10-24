@@ -15,6 +15,7 @@ from candle_timeframe_aggregation import (
 )
 from gui_market_data_host import MarketDataHost
 from mock_validation_host import MockValidationHost
+from mock_validation_candle_provider import project_mock_routine_candles
 from routines.지표추종매매.routine import market_bar_projection_request
 from stock_instance_day_projection import chart_candle_projection_request
 
@@ -34,15 +35,56 @@ def _minutes(count: int, *, start: datetime | None = None) -> list[dict[str, obj
     ]
 
 
+def _timeframe_bars(
+    count: int,
+    interval: int,
+    *,
+    start: datetime | None = None,
+    base: float = 100.0,
+) -> list[dict[str, object]]:
+    anchor = start or datetime(2026, 9, 8, 9, 0, tzinfo=SEOUL_TIMEZONE)
+    return [
+        {
+            "bar_time": (
+                anchor + timedelta(minutes=index * interval)
+            ).isoformat(timespec="seconds"),
+            "open": base + index,
+            "high": base + index + 1.0,
+            "low": base + index - 1.0,
+            "close": base + index + 0.5,
+            "volume": 10.0,
+            "timeframe_minutes": interval,
+            "is_complete": True,
+            "trade_date": (
+                anchor + timedelta(minutes=index * interval)
+            ).date().isoformat(),
+            "session": "regular",
+        }
+        for index in range(count)
+    ]
+
+
 class ProductionCandleProviderTest(unittest.TestCase):
-    def test_chart_display_does_not_hide_completed_prices_for_missing_forming_or_warmup(self) -> None:
+    def test_chart_scope_cannot_reuse_legacy_raw_projection(self) -> None:
         raw = _minutes(390)
         host = MarketDataHost.__new__(MarketDataHost)
-        host.kiwoom_api = SimpleNamespace(current_realtime_shadow_bar=lambda _code: None)
+        host.kiwoom_api = SimpleNamespace(
+            current_realtime_shadow_bar=lambda _code: None
+        )
+        host._direct_timeframe_candles = {
+            ("005930", 5): tuple(_timeframe_bars(60, 5))
+        }
         rules = {"bar": {"bar_minutes": 5}}
-        routine_request = {"projection": "FORMING_BASE_BAR", "warmup_bars": 60}
+        routine_request = {
+            "projection": "FORMING_BASE_BAR",
+            "warmup_bars": 60,
+        }
         sessions = (
-            {"name": "regular", "start_time": "09:00:00", "end_time": "15:30:00"},
+            {
+                "name": "regular",
+                "start_time": "09:00:00",
+                "end_time": "15:30:00",
+            },
         )
         with patch("gui_market_data_host.load_candles", return_value=raw), patch(
             "gui_market_data_host.StockRepository"
@@ -73,16 +115,14 @@ class ProductionCandleProviderTest(unittest.TestCase):
                 consumer_scope="MOCK",
             )
 
-        self.assertEqual("FORMING_SOURCE_UNAVAILABLE", evaluation["availability_state"])
-        self.assertFalse(evaluation["available"])
+        self.assertFalse(evaluation["available"], evaluation)
+        self.assertEqual("SOR_SOURCE_UNAVAILABLE", evaluation["availability_state"])
+        self.assertEqual([], evaluation["candles"])
         self.assertNotIn("warmup_bars", chart_request)
-        self.assertTrue(production_chart["available"])
-        self.assertGreater(len(production_chart["candles"]), 0)
-        self.assertEqual(production_chart["candles"], mock_chart["candles"])
-        self.assertEqual(
-            production_chart["source_identity"],
-            mock_chart["source_identity"],
-        )
+        self.assertEqual([], production_chart["candles"])
+        self.assertEqual([], mock_chart["candles"])
+        self.assertEqual("SOR_SOURCE_UNAVAILABLE", production_chart["availability_state"])
+        self.assertEqual("SOR_SOURCE_UNAVAILABLE", mock_chart["availability_state"])
 
     def test_warmup_margin_and_limit_contract(self) -> None:
         self.assertEqual(63_360, required_minute_candles(240, 240)["required_minute_candles"])
@@ -147,7 +187,7 @@ class ProductionCandleProviderTest(unittest.TestCase):
         self.assertEqual(17, result["available_minute_candles"])
         self.assertEqual(1, result["available_timeframe_bars"])
 
-    def test_provider_adds_forming_shadow_without_committing_it(self) -> None:
+    def test_legacy_forming_shadow_cannot_enter_production_projection(self) -> None:
         raw = _minutes(2)
         forming = _minutes(1, start=datetime(2026, 9, 8, 9, 2, tzinfo=SEOUL_TIMEZONE))[0]
         api = SimpleNamespace(current_realtime_shadow_bar=lambda _code: forming)
@@ -165,9 +205,9 @@ class ProductionCandleProviderTest(unittest.TestCase):
                 as_of=datetime(2026, 9, 8, 9, 2, 30, tzinfo=SEOUL_TIMEZONE),
                 session_windows=({"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"},),
             )
-        self.assertTrue(result["available"])
-        self.assertTrue(result["forming_included"])
-        self.assertFalse(result["candles"][-1]["is_complete"])
+        self.assertFalse(result["available"])
+        self.assertEqual([], result["candles"])
+        self.assertEqual("SOR_SOURCE_UNAVAILABLE", result["availability_state"])
 
     def test_forming_projection_excludes_historical_incomplete_buckets(self) -> None:
         raw = _minutes(
@@ -202,10 +242,17 @@ class ProductionCandleProviderTest(unittest.TestCase):
         self.assertTrue(result["candles"][0]["is_complete"])
         self.assertFalse(result["candles"][-1]["is_complete"])
 
-    def test_same_stock_requests_are_projected_per_applied_interval(self) -> None:
+    def test_legacy_raw_projection_is_blocked_for_each_interval(self) -> None:
         raw = _minutes(288)
         host = MarketDataHost.__new__(MarketDataHost)
-        host.kiwoom_api = SimpleNamespace(current_realtime_shadow_bar=lambda _code: None)
+        host.kiwoom_api = SimpleNamespace(
+            current_realtime_shadow_bar=lambda _code: None
+        )
+        host._direct_timeframe_candles = {
+            ("005930", 5): tuple(_timeframe_bars(60, 5)),
+            ("005930", 120): tuple(_timeframe_bars(2, 120)),
+            ("005930", 240): tuple(_timeframe_bars(1, 240)),
+        }
         counts = {}
         with patch("gui_market_data_host.load_candles", return_value=raw), patch(
             "gui_market_data_host.StockRepository"
@@ -215,13 +262,22 @@ class ProductionCandleProviderTest(unittest.TestCase):
                 result = host.project_routine_candles(
                     stock_code="005930",
                     rules={"bar": {"bar_minutes": interval}},
-                    projection_request={"projection": "COMPLETED_TIMEFRAME", "warmup_bars": 1},
+                    projection_request={
+                        "projection": "COMPLETED_TIMEFRAME",
+                        "warmup_bars": 1,
+                    },
                     as_of=datetime(2026, 9, 8, 14, 0, tzinfo=SEOUL_TIMEZONE),
-                    session_windows=({"name": "regular", "start_time": "09:00:00", "end_time": "15:20:00"},),
+                    session_windows=(
+                        {
+                            "name": "regular",
+                            "start_time": "09:00:00",
+                            "end_time": "15:20:00",
+                        },
+                    ),
                 )
                 counts[interval] = len(result["candles"])
-                self.assertTrue(all(item["timeframe_minutes"] == interval for item in result["candles"]))
-        self.assertEqual({1: 288, 5: 57, 120: 2, 240: 1}, counts)
+                self.assertEqual("SOR_SOURCE_UNAVAILABLE", result["availability_state"])
+        self.assertEqual({1: 0, 5: 0, 120: 0, 240: 0}, counts)
 
     def test_mock_has_no_direct_canonical_file_reader(self) -> None:
         self.assertFalse(hasattr(MockValidationHost, "_read_candles"))
@@ -531,7 +587,11 @@ class ProductionCandleProviderTest(unittest.TestCase):
             MarketDataHost.sync_candle_observation_targets(host, [requirement])
             self.assertEqual(("005930",), monitored[-1])
             self.assertEqual(("000080", "005930"), synced[-1])
-            self.assertEqual(63_360, host._candle_observation_required_by_stock["000080"])
+            self.assertEqual(241, host._candle_observation_required_by_stock["000080"])
+            self.assertEqual(
+                {240: 240},
+                host._candle_observation_timeframe_requirements_by_stock["000080"],
+            )
             MarketDataHost.sync_candle_observation_targets(host, [])
         self.assertEqual(("005930",), monitored[-1])
         self.assertEqual(("005930",), synced[-1])
@@ -565,8 +625,12 @@ class ProductionCandleProviderTest(unittest.TestCase):
             )
         self.assertTrue(result["ok"], result)
         self.assertEqual(
-            200_000,
+            241,
             host._candle_observation_required_by_stock["005930"],
+        )
+        self.assertEqual(
+            {240: 900},
+            host._candle_observation_timeframe_requirements_by_stock["005930"],
         )
         self.assertEqual(("005930",), host._candle_observation_stock_codes)
         self.assertEqual(("005930",), synced[-1])
@@ -594,7 +658,7 @@ class ProductionCandleProviderTest(unittest.TestCase):
         self.assertEqual({"000660": 9}, host._candle_observation_required_by_stock)
         self.assertEqual(("035420",), host._candle_standby_stock_codes)
         self.assertEqual(
-            193,
+            6,
             MarketDataHost.candle_history_required_count(host, "035420"),
         )
         with patch("gui_market_data_host.StockRepository") as repository:
@@ -627,7 +691,7 @@ class ProductionCandleProviderTest(unittest.TestCase):
         )
 
         self.assertTrue(result["ok"])
-        self.assertEqual({"005930": 193, "035420": 999}, host._candle_standby_required_by_stock)
+        self.assertEqual({"005930": 6, "035420": 999}, host._candle_standby_required_by_stock)
         self.assertEqual(("035420",), result["preserved_stock_codes"])
         self.assertNotIn("000660", host._candle_standby_required_by_stock)
 
@@ -666,7 +730,19 @@ class ProductionCandleProviderTest(unittest.TestCase):
         repository.assert_not_called()
         self.assertEqual((), targets)
 
-    def test_mock_requests_production_projection_for_each_instance_rules(self) -> None:
+    def test_production_scope_never_reads_stored_krx_candles(self) -> None:
+        host = MarketDataHost.__new__(MarketDataHost)
+        with patch("gui_market_data_host.load_candles", side_effect=AssertionError("KRX read")):
+            result = MarketDataHost.project_routine_candles(
+                host, stock_code="005930", rules={"bar": {"bar_minutes": 1}},
+                projection_request={"projection": "COMPLETED_TIMEFRAME", "warmup_bars": 1},
+                consumer_scope="PRODUCTION",
+            )
+        self.assertFalse(result["available"])
+        self.assertEqual([], result["candles"])
+        self.assertEqual("SOR_SOURCE_UNAVAILABLE", result["availability_state"])
+
+    def test_legacy_mock_krx_projection_is_not_executable(self) -> None:
         calls: list[dict[str, object]] = []
 
         def provider(**kwargs):
@@ -687,7 +763,10 @@ class ProductionCandleProviderTest(unittest.TestCase):
             },
         )
         host._selected_candle_sessions = lambda settings: MockValidationHost._selected_candle_sessions(host, settings)
-        document = {"session": {"stock_code": "005930"}}
+        document = {
+            "session": {"stock_code": "005930"},
+            "reference_snapshot": {"calculation_market_source": "KRX"},
+        }
         for instance_id, interval in (("A", 1), ("B", 120)):
             result = MockValidationHost._instance_candle_projection(
                 host,
@@ -697,10 +776,36 @@ class ProductionCandleProviderTest(unittest.TestCase):
                 settings={},
                 now=datetime(2026, 9, 8, 10, 0, tzinfo=SEOUL_TIMEZONE),
             )
-            self.assertEqual(interval, result["candles"][0]["timeframe_minutes"])
+            self.assertFalse(result["available"])
+            self.assertEqual([], result["candles"])
+            self.assertEqual("SOURCE_INVALID", result["availability_state"])
 
-        self.assertEqual([1, 120], [call["rules"]["bar"]["bar_minutes"] for call in calls])
-        self.assertTrue(all(call["consumer_scope"] == "MOCK" for call in calls))
+        self.assertEqual([], calls)
+
+    def test_legacy_mock_krx_session_cannot_advance_operation(self) -> None:
+        host = MockValidationHost.__new__(MockValidationHost)
+        document = {"session": {"stock_code": "005930"},
+                    "reference_snapshot": {"calculation_market_source": "KRX"}}
+        self.assertIs(
+            document,
+            MockValidationHost._process_stock(
+                host, document, datetime(2026, 9, 8, 10, tzinfo=SEOUL_TIMEZONE)
+            ),
+        )
+
+    def test_direct_mock_krx_provider_requires_historical_diagnostic_scope(self) -> None:
+        calls = []
+        api = SimpleNamespace(request_minute_candles_read_only=lambda *a, **kw: calls.append((a, kw)))
+        result = project_mock_routine_candles(
+            project_root=Path("unused"), api=api, stock_code="005930",
+            rules={"bar": {"bar_minutes": 1}},
+            projection_request={"projection": "COMPLETED_TIMEFRAME", "warmup_bars": 1},
+            identity_reader=lambda _code: ("session", 1, "login", "identity"),
+            consumer_scope="MOCK",
+        )
+        self.assertFalse(result["available"])
+        self.assertEqual("SOURCE_INVALID", result["availability_state"])
+        self.assertEqual([], calls)
 
 
 if __name__ == "__main__":

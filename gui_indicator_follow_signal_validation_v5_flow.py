@@ -237,10 +237,10 @@ DEFAULT_SIGNAL_VALIDATION_HISTORICAL_COUNT = 5_000
 MAX_SIGNAL_VALIDATION_HISTORICAL_COUNT = 5_000
 _HISTORY_EXTENSION_STEP = 500
 _PERSISTENT_REFRESH_PROBE_COUNT = 300
-_STRICT_KRX_MINUTE_TIMEFRAMES = frozenset(
+_LIVE_MINUTE_TIMEFRAMES = frozenset(
     {"M1", "M3", "M5", "M10", "M15", "M30", "M60", "M120", "M240"}
 )
-_LIVE_CALC_ACCEPTED_TIMEFRAMES = _STRICT_KRX_MINUTE_TIMEFRAMES | {
+_LIVE_CALC_ACCEPTED_TIMEFRAMES = _LIVE_MINUTE_TIMEFRAMES | {
     "D1", "W1", "MO1", "Y1"
 }
 _V5_SOR_FORMING_SOURCES = frozenset({
@@ -6781,7 +6781,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         as_of = latest.replace(second=0, microsecond=0) + timedelta(minutes=1)
             period = session.request.timeframe_key in {"W1", "MO1", "Y1"}
             higher_live = (live_forming and session.request.timeframe_key in
-                           _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"})
+                           _LIVE_MINUTE_TIMEFRAMES - {"M1"})
             rules = ({"bar": {"bar_minutes": 1}} if period or session.request.timeframe_key == "D1"
                      else session.request.settings_snapshot.to_dict())
             session_windows = None
@@ -6917,14 +6917,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         period = timeframe_key in {"W1", "MO1", "Y1"}
         d1 = timeframe_key == "D1"
         source_identity, as_of, projected = frozen
-        live_minute_forming = (timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES
+        live_minute_forming = (timeframe_key in _LIVE_MINUTE_TIMEFRAMES
                                and isinstance(projected, dict)
                                and projected.get("projection") == "FORMING_BASE_BAR")
         live_higher_forming = live_minute_forming and timeframe_key != "M1"
         forming = d1 or period or live_minute_forming
         if self._pool_computation_source_identity(source_pool) != source_identity:
             raise ValueError("SOR_M1_BLOCKED:SOURCE_CHANGED_AFTER_SNAPSHOT")
-        if (normal_base_only and timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}
+        if (normal_base_only and timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
                 and isinstance(projected, dict)
                 and projected.get("availability_state") == "SOR_M1_SOURCE_UNAVAILABLE"
                 and isinstance(view, dict)
@@ -6961,7 +6961,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             and stamps[-1][:8] < now.strftime("%Y%m%d")
                             and display == historical[-len(display):]):
                         return view
-        if (timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}
+        if (timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
                 and isinstance(projected, dict)
                 and projected.get("projection") == "COMPLETED_TIMEFRAME"
                 and isinstance(as_of, datetime)
@@ -7344,7 +7344,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         rules = settings.to_dict() if callable(getattr(settings, "to_dict", None)) else {}
         scope = rules.get("validation_market_scope")
         if (isinstance(scope, dict) and scope.get("regular_market_only") is True
-                and timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES):
+                and timeframe_key in _LIVE_MINUTE_TIMEFRAMES):
             display_calculation = _krx_regular_session_candles(display_calculation)
         if live_calendar and (d1 or period):
             if (not display_calculation or display_calculation[-1]["time"]
@@ -7417,7 +7417,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         proof = frozen[2] if isinstance(frozen, tuple) and len(frozen) == 3 else None
         if (isinstance(proof, dict)
                 and proof.get("availability_state") == "SOR_M1_SOURCE_UNAVAILABLE"
-                and session.request.timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}):
+                and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}):
             request["normal_base_only"] = True
         if getattr(window, "_normal_base_requested", False) or request.get("normal_base_only"):
             self._start_normal_base_prepare(request, history_target)

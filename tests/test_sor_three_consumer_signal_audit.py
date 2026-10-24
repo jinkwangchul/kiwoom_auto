@@ -22,6 +22,7 @@ def evidence(consumer, events=None):
         "rules_hash": "a" * 64,
         "cutoff": "20261024150000",
         "market_data_identity": "005930_AL",
+        "source_proof": "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION",
         "events": [] if events is None else events,
     }
 
@@ -59,6 +60,7 @@ def v5_replay(*, complete=True):
         dropped_raw_rows_count=0, candles=candles, entries=entries,
     )
     view = {"market_source": "INTEGRATED", "market_data_identity": "005930_AL",
+            "source_proof": "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION",
             "candles": candles}
     return snapshot, view
 
@@ -193,6 +195,21 @@ def test_context_mismatch_blocks_before_event_comparison(field, value):
     assert result["status"] == "BLOCKED"
     assert result["reason"] == "CONTEXT_MISMATCH"
     assert result["field"] == field
+
+
+def test_source_proof_mismatch_blocks_equal_events():
+    sources = three([event("20261024090100", "BUY")])
+    sources[1]["source_proof"] = "KRX_RAW"
+    result = compare_three_consumer_signals(*sources)
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "INVALID_EVIDENCE"
+    assert result["consumer"] == "PRODUCTION"
+
+
+def test_v5_adapter_requires_source_proof_from_source_view():
+    snapshot, view = v5_replay()
+    del view["source_proof"]
+    assert audit.extract_v5_replay_evidence(snapshot, view, cutoff="20261023090100") is None
 
 
 @pytest.mark.parametrize("field,value", [

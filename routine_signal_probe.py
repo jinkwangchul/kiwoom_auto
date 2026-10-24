@@ -493,45 +493,46 @@ def probe_routine_for_stock(
         }
     else:
         facts_market = main_facts.get("market", {}) if isinstance(main_facts, dict) else {}
-        sor_selected = (
-            str(stock_config.get("calculation_market_source", "SOR")).strip().upper()
-            != "KRX"
+        if str(stock_config.get("calculation_market_source", "SOR")).strip().upper() != "SOR":
+            return {
+                "signal": "SKIP", "reason": "CALCULATION_MARKET_SOURCE_INVALID",
+                "routine": routine_name, "code": code, "name": name,
+                "execution_enabled": False, "queue_connected": False,
+                "send_order_connected": False,
+            }
+        # The Main-owned SOR calculation is preview-only. An absent or
+        # untrusted projection must NEVER fall back to stored KRX candles.
+        sources = (
+            facts_market.get("candle_supply_by_code")
+            if isinstance(facts_market, dict) else None
         )
-        if sor_selected:
-            # The Main-owned SOR calculation is preview-only. An absent or
-            # untrusted projection must NEVER fall back to the stored KRX
-            # candles and then enter the production order queue.
-            sources = (
-                facts_market.get("candle_supply_by_code")
-                if isinstance(facts_market, dict) else None
-            )
-            evidence = sources.get(code) if isinstance(sources, dict) else None
-            trusted = (
-                isinstance(evidence, dict)
-                and evidence.get("calculation_only") is True
-                and evidence.get("execution_enabled") is False
-                and evidence.get("queue_connected") is False
-                and evidence.get("send_order_connected") is False
-                and evidence.get("market_source") == "INTEGRATED"
-                and evidence.get("market_data_identity") == f"{code}_AL"
-                and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1"
-                and evidence.get("source_proof")
-                == "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
-                and evidence.get("stock_code") == code
-            )
-            if not trusted or evidence.get("available") is not True:
-                return {
-                    "signal": "SKIP",
-                    "reason": (
-                        str(evidence.get("availability_state") or "SOR_SOURCE_UNAVAILABLE")
-                        if trusted else "SOR_CALCULATION_SOURCE_UNAVAILABLE"
-                    ),
-                    "routine": routine_name,
-                    "code": code, "name": name,
-                    "execution_enabled": False,
-                    "queue_connected": False,
-                    "send_order_connected": False,
-                }
+        evidence = sources.get(code) if isinstance(sources, dict) else None
+        trusted = (
+            isinstance(evidence, dict)
+            and evidence.get("calculation_only") is True
+            and evidence.get("execution_enabled") is False
+            and evidence.get("queue_connected") is False
+            and evidence.get("send_order_connected") is False
+            and evidence.get("market_source") == "INTEGRATED"
+            and evidence.get("market_data_identity") == f"{code}_AL"
+            and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1"
+            and evidence.get("source_proof")
+            == "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
+            and evidence.get("stock_code") == code
+        )
+        if not trusted or evidence.get("available") is not True:
+            return {
+                "signal": "SKIP",
+                "reason": (
+                    str(evidence.get("availability_state") or "SOR_SOURCE_UNAVAILABLE")
+                    if trusted else "SOR_CALCULATION_SOURCE_UNAVAILABLE"
+                ),
+                "routine": routine_name,
+                "code": code, "name": name,
+                "execution_enabled": False,
+                "queue_connected": False,
+                "send_order_connected": False,
+            }
         facts_candles = (
             facts_market.get("raw_candles_by_code", {}).get(code)
             if isinstance(facts_market, dict)
@@ -1402,7 +1403,7 @@ def probe_execution_stock_for_committed_bar(
         calculation_source = str(
             projected_config.get("calculation_market_source", "SOR")
         ).strip().upper()
-        sor_preview_requested = calculation_source != "KRX"
+        sor_preview_requested = calculation_source == "SOR"
         candle_supply = (
             provider(
                 stock_code=code,
@@ -1411,14 +1412,13 @@ def probe_execution_stock_for_committed_bar(
                 as_of=parse_market_datetime(tick_key),
                 session_windows=sessions,
                 consumer_scope=(
-                    "SOR_CALCULATION_ONLY" if sor_preview_requested
-                    else "PRODUCTION"
+                    "SOR_CALCULATION_ONLY"
                 ),
             )
-            if callable(provider) and isinstance(projection_request, dict)
+            if sor_preview_requested and callable(provider) and isinstance(projection_request, dict)
             else None
         )
-        if sor_preview_requested and not isinstance(candle_supply, dict):
+        if not isinstance(candle_supply, dict):
             # Never substitute stored KRX history for a selected SOR source.
             candle_supply = {
                 "stock_code": code,

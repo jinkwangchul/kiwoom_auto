@@ -1,7 +1,7 @@
 """Compare caller-supplied V5, PRODUCTION, and MOCK SOR signal records.
 
 Each input is a separate JSON object with consumer, origin_proof, stock,
-timeframe, rules_hash, cutoff, market_data_identity, and events. Each event
+timeframe, rules_hash, cutoff, market_data_identity, source_proof, and events. Each event
 has a YYYYMMDDHHMMSS time and BUY or SELL side. Provenance is supplied by the
 caller; this tool cannot attest a broker, a running GUI, or live parity.
 
@@ -22,7 +22,8 @@ from typing import Any
 
 CONSUMERS = ("V5", "PRODUCTION", "MOCK")
 CONTEXT = ("stock", "timeframe", "rules_hash", "cutoff", "market_data_identity")
-FIELDS = frozenset(("consumer", "origin_proof", "events", *CONTEXT))
+SOURCE_PROOF = "BROKER_ROWS_NOT_INDEPENDENT_MERGE_ATTESTATION"
+FIELDS = frozenset(("consumer", "origin_proof", "source_proof", "events", *CONTEXT))
 SCOPE = "READ_ONLY_RECORDED_SIGNAL_COMPARISON"
 
 
@@ -55,6 +56,7 @@ def _valid_evidence(source: Any, consumer: str) -> bool:
             or not re.fullmatch(r"[0-9a-f]{64}", source["rules_hash"])
             or not _valid_time(source["cutoff"])
             or source["market_data_identity"] != "005930_AL"
+            or source["source_proof"] != SOURCE_PROOF
             or not isinstance(source["events"], list)):
         return False
     previous = ""
@@ -82,6 +84,7 @@ def extract_v5_replay_evidence(
             or not snapshot.historical_request_id
             or source_view.get("market_source") != "INTEGRATED"
             or source_view.get("market_data_identity") != "005930_AL"
+            or source_view.get("source_proof") != SOURCE_PROOF
             or not _valid_time(cutoff)):
         return None
     candles = snapshot.to_candles()
@@ -122,7 +125,8 @@ def extract_v5_replay_evidence(
         "consumer": "V5", "origin_proof": f"V5_REPLAY:{proof}",
         "stock": "005930", "timeframe": "M1",
         "rules_hash": snapshot.settings_hash, "cutoff": cutoff,
-        "market_data_identity": "005930_AL", "events": events,
+        "market_data_identity": "005930_AL", "source_proof": SOURCE_PROOF,
+        "events": events,
     }
 
 
