@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
@@ -30,6 +31,15 @@ _MARKER_KEYS = (
 def _hex(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(
         character in "0123456789abcdef" for character in value)
+
+
+def _kst_time(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).utcoffset() == timedelta(hours=9)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _safe_record(output: Any) -> dict[str, Any] | None:
@@ -68,7 +78,13 @@ def _safe_record(output: Any) -> dict[str, Any] | None:
         "send_order_connected": False,
         "sor_preview_signal": marker["side"],
         **({"sor_preview_activation_time": output.get("sor_preview_activation_time")}
-           if marker["timeframe"] == "M1" else {}),
+           if marker["timeframe"] == "M1" or (
+               "sor_preview_activation_time" in output and (
+                   output["sor_preview_activation_time"] is None
+                   or _kst_time(output["sor_preview_activation_time"])))
+           else {}),
+        **({"sor_preview_evaluated_at": output["sor_preview_evaluated_at"]}
+           if _kst_time(output.get("sor_preview_evaluated_at")) else {}),
         "sor_preview_evidence": {
             **{key: marker[key] for key in _MARKER_KEYS},
             **({"direct_m1_source_proof": marker["direct_m1_source_proof"]}
