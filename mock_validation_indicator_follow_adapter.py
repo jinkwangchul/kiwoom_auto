@@ -2012,7 +2012,7 @@ class MockIndicatorFollowRoutineAdapter:
                     marked = self.repository.mutate_session(
                         session_id, no_signal_mark, expected_revision=document["revision"]
                     )["document"]
-                    if source_marker and source_marker["timeframe"] == "M3":
+                    if source_marker and source_marker["timeframe"] != "M1":
                         self._event(
                             marked, instance_id=instance_id,
                             event_type="ROUTINE_EVALUATED", identity=cycle_id,
@@ -2169,7 +2169,7 @@ class MockIndicatorFollowRoutineAdapter:
                 marked = self.repository.mutate_session(
                     session_id, no_signal_mark, expected_revision=document["revision"]
                 )["document"]
-                if source_marker and source_marker["timeframe"] == "M3":
+                if source_marker and source_marker["timeframe"] != "M1":
                     self._event(
                         marked, instance_id=instance_id,
                         event_type="ROUTINE_EVALUATED", identity=cycle_id,

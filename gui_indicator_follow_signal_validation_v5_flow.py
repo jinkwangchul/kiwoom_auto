@@ -31,7 +31,7 @@ from PyQt5 import sip
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QDialog, QWidget
 
-from candle_timeframe_aggregation import SEOUL_TIMEZONE, candle_market_datetime
+from candle_timeframe_aggregation import SEOUL_TIMEZONE, SUPPORTED_BAR_MINUTES, candle_market_datetime
 from gui_toast import show_toast
 from gui_stock_data import (
     PROJECT_ROOT, STOCK_LIBRARY_READY, load_stock_library_snapshot, read_base_stocks,
@@ -111,21 +111,28 @@ _V5_MARKING_DIAGNOSTIC_PATH = (
 _V5_M3_OPERATIONAL_PATH = (
     Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_sor_m3_operational.jsonl"
 )
+_V5_DIRECT_OPERATIONAL_PATH = (
+    Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_sor_direct_operational.jsonl"
+)
 _V5_MARKING_DIAGNOSTIC_QUEUE = Queue(maxsize=256)
 _V5_MARKING_DIAGNOSTIC_LOCK = Lock()
 _V5_MARKING_DIAGNOSTIC_STARTED = False
 _V5_MARKING_DIAGNOSTIC_MAX_BYTES = 4 * 1024 * 1024
 
 
-def _queue_v5_m3_evidence(lines: str) -> bool:
+def _queue_v5_m3_evidence(lines: str, *, timeframe: str = "M3") -> bool:
     global _V5_MARKING_DIAGNOSTIC_STARTED
     try:
+        if timeframe not in {f"M{n}" for n in SUPPORTED_BAR_MINUTES if n > 1}:
+            return False
         with _V5_MARKING_DIAGNOSTIC_LOCK:
             if not _V5_MARKING_DIAGNOSTIC_STARTED:
                 _DiagnosticThread(target=_write_v5_marking_diagnostics,
                                   name="v5-marking-diagnostic", daemon=True).start()
                 _V5_MARKING_DIAGNOSTIC_STARTED = True
-        _V5_MARKING_DIAGNOSTIC_QUEUE.put_nowait((_V5_M3_OPERATIONAL_PATH, lines))
+        path = (_V5_M3_OPERATIONAL_PATH if timeframe == "M3"
+                else _V5_DIRECT_OPERATIONAL_PATH)
+        _V5_MARKING_DIAGNOSTIC_QUEUE.put_nowait((path, lines))
         return True
     except (Full, RuntimeError, OSError):
         return False
@@ -8289,11 +8296,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 payload["backtest_trust_metadata"] = trust_metadata
                 payload["error"] = ""
                 if (session.request.stock.code == "005930"
-                        and session.request.timeframe_key == "M3"
+                        and session.request.timeframe_minutes in SUPPORTED_BAR_MINUTES
+                        and session.request.timeframe_minutes > 1
+                        and session.request.timeframe_key == f"M{session.request.timeframe_minutes}"
                         and current()):
                     try:
                         marker_path = self._validation_cache_source_marker_path(
-                            session.request.stock, 3, "M3",
+                            session.request.stock, session.request.timeframe_minutes,
+                            session.request.timeframe_key,
                             int(pool.get("requested_count") or 0))
                         if (marker_path is not None and marker_path.is_file()
                                 and marker_path.stat().st_size <= 4096):
@@ -8308,6 +8318,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                                 payload["sor_m3_evidence_lines"] = "".join(
                                     json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
                                     for record in evidence)
+                                payload["sor_evidence_timeframe"] = session.request.timeframe_key
                     except (OSError, ValueError, TypeError, AttributeError):
                         pass  # Optional evidence cannot interrupt replay.
             except Exception as exc:
@@ -8671,9 +8682,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or key in self._prepare_pending):
             return
         identity = (generation, request_id)
-        if (self._sor_m3_replay_published.get(key) != identity
-                and _queue_v5_m3_evidence(lines)):
-            self._sor_m3_replay_published[key] = identity
+        if self._sor_m3_replay_published.get(key) != identity:
+            timeframe = payload.get("sor_evidence_timeframe", "M3")
+            queued = (_queue_v5_m3_evidence(lines) if timeframe == "M3" else
+                      _queue_v5_m3_evidence(lines, timeframe=timeframe))
+            if queued:
+                self._sor_m3_replay_published[key] = identity
 
     def _validation_fetch_contract(
         self,
@@ -10347,11 +10361,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     cancel_predicate=lambda: not current())
                 payload["snapshot"] = snapshot
                 payload["comparison"] = (tuple(c["time"] for c in rows), cache)
-                if (minutes == 3 and session.request.stock.code == "005930"
+                if (minutes in SUPPORTED_BAR_MINUTES and minutes > 1
+                        and session.request.timeframe_key == f"M{minutes}"
+                        and session.request.stock.code == "005930"
                         and not detached_premarket):
                     try:
                         marker_path = self._validation_cache_source_marker_path(
-                            session.request.stock, 3, "M3",
+                            session.request.stock, minutes, session.request.timeframe_key,
                             int(pool.get("requested_count") or 0))
                         if (marker_path is not None and marker_path.is_file()
                                 and marker_path.stat().st_size <= 4096):
@@ -10365,6 +10381,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                                 payload["sor_m3_evidence_lines"] = "".join(
                                     json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
                                     for record in evidence)
+                                payload["sor_evidence_timeframe"] = session.request.timeframe_key
                     except (OSError, ValueError, TypeError):
                         pass  # Optional evidence cannot interrupt marking.
             except Exception as exc:
@@ -10417,7 +10434,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 token = (payload["generation"], payload["request_generation"], payload["key"])
                 key = payload["window_key"]
                 if self._sor_m3_marking_published.get(key) != token:
-                    if _queue_v5_m3_evidence(payload["sor_m3_evidence_lines"]):
+                    timeframe = payload.get("sor_evidence_timeframe", "M3")
+                    queued = (_queue_v5_m3_evidence(payload["sor_m3_evidence_lines"])
+                              if timeframe == "M3" else _queue_v5_m3_evidence(
+                                  payload["sor_m3_evidence_lines"], timeframe=timeframe))
+                    if queued:
                         self._sor_m3_marking_published[key] = token
             _trace_v5_marking("marking_published" if published else "marking_stale",
                               payload["window_key"], payload["generation"],

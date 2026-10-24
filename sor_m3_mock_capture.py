@@ -11,6 +11,7 @@ from sor_m3_operational_evidence import _marker, _qualified_time
 from sor_m3_production_capture import _MARKER_KEYS, _QUEUE, _hex, enqueue_line
 
 _PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_m3_mock_events.jsonl"
+_DIRECT_PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_direct_mock_events.jsonl"
 _LOCK = Lock()
 _SEEN: dict[str, None] = {}
 
@@ -28,7 +29,9 @@ def enqueue_event(event: Any, *, cycle_identity: Any = None,
         side = payload.get("signal") if isinstance(payload, dict) else None
         activation_time = payload.get("signal_bar_time") if side in {"BUY", "SELL"} else None
         activated = _qualified_time(activation_time)
-        if (not _marker(marker, event_time or "")
+        if (not isinstance(marker, dict)
+                or not _marker(marker, event_time or "",
+                               timeframe=marker.get("timeframe"))
                 or any(key not in marker for key in _MARKER_KEYS)
                 or not _hex(marker.get("source_session_sha256"))
                 or type(marker.get("source_connection_epoch")) is not int
@@ -70,7 +73,8 @@ def enqueue_event(event: Any, *, cycle_identity: Any = None,
         with _LOCK:
             if record["event_id"] in _SEEN:
                 return False
-            if not enqueue_line(_PATH, line):
+            path = _PATH if marker["timeframe"] == "M3" else _DIRECT_PATH
+            if not enqueue_line(path, line):
                 return False
             _SEEN[record["event_id"]] = None
             if len(_SEEN) > 256:

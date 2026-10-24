@@ -66,6 +66,7 @@ from running_budget_adjustment import (
 )
 from state_policy import read_operation_policy
 from sor_routine_signal_evidence import build_source_marker, _hash as _evidence_hash
+from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES
 from sor_m3_production_capture import enqueue_preview as _enqueue_sor_m3_preview
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -519,7 +520,8 @@ def probe_routine_for_stock(
             and (
                 (evidence.get("timeframe_minutes") == 1
                  and evidence.get("calculation_source") == "BROKER_AL_CONFIRMED_M1")
-                or (evidence.get("timeframe_minutes") == 3
+                or (evidence.get("timeframe_minutes") in SUPPORTED_BAR_MINUTES
+                    and evidence.get("timeframe_minutes") != 1
                     and evidence.get("calculation_source")
                     == "BROKER_AL_CONFIRMED_DIRECT"
                     and evidence.get("direct_history_source")
@@ -819,7 +821,7 @@ def probe_routine_for_stock(
                     source=candle_projection_evidence, side=preview_side,
                 )
                 cycle_hash = None
-                if source_marker and source_marker.get("timeframe") == "M3":
+                if source_marker and source_marker.get("timeframe") != "M1":
                     try:
                         cycle_hash = _evidence_hash(context.get("cycle"))
                     except (TypeError, ValueError, OverflowError):
@@ -844,14 +846,14 @@ def probe_routine_for_stock(
                             context.get("cycle", {}).get("status")
                             if isinstance(context.get("cycle"), dict) else None),
                         "sor_preview_observed_at": tick_key}
-                       if source_marker and source_marker.get("timeframe") == "M3"
+                       if source_marker and source_marker.get("timeframe") != "M1"
                        else {}),
                     "candles": len(candles),
                     "execution_enabled": False,
                     "queue_connected": False,
                     "send_order_connected": False,
                 }
-                if source_marker and source_marker.get("timeframe") == "M3":
+                if source_marker and source_marker.get("timeframe") != "M1":
                     _enqueue_sor_m3_preview(output)
                 return output
             try:

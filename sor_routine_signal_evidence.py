@@ -69,18 +69,18 @@ def build_source_marker(
             or source.get("send_order_connected") is not False
             or not isinstance(candles, (list, tuple)) or not candles):
         return None
-    from candle_timeframe_aggregation import read_canonical_bar_minutes
+    from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES, read_canonical_bar_minutes
 
     try:
         bar = rules.get("bar") if isinstance(rules.get("bar"), dict) else {}
         if "bar_minutes" not in bar and "bar_minutes" not in rules:
             return None
         interval = read_canonical_bar_minutes(rules)
-        if interval not in (1, 3) or source.get("timeframe_minutes") != interval:
+        if interval not in SUPPORTED_BAR_MINUTES or source.get("timeframe_minutes") != interval:
             return None
         if interval == 1 and source.get("calculation_source") != "BROKER_AL_CONFIRMED_M1":
             return None
-        if interval == 3 and (source.get("direct_history_source")
+        if interval > 1 and (source.get("direct_history_source")
                               != "BROKER_AL_CONFIRMED_DIRECT"
                               or source.get("calculation_source")
                               != "BROKER_AL_CONFIRMED_DIRECT"
@@ -90,11 +90,11 @@ def build_source_marker(
                               or not re.fullmatch(r"[0-9a-f]{64}", source["source_identity"])
                               or source.get("forming_included") is True):
             return None
-        if interval == 3:
+        if interval > 1:
             receipt = source.get("direct_source_receipt")
             if (not isinstance(receipt, dict)
                     or receipt.get("stock_code") != stock
-                    or receipt.get("timeframe_key") != "M3"
+                    or receipt.get("timeframe_key") != f"M{interval}"
                     or receipt.get("source_content_sha256") != source["source_identity"]
                     or type(receipt.get("connection_epoch")) is not int
                     or receipt["connection_epoch"] <= 0
@@ -108,7 +108,7 @@ def build_source_marker(
                 or any(row.get("timeframe_minutes") != interval for row in candles)
                 or times != sorted(set(times))):
             return None
-        if interval == 3 and any(
+        if interval > 1 and any(
             row.get("market_data_identity") != "005930_AL"
             or row.get("market_source") != "INTEGRATED"
             or row.get("display_only") is not True
@@ -124,7 +124,7 @@ def build_source_marker(
         direct_rows = ([{
             "time": time.strftime("%Y%m%d%H%M%S"),
             **{key: row[key] for key in ("open", "high", "low", "close", "volume")},
-        } for time, row in zip(times, candles)] if interval == 3 else None)
+        } for time, row in zip(times, candles)] if interval > 1 else None)
         marker = {
             "stock": stock, "timeframe": f"M{interval}", "rules_hash": _hash(rules),
             "evaluation_time": times[-1].strftime("%Y%m%d%H%M%S"),
@@ -132,7 +132,7 @@ def build_source_marker(
             "input_hash": _hash(candles if interval == 1 else direct_rows),
             "side": side_text,
         }
-        if interval == 3:
+        if interval > 1:
             marker["source_identity"] = source["source_identity"]
             marker["receipt_hash"] = _hash(direct_rows[-1])
             marker["source_session_sha256"] = receipt["session_sha256"]

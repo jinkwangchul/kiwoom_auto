@@ -50,3 +50,28 @@ The current runtime has no independently observed accepted V5 M3, Production
 M3, and Mock M3 records. A missing V5 accepted file is reported as `BLOCKED`.
 Offline tests and cache sidecars do not establish live parity. No GUI or broker
 session should be started merely to fill this evidence gap.
+
+## Direct-source chart frames
+
+The same bounded collector accepts `--timeframe M5` (or M10, M15, M30,
+M60, M120, M240) with the matching frame's V5, Production, and Mock files.
+The default remains M3 with the original file names and schema. New direct
+minute records use `v5_sor_direct_operational.jsonl`,
+`sor_direct_production_outputs.jsonl`, and `sor_direct_mock_events.jsonl` in
+`runtime/diagnostics`. A frame must be selected exactly; records for other
+known minute frames are excluded, while a missing selected route blocks
+comparison. The Production and Mock markers require that frame's
+direct completed `_AL` rows, their source content identity, session/epoch
+receipt, and canonical rule and row hashes. The V5 sidecar verifies cache
+content and accepted replay only; it does not independently attest broker
+receipt or establish live order/cycle parity. A matching selection therefore
+continues to report overall `BLOCKED` and order/cycle status `UNKNOWN`.
+
+M1 remains `BLOCKED`: its existing calculation marker has no direct completed
+M1 session/epoch receipt and per-bar receipt hash required by this collector.
+The forming M1/tick path is unchanged. D1, W1, MO1, and Y1 remain `BLOCKED`:
+there is no proven direct SOR period-row receipt, period candle schema, or
+participating routine marker for those frames. No higher-period decision is
+inferred from minute bars. The other minute frames are code-eligible only;
+accepted records from all three independent routes have not been observed in
+a live authorized session.

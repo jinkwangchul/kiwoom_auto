@@ -9,9 +9,11 @@ from queue import Queue
 from threading import Lock, Thread
 from typing import Any
 
+from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES
 from sor_routine_signal_evidence import _SOURCE_PROOF, _valid_cutoff
 
 _PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_m3_production_outputs.jsonl"
+_DIRECT_PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_direct_production_outputs.jsonl"
 _MAX_BYTES = 4 * 1024 * 1024
 _QUEUE: Queue[tuple[Path, str]] = Queue(maxsize=256)
 _LOCK = Lock()
@@ -39,7 +41,9 @@ def _safe_record(output: Any) -> dict[str, Any] | None:
             or any(output.get(key) is not False for key in
                    ("execution_enabled", "queue_connected", "send_order_connected"))
             or not isinstance(marker, dict)
-            or marker.get("stock") != "005930" or marker.get("timeframe") != "M3"
+            or marker.get("stock") != "005930"
+            or marker.get("timeframe") not in {
+                f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
             or marker.get("market_data_identity") != "005930_AL"
             or marker.get("source_proof") != _SOURCE_PROOF
             or marker.get("side") not in {"BUY", "SELL", "NONE"}
@@ -114,7 +118,7 @@ def enqueue_preview(output: Any) -> bool:
             return False
         marker = record["sor_preview_evidence"]
         key = (record["sor_preview_routine_instance_sha256"],
-               marker["evaluation_time"],
+               marker["timeframe"], marker["evaluation_time"],
                marker["source_identity"], marker["rules_hash"],
                record["sor_preview_cycle_hash"])
         line = json.dumps(record, ensure_ascii=True, sort_keys=True,
@@ -125,7 +129,8 @@ def enqueue_preview(output: Any) -> bool:
             if not _STARTED:
                 Thread(target=_write_loop, name="sor-m3-production-evidence", daemon=True).start()
                 _STARTED = True
-            _QUEUE.put_nowait((_PATH, line))
+            _QUEUE.put_nowait(((_PATH if marker["timeframe"] == "M3"
+                              else _DIRECT_PATH), line))
             _SEEN[key] = None
             if len(_SEEN) > 256:
                 del _SEEN[next(iter(_SEEN))]

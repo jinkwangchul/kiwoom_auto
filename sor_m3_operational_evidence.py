@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES
 from sor_routine_signal_evidence import _SOURCE_PROOF, _valid_cutoff
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -33,15 +34,17 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                      rows: Any, entries: Any, *, generation: int,
                      request_generation: int, window_key: int = 0,
                      capture_kind: str = "MARKING") -> list[dict[str, Any]]:
-    """Run on the replay worker; return only source-bound evaluated M3 rows."""
+    """Run on the replay worker; return source-bound evaluated direct minute rows."""
     try:
         source = pool["candles"]
         stock = snapshot.stock.code
+        timeframe = pool.get("timeframe_key")
+        minutes = pool.get("timeframe_minutes")
         if (stock != "005930" or pool["stock"].code != stock
-                or pool.get("timeframe_key") != "M3"
-                or pool.get("timeframe_minutes") != 3
-                or snapshot.timeframe_key != "M3"
-                or snapshot.timeframe_minutes != 3
+                or type(minutes) is not int or minutes not in SUPPORTED_BAR_MINUTES
+                or minutes == 1 or timeframe != f"M{minutes}"
+                or snapshot.timeframe_key != timeframe
+                or snapshot.timeframe_minutes != minutes
                 or pool.get("market_source") != "INTEGRATED"
                 or pool.get("market_data_identity") != "005930_AL"
                 or not isinstance(cache_marker, dict)
@@ -117,7 +120,7 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
         return [{"origin": "V5", "capture_kind": capture_kind,
                  "source_verified": True,
                  "verification_kind": "CACHE_SIDECAR_CONTENT_MATCH_ONLY",
-                 "stock": stock, "timeframe": "M3", "rules_hash": snapshot.settings_hash,
+                 "stock": stock, "timeframe": timeframe, "rules_hash": snapshot.settings_hash,
                  "evaluation_time": rows[i]["time"],
                  "activation_time": rows[i]["time"],
                  "signal_time": signal_times.get(i),
@@ -134,11 +137,13 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
         return []
 
 
-def _marker(value: Any, cutoff: str) -> bool:
+def _marker(value: Any, cutoff: str, *, timeframe: str = "M3") -> bool:
     return bool(
+        timeframe in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
+        and
         isinstance(value, dict)
         and value.get("stock") == "005930"
-        and value.get("timeframe") == "M3"
+        and value.get("timeframe") == timeframe
         and value.get("market_data_identity") == "005930_AL"
         and value.get("source_proof") == _SOURCE_PROOF
         and value.get("side") in {"BUY", "SELL", "NONE"}
@@ -169,10 +174,15 @@ def _observation_time(value: Any) -> str | None:
     return stamp.strftime("%Y%m%d%H%M%S") if stamp else None
 
 
-def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict[str, Any]:
+def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
+                    timeframe: str = "M3") -> dict[str, Any]:
     """Compare recorded decisions only; matching selections cannot prove live parity."""
     if not _valid_cutoff(cutoff):
         return _blocked("INVALID_CUTOFF")
+    if timeframe == "M1":
+        return _blocked("M1_DIRECT_SOURCE_RECEIPT_MISSING")
+    if timeframe not in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}:
+        return _blocked("DIRECT_PERIOD_SOURCE_SCHEMA_UNPROVEN")
     if not isinstance(v5, list) or not v5:
         return _blocked("V5_ACCEPTED_M3_MISSING")
     if not isinstance(production, list) or not production:
@@ -180,7 +190,9 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
     captured_mock = isinstance(mock, list)
     if captured_mock:
         mock_events = mock
-        mock_session = mock[0].get("validation_session_id") if mock and isinstance(mock[0], dict) else None
+        mock_session = (mock[0].get("validation_session_id")
+                        if timeframe == "M3" and mock and isinstance(mock[0], dict)
+                        else None)
     elif isinstance(mock, dict) and mock.get("schema_version") == "mock_validation_event_v1":
         mock_events = mock.get("events")
         mock_session = mock.get("validation_session_id")
@@ -188,11 +200,12 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
         mock_events = None
         mock_session = None
     if (not isinstance(mock_events, list) or not mock_events
-            or not isinstance(mock_session, str)
-            or not mock_session.startswith("MV-")):
+            or (not captured_mock and (not isinstance(mock_session, str)
+                                       or not mock_session.startswith("MV-")))):
         return _blocked("MOCK_SESSION_JOURNAL_MISSING")
 
     selected: dict[str, dict[str, dict[str, Any]]] = {}
+    selected_records: dict[str, dict[str, dict[str, Any]]] = {}
     for origin in ("V5", "PRODUCTION", "MOCK"):
         records = (v5 if origin == "V5" else production if origin == "PRODUCTION"
                    else [event for event in mock_events
@@ -202,6 +215,7 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
         if len(records) > _MAX_RECORDS:
             return _blocked(f"{origin}_RECORD_BOUND_EXCEEDED")
         by_time: dict[str, dict[str, Any]] = {}
+        by_record: dict[str, dict[str, Any]] = {}
         ids: set[str] = set()
         for record in records:
             if not isinstance(record, dict):
@@ -210,8 +224,13 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
                       record.get("sor_preview_evidence") if origin == "PRODUCTION" else
                       record.get("payload", {}).get("sor_source_evidence")
                       if isinstance(record.get("payload"), dict) else None)
-            if not _marker(marker, cutoff):
-                return _blocked(f"{origin}_M3_MARKER_UNPROVEN")
+            if (isinstance(marker, dict) and marker.get("timeframe") != timeframe
+                    and marker.get("timeframe") in {
+                        f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}):
+                continue
+            if not _marker(marker, cutoff, timeframe=timeframe):
+                return _blocked(f"{origin}_M3_MARKER_UNPROVEN" if timeframe == "M3"
+                                else f"{origin}_FRAME_MARKER_UNPROVEN")
             t = marker["evaluation_time"]
             if t in by_time:
                 return _blocked(f"{origin}_DUPLICATE_EVALUATION")
@@ -233,6 +252,7 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
                         or not isinstance(marker.get("source_session_sha256"), str)
                         or not _HEX.fullmatch(marker["source_session_sha256"])
                         or type(marker.get("source_connection_epoch")) is not int
+                        or marker["source_connection_epoch"] <= 0
                         or record.get("reason") != "SOR_CALCULATION_ONLY_NO_ORDER"
                         or any(record.get(key) is not False for key in
                                ("execution_enabled", "queue_connected", "send_order_connected"))
@@ -252,16 +272,21 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
                     return _blocked("PRODUCTION_PREVIEW_OR_CYCLE_UNPROVEN")
             else:
                 payload = record.get("payload")
+                if captured_mock and mock_session is None:
+                    mock_session = record.get("validation_session_id")
                 event_id = record.get("event_id")
                 cycle_id = payload.get("evaluation_cycle_id") if isinstance(payload, dict) else None
                 signal_instant = _qualified_time(payload.get("signal_bar_time")) if isinstance(payload, dict) else None
                 activation_time = record.get("activation_time")
                 observed_instant = _qualified_time(record.get("timestamp"))
                 observed_time = observed_instant.strftime("%Y%m%d%H%M%S") if observed_instant else None
-                if (record.get("validation_session_id") != mock_session
+                if (not isinstance(mock_session, str)
+                        or not mock_session.startswith("MV-")
+                        or record.get("validation_session_id") != mock_session
                         or not isinstance(marker.get("source_session_sha256"), str)
                         or not _HEX.fullmatch(marker["source_session_sha256"])
                         or type(marker.get("source_connection_epoch")) is not int
+                        or marker["source_connection_epoch"] <= 0
                         or not isinstance(event_id, str) or not event_id.startswith("ME-")
                         or event_id in ids
                         or not isinstance(cycle_id, str) or not cycle_id.startswith("MC-")
@@ -286,9 +311,11 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
                     return _blocked("MOCK_JOURNAL_BINDING_UNPROVEN")
                 ids.update((event_id, cycle_id))
             by_time[t] = marker
+            by_record[t] = record
         if not by_time or max(by_time) != cutoff:
             return _blocked(f"{origin}_CUTOFF_MISSING")
         selected[origin] = by_time
+        selected_records[origin] = by_record
 
     times = sorted(set().union(*(set(items) for items in selected.values())))
     if any(set(items) != set(times) for items in selected.values()):
@@ -310,9 +337,8 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str) -> dict
     first = next((t for t in times if len({selected[origin][t]["side"] for origin
                                           in selected}) > 1), None)
     for t in times:
-        production_record = next(row for row in production
-                                 if row["sor_preview_evidence"]["evaluation_time"] == t)
-        mock_record = next(row for row in records if row["payload"]["sor_source_evidence"]["evaluation_time"] == t)
+        production_record = selected_records["PRODUCTION"][t]
+        mock_record = selected_records["MOCK"][t]
         production_instance = (production_record.get("sor_preview_routine_instance_sha256")
                                or hashlib.sha256(str(production_record.get(
                                    "sor_preview_routine_instance_id", "")).encode("utf-8")).hexdigest())
@@ -381,17 +407,19 @@ def _read_mock(path: Path) -> Any:
             for line in raw.splitlines()[-_MAX_RECORDS:]]
 
 
-def _latest_v5_batch(records: list[dict[str, Any]], cutoff: str) -> list[dict[str, Any]]:
+def _latest_v5_batch(records: list[dict[str, Any]], cutoff: str,
+                     timeframe: str = "M3") -> list[dict[str, Any]]:
     latest = next((row for row in reversed(records)
-                   if isinstance(row, dict) and row.get("evaluation_time") == cutoff), None)
+                   if isinstance(row, dict) and row.get("evaluation_time") == cutoff
+                   and row.get("timeframe") == timeframe), None)
     if latest is None:
         return []
     identity = tuple(latest.get(key) for key in
-                     ("window_key", "generation", "request_generation",
+                     ("timeframe", "window_key", "generation", "request_generation",
                       "historical_request_id", "source_identity", "capture_kind"))
     return [row for row in records if isinstance(row, dict) and
             tuple(row.get(key) for key in
-                  ("window_key", "generation", "request_generation",
+                  ("timeframe", "window_key", "generation", "request_generation",
                    "historical_request_id", "source_identity", "capture_kind")) == identity
             and row.get("evaluation_time", "") <= cutoff]
 
@@ -409,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--production", required=True, type=Path)
     parser.add_argument("--mock", required=True, type=Path)
     parser.add_argument("--cutoff", required=True)
+    parser.add_argument("--timeframe", default="M3", help="exact chart frame (default: M3)")
     args = parser.parse_args(argv)
     sources = []
     result = None
@@ -423,11 +452,12 @@ def main(argv: list[str] | None = None) -> int:
             result = _blocked(reason)
             break
     if result is None:
-        sources[0] = _latest_v5_batch(sources[0], args.cutoff)
+        sources[0] = _latest_v5_batch(sources[0], args.cutoff, args.timeframe)
         sources[1] = _latest_production_batch(
             sources[1], args.cutoff,
             {row["evaluation_time"] for row in sources[0]})
-        result = compare_records(*sources, cutoff=args.cutoff)
+        result = compare_records(*sources, cutoff=args.cutoff,
+                                 timeframe=args.timeframe)
     print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     return 1 if result["status"] == "MISMATCH" else 2
 
