@@ -1182,9 +1182,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return
         state["requests"] += 1
         state["pending"] = True
+        attempt = object()
+        state["attempt"] = attempt
 
         def terminal(result: object) -> None:
             if (self._offsession_sor_m1_requests.get(key) is not state
+                    or state.get("attempt") is not attempt
                     or not state["pending"]
                     or self._open_windows.get(key) is not window
                     or getattr(getattr(window, "stock", None), "code", None) != code
@@ -1233,6 +1236,22 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             )
             if isinstance(started, dict) and started.get("ok") is not True:
                 terminal(started)
+            elif isinstance(started, dict) and started.get("ok") is True and state["pending"]:
+                def callback_timeout() -> None:
+                    if (self._offsession_sor_m1_requests.get(key) is not state
+                            or state.get("attempt") is not attempt
+                            or not state["pending"]
+                            or self._open_windows.get(key) is not window
+                            or getattr(getattr(window, "stock", None), "code", None) != code
+                            or MarketDataHost._current_display_session_identity(market) != identity
+                            or MarketDataHost._current_display_candles(market, code, 1)):
+                        return
+                    state["pending"] = False
+                    state["requests"] = 2
+                    state["reason"] = "CALLBACK_TIMEOUT"
+                    self.validation_failed.emit("SOR_M1_ACQUISITION_FAILED:CALLBACK_TIMEOUT")
+
+                QTimer.singleShot(30000, callback_timeout)
         except Exception as exc:
             terminal({"ok": False, "reason_code": f"REQUEST_{type(exc).__name__}"})
 

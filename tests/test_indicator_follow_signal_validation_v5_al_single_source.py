@@ -156,7 +156,7 @@ def test_off_session_v5_lease_fetches_missing_al_m1_once_and_retries_after_verif
     with patch(
         "auto_candle_refresh.request_display_timeframe_candles_for_stock",
         side_effect=capture_request,
-    ), patch.object(flow_module.QTimer, "singleShot", side_effect=lambda _ms, callback: callback()):
+    ), patch.object(flow_module.QTimer, "singleShot", side_effect=lambda ms, callback: callback() if ms == 0 else None):
         flow._sync_v5_observation_lease(window)
         flow._sync_v5_observation_lease(window)
         assert len(requests) == 1
@@ -264,15 +264,15 @@ def test_offsession_m1_failure_retries_once_then_stops():
                    flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
         flow._sync_v5_observation_lease(window)
         requests[0]["on_terminal"]({"ok": False, "reason_code": "DISPLAY_TIMEFRAME_SESSION_UNAVAILABLE"})
-        assert len(timers) == 1
+        assert [ms for ms, _ in timers] == [30000, 1000]
         delay, retry = timers.pop()
-        assert delay > 0
+        assert delay == 1000
         flow._sync_v5_observation_lease(window)
         assert len(requests) == 1
         retry()
         assert len(requests) == 2
         requests[1]["on_terminal"]({"ok": False, "reason_code": "BROKER_FAILED"})
-        assert timers == []
+        assert [ms for ms, _ in timers] == [30000, 30000]
         flow._request_offsession_sor_m1_once(window, market, "005930")
         assert len(requests) == 2
     assert reasons == ["SOR_M1_ACQUISITION_FAILED:BROKER_FAILED"]
@@ -319,7 +319,7 @@ def test_offsession_m1_late_session_and_cancellation_guards():
         timers.pop()[1]()
         assert len(requests) == 1
         requests[0]["on_terminal"]({"ok": False, "reason_code": "BROKER_FAILED"})
-        assert len(timers) == 1
+        assert [ms for ms, _ in timers] == [30000, 1000]
         flow._open_windows.pop(id(window))
         timers.pop()[1]()
         assert len(requests) == 1
@@ -352,8 +352,125 @@ def test_offsession_m1_stale_request_cannot_revalidate_new_stock_or_session(chan
         market._display_timeframe_candles[("005930", 1)] = cached[("005930", 1)]
         market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
         requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
-    assert timers == []
+    assert [ms for ms, _ in timers] == [30000]
     assert published == []
+
+
+def _offsession_accepted_request_case():
+    flow, session, _pool, market, cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    market._display_timeframe_candles.pop(("005930", 1))
+    market._display_timeframe_session_identity.pop(("005930", 1))
+    market.set_v5_observation_lease = lambda _key, _code: {"ok": True}
+    revalidated = []
+    window = SimpleNamespace(
+        stock=session.request.stock, _normal_base_requested=True,
+        request_initial_validation=lambda: revalidated.append("revalidated"),
+    )
+    flow._open_windows[id(window)] = window
+    requests, timers, reasons = [], [], []
+    flow.validation_failed.connect(reasons.append)
+    return flow, window, market, cached, requests, timers, reasons, revalidated
+
+
+def test_offsession_m1_accepted_request_times_out_once_without_overlap():
+    flow, window, market, _cached, requests, timers, reasons, revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        assert [ms for ms, _ in timers] == [30000]
+        flow._sync_v5_observation_lease(window)
+        assert len(requests) == 1
+        timers.pop()[1]()
+        assert flow._offsession_sor_m1_requests[id(window)]["pending"] is False
+        flow._sync_v5_observation_lease(window)
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        assert len(requests) == 1
+    assert reasons == ["SOR_M1_ACQUISITION_FAILED:CALLBACK_TIMEOUT"]
+    assert revalidated == []
+
+
+def test_offsession_m1_terminal_before_watchdog_revalidates_once():
+    flow, window, market, cached, requests, timers, reasons, revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        market._display_timeframe_candles[("005930", 1)] = cached[("005930", 1)]
+        market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
+        requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
+        assert [ms for ms, _ in timers] == [30000, 0]
+        timers.pop()[1]()
+        timers.pop()[1]()
+    assert revalidated == ["revalidated"]
+    assert reasons == []
+    assert len(requests) == 1
+
+
+def test_offsession_m1_late_terminal_after_timeout_cannot_revalidate():
+    flow, window, market, cached, requests, timers, reasons, revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        timers.pop()[1]()
+        market._display_timeframe_candles[("005930", 1)] = cached[("005930", 1)]
+        market._display_timeframe_session_identity[("005930", 1)] = (1, "SESSION-1")
+        requests[0]["on_terminal"]({"ok": True, "install_result": {"ok": True}})
+    assert reasons == ["SOR_M1_ACQUISITION_FAILED:CALLBACK_TIMEOUT"]
+    assert revalidated == []
+    assert timers == []
+
+
+def test_offsession_m1_old_watchdog_cannot_timeout_explicit_retry():
+    flow, window, market, _cached, requests, timers, reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        first_watchdog = timers.pop()[1]
+        requests[0]["on_terminal"]({"ok": False, "reason_code": "BROKER_FAILED"})
+        assert [ms for ms, _ in timers] == [1000]
+        timers.pop()[1]()
+        assert [ms for ms, _ in timers] == [30000]
+        first_watchdog()
+        assert flow._offsession_sor_m1_requests[id(window)]["pending"] is True
+        assert reasons == []
+        assert len(requests) == 2
+        timers.pop()[1]()
+    assert reasons == ["SOR_M1_ACQUISITION_FAILED:CALLBACK_TIMEOUT"]
+
+
+@pytest.mark.parametrize("change", ["window", "stock", "session"])
+def test_offsession_m1_watchdog_ignores_changed_context(change):
+    flow, window, market, _cached, requests, timers, reasons, _revalidated = (
+        _offsession_accepted_request_case()
+    )
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._sync_v5_observation_lease(window)
+        assert [ms for ms, _ in timers] == [30000]
+        if change == "window":
+            flow._open_windows.pop(id(window))
+        elif change == "stock":
+            window.stock = ValidationStockRef("000660", "SK Hynix")
+        else:
+            market.kiwoom_api.broker_session_snapshot = lambda: SimpleNamespace(
+                connected=True, connection_epoch=2, login_session_id="SESSION-2",
+            )
+        timers.pop()[1]()
+    assert reasons == []
+    assert len(requests) == 1
 
 
 def test_offsession_m1_invalid_al_eligibility_does_not_request():
