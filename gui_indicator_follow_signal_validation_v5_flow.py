@@ -18,10 +18,12 @@ import math
 import os
 from pathlib import Path
 import pickle
+from queue import Full, Queue
 import re
 import tempfile
 import time
 from threading import Event, Lock, Thread
+from threading import Thread as _DiagnosticThread
 import weakref
 
 from PyQt5 import sip
@@ -102,6 +104,65 @@ _SOR_AL_M1_DIAGNOSTIC_PATH = (
     Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_sor_al_m1.jsonl"
 )
 _SOR_AL_M1_DIAGNOSTIC_LOCK = Lock()
+_V5_MARKING_DIAGNOSTIC_PATH = (
+    Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_marking_signal.jsonl"
+)
+_V5_MARKING_DIAGNOSTIC_QUEUE = Queue(maxsize=256)
+_V5_MARKING_DIAGNOSTIC_LOCK = Lock()
+_V5_MARKING_DIAGNOSTIC_STARTED = False
+_V5_MARKING_DIAGNOSTIC_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _write_v5_marking_diagnostics() -> None:
+    while True:
+        path, line = _V5_MARKING_DIAGNOSTIC_QUEUE.get()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                size = 0
+            if size + len(line) > _V5_MARKING_DIAGNOSTIC_MAX_BYTES:
+                continue
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        except Exception:
+            pass  # Diagnostics cannot change marking behavior.
+        finally:
+            _V5_MARKING_DIAGNOSTIC_QUEUE.task_done()
+
+
+def _trace_v5_marking(event: str, window_key: object, generation: object,
+                      request_generation: object, **fields: object) -> None:
+    if event not in {"marking_requested", "marking_calculated", "marking_failed",
+                     "marking_published", "marking_stale"}:
+        return
+    record = {"time": datetime.now(SEOUL_TIMEZONE).isoformat(),
+              "pid": os.getpid(), "event": event}
+    for name, value in (("window_key", window_key), ("generation", generation),
+                        ("request_generation", request_generation),
+                        *((name, fields.get(name)) for name in
+                          ("calculation_count", "display_count", "entry_count"))):
+        if type(value) is int and 0 <= value <= 1_000_000:
+            record[name] = value
+    reason = fields.get("reason")
+    if reason is not None:
+        record["reason"] = (reason if type(reason) is str and reason in {
+            "MARKING_SOURCE_UNAVAILABLE", "MARKING_TIMEFRAME_MISMATCH",
+            "MARKING_PREMARKET_SOURCE_NOT_VERIFIED",
+            "SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED",
+        } else "UNCLASSIFIED")
+    line = json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
+    global _V5_MARKING_DIAGNOSTIC_STARTED
+    try:
+        with _V5_MARKING_DIAGNOSTIC_LOCK:
+            if not _V5_MARKING_DIAGNOSTIC_STARTED:
+                _DiagnosticThread(target=_write_v5_marking_diagnostics,
+                                  name="v5-marking-diagnostic", daemon=True).start()
+                _V5_MARKING_DIAGNOSTIC_STARTED = True
+        _V5_MARKING_DIAGNOSTIC_QUEUE.put_nowait((_V5_MARKING_DIAGNOSTIC_PATH, line))
+    except (Full, RuntimeError, OSError):
+        pass  # A full or unavailable diagnostic sink cannot affect marking.
 
 
 def _trace_sor_al_m1(event: str, code: str, **fields: object) -> None:
@@ -9988,6 +10049,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if window is None or self._open_windows.get(id(window)) is not window:
             return
         key = id(window)
+        request_generation = self._request_generation.get(key, 0)
+        _trace_v5_marking("marking_requested", key, request.get("generation"),
+                          request_generation,
+                          calculation_count=(len(request["calculation"]) if isinstance(
+                              request.get("calculation"), (list, tuple)) else None),
+                          display_count=(len(request["display"]) if isinstance(
+                              request.get("display"), (list, tuple)) else None))
         source_session = self._validation_sessions.get(key)
         pool = self._historical_pools.get(key)
         try:
@@ -10036,6 +10104,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 and len(publication) == 4 else ()
             )
         except (TypeError, ValueError, KeyError) as exc:
+            _trace_v5_marking("marking_failed", key, request.get("generation"),
+                              request_generation, reason=str(exc))
             window._disable_marking(clear_cache=True)
             window.marking_display_check.setToolTip(str(exc))
             return
@@ -10052,6 +10122,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                            request_generation=request_generation, snapshot=None, error="")
             try:
                 if not current():
+                    _trace_v5_marking("marking_stale", key, generation,
+                                      request_generation)
                     return
                 source_candles = [
                     source_by_time[row["time"]]
@@ -10124,14 +10196,29 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             except Exception as exc:
                 payload["error"] = str(exc)
             if current():
+                if payload["error"]:
+                    _trace_v5_marking("marking_failed", key, generation,
+                                      request_generation, reason=payload["error"])
+                else:
+                    _trace_v5_marking("marking_calculated", key, generation,
+                                      request_generation,
+                                      calculation_count=snapshot.candle_count,
+                                      display_count=len(request["display"]),
+                                      entry_count=len(snapshot._entries))
                 try:
                     self.marking_completed.emit(payload)
                 except RuntimeError:
-                    pass
+                    _trace_v5_marking("marking_stale", key, generation,
+                                      request_generation)
+            else:
+                _trace_v5_marking("marking_stale", key, generation,
+                                  request_generation)
 
         try:
             Thread(target=prepare, name="indicator-follow-v5-marking", daemon=True).start()
         except Exception as exc:
+            _trace_v5_marking("marking_failed", key, generation,
+                              request_generation, reason=str(exc))
             window._disable_marking(clear_cache=True)
             window.marking_display_check.setToolTip(str(exc))
 
@@ -10143,13 +10230,23 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if (window is None or payload["generation"] != window._marking_generation
                 or payload["key"] != window._marking_key
                 or payload["request_generation"] != self._request_generation.get(id(window), 0)):
+            _trace_v5_marking("marking_stale", payload["window_key"],
+                              payload["generation"], payload["request_generation"])
             return
         try:
             if payload.get("error"):
                 raise ValueError(payload["error"])
-            window.apply_marking_snapshot(payload["generation"], payload["key"],
-                                          payload["snapshot"], payload["comparison"])
+            published = window.apply_marking_snapshot(
+                payload["generation"], payload["key"], payload["snapshot"],
+                payload["comparison"])
+            _trace_v5_marking("marking_published" if published else "marking_stale",
+                              payload["window_key"], payload["generation"],
+                              payload["request_generation"])
         except (TypeError, ValueError, KeyError) as exc:
+            if not payload.get("error"):
+                _trace_v5_marking("marking_failed", payload["window_key"],
+                                  payload["generation"], payload["request_generation"],
+                                  reason=str(exc))
             window._disable_marking(clear_cache=True)
             window.marking_display_check.setToolTip(str(exc))
 
