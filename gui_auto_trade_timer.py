@@ -117,12 +117,6 @@ def _process_pending_signal_pipeline(
     ):
         return signal_result
 
-    allowed_stock_codes = tuple(
-        entry.stock_code for entry in snapshot.entries if entry.execution_ready
-    )
-    if not allowed_stock_codes:
-        return signal_result
-
     signal_cutoff_by_stock_code: dict[str, str] = {}
     for entry in snapshot.entries:
         if not entry.execution_ready:
@@ -149,16 +143,21 @@ def _process_pending_signal_pipeline(
         if getattr(entry, "execution_ready", False)
         and not getattr(entry, "signal_probe_only", False)
     )
+    if not eligible_execution_codes:
+        return signal_result
+    allowed_stock_codes = eligible_execution_codes
     entries_by_code = {
         entry.stock_code: entry
         for entry in snapshot.entries
         if getattr(entry, "execution_ready", False)
+        and not getattr(entry, "signal_probe_only", False)
     }
     mark_review = getattr(window, "mark_review_required", None)
     stock_dirs = {
         entry.stock_code: Path(entry.stock_dir)
         for entry in snapshot.entries
         if getattr(entry, "execution_ready", False)
+        and not getattr(entry, "signal_probe_only", False)
         and getattr(entry, "stock_dir", None) is not None
         and (Path(entry.stock_dir) / "config.json").is_file()
         and (Path(entry.stock_dir) / "state.json").is_file()
@@ -217,6 +216,7 @@ def _process_pending_signal_pipeline(
         str(code or "").strip(): str(config.get("assigned_routine_instance_id") or "").strip()
         for code, config in main_facts.get("stock_configs", {}).items()
         if isinstance(config, dict)
+        and code in eligible_execution_codes
         and str(config.get("assigned_routine_instance_id") or "").strip()
     }
     assigned_instances = tuple(dict.fromkeys(assigned_instance_by_code.values()))

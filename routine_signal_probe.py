@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import sys
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -68,6 +68,7 @@ from state_policy import read_operation_policy
 from sor_routine_signal_evidence import build_source_marker, _hash as _evidence_hash
 from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES
 from sor_m3_production_capture import enqueue_preview as _enqueue_sor_m3_preview
+from routine_signal_consumer import holding_consistency_from_main_facts
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -361,6 +362,121 @@ def _signal_marker_snapshot(
     return marker
 
 
+def _sor_live_signal_ready(
+    *, code: str, rules: dict[str, Any] | None, candles: list[dict[str, Any]],
+    source: dict[str, Any], context: dict[str, Any], main_facts: dict[str, Any] | None,
+    execution_authorized: bool, execution_readiness_reader: Callable[[], bool] | None,
+) -> bool:
+    if not execution_authorized or not isinstance(main_facts, dict):
+        return False
+    if callable(execution_readiness_reader):
+        try:
+            if execution_readiness_reader() is not True:
+                return False
+        except Exception:
+            return False
+    states = main_facts.get("stock_states")
+    configs = main_facts.get("stock_configs")
+    state = states.get(code) if isinstance(states, dict) else None
+    config = configs.get(code) if isinstance(configs, dict) else None
+    if not isinstance(state, dict) or not isinstance(config, dict):
+        return False
+    cycle = context.get("cycle")
+    try:
+        holdings_resolved = holding_consistency_from_main_facts(main_facts, code)
+    except (TypeError, ValueError):
+        return False
+    if (state.get("signal_probe_only") is True
+            or not _is_trade_watch_target(state)
+            or str(config.get("assigned_routine_instance_id") or "").strip()
+            != context.get("routine_instance_id")
+            or not str(main_facts.get("selected_account_no") or "").strip()
+            or not isinstance(main_facts.get("allowed_stock_codes"), (list, tuple))
+            or code not in main_facts["allowed_stock_codes"]
+            or not isinstance(cycle, dict) or cycle.get("status") != "resolved"
+            or not holdings_resolved
+            or not isinstance(rules, dict) or not rules
+            or not candles or source.get("candles") != candles
+            or source.get("projection") != (
+                "FORMING_BASE_BAR" if context.get("forming_base_bar_projection")
+                else "COMPLETED_TIMEFRAME"
+            )):
+        return False
+    try:
+        interval = read_canonical_bar_minutes(rules)
+    except (TypeError, ValueError):
+        return False
+    if source.get("timeframe_minutes") != interval:
+        return False
+    if interval == 1 and source.get("projection") == "COMPLETED_TIMEFRAME" \
+            and not isinstance(source.get("direct_source_receipt"), dict):
+        return False
+    receipt = (source.get("sor_source_receipt")
+               if source.get("projection") == "FORMING_BASE_BAR"
+               else source.get("direct_source_receipt"))
+    if not isinstance(receipt, dict):
+        return False
+    try:
+        if parse_market_datetime(receipt.get("source_as_of")) != parse_market_datetime(
+            context.get("tick_key")
+        ):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if (source.get("projection") == "COMPLETED_TIMEFRAME"
+            and build_source_marker(stock=code, rules=rules, candles=candles,
+                                    source=source, side="NONE") is not None):
+        return True
+    # Forming M1 has a separate broker snapshot receipt; completed-bar markers
+    # intentionally reject its unfinished last row.
+    if (interval != 1 or source.get("projection") != "FORMING_BASE_BAR"
+            or source.get("forming_included") is not True
+            or not isinstance(receipt, dict)
+            or receipt.get("stock_code") != code
+            or receipt.get("timeframe_key") != "M1"
+            or receipt.get("source_base_timeframe_key") != "M1"
+            or receipt.get("source_proof") != source.get("source_proof")
+            or type(receipt.get("connection_epoch")) is not int
+            or receipt["connection_epoch"] <= 0
+            or not isinstance(receipt.get("session_sha256"), str)
+            or len(receipt["session_sha256"]) != 64
+            or not isinstance(receipt.get("source_snapshot_key"), str)
+            or len(receipt["source_snapshot_key"]) != 64
+            or source.get("market_data_identity") != f"{code}_AL"
+            or source.get("calculation_source") != "BROKER_AL_CONFIRMED_M1"
+            or source.get("forming_snapshot_source") not in
+            {"BROKER_AL_TR_FORMING_M1", "BROKER_AL_PARITY_NATIVE_FORMING_M1"}
+            or not isinstance(source.get("source_identity"), str)
+            or len(source["source_identity"]) != 64
+            or candles[-1].get("is_complete") is not False
+            or any(row.get("timeframe_minutes") != 1
+                   or (row.get("market_data_identity") not in (None, f"{code}_AL"))
+                   or row.get("market_source") not in (None, "INTEGRATED")
+                   or (index < len(candles) - 1 and row.get("is_complete") is not True)
+                   for index, row in enumerate(candles))):
+        return False
+    try:
+        as_of = datetime.fromisoformat(receipt["source_as_of"])
+        received = datetime.fromisoformat(receipt["received_at"])
+        bar_time = candle_market_datetime(candles[-1])
+        forming = candles[-1]
+        key_parts = (
+            code, source.get("source_identity"), forming["bar_time"],
+            {key: float(forming[key]) for key in
+             ("open", "high", "low", "close", "volume")},
+            received.isoformat(), receipt["connection_epoch"], receipt["session_sha256"],
+        )
+        return bool(bar_time is not None and as_of.utcoffset() == received.utcoffset()
+                    and as_of.utcoffset().total_seconds() == 9 * 3600
+                    and as_of <= received and received - as_of < timedelta(minutes=1)
+                    and bar_time.replace(second=0, microsecond=0)
+                    == as_of.replace(second=0, microsecond=0)
+                    and source.get("forming_snapshot_received_at") == receipt["received_at"]
+                    and receipt["source_snapshot_key"] == _evidence_hash(key_parts))
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return False
+
+
 def apply_signal_runtime_error_policy(
     result: dict[str, Any],
     runtime_policy: dict[str, Any] | None,
@@ -448,6 +564,8 @@ def probe_routine_for_stock(
     fresh_main_facts_provider: Callable[[], dict[str, Any]] | None = None,
     market_bar_projection_reader: Any = _DEFAULT_MARKET_BAR_PROJECTION_READER,
     cycle_projection_reader: Any = _DEFAULT_CYCLE_PROJECTION_READER,
+    execution_authorized: bool = False,
+    execution_readiness_reader: Callable[[], bool] | None = None,
     _facts_retry: int = 0,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
@@ -502,8 +620,7 @@ def probe_routine_for_stock(
                 "execution_enabled": False, "queue_connected": False,
                 "send_order_connected": False,
             }
-        # The Main-owned SOR calculation is preview-only. An absent or
-        # untrusted projection must NEVER fall back to stored KRX candles.
+        # An absent or untrusted SOR projection must never fall back to KRX.
         sources = (
             facts_market.get("candle_supply_by_code")
             if isinstance(facts_market, dict) else None
@@ -803,10 +920,22 @@ def probe_routine_for_stock(
                         "cycle_ended": False,
                         "unresolved_reason": f"CYCLE_PROJECTION_ERROR:{type(exc).__name__}",
                     }
-            if (isinstance(candle_projection_evidence, dict)
-                    and candle_projection_evidence.get("calculation_only") is True):
-                # Real operation caller may inspect BUY/SELL calculation, but
-                # this migration path must never create a queue or order.
+            sor_calculation_only = (
+                isinstance(candle_projection_evidence, dict)
+                and candle_projection_evidence.get("calculation_only") is True
+            )
+            live_sor_ready = (
+                sor_calculation_only
+                and _sor_live_signal_ready(
+                    code=code, rules=instance_rules, candles=candles,
+                    source=candle_projection_evidence, context=context,
+                    main_facts=main_facts,
+                    execution_authorized=execution_authorized,
+                    execution_readiness_reader=execution_readiness_reader,
+                )
+            )
+            if sor_calculation_only and not live_sor_ready:
+                # Non-execution targets keep the original calculation preview.
                 selector = getattr(routine_module, "evaluate_signal_selection", None)
                 try:
                     preview = (
@@ -939,8 +1068,19 @@ def probe_routine_for_stock(
                             review_marker=review_marker,
                             main_facts=fresh_facts,
                             fresh_main_facts_provider=fresh_main_facts_provider,
+                            execution_authorized=execution_authorized,
+                            execution_readiness_reader=execution_readiness_reader,
                             _facts_retry=_facts_retry + 1,
                         )
+                if live_sor_ready and not _sor_live_signal_ready(
+                    code=code, rules=instance_rules, candles=candles,
+                    source=candle_projection_evidence, context=context,
+                    main_facts=main_facts,
+                    execution_authorized=execution_authorized,
+                    execution_readiness_reader=execution_readiness_reader,
+                ):
+                    return {"signal": "SKIP", "reason": "SOR_EXECUTION_READINESS_CHANGED",
+                            "routine": routine_name, "code": code, "name": name}
                 if isinstance(main_facts, dict):
                     facts_identity = routine_main_facts_identity(
                         main_facts,
@@ -1523,6 +1663,19 @@ def probe_execution_stock_for_committed_bar(
     probe_kwargs["cycle_projection_reader"] = cycle_projection_reader
     probe_kwargs["main_facts"] = signal_main_facts
     probe_kwargs["fresh_main_facts_provider"] = capture_signal_facts
+    if entry.signal_probe_only is False:
+        def current_execution_ready() -> bool:
+            current = project_execution_universe(window, stock_dirs=[target_dir])
+            return any(
+                candidate.stock_code == code
+                and candidate.stock_dir.resolve() == target_dir.resolve()
+                and candidate.execution_ready is True
+                and candidate.signal_probe_only is False
+                for candidate in current.entries
+            )
+
+        probe_kwargs["execution_authorized"] = True
+        probe_kwargs["execution_readiness_reader"] = current_execution_ready
     return probe_routine_for_stock(
         routine_module,
         routine_name,
