@@ -267,9 +267,10 @@ def test_cold_weekend_m3_displays_completed_direct_al_without_m1_signal_proof():
         dict(row, time=f"2026102319{45 + 3 * i:02d}00", is_complete=True)
         for i, row in enumerate(pool["candles"])
     ]
+    pool["candles"].insert(0, dict(pool["candles"][0], time="20261023153900"))
     flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
     frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    assert frozen[2]["availability_state"] == "SOR_DIRECT_HISTORY_UNAVAILABLE"
+    assert frozen[2]["projection"] == "DIRECT_COMPLETED_TIMEFRAME"
     view = dict(pool, display_candles=list(pool["candles"]))
     assert flow._sor_m1_calculation_view(
         session, pool, view, frozen, normal_base_only=True,
@@ -277,7 +278,7 @@ def test_cold_weekend_m3_displays_completed_direct_al_without_m1_signal_proof():
     assert flow._sor_m1_calculation_view(session, pool, view, frozen) is view
 
 
-def test_cold_weekend_m3_routes_validation_to_indicator_only_prepare():
+def test_cold_weekend_m3_routes_direct_history_to_signal_replay():
     flow, window, pool, _event = _observed_v5_case("M3", 3)
     market = flow.parent().existing_market_data_host()
     market._display_timeframe_candles.pop(("005930", 1))
@@ -298,9 +299,10 @@ def test_cold_weekend_m3_routes_validation_to_indicator_only_prepare():
     with patch.object(flow, "_start_normal_base_prepare") as normal, patch.object(
         flow, "_replay_factory", side_effect=AssertionError("signal replay started")
     ):
-        flow._start_pool_prepare(request)
-    normal.assert_called_once()
-    assert request["normal_base_only"] is True
+        with pytest.raises(AssertionError, match="signal replay started"):
+            flow._start_pool_prepare(request)
+    normal.assert_not_called()
+    assert request.get("normal_base_only") is not True
 
 
 @pytest.mark.parametrize("invalid", ["identity", "forming", "today", "display", "coverage"])
@@ -1464,6 +1466,7 @@ def test_live_higher_minute_reuses_host_and_preserves_5000_direct_prior_bars(
     timeframe, minutes, target, direct_target_present,
 ):
     from copy import deepcopy
+    from gui_market_data_host import MarketDataHost
     flow, base_session, _pool, _market, _ = _registered_m1_calculation_case()
     market, as_of = _complete_morning_forming_host()
     flow.parent().existing_market_data_host = lambda: market
@@ -1480,9 +1483,13 @@ def test_live_higher_minute_reuses_host_and_preserves_5000_direct_prior_bars(
         for clock in (("090000", "110000" if minutes == 120 else "130000")
                       if minutes in (120, 240) else ("090000",))]
     direct = [*prior]
+    latest = MarketDataHost._expected_latest_completed_display_start(as_of, minutes)
+    if latest is not None:
+        direct.append({"time": latest.strftime("%Y%m%d%H%M%S"),
+                       "open": 1, "high": 2, "low": 1, "close": 1, "volume": 1})
     if direct_target_present:
         direct.append({"time": target, "open": 1, "high": 2,
-                       "low": 1, "close": 1, "volume": 1})
+                       "low": 1, "close": 1, "volume": 1, "is_complete": False})
     pool = {
         "stock": session.request.stock, "candles": direct,
         "market_source": "INTEGRATED", "market_data_identity": "005930_AL",
@@ -1493,10 +1500,9 @@ def test_live_higher_minute_reuses_host_and_preserves_5000_direct_prior_bars(
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is True
     assert frozen[2]["forming_target_source_covered"] is True
-    assert frozen[2]["today_m1_source_covered"] is True
     assert frozen[2]["projection"] == "FORMING_BASE_BAR"
     if direct_target_present:
-        with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_UNAVAILABLE"):
+        with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
             flow._sor_m1_calculation_view(
                 session, pool, dict(pool, display_candles=list(direct)), frozen,
             )
@@ -1510,7 +1516,7 @@ def test_live_higher_minute_reuses_host_and_preserves_5000_direct_prior_bars(
         field: formed[field] for field in ("open", "high", "low", "close", "volume")
     }}
     assert view["candles"][:5000] == prior
-    assert len(view["candles"]) == 5000 + len(frozen[2]["candles"])
+    assert len(view["candles"]) == len(direct) + 1
     assert view["candles"][-1] == expected
     assert view["display_candles"][-1] == expected
     assert len(view["display_candles"]) == 5000
@@ -1553,7 +1559,6 @@ def test_live_higher_minute_keeps_direct_today_and_forms_only_current_target(tod
     original = deepcopy(pool)
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is True
-    assert frozen[2]["today_m1_source_covered"] is True
     projected_today = [
         {"time": row["bar_time"][:10].replace("-", "") +
          row["bar_time"][11:19].replace(":", ""),
@@ -1562,6 +1567,13 @@ def test_live_higher_minute_keeps_direct_today_and_forms_only_current_target(tod
         if row["bar_time"].startswith("2026-10-20")
     ]
     assert [row["time"] for row in projected_today] == ["20261020091000"]
+    if not today_direct_stamps:
+        with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_UNAVAILABLE"):
+            flow._sor_m1_calculation_view(
+                session, pool, dict(pool, display_candles=list(direct)), frozen,
+            )
+        assert pool == original
+        return
     view = flow._sor_m1_calculation_view(
         session, pool, dict(pool, display_candles=list(direct)), frozen,
     )
@@ -1593,8 +1605,7 @@ def test_live_higher_minute_blocks_morning_m1_gap_before_complete_target():
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is True
     assert frozen[2]["forming_target_source_covered"] is True
-    assert frozen[2]["today_m1_source_covered"] is False
-    with pytest.raises(ValueError, match="TODAY_M1_COVERAGE_INCOMPLETE"):
+    with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_UNAVAILABLE"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
@@ -1619,7 +1630,7 @@ def test_live_higher_minute_blocks_missing_open_bucket_source_and_broker_anchor(
     conflict = dict(pool, candles=[dict(row, time="20261019100000"), second])
     with pytest.raises(ValueError, match="SOURCE_CHANGED_AFTER_SNAPSHOT"):
         flow._sor_m1_calculation_view(session, conflict, conflict, frozen)
-    with pytest.raises(ValueError, match="BROKER_TARGET_ANCHOR_UNVERIFIED"):
+    with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
         flow._sor_m1_calculation_view(
             session, conflict, conflict,
             flow._sor_m1_calculation_snapshot(session, conflict, live_forming=True),
@@ -1630,7 +1641,7 @@ def test_live_higher_minute_blocks_missing_open_bucket_source_and_broker_anchor(
     )
     missing = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert missing[2]["forming_target_source_covered"] is False
-    with pytest.raises(ValueError, match="FORMING_SOURCE_INVALID"):
+    with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_UNAVAILABLE"):
         flow._sor_m1_calculation_view(session, pool, pool, missing)
 
 
@@ -1649,7 +1660,8 @@ def test_higher_minute_afterhours_bucket_stays_unavailable_without_broker_anchor
         "candles": [{"bar_time": "2026-10-20T15:40:00+09:00"}],
     }
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    assert frozen[2]["forming_target_source_covered"] is False
+    with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
+        flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
 def _after_forming_case(timeframe, minutes, hour=15, minute=40):
@@ -1703,6 +1715,9 @@ def _after_forming_case(timeframe, minutes, hour=15, minute=40):
          "low": 9, "close": 10, "volume": 1}
         for clock in [*regular, "154000"]
     ]
+    latest = MarketDataHost._expected_latest_completed_display_start(as_of, minutes)
+    if latest is not None:
+        direct.append(dict(direct[-1], time=latest.strftime("%Y%m%d%H%M%S")))
     pool = dict(stock=session.request.stock, candles=direct,
                 market_source="INTEGRATED", market_data_identity="005930_AL",
                 timeframe_key=timeframe, timeframe_minutes=minutes,
@@ -1717,15 +1732,9 @@ def test_completed_m3_direct_al_auction_gaps_only_pass_off_session(case):
     from copy import deepcopy
 
     flow, session, pool, market = _after_forming_case("M3", 3)
-    key = ("005930", 1)
-    m1 = [dict(row, bar_time=row["bar_time"].replace("2026-10-20", "2026-10-23"),
-               trade_date="2026-10-23")
-          for row in market._display_timeframe_candles[key]]
-    for minute in range(15 * 60 + 40, 20 * 60):
-        clock = f"{minute // 60:02d}:{minute % 60:02d}"
-        m1.append(dict(m1[-1], bar_time=f"2026-10-23T{clock}:00+09:00",
-                       session="NXT_AFTER"))
-    market._display_timeframe_candles[key] = tuple(m1)
+    # Completed auction bars are supplied only by the selected direct M3 pool.
+    market.project_broker_sor_m1_calculation = lambda **_kw: pytest.fail(
+        "completed M3 must not request M1 projection")
     pool["candles"] = [
         dict(pool["candles"][0], time=f"{day}{clock}")
         for day, clock in (("20261021", "153000"), ("20261021", "153300"),
@@ -1744,32 +1753,23 @@ def test_completed_m3_direct_al_auction_gaps_only_pass_off_session(case):
                                          25 if case != "active_session" else 59,
                                          tzinfo=ZoneInfo("Asia/Seoul"))
     frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    assert frozen[1].date().isoformat() == "2026-10-23"
-    assert frozen[2]["projection"] == "COMPLETED_TIMEFRAME"
-    assert frozen[2]["available"] is True
+    assert frozen[2]["projection"] == "DIRECT_COMPLETED_TIMEFRAME"
     assert {f"202610{'22' if case == 'stale_date' else '23'}{clock}"
             for clock in ("153000", "153300", "153900")}.issubset(
         {row["time"] for row in pool["candles"]}
     )
-    assert not {"08:50", "15:31", "15:32", "15:33", "15:34", "15:39"} & {
-        row["bar_time"][11:16] for row in m1
-    }
     if case == "invalid_al":
         view_pool["market_data_identity"] = "005930"
-    elif case == "stale_date":
-        frozen[2]["available"] = False
     elif case == "forming":
-        frozen[2]["projection"] = "FORMING_BASE_BAR"
+        view_pool["candles"] = deepcopy(view_pool["candles"])
+        view_pool["candles"][0]["is_complete"] = False
     elif case == "incomplete_bar":
         view_pool["candles"] = deepcopy(view_pool["candles"])
         view_pool["candles"][-1]["is_complete"] = False
     elif case == "display_mismatch":
         view_pool["display_candles"] = view_pool["display_candles"][:-1]
-    if case != "off_session":
-        with pytest.raises(ValueError, match=(
-            "TODAY_TARGET_COVERAGE_MISMATCH" if case == "active_session"
-            else "SOR_M1_BLOCKED"
-        )):
+    if case not in {"off_session", "stale_date"}:
+        with pytest.raises(ValueError, match="SOR_M1_BLOCKED"):
             flow._sor_m1_calculation_view(session, pool, view_pool, frozen)
         return
     view = flow._sor_m1_calculation_view(
@@ -1791,7 +1791,6 @@ def test_after_first_bucket_uses_verified_prior_broker_anchor(timeframe, minutes
     before = deepcopy(pool)
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is True
-    assert frozen[2]["today_m1_source_covered"] is True
     assert frozen[2]["forming_target_source_covered"] is True
     view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
     assert view["candles"][:len(before["candles"])] == before["candles"]
@@ -1811,31 +1810,20 @@ def test_after_m3_uses_direct_broker_anchor_without_fabricated_m1(minute, target
     from gui_market_data_host import MarketDataHost
 
     flow, session, pool, market = _after_forming_case("M3", 3, minute=minute)
-    pool["candles"][-1]["time"] = "20261019153900"
+    pool["candles"][-2]["time"] = "20261019153900"
+    if minute >= 43:
+        pool["candles"][-1]["time"] = "20261020153900"
+    elif minute >= 42:
+        pool["candles"].append(dict(pool["candles"][-1], time="20261020153900"))
     before = deepcopy(pool)
     source = MarketDataHost._current_display_candles(market, "005930", 1)
     assert not any(candle_market_datetime(row).strftime("%H%M") == "1539"
                    for row in source)
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is True
-    assert frozen[2]["today_m1_source_covered"] is True
     assert frozen[2]["forming_target_source_covered"] is True
-    assert [stamp for stamp in frozen[2]["today_target_starts"]
-            if stamp >= "20261020153900"] == (
-        ["20261020153900"] if minute < 42
-        else ["20261020153900", "20261020154200"]
-    )
-    after = [row for row in frozen[2]["candles"]
-             if row["bar_time"] >= "2026-10-20T15:39"]
-    assert [row["bar_time"][11:16] for row in after] == (
-        ["15:39"] if minute < 42 else ["15:39", "15:42"]
-    )
-    if minute >= 42:
-        assert after[0]["is_complete"] is True
-        assert after[0]["volume"] == sum(
-            row["volume"] for row in source
-            if candle_market_datetime(row).strftime("%H%M") in {"1540", "1541"}
-        )
+    assert [row["bar_time"][11:16] for row in frozen[2]["candles"]
+            if row["bar_time"] >= "2026-10-20T15:39"] == [target[8:10] + ":" + target[10:12]]
     view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
     assert view["candles"][:len(before["candles"])] == before["candles"]
     assert view["candles"][-1]["time"] == target
@@ -1858,7 +1846,7 @@ def test_after_m3_requires_aligned_selected_direct_broker_evidence(prior_after):
 
 def test_after_m3_anchor_proof_rejects_wrong_source_and_prior_day_conflict():
     flow, session, pool, _market = _after_forming_case("M3", 3)
-    pool["candles"][-1]["time"] = "20261019153900"
+    pool["candles"][-2]["time"] = "20261019153900"
     as_of = flow._now_factory()
     assert flow._sor_m3_after_anchor_verified(pool, as_of)
     assert not flow._sor_m3_after_anchor_verified(
@@ -1867,7 +1855,7 @@ def test_after_m3_anchor_proof_rejects_wrong_source_and_prior_day_conflict():
     assert not flow._sor_m3_after_anchor_verified(
         dict(pool, candles=[
             dict(pool["candles"][0], time="20261016090000"),
-            dict(pool["candles"][-1], time="20261016153900"),
+            dict(pool["candles"][-1], time="20261016154000"),
             *pool["candles"][:-1],
         ]), as_of,
     )
@@ -1882,12 +1870,12 @@ def test_after_m3_anchor_proof_rejects_wrong_source_and_prior_day_conflict():
 ])
 def test_after_keeps_all_5000_direct_prior_bars_and_visible_limit(timeframe, minutes, anchor):
     flow, session, pool, _market = _after_forming_case(timeframe, minutes)
-    pool["candles"][-1]["time"] = f"20261019{anchor}"
+    pool["candles"][-2]["time"] = f"20261019{anchor}"
     older = [
         {"time": (datetime(2000, 1, 1) + timedelta(days=i)).strftime("%Y%m%d")
          + "090000", "open": 10, "high": 11, "low": 9, "close": 10,
          "volume": 1}
-        for i in range(4998)
+        for i in range(4997)
     ]
     pool["candles"] = older + pool["candles"]
     direct = list(pool["candles"])
@@ -1914,13 +1902,12 @@ def test_after_later_bucket_keeps_common_session_origin(
     flow, session, pool, _market = _after_forming_case(
         timeframe, minutes, hour, minute,
     )
-    pool["candles"].append(dict(
+    pool["candles"].insert(-1, dict(
         pool["candles"][-1],
         time=(datetime(2026, 10, 19, 15, 40) + timedelta(minutes=minutes))
         .strftime("%Y%m%d%H%M%S"),
     ))
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    assert frozen[2]["today_m1_source_covered"] is True
     assert frozen[2]["forming_target_source_covered"] is True
     view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
     assert view["candles"][-1]["time"] == target
@@ -1937,23 +1924,26 @@ def test_after_rejects_missing_or_conflicting_prior_anchor(prior_after):
     ]
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["forming_target_source_covered"] is True
-    with pytest.raises(ValueError, match="BROKER_AFTER_ANCHOR_UNVERIFIED"):
-        flow._sor_m1_calculation_view(session, pool, pool, frozen)
+    if not prior_after:
+        view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
+        assert view["candles"][:-1] == pool["candles"]
+    else:
+        with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
+            flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
 def test_after_rejects_conflicting_older_direct_day():
     flow, session, pool, _market = _after_forming_case("M10", 10)
     pool["candles"].insert(0, dict(pool["candles"][-1], time="20261016154500"))
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    with pytest.raises(ValueError, match="BROKER_AFTER_ANCHOR_UNVERIFIED"):
+    with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
 def test_after_m15_remains_closed_without_broker_bucket_proof():
     flow, session, pool, _market = _after_forming_case("M15", 15)
-    pool["candles"][-1]["time"] = "20261019154500"
+    pool["candles"][-2]["time"] = "20261019154500"
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    assert frozen[2]["forming_target_source_covered"] is False
     with pytest.raises(ValueError, match="BROKER_AFTER_ANCHOR_UNVERIFIED"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
@@ -1967,8 +1957,10 @@ def test_after_m15_uses_proven_partial_broker_bucket_without_fabricated_m1(minut
     from gui_market_data_host import MarketDataHost
 
     flow, session, pool, market = _after_forming_case("M15", 15, minute=minute)
-    pool["candles"][-1]["time"] = "20261019153000"
-    pool["candles"].append(dict(pool["candles"][-1], time="20261019154500"))
+    pool["candles"][-2]["time"] = "20261019153000"
+    pool["candles"].insert(-1, dict(pool["candles"][-2], time="20261019154500"))
+    if minute == 45:
+        pool["candles"].append(dict(pool["candles"][-1], time="20261020153000"))
     before = deepcopy(pool)
     source = MarketDataHost._current_display_candles(market, "005930", 1)
     assert not any(candle_market_datetime(row).strftime("%H%M") == "1530"
@@ -1982,28 +1974,13 @@ def test_after_m15_uses_proven_partial_broker_bucket_without_fabricated_m1(minut
     assert market._sor_forming_m1_by_stock["005930"]["candle"][
         "bar_time"] == f"2026-10-20T15:{minute:02d}:00+09:00"
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    assert frozen[2]["today_m1_source_covered"] is True
     assert frozen[2]["forming_target_source_covered"] is True
-    assert [stamp for stamp in frozen[2]["today_target_starts"]
-            if stamp >= "20261020153000"] == (
-        ["20261020153000"] if minute < 45
-        else ["20261020153000", "20261020154500"]
-    )
     after = [row for row in frozen[2]["candles"]
              if row["bar_time"] >= "2026-10-20T15:30"]
     assert [row["bar_time"][11:16] for row in after] == (
-        ["15:30"] if minute < 45 else ["15:30", "15:45"]
+        ["15:30"] if minute < 45 else ["15:45"]
     )
-    if minute == 45:
-        first = after[0]
-        physical = after_m1[:5]
-        assert first["is_complete"] is True
-        assert (first["open"], first["high"], first["low"], first["close"],
-                first["volume"]) == (
-            physical[0]["open"], max(row["high"] for row in physical),
-            min(row["low"] for row in physical), physical[-1]["close"],
-            sum(row["volume"] for row in physical),
-        )
+    assert after[0]["is_complete"] is False
     view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
     assert view["candles"][:len(before["candles"])] == before["candles"]
     assert view["candles"][-1]["time"] == target
@@ -2018,20 +1995,19 @@ def test_after_m15_uses_proven_partial_broker_bucket_without_fabricated_m1(minut
 ])
 def test_after_m15_rejects_missing_or_conflicting_direct_bucket_proof(prior_after):
     flow, session, pool, _market = _after_forming_case("M15", 15)
-    pool["candles"] = pool["candles"][:-1] + [
+    pool["candles"] = pool["candles"][:1] + [
         dict(pool["candles"][-1], time=f"20261019{clock}")
         for clock in prior_after
-    ]
+    ] + pool["candles"][-1:]
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    assert frozen[2]["forming_target_source_covered"] is False
     with pytest.raises(ValueError, match="BROKER_AFTER_ANCHOR_UNVERIFIED"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
 def test_after_m15_rejects_conflicting_older_or_latest_direct_day():
     flow, session, pool, _market = _after_forming_case("M15", 15)
-    pool["candles"][-1]["time"] = "20261019153000"
-    pool["candles"].append(dict(pool["candles"][-1], time="20261019154500"))
+    pool["candles"][-2]["time"] = "20261019153000"
+    pool["candles"].insert(-1, dict(pool["candles"][-2], time="20261019154500"))
     as_of = flow._now_factory()
     assert flow._sor_m15_after_anchor_verified(pool, as_of)
     conflict = dict(
@@ -2042,7 +2018,8 @@ def test_after_m15_rejects_conflicting_older_or_latest_direct_day():
     with pytest.raises(ValueError, match="BROKER_AFTER_ANCHOR_UNVERIFIED"):
         flow._sor_m1_calculation_view(session, conflict, conflict, frozen)
     current_normal = dict(pool, candles=[
-        *pool["candles"], dict(pool["candles"][-1], time="20261020090000"),
+        *pool["candles"][:-1], dict(pool["candles"][-1], time="20261020090000"),
+        pool["candles"][-1],
     ])
     assert flow._sor_m15_after_anchor_verified(current_normal, as_of)
     assert not flow._sor_m15_after_anchor_verified(dict(
@@ -2061,19 +2038,20 @@ def test_after_m15_rejects_conflicting_older_or_latest_direct_day():
 
 def test_after_m15_rejects_missing_authenticated_forming_m1():
     flow, session, pool, market = _after_forming_case("M15", 15)
-    pool["candles"][-1]["time"] = "20261019153000"
-    pool["candles"].append(dict(pool["candles"][-1], time="20261019154500"))
+    pool["candles"][-2]["time"] = "20261019153000"
+    pool["candles"].insert(-1, dict(pool["candles"][-2], time="20261019154500"))
     market._sor_forming_m1_by_stock.pop("005930")
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is False
-    with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_NOT_VERIFIED"):
+    with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_UNAVAILABLE"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
 def test_after_m15_rejects_missing_completed_physical_m1():
     flow, session, pool, market = _after_forming_case("M15", 15, minute=45)
-    pool["candles"][-1]["time"] = "20261019153000"
-    pool["candles"].append(dict(pool["candles"][-1], time="20261019154500"))
+    pool["candles"][-2]["time"] = "20261019153000"
+    pool["candles"].insert(-1, dict(pool["candles"][-2], time="20261019154500"))
+    pool["candles"].append(dict(pool["candles"][-1], time="20261020153000"))
     market._display_timeframe_candles[("005930", 1)] = tuple(
         row for row in market._display_timeframe_candles[("005930", 1)]
         if not row["bar_time"].endswith("15:44:00+09:00")
@@ -2081,7 +2059,7 @@ def test_after_m15_rejects_missing_completed_physical_m1():
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is False
     assert frozen[2]["availability_state"] == "SOR_M1_LAST_COMPLETED_MINUTE_MISSING"
-    with pytest.raises(ValueError, match="SOR_M1_LAST_COMPLETED_MINUTE_MISSING"):
+    with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_UNAVAILABLE"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
@@ -2136,8 +2114,8 @@ def test_sor_missing_last_minute_writes_one_bounded_diagnostic(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("trace_env", [None, "0", "1"], ids=["unset", "off", "on"])
-@pytest.mark.parametrize("branch", ["SOURCE_TARGET", "PROJECTED_TARGET"])
-def test_sor_today_target_mismatch_writes_one_bounded_diagnostic(
+@pytest.mark.parametrize("branch", ["SOURCE_TARGET", "DIRECT_MISSING"])
+def test_sor_source_mismatch_diagnostic_and_direct_missing_denial(
     branch, tmp_path, monkeypatch, trace_env,
 ):
     import indicator_follow_signal_validation_runtime_trace as trace
@@ -2153,13 +2131,19 @@ def test_sor_today_target_mismatch_writes_one_bounded_diagnostic(
         frozen = flow._sor_m1_calculation_snapshot(session, pool)
     else:
         flow, session, pool, market = _after_forming_case("M5", 5)
+        pool["candles"].pop()
         frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-        frozen[2]["today_target_starts"] = frozen[2]["today_target_starts"][:-1]
     for _ in range(2):
-        with pytest.raises(ValueError, match="TODAY_TARGET_COVERAGE_MISMATCH"):
+        with pytest.raises(ValueError, match=(
+            "TODAY_TARGET_COVERAGE_MISMATCH" if branch == "SOURCE_TARGET"
+            else "SOR_DIRECT_HISTORY_UNAVAILABLE"
+        )):
             flow._sor_m1_calculation_view(session, pool, pool, frozen)
     if trace_env != "1":
         trace.trace_signal_validation_event("ordinary_trace_must_stay_off")
+    if branch == "DIRECT_MISSING":
+        assert not trace._TRACE_PATH.exists()
+        return
     assert trace._TRACE_PATH.exists(), "SOR block diagnostic must be recorded with trace OFF"
     assert trace.signal_validation_trace_enabled() is (trace_env == "1")
     records = [json.loads(line) for line in trace._TRACE_PATH.read_text(encoding="utf-8").splitlines()]
@@ -2175,24 +2159,20 @@ def test_sor_today_target_mismatch_writes_one_bounded_diagnostic(
     assert "SESSION-1" not in json.dumps(record)
 
 
-def test_completed_m3_keeps_verified_al_history_before_short_m1_projection():
+def test_completed_m3_keeps_verified_direct_al_history_without_m1_projection():
     from copy import deepcopy
 
-    flow, session, pool, _market = _after_forming_case("M3", 3)
-    frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    assert frozen[2]["available"] is True
-    projected_today = [row for row in frozen[2]["candles"]
-                       if candle_market_datetime(row).strftime("%Y%m%d") == "20261020"]
-    assert len(projected_today) > 5
-    direct_today = [{"time": candle_market_datetime(row).strftime("%Y%m%d%H%M%S"),
-                     **{field: row[field] for field in
-                        ("open", "high", "low", "close", "volume")}}
-                    for row in projected_today]
-    pool["candles"].extend(direct_today)
+    flow, session, pool, market = _after_forming_case("M3", 3)
+    market.project_broker_sor_m1_calculation = lambda **_kw: pytest.fail(
+        "completed M3 must not request M1 projection")
+    pool["candles"][-1:-1] = [
+        dict(pool["candles"][-1], time=f"20261020090{minute}00")
+        for minute in (0, 3)
+    ]
     pool["requested_count"] = len(pool["candles"])
     original = deepcopy(pool)
     frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    frozen[2]["candles"] = frozen[2]["candles"][-5:]
+    assert frozen[2]["projection"] == "DIRECT_COMPLETED_TIMEFRAME"
 
     view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
@@ -2200,21 +2180,14 @@ def test_completed_m3_keeps_verified_al_history_before_short_m1_projection():
     assert pool == original
 
 
-def test_completed_m3_rejects_gap_inside_short_m1_projection():
-    flow, session, pool, _market = _after_forming_case("M3", 3)
+def test_completed_m3_rejects_missing_direct_today_without_m1_fallback():
+    flow, session, pool, market = _after_forming_case("M3", 3)
+    market.project_broker_sor_m1_calculation = lambda **_kw: pytest.fail(
+        "missing direct M3 must not request M1 fallback")
+    pool["candles"].pop()
     frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    projected_today = [row for row in frozen[2]["candles"]
-                       if candle_market_datetime(row).strftime("%Y%m%d") == "20261020"]
-    pool["candles"].extend(
-        {"time": candle_market_datetime(row).strftime("%Y%m%d%H%M%S"),
-         **{field: row[field] for field in ("open", "high", "low", "close", "volume")}}
-        for row in projected_today[-5:]
-    )
-    frozen = flow._sor_m1_calculation_snapshot(session, pool)
-    frozen[2]["candles"] = frozen[2]["candles"][-5:]
-    del frozen[2]["candles"][-2]
 
-    with pytest.raises(ValueError, match="TODAY_TARGET_COVERAGE_MISMATCH"):
+    with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_UNAVAILABLE"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 
@@ -2253,13 +2226,13 @@ def test_sor_diagnostic_failure_keeps_original_blocks(monkeypatch, tmp_path, dia
 
 def test_after_m15_keeps_all_5000_direct_prior_bars_and_visible_limit():
     flow, session, pool, _market = _after_forming_case("M15", 15)
-    pool["candles"][-1]["time"] = "20261019153000"
-    pool["candles"].append(dict(pool["candles"][-1], time="20261019154500"))
+    pool["candles"][-2]["time"] = "20261019153000"
+    pool["candles"].insert(-1, dict(pool["candles"][-2], time="20261019154500"))
     pool["candles"] = [
         {"time": (datetime(2000, 1, 1) + timedelta(days=i)).strftime("%Y%m%d")
          + "090000", "open": 10, "high": 11, "low": 9, "close": 10,
          "volume": 1}
-        for i in range(4997)
+        for i in range(4996)
     ] + pool["candles"]
     direct = list(pool["candles"])
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
@@ -2272,16 +2245,16 @@ def test_after_m15_keeps_all_5000_direct_prior_bars_and_visible_limit():
 
 
 @pytest.mark.parametrize("missing", ["080000", "090000"])
-def test_after_requires_full_day_m1_source(missing):
+def test_after_ignores_m1_gap_outside_current_forming_bucket(missing):
     flow, session, pool, market = _after_forming_case("M5", 5)
     market._display_timeframe_candles[("005930", 1)] = tuple(
         row for row in market._display_timeframe_candles[("005930", 1)]
         if not row["bar_time"].endswith(f"{missing[:2]}:{missing[2:4]}:00+09:00")
     )
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
-    assert frozen[2]["today_m1_source_covered"] is False
-    with pytest.raises(ValueError, match="TODAY_M1_COVERAGE_INCOMPLETE"):
-        flow._sor_m1_calculation_view(session, pool, pool, frozen)
+    assert frozen[2]["forming_target_source_covered"] is True
+    view = flow._sor_m1_calculation_view(session, pool, pool, frozen)
+    assert view["candles"][:-1] == pool["candles"]
 
 
 def test_after_rejects_missing_authenticated_current_m1():
@@ -2289,7 +2262,7 @@ def test_after_rejects_missing_authenticated_current_m1():
     market._sor_forming_m1_by_stock.pop("005930")
     frozen = flow._sor_m1_calculation_snapshot(session, pool, live_forming=True)
     assert frozen[2]["available"] is False
-    with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_NOT_VERIFIED"):
+    with pytest.raises(ValueError, match="SOR_FORMING_SOURCE_UNAVAILABLE"):
         flow._sor_m1_calculation_view(session, pool, pool, frozen)
 
 

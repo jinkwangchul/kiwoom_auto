@@ -503,8 +503,16 @@ def project_candle_supply(
             forming = forming_minute if isinstance(forming_minute, dict) else embedded_forming
             if isinstance(forming, dict):
                 current = now or datetime.now(SEOUL_TIMEZONE)
-                today = [row for row in raw if (candle_market_datetime(row) is not None
-                         and candle_market_datetime(row).date() == current.date())]
+                # Project only the active bucket. Older M1 must never create a
+                # completed higher-timeframe candle, including transiently.
+                marker = aggregate_minute_candles(
+                    [forming], interval, now=current,
+                    session_windows=session_windows,
+                )
+                bucket_start = candle_market_datetime(marker[-1]) if marker else None
+                today = [row for row in raw if bucket_start is not None
+                         and (stamp := candle_market_datetime(row)) is not None
+                         and bucket_start <= stamp < current]
                 projected = aggregate_minute_candles(
                     [*today, forming], interval, now=current,
                     session_windows=session_windows,

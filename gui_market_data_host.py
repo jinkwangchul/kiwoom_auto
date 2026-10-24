@@ -2181,7 +2181,7 @@ class MarketDataHost(QObject):
                     or not numbers[2] <= numbers[3] <= numbers[1]):
                 return blocked("SOR_M1_OHLCV_INVALID")
             if time + timedelta(minutes=1) <= cutoff:
-                if rows:
+                if interval == 1 and rows:
                     previous = candle_market_datetime(rows[-1])
                     if (previous is not None and previous.date() == time.date()
                             and MarketDataHost._display_session_for_time(previous)

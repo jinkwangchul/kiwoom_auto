@@ -6680,8 +6680,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         newest_day = prior[-1][:8]
         after = [stamp for stamp in prior if stamp[8:12] >= "1530"]
         return (f"{newest_day}153900" in after and all(
-            "1539" <= stamp[8:12] < "2000"
-            and (int(stamp[8:10]) * 60 + int(stamp[10:12]) - 939) % 3 == 0
+            "1530" <= stamp[8:12] < "2000"
+            and (int(stamp[8:10]) * 60 + int(stamp[10:12])
+                 - (930 if stamp[8:12] < "1539" else 939)) % 3 == 0
             and stamp[12:] == "00" and stamp < as_of.strftime("%Y%m%d%H%M%S")
             for stamp in after
         ))
@@ -6726,22 +6727,26 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         )
 
     def _sor_m1_calculation_snapshot(self, session, pool, *, live_forming=False):
-        """Freeze the already registered host's calculation-only M1 projection on the GUI thread."""
+        """Freeze M1 only for the current forming bar; completed minute bars stay direct."""
         code = session.request.stock.code
         if (self._verified_sor_tail_provider is not None
                 or self._validation_source_by_code.get(code) is not True
                 or pool.get("market_source") != "INTEGRATED"
                 or pool.get("market_data_identity") != f"{code}_AL"):
             return None
+        as_of = self._now_factory()
+        as_of = (as_of.replace(tzinfo=SEOUL_TIMEZONE) if as_of.tzinfo is None
+                 else as_of.astimezone(SEOUL_TIMEZONE))
+        if (session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
+                and not live_forming):
+            return (self._pool_computation_source_identity(pool), as_of,
+                    {"projection": "DIRECT_COMPLETED_TIMEFRAME"})
         owner = self.parent()
         getter = getattr(owner, "existing_market_data_host", None)
         market = getter() if callable(getter) else None
         required = getattr(market, "_sor_m1_required_by_stock", None)
         if not isinstance(required, dict) or code not in required:
             return None
-        as_of = self._now_factory()
-        as_of = (as_of.replace(tzinfo=SEOUL_TIMEZONE) if as_of.tzinfo is None
-                 else as_of.astimezone(SEOUL_TIMEZONE))
         try:
             if not live_forming:
                 from gui_market_data_host import MarketDataHost
@@ -6889,8 +6894,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if (not isinstance(view, dict)
                     or source_pool.get("market_source") != "INTEGRATED"
                     or source_pool.get("market_data_identity") != f"{code}_AL"
+                    or source_pool.get("timeframe_key") != timeframe_key
+                    or source_pool.get("timeframe_minutes") != session.request.timeframe_minutes
                     or view.get("market_source") != "INTEGRATED"
                     or view.get("market_data_identity") != f"{code}_AL"
+                    or view.get("timeframe_key") != timeframe_key
+                    or view.get("timeframe_minutes") != session.request.timeframe_minutes
                     or not isinstance(historical, list) or not historical
                     or not isinstance(display, list) or not display
                     or view.get("source_coverage_sufficient") is False
@@ -6904,7 +6913,48 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     or any(row.get("is_complete") is False for row in historical)
                     or display != historical[-len(display):]):
                 raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
+            from gui_market_data_host import MarketDataHost, _DISPLAY_INTEGRATED_SESSIONS
+            for row, stamp in zip(historical, stamps):
+                try:
+                    bar_start = datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(
+                        tzinfo=SEOUL_TIMEZONE)
+                except ValueError:
+                    raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID") from None
+                session_name = MarketDataHost._display_session_for_time(bar_start)
+                session_span = next(((start, end) for name, start, end in
+                                     _DISPLAY_INTEGRATED_SESSIONS if name == session_name), None)
+                session_end = session_span[1] if session_span else None
+                anchor = session_span[0] if session_span else 15 * 60 + 30
+                if (session_end is None and timeframe_key in {"M3", "M15"}
+                        and 15 * 60 + 30 <= bar_start.hour * 60 + bar_start.minute
+                        < 15 * 60 + 40):
+                    session_end = 15 * 60 + 40
+                if session_name == "NXT_AFTER":
+                    if timeframe_key == "M3" and self._sor_m3_after_anchor_verified(source_pool, as_of):
+                        anchor = 15 * 60 + 39
+                    elif timeframe_key == "M15" and self._sor_m15_after_anchor_verified(source_pool, as_of):
+                        anchor = 15 * 60 + 30
+                if (session_end is None or bar_start.second != 0
+                        or (bar_start.hour * 60 + bar_start.minute - anchor)
+                        % session.request.timeframe_minutes != 0
+                        or row.get("market_data_identity", f"{code}_AL") != f"{code}_AL"
+                        or row.get("market_source", "INTEGRATED") != "INTEGRATED"
+                        or row.get("timeframe_minutes", session.request.timeframe_minutes)
+                        != session.request.timeframe_minutes
+                        or min(bar_start + timedelta(minutes=session.request.timeframe_minutes),
+                               bar_start.replace(hour=session_end // 60,
+                                                 minute=session_end % 60)) > as_of):
+                    raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
             if not live_higher_forming:
+                if (as_of.weekday() < 5
+                        and MarketDataHost._display_session_for_time(as_of)
+                        in {"NXT_PRE", "KRX", "NXT_AFTER"}):
+                    latest_direct = MarketDataHost._expected_latest_completed_display_start(
+                        as_of, session.request.timeframe_minutes,
+                    )
+                    if (latest_direct is not None and
+                            stamps[-1] < latest_direct.strftime("%Y%m%d%H%M%S")):
+                        raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_UNAVAILABLE")
                 if (expected_calculation is not None
                         and expected_calculation != historical[-len(expected_calculation):]):
                     raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
@@ -6928,6 +6978,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             latest_direct = MarketDataHost._expected_latest_completed_display_start(
                 as_of, session.request.timeframe_minutes,
             )
+            if (latest_direct is not None and
+                    (timeframe_key == "M3" and self._sor_m3_after_anchor_verified(source_pool, as_of)
+                     or timeframe_key == "M15" and self._sor_m15_after_anchor_verified(source_pool, as_of))):
+                latest_direct = min(
+                    latest_direct,
+                    forming_stamp - timedelta(minutes=session.request.timeframe_minutes),
+                )
             if (latest_direct is not None
                     and latest_direct < forming_stamp
                     and stamps[-1] < latest_direct.strftime("%Y%m%d%H%M%S")):
