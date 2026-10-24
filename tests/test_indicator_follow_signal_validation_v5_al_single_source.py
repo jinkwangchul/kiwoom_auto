@@ -528,6 +528,8 @@ def test_offsession_direct_al_m1_persists_full_completed_broker_history(tmp_path
             "display_only": True, "connection_epoch": 1,
             "login_session_id": "SESSION-1", "install_result": {"ok": True},
         })
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        assert len(requests) == 1
     entry = flow._cached_history(window.stock, 1, "M1", requests[0]["count"])
     assert entry is not None
     assert [row["time"] for row in entry.candles] == [
@@ -544,6 +546,132 @@ def test_offsession_direct_al_m1_persists_full_completed_broker_history(tmp_path
                and e["count"] == 2 and e["last_minute"] == "2026-10-23T19:59+09:00"
                for e in events)
     assert "SESSION-1" not in flow_module._SOR_AL_M1_DIAGNOSTIC_PATH.read_text(encoding="utf-8")
+
+
+def test_offsession_existing_complete_session_m1_persists_without_broker_request(tmp_path):
+    from gui_market_data_host import MarketDataHost
+
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    with patch.object(flow._historical_cache, "store_if_lease_current",
+                      wraps=flow._historical_cache.store_if_lease_current) as store, patch.object(
+        MarketDataHost, "_full_day_display_count", return_value=5), patch(
+        "auto_candle_refresh.request_display_timeframe_candles_for_stock"
+    ) as request:
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        request.assert_not_called()
+        assert store.call_count == 1
+    entry = flow._cached_history(window.stock, 1, "M1", 5)
+    assert entry is not None
+    assert [row["time"] for row in entry.candles] == [
+        f"20261020090{i}00" for i in range(5)
+    ]
+    assert any(e["event"] == "persist_result" and e["persisted"] is True
+               for e in _m1_events())
+
+
+def test_offsession_existing_short_session_m1_requests_full_direct_history(tmp_path):
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    requests, timers, failures = [], [], []
+    flow.validation_failed.connect(failures.append)
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot", side_effect=lambda ms, fn: timers.append((ms, fn))):
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        assert len(requests) == 1
+        assert requests[0]["count"] > len(market._display_timeframe_candles[("005930", 1)])
+        assert requests[0]["nxt_available"] is True
+        assert flow._cached_history(window.stock, 1, "M1", requests[0]["count"]) is None
+        assert [ms for ms, _ in timers] == [30000]
+        timers[0][1]()
+    assert failures == ["SOR_M1_ACQUISITION_FAILED:CALLBACK_TIMEOUT"]
+
+
+def test_offsession_existing_short_session_m1_persists_full_direct_reply(tmp_path):
+    from tests.test_display_only_integrated_history import _opt10080_row
+
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    requests = []
+    with patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+               side_effect=lambda **kwargs: requests.append(kwargs) or {"ok": True}), patch.object(
+                   flow_module.QTimer, "singleShot"):
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        market._display_timeframe_candles[("005930", 1)] = ({
+            "bar_time": "2026-10-23T19:59:00+09:00", "open": 110.0,
+            "high": 112.0, "low": 108.0, "close": 111.0, "volume": 10.0,
+            "is_complete": True, "display_only": True,
+            "market_data_identity": "005930_AL", "market_source": "INTEGRATED",
+        },)
+        requests[0]["on_terminal"]({
+            "ok": True, "code": "005930", "interval": 1,
+            "rows": [_opt10080_row("20261023195900", 110)],
+            "market_data_identity": "005930_AL", "market_source": "INTEGRATED",
+            "display_only": True, "connection_epoch": 1,
+            "login_session_id": "SESSION-1", "install_result": {"ok": True},
+        })
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        assert len(requests) == 1
+    entry = flow._cached_history(window.stock, 1, "M1", requests[0]["count"])
+    assert entry is not None and entry.candles[-1]["time"] == "20261023195900"
+
+
+@pytest.mark.parametrize("invalid", ["source", "bar_session", "future", "forming", "identity"])
+def test_offsession_existing_invalid_session_m1_never_persists(tmp_path, invalid):
+    from gui_market_data_host import MarketDataHost
+
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    key = ("005930", 1)
+    rows = list(market._display_timeframe_candles[key])
+    if invalid == "identity":
+        market._display_timeframe_session_identity[key] = (2, "SESSION-2")
+    else:
+        field, value = {
+            "source": ("market_data_identity", "005930"),
+            "bar_session": ("session", "NXT_AFTER"),
+            "future": ("bar_time", "2026-10-24T10:03:00+09:00"),
+            "forming": ("is_complete", False),
+        }[invalid]
+        rows[-1] = dict(rows[-1], **{field: value})
+        market._display_timeframe_candles[key] = tuple(rows)
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    with patch.object(MarketDataHost, "_full_day_display_count", return_value=5), patch(
+        "auto_candle_refresh.request_display_timeframe_candles_for_stock", return_value={"ok": True}
+    ) as request, patch.object(flow_module.QTimer, "singleShot"):
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        request.assert_called_once()
+    assert flow._cached_history(window.stock, 1, "M1", 5) is None
+
+
+def test_offsession_existing_session_m1_rejected_cache_lease_does_not_persist(tmp_path):
+    from gui_market_data_host import MarketDataHost
+
+    flow, session, _pool, market, _cached = _registered_m1_calculation_case()
+    flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
+    flow._now_factory = lambda: datetime(2026, 10, 24, 10, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+    window = SimpleNamespace(stock=session.request.stock)
+    flow._open_windows[id(window)] = window
+    with patch.object(MarketDataHost, "_full_day_display_count", return_value=5), patch.object(
+        flow._historical_cache, "store_if_lease_current", return_value=False
+    ), patch("auto_candle_refresh.request_display_timeframe_candles_for_stock",
+             return_value={"ok": True}) as request, patch.object(flow_module.QTimer, "singleShot"):
+        flow._request_offsession_sor_m1_once(window, market, "005930")
+        request.assert_called_once()
+    assert flow._cached_history(window.stock, 1, "M1", 5) is None
 
 
 @pytest.mark.parametrize("invalid", ["source", "session", "failed", "forming"])

@@ -1184,9 +1184,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 self._note_sor_m1_skip(key, code, "ACTIVE_SESSION")
                 return
             identity = MarketDataHost._current_display_session_identity(market)
-            if MarketDataHost._current_display_candles(market, code, 1):
-                self._note_sor_m1_skip(key, code, "SESSION_M1_PRESENT")
-                return
             if code not in MarketDataHost._nxt_eligible_targets((code,)):
                 self._note_sor_m1_skip(key, code, "NXT_INELIGIBLE")
                 return
@@ -1198,6 +1195,31 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 DEFAULT_CANDLES_MAX_COUNT,
                 max(MarketDataHost._full_day_display_count(1), required_count),
             )
+            prior = self._offsession_sor_m1_requests.get(key)
+            if (isinstance(prior, dict) and prior.get("market") is market
+                    and prior.get("code") == code and prior.get("identity") == identity):
+                if prior.get("snapshot_persisted") is True and prior.get("count") == count:
+                    return
+                if prior.get("completed") is True:
+                    return
+                if prior.get("pending") or prior.get("scheduled"):
+                    self._note_sor_m1_skip(key, code, "REQUEST_IN_FLIGHT")
+                    return
+            session_m1 = MarketDataHost._current_display_candles(market, code, 1)
+            if (isinstance(prior, dict) and prior.get("market") is market
+                    and prior.get("code") == code and prior.get("identity") == identity
+                    and prior.get("requests", 0) >= 2 and len(session_m1) < count):
+                self._note_sor_m1_skip(key, code, "ATTEMPTS_EXHAUSTED")
+                return
+            if session_m1 and self._persist_offsession_session_m1(
+                window.stock, market, identity, session_m1, count, now,
+            ):
+                self._offsession_sor_m1_requests[key] = {
+                    "snapshot_persisted": True, "market": market, "code": code,
+                    "identity": identity, "count": count,
+                }
+                self._note_sor_m1_skip(key, code, "SESSION_M1_PERSISTED")
+                return
         except (AttributeError, RuntimeError, TypeError, ValueError):
             self._note_sor_m1_skip(key, code, "PREREQUISITE_ERROR")
             return
@@ -1320,6 +1342,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._persist_offsession_sor_m1(
                 window.stock, market, identity, result, count, now, cache_lease,
             )
+            if source_match and epoch_match:
+                state["completed"] = True
             if not getattr(window, "_normal_base_requested", False):
                 return
 
@@ -1360,8 +1384,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             or not state["pending"]
                             or self._open_windows.get(key) is not window
                             or getattr(getattr(window, "stock", None), "code", None) != code
-                            or MarketDataHost._current_display_session_identity(market) != identity
-                            or MarketDataHost._current_display_candles(market, code, 1)):
+                            or MarketDataHost._current_display_session_identity(market) != identity):
                         return
                     state["pending"] = False
                     timed_out_attempt = state["requests"]
@@ -1376,6 +1399,85 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             _trace_sor_al_m1("immediate_rejection", code, attempt=state["requests"],
                              reason=f"REQUEST_{type(exc).__name__.upper()}")
             terminal({"ok": False, "reason_code": f"REQUEST_{type(exc).__name__}"})
+
+    def _persist_offsession_session_m1(
+        self, stock, market, identity, session_m1, count, as_of,
+    ) -> bool:
+        """Store a complete, current-session direct AL snapshot under a cache lease."""
+        from gui_market_data_host import MarketDataHost
+
+        reason = "SESSION_M1_INVALID"
+        try:
+            if identity is None:
+                return False
+            candles = []
+            last_time = None
+            for row in session_m1:
+                bar_time = candle_market_datetime(row)
+                values = tuple(row.get(field) for field in
+                               ("open", "high", "low", "close", "volume"))
+                if (not isinstance(row, dict)
+                        or row.get("market_data_identity") != f"{stock.code}_AL"
+                        or row.get("market_source") != "INTEGRATED"
+                        or row.get("display_only") is not True
+                        or row.get("is_complete") is not True
+                        or row.get("timeframe_minutes") != 1
+                        or bar_time is None or bar_time.utcoffset() != timedelta(hours=9)
+                        or bar_time.second or bar_time.microsecond
+                        or bar_time.weekday() >= 5
+                        or bar_time + timedelta(minutes=1) > as_of
+                        or (last_time is not None and bar_time <= last_time)
+                        or row.get("session") != MarketDataHost._display_session_for_time(bar_time)
+                        or not row.get("session")
+                        or row.get("trade_date") != bar_time.date().isoformat()
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               for value in values)
+                        or values[2] <= 0 or values[4] < 0
+                        or not values[2] <= values[0] <= values[1]
+                        or not values[2] <= values[3] <= values[1]):
+                    return False
+                last_time = bar_time
+                candles.append({
+                    "time": bar_time.strftime("%Y%m%d%H%M%S"),
+                    **{field: row[field] for field in
+                       ("open", "high", "low", "close", "volume")},
+                })
+            if len(candles) < count:
+                reason = "SESSION_M1_INSUFFICIENT"
+                return False
+            capture_lease = getattr(self._historical_cache, "capture_store_lease", None)
+            if (not callable(capture_lease)
+                    or not callable(getattr(self._historical_cache,
+                                            "store_if_lease_current", None))):
+                reason = "CACHE_LEASE_UNAVAILABLE"
+                return False
+            cache_lease = capture_lease(stock.code)
+            previous = self._cached_history(stock, 1, "M1", count)
+            if previous is not None and previous.candles[-1]["time"] > candles[-1]["time"]:
+                reason = "CACHE_NEWER"
+                return False
+            capacity = max(count, previous.requested_count) if previous else count
+            merged = merge_validation_candles(
+                previous.candles if previous else (), candles, capacity,
+            )
+            if (MarketDataHost._current_display_session_identity(market) != identity
+                    or MarketDataHost._current_display_candles(market, stock.code, 1)
+                    != session_m1):
+                reason = "SESSION_CHANGED"
+                return False
+            persisted = self._persist_history(
+                stock, 1, "M1", capacity, merged,
+                market_data_identity=f"{stock.code}_AL", market_source="INTEGRATED",
+                cache_lease=cache_lease,
+            )
+            reason = "OK" if persisted else "STORE_REJECTED"
+            return persisted
+        except Exception:
+            reason = "SESSION_M1_INVALID"
+            return False
+        finally:
+            _trace_sor_al_m1("persist_result", stock.code, reason=reason,
+                             persisted=reason == "OK", count=len(session_m1))
 
     def _persist_offsession_sor_m1(
         self, stock, market, identity, result, count, as_of, cache_lease,
