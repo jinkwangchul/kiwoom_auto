@@ -18,7 +18,7 @@ import re
 from typing import Any
 
 from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES
-from sor_routine_signal_evidence import _SOURCE_PROOF, _valid_cutoff
+from sor_routine_signal_evidence import _SOURCE_PROOF, _valid_cutoff, _valid_stock
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_BYTES = 4 * 1024 * 1024
@@ -40,17 +40,17 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
         stock = snapshot.stock.code
         timeframe = pool.get("timeframe_key")
         minutes = pool.get("timeframe_minutes")
-        if (stock != "005930" or pool["stock"].code != stock
+        if (not _valid_stock(stock) or pool["stock"].code != stock
                 or type(minutes) is not int or minutes not in SUPPORTED_BAR_MINUTES
                 or minutes == 1 or timeframe != f"M{minutes}"
                 or snapshot.timeframe_key != timeframe
                 or snapshot.timeframe_minutes != minutes
                 or pool.get("market_source") != "INTEGRATED"
-                or pool.get("market_data_identity") != "005930_AL"
+                or pool.get("market_data_identity") != f"{stock}_AL"
                 or not isinstance(cache_marker, dict)
                 or cache_marker.get("canonical_stock_code") != stock
                 or cache_marker.get("market_source") != "INTEGRATED"
-                or cache_marker.get("market_data_identity") != "005930_AL"
+                or cache_marker.get("market_data_identity") != f"{stock}_AL"
                 or not isinstance(source, list) or not source
                 or not isinstance(rows, list) or not rows
                 or not isinstance(entries, (list, tuple))
@@ -124,7 +124,7 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
                  "evaluation_time": rows[i]["time"],
                  "activation_time": rows[i]["time"],
                  "signal_time": signal_times.get(i),
-                 "market_data_identity": "005930_AL", "source_proof": _SOURCE_PROOF,
+                 "market_data_identity": f"{stock}_AL", "source_proof": _SOURCE_PROOF,
                  "source_identity": cache_marker["candle_content_sha256"],
                  "input_hash": prefix_hashes[i],
                  "receipt_hash": receipt_hashes[i],
@@ -137,14 +137,16 @@ def build_v5_records(pool: Any, cache_marker: Any, snapshot: Any,
         return []
 
 
-def _marker(value: Any, cutoff: str, *, timeframe: str = "M3") -> bool:
+def _marker(value: Any, cutoff: str, *, timeframe: str = "M3",
+            stock: str | None = None) -> bool:
     return bool(
         timeframe in {f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
         and
         isinstance(value, dict)
-        and value.get("stock") == "005930"
+        and _valid_stock(value.get("stock"))
+        and (stock is None or value["stock"] == stock)
         and value.get("timeframe") == timeframe
-        and value.get("market_data_identity") == "005930_AL"
+        and value.get("market_data_identity") == f"{value['stock']}_AL"
         and value.get("source_proof") == _SOURCE_PROOF
         and value.get("side") in {"BUY", "SELL", "NONE"}
         and _valid_cutoff(value.get("evaluation_time"))
@@ -175,8 +177,10 @@ def _observation_time(value: Any) -> str | None:
 
 
 def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
-                    timeframe: str = "M3") -> dict[str, Any]:
+                    timeframe: str = "M3", stock: str = "005930") -> dict[str, Any]:
     """Compare recorded decisions only; matching selections cannot prove live parity."""
+    if not _valid_stock(stock):
+        return _blocked("INVALID_STOCK")
     if not _valid_cutoff(cutoff):
         return _blocked("INVALID_CUTOFF")
     if timeframe == "M1":
@@ -190,9 +194,7 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
     captured_mock = isinstance(mock, list)
     if captured_mock:
         mock_events = mock
-        mock_session = (mock[0].get("validation_session_id")
-                        if timeframe == "M3" and mock and isinstance(mock[0], dict)
-                        else None)
+        mock_session = None
     elif isinstance(mock, dict) and mock.get("schema_version") == "mock_validation_event_v1":
         mock_events = mock.get("events")
         mock_session = mock.get("validation_session_id")
@@ -211,7 +213,7 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                    else [event for event in mock_events
                          if isinstance(event, dict)
                          and event.get("event_type") == "ROUTINE_EVALUATED"
-                         and event.get("stock_code") == "005930"])
+                         and event.get("stock_code") == stock])
         if len(records) > _MAX_RECORDS:
             return _blocked(f"{origin}_RECORD_BOUND_EXCEEDED")
         by_time: dict[str, dict[str, Any]] = {}
@@ -224,11 +226,15 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                       record.get("sor_preview_evidence") if origin == "PRODUCTION" else
                       record.get("payload", {}).get("sor_source_evidence")
                       if isinstance(record.get("payload"), dict) else None)
-            if (isinstance(marker, dict) and marker.get("timeframe") != timeframe
+            if (isinstance(marker, dict) and _valid_stock(marker.get("stock"))
+                    and marker.get("market_data_identity") == f"{marker['stock']}_AL"
                     and marker.get("timeframe") in {
-                        f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}):
+                        f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
+                    and (origin != "PRODUCTION" or record.get("code") == marker["stock"])
+                    and (origin != "MOCK" or record.get("stock_code") == marker["stock"])
+                    and (marker["stock"] != stock or marker["timeframe"] != timeframe)):
                 continue
-            if not _marker(marker, cutoff, timeframe=timeframe):
+            if not _marker(marker, cutoff, timeframe=timeframe, stock=stock):
                 return _blocked(f"{origin}_M3_MARKER_UNPROVEN" if timeframe == "M3"
                                 else f"{origin}_FRAME_MARKER_UNPROVEN")
             t = marker["evaluation_time"]
@@ -248,7 +254,7 @@ def compare_records(v5: Any, production: Any, mock: Any, *, cutoff: str,
                         not in {"MARKING", "NORMAL_REPLAY"}):
                     return _blocked("V5_ACCEPTED_SOURCE_UNPROVEN")
             elif origin == "PRODUCTION":
-                if (record.get("code") != "005930" or record.get("signal") != "SKIP"
+                if (record.get("code") != stock or record.get("signal") != "SKIP"
                         or not isinstance(marker.get("source_session_sha256"), str)
                         or not _HEX.fullmatch(marker["source_session_sha256"])
                         or type(marker.get("source_connection_epoch")) is not int
@@ -408,26 +414,29 @@ def _read_mock(path: Path) -> Any:
 
 
 def _latest_v5_batch(records: list[dict[str, Any]], cutoff: str,
-                     timeframe: str = "M3") -> list[dict[str, Any]]:
+                     timeframe: str = "M3", stock: str = "005930") -> list[dict[str, Any]]:
     latest = next((row for row in reversed(records)
                    if isinstance(row, dict) and row.get("evaluation_time") == cutoff
-                   and row.get("timeframe") == timeframe), None)
+                   and row.get("timeframe") == timeframe
+                   and row.get("stock") == stock), None)
     if latest is None:
         return []
     identity = tuple(latest.get(key) for key in
-                     ("timeframe", "window_key", "generation", "request_generation",
+                     ("stock", "timeframe", "window_key", "generation", "request_generation",
                       "historical_request_id", "source_identity", "capture_kind"))
     return [row for row in records if isinstance(row, dict) and
             tuple(row.get(key) for key in
-                  ("timeframe", "window_key", "generation", "request_generation",
+                  ("stock", "timeframe", "window_key", "generation", "request_generation",
                    "historical_request_id", "source_identity", "capture_kind")) == identity
             and row.get("evaluation_time", "") <= cutoff]
 
 
 def _latest_production_batch(records: list[dict[str, Any]],
-                             cutoff: str, times: set[str]) -> list[dict[str, Any]]:
+                             cutoff: str, times: set[str], stock: str = "005930") -> list[dict[str, Any]]:
     return [row for row in records if isinstance(row, dict)
             and isinstance(row.get("sor_preview_evidence"), dict)
+            and (row.get("code") == stock
+                 or row["sor_preview_evidence"].get("stock") == stock)
             and row["sor_preview_evidence"].get("evaluation_time") in times]
 
 
@@ -438,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mock", required=True, type=Path)
     parser.add_argument("--cutoff", required=True)
     parser.add_argument("--timeframe", default="M3", help="exact chart frame (default: M3)")
+    parser.add_argument("--stock", default="005930", help="six-digit stock code (default: 005930)")
     args = parser.parse_args(argv)
     sources = []
     result = None
@@ -452,12 +462,12 @@ def main(argv: list[str] | None = None) -> int:
             result = _blocked(reason)
             break
     if result is None:
-        sources[0] = _latest_v5_batch(sources[0], args.cutoff, args.timeframe)
+        sources[0] = _latest_v5_batch(sources[0], args.cutoff, args.timeframe, args.stock)
         sources[1] = _latest_production_batch(
             sources[1], args.cutoff,
-            {row["evaluation_time"] for row in sources[0]})
+            {row["evaluation_time"] for row in sources[0]}, args.stock)
         result = compare_records(*sources, cutoff=args.cutoff,
-                                 timeframe=args.timeframe)
+                                 timeframe=args.timeframe, stock=args.stock)
     print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     return 1 if result["status"] == "MISMATCH" else 2
 

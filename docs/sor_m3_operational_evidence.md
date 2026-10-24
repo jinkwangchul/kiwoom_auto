@@ -75,3 +75,23 @@ participating routine marker for those frames. No higher-period decision is
 inferred from minute bars. The other minute frames are code-eligible only;
 accepted records from all three independent routes have not been observed in
 a live authorized session.
+
+## Participating stocks
+
+Direct minute evidence accepts any canonical six-digit participating stock
+code with matching `stock_AL` identity, direct frame, content hash,
+session/epoch receipt, and rule hash. Production remains calculation only.
+V5 worker capture stays bounded to 24 decisions and uses the existing
+accepted replay publication and background writer. Multiple stocks may
+share the same M3 or direct-minute files. Select a stock and frame:
+
+```powershell
+python sor_m3_operational_evidence.py --v5 runtime/diagnostics/v5_sor_direct_operational.jsonl --production runtime/diagnostics/sor_direct_production_outputs.jsonl --mock runtime/diagnostics/sor_direct_mock_events.jsonl --stock 000660 --timeframe M5 --cutoff 20261024090000
+```
+
+Omitting `--stock` selects Samsung `005930`; omitting `--timeframe` selects
+M3 and retains its original file names. The collector skips other valid
+stocks and direct minute frames, then blocks a missing or malformed selected
+route. V5 cache sidecars validate row content; Production and Mock carry
+direct session receipts. A matching decision set still has overall
+`BLOCKED` status until independent live cycle evidence exists.

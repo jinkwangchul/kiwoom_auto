@@ -25,6 +25,26 @@ def _direct(frame):
     return candle, source, rules
 
 
+def _stock_records(stock, frame="M3"):
+    candle, source, rules = _direct(frame)
+    candle["market_data_identity"] = f"{stock}_AL"
+    source["stock_code"] = stock
+    source["market_data_identity"] = f"{stock}_AL"
+    source["direct_source_receipt"]["stock_code"] = stock
+    source["candles"] = [candle]
+    marker = build_source_marker(stock=stock, rules=rules,
+                                 candles=[candle], source=source, side="BUY")
+    assert marker is not None
+    v5, production, mock = _records()
+    for record in (v5[0], production[0]["sor_preview_evidence"],
+                   mock["events"][0]["payload"]["sor_source_evidence"]):
+        record.update(marker)
+    production[0]["code"] = stock
+    mock["events"][0]["stock_code"] = stock
+    mock["events"][0]["payload"]["rules_hash"] = marker["rules_hash"]
+    return v5, production, mock
+
+
 @pytest.mark.parametrize("frame", ["M5", "M240"])
 def test_direct_marker_and_collector_compare_only_selected_frame(frame):
     candle, source, rules = _direct(frame)
@@ -192,3 +212,87 @@ def test_cli_requires_explicit_frame_for_non_m3(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["comparison"] == "UNAVAILABLE"
     assert main(argv + ["--timeframe", "M5"]) == 2
     assert json.loads(capsys.readouterr().out)["comparison"] == "MATCH"
+
+
+def test_two_stocks_share_direct_routes_and_explicit_selection(tmp_path, capsys):
+    samsung = _stock_records("005930")
+    hynix = _stock_records("000660")
+    assert _safe_record(hynix[1][0])["code"] == "000660"
+    v5 = samsung[0] + hynix[0]
+    production = samsung[1] + hynix[1]
+    mock = {**samsung[2], "events": samsung[2]["events"] + hynix[2]["events"]}
+    for stock in ("005930", "000660"):
+        result = compare_records(v5, production, mock,
+                                 cutoff="20261024090000", stock=stock)
+        assert result["comparison"] == "MATCH"
+        assert result["matched_bars"] == 1
+    paths = [tmp_path / name for name in ("v5.jsonl", "production.json", "mock.json")]
+    paths[0].write_text("".join(json.dumps(row) + "\n" for row in v5), encoding="utf-8")
+    paths[1].write_text(json.dumps(production), encoding="utf-8")
+    paths[2].write_text(json.dumps(mock), encoding="utf-8")
+    argv = ["--v5", str(paths[0]), "--production", str(paths[1]),
+            "--mock", str(paths[2]), "--cutoff", "20261024090000"]
+    assert main(argv + ["--stock", "000660"]) == 2
+    assert json.loads(capsys.readouterr().out)["comparison"] == "MATCH"
+    assert main(argv) == 2
+    assert json.loads(capsys.readouterr().out)["comparison"] == "MATCH"
+
+
+def test_multi_stock_mismatch_and_corrupt_source_fail_closed():
+    v5, production, mock = _stock_records("000660", "M5")
+    assert compare_records(v5, production, mock, cutoff="20261024090000",
+                           stock="000660", timeframe="M5")["comparison"] == "MATCH"
+    production[0]["sor_preview_evidence"]["receipt_hash"] = "f" * 64
+    assert compare_records(v5, production, mock, cutoff="20261024090000",
+                           stock="000660", timeframe="M5")["reason"] == "SOURCE_RULES_OR_PREFIX_MISMATCH"
+    v5, production, mock = _stock_records("000660", "M5")
+    production[0]["sor_preview_evidence"]["market_data_identity"] = "005930_AL"
+    assert _safe_record(production[0]) is None
+    assert compare_records(v5, production, mock, cutoff="20261024090000",
+                           stock="000660", timeframe="M5")["status"] == "BLOCKED"
+    assert compare_records(v5, production, mock, cutoff="20261024090000",
+                           stock="A00660", timeframe="M5")["reason"] == "INVALID_STOCK"
+    v5, production, mock = _stock_records("000660", "M5")
+    production[0]["sor_preview_evidence"]["stock"] = "005930"
+    production[0]["sor_preview_evidence"]["market_data_identity"] = "005930_AL"
+    assert compare_records(v5, production, mock, cutoff="20261024090000",
+                           stock="000660", timeframe="M5")["status"] == "BLOCKED"
+
+
+def test_capture_sinks_accept_other_stock_on_shared_direct_file(tmp_path, monkeypatch):
+    import sor_m3_mock_capture as mock_capture
+    import sor_m3_production_capture as production_capture
+
+    monkeypatch.setattr(production_capture, "_DIRECT_PATH", tmp_path / "production.jsonl")
+    monkeypatch.setattr(mock_capture, "_DIRECT_PATH", tmp_path / "mock.jsonl")
+    _, production, mock = _stock_records("000660", "M5")
+    mock["events"][0]["event_id"] = "ME-multi-stock-M5"
+    assert production_capture.enqueue_preview(production[0]) is True
+    assert mock_capture.enqueue_event(mock["events"][0]) is True
+    production_capture._QUEUE.join()
+    assert json.loads((tmp_path / "production.jsonl").read_text(
+        encoding="utf-8").splitlines()[0])["code"] == "000660"
+    assert json.loads((tmp_path / "mock.jsonl").read_text(
+        encoding="utf-8").splitlines()[0])["stock_code"] == "000660"
+
+
+def test_v5_worker_accepts_other_stock_only_with_matching_direct_cache():
+    row = {"time": "20261024090000", "open": 100, "high": 101,
+           "low": 99, "close": 100, "volume": 10}
+    stock = SimpleNamespace(code="000660")
+    pool = {"stock": stock, "timeframe_key": "M3", "timeframe_minutes": 3,
+            "market_source": "INTEGRATED", "market_data_identity": "000660_AL",
+            "candles": [row]}
+    marker = {"canonical_stock_code": "000660", "market_source": "INTEGRATED",
+              "market_data_identity": "000660_AL",
+              "candle_content_sha256": sha256(json.dumps([row], sort_keys=True,
+                  separators=(",", ":")).encode()).hexdigest()}
+    snapshot = SimpleNamespace(stock=stock, timeframe_key="M3",
+        timeframe_minutes=3, settings_hash="a" * 64,
+        historical_request_id="AL-1", evaluated_start_index=0,
+        evaluated_end_index=0)
+    assert build_v5_records(pool, marker, snapshot, [row], [], generation=1,
+                            request_generation=1)[0]["market_data_identity"] == "000660_AL"
+    assert build_v5_records(pool, dict(marker, market_data_identity="005930_AL"),
+                            snapshot, [row], [], generation=1,
+                            request_generation=1) == []

@@ -13,7 +13,7 @@ from sor_m3_production_capture import _MARKER_KEYS, _QUEUE, _hex, enqueue_line
 _PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_m3_mock_events.jsonl"
 _DIRECT_PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_direct_mock_events.jsonl"
 _LOCK = Lock()
-_SEEN: dict[str, None] = {}
+_SEEN: dict[tuple[str, str], None] = {}
 
 
 def enqueue_event(event: Any, *, cycle_identity: Any = None,
@@ -71,12 +71,13 @@ def enqueue_event(event: Any, *, cycle_identity: Any = None,
         line = json.dumps(record, ensure_ascii=True, sort_keys=True,
                           separators=(",", ":"), allow_nan=False) + "\n"
         with _LOCK:
-            if record["event_id"] in _SEEN:
+            key = (record["stock_code"], record["event_id"])
+            if key in _SEEN:
                 return False
             path = _PATH if marker["timeframe"] == "M3" else _DIRECT_PATH
             if not enqueue_line(path, line):
                 return False
-            _SEEN[record["event_id"]] = None
+            _SEEN[key] = None
             if len(_SEEN) > 256:
                 del _SEEN[next(iter(_SEEN))]
         return True

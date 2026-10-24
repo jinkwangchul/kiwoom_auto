@@ -22,6 +22,10 @@ _MARKER_FIELDS = frozenset({
 })
 
 
+def _valid_stock(stock: Any) -> bool:
+    return isinstance(stock, str) and re.fullmatch(r"[0-9]{6}", stock) is not None
+
+
 def _hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -55,13 +59,13 @@ def build_source_marker(
     *, stock: str, rules: Any, candles: Any, source: Any, side: Any,
 ) -> dict[str, str] | None:
     """Bind one actual BUY/SELL/NONE output to the exact admitted AL rows."""
-    if (stock != "005930" or not isinstance(rules, dict) or not rules
+    if (not _valid_stock(stock) or not isinstance(rules, dict) or not rules
             or not isinstance(source, dict) or source.get("available") is not True
             or source.get("stock_code") != stock
             or not isinstance(source.get("candles"), (list, tuple))
             or list(source["candles"]) != list(candles)
             or source.get("market_source") != "INTEGRATED"
-            or source.get("market_data_identity") != "005930_AL"
+            or source.get("market_data_identity") != f"{stock}_AL"
             or source.get("source_proof") != _SOURCE_PROOF
             or source.get("calculation_only") is not True
             or source.get("execution_enabled") is not False
@@ -109,7 +113,7 @@ def build_source_marker(
                 or times != sorted(set(times))):
             return None
         if interval > 1 and any(
-            row.get("market_data_identity") != "005930_AL"
+            row.get("market_data_identity") != f"{stock}_AL"
             or row.get("market_source") != "INTEGRATED"
             or row.get("display_only") is not True
             or row.get("is_complete") is not True
@@ -128,7 +132,7 @@ def build_source_marker(
         marker = {
             "stock": stock, "timeframe": f"M{interval}", "rules_hash": _hash(rules),
             "evaluation_time": times[-1].strftime("%Y%m%d%H%M%S"),
-            "market_data_identity": "005930_AL", "source_proof": _SOURCE_PROOF,
+            "market_data_identity": f"{stock}_AL", "source_proof": _SOURCE_PROOF,
             "input_hash": _hash(candles if interval == 1 else direct_rows),
             "side": side_text,
         }
@@ -145,8 +149,8 @@ def build_source_marker(
 def _valid_marker(marker: Any) -> bool:
     return bool(
         isinstance(marker, dict) and set(marker) == _MARKER_FIELDS
-        and marker["stock"] == "005930" and marker["timeframe"] == "M1"
-        and marker["market_data_identity"] == "005930_AL"
+        and _valid_stock(marker["stock"]) and marker["timeframe"] == "M1"
+        and marker["market_data_identity"] == f"{marker['stock']}_AL"
         and marker["source_proof"] == _SOURCE_PROOF
         and marker["side"] in {"BUY", "SELL", "NONE"}
         and _valid_cutoff(marker["evaluation_time"])
@@ -180,20 +184,21 @@ def _extract(marked: list[tuple[Any, Any]], *, consumer: str,
     return {
         "consumer": consumer,
         "origin_proof": f"{consumer}_{'ROUTINE_EVALUATED' if consumer == 'MOCK' else 'ROUTINE_OUTPUT'}:{_hash(proof_data)}",
-        "stock": "005930", "timeframe": "M1",
+        "stock": first["stock"], "timeframe": "M1",
         "rules_hash": first["rules_hash"], "cutoff": cutoff,
-        "market_data_identity": "005930_AL", "source_proof": _SOURCE_PROOF,
+        "market_data_identity": first["market_data_identity"], "source_proof": _SOURCE_PROOF,
         "events": events,
     }
 
 
-def extract_production_evidence(outputs: Any, *, cutoff: str) -> dict[str, Any] | None:
+def extract_production_evidence(outputs: Any, *, cutoff: str,
+                                stock: str = "005930") -> dict[str, Any] | None:
     """Adapt captured calculation-only outputs from routine_signal_probe."""
-    if not isinstance(outputs, list) or not outputs:
+    if not _valid_stock(stock) or not isinstance(outputs, list) or not outputs:
         return None
     marked = []
     for output in outputs:
-        if (not isinstance(output, dict) or output.get("code") != "005930"
+        if (not isinstance(output, dict) or output.get("code") != stock
                 or output.get("signal") != "SKIP"
                 or output.get("reason") != "SOR_CALCULATION_ONLY_NO_ORDER"
                 or output.get("execution_enabled") is not False
@@ -206,9 +211,10 @@ def extract_production_evidence(outputs: Any, *, cutoff: str) -> dict[str, Any] 
                     proof_data=outputs)
 
 
-def extract_mock_evidence(journal: Any, *, cutoff: str) -> dict[str, Any] | None:
+def extract_mock_evidence(journal: Any, *, cutoff: str,
+                          stock: str = "005930") -> dict[str, Any] | None:
     """Adapt an existing Mock Validation ROUTINE_EVALUATED journal."""
-    if (not isinstance(journal, dict)
+    if (not _valid_stock(stock) or not isinstance(journal, dict)
             or journal.get("schema_version") != "mock_validation_event_v1"
             or not isinstance(journal.get("validation_session_id"), str)
             or not journal["validation_session_id"].startswith("MV-")
@@ -222,7 +228,7 @@ def extract_mock_evidence(journal: Any, *, cutoff: str) -> dict[str, Any] | None
     cycle_ids = set()
     for event in selected:
         payload = event.get("payload")
-        if (not isinstance(payload, dict) or event.get("stock_code") != "005930"
+        if (not isinstance(payload, dict) or event.get("stock_code") != stock
                 or event.get("validation_session_id") != journal["validation_session_id"]
                 or not isinstance(event.get("event_id"), str)
                 or not event["event_id"].startswith("ME-")
@@ -260,14 +266,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("consumer", choices=("PRODUCTION", "MOCK"))
     parser.add_argument("source", type=Path)
     parser.add_argument("cutoff", help="last evaluated M1 bar, YYYYMMDDHHMMSS")
+    parser.add_argument("--stock", default="005930", help="six-digit stock code (default: 005930)")
     args = parser.parse_args(argv)
     try:
         with args.source.open("r", encoding="utf-8") as stream:
             source = json.load(stream, object_pairs_hook=_unique_keys)
         evidence = (
-            extract_production_evidence(source, cutoff=args.cutoff)
+            extract_production_evidence(source, cutoff=args.cutoff, stock=args.stock)
             if args.consumer == "PRODUCTION"
-            else extract_mock_evidence(source, cutoff=args.cutoff)
+            else extract_mock_evidence(source, cutoff=args.cutoff, stock=args.stock)
         )
     except (OSError, UnicodeError, ValueError, TypeError):
         evidence = None

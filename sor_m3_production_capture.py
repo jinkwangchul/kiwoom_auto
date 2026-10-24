@@ -10,7 +10,7 @@ from threading import Lock, Thread
 from typing import Any
 
 from candle_timeframe_aggregation import SUPPORTED_BAR_MINUTES
-from sor_routine_signal_evidence import _SOURCE_PROOF, _valid_cutoff
+from sor_routine_signal_evidence import _SOURCE_PROOF, _valid_cutoff, _valid_stock
 
 _PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_m3_production_outputs.jsonl"
 _DIRECT_PATH = Path(__file__).resolve().parent / "runtime" / "diagnostics" / "sor_direct_production_outputs.jsonl"
@@ -36,15 +36,15 @@ def _safe_record(output: Any) -> dict[str, Any] | None:
     if not isinstance(output, dict):
         return None
     marker = output.get("sor_preview_evidence")
-    if (output.get("code") != "005930" or output.get("signal") != "SKIP"
+    if (not _valid_stock(output.get("code")) or output.get("signal") != "SKIP"
             or output.get("reason") != "SOR_CALCULATION_ONLY_NO_ORDER"
             or any(output.get(key) is not False for key in
                    ("execution_enabled", "queue_connected", "send_order_connected"))
             or not isinstance(marker, dict)
-            or marker.get("stock") != "005930"
+            or marker.get("stock") != output["code"]
             or marker.get("timeframe") not in {
                 f"M{minutes}" for minutes in SUPPORTED_BAR_MINUTES if minutes > 1}
-            or marker.get("market_data_identity") != "005930_AL"
+            or marker.get("market_data_identity") != f"{output['code']}_AL"
             or marker.get("source_proof") != _SOURCE_PROOF
             or marker.get("side") not in {"BUY", "SELL", "NONE"}
             or not _valid_cutoff(marker.get("evaluation_time"))
@@ -60,7 +60,7 @@ def _safe_record(output: Any) -> dict[str, Any] | None:
             or str(output.get("sor_preview_signal") or "NONE").upper() != marker["side"]):
         return None
     return {
-        "origin": "PRODUCTION", "code": "005930", "signal": "SKIP",
+        "origin": "PRODUCTION", "code": output["code"], "signal": "SKIP",
         "reason": "SOR_CALCULATION_ONLY_NO_ORDER",
         "execution_enabled": False, "queue_connected": False,
         "send_order_connected": False,
@@ -117,7 +117,7 @@ def enqueue_preview(output: Any) -> bool:
         if record is None:
             return False
         marker = record["sor_preview_evidence"]
-        key = (record["sor_preview_routine_instance_sha256"],
+        key = (record["code"], record["sor_preview_routine_instance_sha256"],
                marker["timeframe"], marker["evaluation_time"],
                marker["source_identity"], marker["rules_hash"],
                record["sor_preview_cycle_hash"])

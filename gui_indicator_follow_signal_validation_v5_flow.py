@@ -8295,8 +8295,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 )
                 payload["backtest_trust_metadata"] = trust_metadata
                 payload["error"] = ""
-                if (session.request.stock.code == "005930"
-                        and session.request.timeframe_minutes in SUPPORTED_BAR_MINUTES
+                if (session.request.timeframe_minutes in SUPPORTED_BAR_MINUTES
                         and session.request.timeframe_minutes > 1
                         and session.request.timeframe_key == f"M{session.request.timeframe_minutes}"
                         and current()):
@@ -10363,7 +10362,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 payload["comparison"] = (tuple(c["time"] for c in rows), cache)
                 if (minutes in SUPPORTED_BAR_MINUTES and minutes > 1
                         and session.request.timeframe_key == f"M{minutes}"
-                        and session.request.stock.code == "005930"
                         and not detached_premarket):
                     try:
                         marker_path = self._validation_cache_source_marker_path(
