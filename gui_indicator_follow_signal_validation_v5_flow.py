@@ -6492,6 +6492,50 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         forming = d1 or period or live_minute_forming
         if self._pool_computation_source_identity(source_pool) != source_identity:
             raise ValueError("SOR_M1_BLOCKED:SOURCE_CHANGED_AFTER_SNAPSHOT")
+        if (timeframe_key in _STRICT_KRX_MINUTE_TIMEFRAMES - {"M1"}
+                and isinstance(projected, dict)
+                and projected.get("projection") == "COMPLETED_TIMEFRAME"
+                and isinstance(as_of, datetime)
+                and isinstance(view, dict)
+                and source_pool.get("market_source") == "INTEGRATED"
+                and view.get("market_source") == "INTEGRATED"
+                and source_pool.get("market_data_identity") ==
+                    f"{session.request.stock.code}_AL"
+                and view.get("market_data_identity") ==
+                    source_pool.get("market_data_identity")
+                and source_pool.get("timeframe_key") == timeframe_key
+                and view.get("timeframe_key") == timeframe_key
+                and source_pool.get("timeframe_minutes") == session.request.timeframe_minutes
+                and view.get("timeframe_minutes") == session.request.timeframe_minutes
+                and view.get("source_coverage_sufficient") is not False
+                and view.get("display_only_integrated") is not True):
+            from gui_market_data_host import MarketDataHost
+
+            now = self._now_factory()
+            now = (now.replace(tzinfo=SEOUL_TIMEZONE) if now.tzinfo is None
+                   else now.astimezone(SEOUL_TIMEZONE))
+            if (now.weekday() >= 5 or MarketDataHost._display_session_for_time(now)
+                    not in {"NXT_PRE", "KRX", "NXT_AFTER"}):
+                historical = view.get("candles")
+                display = view.get("display_candles", historical)
+                if (isinstance(historical, list) and historical
+                        and isinstance(display, list) and display
+                        and all(isinstance(row, dict) and row.get("is_complete") is not False
+                                for row in historical)
+                        and all(isinstance(row, dict) and row.get("is_complete") is not False
+                                for row in display)):
+                    stamps = [str(row.get("time") or "") for row in historical]
+                    if (all(len(stamp) == 14 and stamp.isdigit() for stamp in stamps)
+                            and stamps == sorted(set(stamps))
+                            and stamps[-1][:8] == as_of.strftime("%Y%m%d")
+                            and as_of.date() <= now.date()
+                            and display == historical[-len(display):]):
+                        if (expected_calculation is not None
+                                and (not isinstance(expected_calculation, list)
+                                     or not expected_calculation
+                                     or expected_calculation != historical[-len(expected_calculation):])):
+                            raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
+                        return view
         if (live_higher_forming and timeframe_key == "M3"
                 and 15 * 60 + 40 <= as_of.hour * 60 + as_of.minute < 20 * 60
                 and not self._sor_m3_after_anchor_verified(source_pool, as_of)):

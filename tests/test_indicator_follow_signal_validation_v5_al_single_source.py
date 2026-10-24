@@ -182,6 +182,17 @@ def test_weekend_v5_history_uses_last_verified_al_minute_not_weekend_clock():
     assert frozen[2]["available"] is True
 
 
+def test_weekend_m1_still_requires_valid_projection():
+    flow, session, pool, _market, _cached = _registered_m1_calculation_case()
+    flow._now_factory = lambda: datetime(
+        2026, 10, 24, 5, 25, tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    frozen[2]["available"] = False
+    with pytest.raises(ValueError, match="SOR_M1_BLOCKED"):
+        flow._sor_m1_calculation_view(session, pool, pool, frozen)
+
+
 def test_active_session_v5_lease_does_not_start_parallel_al_m1_request():
     flow, session, _pool, market, _cached = _registered_m1_calculation_case()
     flow._now_factory = lambda: datetime(
@@ -1067,6 +1078,76 @@ def _after_forming_case(timeframe, minutes, hour=15, minute=40):
                 timeframe_key=timeframe, timeframe_minutes=minutes,
                 requested_count=len(direct), request_id="direct-al")
     return flow, session, pool, market
+
+
+@pytest.mark.parametrize("case", ["off_session", "active_session", "stale_date",
+                                   "invalid_al", "forming", "incomplete_bar",
+                                   "display_mismatch"])
+def test_completed_m3_direct_al_auction_gaps_only_pass_off_session(case):
+    from copy import deepcopy
+
+    flow, session, pool, market = _after_forming_case("M3", 3)
+    key = ("005930", 1)
+    m1 = [dict(row, bar_time=row["bar_time"].replace("2026-10-20", "2026-10-23"),
+               trade_date="2026-10-23")
+          for row in market._display_timeframe_candles[key]]
+    for minute in range(15 * 60 + 40, 20 * 60):
+        clock = f"{minute // 60:02d}:{minute % 60:02d}"
+        m1.append(dict(m1[-1], bar_time=f"2026-10-23T{clock}:00+09:00",
+                       session="NXT_AFTER"))
+    market._display_timeframe_candles[key] = tuple(m1)
+    pool["candles"] = [
+        dict(pool["candles"][0], time=f"{day}{clock}")
+        for day, clock in (("20261021", "153000"), ("20261021", "153300"),
+                           ("20261021", "153900"), ("20261023", "090000"),
+                           ("20261023", "153000"), ("20261023", "153300"),
+                           ("20261023", "153900"), ("20261023", "195700"))
+    ]
+    pool["requested_count"] = len(pool["candles"])
+    if case == "stale_date":
+        for row in pool["candles"]:
+            row["time"] = row["time"].replace("20261023", "20261022")
+    original = deepcopy(pool)
+    view_pool = dict(pool, display_candles=list(pool["candles"]))
+    flow._now_factory = lambda: datetime(2026, 10, 24 if case != "active_session" else 23,
+                                         5 if case != "active_session" else 19,
+                                         25 if case != "active_session" else 59,
+                                         tzinfo=ZoneInfo("Asia/Seoul"))
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    assert frozen[1].date().isoformat() == "2026-10-23"
+    assert frozen[2]["projection"] == "COMPLETED_TIMEFRAME"
+    assert frozen[2]["available"] is True
+    assert {f"202610{'22' if case == 'stale_date' else '23'}{clock}"
+            for clock in ("153000", "153300", "153900")}.issubset(
+        {row["time"] for row in pool["candles"]}
+    )
+    assert not {"08:50", "15:31", "15:32", "15:33", "15:34", "15:39"} & {
+        row["bar_time"][11:16] for row in m1
+    }
+    if case == "invalid_al":
+        view_pool["market_data_identity"] = "005930"
+    elif case == "stale_date":
+        frozen[2]["available"] = False
+    elif case == "forming":
+        frozen[2]["projection"] = "FORMING_BASE_BAR"
+    elif case == "incomplete_bar":
+        view_pool["candles"] = deepcopy(view_pool["candles"])
+        view_pool["candles"][-1]["is_complete"] = False
+    elif case == "display_mismatch":
+        view_pool["display_candles"] = view_pool["display_candles"][:-1]
+    if case != "off_session":
+        with pytest.raises(ValueError, match=(
+            "TODAY_TARGET_COVERAGE_MISMATCH" if case == "active_session"
+            else "SOR_M1_BLOCKED"
+        )):
+            flow._sor_m1_calculation_view(session, pool, view_pool, frozen)
+        return
+    view = flow._sor_m1_calculation_view(
+        session, pool, view_pool, frozen, expected_calculation=pool["candles"][-3:],
+    )
+    assert view["candles"] == original["candles"]
+    assert view["display_candles"] == original["candles"]
+    assert pool == original
 
 
 @pytest.mark.parametrize("timeframe,minutes", [
