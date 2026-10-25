@@ -1302,7 +1302,7 @@ class StockInstanceCloseChart(QWidget):
                 visible_end = parse_market_datetime(item[1])
                 if visible_start is not None and visible_end is not None and visible_start < visible_end:
                     self.visible_time_ranges.append((visible_start, visible_end))
-        self.multi_day_timeline = (self.operation_timeline.get("status") not in (None, "NOT_PROVEN")
+        self.multi_day_timeline = (self.operation_timeline.get("status") in {"ONGOING", "ENDED", "END_UNKNOWN"}
                                    and len({start.date() for start, _end in self.visible_time_ranges}) > 1)
         active_ranges = list(self.visible_time_ranges)
         if not active_ranges and self.fixed_time_range is not None:
@@ -3061,7 +3061,7 @@ class StockInstanceChartWindow(QDialog):
         self.last_refresh_status = status
         if self._can_preserve_last_valid_projection(
             self._projection_identity(data)
-        ):
+        ) and data.get("operation_timeline") == self.last_projection.get("operation_timeline"):
             self.notice_label.setText(self._preserved_series_notice(status))
             self._update_operation_button_state()
             return
@@ -3119,8 +3119,8 @@ class StockInstanceChartWindow(QDialog):
     def _operation_display_time_range(cls, data: dict[str, Any], trade_date: str):
         timeline = data.get("operation_timeline")
         timeline = timeline if isinstance(timeline, dict) else {}
-        days = timeline.get("trade_dates")
-        if timeline.get("status") != "NOT_PROVEN" and isinstance(days, list) and days:
+        days = timeline.get("display_dates") or timeline.get("trade_dates")
+        if timeline.get("status") in {"ONGOING", "ENDED", "END_UNKNOWN"} and isinstance(days, list) and days:
             ranges = []
             for day in days:
                 try:
@@ -3196,15 +3196,26 @@ class StockInstanceChartWindow(QDialog):
         start_text = str(timeline.get("start_at") or "")[5:19].replace("T", " ")
         end_text = str(timeline.get("end_at") or "")[5:19].replace("T", " ")
         self.timeline_label.setText({
+            "WAITING": "NEW OPERATION WAITING",
             "ENDED": f"Operation {start_text} → {end_text}",
             "ONGOING": f"Operation {start_text} → ongoing",
             "END_UNKNOWN": f"Operation {start_text} → end unverified",
         }.get(timeline_status, "Operation timeline: not proven"))
-        if len(timeline.get("trade_dates") or ()) > 1:
-            self.timeline_label.setText(self.timeline_label.text() + " · event/source dates only")
+        if timeline_status in {"ONGOING", "ENDED", "END_UNKNOWN"}:
+            unverified = timeline.get("unverified_calendar_dates") or []
+            if unverified:
+                coverage_label = ("SOR source missing" if not timeline.get("source_dates")
+                                  else "SOR coverage unverified")
+                self.timeline_label.setText(
+                    self.timeline_label.text() +
+                    f" · {coverage_label}: {unverified[0]} to {unverified[-1]}"
+                    " (calendar weekdays; exchange sessions unverified)"
+                )
+            elif len(timeline.get("trade_dates") or ()) > 1:
+                self.timeline_label.setText(self.timeline_label.text() + " · event/source dates only")
         self.timeline_label.setToolTip(
             f"{timeline.get('start_at') or ''} → {timeline.get('end_at') or timeline_status}"
-            if timeline_status != "NOT_PROVEN" else ""
+            if timeline_status in {"ONGOING", "ENDED", "END_UNKNOWN"} else ""
         )
         self.chart.set_projection(
             candles,

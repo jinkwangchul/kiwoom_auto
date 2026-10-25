@@ -713,20 +713,41 @@ def project_operation_timeline(
     end = exact_timestamp(end_at) if end_at else None
     if start is None or start > now or (end_at and end is None) or (end is not None and (end < start or end > now)):
         return {"status": "NOT_PROVEN", "start_at": "", "end_at": "", "trade_dates": []}
-    last_day = (end or now).date().isoformat()
+    first_day = start.date().isoformat()
+    target_day = (end or now).date()
+    if end is None:
+        while target_day.weekday() >= 5:
+            target_day -= timedelta(days=1)
+    last_day = max(first_day, target_day.isoformat())
+    witnessed_source_days = sorted(day for day in source_dates
+                                   if first_day <= day <= last_day)
     event_days = {start.date().isoformat()}
     if end is not None:
         event_days.add(end.date().isoformat())
     days = sorted(
         day for day in source_dates | event_days
-        if start.date().isoformat() <= day <= last_day
+        if first_day <= day <= last_day
     )
+    cursor = start.date()
+    display_days = set(days)
+    unverified_days = []
+    while cursor <= date.fromisoformat(last_day):
+        day = cursor.isoformat()
+        if cursor.weekday() < 5:
+            display_days.add(day)
+            if day not in witnessed_source_days:
+                unverified_days.append(day)
+        cursor += timedelta(days=1)
     return {
         "status": "ENDED" if end is not None else "ONGOING" if active else "END_UNKNOWN",
         "start_at": start.isoformat(),
         "end_at": end.isoformat() if end is not None else "",
         "trade_dates": days,
-        "date_coverage": "SOURCE_OR_EVENT_WITNESSED_ONLY",
+        "source_dates": witnessed_source_days,
+        "display_dates": sorted(display_days),
+        "unverified_calendar_dates": unverified_days,
+        "date_coverage": ("CALENDAR_WEEKDAYS_UNVERIFIED" if unverified_days
+                          else "SOURCE_DATES_WITNESSED"),
     }
 
 
@@ -775,6 +796,8 @@ def _production_operation_timeline(root: Path, stock_code: str, now: datetime,
               and stock_status in {"MONITORING", "RUNNING", "SELL_ONLY", "AUTO_CLOSE",
                                    "AUTO_CLOSING", "EARLY_CLOSE", "EARLY_CLOSING"}
               and stock_state.get("review_required") is not True)
+    if not active and not endings:
+        return {"status": "WAITING", "start_at": "", "end_at": "", "trade_dates": []}
     return project_operation_timeline(
         start_at, endings[0]["occurred_at"] if endings else None,
         now=now, source_dates=source_dates, active=active,
@@ -963,12 +986,30 @@ def project_stock_instance_day(
     operation_timeline = _production_operation_timeline(
         root, stock_code, projection_now, source_dates,
     )
+    episode_start = episode_end = None
+    if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}:
+        episode_start = datetime.fromisoformat(operation_timeline["start_at"])
+        episode_end = (datetime.fromisoformat(operation_timeline["end_at"])
+                       if operation_timeline["end_at"] else projection_now)
+        chart_candles = [item for item in chart_candles
+                         if (bar_time := candle_market_datetime(item)) is not None
+                         and episode_start <= bar_time <= episode_end]
+        in_range_source_dates = {
+            bar_time.date().isoformat()
+            for item in chart_candles
+            if (bar_time := candle_market_datetime(item)) is not None
+        }
+        operation_timeline = project_operation_timeline(
+            operation_timeline["start_at"], operation_timeline["end_at"] or None,
+            now=projection_now, source_dates=in_range_source_dates,
+            active=operation_timeline["status"] == "ONGOING",
+        )
     timeline_dates = (
         set(operation_timeline["trade_dates"])
-        if operation_timeline["status"] != "NOT_PROVEN"
+        if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}
         else {str(trade_date)}
     )
-    if operation_timeline["status"] != "NOT_PROVEN":
+    if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}:
         chart_candles = [item for item in chart_candles
                          if (bar_time := candle_market_datetime(item)) is not None
                          and bar_time.date().isoformat() in timeline_dates]
@@ -1014,6 +1055,10 @@ def project_stock_instance_day(
         if not instance_id or record_instance != instance_id:
             continue
         if str(marker["signal_trade_date"]) not in timeline_dates:
+            continue
+        marker_time = candle_market_datetime({"bar_time": marker["signal_bar_time"]})
+        if (episode_start is not None and
+                (marker_time is None or not episode_start <= marker_time <= episode_end)):
             continue
         if marker["signal"] in {"BUY", "SELL"}:
             markers.append(marker)
@@ -1106,7 +1151,7 @@ def project_stock_instance_day(
         for key in ("actual_fill_markers", "actual_buy_fill_markers",
                     "actual_sell_fill_markers", "execution_process_rails", "diagnostics")
     }
-    if operation_timeline["status"] != "NOT_PROVEN":
+    if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}:
         started = datetime.fromisoformat(operation_timeline["start_at"])
         finished = datetime.fromisoformat(operation_timeline["end_at"]) if operation_timeline["end_at"] else projection_now
         for key in ("actual_fill_markers", "actual_buy_fill_markers", "actual_sell_fill_markers"):
@@ -1190,10 +1235,11 @@ def project_stock_instance_day(
 def chart_candle_projection_request(
     routine_projection_request: dict[str, Any],
 ) -> dict[str, Any]:
-    """Keep the Routine projection kind while separating Chart display from warm-up."""
+    """Keep the Routine projection kind without trimming chart history to evaluation needs."""
 
     if not isinstance(routine_projection_request, dict):
         raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
     request = deepcopy(routine_projection_request)
     request.pop("warmup_bars", None)
+    request.pop("history_target_bars", None)
     return request

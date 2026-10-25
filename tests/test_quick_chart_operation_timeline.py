@@ -22,7 +22,8 @@ from mock_validation_host import MockValidationHost
 from mock_validation_ui_actions import MockValidationUIActions
 from mock_validation_quick_chart import (_mock_operation_timeline,
                                          _projection as mock_projection)
-from stock_instance_day_projection import project_stock_instance_day, project_operation_timeline
+from stock_instance_day_projection import (project_stock_instance_day, project_operation_timeline,
+                                           _production_operation_timeline)
 from tests.test_mock_indicator_follow_adapter import _buy_rules
 from tests.test_mock_validation_host_ui import _Api, _reference
 
@@ -56,6 +57,173 @@ def test_timeline_keeps_exact_events_and_only_source_witnessed_days():
     assert result["end_at"].endswith("14:00:29+09:00")
     assert result["trade_dates"] == ["2026-10-16", "2026-10-19", "2026-10-20"]
     assert project_operation_timeline(START, None, now=NOW, source_dates=set())["status"] == "END_UNKNOWN"
+
+
+def test_stopped_stock_with_old_start_is_new_operation_waiting_without_start_marker():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        _write(root / "stocks" / "005930_Test" / "state.json",
+               {"status": "STOPPED", "trade_enabled": False, "holding_qty": 0})
+        _write(root / "runtime" / "operation_state.json",
+               {"operation_status": "STOPPED", "operation_participant_stock_codes": []})
+        journal = EventJournalWriter(root / "runtime" / "event_journal")
+        for when in ("2026-09-11T11:59:00+09:00", "2026-09-11T12:07:00+09:00"):
+            assert journal.append_event(
+                event_type="OPERATION_STARTED", occurred_at=when, category="OPERATION",
+                severity="INFO", template_args={"target": "005930"}, result="SUCCESS",
+                source="test", target_type="STOCK", target_id="005930",
+                target_name="Test", stock_code="005930")["appended"]
+        timeline = _production_operation_timeline(root, "005930", NOW, {"2026-10-19"})
+        assert timeline["status"] == "WAITING"
+        assert timeline["start_at"] == timeline["end_at"] == ""
+        assert timeline["trade_dates"] == []
+        app = QApplication.instance() or QApplication([])
+        window = StockInstanceChartWindow("005930", "2026-10-20",
+                                          projection_provider=lambda _code, _day: {
+                                              "stock_code": "005930", "trade_date": "2026-10-20",
+                                              "operation_timeline": timeline, "candles": []})
+        try:
+            assert "NEW OPERATION WAITING" in window.timeline_label.text()
+            assert window.chart.operation_timeline["start_at"] == ""
+            app.processEvents()
+        finally:
+            window.close()
+
+
+def test_active_m3_range_exposes_unverified_dates_without_inventing_candles():
+    timeline = project_operation_timeline(
+        "2026-09-11T11:59:00+09:00", None,
+        now=datetime(2026, 10, 25, 12, tzinfo=SEOUL),
+        source_dates={"2026-09-11", "2026-10-23"}, active=True,
+    )
+    assert timeline["status"] == "ONGOING"
+    assert timeline["trade_dates"] == ["2026-09-11", "2026-10-23"]
+    assert timeline["display_dates"][0] == "2026-09-11"
+    assert timeline["display_dates"][-1] == "2026-10-23"
+    assert "2026-09-14" in timeline["unverified_calendar_dates"]
+    assert "2026-10-23" not in timeline["unverified_calendar_dates"]
+    app = QApplication.instance() or QApplication([])
+    rows = [{**_bar(day, "10:00:00", close), "timeframe_minutes": 3}
+            for day, close in (("2026-09-11", 101), ("2026-10-23", 103))]
+    window = StockInstanceChartWindow("005930", "2026-10-25",
+                                      projection_provider=lambda _code, _day: {
+                                          "stock_code": "005930", "trade_date": "2026-10-25",
+                                          "instance_id": "instance-1", "bar_minutes": 3,
+                                          "projection_status": "VALID", "candles": rows,
+                                          "operation_timeline": timeline})
+    try:
+        assert len(window.chart.close_series) == 2
+        assert len(window.chart.visible_time_ranges) == len(timeline["display_dates"])
+        assert "coverage unverified" in window.timeline_label.text()
+        app.processEvents()
+    finally:
+        window.close()
+
+
+def test_active_range_identifies_trailing_source_gap_before_sunday():
+    timeline = project_operation_timeline(
+        "2026-09-11T11:59:00+09:00", None,
+        now=datetime(2026, 10, 25, 12, tzinfo=SEOUL),
+        source_dates={"2026-09-11", "2026-10-20"}, active=True)
+    assert timeline["display_dates"][-1] == "2026-10-23"
+    assert timeline["unverified_calendar_dates"][-3:] == [
+        "2026-10-21", "2026-10-22", "2026-10-23"]
+
+
+def test_refresh_replaces_stale_start_when_stock_becomes_waiting():
+    app = QApplication.instance() or QApplication([])
+    active = {"stock_code": "005930", "trade_date": "2026-10-20",
+              "instance_id": "instance-1", "bar_minutes": 3,
+              "projection_status": "VALID",
+              "candles": [{**_bar("2026-10-20", "10:03:00", 101),
+                           "timeframe_minutes": 3}],
+              "operation_timeline": project_operation_timeline(
+                  START, None, now=NOW, source_dates={"2026-10-20"}, active=True)}
+    waiting = {**active, "projection_status": "NO_DAY_DATA", "candles": [],
+               "operation_timeline": {"status": "WAITING", "start_at": "",
+                                      "end_at": "", "trade_dates": []}}
+    current = {"projection": active}
+    window = StockInstanceChartWindow(
+        "005930", "2026-10-20",
+        projection_provider=lambda _code, _day: current["projection"])
+    try:
+        assert window.chart.close_series
+        current["projection"] = waiting
+        window.refresh_projection()
+        assert window.timeline_label.text() == "NEW OPERATION WAITING"
+        assert window.chart.operation_timeline["start_at"] == ""
+        assert window.chart.close_series == []
+        app.processEvents()
+    finally:
+        window.close()
+
+
+def test_active_m3_uses_all_witnessed_native_sor_sessions_without_m1_rebuild():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        stock_dir = root / "stocks" / "005930_Test"
+        _write(stock_dir / "config.json", {"assigned_routine_instance_id": "instance-1"})
+        _write(stock_dir / "state.json", {"status": "RUNNING"})
+        _write(root / "runtime" / "operation_state.json", {
+            "operation_status": "RUNNING", "operation_started_at": "2026-10-19T09:59:00+09:00",
+            "operation_participant_stock_codes": ["005930"]})
+        _write(root / "operation_policy.json", {})
+        rules_path = root / "rules.json"
+        _write(rules_path, {"bar": {"bar_minutes": 3}})
+        journal = EventJournalWriter(root / "runtime" / "event_journal")
+        assert journal.append_event(
+            event_type="OPERATION_STARTED", occurred_at=START, category="OPERATION",
+            severity="INFO", template_args={"target": "005930"}, result="SUCCESS",
+            source="test", target_type="STOCK", target_id="005930",
+            target_name="Test", stock_code="005930")["appended"]
+        bars = [{**_bar(day, clock, close), "timeframe_minutes": 3}
+                for day, prices in (("2026-10-19", (101, 102)),
+                                    ("2026-10-20", (103, 104)),
+                                    ("2026-10-21", (105, 106)))
+                for clock, close in zip(("10:03:00", "10:06:00"), prices)]
+        scopes = []
+        def provider(**kwargs):
+            scopes.append(kwargs["consumer_scope"])
+            selected = bars[-kwargs["projection_request"].get("history_target_bars", len(bars)):]
+            source_hash = canonical_candle_content_hash(selected)
+            return {"available": True, "availability_state": "AVAILABLE",
+                    "candles": selected, "timeframe_minutes": 3,
+                    "market_source": "INTEGRATED", "market_data_identity": "005930_AL",
+                    "calculation_only": True, "execution_enabled": False,
+                    "queue_connected": False, "send_order_connected": False,
+                    "calculation_source": "BROKER_AL_CONFIRMED_DIRECT",
+                    "direct_history_source": "BROKER_AL_CONFIRMED_DIRECT",
+                    "direct_timeframe_source": True, "source_identity": source_hash,
+                    "direct_source_receipt": {"stock_code": "005930",
+                                              "timeframe_key": "M3",
+                                              "source_content_sha256": source_hash}}
+        with (patch("stock_instance_day_projection.routine_instance_by_id",
+                    return_value=SimpleNamespace(rules_path=rules_path, definition_id="def",
+                                                 display_name="Test")),
+              patch("stock_instance_day_projection.routine_definition_by_id",
+                    return_value=object()),
+              patch("stock_instance_day_projection.load_routine_callable",
+                    return_value=lambda _rules: {"projection": "COMPLETED_TIMEFRAME",
+                                                 "history_target_bars": 2})):
+            projected = project_stock_instance_day(
+                "005930", "2026-10-21", project_root=root,
+                now=datetime(2026, 10, 21, 14, tzinfo=SEOUL), candle_provider=provider)
+        assert scopes == ["SOR_CALCULATION_ONLY"]
+        assert projected["operation_timeline"]["status"] == "ONGOING"
+        assert projected["operation_timeline"]["unverified_calendar_dates"] == []
+        assert [bar["close"] for bar in projected["candles"]] == [101, 102, 103, 104, 105, 106]
+        assert projected["calculation_candle_source"] == "SOR_AL"
+        app = QApplication.instance() or QApplication([])
+        window = StockInstanceChartWindow("005930", "2026-10-21",
+                                          projection_provider=lambda _code, _day: projected)
+        try:
+            assert len(window.chart.close_series) == 6
+            assert len(window.chart.visible_time_ranges) == 3
+            assert [len(segment) for segment in window.chart._line_segments()] == [2, 2, 2]
+            assert "ongoing" in window.timeline_label.text()
+            app.processEvents()
+        finally:
+            window.close()
 
 
 def test_production_projection_uses_verified_stock_journal_and_sor_without_guessing_end():
@@ -99,10 +267,10 @@ def test_production_projection_uses_verified_stock_journal_and_sor_without_guess
             assert result["appended"], result
         event("OPERATION_STARTED", START)
         bars = [_bar("2026-10-19", "10:05:00", 101), _bar("2026-10-20", "13:55:00", 102)]
-        source_hash = canonical_candle_content_hash(bars)
         scopes = []
         def provider(**kwargs):
             scopes.append(kwargs["consumer_scope"])
+            source_hash = canonical_candle_content_hash(bars)
             return {"available": True, "availability_state": "AVAILABLE", "candles": bars,
                     "market_source": "INTEGRATED", "market_data_identity": "005930_AL",
                     "timeframe_minutes": 5, "calculation_only": True,
@@ -139,8 +307,12 @@ def test_production_projection_uses_verified_stock_journal_and_sor_without_guess
             _write(stock_dir / "state.json", {"status": "RUNNING"})
             event("LIQUIDATION_COMPLETED", END,
                   details={"completion_status": "DONE", "close_mode": "AUTO_CLOSE"})
+            bars[:] = [_bar("2026-10-19", "09:55:00", 99), *bars,
+                       _bar("2026-10-20", "14:02:00", 104)]
             ended = project_stock_instance_day("005930", "2026-10-20", project_root=root,
-                                               now=NOW, candle_provider=provider)
+                                               now=datetime(2026, 10, 20, 14, 10,
+                                                            tzinfo=SEOUL),
+                                               candle_provider=provider)
             unavailable = project_stock_instance_day(
                 "005930", "2026-10-20", project_root=root, now=NOW,
                 candle_provider=lambda **_kwargs: {"available": False, "candles": [],
@@ -150,16 +322,27 @@ def test_production_projection_uses_verified_stock_journal_and_sor_without_guess
         assert ongoing["operation_timeline"]["end_at"] == ""
         assert still_unknown["operation_timeline"]["end_at"] == ""
         assert off_policy["operation_timeline"]["status"] == "ONGOING"
-        assert review["operation_timeline"]["status"] == "END_UNKNOWN"
+        assert review["operation_timeline"]["status"] == "WAITING"
+        assert review["operation_timeline"]["start_at"] == ""
         assert ended["operation_timeline"]["status"] == "ENDED"
         assert ended["operation_timeline"]["end_at"] == END
         assert ended["operation_timeline"]["trade_dates"] == ["2026-10-19", "2026-10-20"]
-        assert [row["bar_time"] for row in ended["candles"]] == [row["bar_time"] for row in bars]
+        assert unavailable["candles"] == []
+        assert unavailable["operation_timeline"]["source_dates"] == []
+        assert [row["bar_time"] for row in ended["candles"]] == [
+            "2026-10-19T10:05:00+09:00", "2026-10-20T13:55:00+09:00"]
         assert ended["buy_signal_markers"][0]["signal_bar_time"] == "2026-10-19T10:05:00+09:00"
         assert ended["sell_signal_markers"][0]["signal_bar_time"] == "2026-10-20T13:55:00+09:00"
         assert [(item["fill_id"], item["filled_price"], item["filled_quantity_delta"])
                 for item in ended["actual_fill_markers"]] == [("FB", 101, 1), ("FS", 102, 1)]
         app = QApplication.instance() or QApplication([])
+        missing_window = StockInstanceChartWindow(
+            "005930", "2026-10-20", projection_provider=lambda _code, _day: unavailable)
+        try:
+            assert "SOR source missing" in missing_window.timeline_label.text()
+            assert missing_window.chart.close_series == []
+        finally:
+            missing_window.close()
         window = StockInstanceChartWindow("005930", "2026-10-20",
                                           projection_provider=lambda _code, _day: ended)
         try:
