@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import math
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -93,6 +93,17 @@ _COMMON_PNL_REFRESH_TIMER: QTimer | None = None
 _CHART_TILE_GAP = 8
 _CHART_TILE_FRAME_TOLERANCE = 12
 _CHART_TILE_MIN_OVERLAP_RATIO = 0.45
+
+
+def _exact_chart_datetime(value: Any) -> datetime | None:
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return parse_market_datetime(value)
+    return (parsed.replace(tzinfo=SEOUL_TIMEZONE) if parsed.tzinfo is None
+            else parsed.astimezone(SEOUL_TIMEZONE))
 
 
 def _today_trade_date() -> str:
@@ -1189,6 +1200,8 @@ class StockInstanceCloseChart(QWidget):
         self.live_price_data_quality = ""
         self.fixed_time_range: tuple[datetime, datetime] | None = None
         self.visible_time_ranges: list[tuple[datetime, datetime]] = []
+        self.operation_timeline: dict[str, Any] = {}
+        self.multi_day_timeline = False
         self.nxt_available = False
         self.timeframe_minutes: int | None = None
         self.empty_message = "표시할 기준봉 데이터가 없습니다."
@@ -1230,6 +1243,7 @@ class StockInstanceCloseChart(QWidget):
         actual_fill_markers: Any = None,
         process_rails: Any = None,
         average_price: Any = None,
+        operation_timeline: Any = None,
     ) -> None:
         self.close_series = self._series_from(
             candles,
@@ -1251,7 +1265,7 @@ class StockInstanceCloseChart(QWidget):
             for marker in actual_fill_markers:
                 if not isinstance(marker, dict):
                     continue
-                occurred_at = parse_market_datetime(marker.get("occurred_at"))
+                occurred_at = _exact_chart_datetime(marker.get("occurred_at"))
                 price = _finite_number(marker.get("filled_price"))
                 side = str(marker.get("side") or "").strip().upper()
                 if occurred_at is None or price is None or price <= 0 or side not in {"BUY", "SELL"}:
@@ -1279,6 +1293,7 @@ class StockInstanceCloseChart(QWidget):
             else None
         )
         self.visible_time_ranges = []
+        self.operation_timeline = dict(operation_timeline) if isinstance(operation_timeline, dict) else {}
         if isinstance(visible_time_ranges, list):
             for item in visible_time_ranges:
                 if not isinstance(item, (list, tuple)) or len(item) != 2:
@@ -1287,6 +1302,8 @@ class StockInstanceCloseChart(QWidget):
                 visible_end = parse_market_datetime(item[1])
                 if visible_start is not None and visible_end is not None and visible_start < visible_end:
                     self.visible_time_ranges.append((visible_start, visible_end))
+        self.multi_day_timeline = (self.operation_timeline.get("status") not in (None, "NOT_PROVEN")
+                                   and len({start.date() for start, _end in self.visible_time_ranges}) > 1)
         active_ranges = list(self.visible_time_ranges)
         if not active_ranges and self.fixed_time_range is not None:
             active_ranges = [self.fixed_time_range]
@@ -1455,6 +1472,8 @@ class StockInstanceCloseChart(QWidget):
         if endpoint is None or not visible_plot.contains(endpoint):
             return None
         for bar_time, close in reversed(self.close_series):
+            if bar_time.date() != live_time.date():
+                return None
             startpoint = self.position_for(bar_time, close, target, scales=scales)
             if startpoint is None or not visible_plot.contains(startpoint):
                 continue
@@ -1517,6 +1536,11 @@ class StockInstanceCloseChart(QWidget):
             return []
         minimum_time, maximum_time = time_range
         time_span = (maximum_time - minimum_time).total_seconds()
+        if self.multi_day_timeline:
+            labels = [item[0] for item in self.visible_time_ranges]
+            labels.append(self.visible_time_ranges[-1][1])
+            return [(item, plot.left() + self._time_fraction(item) * plot.width())
+                    for item in labels]
         if self.fixed_time_range is not None:
             if self.nxt_available:
                 label_times = []
@@ -1576,8 +1600,23 @@ class StockInstanceCloseChart(QWidget):
             painter.drawText(
                 QRectF(x - 32, plot.bottom() + 7, 64, 18),
                 Qt.AlignHCenter | Qt.AlignTop,
-                bar_time.strftime("%H:%M"),
+                (bar_time.strftime("%m-%d") if self.multi_day_timeline
+                 and bar_time.hour == 8 else bar_time.strftime("%H:%M")),
             )
+
+    def _time_fraction(self, instant: datetime) -> float:
+        ranges = self.visible_time_ranges
+        if not self.multi_day_timeline:
+            bounds = self._time_range()
+            return ((instant - bounds[0]).total_seconds() /
+                    max((bounds[1] - bounds[0]).total_seconds(), 1)) if bounds else 0.5
+        total = sum((end - start).total_seconds() for start, end in ranges)
+        elapsed = 0.0
+        for start, end in ranges:
+            if instant <= end:
+                return (elapsed + max(0.0, (instant - start).total_seconds())) / total
+            elapsed += (end - start).total_seconds()
+        return 1.0
 
     def position_for(
         self,
@@ -1590,18 +1629,16 @@ class StockInstanceCloseChart(QWidget):
         """Return the exact chart coordinate used by both lines and markers."""
         if scales is None:
             scales = self._scale_values()
-        parsed_time = parse_market_datetime(bar_time)
+        parsed_time = _exact_chart_datetime(bar_time)
         parsed_close = _finite_number(close)
         if scales is None or parsed_time is None or parsed_close is None:
             return None
         minimum_time, maximum_time, low, high = scales
         target = plot or self._plot_rect()
         time_span = (maximum_time - minimum_time).total_seconds()
-        x_ratio = (
-            0.5
-            if time_span <= 0
-            else (parsed_time - minimum_time).total_seconds() / time_span
-        )
+        x_ratio = (self._time_fraction(parsed_time) if self.multi_day_timeline
+                   else 0.5 if time_span <= 0
+                   else (parsed_time - minimum_time).total_seconds() / time_span)
         y_ratio = (parsed_close - low) / max(high - low, 1e-12)
         return QPointF(
             target.left() + x_ratio * target.width(),
@@ -1771,6 +1808,21 @@ class StockInstanceCloseChart(QWidget):
 
         self._draw_plot_axes(painter, plot, axis_color)
         scales = self._scale_values()
+        if self.multi_day_timeline:
+            painter.setPen(QPen(grid_color, 1, Qt.DashLine))
+            for start, _end in self.visible_time_ranges[1:]:
+                x = plot.left() + self._time_fraction(start) * plot.width()
+                painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+        for key, color, label in (("start_at", QColor("#7C3AED"), "START"),
+                                  ("end_at", QColor("#B45309"), "END")):
+            instant = _exact_chart_datetime(self.operation_timeline.get(key))
+            if instant is None or self._session_index_for(instant) < 0:
+                continue
+            x = plot.left() + self._time_fraction(instant) * plot.width()
+            painter.setPen(QPen(color, 2, Qt.DashLine))
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+            painter.drawText(QRectF(x - 30, plot.top(), 60, 17),
+                             Qt.AlignHCenter | Qt.AlignTop, label)
         self._draw_x_axis_labels(painter, plot, text_color, time_range=scales[:2] if scales else None)
         painter.setFont(self.font())
         if scales is None:
@@ -2516,6 +2568,12 @@ class StockInstanceChartWindow(QDialog):
             self.operation_info_labels[key] = label
         operation_info.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.operation_info_panel = operation_info
+        self.timeline_label = QLabel("Operation timeline: not proven")
+        self.timeline_label.setObjectName("stockInstanceChartTimelineStatus")
+        self.timeline_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.timeline_label.setWordWrap(True)
+        self.timeline_label.setStyleSheet("color: #6B7280; font-size: 11px;")
+        operation_info_layout.addWidget(self.timeline_label)
         info_layout.addWidget(operation_info, 0, Qt.AlignTop)
         info_layout.addStretch(1)
 
@@ -2901,11 +2959,7 @@ class StockInstanceChartWindow(QDialog):
     @classmethod
     def _projection_has_renderable_candle(cls, data: dict[str, Any]) -> bool:
         trade_date = str(data.get("trade_date") or "").strip()
-        _start, _end, visible_ranges = cls._chart_display_time_range(
-            trade_date,
-            data.get("nxt_available") is True,
-            data.get("market_sessions"),
-        )
+        _start, _end, visible_ranges = cls._operation_display_time_range(data, trade_date)
         if not visible_ranges:
             return False
         candles = data.get("candles", [])
@@ -3061,6 +3115,26 @@ class StockInstanceChartWindow(QDialog):
             return None, None, []
         return visible_ranges[0][0], visible_ranges[-1][1], visible_ranges
 
+    @classmethod
+    def _operation_display_time_range(cls, data: dict[str, Any], trade_date: str):
+        timeline = data.get("operation_timeline")
+        timeline = timeline if isinstance(timeline, dict) else {}
+        days = timeline.get("trade_dates")
+        if timeline.get("status") != "NOT_PROVEN" and isinstance(days, list) and days:
+            ranges = []
+            for day in days:
+                try:
+                    parsed = date.fromisoformat(day)
+                except (TypeError, ValueError):
+                    continue
+                ranges.append((datetime.combine(parsed, time(8), SEOUL_TIMEZONE),
+                               datetime.combine(parsed, time(20), SEOUL_TIMEZONE)))
+            if ranges:
+                return ranges[0][0], ranges[-1][1], ranges
+        return cls._chart_display_time_range(
+            trade_date, data.get("nxt_available") is True, data.get("market_sessions"),
+        )
+
     def _apply_projection(self, data: dict[str, Any]) -> None:
         selected_marker_id = str(
             getattr(self.chart, "selected_actual_fill_marker_id", "") or ""
@@ -3113,10 +3187,24 @@ class StockInstanceChartWindow(QDialog):
         buy_markers = data.get("buy_signal_markers", [])
         sell_markers = data.get("sell_signal_markers", [])
         empty_message = self._empty_chart_message(data)
-        x_range_start, x_range_end, visible_time_ranges = self._chart_display_time_range(
-            projected_trade_date,
-            data.get("nxt_available") is True,
-            data.get("market_sessions"),
+        x_range_start, x_range_end, visible_time_ranges = self._operation_display_time_range(
+            data, projected_trade_date,
+        )
+        timeline = data.get("operation_timeline")
+        timeline = timeline if isinstance(timeline, dict) else {}
+        timeline_status = str(timeline.get("status") or "NOT_PROVEN")
+        start_text = str(timeline.get("start_at") or "")[5:19].replace("T", " ")
+        end_text = str(timeline.get("end_at") or "")[5:19].replace("T", " ")
+        self.timeline_label.setText({
+            "ENDED": f"Operation {start_text} → {end_text}",
+            "ONGOING": f"Operation {start_text} → ongoing",
+            "END_UNKNOWN": f"Operation {start_text} → end unverified",
+        }.get(timeline_status, "Operation timeline: not proven"))
+        if len(timeline.get("trade_dates") or ()) > 1:
+            self.timeline_label.setText(self.timeline_label.text() + " · event/source dates only")
+        self.timeline_label.setToolTip(
+            f"{timeline.get('start_at') or ''} → {timeline.get('end_at') or timeline_status}"
+            if timeline_status != "NOT_PROVEN" else ""
         )
         self.chart.set_projection(
             candles,
@@ -3135,6 +3223,7 @@ class StockInstanceChartWindow(QDialog):
                 if data.get("average_price_visible") is True
                 else None
             ),
+            operation_timeline=timeline,
         )
         self.process_rail.set_processes(data.get("execution_process_rails", []))
         marker_by_id = {
@@ -3227,6 +3316,7 @@ class StockInstanceChartWindow(QDialog):
             self._update_operation_button_state()
             return
         self.last_projection = {}
+        self.timeline_label.setText("Operation timeline: not proven")
         for label in self.info_labels.values():
             label.setText("-")
         self.info_labels["stock"].setText(self.stock_code or "-")

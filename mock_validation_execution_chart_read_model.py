@@ -62,7 +62,8 @@ def project_mock_execution_chart(document, routine_instance_id, trade_date):
     operation = document.get("mock_operation_lifecycle", {}).get("instance_operations", {}).get(routine_instance_id, {})
     started = _timestamp(operation.get("started_at"))
     ended = _timestamp(operation.get("ended_at"))
-    if operation and (operation.get("trading_date") != trade_date or started is None):
+    if operation and (started is None or trade_date < started.date().isoformat()
+                      or (ended is not None and trade_date > ended.date().isoformat())):
         diagnostics.append({"reason": "MOCK_CHART_OPERATION_SCOPE_UNAVAILABLE"})
         return result
 
