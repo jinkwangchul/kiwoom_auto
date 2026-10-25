@@ -65,6 +65,11 @@ from pnl_ui_refresh import (
     project_current_stock_pnl,
     project_current_stock_pnl_snapshot,
 )
+from quick_chart_native_history import (
+    apply_native_history_projection,
+    native_history_request_count,
+    validate_native_history_receipt,
+)
 from state_policy import actual_exchange_session_ranges
 from gui_window_policy import (
     configure_persistent_feature_window,
@@ -1962,10 +1967,15 @@ class StockInstanceChartWindow(QDialog):
         )
         self.stock_code = str(stock_code or "").strip()
         self.trade_date = str(trade_date or _today_trade_date()).strip()
+        self._native_history_api = None
+        self._native_history: dict[str, Any] | None = None
+        self._native_history_attempt: tuple[Any, ...] | None = None
         if projection_provider is not None:
             self._projection_provider = projection_provider
         else:
             candle_provider = _production_candle_provider(parent)
+            self._native_history_api = getattr(getattr(candle_provider, "__self__", None),
+                                               "kiwoom_api", None)
             if candle_provider is None:
                 self._projection_provider = project_stock_instance_day
             else:
@@ -2397,6 +2407,7 @@ class StockInstanceChartWindow(QDialog):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._chart_closed = True
+        self._native_history = None
         header_timer = self._operation_header_refresh_timer
         if header_timer is not None:
             header_timer.stop()
@@ -3213,6 +3224,10 @@ class StockInstanceChartWindow(QDialog):
                 )
             elif len(timeline.get("trade_dates") or ()) > 1:
                 self.timeline_label.setText(self.timeline_label.text() + " · event/source dates only")
+            if timeline.get("native_history_incomplete") is True:
+                self.timeline_label.setText(
+                    self.timeline_label.text() + " · earlier native SOR bars still unavailable"
+                )
         self.timeline_label.setToolTip(
             f"{timeline.get('start_at') or ''} → {timeline.get('end_at') or timeline_status}"
             if timeline_status in {"ONGOING", "ENDED", "END_UNKNOWN"} else ""
@@ -3369,7 +3384,7 @@ class StockInstanceChartWindow(QDialog):
         return str(latest.get("bar_time") or "").strip() if isinstance(latest, dict) else ""
 
     def refresh_projection(self, *, preserve_pnl_if_same_bar: bool = False) -> None:
-        """Re-read only the projection; it never requests or writes candles."""
+        """Re-read the projection and asynchronously fill chart-only native history."""
         self._bar_committed_refresh_pending = False
         try:
             projected = self._projection_provider(self.stock_code, self.trade_date)
@@ -3379,9 +3394,19 @@ class StockInstanceChartWindow(QDialog):
         if not isinstance(projected, dict):
             self._apply_projection_error()
             return
+        session = self._native_chart_session()
+        history = self._native_history
+        if history is not None and session == (
+            history.get("connection_epoch"), history.get("login_session_id")
+        ):
+            projected = apply_native_history_projection(
+                projected, history, now=datetime.now(SEOUL_TIMEZONE))
+        elif history is not None:
+            self._native_history = None
         refresh_status = self._projection_refresh_status(projected)
         if refresh_status != CHART_PROJECTION_VALID:
             self._apply_unavailable_projection(projected, refresh_status)
+            self._maybe_request_native_history(projected, session)
             return
         if (
             preserve_pnl_if_same_bar
@@ -3408,6 +3433,84 @@ class StockInstanceChartWindow(QDialog):
                 if key in self.last_projection:
                     projected[key] = self.last_projection[key]
         self._apply_projection(projected)
+        self._maybe_request_native_history(projected, session)
+
+    def _native_chart_session(self) -> tuple[int, str] | None:
+        getter = getattr(self._native_history_api, "broker_session_snapshot", None)
+        try:
+            snapshot = getter() if callable(getter) else None
+            epoch = getattr(snapshot, "connection_epoch", None)
+            login = getattr(snapshot, "login_session_id", None)
+            if (getattr(snapshot, "connected", None) is True
+                    and type(epoch) is int and epoch > 0
+                    and isinstance(login, str) and login):
+                return epoch, login
+        except Exception:
+            pass
+        return None
+
+    def _maybe_request_native_history(
+        self, data: dict[str, Any], session: tuple[int, str] | None,
+    ) -> None:
+        timeline = data.get("operation_timeline")
+        timeline = timeline if isinstance(timeline, dict) else {}
+        interval = data.get("bar_minutes")
+        start_at = timeline.get("start_at")
+        end_at = timeline.get("end_at") or ""
+        request = getattr(self._native_history_api,
+                          "request_minute_candles_display_only_integrated", None)
+        if (self._chart_closed or session is None or not callable(request)
+                or timeline.get("status") not in {"ONGOING", "ENDED", "END_UNKNOWN"}
+                or data.get("nxt_available") is not True
+                or not str(data.get("instance_id") or "").strip()
+                or type(interval) is not int or not isinstance(start_at, str)
+                or data.get("stock_code") != self.stock_code):
+            return
+        count = native_history_request_count(start_at, datetime.now(SEOUL_TIMEZONE), interval)
+        if not count:
+            return
+        key = (self.stock_code, data["instance_id"], interval,
+               start_at, end_at, session)
+        if key == self._native_history_attempt:
+            return
+        self._native_history_attempt = key
+        started = None
+        completed = False
+        buffered: list[dict[str, Any]] = []
+        window_ref = weakref.ref(self)
+        stock_code = self.stock_code
+
+        def received(response: dict[str, Any]) -> None:
+            nonlocal completed
+            if started is None:
+                buffered.append(response)
+                return
+            if completed:
+                return
+            completed = True
+            window = window_ref()
+            if window is None or window._chart_closed or window._native_history_attempt != key:
+                return
+            current = window._native_chart_session()
+            if current is None:
+                return
+            history = validate_native_history_receipt(
+                started, response, session, current, stock_code,
+                interval, start_at, end_at or None, requested_count=count)
+            if history is not None:
+                window._native_history = history
+                window.refresh_projection()
+
+        try:
+            started = request(
+                self.stock_code, str(data.get("stock_name") or ""),
+                interval=interval, count=count, callback=received,
+                nxt_available=True,
+            )
+        except Exception:
+            return
+        for response in buffered:
+            received(response)
 
 
 def open_stock_instance_chart(
