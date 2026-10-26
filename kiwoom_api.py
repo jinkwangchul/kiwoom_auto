@@ -1019,6 +1019,12 @@ class KiwoomApi(QObject):
                     stock_codes=codes,
                     raw_registration_result=raw_result,
                 )
+                if raw_result not in (None, 0, "0"):
+                    raise RuntimeError(f"SetRealReg failed: {raw_result}")
+            if (session.connection_epoch, session.login_session_id) != (
+                self._connection_epoch, self._login_session_id
+            ) or not self._connected:
+                raise RuntimeError("NXT display broker session changed")
         except Exception as exc:
             self._clear_realtime_shadow_batches(registered, remove_from_broker=True)
             self._nxt_display_registration = self._empty_nxt_display_snapshot(

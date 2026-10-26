@@ -1,0 +1,92 @@
+--- a/gui_indicator_follow_signal_validation_v5_flow.py
++++ b/gui_indicator_follow_signal_validation_v5_flow.py
+@@ -509,6 +509,24 @@
+         return False
+ 
+ 
++def _v5_native_forming_receipt_is_fresh(stock, receipt, forming, broker, now) -> bool:
++    """A native partial survives minute rollover, but only briefly within its own bar."""
++    try:
++        started, response = receipt
++        received = datetime.fromisoformat(response["received_at"])
++        end = datetime.fromisoformat(forming["native_bar_end"])
++        return (
++            isinstance(forming, dict)
++            and forming.get("is_complete") is False
++            and forming == response.get("native_forming_candle")
++            and received <= now < end
++            and timedelta(0) <= now - received < timedelta(minutes=1)
++            and _v5_native_receipt_is_current(stock, started, response, broker, now)
++        )
++    except (AttributeError, KeyError, TypeError, ValueError):
++        return False
++
++
+ def _v5_native_snapshot_parts(candles, plan, source, interval, requested, timeframe_key=None):
+     """Freeze completion at request time; retain one native partial separately."""
+     completed, forming = [], None
+@@ -1387,7 +1405,12 @@
+         stock = getattr(window, "stock", None)
+         code = stock.code if isinstance(stock, ValidationStockRef) else None
+         try:
+-            result = setter(key, code)
++            run_request = self._last_run_requests.get(key)
++            timeframe = (validation_timeframe_from_rules(
++                run_request.settings_snapshot.to_dict()).get("minutes")
++                if isinstance(run_request, IndicatorFollowSignalValidationRunRequest)
++                else None)
++            result = setter(key, code, timeframe_minutes=timeframe or 0) if code else setter(key, None)
+         except (AttributeError, RuntimeError, TypeError, ValueError):
+             if code:
+                 self._v5_lease_hosts[key] = market
+@@ -1397,7 +1420,6 @@
+             self._v5_lease_hosts[key] = market
+         if isinstance(result, dict) and result.get("ok") is True and code:
+             self._bind_sor_m1_observations()
+-            self._request_offsession_sor_m1_once(window, market, code)
+         elif code:
+             self._note_sor_m1_skip(key, code, "LEASE_REJECTED")
+         else:
+@@ -4374,14 +4396,8 @@
+             if pool.get("native_forming_included") is True:
+                 forming = pool.get("native_forming_candle")
+                 now = self._now_factory()
+-                requested = datetime.fromisoformat(receipt[0]["request_as_of"])
+-                if (not isinstance(forming, dict)
+-                        or forming != receipt[1].get("native_forming_candle")
+-                        or forming.get("is_complete") is not False
+-                        or now.replace(second=0, microsecond=0) != requested.replace(second=0, microsecond=0)
+-                        or now >= datetime.fromisoformat(forming["native_bar_end"])
+-                        or not _v5_native_receipt_is_current(session.request.stock, *receipt,
+-                                                            self._broker, now)):
++                if not _v5_native_forming_receipt_is_fresh(
++                        session.request.stock, receipt, forming, self._broker, now):
+                     raise ValueError("NATIVE_FORMING_RECEIPT_EXPIRED")
+ 
+     @staticmethod
+@@ -4472,13 +4488,8 @@
+             now = self._now_factory()
+             fresh = False
+             if isinstance(forming, dict) and forming.get("is_complete") is False:
+-                requested = datetime.fromisoformat(native_receipt[0]["request_as_of"])
+-                fresh = (
+-                    now.replace(second=0, microsecond=0) == requested.replace(second=0, microsecond=0)
+-                    and now < datetime.fromisoformat(forming["native_bar_end"])
+-                    and _v5_native_receipt_is_current(session.request.stock, *native_receipt,
+-                                                      self._broker, now)
+-                )
++                fresh = _v5_native_forming_receipt_is_fresh(
++                    session.request.stock, native_receipt, forming, self._broker, now)
+             # The completed pool never receives this row, even after its deadline.
+             if fresh:
+                 normalized_raw.append(dict(forming))
+@@ -9312,8 +9323,7 @@
+                 self._validation_frozen_krx_codes.discard(stock.code)
+             first_source_verification = self._validation_source_by_code.get(stock.code) is not eligibility
+             self._validation_source_by_code[stock.code] = eligibility
+-            if first_source_verification:
+-                self._sync_v5_observation_lease(window)
++            self._sync_v5_observation_lease(window)
+             snapshot_rules = snapshot.to_dict()
+             target_timeframe_minutes = snapshot_rules["bar"]["bar_minutes"]
+             warmup_bars = required_validation_history_context_bars(snapshot_rules)

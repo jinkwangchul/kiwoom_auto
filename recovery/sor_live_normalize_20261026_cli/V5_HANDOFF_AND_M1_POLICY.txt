@@ -1,0 +1,43 @@
+V5 integration boundary (2026-10-26)
+
+Implemented only in candidate/gui_indicator_follow_signal_validation_v5_flow.py:
+- A native selected-timeframe forming receipt remains admissible across a minute
+  boundary while its own bar is open, its source/session/identity still match,
+  and the receipt is less than 60 seconds old. The 08:01:57.874777 M3 request
+  received at 08:02:06.867711 is admitted until 08:03, subject to freshness.
+- The V5 lease supplies the selected minute interval (or zero for a period
+  chart), and the off-session SOR M1 prefetch call is removed. Original V5 and
+  its existing tests remain untouched.
+
+Pending WinApp-owned integration, not claimed live:
+- Preserve the current WinApp V5 history-preservation edits as the base. Apply
+  the candidate's small freshness and lease hunks to that base only after a
+  byte-level review; do not copy this candidate file over the original.
+- Consume NATIVE_SELECTED_FORMING_ACCEPTED and NATIVE_SELECTED_COMPLETED_ACCEPTED
+  through the common host after checking the current broker identity, chart
+  lease generation, stock, selected interval, frozen source plan, and request
+  identity. The native completed rows are a separate direct-broker delta; the
+  forming row stays separate and expires at its native bar end or 60-second
+  freshness limit. Do not promote it from ticks or M1.
+- At 08:50/09:00, retain verified NX PRE history and fetch direct AL selected
+  history for the regular session once. Switch the live pool to AL under the
+  frozen source plan; do not re-evaluate NXT capability. Keep NX PRE rows as
+  preserved historical/display evidence and AL rows as AL calculation evidence.
+  Reject callbacks from old source/generation. Apply the analogous frozen-plan
+  source changes at 15:20/15:30/15:40. Do not reload 5000 rows per minute.
+- Original V5 still has _validation_nxt_pre_codes and its old M1/AL-only event
+  acceptance path, so an existing 08h chart is not yet normalized live at 09h.
+  The common receiver does not assert otherwise.
+
+Proposed exact replacement for the older full-day SOR M1 policy clause:
+"V5 must request the broker's direct bars for the selected timeframe. M1 may be
+requested only when the selected timeframe is M1 or when M1 is demonstrably
+needed for the current forming target bar; in the latter case request only that
+current-bar window. Never prefetch 700/701 full-day M1 rows for an upper
+timeframe, reconstruct completed upper bars from M1 or ticks, or prefetch a
+prior-day M1 session off-session. Explicit historical M1 charts and legitimate
+display-only M1 consumers retain their own independent requirements."
+
+Compatibility limit: common host keeps legacy 700 M1 behavior for callers that
+omit timeframe_minutes. The original V5 still omits it until WinApp applies
+the candidate caller change. No canonical document was edited.

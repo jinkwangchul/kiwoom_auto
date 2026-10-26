@@ -1,0 +1,422 @@
+"""Offline regressions for the common native observation boundary."""
+
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
+import pytest
+
+from candle_timeframe_aggregation import SEOUL_TIMEZONE
+from gui_market_data_host import MarketDataHost
+from kiwoom_realtime_fids import NXT_REALTIME_EXECUTION_TYPE
+from tests.test_display_only_integrated_history import _opt10080_row
+from tests.test_kiwoom_realtime_registration import _api
+from stock_market_source_plan import _build
+
+
+def test_nx_registration_failed_return_rolls_back_without_active_snapshot():
+    api = _api()
+    original = api._control.dynamicCall
+
+    def failed(signature, *args):
+        if signature.startswith("SetRealReg"):
+            api._control.calls.append((signature, args))
+            return -1
+        return original(signature, *args)
+
+    api._control.dynamicCall = failed
+    result = api.sync_nxt_display_registration(("005930",))
+    assert result["ok"] is False
+    assert result["active"] is False
+    assert api.nxt_display_registration_snapshot().active is False
+    assert any(call[0].startswith("SetRealRemove") for call in api._control.calls)
+
+
+def test_explicit_v5_m3_lease_does_not_require_full_day_m1():
+    host = SimpleNamespace(
+        _v5_observation_leases={}, _v5_observation_timeframes={},
+        _sor_standby_m1_required_by_stock={}, _sor_observation_m1_required_by_stock={},
+        _sor_m1_required_by_stock={}, _sor_forming_m1_by_stock={},
+        _v5_al_native_minutes={}, _v5_al_parity={}, _v5_watch_generation=0,
+        _v5_native_last_attempt={},
+        _al_realtime_target_codes=lambda: ("005930",),
+        _v5_watch_inflight=False, _production_monitoring_stock_codes=(),
+        kiwoom_api=SimpleNamespace(sync_v5_al_realtime_targets=lambda _: {"ok": True}),
+        sync_monitoring_targets=lambda _: {"ok": True},
+    )
+    with patch.object(MarketDataHost, "_schedule_v5_observation_watch"):
+        MarketDataHost.set_v5_observation_lease(
+            host, "chart", "005930", timeframe_minutes=3,
+        )
+    assert host._v5_observation_timeframes["chart"] == 3
+    assert "005930" not in host._sor_m1_required_by_stock
+
+
+def test_explicit_period_lease_does_not_start_minute_history_bootstrap():
+    host = SimpleNamespace(
+        _v5_observation_leases={}, _v5_observation_timeframes={},
+        _sor_standby_m1_required_by_stock={}, _sor_observation_m1_required_by_stock={},
+        _sor_m1_required_by_stock={}, _sor_forming_m1_by_stock={},
+        _v5_al_native_minutes={}, _v5_al_parity={}, _v5_native_last_attempt={},
+        _v5_watch_generation=0, _v5_watch_inflight=False, _production_monitoring_stock_codes=(),
+        _al_realtime_target_codes=lambda: ("005930",),
+        kiwoom_api=SimpleNamespace(sync_v5_al_realtime_targets=lambda _: {"ok": True}),
+        sync_monitoring_targets=lambda _: {"ok": True},
+    )
+    with patch.object(MarketDataHost, "_schedule_v5_observation_watch"):
+        result = MarketDataHost.set_v5_observation_lease(
+            host, "period", "005930", timeframe_minutes=0)
+    assert result["ok"] is True
+    assert host._sor_m1_required_by_stock == {}
+
+
+def test_timeframe_change_rearms_periodic_watch_and_removed_lease_stays_stopped():
+    scheduled = []
+    host = SimpleNamespace(
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _sor_standby_m1_required_by_stock={}, _sor_observation_m1_required_by_stock={},
+        _sor_m1_required_by_stock={}, _sor_forming_m1_by_stock={},
+        _v5_al_native_minutes={}, _v5_al_parity={}, _v5_native_last_attempt={},
+        _v5_watch_generation=7, _v5_watch_inflight=False, _shutting_down=False,
+        _production_monitoring_stock_codes=(), _al_realtime_target_codes=lambda: ("005930",),
+        kiwoom_api=SimpleNamespace(sync_v5_al_realtime_targets=lambda _: {"ok": True}),
+        sync_monitoring_targets=lambda _: {"ok": True},
+    )
+    with patch("gui_market_data_host.QTimer.singleShot",
+               side_effect=lambda delay, callback: scheduled.append((delay, callback))), \
+            patch.object(MarketDataHost, "_refresh_v5_observation"):
+        MarketDataHost.set_v5_observation_lease(host, "chart", "005930", timeframe_minutes=5)
+        assert host._v5_watch_generation == 8
+        periodic = [(delay, callback) for delay, callback in scheduled if delay > 0]
+        assert len(periodic) == 1
+        periodic[0][1]()
+        assert len([delay for delay, _ in scheduled if delay > 0]) == 2
+        MarketDataHost.set_v5_observation_lease(host, "chart", None)
+        count = len(scheduled)
+        scheduled[-1][1]()
+        assert len(scheduled) == count
+
+
+def test_native_selected_snapshot_is_bounded_and_rejects_completed_or_wrong_source():
+    install = getattr(MarketDataHost, "install_native_observation_candle", None)
+    assert callable(install)
+    at = datetime(2026, 10, 26, 8, 2, 6, tzinfo=SEOUL_TIMEZONE)
+    row = _opt10080_row("20261026080000", 101)
+    plan = {"sessions": [{"name": "NXT_PRE", "source": "NXT",
+             "market_data_identity": "005930_NX", "start_time": "08:00:00",
+             "end_time": "08:50:00"}], "trading_date": "2026-10-26"}
+    host = SimpleNamespace(
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _native_observation_forming_by_stock={},
+        _realtime_shadow_session_identity=(7, "offline"),
+        kiwoom_api=SimpleNamespace(broker_session_snapshot=lambda: SimpleNamespace(
+            connected=True, connection_epoch=7, login_session_id="offline")),
+        market_data_observed=SimpleNamespace(emit=lambda event: events.append(event)),
+    )
+    events = []
+    with patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan):
+        accepted = install(host, "005930", 3, [row], source="NXT",
+                           request_as_of=at - timedelta(seconds=9),
+                           received_at=at, identity=(7, "offline"), request_id="r1", now=at)
+        duplicate = install(host, "005930", 3, [row], source="NXT",
+                            request_as_of=at - timedelta(seconds=9),
+                            received_at=at, identity=(7, "offline"), request_id="r1", now=at)
+        late = install(host, "005930", 3, [row], source="NXT",
+                       request_as_of=at.replace(second=55),
+                       received_at=at.replace(minute=3, second=1), identity=(7, "offline"),
+                       request_id="r2", now=at.replace(minute=3, second=1))
+        wrong = install(host, "005930", 3, [row], source="INTEGRATED",
+                        request_as_of=at - timedelta(seconds=9),
+                        received_at=at, identity=(7, "offline"), request_id="r3", now=at)
+    assert accepted["ok"] is True, accepted
+    assert accepted["request_count"] <= 3
+    assert duplicate["ok"] is False
+    assert late["ok"] is False
+    assert wrong["ok"] is False
+    assert len(events) == 1
+    assert events[0]["source"] == "NATIVE_SELECTED_FORMING_ACCEPTED"
+    assert events[0]["timeframe_minutes"] == 3
+    assert events[0]["market_data_identity"] == "005930_NX"
+    assert events[0]["forming_candle"]["close"] == 102
+
+
+def test_native_receipt_order_and_age_do_not_replace_newer_forming_bar():
+    at = datetime(2026, 10, 26, 8, 2, 12, tzinfo=SEOUL_TIMEZONE)
+    plan = {"sessions": [{"name": "NXT_PRE", "source": "NXT",
+             "market_data_identity": "005930_NX", "start_time": "08:00:00",
+             "end_time": "08:50:00"}], "trading_date": "2026-10-26"}
+    events = []
+    session = [SimpleNamespace(connected=True, connection_epoch=7, login_session_id="offline")]
+    host = SimpleNamespace(
+        _v5_observation_leases={"chart": "005930", "long": "005930"},
+        _v5_observation_timeframes={"chart": 3, "long": 240},
+        _native_observation_forming_by_stock={},
+        kiwoom_api=SimpleNamespace(broker_session_snapshot=lambda: session[0]),
+        market_data_observed=SimpleNamespace(emit=events.append),
+    )
+    def install(interval, price, requested, received, request_id, now=at):
+        return MarketDataHost.install_native_observation_candle(
+            host, "005930", interval, [_opt10080_row("20261026080000", price)],
+            source="NXT", request_as_of=requested, received_at=received,
+            identity=(7, "offline"), request_id=request_id, now=now,
+        )
+    with patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan):
+        newer = install(3, 102, at.replace(second=0), at.replace(second=10), "new")
+        older = install(3, 100, at.replace(minute=1, second=57),
+                        at.replace(second=6), "old")
+        duplicate = install(3, 102, at.replace(second=0), at.replace(second=10), "new")
+        stale = install(240, 102, at.replace(minute=1, second=0),
+                        at.replace(minute=1, second=1), "stale",
+                        now=at.replace(minute=25))
+        session[0] = SimpleNamespace(connected=True, connection_epoch=8,
+                                     login_session_id="other")
+        changed = install(3, 105, at.replace(second=1), at.replace(second=11), "changed")
+        malformed = MarketDataHost.install_native_observation_candle(
+            host, "005930", 3, [], source="NXT", request_as_of="bad",
+            received_at=at, identity=(7, "offline"), request_id="bad", now=at,
+        )
+    assert newer["ok"] is True
+    assert all(item["ok"] is False for item in (older, duplicate, stale, changed, malformed))
+    assert host._native_observation_forming_by_stock[("005930", 3)]["candle"]["close"] == 103
+    assert len(events) == 1
+
+
+def test_native_response_keeps_direct_completed_separate_without_promoting_old_forming():
+    at = datetime(2026, 10, 26, 8, 3, 6, tzinfo=SEOUL_TIMEZONE)
+    plan = _build("005930", "Samsung", at.date(), at.isoformat(), True)
+    events = []
+    host = SimpleNamespace(
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _native_observation_forming_by_stock={},
+        _native_observation_completed_by_stock={},
+        kiwoom_api=SimpleNamespace(broker_session_snapshot=lambda: SimpleNamespace(
+            connected=True, connection_epoch=7, login_session_id="offline")),
+        market_data_observed=SimpleNamespace(emit=events.append),
+    )
+    with patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan):
+        first = MarketDataHost.install_native_observation_candle(
+            host, "005930", 3, [_opt10080_row("20261026080000", 100),
+                                   _opt10080_row("20261026080300", 103)],
+            source="NXT", request_as_of=at.replace(second=1), received_at=at,
+            identity=(7, "offline"), request_id="r1", now=at)
+        assert first["ok"] is True
+        assert [row["time"] for row in events[-1]["completed_candles"]] == ["20261026080000"]
+        assert events[-1]["forming_candle"]["time"] == "20261026080300"
+        later = at.replace(minute=6, second=4)
+        second = MarketDataHost.install_native_observation_candle(
+            host, "005930", 3, [_opt10080_row("20261026080600", 106)],
+            source="NXT", request_as_of=later.replace(second=1), received_at=later,
+            identity=(7, "offline"), request_id="r2", now=later)
+    assert second["ok"] is True
+    assert [row["time"] for row in host._native_observation_completed_by_stock[("005930", 3, "NXT")]["candles"]] == ["20261026080000"]
+    assert events[-1]["completed_candles"] == []
+
+
+def test_native_completed_delta_keeps_nx_and_al_histories_separate():
+    plan = _build("005930", "Samsung", datetime(2026, 10, 26).date(),
+                  "2026-10-26T08:00:00+09:00", True)
+    host = SimpleNamespace(
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _native_observation_forming_by_stock={},
+        _native_observation_completed_by_stock={},
+        kiwoom_api=SimpleNamespace(broker_session_snapshot=lambda: SimpleNamespace(
+            connected=True, connection_epoch=7, login_session_id="offline")),
+        market_data_observed=SimpleNamespace(emit=lambda event: None),
+    )
+    with patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan):
+        for source, hour, prefix in (("NXT", 8, "08"), ("INTEGRATED", 9, "09")):
+            at = datetime(2026, 10, 26, hour, 3, 6, tzinfo=SEOUL_TIMEZONE)
+            result = MarketDataHost.install_native_observation_candle(
+                host, "005930", 3,
+                [_opt10080_row(f"20261026{prefix}0000", 100),
+                 _opt10080_row(f"20261026{prefix}0300", 103)],
+                source=source, request_as_of=at.replace(second=1),
+                received_at=at, identity=(7, "offline"),
+                request_id=f"{source}-1", now=at)
+            assert result["ok"] is True, result
+    caches = host._native_observation_completed_by_stock
+    assert [row["time"] for row in caches[("005930", 3, "NXT")]["candles"]] == ["20261026080000"]
+    assert [row["time"] for row in caches[("005930", 3, "INTEGRATED")]["candles"]] == ["20261026090000"]
+
+
+def test_accepted_nx_tick_schedules_only_one_native_refresh():
+    scheduled = []
+    at = datetime(2026, 10, 26, 8, 2, 6, tzinfo=SEOUL_TIMEZONE)
+    host = SimpleNamespace(
+        _realtime_shadow_session_identity=(7, "offline"),
+        _nxt_display_live_price_states={},
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _v5_native_tick_refresh_scheduled=False,
+        _display_observation_target_stock_codes=lambda: ("005930",),
+        _observe_realtime_boundary=lambda *a, **k: None,
+    )
+    tick = {"canonical_stock_code": "005930", "broker_code_identity": "005930_NX",
+            "market_source": "NXT", "source_real_type": NXT_REALTIME_EXECUTION_TYPE,
+            "connection_epoch": 7, "login_session_id": "offline",
+            "market_datetime": at.isoformat(), "current_price": 101,
+            "receive_sequence": 1, "execution_time_raw": "080206",
+            "received_at": at.isoformat()}
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at
+    plan = {"sessions": [{"name": "NXT_PRE", "source": "NXT",
+             "market_data_identity": "005930_NX", "start_time": "08:00:00",
+             "end_time": "08:50:00"}], "trading_date": "2026-10-26"}
+    with patch("gui_market_data_host.datetime", Clock), \
+            patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan), \
+            patch("gui_market_data_host.QTimer.singleShot",
+                  side_effect=lambda _delay, callback: scheduled.append(callback)):
+        assert MarketDataHost._process_nxt_display_tick(host, tick) is True
+        assert MarketDataHost._process_nxt_display_tick(host,
+               dict(tick, receive_sequence=2)) is True
+    assert len(scheduled) == 1
+
+
+@pytest.mark.parametrize("hour,minute,expected", [
+    (8, 49, "NXT"), (8, 50, None), (9, 0, "INTEGRATED"),
+    (9, 5, "INTEGRATED"), (15, 20, "INTEGRATED"),
+    (15, 30, "INTEGRATED"), (15, 40, "INTEGRATED"),
+])
+def test_selected_m3_watch_uses_frozen_native_session_source(hour, minute, expected):
+    at = datetime(2026, 10, 26, hour, minute, 10, tzinfo=SEOUL_TIMEZONE)
+    plan = _build("005930", "Samsung", at.date(), at.isoformat(), True)
+    calls = []
+    def request(source):
+        def start(code, name, **kwargs):
+            calls.append((source, code, kwargs["interval"], kwargs["count"]))
+            return {"ok": True}
+        return start
+    api = SimpleNamespace(
+        sync_v5_al_realtime_targets=lambda _: {"ok": True},
+        request_minute_candles_display_only_nxt=request("NXT"),
+        request_minute_candles_display_only_integrated=request("INTEGRATED"),
+    )
+    host = SimpleNamespace(
+        _v5_watch_inflight=False, _v5_watch_generation=1,
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _v5_native_last_attempt={}, _shutting_down=False,
+        _current_display_session_identity=lambda: (7, "offline"),
+        _al_realtime_target_codes=lambda: ("005930",),
+        kiwoom_api=api,
+    )
+    with patch.object(MarketDataHost, "_nxt_eligible_targets", return_value=("005930",)), \
+            patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan):
+        MarketDataHost._refresh_v5_observation(host, now=at)
+    assert calls == ([] if expected is None else [(expected, "005930", 3, 3)])
+
+
+def test_native_callback_binds_started_request_and_finishes_once_with_timeout():
+    at = datetime(2026, 10, 26, 8, 2, 12, tzinfo=SEOUL_TIMEZONE)
+    plan = _build("005930", "Samsung", at.date(), at.isoformat(), True)
+    timers, callbacks, installed = [], [], []
+    started = dict(ok=True, code="005930", interval=3, rqname="native-1",
+                   request_as_of=at.replace(second=0).isoformat(),
+                   market_data_identity="005930_NX", market_source="NXT",
+                   display_only=True, connection_epoch=7, login_session_id="offline")
+    def request(code, name, **kwargs):
+        callbacks.append(kwargs["callback"])
+        assert kwargs["count"] == 3 and kwargs["interval"] == 3
+        return dict(started)
+    api = SimpleNamespace(sync_v5_al_realtime_targets=lambda _: {"ok": True},
+                          request_minute_candles_display_only_nxt=request)
+    host = SimpleNamespace(
+        _v5_watch_inflight=False, _v5_watch_generation=1,
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3}, _v5_native_last_attempt={},
+        _shutting_down=False, _current_display_session_identity=lambda: (7, "offline"),
+        _al_realtime_target_codes=lambda: ("005930",), kiwoom_api=api,
+    )
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at
+    terminal = dict(started, request_id="native-1", received_at=at.isoformat(),
+                    rows=[_opt10080_row("20261026080000", 100)])
+    with patch.object(MarketDataHost, "_nxt_eligible_targets", return_value=("005930",)), \
+            patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan), \
+            patch("gui_market_data_host.datetime", Clock), \
+            patch("gui_market_data_host.QTimer.singleShot",
+                  side_effect=lambda delay, cb: timers.append((delay, cb))), \
+            patch.object(MarketDataHost, "install_native_observation_candle",
+                         side_effect=lambda *a, **k: installed.append(k) or {"ok": True}):
+        MarketDataHost._refresh_v5_observation(host, now=at)
+        callbacks[0](dict(terminal, request_id="wrong"))
+        assert installed == []
+        callbacks[0](terminal)
+        callbacks[0](terminal)
+        assert len(installed) == 1
+        assert installed[0]["request_id"] == "native-1"
+        assert host._v5_watch_inflight is False
+        assert any(delay == 15000 for delay, _ in timers)
+        host._v5_watch_generation += 1
+        callbacks[0](terminal)
+        assert len(installed) == 1
+
+
+def test_native_watch_timeout_unblocks_missing_callback():
+    at = datetime(2026, 10, 26, 8, 2, 12, tzinfo=SEOUL_TIMEZONE)
+    timers = []
+    api = SimpleNamespace(sync_v5_al_realtime_targets=lambda _: {"ok": True},
+        request_minute_candles_display_only_nxt=lambda code, name, **kwargs: {
+            "ok": True, "rqname": "pending", "request_as_of": at.isoformat()})
+    host = SimpleNamespace(_v5_watch_inflight=False, _v5_watch_generation=1,
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3}, _v5_native_last_attempt={},
+        _shutting_down=False, _current_display_session_identity=lambda: (7, "offline"),
+        _al_realtime_target_codes=lambda: ("005930",), kiwoom_api=api)
+    plan = _build("005930", "Samsung", at.date(), at.isoformat(), True)
+    with patch.object(MarketDataHost, "_nxt_eligible_targets", return_value=("005930",)), \
+            patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan), \
+            patch("gui_market_data_host.QTimer.singleShot",
+                  side_effect=lambda delay, cb: timers.append((delay, cb))):
+        MarketDataHost._refresh_v5_observation(host, now=at)
+        assert host._v5_watch_inflight is True
+        timeout = next(cb for delay, cb in timers if delay == 15000)
+        timeout()
+        assert host._v5_watch_inflight is False
+
+
+def test_delayed_next_request_reselects_source_at_dispatch():
+    before = datetime(2026, 10, 26, 8, 49, 10, tzinfo=SEOUL_TIMEZONE)
+    clock = [before]
+    timers, calls, callbacks = [], [], []
+    def request(source):
+        def start(code, name, **kwargs):
+            calls.append((source, code, kwargs["interval"], kwargs["count"]))
+            callbacks.append(kwargs["callback"])
+            return {"ok": True, "rqname": f"{code}-1",
+                    "request_as_of": clock[0].isoformat()}
+        return start
+    api = SimpleNamespace(sync_v5_al_realtime_targets=lambda _: {"ok": True},
+        request_minute_candles_display_only_nxt=request("NXT"),
+        request_minute_candles_display_only_integrated=request("INTEGRATED"))
+    host = SimpleNamespace(_v5_watch_inflight=False, _v5_watch_generation=1,
+        _v5_observation_leases={"a": "005930", "b": "006400"},
+        _v5_observation_timeframes={"a": 3, "b": 3}, _v5_native_last_attempt={},
+        _shutting_down=False, _current_display_session_identity=lambda: (7, "offline"),
+        _al_realtime_target_codes=lambda: ("005930", "006400"), kiwoom_api=api)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+    with patch.object(MarketDataHost, "_nxt_eligible_targets",
+                      return_value=("005930", "006400")), \
+            patch("gui_market_data_host.read_stock_market_source_plan",
+                  side_effect=lambda root, code, day: _build(code, "Name", day,
+                                                               before.isoformat(), True)), \
+            patch("gui_market_data_host.datetime", Clock), \
+            patch("gui_market_data_host.QTimer.singleShot",
+                  side_effect=lambda delay, cb: timers.append((delay, cb))):
+        MarketDataHost._refresh_v5_observation(host, now=before)
+        assert calls == [("NXT", "005930", 3, 3)]
+        callbacks[0](None)
+        clock[0] = before.replace(hour=9, minute=0)
+        next_request = next(cb for delay, cb in timers if delay == 1100)
+        next_request()
+    assert calls[-1] == ("INTEGRATED", "006400", 3, 3)

@@ -41,7 +41,7 @@ from gui_stock_data import (
     stock_nxt_availability,
 )
 from stock_market_source_plan import (
-    read_stock_market_source_plan, source_for_time,
+    native_bar_end, read_stock_market_source_plan, source_for_time,
     split_native_closing_price_candles,
 )
 from kiwoom_market_data_authority import (
@@ -381,6 +381,12 @@ class MarketDataHost(QObject):
         self._execution_shadow_stock_codes: tuple[str, ...] = ()
         self._candle_observation_stock_codes: tuple[str, ...] = ()
         self._v5_observation_leases: dict[object, str] = {}
+        self._v5_observation_timeframes: dict[object, int] = {}
+        self._native_observation_forming_by_stock: dict[tuple[str, int], dict[str, object]] = {}
+        self._native_observation_completed_by_stock: dict[tuple[str, int], dict[str, object]] = {}
+        self._native_observation_last_receipt_by_stock: dict[tuple[str, int], dict[str, object]] = {}
+        self._v5_native_last_attempt: dict[tuple[str, int, str], datetime] = {}
+        self._v5_native_tick_refresh_scheduled = False
         self._mini_chart_observation_leases: dict[object, str] = {}
         self._sor_display_live_price_states: dict[str, SorDisplayLivePriceState] = {}
         self._v5_al_native_minutes: dict[str, dict[str, object]] = {}
@@ -1182,6 +1188,134 @@ class MarketDataHost(QObject):
             pass
         return None
 
+    def install_native_observation_candle(
+        self, stock_code: str, timeframe_minutes: int, rows: object, *,
+        source: str, request_as_of: datetime, received_at: datetime,
+        identity: tuple[int, str], request_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        """Admit only a broker-native current selected bar for a live chart lease."""
+        code = str(stock_code or "").strip()
+        interval = timeframe_minutes if type(timeframe_minutes) is int else 0
+        current = now if isinstance(now, datetime) else datetime.now(SEOUL_TIMEZONE)
+        if (interval <= 0 or interval > 240 or not isinstance(rows, list)
+                or source not in {"NXT", "INTEGRATED"}
+                or not isinstance(request_id, str) or not request_id.strip()
+                or identity != MarketDataHost._current_display_session_identity(self)
+                or not isinstance(request_as_of, datetime)
+                or not isinstance(received_at, datetime)
+                or request_as_of.tzinfo is None or received_at.tzinfo is None
+                or current.tzinfo is None
+                or not request_as_of <= received_at <= current
+                or received_at - request_as_of >= timedelta(minutes=1)
+                or current - received_at >= timedelta(minutes=1)
+                or not any(
+                    leased == code and _host_attr(self, "_v5_observation_timeframes", {}).get(key) == interval
+                    for key, leased in _host_attr(self, "_v5_observation_leases", {}).items()
+                )):
+            return {"ok": False, "reason_code": "NATIVE_OBSERVATION_EVIDENCE_INVALID"}
+        try:
+            plan = read_stock_market_source_plan(PROJECT_ROOT, code, request_as_of.date())
+            requested = source_for_time(plan, request_as_of) if plan else None
+            received = source_for_time(plan, received_at) if plan else None
+            active = source_for_time(plan, current) if plan else None
+        except (ValueError, TypeError, KeyError):
+            return {"ok": False, "reason_code": "NATIVE_OBSERVATION_PLAN_UNAVAILABLE"}
+        expected_source = "NXT" if source == "NXT" else "SOR"
+        expected_identity = f"{code}_{'NX' if source == 'NXT' else 'AL'}"
+        if (requested is None or received is None or active is None
+                or any(item["source"] != expected_source
+                       or item["market_data_identity"] != expected_identity
+                       or item["name"] != requested["name"]
+                       for item in (requested, received, active))):
+            return {"ok": False, "reason_code": "NATIVE_OBSERVATION_SOURCE_CHANGED"}
+        key = (code, interval)
+        last_receipts = _host_attr(self, "_native_observation_last_receipt_by_stock", None)
+        if not isinstance(last_receipts, dict):
+            last_receipts = {}
+            self._native_observation_last_receipt_by_stock = last_receipts
+        prior = last_receipts.get(key)
+        if isinstance(prior, dict) and prior.get("session_identity") == identity:
+            if (prior.get("request_id") == request_id
+                    or request_as_of <= prior["request_as_of"]
+                    or received_at <= prior["received_at"]):
+                return {"ok": False, "reason_code": "NATIVE_OBSERVATION_SUPERSEDED"}
+        forming = None
+        completed = []
+        for row in normalize_opt10080_rows(rows):
+            start = candle_market_datetime(row)
+            if start is None or start.date() != current.date():
+                continue
+            try:
+                end = native_bar_end(plan, start, interval)
+                row_source = source_for_time(plan, start)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if (end is None or row_source is None
+                    or row_source["source"] != expected_source
+                    or row_source["market_data_identity"] != expected_identity):
+                continue
+            values = tuple(row.get(field) for field in ("open", "high", "low", "close", "volume"))
+            if (any(type(value) not in (int, float) or not isfinite(value) for value in values)
+                    or values[2] <= 0 or values[4] < 0
+                    or not values[2] <= values[0] <= values[1]
+                    or not values[2] <= values[3] <= values[1]):
+                continue
+            candle = {field: row[field] for field in ("time", "open", "high", "low", "close", "volume")}
+            candle.update(is_complete=end <= request_as_of, native_bar_end=end.isoformat(),
+                          market_source=source, market_data_identity=expected_identity,
+                          snapshot_request_as_of=request_as_of.isoformat(),
+                          snapshot_received_at=received_at.isoformat())
+            if end <= request_as_of:
+                if source == "INTEGRATED" and interval == 1 and start.hour == 15 and start.minute == 35:
+                    try:
+                        _calculation, marked = split_native_closing_price_candles(
+                            [candle], timeframe_minutes=1,
+                            market_data_identity=expected_identity, market_source=source)
+                        candle = marked[0]
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                completed.append(candle)
+            elif start <= request_as_of <= received_at <= current < end:
+                forming = candle
+        if forming is None and not completed:
+            return {"ok": False, "reason_code": "NATIVE_OBSERVATION_NO_CURRENT_BAR"}
+        last_receipts[key] = {"session_identity": identity, "request_id": request_id,
+                              "request_as_of": request_as_of, "received_at": received_at}
+        forming_cache = _host_attr(self, "_native_observation_forming_by_stock", {})
+        if forming is not None:
+            forming_cache[key] = {"session_identity": identity, "candle": forming,
+                                  "request_id": request_id, "request_as_of": request_as_of,
+                                  "received_at": received_at}
+        elif key in forming_cache:
+            forming_cache.pop(key, None)
+        complete_cache = _host_attr(self, "_native_observation_completed_by_stock", None)
+        if not isinstance(complete_cache, dict):
+            complete_cache = {}
+            self._native_observation_completed_by_stock = complete_cache
+        complete_key = (code, interval, source)
+        previous = complete_cache.get(complete_key)
+        merged = ({row["time"]: row for row in previous["candles"]}
+                  if isinstance(previous, dict) and previous.get("session_identity") == identity
+                  else {})
+        merged.update({row["time"]: row for row in completed})
+        complete_cache[complete_key] = {"session_identity": identity,
+                                        "candles": tuple(merged[stamp] for stamp in sorted(merged)[-64:])}
+        try:
+            self.market_data_observed.emit({
+                "source": ("NATIVE_SELECTED_FORMING_ACCEPTED" if forming is not None
+                           else "NATIVE_SELECTED_COMPLETED_ACCEPTED"),
+                "stock_code": code, "timeframe_minutes": interval,
+                "market_data_identity": expected_identity,
+                "market_source": source, "forming_candle": dict(forming) if forming else None,
+                "completed_candles": [dict(row) for row in completed],
+                "request_id": request_id,
+            })
+        except Exception:
+            pass  # Optional observers cannot invalidate accepted native evidence.
+        return {"ok": True, "request_count": min(3, DEFAULT_CANDLES_MAX_COUNT),
+                "reason_code": "NATIVE_OBSERVATION_ACCEPTED"}
+
     def _arm_sor_diagnostic_idle_timer(self, now: datetime | None = None) -> None:
         timer = _host_attr(self, "_sor_diagnostic_idle_timer")
         if timer is None:
@@ -1628,10 +1762,11 @@ class MarketDataHost(QObject):
                 self._sor_m1_required_by_stock.get(code, 0), count
             )
         for code in v5_codes:
-            self._sor_m1_required_by_stock[code] = max(
-                self._sor_m1_required_by_stock.get(code, 0),
-                MarketDataHost._full_day_display_count(1),
-            )
+            count = MarketDataHost._v5_m1_requirement(self, code)
+            if count:
+                self._sor_m1_required_by_stock[code] = max(
+                    self._sor_m1_required_by_stock.get(code, 0), count,
+                )
         targets = tuple(
             sorted(
                 set(self._production_monitoring_stock_codes)
@@ -1859,20 +1994,38 @@ class MarketDataHost(QObject):
             "forming_minute": updated["bar_time"],
         })
 
-    def set_v5_observation_lease(self, window_key: object, stock_code: object) -> dict[str, object]:
+    def _v5_m1_requirement(self, code: str) -> int:
+        matches = [key for key, value in self._v5_observation_leases.items() if value == code]
+        explicit = _host_attr(self, "_v5_observation_timeframes", {})
+        if any(key not in explicit for key in matches):
+            return MarketDataHost._full_day_display_count(1)  # Legacy caller.
+        return 3 if any(explicit[key] == 1 for key in matches) else 0
+
+    def set_v5_observation_lease(
+        self, window_key: object, stock_code: object, *, timeframe_minutes: object = None,
+    ) -> dict[str, object]:
         """Watch one V5 window's stock through this host without replacing other consumers."""
         leases = self._v5_observation_leases
         code = str(stock_code or "").strip()
         if code and (not is_broker_action_stock_code(code)
                      or len(code) != 6 or not code.isascii() or not code.isdigit()):
             return {"ok": False, "changed": False, "reason_code": "V5_AL_CODE_INVALID"}
+        if timeframe_minutes is not None and (type(timeframe_minutes) is not int
+                or timeframe_minutes < 0 or timeframe_minutes > 240):
+            return {"ok": False, "changed": False, "reason_code": "V5_TIMEFRAME_INVALID"}
         previous_codes = set(leases.values())
+        previous_interval = self._v5_observation_timeframes.get(window_key)
         if code:
             leases[window_key] = code
+            if timeframe_minutes is not None:
+                self._v5_observation_timeframes[window_key] = timeframe_minutes
+            else:
+                self._v5_observation_timeframes.pop(window_key, None)
         else:
             leases.pop(window_key, None)
+            self._v5_observation_timeframes.pop(window_key, None)
         current_codes = set(leases.values())
-        if current_codes == previous_codes:
+        if current_codes == previous_codes and previous_interval == self._v5_observation_timeframes.get(window_key):
             sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
             if callable(sync_v5):
                 sync_v5(self._al_realtime_target_codes())
@@ -1880,12 +2033,13 @@ class MarketDataHost(QObject):
         standby = _host_attr(self, "_sor_standby_m1_required_by_stock", {})
         observation = _host_attr(self, "_sor_observation_m1_required_by_stock", {})
         self._sor_m1_required_by_stock = dict(standby)
-        for source in (observation, {item: MarketDataHost._full_day_display_count(1)
+        for source in (observation, {item: MarketDataHost._v5_m1_requirement(self, item)
                                      for item in current_codes}):
             for item, count in source.items():
-                self._sor_m1_required_by_stock[item] = max(
+                if count:
+                    self._sor_m1_required_by_stock[item] = max(
                     self._sor_m1_required_by_stock.get(item, 0), count
-                )
+                    )
         forming = _host_attr(self, "_sor_forming_m1_by_stock", None)
         if isinstance(forming, dict):
             for removed in previous_codes - current_codes - set(standby) - set(observation):
@@ -1893,6 +2047,20 @@ class MarketDataHost(QObject):
         for removed in previous_codes - current_codes:
             self._v5_al_native_minutes.pop(removed, None)
             self._v5_al_parity.pop(removed, None)
+            for cache_name in (
+                "_native_observation_forming_by_stock",
+                "_native_observation_completed_by_stock",
+                "_native_observation_last_receipt_by_stock",
+            ):
+                cache = _host_attr(self, cache_name, None)
+                if isinstance(cache, dict):
+                    for key in tuple(cache):
+                        if key[0] == removed:
+                            cache.pop(key, None)
+        self._v5_native_last_attempt = {
+            key: value for key, value in self._v5_native_last_attempt.items()
+            if key[0] in current_codes
+        }
         result = self.sync_monitoring_targets(self._production_monitoring_stock_codes)
         sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
         if callable(sync_v5):
@@ -1903,16 +2071,19 @@ class MarketDataHost(QObject):
             self._v5_watch_generation += 1
             self._v5_watch_inflight = False
         elif isinstance(result, dict) and result.get("ok") is True:
+            self._v5_watch_generation += 1
+            self._v5_watch_inflight = False
             if not previous_codes:
-                self._v5_watch_generation += 1
                 MarketDataHost._schedule_v5_observation_watch(self, immediate=True)
-            elif current_codes - previous_codes:
+            else:
+                MarketDataHost._schedule_v5_observation_watch(self)
                 QTimer.singleShot(0, lambda: MarketDataHost._refresh_v5_observation(self))
         return result
 
     def _al_realtime_target_codes(self) -> tuple[str, ...]:
         return MarketDataHost._nxt_eligible_targets(
-            set(_host_attr(self, "_v5_observation_leases", {}).values())
+            {code for key, code in _host_attr(self, "_v5_observation_leases", {}).items()
+             if _host_attr(self, "_v5_observation_timeframes", {}).get(key, 1) > 0}
             | set(_host_attr(self, "_mini_chart_observation_leases", {}).values())
         )
 
@@ -1946,7 +2117,9 @@ class MarketDataHost(QObject):
         return state
 
     def _schedule_v5_observation_watch(self, *, immediate: bool = False) -> None:
-        if not self._v5_observation_leases or self._shutting_down:
+        if (not self._v5_observation_leases or self._shutting_down
+                or not any(self._v5_observation_timeframes.get(key, 1) > 0
+                           for key in self._v5_observation_leases)):
             return
         now = datetime.now(SEOUL_TIMEZONE)
         next_at = now.replace(second=10, microsecond=0)
@@ -1968,68 +2141,182 @@ class MarketDataHost(QObject):
             return
         current = (now or datetime.now(SEOUL_TIMEZONE)).astimezone(SEOUL_TIMEZONE)
         if MarketDataHost._display_session_for_time(current) not in {
-                "NXT_PRE", "KRX", "KRX_CLOSING_AUCTION", "NXT_AFTER"}:
+                "NXT_PRE", "KRX", "KRX_CLOSING_AUCTION", "AL_TRANSITION", "NXT_AFTER"}:
             return
         identity = self._current_display_session_identity()
         if identity is None:
             return
-        codes = tuple(sorted(set(self._v5_observation_leases.values())))
-        codes = MarketDataHost._nxt_eligible_targets(codes)
+        codes = MarketDataHost._nxt_eligible_targets(
+            set(self._v5_observation_leases.values())
+        )
         sync_v5 = getattr(self.kiwoom_api, "sync_v5_al_realtime_targets", None)
         if callable(sync_v5):
             sync_v5(self._al_realtime_target_codes())  # Rearm all active leases.
         if not codes:
             return
-        minute_key = current.strftime("%Y-%m-%d %H:%M")
+        targets = tuple(sorted({
+            (code, self._v5_observation_timeframes[key], True)
+            for key, code in self._v5_observation_leases.items()
+            if code in codes and self._v5_observation_timeframes.get(key, 0) > 0
+        } | {
+            (code, 1, False)
+            for key, code in self._v5_observation_leases.items()
+            if code in codes and key not in self._v5_observation_timeframes
+        }))
+        if not targets:
+            return
         self._v5_watch_inflight = True
         generation = self._v5_watch_generation
 
         def request_next(index: int) -> None:
             if generation != self._v5_watch_generation:
                 return
-            if index >= len(codes):
+            if index >= len(targets):
                 self._v5_watch_inflight = False
                 return
             if (self._shutting_down or identity != self._current_display_session_identity()):
                 self._v5_watch_inflight = False
                 return
-            code = codes[index]
-            if code not in self._v5_observation_leases.values():
+            code, interval, explicit = targets[index]
+            if not any(value == code and
+                       (self._v5_observation_timeframes.get(key) == interval if explicit
+                        else key not in self._v5_observation_timeframes)
+                       for key, value in self._v5_observation_leases.items()):
                 request_next(index + 1)
+                return
+            dispatch_at = (current if now is not None and index == 0
+                           else datetime.now(SEOUL_TIMEZONE))
+            if MarketDataHost._display_session_for_time(dispatch_at) not in {
+                    "NXT_PRE", "KRX", "KRX_CLOSING_AUCTION", "AL_TRANSITION", "NXT_AFTER"}:
+                request_next(index + 1)
+                return
+            if not explicit:
+                try:
+                    specs = MarketDataHost.display_timeframe_refresh_specs(
+                        self, code, dispatch_at.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    selected = next((item for item in specs
+                                     if item.get("timeframe_minutes") == 1
+                                     and item.get("nxt_available") is True), None)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    selected = None
+                if selected is None:
+                    request_next(index + 1)
+                    return
+                from auto_candle_refresh import request_display_timeframe_candles_for_stock
+
+                def legacy_terminal(_result: object) -> None:
+                    if generation == self._v5_watch_generation:
+                        if index + 1 < len(targets):
+                            QTimer.singleShot(1100, lambda: request_next(index + 1))
+                        else:
+                            self._v5_watch_inflight = False
+
+                try:
+                    request_display_timeframe_candles_for_stock(
+                        window=self, code=code, name="",
+                        operation_cycle_minute_key=dispatch_at.strftime("%Y-%m-%d %H:%M"),
+                        timeframe_minutes=1, count=int(selected["request_count"]),
+                        nxt_available=True, on_terminal=legacy_terminal,
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    legacy_terminal(None)
                 return
             try:
-                specs = MarketDataHost.display_timeframe_refresh_specs(self, code, minute_key)
-                selected = next((spec for spec in specs
-                                 if spec.get("timeframe_minutes") == 1
-                                 and spec.get("nxt_available") is True), None)
+                plan = read_stock_market_source_plan(PROJECT_ROOT, code, dispatch_at.date())
+                selected = source_for_time(plan, dispatch_at) if plan else None
             except (AttributeError, RuntimeError, TypeError, ValueError):
-                self._v5_watch_inflight = False
-                return
-            if selected is None:
+                selected = None
+            if selected is None or selected["source"] not in {"NXT", "SOR"}:
                 request_next(index + 1)
                 return
-            from auto_candle_refresh import request_display_timeframe_candles_for_stock
+            source = "NXT" if selected["source"] == "NXT" else "INTEGRATED"
+            key = (code, interval, source)
+            last = self._v5_native_last_attempt.get(key)
+            if last is not None and timedelta(0) <= dispatch_at - last < timedelta(seconds=10):
+                request_next(index + 1)
+                return
+            self._v5_native_last_attempt[key] = dispatch_at
+            method = ("request_minute_candles_display_only_nxt" if source == "NXT"
+                      else "request_minute_candles_display_only_integrated")
+            request = getattr(self.kiwoom_api, method, None)
+
+            finished = False
+            started: dict[str, object] | None = None
+            early: list[object] = []
 
             def finish() -> None:
+                nonlocal finished
+                if finished:
+                    return
+                finished = True
                 if generation != self._v5_watch_generation:
                     return
-                if index + 1 < len(codes):
+                if index + 1 < len(targets):
                     QTimer.singleShot(1100, lambda: request_next(index + 1))
                 else:
                     self._v5_watch_inflight = False
 
             def terminal(result: object) -> None:
-                finish()
+                if finished:
+                    return
+                if started is None:
+                    early.append(result)
+                    return
+                if (generation != self._v5_watch_generation or self._shutting_down
+                        or identity != self._current_display_session_identity()
+                        or not isinstance(result, dict)):
+                    finish()
+                    return
+                if result.get("ok") is not True:
+                    finish()
+                    return
+                expected_identity = f"{code}_{'NX' if source == 'NXT' else 'AL'}"
+                request_name = started.get("rqname")
+                if (started.get("ok") is True and started.get("code") == code
+                        and started.get("market_source") == source
+                        and started.get("market_data_identity") == expected_identity
+                        and started.get("display_only") is True
+                        and (started.get("connection_epoch"), started.get("login_session_id")) == identity
+                        and isinstance(request_name, str) and bool(request_name)
+                        and isinstance(started.get("request_as_of"), str)
+                        and result.get("rqname") == request_name
+                        and result.get("request_id", request_name) == request_name
+                        and result.get("request_as_of") == started["request_as_of"]
+                        and result.get("code") == code
+                        and result.get("interval") == interval
+                        and result.get("market_source") == source
+                        and result.get("market_data_identity") == expected_identity
+                        and result.get("display_only") is True
+                        and (result.get("connection_epoch"), result.get("login_session_id")) == identity):
+                    try:
+                        MarketDataHost.install_native_observation_candle(
+                            self, code, interval, result.get("rows"), source=source,
+                            request_as_of=datetime.fromisoformat(result["request_as_of"]),
+                            received_at=datetime.fromisoformat(result["received_at"]),
+                            identity=identity, request_id=request_name,
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                    finish()
 
             try:
-                request_display_timeframe_candles_for_stock(
-                    window=self, code=code, name="",
-                    operation_cycle_minute_key=minute_key,
-                    timeframe_minutes=1, count=int(selected["request_count"]),
-                    nxt_available=True, on_terminal=terminal,
-                )
+                if not callable(request):
+                    finish()
+                    return
+                response = request(code, "", interval=interval, count=3,
+                                   nxt_available=True, callback=terminal)
+                started = dict(response) if isinstance(response, dict) else {}
+                if (started.get("ok") is not True or not isinstance(started.get("rqname"), str)
+                        or not started["rqname"] or not isinstance(started.get("request_as_of"), str)):
+                    finish()
+                    return
+                QTimer.singleShot(15000, finish)
+                for pending in early:
+                    terminal(pending)
+                early.clear()
             except (AttributeError, RuntimeError, TypeError, ValueError):
-                self._v5_watch_inflight = False
+                finish()
 
         request_next(0)
 
@@ -2145,10 +2432,11 @@ class MarketDataHost(QObject):
                 self._sor_m1_required_by_stock.get(code, 0), count
             )
         for code in v5_codes:
-            self._sor_m1_required_by_stock[code] = max(
-                self._sor_m1_required_by_stock.get(code, 0),
-                MarketDataHost._full_day_display_count(1),
-            )
+            count = MarketDataHost._v5_m1_requirement(self, code)
+            if count:
+                self._sor_m1_required_by_stock[code] = max(
+                    self._sor_m1_required_by_stock.get(code, 0), count,
+                )
         if _host_attr(self, "_sor_diagnostic_idle_timer") is not None:
             self._sor_diagnostic_idle_required = diagnostic_idle_requested
             MarketDataHost._arm_sor_diagnostic_idle_timer(self)
@@ -3773,8 +4061,14 @@ class MarketDataHost(QObject):
         self._automatic_candle_refresh_rerun_requested = False
         self._automatic_candle_refresh_rerun_minute_key = ""
         self._v5_watch_inflight = False
+        self._v5_watch_generation += 1
+        self._v5_native_tick_refresh_scheduled = False
         self._v5_al_native_minutes.clear()
         self._v5_al_parity.clear()
+        self._v5_native_last_attempt.clear()
+        self._native_observation_forming_by_stock.clear()
+        self._native_observation_completed_by_stock.clear()
+        self._native_observation_last_receipt_by_stock.clear()
         self._sor_display_live_price_states.clear()
         self._candle_bootstrap_completed = {}
         self._candle_refresh_round_robin_offset = 0
@@ -4153,6 +4447,30 @@ class MarketDataHost(QObject):
             receive_sequence=sequence,
             current_price=payload.get("current_price"),
         )
+        if (not _host_attr(self, "_v5_native_tick_refresh_scheduled", False)
+                and any(value == code and _host_attr(self, "_v5_observation_timeframes", {}).get(key, 0) > 0
+                        for key, value in _host_attr(self, "_v5_observation_leases", {}).items())):
+            now = datetime.now(SEOUL_TIMEZONE)
+            tick_at = parse_market_datetime(payload.get("market_datetime"))
+            try:
+                plan = read_stock_market_source_plan(PROJECT_ROOT, code, now.date())
+                selected = source_for_time(plan, now) if plan else None
+                tick_source = source_for_time(plan, tick_at) if plan and tick_at else None
+            except (ValueError, TypeError, KeyError):
+                selected = tick_source = None
+            if (tick_at is not None and timedelta(0) <= now - tick_at <= timedelta(seconds=30)
+                    and selected is not None and tick_source is not None
+                    and selected["source"] == tick_source["source"] == "NXT"
+                    and selected["name"] == tick_source["name"]):
+                self._v5_native_tick_refresh_scheduled = True
+                generation = _host_attr(self, "_v5_watch_generation", 0)
+
+                def refresh() -> None:
+                    self._v5_native_tick_refresh_scheduled = False
+                    if generation == _host_attr(self, "_v5_watch_generation", 0):
+                        MarketDataHost._refresh_v5_observation(self)
+
+                QTimer.singleShot(0, refresh)
         return True
 
     def _schedule_raw_realtime_tick_drain(self) -> None:

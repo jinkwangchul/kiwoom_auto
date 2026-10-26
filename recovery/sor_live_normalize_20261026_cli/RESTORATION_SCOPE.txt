@@ -1,0 +1,23 @@
+Recovery branch snapshot scope, 2026-10-26
+
+Preimage commit: byte-exact contents from preimage/ for these four root paths:
+gui_market_data_host.py, kiwoom_api.py, auto_candle_refresh.py,
+gui_indicator_follow_signal_validation_v5_flow.py. The latter is untracked in
+the active checkout and included solely to preserve its original bytes.
+
+Postimage commit: the same four root paths except that host and API contain
+the approved common repairs; auto_candle_refresh.py and original V5 remain
+byte-identical to preimage. Also includes the new focused common test and the
+recovery handoff files listed below. The V5 candidate lives only under
+recovery/sor_live_normalize_20261026_cli/candidate/.
+
+Committed handoff files: PLAN_AND_LEDGER.md, SHA256_MANIFEST.json,
+V5_HANDOFF_AND_M1_POLICY.txt, RESTORATION_SCOPE.txt,
+candidate/gui_indicator_follow_signal_validation_v5_flow.py,
+candidate/test_v5_candidate_20261026.py, patches/common_host.patch,
+patches/common_api.patch, patches/v5_candidate_only.patch,
+patches/new_common_tests.patch.
+
+No active branch, normal index, runtime/stock/config/order files, original V5,
+or existing tests are altered by creating this recovery branch. Exact original
+bytes remain in local preimage/ backups.
