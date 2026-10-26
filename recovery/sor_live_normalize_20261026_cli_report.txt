@@ -1,0 +1,101 @@
+SOR/NXT live candle normalization - CLI scoped delivery (2026-10-26)
+
+STATUS
+Common receiver repair is implemented in the original checkout. Original V5
+integration and real broker/GUI behavior remain pending. No GUI or broker live
+run was made; PID 22732 was not controlled. Original V5 and its tests were not
+modified. No runtime, stocks, accounts, orders, config, or canonical document
+were edited by this task.
+
+ORIGINAL COMMON FILES CHANGED
+- gui_market_data_host.py: explicit selected-timeframe V5 leases; bounded native
+  count=3 request at actual dispatch under the frozen source plan; NX/AL source
+  selection across 08:50, 09:00, 15:20, 15:30 and 15:40; coalesced valid NX tick
+  wake-up plus periodic watch rearm; 15-second missing-callback watchdog;
+  callback/request/session/generation binding. Direct broker completed deltas
+  and the current forming candle remain separate and source-specific. The
+  installer rejects stale, superseded, duplicate, wrong-session/source, and
+  expired native evidence. A receipt can cross a minute within its native bar,
+  subject to a 60-second freshness bound. Caches clear on lease removal/session
+  reset. No tick/M1 completion promotion or 5000-bar periodic reload.
+- kiwoom_api.py: failed SetRealReg return or changed broker session rolls back
+  the NXT display registration instead of publishing an active snapshot.
+- auto_candle_refresh.py: not changed; initial bytes preserved.
+- New test: tests/test_sor_live_normalize_common_20261026.py.
+
+ISOLATED V5 HANDOFF
+recovery/sor_live_normalize_20261026_cli/candidate/
+gui_indicator_follow_signal_validation_v5_flow.py contains only a candidate
+freshness and explicit-timeframe caller adaptation. It accepts the saved
+08:01:57.874777 request / 08:02:06.867711 receipt for the still-open 08:00 M3
+bar, while rejecting bar-end, stale M240 and login-switched evidence. It omits
+the off-session M1 prefetch. It must be merged by the WinApp owner against its
+current original V5 edits, never copied wholesale. The original V5 still
+keeps _validation_nxt_pre_codes and its AL/M1-only acceptance route: an 08h NX
+chart is not yet proved to refresh from AL at 09h. Exact integration steps and
+the proposed M1 contract replacement are in V5_HANDOFF_AND_M1_POLICY.txt.
+
+OFFLINE TEST EVIDENCE (bundled Python 3.11-32; no broker)
+- RED: focused common behavioral cases reproduced the independently reported
+  generation, receipt-order and long-period freshness failures before repair.
+  Candidate V5 RED run had 2 failing fixed-clock cases before its patch.
+- python -m pytest -q tests/test_sor_live_normalize_common_20261026.py
+  tests/test_v5_sor_al_native_watch.py tests/test_v5_sor_al_native_host.py
+  tests/test_phase5_nxt_native.py --disable-warnings --tb=short
+  Result: 67 passed in 14.11s, exit 0. Includes exact native request count=3,
+  timeout, duplicate callback, delayed source dispatch, receipt order/age,
+  M3 minute crossing, source-specific completed rows and tick coalescing.
+- python -m pytest -q tests/test_kiwoom_realtime_registration.py
+  -k 'nxt_registration or valid_ecn_execution or invalid_ecn_time'
+  --disable-warnings --tb=short
+  Result: 4 passed, 27 deselected, exit 0.
+- From candidate/ with PYTHONPATH=root and QT_QPA_PLATFORM=offscreen:
+  python -m pytest -q test_v5_candidate_20261026.py --disable-warnings
+  --tb=short
+  Result: 5 passed in 1.82s, exit 0.
+- Python compile(bytes, path, 'exec'): host, API, new common test, candidate
+  V5 and candidate test: 5 compiled, exit 0.
+- A broader adjacent run had 95 passed and 5 failed. The same five exact node
+  IDs failed against byte-exact preimage host/API in an isolated baseline
+  (5 failed in 5.15s), so these failures predate this repair:
+  RealtimeHandlerTests.test_realtime_boundary_diagnostic_preserves_existing_rejects;
+  RealtimeHandlerTests.test_realtime_boundary_diagnostic_retains_other_stock_evidence;
+  MarketDataHostSeparationTests.test_host_creation_adds_no_widget_api_or_polling_timer;
+  MarketDataHostSeparationTests.test_production_current_price_evidence_selects_krx_in_regular_window;
+  MarketDataHostSeparationTests.test_production_current_price_evidence_selects_nxt_after_hours.
+  No unrelated tests were edited to change their result.
+
+RESTORATION AND HASH GUARDS
+- Preimage byte copies, scoped patches, manifest and handoff live in
+  recovery/sor_live_normalize_20261026_cli/. Preimage hash -> current hash:
+  host 2D93328D92B9F8F651F1FE20F18285D9B0F572E88937A49EEEC2B5B2CD4EB7FB
+    -> 4C07902852E064DAF8A134471B4D8FE421CC6A06F9AAD1CE7F3C313C70C07093;
+  API 60EB9EB2C585254A1924C9EA8E423DD249ED7EC719226A15CB73589EE76B1495
+    -> 3715971A4349ADAFA93A2BF798770620ED1F50CA9427B5A13A16B9A5BBB3EDBF.
+  Original V5 remained B73ABA2DE8FA5A27BB64C00510E607E91E4916A2B9B2FDC7A0D523CDDD013001.
+  Candidate V5 is 9AB7FFA06C27972271A6A7A59D8FE83AD183929D9FDC559EE21E72BA3D001C00.
+- Scoped preimage commit 597b97b6c1c223f32277e05d7f58be4d8aabdd82
+  (parent 75296031aec709ef032e329db5c5af27a5d928e8) captures the four
+  original source bytes. Scoped postimage commit
+  e3cea911ab1811de92a70464f7c6a7deef61adb0 captures changed host/API,
+  unchanged auto-candle/V5, new test, candidate and handoff. Git show blobs
+  were compared byte for byte with both snapshots. Branch:
+  recovery/sor-live-normalize-20261026-cli-4c079028. Normal push succeeded;
+  git ls-remote verified e3cea911ab1811de92a70464f7c6a7deef61adb0.
+- Active branch remained feat/restore-auto-trade-setting-ui, HEAD remained
+  75296031aec709ef032e329db5c5af27a5d928e8, normal index SHA256 remained
+  6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924.
+  Unrelated dirty/untracked WIP was preserved. First sandboxed commit attempt
+  could not write .git objects; the approved elevated retry completed.
+
+LIMITS / MUST VERIFY
+- Original V5 does not yet pass timeframe_minutes; legacy no-timeframe callers
+  retain the 700 M1 requirement. This is compatibility behavior until WinApp
+  applies the isolated caller patch. Other legitimate M1 consumers were not
+  changed. No full-day M1 policy claim is made for original V5.
+- Original V5 does not yet consume the common native selected-bar notification
+  or perform the frozen NX PRE -> AL history/live handoff. Source transition and
+  display/calculation parity require WinApp integration and its own tests.
+- Real SetRealReg, raw NX tick arrival, native TR acceptance, no-fill intervals,
+  and 09h/after-hours behavior need later controlled live validation. Offline
+  tests do not establish a live receipt or an active chart outcome.

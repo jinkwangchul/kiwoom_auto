@@ -18,9 +18,9 @@ Plan:
 
 Ledger:
 - [x] Initial HEAD, branch, dirty-tree, and four SHA256 guards recorded.
-- [ ] Byte-exact preimages and current-source test snapshot created.
-- [ ] RED offline reproductions captured.
-- [ ] Common receiver fix GREEN and compiled; original V5 untouched.
-- [ ] Isolated V5 candidate and tests, with handoff patch.
-- [ ] Scoped pre/post recovery commits pushed and remote SHA verified.
-- [ ] Final evidence and limitations reported.
+- [x] Byte-exact preimages and current-source test snapshot created.
+- [x] RED offline reproductions captured for the common and isolated V5 breaks.
+- [x] Common receiver fix GREEN and compiled; original V5 untouched.
+- [x] Isolated V5 candidate and tests, with handoff patch.
+- [x] Scoped pre/post recovery commits pushed and remote SHA verified.
+- [x] Final evidence and limitations in `../sor_live_normalize_20261026_cli_report.txt`.
