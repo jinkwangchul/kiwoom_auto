@@ -1,6 +1,7 @@
 """Broker-native quickchart history stays separate from operation candle caches."""
 
 from datetime import datetime, timedelta, timezone
+from collections import OrderedDict
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,10 +16,13 @@ from quick_chart_native_history import (
     merge_native_history_increment,
     native_history_completed_slot,
     native_history_request_count,
+    native_history_source,
     validate_native_history_receipt,
+    waiting_display_start,
 )
 from stock_instance_day_projection import project_operation_timeline
 from gui_stock_instance_chart_window import StockInstanceChartWindow
+from gui_market_data_host import MarketDataHost
 from stock_market_source_plan import initialize_stock_market_source_plan
 
 
@@ -56,6 +60,14 @@ def test_native_request_budget_is_bounded_by_session_day_capacity():
     assert count == 5000
     assert native_history_request_count("2026-10-27T08:00:00+09:00",
                                         datetime(2026, 10, 27, 17, tzinfo=SEOUL), 1) == 721
+
+
+def test_after_market_source_stays_on_last_approved_session(tmp_path):
+    day = datetime(2026, 10, 27, 20, 5, tzinfo=SEOUL)
+    plan = initialize_stock_market_source_plan(
+        tmp_path, "005930", "Samsung", trading_day=day.date(),
+        decided_at=day, nxt_available=True)
+    assert native_history_source(plan, day) == plan["sessions"][-1]
 
 
 def test_native_receipt_adds_every_returned_direct_close_and_keeps_missing_dates():
@@ -212,6 +224,10 @@ def test_waiting_m3_window_displays_verified_day_without_operation_markers(tmp_p
 
     class Market:
         kiwoom_api = Api()
+        _quickchart_native_histories = OrderedDict()
+        _current_display_session_identity = MarketDataHost._current_display_session_identity
+        quickchart_native_history = MarketDataHost.quickchart_native_history
+        remember_quickchart_native_history = MarketDataHost.remember_quickchart_native_history
 
         def project_routine_candles(self, **_kwargs):
             raise AssertionError("test supplies projection")
@@ -239,9 +255,30 @@ def test_waiting_m3_window_displays_verified_day_without_operation_markers(tmp_p
             assert window.timeline_label.text() == "NEW OPERATION WAITING"
             assert window.last_projection["operation_timeline"]["start_at"] == ""
             assert window.chart.buy_series == window.chart.sell_series == []
+            assert len(market._quickchart_native_histories) == 1
             app.processEvents()
         finally:
             window.close()
+
+        reopened = StockInstanceChartWindow("005930", now.date().isoformat())
+        try:
+            assert [value for _, value in reopened.chart.close_series] == [101, 103]
+            assert reopened.chart.buy_series == reopened.chart.sell_series == []
+            assert market.kiwoom_api.count == 241
+            assert market.quickchart_native_history(
+                "005930", 1, "INTEGRATED", waiting_display_start(plan), "") is None
+            assert market.quickchart_native_history(
+                "000660", 3, "INTEGRATED", waiting_display_start(plan), "") is None
+            assert market.quickchart_native_history(
+                "005930", 3, "KRX", waiting_display_start(plan), "") is None
+            assert market.quickchart_native_history(
+                "005930", 3, "INTEGRATED", START, "") is None
+            market.kiwoom_api.broker_session_snapshot = lambda: SimpleNamespace(
+                connected=True, connection_epoch=8, login_session_id="session-8")
+            assert market.quickchart_native_history(
+                "005930", 3, "INTEGRATED", waiting_display_start(plan), "") is None
+        finally:
+            reopened.close()
 
 
 def test_waiting_m1_keeps_more_than_300_actual_native_closes(tmp_path):
@@ -360,6 +397,57 @@ def test_increment_requires_identical_native_overlap_and_preserves_history():
     changed = dict(newer)
     changed["candles"] = [{**newer["candles"][0], "close": 999}, newer["candles"][1]]
     assert merge_native_history_increment(old, changed) is None
+
+
+def test_host_keeps_verified_native_history_after_forty_incremental_receipts(tmp_path):
+    plan = initialize_stock_market_source_plan(
+        tmp_path, "005930", "Samsung", trading_day=datetime(2026, 10, 27).date(),
+        decided_at=datetime(2026, 10, 27, 9, tzinfo=SEOUL), nxt_available=True)
+
+    class Host:
+        _quickchart_native_histories = OrderedDict()
+        quickchart_native_history = MarketDataHost.quickchart_native_history
+        remember_quickchart_native_history = MarketDataHost.remember_quickchart_native_history
+
+        def _current_display_session_identity(self):
+            return self.session
+
+    host = Host()
+    host.session = (7, "session-7")
+    history = None
+    start = "2026-10-27T09:00:00+09:00"
+    for index in range(40):
+        rows = [_raw("2026-10-27", f"{9 + minute // 60:02d}{minute % 60:02d}00", 100 + minute)
+                for minute in range(max(0, index - 2), index + 1)]
+        started, response = _receipt(list(reversed(rows)))
+        as_of = datetime(2026, 10, 27, 9, index + 1, tzinfo=SEOUL).isoformat()
+        started["request_as_of"] = response["request_as_of"] = as_of
+        response["received_at"] = as_of
+        response["interval"] = 1
+        part = validate_native_history_receipt(
+            started, response, host.session, host.session, "005930", 1, start, None,
+            requested_count=5000, nxt_available=True, selected_source="INTEGRATED",
+            source_plan=plan)
+        assert part is not None
+        history = merge_native_history_increment(history, part) if history else part
+        assert history is not None
+        assert host.remember_quickchart_native_history(
+            history, started, response, 5000, True, plan)
+    assert len(host._quickchart_native_histories) == 1
+    assert len(next(iter(host._quickchart_native_histories.values()))["receipt"][1]["rows"]) == 3
+    assert host.quickchart_native_history("005930", 1, "INTEGRATED", start, "") == history
+
+    prior = host.quickchart_native_history("005930", 1, "INTEGRATED", start, "")
+    changed = dict(history)
+    changed["candles"] = [*history["candles"][:-1], {**history["candles"][-1], "close": 999}]
+    changed["source_content_sha256"] = canonical_candle_content_hash(changed["candles"])
+    assert not host.remember_quickchart_native_history(
+        changed, started, response, 5000, True, plan)
+    assert host.quickchart_native_history("005930", 1, "INTEGRATED", start, "") == prior
+    host.session = (8, "session-8")
+    assert not host.remember_quickchart_native_history(
+        history, started, response, 5000, True, plan)
+    assert host.quickchart_native_history("005930", 1, "INTEGRATED", start, "") is None
 
 
 def test_production_window_requests_native_m3_and_displays_uncached_closes(tmp_path):

@@ -1968,6 +1968,7 @@ class StockInstanceChartWindow(QDialog):
         self.stock_code = str(stock_code or "").strip()
         self.trade_date = str(trade_date or _today_trade_date()).strip()
         self._native_history_api = None
+        self._native_history_host = None
         self._native_history: dict[str, Any] | None = None
         self._native_histories: dict[str, dict[str, Any]] = {}
         self._native_history_attempt: tuple[Any, ...] | None = None
@@ -1975,8 +1976,11 @@ class StockInstanceChartWindow(QDialog):
             self._projection_provider = projection_provider
         else:
             candle_provider = _production_candle_provider(parent)
-            self._native_history_api = getattr(getattr(candle_provider, "__self__", None),
-                                               "kiwoom_api", None)
+            provider_host = getattr(candle_provider, "__self__", None)
+            if (callable(getattr(provider_host, "quickchart_native_history", None))
+                    and callable(getattr(provider_host, "remember_quickchart_native_history", None))):
+                self._native_history_host = provider_host
+            self._native_history_api = getattr(provider_host, "kiwoom_api", None)
             if candle_provider is None:
                 self._projection_provider = project_stock_instance_day
             else:
@@ -3438,6 +3442,23 @@ class StockInstanceChartWindow(QDialog):
         selected = native_history_source(projected.get("source_plan"), datetime.now(SEOUL_TIMEZONE))
         source = ({"SOR": "INTEGRATED"}.get(selected["source"], selected["source"])
                   if selected else "")
+        timeline = projected.get("operation_timeline")
+        plan = projected.get("source_plan")
+        if (session is not None and self._native_history_host is not None
+                and isinstance(timeline, dict) and isinstance(plan, dict)
+                and timeline.get("status") in {"WAITING", "ONGOING", "ENDED", "END_UNKNOWN"}
+                and type(projected.get("bar_minutes")) is int):
+            waiting = timeline["status"] == "WAITING"
+            start = waiting_display_start(plan) if waiting else timeline.get("start_at")
+            end = timeline.get("end_at") or ""
+            sources = ({"INTEGRATED" if item.get("source") == "SOR" else item.get("source")
+                        for item in plan.get("sessions", [])} if waiting else {source})
+            if isinstance(start, str) and start:
+                for candidate in sources & {"INTEGRATED", "NXT", "KRX"}:
+                    history = self._native_history_host.quickchart_native_history(
+                        self.stock_code, projected["bar_minutes"], candidate, start, end)
+                    if history is not None:
+                        self._native_histories[candidate] = history
         histories = list(self._native_histories.values()) if (
             projected.get("operation_timeline", {}).get("status") == "WAITING"
         ) else [self._native_histories.get(source)]
@@ -3554,6 +3575,14 @@ class StockInstanceChartWindow(QDialog):
         slot = native_history_completed_slot(plan, now, interval, source) if active else None
         if prior is not None and slot is None:
             return
+        if prior is not None and slot is not None:
+            try:
+                requested_at = datetime.fromisoformat(prior["request_as_of"])
+            except (KeyError, TypeError, ValueError):
+                requested_at = None
+            if (requested_at is not None and
+                    native_history_completed_slot(plan, requested_at, interval, source) == slot):
+                return
         count = 3 if prior is not None else native_history_request_count(start_at, now, interval)
         if not count:
             return
@@ -3592,6 +3621,10 @@ class StockInstanceChartWindow(QDialog):
                 if prior is not None:
                     history = merge_native_history_increment(prior, history)
                 if history is not None:
+                    if window._native_history_host is not None:
+                        window._native_history_host.remember_quickchart_native_history(
+                            history, started, response, count, eligibility,
+                            data.get("source_plan"))
                     window._native_histories[native_source] = history
                     window._native_history = history
                     window.refresh_projection()

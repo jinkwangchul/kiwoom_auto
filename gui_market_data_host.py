@@ -322,6 +322,7 @@ class MarketDataHost(QObject):
         super().__init__(owner)
         self._owner = owner
         self.kiwoom_api = kiwoom_api
+        self._quickchart_native_histories: OrderedDict[tuple, dict] = OrderedDict()
         self._execution_entry_provider = execution_entry_provider
         self._sor_m1_registration = ConfirmedSorM1Registration()
         self._shutting_down = False
@@ -890,25 +891,17 @@ class MarketDataHost(QObject):
     ) -> tuple[dict[str, int], ...]:
         code = str(stock_code or "").strip()
         now = parse_market_datetime(minute_key) or datetime.now(SEOUL_TIMEZONE)
+        try:
+            plan = read_stock_market_source_plan(PROJECT_ROOT, code, now.date())
+        except (OSError, TypeError, ValueError):
+            return ()
+        if (not isinstance(plan, dict) or plan.get("stock_code") != code
+                or plan.get("trading_date") != now.date().isoformat()
+                or type(plan.get("nxt_available")) is not bool
+                or plan["nxt_available"] is not False):
+            return ()
         specs: list[dict[str, int]] = []
         requirements = MarketDataHost.direct_timeframe_requirements(self, code)
-        sor_standby = _host_attr(self, "_sor_standby_m1_required_by_stock", {})
-        if code in sor_standby:
-            standby = _host_attr(
-                self, "_candle_standby_timeframe_requirements_by_stock", {}
-            ).get(code, {})
-            for interval in standby:
-                other = max(
-                    _host_attr(self, attribute, {}).get(code, {}).get(interval, 0)
-                    for attribute in (
-                        "_candle_execution_timeframe_requirements_by_stock",
-                        "_candle_observation_timeframe_requirements_by_stock",
-                    )
-                )
-                if other:
-                    requirements[interval] = other
-                else:
-                    requirements.pop(interval, None)
         for interval, required_count in sorted(
             requirements.items()
         ):
@@ -1125,15 +1118,21 @@ class MarketDataHost(QObject):
         minute_key: object,
     ) -> tuple[dict[str, int], ...]:
         code = str(stock_code or "").strip()
-        if code not in MarketDataHost._nxt_eligible_targets((code,)):
-            return ()
         now = parse_market_datetime(minute_key) or datetime.now(SEOUL_TIMEZONE)
         try:
             plan = read_stock_market_source_plan(PROJECT_ROOT, code, now.date())
-        except ValueError:
+        except (OSError, TypeError, ValueError):
             return ()
-        active = source_for_time(plan, now) if plan is not None else None
-        if plan is None or (active is not None and active["source"] != "SOR"):
+        if (not isinstance(plan, dict) or plan.get("stock_code") != code
+                or plan.get("trading_date") != now.date().isoformat()
+                or type(plan.get("nxt_available")) is not bool
+                or plan["nxt_available"] is not True):
+            return ()
+        try:
+            active = source_for_time(plan, now)
+        except (KeyError, TypeError, ValueError):
+            return ()
+        if active is not None and active.get("source") != "SOR":
             return ()
         specs: list[dict[str, int]] = []
         for interval, required_count in sorted(
@@ -1200,6 +1199,78 @@ class MarketDataHost(QObject):
         except Exception:
             pass
         return None
+
+    def quickchart_native_history(self, code, interval, source, start, end):
+        """Return verified history only while its latest receipt and login agree."""
+        from quick_chart_native_history import validate_native_history_receipt
+
+        session = self._current_display_session_identity()
+        cache = _host_attr(self, "_quickchart_native_histories", None)
+        if session is None or not isinstance(cache, OrderedDict):
+            return None
+        key = (code, interval, source, session, start, end)
+        record = cache.get(key)
+        if record is None:
+            return None
+        started, response, count, eligibility, plan = record["receipt"]
+        part = validate_native_history_receipt(
+            started, response, session, session, code, interval, start,
+            end or None, requested_count=count, nxt_available=eligibility,
+            selected_source=source, source_plan=plan)
+        history = record["history"]
+        tail = {row["bar_time"]: row for row in history["candles"]}
+        if (part is None or not part["candles"]
+                or not 1 <= len(history["candles"]) <= 5000
+                or history["source_content_sha256"] != canonical_candle_content_hash(history["candles"])
+                or any(tail.get(row["bar_time"]) != row for row in part["candles"])
+                or any(history.get(field) != part.get(field) for field in (
+                    "stock_code", "timeframe_minutes", "market_data_identity",
+                    "market_source", "operation_start", "operation_end",
+                    "connection_epoch", "login_session_id", "request_id", "received_at",
+                    "request_as_of"))):
+            cache.pop(key, None)
+            return None
+        cache.move_to_end(key)
+        return deepcopy(history)
+
+    def remember_quickchart_native_history(
+        self, history, started, response, count, eligibility, plan,
+    ) -> bool:
+        from quick_chart_native_history import (merge_native_history_increment,
+                                                validate_native_history_receipt)
+
+        if not isinstance(history, dict):
+            return False
+        key = (history.get("stock_code"), history.get("timeframe_minutes"),
+               history.get("market_source"),
+               (history.get("connection_epoch"), history.get("login_session_id")),
+               history.get("operation_start"), history.get("operation_end"))
+        if (key[3] != self._current_display_session_identity()
+                or key[2] not in {"INTEGRATED", "NXT", "KRX"}
+                or not isinstance(history.get("candles"), list)
+                or not 1 <= len(history["candles"]) <= 5000
+                or history.get("source_content_sha256") != canonical_candle_content_hash(history["candles"])):
+            return False
+        part = validate_native_history_receipt(
+            started, response, key[3], key[3], *key[:2], key[4], key[5] or None,
+            requested_count=count, nxt_available=eligibility,
+            selected_source=key[2], source_plan=plan)
+        if part is None or not part["candles"]:
+            return False
+        cache = self._quickchart_native_histories
+        previous = cache.get(key)
+        if previous and self.quickchart_native_history(*key[:3], *key[4:]) is None:
+            return False
+        merged = merge_native_history_increment(previous["history"], part) if previous else part
+        if (merged is None or merged != history or len(merged["candles"]) > 5000
+                or (previous and len(previous["history"]["candles"]) >= 5000)):
+            return False
+        cache[key] = {"history": deepcopy(merged), "receipt": (
+            deepcopy(started), deepcopy(response), count, eligibility, deepcopy(plan))}
+        cache.move_to_end(key)
+        while len(cache) > 8:
+            cache.popitem(last=False)
+        return True
 
     def install_native_observation_candle(
         self, stock_code: str, timeframe_minutes: int, rows: object, *,
@@ -4536,6 +4607,9 @@ class MarketDataHost(QObject):
         return self.clear()
 
     def _clear_session_state(self) -> None:
+        quickchart_histories = _host_attr(self, "_quickchart_native_histories", None)
+        if isinstance(quickchart_histories, dict):
+            quickchart_histories.clear()
         timer = _host_attr(self, "_sor_diagnostic_idle_timer")
         if timer is not None:
             timer.stop()

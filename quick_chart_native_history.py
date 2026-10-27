@@ -267,6 +267,7 @@ def validate_native_history_receipt(
             "operation_start": start.isoformat(), "operation_end": end.isoformat() if end else "",
             "connection_epoch": request_session[0], "login_session_id": request_session[1],
             "request_id": rqname, "received_at": received.isoformat(),
+            "request_as_of": requested.isoformat(),
             "oldest_returned": oldest.isoformat() if oldest else "", "has_more": has_more,
             "request_limit_reached": (type(requested_count) is int and
                                       requested_count > 0 and len(rows) >= requested_count),
