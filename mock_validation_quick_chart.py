@@ -17,7 +17,7 @@ from gui_auto_trade_display import (
     auto_trade_setting_status_color,
 )
 from gui_stock_instance_chart_window import StockInstanceChartWindow
-from mock_validation_contract import SESSION_ENDED, clean_text, payload_hash
+from mock_validation_contract import clean_text, payload_hash
 from mock_validation_execution_chart_read_model import project_mock_execution_chart
 from mock_validation_repository import MockValidationRepository
 from mock_validation_ui_projection import mock_instance_projection
@@ -25,7 +25,9 @@ from stock_instance_day_projection import (
     chart_candle_projection_request,
     chart_market_session_projection,
     chart_operation_method_badge_label,
+    project_operation_timeline,
 )
+from candle_timeframe_aggregation import candle_market_datetime
 
 
 _OPEN_MOCK_INSTANCE_CHARTS: dict[
@@ -82,7 +84,6 @@ def _target_document(window: Any, target: Any, *, read_cache=None) -> dict[str, 
         != clean_text(getattr(target, "validation_session_id", ""))
         or session.get("stock_code") != clean_text(getattr(target, "stock_code", ""))
         or not isinstance(execution, dict)
-        or execution.get("state") == SESSION_ENDED
     ):
         return None
     return document
@@ -143,6 +144,8 @@ def _chart_candles(rows: Any) -> list[dict[str, Any]]:
                 "low": row.get("low", close),
                 "close": close,
                 "volume": row.get("volume", 0),
+                **({"display_only_special": row["display_only_special"]}
+                   if row.get("display_only_special") else {}),
             }
         )
     return result
@@ -213,6 +216,7 @@ def _signal_markers(
     instance_id: str,
     rules: dict[str, Any],
     trade_date: str,
+    trade_dates: set[str] | None = None,
     events: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     operation_identity = _current_operation_identity(document, instance_id)
@@ -236,7 +240,7 @@ def _signal_markers(
             or clean_text(payload.get("operation_identity")) != operation_identity
             or clean_text(payload.get("rules_hash")) != rules_hash
             or not bar_time
-            or clean_text(payload.get("signal_trade_date")) != trade_date
+            or clean_text(payload.get("signal_trade_date")) not in (trade_dates or {trade_date})
             or payload.get("signal_bar_close") in (None, "")
         ):
             continue
@@ -259,6 +263,34 @@ def _signal_markers(
     for key in sorted(unique, key=lambda item: (item[1], item[0])):
         (buy_markers if key[0] == "BUY" else sell_markers).append(unique[key])
     return buy_markers, sell_markers
+
+
+def _mock_operation_timeline(document: dict[str, Any], instance_id: str,
+                             events: Any, now: datetime,
+                             source_dates: set[str]) -> dict[str, Any]:
+    operation = _current_operation(document, instance_id)
+    identity = clean_text(operation.get("operation_session_id"))
+    matching = [event for event in events if isinstance(event, dict)
+                and clean_text(event.get("routine_instance_id")) == instance_id
+                and clean_text(event.get("stock_code")) == clean_text(document["session"].get("stock_code"))
+                and isinstance(event.get("payload"), dict)
+                and (event["payload"].get("instance_operation") is True
+                     or clean_text(event["payload"].get("operation_session_id")) == identity)] if isinstance(events, list) and identity else []
+    started = any(event.get("event_type") == "OPERATION_STARTED"
+                  and event.get("timestamp") == operation.get("started_at")
+                  for event in matching)
+    ended = any(event.get("timestamp") == operation.get("ended_at")
+                and (event.get("event_type") in {"OPERATION_DONE", "OPERATION_CARRYOVER_DONE"}
+                     or (event.get("event_type") == "CLOSE_RESIDUAL_DETECTED"
+                         and clean_text(event["payload"].get("operation_session_id")) == identity))
+                for event in matching)
+    state = clean_text(operation.get("state"))
+    return project_operation_timeline(
+        operation.get("started_at") if started else None,
+        operation.get("ended_at") if state in {"ENDED", "REVIEW_STOPPED"} and ended else None,
+        now=now, source_dates=source_dates,
+        active=state in {"RUNNING", "CLOSING"},
+    )
 
 
 def _projection(window: Any, target: Any, stock_code: str, trade_date: str, *, read_cache=None) -> dict[str, Any]:
@@ -290,7 +322,8 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str, *, r
             routine_projection_request
         ),
     )
-    candles = _chart_candles(candle_supply.get("candles"))
+    candles = _chart_candles(candle_supply.get("display_candles",
+                                               candle_supply.get("candles")))
     session_id = document["session"]["validation_session_id"]
     if read_cache is not None and isinstance(host.repository, MockValidationRepository):
         events = _read_chart_source(
@@ -300,11 +333,27 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str, *, r
         )
     else:
         events = host.repository.read_events(session_id)
+    source_dates = {
+        bar_time.date().isoformat() for item in candles
+        if (bar_time := candle_market_datetime(item)) is not None
+    }
+    operation_timeline = _mock_operation_timeline(
+        document, instance_id, events, now, source_dates,
+    )
+    timeline_dates = (
+        set(operation_timeline["trade_dates"])
+        if operation_timeline["status"] != "NOT_PROVEN" else {trade_date}
+    )
+    if operation_timeline["status"] != "NOT_PROVEN":
+        candles = [item for item in candles
+                   if (bar_time := candle_market_datetime(item)) is not None
+                   and bar_time.date().isoformat() in timeline_dates]
     buy_markers, sell_markers = _signal_markers(
         document,
         instance_id=instance_id,
         rules=rules,
         trade_date=trade_date,
+        trade_dates=timeline_dates,
         events=events,
     )
     position = next(
@@ -334,7 +383,12 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str, *, r
         host.project_root,
     )
     bar_minutes = _bar_minutes(document, instance_id, rules)
-    execution_chart = project_mock_execution_chart(document, instance_id, trade_date)
+    execution_charts = [project_mock_execution_chart(document, instance_id, day)
+                        for day in sorted(timeline_dates)]
+    execution_chart = {
+        key: [item for result in execution_charts for item in result.get(key, [])]
+        for key in ("actual_fill_markers", "execution_process_rails", "diagnostics")
+    }
     return {
         "stock_code": stock_code,
         "stock_name": document["session"].get("stock_name", ""),
@@ -342,6 +396,7 @@ def _projection(window: Any, target: Any, stock_code: str, trade_date: str, *, r
         "instance_id": instance_id,
         "instance_name": clean_text(instance.get("routine_instance_name")) or instance_id,
         "operation_session_id": clean_text(operation.get("operation_session_id")),
+        "operation_timeline": operation_timeline,
         "rules_hash": payload_hash(rules),
         "bar_minutes": bar_minutes,
         "operation_title_display": "Mock Validation",

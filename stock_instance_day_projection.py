@@ -12,12 +12,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from broker_holding_recorder import _reconciliation_status as broker_holding_reconciliation_status
+from candle_manager import canonical_candle_content_hash
 from candle_timeframe_aggregation import (
     SEOUL_TIMEZONE,
+    candle_market_datetime,
     candle_session_windows,
     read_canonical_bar_minutes,
 )
 from execution_queue_writer import read_execution_queue_records
+from event_journal_reader import EventJournalReader
 from execution_chart_read_model import project_execution_chart_read_model
 from gui_stock_data import STOCK_LIBRARY_READY, load_stock_library_snapshot
 from manual_ats_runtime import manual_ats_runtime_selected_keys
@@ -41,6 +44,8 @@ from state_policy import (
 )
 from stock_repository import StockRepository
 from stock_code_contract import normalize_broker_stock_code
+from stock_market_source_plan import read_stock_market_source_plan, source_for_time
+from mock_validation_candle_provider import verified_native_calculation_supply
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -65,39 +70,65 @@ def _finite_number(value: Any) -> float | None:
 
 
 def _stock_nxt_availability(stock_code: object, root: Path) -> bool | None:
-    """Read the verified Kiwoom Master Library capability without fallback."""
-    snapshot = load_stock_library_snapshot(root)
-    if snapshot.state != STOCK_LIBRARY_READY:
+    """Read the frozen trading-day decision without a late library lookup."""
+    try:
+        plan = read_stock_market_source_plan(
+            root, normalize_broker_stock_code(stock_code),
+            datetime.now(SEOUL_TIMEZONE).date(),
+        )
+    except ValueError:
         return None
-    code = normalize_broker_stock_code(stock_code)
-    for record in snapshot.records:
-        if normalize_broker_stock_code(record.get("code")) != code:
-            continue
-        value = record.get("nxt_available")
-        return value if value is True or value is False else None
-    return None
+    return plan["nxt_available"] if plan is not None else None
 
 
 def chart_market_session_projection(
     stock_code: object,
     root: Path,
+    *,
+    trading_day: date | None = None,
 ) -> dict[str, Any]:
-    """Project one verified eligibility and its actual exchange sessions."""
+    """Project the frozen source decision; an absent plan admits no session."""
 
-    nxt_available = _stock_nxt_availability(stock_code, root)
+    try:
+        plan = read_stock_market_source_plan(
+            root, normalize_broker_stock_code(stock_code),
+            trading_day or datetime.now(SEOUL_TIMEZONE).date(),
+        )
+        plan_status = "READY" if plan is not None else "MARKET_SOURCE_PLAN_MISSING"
+    except ValueError:
+        plan = None
+        plan_status = "MARKET_SOURCE_PLAN_INVALID"
+    nxt_available = plan["nxt_available"] if plan is not None else None
     return {
+        "source_plan": plan,
+        "source_plan_status": plan_status,
         "nxt_available": nxt_available,
         "market_eligibility": {
-            "krx": True,
+            "krx": plan is not None,
             "nxt": nxt_available,
         },
         "market_sessions": [
-            dict(item)
-            for item in actual_exchange_session_ranges(
-                nxt_available=nxt_available,
-            )
+            dict(item) for item in (plan["sessions"] if plan is not None else ())
         ],
     }
+
+
+def _chart_calculation_scope(root: Path, code: str, at: datetime) -> str:
+    try:
+        plan = read_stock_market_source_plan(root, normalize_broker_stock_code(code), at.date())
+        active = source_for_time(plan, at) if plan is not None else None
+    except ValueError:
+        return ""
+    source = active.get("source") if active is not None else ""
+    return f"{source}_CALCULATION_ONLY" if source in {"SOR", "KRX", "NXT"} else ""
+
+
+def _verified_krx_chart_supply(
+    supply: dict[str, Any], code: str, interval: int, *, plan: dict[str, Any], as_of: datetime,
+) -> bool:
+    return verified_native_calculation_supply(supply, stock_code=code, interval=interval,
+                                              as_of=as_of, plan=plan)
+
 
 
 def chart_operation_method_badge_label(
@@ -690,6 +721,118 @@ def _marker_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def project_operation_timeline(
+    start_at: object,
+    end_at: object,
+    *,
+    now: datetime,
+    source_dates: set[str],
+    active: bool = False,
+) -> dict[str, Any]:
+    """Share only the read-only chart DTO, never lifecycle ownership."""
+    def exact_timestamp(value: object) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return (parsed.replace(tzinfo=SEOUL_TIMEZONE) if parsed.tzinfo is None
+                else parsed.astimezone(SEOUL_TIMEZONE))
+
+    start = exact_timestamp(start_at)
+    end = exact_timestamp(end_at) if end_at else None
+    if start is None or start > now or (end_at and end is None) or (end is not None and (end < start or end > now)):
+        return {"status": "NOT_PROVEN", "start_at": "", "end_at": "", "trade_dates": []}
+    first_day = start.date().isoformat()
+    target_day = (end or now).date()
+    if end is None:
+        while target_day.weekday() >= 5:
+            target_day -= timedelta(days=1)
+    last_day = max(first_day, target_day.isoformat())
+    witnessed_source_days = sorted(day for day in source_dates
+                                   if first_day <= day <= last_day)
+    event_days = {start.date().isoformat()}
+    if end is not None:
+        event_days.add(end.date().isoformat())
+    days = sorted(
+        day for day in source_dates | event_days
+        if first_day <= day <= last_day
+    )
+    cursor = start.date()
+    display_days = set(days)
+    unverified_days = []
+    while cursor <= date.fromisoformat(last_day):
+        day = cursor.isoformat()
+        if cursor.weekday() < 5:
+            display_days.add(day)
+            if day not in witnessed_source_days:
+                unverified_days.append(day)
+        cursor += timedelta(days=1)
+    return {
+        "status": "ENDED" if end is not None else "ONGOING" if active else "END_UNKNOWN",
+        "start_at": start.isoformat(),
+        "end_at": end.isoformat() if end is not None else "",
+        "trade_dates": days,
+        "source_dates": witnessed_source_days,
+        "display_dates": sorted(display_days),
+        "unverified_calendar_dates": unverified_days,
+        "date_coverage": ("CALENDAR_WEEKDAYS_UNVERIFIED" if unverified_days
+                          else "SOURCE_DATES_WITNESSED"),
+    }
+
+
+def _production_operation_timeline(root: Path, stock_code: str, now: datetime,
+                                   source_dates: set[str]) -> dict[str, Any]:
+    journal = EventJournalReader(root / "runtime" / "event_journal").read_events(
+        category="OPERATION", end_at=now, descending=False,
+    )
+    if journal["errors"] or journal["malformed_count"] or journal["invalid_count"]:
+        return project_operation_timeline(None, None, now=now, source_dates=set())
+    code = normalize_broker_stock_code(stock_code)
+    starts = [event for event in journal["events"]
+              if event.get("event_type") == "OPERATION_STARTED"
+              and event.get("result") == "SUCCESS"
+              and event.get("target_type") == "STOCK"
+              and normalize_broker_stock_code(event.get("stock_code")) == code]
+    if not starts:
+        return project_operation_timeline(None, None, now=now, source_dates=set())
+    start = starts[-1]
+    start_at = start["occurred_at"]
+    start_time = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+    endings = [event for event in journal["events"]
+               if event.get("event_type") == "LIQUIDATION_COMPLETED"
+               and event.get("result") == "COMPLETED"
+               and event.get("source") == "operation_close_completion_check_service.check_global_close_completion_after_durable_update"
+               and event.get("target_type") == "STOCK"
+               and normalize_broker_stock_code(event.get("stock_code")) == code
+               and datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00")) >= start_time
+               and isinstance(event.get("details"), dict)
+               and event["details"].get("completion_status") == "DONE"]
+    operation_state = read_json_dict(root / "runtime" / "operation_state.json")
+    participants = operation_state.get("operation_participant_stock_codes")
+    try:
+        global_start = datetime.fromisoformat(
+            str(operation_state.get("operation_started_at") or "").replace("Z", "+00:00")
+        )
+        if global_start.tzinfo is None:
+            global_start = global_start.replace(tzinfo=SEOUL_TIMEZONE)
+    except ValueError:
+        global_start = None
+    stock_state = read_json_dict(StockRepository(project_root=root).resolve_stock_dir(code) / "state.json")
+    stock_status = str(stock_state.get("status") or "").upper()
+    active = (not endings and operation_state.get("operation_status") == "RUNNING"
+              and global_start is not None and global_start <= start_time
+              and isinstance(participants, list) and code in participants
+              and stock_status in {"MONITORING", "RUNNING", "SELL_ONLY", "AUTO_CLOSE",
+                                   "AUTO_CLOSING", "EARLY_CLOSE", "EARLY_CLOSING"}
+              and stock_state.get("review_required") is not True)
+    if not active and not endings:
+        return {"status": "WAITING", "start_at": "", "end_at": "", "trade_dates": []}
+    return project_operation_timeline(
+        start_at, endings[0]["occurred_at"] if endings else None,
+        now=now, source_dates=source_dates, active=active,
+    )
+
+
 def project_stock_instance_day(
     stock_code: str,
     trade_date: str,
@@ -766,19 +909,31 @@ def project_stock_instance_day(
             routine_projection_request = request_reader(rules)
             if not isinstance(routine_projection_request, dict):
                 raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
+            projection_as_of = _projection_as_of(trade_date, now)
+            market_projection = chart_market_session_projection(
+                stock_code, root, trading_day=date.fromisoformat(trade_date),
+            )
+            plan = market_projection["source_plan"]
+            if plan is not None and projection_as_of.date().isoformat() != trade_date:
+                last_end = plan["sessions"][-1]["end_time"]
+                projection_as_of = (datetime.combine(date.fromisoformat(trade_date),
+                                  time.fromisoformat(last_end), tzinfo=SEOUL_TIMEZONE)
+                                  - timedelta(seconds=1))
+            consumer_scope = _chart_calculation_scope(root, stock_code, projection_as_of)
             projection_request = chart_candle_projection_request(
-                routine_projection_request
+                routine_projection_request,
+                krx_native=consumer_scope == "KRX_CALCULATION_ONLY",
             )
             candle_supply = candle_provider(
                 stock_code=stock_code,
                 rules=rules,
                 projection_request=projection_request,
-                as_of=_projection_as_of(trade_date, now),
+                as_of=projection_as_of,
                 session_windows=candle_session_windows(
                     read_json_dict(root / "operation_policy.json"),
                     manual_ats_runtime_selected_keys(state),
                 ),
-                consumer_scope="PRODUCTION",
+                consumer_scope=consumer_scope,
             )
             if not isinstance(candle_supply, dict):
                 raise TypeError("Production Candle provider returned a non-object")
@@ -802,6 +957,128 @@ def project_stock_instance_day(
     diagnostics["candle_availability_state"] = str(
         candle_supply.get("availability_state") or ""
     ).strip()
+    market_projection = chart_market_session_projection(
+        stock_code, root, trading_day=date.fromisoformat(trade_date),
+    )
+    nxt_available = market_projection["nxt_available"]
+    display_metadata = candle_supply.get("display_metadata", {})
+    display_metadata = (
+        deepcopy(display_metadata)
+        if isinstance(display_metadata, dict)
+        else {}
+    )
+    supplied_display = candle_supply.get("display_candles", [])
+    display_candles = (
+        [
+            deepcopy(item)
+            for item in supplied_display
+            if isinstance(item, dict)
+            and (bar_time := candle_market_datetime(item)) is not None
+            and bar_time.date().isoformat() == str(trade_date or "")
+        ]
+        if isinstance(supplied_display, list)
+        else []
+    )
+    display_evidence_valid = bool(
+        display_candles
+        and nxt_available is True
+        and display_metadata.get("display_only") is True
+        and str(display_metadata.get("market_source") or "") == "INTEGRATED"
+        and str(display_metadata.get("market_data_identity") or "")
+        == f"{normalize_broker_stock_code(stock_code)}_AL"
+    )
+    sor_verified = (
+        nxt_available is True
+        and candle_supply.get("available") is True
+        and candle_supply.get("market_source") == "INTEGRATED"
+        and candle_supply.get("market_data_identity") == f"{normalize_broker_stock_code(stock_code)}_AL"
+        and candle_supply.get("calculation_only") is True
+        and candle_supply.get("execution_enabled") is False
+        and candle_supply.get("queue_connected") is False
+        and candle_supply.get("send_order_connected") is False
+        and (
+            candle_supply.get("calculation_source") == "BROKER_AL_CONFIRMED_M1"
+            if bar_minutes == 1 else
+            candle_supply.get("calculation_source") == "BROKER_AL_CONFIRMED_DIRECT"
+            and candle_supply.get("direct_history_source") == "BROKER_AL_CONFIRMED_DIRECT"
+            and candle_supply.get("direct_timeframe_source") is True
+            and isinstance(candle_supply.get("direct_source_receipt"), dict)
+            and candle_supply["direct_source_receipt"].get("stock_code") == normalize_broker_stock_code(stock_code)
+            and candle_supply["direct_source_receipt"].get("timeframe_key") == f"M{bar_minutes}"
+            and isinstance(candle_supply.get("source_identity"), str)
+            and len(candle_supply["source_identity"]) == 64
+            and candle_supply["direct_source_receipt"].get("source_content_sha256")
+            == candle_supply.get("source_identity")
+        )
+    )
+    krx_verified = (nxt_available is False and bar_minutes is not None
+                    and candle_supply.get("available") is True
+                    and _verified_krx_chart_supply(
+                        candle_supply, normalize_broker_stock_code(stock_code), bar_minutes,
+                        plan=market_projection["source_plan"], as_of=projection_as_of))
+    nxt_verified = (nxt_available is True and bar_minutes is not None
+                    and candle_supply.get("market_source") == "NXT"
+                    and candle_supply.get("available") is True
+                    and _verified_krx_chart_supply(
+                        candle_supply, normalize_broker_stock_code(stock_code), bar_minutes,
+                        plan=market_projection["source_plan"], as_of=projection_as_of))
+    calculation_verified = sor_verified or krx_verified or nxt_verified
+    chart_candles = (
+        [item for item in candles
+         if (bar_time := candle_market_datetime(item)) is not None
+         and bar_time.date().isoformat() != str(trade_date or "")] + display_candles
+        if display_evidence_valid and sor_verified else candles if calculation_verified else []
+    )
+    projection_now = now or datetime.now(SEOUL_TIMEZONE)
+    if projection_now.tzinfo is None:
+        projection_now = projection_now.replace(tzinfo=SEOUL_TIMEZONE)
+    else:
+        projection_now = projection_now.astimezone(SEOUL_TIMEZONE)
+    source_dates = {
+        bar_time.date().isoformat()
+        for item in chart_candles
+        if (bar_time := candle_market_datetime(item)) is not None
+    }
+    operation_timeline = _production_operation_timeline(
+        root, stock_code, projection_now, source_dates,
+    )
+    episode_start = episode_end = None
+    if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}:
+        episode_start = datetime.fromisoformat(operation_timeline["start_at"])
+        episode_end = (datetime.fromisoformat(operation_timeline["end_at"])
+                       if operation_timeline["end_at"] else projection_now)
+        chart_candles = [item for item in chart_candles
+                         if (bar_time := candle_market_datetime(item)) is not None
+                         and episode_start <= bar_time <= episode_end]
+        in_range_source_dates = {
+            bar_time.date().isoformat()
+            for item in chart_candles
+            if (bar_time := candle_market_datetime(item)) is not None
+        }
+        operation_timeline = project_operation_timeline(
+            operation_timeline["start_at"], operation_timeline["end_at"] or None,
+            now=projection_now, source_dates=in_range_source_dates,
+            active=operation_timeline["status"] == "ONGOING",
+        )
+    timeline_dates = (
+        set(operation_timeline["trade_dates"])
+        if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}
+        else {str(trade_date)}
+    )
+    if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}:
+        chart_candles = [item for item in chart_candles
+                         if (bar_time := candle_market_datetime(item)) is not None
+                         and bar_time.date().isoformat() in timeline_dates]
+    diagnostics["calculation_candle_count"] = len(candles)
+    diagnostics["chart_candle_count"] = len(chart_candles)
+    diagnostics["chart_display_only_integrated"] = display_evidence_valid and sor_verified
+    diagnostics["chart_candle_source"] = (
+        "INTEGRATED_DISPLAY_ONLY"
+        if display_evidence_valid and sor_verified
+        else "CALCULATION_SOR_AL" if sor_verified
+        else "CALCULATION_KRX_NATIVE" if krx_verified
+        else "CALCULATION_NXT_NATIVE" if nxt_verified else "SOURCE_UNAVAILABLE"
+    )
 
     malformed_or_failed = any(
         "MALFORMED" in str(issue).upper()
@@ -814,7 +1091,7 @@ def project_stock_instance_day(
         projection_status = CHART_PROJECTION_REFRESH_FAILED
     elif not instance_id or not rules:
         projection_status = CHART_PROJECTION_RULES_UNAVAILABLE
-    elif candle_supply.get("available") is True and candles:
+    elif calculation_verified and candles:
         projection_status = CHART_PROJECTION_VALID
     elif diagnostics["raw_candle_count"] > 0:
         projection_status = CHART_PROJECTION_NOT_READY
@@ -835,7 +1112,11 @@ def project_stock_instance_day(
             continue
         if not instance_id or record_instance != instance_id:
             continue
-        if str(marker["signal_trade_date"]) != str(trade_date):
+        if str(marker["signal_trade_date"]) not in timeline_dates:
+            continue
+        marker_time = candle_market_datetime({"bar_time": marker["signal_bar_time"]})
+        if (episode_start is not None and
+                (marker_time is None or not episode_start <= marker_time <= episode_end)):
             continue
         if marker["signal"] in {"BUY", "SELL"}:
             markers.append(marker)
@@ -877,8 +1158,6 @@ def project_stock_instance_day(
         root,
     )
     ats_session_ranges = _selected_ats_session_ranges(config, state, root)
-    market_projection = chart_market_session_projection(stock_code, root)
-    nxt_available = market_projection["nxt_available"]
     instance_name = str(
         getattr(instance, "display_name", "")
         or config.get("routine_instance_name")
@@ -899,11 +1178,6 @@ def project_stock_instance_day(
     # It must not inherit the bar-scoped PnL cache after an additional buy or a
     # full sell.
     open_position = _open_position_projection(root, stock_code)
-    projection_now = now or datetime.now(SEOUL_TIMEZONE)
-    if projection_now.tzinfo is None:
-        projection_now = projection_now.replace(tzinfo=SEOUL_TIMEZONE)
-    else:
-        projection_now = projection_now.astimezone(SEOUL_TIMEZONE)
     current_day_position = str(trade_date or "") == projection_now.date().isoformat()
     average_price = _finite_number(open_position.get("average_price"))
     holding_quantity = _finite_number(open_position.get("holding_quantity"))
@@ -923,13 +1197,27 @@ def project_stock_instance_day(
     execution_data, execution_error = _read_runtime_object(
         root / "runtime" / "order_executions.json"
     )
-    execution_chart = project_execution_chart_read_model(
+    execution_charts = [project_execution_chart_read_model(
         fills=fill_records,
         order_executions=execution_data,
         queue_records=order_records,
         stock_code=stock_code,
-        trade_date=trade_date,
-    )
+        trade_date=day,
+    ) for day in sorted(timeline_dates)]
+    execution_chart = {
+        key: [item for result in execution_charts for item in result.get(key, [])]
+        for key in ("actual_fill_markers", "actual_buy_fill_markers",
+                    "actual_sell_fill_markers", "execution_process_rails", "diagnostics")
+    }
+    if operation_timeline["status"] in {"ONGOING", "ENDED", "END_UNKNOWN"}:
+        started = datetime.fromisoformat(operation_timeline["start_at"])
+        finished = datetime.fromisoformat(operation_timeline["end_at"]) if operation_timeline["end_at"] else projection_now
+        for key in ("actual_fill_markers", "actual_buy_fill_markers", "actual_sell_fill_markers"):
+            execution_chart[key] = [item for item in execution_chart[key]
+                                    if isinstance(item, dict)
+                                    and isinstance(item.get("occurred_at"), str)
+                                    and (occurred := datetime.fromisoformat(item["occurred_at"]))
+                                    and started <= occurred <= finished]
     diagnostics["actual_fill_diagnostics"] = execution_chart.get("diagnostics", [])
     diagnostics["actual_fill_read_errors"] = [
         error for error in (fill_error, execution_error) if error
@@ -952,7 +1240,8 @@ def project_stock_instance_day(
         "operation_mode": normalized_operation_mode,
         "operation_mode_display": operation_mode_display(normalized_operation_mode),
         "operation_title_display": operation_title_display,
-        "chart_domain_label": "KRX",
+        "operation_timeline": operation_timeline,
+        "chart_domain_label": "SOR _AL" if sor_verified else "KRX" if krx_verified else "NXT _NX" if nxt_verified else "-",
         "chart_operation_method_label": chart_operation_method_badge_label(
             normalized_operation_mode,
             ats_selected=bool(ats_session_ranges),
@@ -977,7 +1266,13 @@ def project_stock_instance_day(
         "open_position_unavailable_reason": open_position.get("open_position_unavailable_reason"),
         "average_price": average_price if average_price_visible else None,
         "average_price_visible": average_price_visible,
-        "candles": candles,
+        "candles": chart_candles,
+        "calculation_candle_source": ("SOR_AL" if sor_verified else
+                                      "KRX_NATIVE" if krx_verified else
+                                      "NXT_NATIVE" if nxt_verified else "SOURCE_UNAVAILABLE"),
+        "chart_candle_source": diagnostics["chart_candle_source"],
+        "chart_display_only_integrated": display_evidence_valid and sor_verified,
+        "display_metadata": display_metadata if display_evidence_valid and sor_verified else {},
         "candle_availability": deepcopy(candle_supply),
         "completeness": deepcopy(candle_supply.get("completeness", {})),
         "freshness": deepcopy(candle_supply.get("freshness", {})),
@@ -999,11 +1294,13 @@ def project_stock_instance_day(
 
 def chart_candle_projection_request(
     routine_projection_request: dict[str, Any],
+    *, krx_native: bool = False,
 ) -> dict[str, Any]:
-    """Keep the Routine projection kind while separating Chart display from warm-up."""
+    """Keep the Routine projection kind without trimming chart history to evaluation needs."""
 
     if not isinstance(routine_projection_request, dict):
         raise ValueError("ROUTINE_MARKET_PROJECTION_REQUEST_INVALID")
     request = deepcopy(routine_projection_request)
     request.pop("warmup_bars", None)
+    request.pop("history_target_bars", None)
     return request
