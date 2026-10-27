@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import math
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -65,6 +65,12 @@ from pnl_ui_refresh import (
     project_current_stock_pnl,
     project_current_stock_pnl_snapshot,
 )
+from quick_chart_native_history import (
+    apply_native_history_projection,
+    native_history_request_count,
+    native_history_source,
+    validate_native_history_receipt,
+)
 from state_policy import actual_exchange_session_ranges
 from gui_window_policy import (
     configure_persistent_feature_window,
@@ -95,30 +101,37 @@ _CHART_TILE_FRAME_TOLERANCE = 12
 _CHART_TILE_MIN_OVERLAP_RATIO = 0.45
 
 
+def _exact_chart_datetime(value: Any) -> datetime | None:
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return parse_market_datetime(value)
+    return (parsed.replace(tzinfo=SEOUL_TIMEZONE) if parsed.tzinfo is None
+            else parsed.astimezone(SEOUL_TIMEZONE))
+
+
 def _today_trade_date() -> str:
     return datetime.now(SEOUL_TIMEZONE).date().isoformat()
 
 
 def _live_price_market_source(
     *,
-    nxt_available: bool,
+    source_plan: dict[str, Any] | None,
     now_dt: datetime | None = None,
 ) -> str:
-    """Select the display source without granting NXT execution authority."""
+    """Select the display source from the immutable stock decision."""
 
-    if not nxt_available:
-        return "KRX"
+    from stock_market_source_plan import source_for_time
+
+    if source_plan is None:
+        return ""
     current = now_dt or datetime.now(SEOUL_TIMEZONE)
     if current.tzinfo is None:
         current = current.replace(tzinfo=SEOUL_TIMEZONE)
-    else:
-        current = current.astimezone(SEOUL_TIMEZONE)
-    minute = current.hour * 60 + current.minute
-    if (8 * 60) <= minute < (8 * 60 + 50):
-        return "NXT"
-    if (15 * 60 + 40) <= minute < (20 * 60):
-        return "NXT"
-    return "KRX"
+    selected = source_for_time(source_plan, current)
+    return selected["source"] if selected is not None else ""
 
 
 def _main_monitoring_owner(parent: QWidget | None) -> QWidget | None:
@@ -1189,6 +1202,8 @@ class StockInstanceCloseChart(QWidget):
         self.live_price_data_quality = ""
         self.fixed_time_range: tuple[datetime, datetime] | None = None
         self.visible_time_ranges: list[tuple[datetime, datetime]] = []
+        self.operation_timeline: dict[str, Any] = {}
+        self.multi_day_timeline = False
         self.nxt_available = False
         self.timeframe_minutes: int | None = None
         self.empty_message = "표시할 기준봉 데이터가 없습니다."
@@ -1230,6 +1245,7 @@ class StockInstanceCloseChart(QWidget):
         actual_fill_markers: Any = None,
         process_rails: Any = None,
         average_price: Any = None,
+        operation_timeline: Any = None,
     ) -> None:
         self.close_series = self._series_from(
             candles,
@@ -1251,7 +1267,7 @@ class StockInstanceCloseChart(QWidget):
             for marker in actual_fill_markers:
                 if not isinstance(marker, dict):
                     continue
-                occurred_at = parse_market_datetime(marker.get("occurred_at"))
+                occurred_at = _exact_chart_datetime(marker.get("occurred_at"))
                 price = _finite_number(marker.get("filled_price"))
                 side = str(marker.get("side") or "").strip().upper()
                 if occurred_at is None or price is None or price <= 0 or side not in {"BUY", "SELL"}:
@@ -1279,6 +1295,7 @@ class StockInstanceCloseChart(QWidget):
             else None
         )
         self.visible_time_ranges = []
+        self.operation_timeline = dict(operation_timeline) if isinstance(operation_timeline, dict) else {}
         if isinstance(visible_time_ranges, list):
             for item in visible_time_ranges:
                 if not isinstance(item, (list, tuple)) or len(item) != 2:
@@ -1287,6 +1304,8 @@ class StockInstanceCloseChart(QWidget):
                 visible_end = parse_market_datetime(item[1])
                 if visible_start is not None and visible_end is not None and visible_start < visible_end:
                     self.visible_time_ranges.append((visible_start, visible_end))
+        self.multi_day_timeline = (self.operation_timeline.get("status") in {"ONGOING", "ENDED", "END_UNKNOWN"}
+                                   and len({start.date() for start, _end in self.visible_time_ranges}) > 1)
         active_ranges = list(self.visible_time_ranges)
         if not active_ranges and self.fixed_time_range is not None:
             active_ranges = [self.fixed_time_range]
@@ -1455,6 +1474,8 @@ class StockInstanceCloseChart(QWidget):
         if endpoint is None or not visible_plot.contains(endpoint):
             return None
         for bar_time, close in reversed(self.close_series):
+            if bar_time.date() != live_time.date():
+                return None
             startpoint = self.position_for(bar_time, close, target, scales=scales)
             if startpoint is None or not visible_plot.contains(startpoint):
                 continue
@@ -1517,6 +1538,11 @@ class StockInstanceCloseChart(QWidget):
             return []
         minimum_time, maximum_time = time_range
         time_span = (maximum_time - minimum_time).total_seconds()
+        if self.multi_day_timeline:
+            labels = [item[0] for item in self.visible_time_ranges]
+            labels.append(self.visible_time_ranges[-1][1])
+            return [(item, plot.left() + self._time_fraction(item) * plot.width())
+                    for item in labels]
         if self.fixed_time_range is not None:
             if self.nxt_available:
                 label_times = []
@@ -1576,8 +1602,23 @@ class StockInstanceCloseChart(QWidget):
             painter.drawText(
                 QRectF(x - 32, plot.bottom() + 7, 64, 18),
                 Qt.AlignHCenter | Qt.AlignTop,
-                bar_time.strftime("%H:%M"),
+                (bar_time.strftime("%m-%d") if self.multi_day_timeline
+                 and bar_time.hour == 8 else bar_time.strftime("%H:%M")),
             )
+
+    def _time_fraction(self, instant: datetime) -> float:
+        ranges = self.visible_time_ranges
+        if not self.multi_day_timeline:
+            bounds = self._time_range()
+            return ((instant - bounds[0]).total_seconds() /
+                    max((bounds[1] - bounds[0]).total_seconds(), 1)) if bounds else 0.5
+        total = sum((end - start).total_seconds() for start, end in ranges)
+        elapsed = 0.0
+        for start, end in ranges:
+            if instant <= end:
+                return (elapsed + max(0.0, (instant - start).total_seconds())) / total
+            elapsed += (end - start).total_seconds()
+        return 1.0
 
     def position_for(
         self,
@@ -1590,18 +1631,16 @@ class StockInstanceCloseChart(QWidget):
         """Return the exact chart coordinate used by both lines and markers."""
         if scales is None:
             scales = self._scale_values()
-        parsed_time = parse_market_datetime(bar_time)
+        parsed_time = _exact_chart_datetime(bar_time)
         parsed_close = _finite_number(close)
         if scales is None or parsed_time is None or parsed_close is None:
             return None
         minimum_time, maximum_time, low, high = scales
         target = plot or self._plot_rect()
         time_span = (maximum_time - minimum_time).total_seconds()
-        x_ratio = (
-            0.5
-            if time_span <= 0
-            else (parsed_time - minimum_time).total_seconds() / time_span
-        )
+        x_ratio = (self._time_fraction(parsed_time) if self.multi_day_timeline
+                   else 0.5 if time_span <= 0
+                   else (parsed_time - minimum_time).total_seconds() / time_span)
         y_ratio = (parsed_close - low) / max(high - low, 1e-12)
         return QPointF(
             target.left() + x_ratio * target.width(),
@@ -1771,6 +1810,21 @@ class StockInstanceCloseChart(QWidget):
 
         self._draw_plot_axes(painter, plot, axis_color)
         scales = self._scale_values()
+        if self.multi_day_timeline:
+            painter.setPen(QPen(grid_color, 1, Qt.DashLine))
+            for start, _end in self.visible_time_ranges[1:]:
+                x = plot.left() + self._time_fraction(start) * plot.width()
+                painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+        for key, color, label in (("start_at", QColor("#7C3AED"), "START"),
+                                  ("end_at", QColor("#B45309"), "END")):
+            instant = _exact_chart_datetime(self.operation_timeline.get(key))
+            if instant is None or self._session_index_for(instant) < 0:
+                continue
+            x = plot.left() + self._time_fraction(instant) * plot.width()
+            painter.setPen(QPen(color, 2, Qt.DashLine))
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+            painter.drawText(QRectF(x - 30, plot.top(), 60, 17),
+                             Qt.AlignHCenter | Qt.AlignTop, label)
         self._draw_x_axis_labels(painter, plot, text_color, time_range=scales[:2] if scales else None)
         painter.setFont(self.font())
         if scales is None:
@@ -1910,10 +1964,15 @@ class StockInstanceChartWindow(QDialog):
         )
         self.stock_code = str(stock_code or "").strip()
         self.trade_date = str(trade_date or _today_trade_date()).strip()
+        self._native_history_api = None
+        self._native_history: dict[str, Any] | None = None
+        self._native_history_attempt: tuple[Any, ...] | None = None
         if projection_provider is not None:
             self._projection_provider = projection_provider
         else:
             candle_provider = _production_candle_provider(parent)
+            self._native_history_api = getattr(getattr(candle_provider, "__self__", None),
+                                               "kiwoom_api", None)
             if candle_provider is None:
                 self._projection_provider = project_stock_instance_day
             else:
@@ -1934,6 +1993,7 @@ class StockInstanceChartWindow(QDialog):
         self._bar_committed_refresh_pending = False
         self._chart_closed = False
         self._live_price_operation_host = None
+        self._mini_live_lease_code = ""
         self._live_price_refresh_timer: QTimer | None = None
         self._live_price_diagnostic_count = 0
         self._live_price_diagnostic_last: dict[str, Any] = {}
@@ -2052,6 +2112,20 @@ class StockInstanceChartWindow(QDialog):
         clear = getattr(self.chart, "clear_live_price_projection", None)
         return bool(clear()) if callable(clear) else False
 
+    def _sync_mini_live_lease(self, eligibility: bool | None) -> None:
+        host = self._live_price_operation_host
+        setter = getattr(host, "set_mini_chart_observation_lease", None)
+        code = self.stock_code if eligibility is True or eligibility is False else ""
+        if not callable(setter) or code == self._mini_live_lease_code:
+            return
+        try:
+            result = setter(id(self), code)
+        except Exception:
+            return
+        if isinstance(result, dict):
+            # The host retains the desired lease for reconnect even if broker sync failed.
+            self._mini_live_lease_code = code
+
     def _observe_live_price_diagnostic(
         self,
         stage: str,
@@ -2085,18 +2159,23 @@ class StockInstanceChartWindow(QDialog):
             snapshot = host.high_resolution_market_data_snapshot()
             eligibility = self.last_projection.get("market_eligibility")
             nxt_available = (
-                eligibility.get("nxt") is True
+                eligibility.get("nxt")
                 if isinstance(eligibility, dict)
-                else self.last_projection.get("nxt_available") is True
+                else self.last_projection.get("nxt_available")
             )
+            self._sync_mini_live_lease(nxt_available)
             market_source = _live_price_market_source(
-                nxt_available=nxt_available,
+                source_plan=self.last_projection.get("source_plan"),
             )
             if market_source == "NXT":
                 reader = getattr(host, "nxt_display_live_price_state", None)
                 state = reader(self.stock_code) if callable(reader) else None
+            elif market_source == "SOR":
+                reader = getattr(host, "sor_display_live_price_state", None)
+                state = reader(self.stock_code) if callable(reader) else None
             else:
-                state = host.high_resolution_market_state(self.stock_code)
+                state = (host.high_resolution_market_state(self.stock_code)
+                         if market_source == "KRX" else None)
         except Exception as exc:
             self._observe_live_price_diagnostic(
                 "LIVE_PRICE_LOOKUP_FAILED",
@@ -2113,7 +2192,17 @@ class StockInstanceChartWindow(QDialog):
             )
             return self._clear_live_price_projection()
 
-        if market_source == "NXT":
+        if market_source == "SOR":
+            if (
+                str(getattr(state, "canonical_stock_code", "") or "").strip()
+                != self.stock_code
+                or str(getattr(state, "broker_code_identity", "") or "").strip()
+                != f"{self.stock_code}_AL"
+                or str(getattr(state, "market_source", "") or "").strip() != "SOR"
+            ):
+                self._observe_live_price_diagnostic("SOR_DISPLAY_IDENTITY_MISMATCH")
+                return self._clear_live_price_projection()
+        elif market_source == "NXT":
             if (
                 str(getattr(state, "canonical_stock_code", "") or "").strip()
                 != self.stock_code
@@ -2345,6 +2434,7 @@ class StockInstanceChartWindow(QDialog):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._chart_closed = True
+        self._native_history = None
         header_timer = self._operation_header_refresh_timer
         if header_timer is not None:
             header_timer.stop()
@@ -2353,6 +2443,14 @@ class StockInstanceChartWindow(QDialog):
         if live_timer is not None:
             live_timer.stop()
         self._live_price_refresh_timer = None
+        setter = getattr(self._live_price_operation_host,
+                         "set_mini_chart_observation_lease", None)
+        if callable(setter) and self._mini_live_lease_code:
+            try:
+                setter(id(self), "")
+            except Exception:
+                pass
+        self._mini_live_lease_code = ""
         self._live_price_operation_host = None
         self._disconnect_operation_cycle_refresh()
         self._disconnect_bar_committed_refresh()
@@ -2516,6 +2614,12 @@ class StockInstanceChartWindow(QDialog):
             self.operation_info_labels[key] = label
         operation_info.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.operation_info_panel = operation_info
+        self.timeline_label = QLabel("Operation timeline: not proven")
+        self.timeline_label.setObjectName("stockInstanceChartTimelineStatus")
+        self.timeline_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.timeline_label.setWordWrap(True)
+        self.timeline_label.setStyleSheet("color: #6B7280; font-size: 11px;")
+        operation_info_layout.addWidget(self.timeline_label)
         info_layout.addWidget(operation_info, 0, Qt.AlignTop)
         info_layout.addStretch(1)
 
@@ -2901,11 +3005,7 @@ class StockInstanceChartWindow(QDialog):
     @classmethod
     def _projection_has_renderable_candle(cls, data: dict[str, Any]) -> bool:
         trade_date = str(data.get("trade_date") or "").strip()
-        _start, _end, visible_ranges = cls._chart_display_time_range(
-            trade_date,
-            data.get("nxt_available") is True,
-            data.get("market_sessions"),
-        )
+        _start, _end, visible_ranges = cls._operation_display_time_range(data, trade_date)
         if not visible_ranges:
             return False
         candles = data.get("candles", [])
@@ -3007,7 +3107,7 @@ class StockInstanceChartWindow(QDialog):
         self.last_refresh_status = status
         if self._can_preserve_last_valid_projection(
             self._projection_identity(data)
-        ):
+        ) and data.get("operation_timeline") == self.last_projection.get("operation_timeline"):
             self.notice_label.setText(self._preserved_series_notice(status))
             self._update_operation_button_state()
             return
@@ -3038,8 +3138,8 @@ class StockInstanceChartWindow(QDialog):
     ]:
         sessions = (
             market_sessions
-            if isinstance(market_sessions, (list, tuple)) and market_sessions
-            else actual_exchange_session_ranges(nxt_available=nxt_available)
+            if isinstance(market_sessions, (list, tuple))
+            else ()
         )
         visible_ranges: list[tuple[datetime, datetime]] = []
         for session in sessions:
@@ -3060,6 +3160,26 @@ class StockInstanceChartWindow(QDialog):
         if not visible_ranges:
             return None, None, []
         return visible_ranges[0][0], visible_ranges[-1][1], visible_ranges
+
+    @classmethod
+    def _operation_display_time_range(cls, data: dict[str, Any], trade_date: str):
+        timeline = data.get("operation_timeline")
+        timeline = timeline if isinstance(timeline, dict) else {}
+        days = timeline.get("display_dates") or timeline.get("trade_dates")
+        if timeline.get("status") in {"ONGOING", "ENDED", "END_UNKNOWN"} and isinstance(days, list) and days:
+            ranges = []
+            for day in days:
+                try:
+                    parsed = date.fromisoformat(day)
+                except (TypeError, ValueError):
+                    continue
+                ranges.append((datetime.combine(parsed, time(8), SEOUL_TIMEZONE),
+                               datetime.combine(parsed, time(20), SEOUL_TIMEZONE)))
+            if ranges:
+                return ranges[0][0], ranges[-1][1], ranges
+        return cls._chart_display_time_range(
+            trade_date, data.get("nxt_available") is True, data.get("market_sessions"),
+        )
 
     def _apply_projection(self, data: dict[str, Any]) -> None:
         selected_marker_id = str(
@@ -3113,10 +3233,39 @@ class StockInstanceChartWindow(QDialog):
         buy_markers = data.get("buy_signal_markers", [])
         sell_markers = data.get("sell_signal_markers", [])
         empty_message = self._empty_chart_message(data)
-        x_range_start, x_range_end, visible_time_ranges = self._chart_display_time_range(
-            projected_trade_date,
-            data.get("nxt_available") is True,
-            data.get("market_sessions"),
+        x_range_start, x_range_end, visible_time_ranges = self._operation_display_time_range(
+            data, projected_trade_date,
+        )
+        timeline = data.get("operation_timeline")
+        timeline = timeline if isinstance(timeline, dict) else {}
+        timeline_status = str(timeline.get("status") or "NOT_PROVEN")
+        start_text = str(timeline.get("start_at") or "")[5:19].replace("T", " ")
+        end_text = str(timeline.get("end_at") or "")[5:19].replace("T", " ")
+        self.timeline_label.setText({
+            "WAITING": "NEW OPERATION WAITING",
+            "ENDED": f"Operation {start_text} → {end_text}",
+            "ONGOING": f"Operation {start_text} → ongoing",
+            "END_UNKNOWN": f"Operation {start_text} → end unverified",
+        }.get(timeline_status, "Operation timeline: not proven"))
+        if timeline_status in {"ONGOING", "ENDED", "END_UNKNOWN"}:
+            unverified = timeline.get("unverified_calendar_dates") or []
+            if unverified:
+                coverage_label = ("SOR source missing" if not timeline.get("source_dates")
+                                  else "SOR coverage unverified")
+                self.timeline_label.setText(
+                    self.timeline_label.text() +
+                    f" · {coverage_label}: {unverified[0]} to {unverified[-1]}"
+                    " (calendar weekdays; exchange sessions unverified)"
+                )
+            elif len(timeline.get("trade_dates") or ()) > 1:
+                self.timeline_label.setText(self.timeline_label.text() + " · event/source dates only")
+            if timeline.get("native_history_incomplete") is True:
+                self.timeline_label.setText(
+                    self.timeline_label.text() + " · earlier native SOR bars still unavailable"
+                )
+        self.timeline_label.setToolTip(
+            f"{timeline.get('start_at') or ''} → {timeline.get('end_at') or timeline_status}"
+            if timeline_status in {"ONGOING", "ENDED", "END_UNKNOWN"} else ""
         )
         self.chart.set_projection(
             candles,
@@ -3135,6 +3284,7 @@ class StockInstanceChartWindow(QDialog):
                 if data.get("average_price_visible") is True
                 else None
             ),
+            operation_timeline=timeline,
         )
         self.process_rail.set_processes(data.get("execution_process_rails", []))
         marker_by_id = {
@@ -3227,6 +3377,7 @@ class StockInstanceChartWindow(QDialog):
             self._update_operation_button_state()
             return
         self.last_projection = {}
+        self.timeline_label.setText("Operation timeline: not proven")
         for label in self.info_labels.values():
             label.setText("-")
         self.info_labels["stock"].setText(self.stock_code or "-")
@@ -3268,7 +3419,7 @@ class StockInstanceChartWindow(QDialog):
         return str(latest.get("bar_time") or "").strip() if isinstance(latest, dict) else ""
 
     def refresh_projection(self, *, preserve_pnl_if_same_bar: bool = False) -> None:
-        """Re-read only the projection; it never requests or writes candles."""
+        """Re-read the projection and asynchronously fill chart-only native history."""
         self._bar_committed_refresh_pending = False
         try:
             projected = self._projection_provider(self.stock_code, self.trade_date)
@@ -3278,9 +3429,19 @@ class StockInstanceChartWindow(QDialog):
         if not isinstance(projected, dict):
             self._apply_projection_error()
             return
+        session = self._native_chart_session()
+        history = self._native_history
+        if history is not None and session == (
+            history.get("connection_epoch"), history.get("login_session_id")
+        ):
+            projected = apply_native_history_projection(
+                projected, history, now=datetime.now(SEOUL_TIMEZONE))
+        elif history is not None:
+            self._native_history = None
         refresh_status = self._projection_refresh_status(projected)
         if refresh_status != CHART_PROJECTION_VALID:
             self._apply_unavailable_projection(projected, refresh_status)
+            self._maybe_request_native_history(projected, session)
             return
         if (
             preserve_pnl_if_same_bar
@@ -3307,6 +3468,95 @@ class StockInstanceChartWindow(QDialog):
                 if key in self.last_projection:
                     projected[key] = self.last_projection[key]
         self._apply_projection(projected)
+        self._maybe_request_native_history(projected, session)
+
+    def _native_chart_session(self) -> tuple[int, str] | None:
+        getter = getattr(self._native_history_api, "broker_session_snapshot", None)
+        try:
+            snapshot = getter() if callable(getter) else None
+            epoch = getattr(snapshot, "connection_epoch", None)
+            login = getattr(snapshot, "login_session_id", None)
+            if (getattr(snapshot, "connected", None) is True
+                    and type(epoch) is int and epoch > 0
+                    and isinstance(login, str) and login):
+                return epoch, login
+        except Exception:
+            pass
+        return None
+
+    def _maybe_request_native_history(
+        self, data: dict[str, Any], session: tuple[int, str] | None,
+    ) -> None:
+        timeline = data.get("operation_timeline")
+        timeline = timeline if isinstance(timeline, dict) else {}
+        interval = data.get("bar_minutes")
+        start_at = timeline.get("start_at")
+        end_at = timeline.get("end_at") or ""
+        eligibility = data.get("nxt_available")
+        plan = data.get("source_plan")
+        selected = native_history_source(plan, datetime.now(SEOUL_TIMEZONE))
+        if selected is None:
+            return
+        source = selected["source"]
+        route = {"SOR": "request_minute_candles_display_only_integrated",
+                 "NXT": "request_minute_candles_display_only_nxt",
+                 "KRX": "request_minute_candles_display_only_krx"}.get(source, "")
+        request = getattr(self._native_history_api, route, None)
+        if (self._chart_closed or session is None or not callable(request)
+                or timeline.get("status") not in {"ONGOING", "ENDED", "END_UNKNOWN"}
+                or type(eligibility) is not bool
+                or not str(data.get("instance_id") or "").strip()
+                or type(interval) is not int or not isinstance(start_at, str)
+                or data.get("stock_code") != self.stock_code):
+            return
+        count = native_history_request_count(start_at, datetime.now(SEOUL_TIMEZONE), interval)
+        if not count:
+            return
+        key = (self.stock_code, data["instance_id"], interval,
+               start_at, end_at, session, eligibility, source)
+        if key == self._native_history_attempt:
+            return
+        self._native_history_attempt = key
+        started = None
+        completed = False
+        buffered: list[dict[str, Any]] = []
+        window_ref = weakref.ref(self)
+        stock_code = self.stock_code
+
+        def received(response: dict[str, Any]) -> None:
+            nonlocal completed
+            if started is None:
+                buffered.append(response)
+                return
+            if completed:
+                return
+            completed = True
+            window = window_ref()
+            if window is None or window._chart_closed or window._native_history_attempt != key:
+                return
+            current = window._native_chart_session()
+            if current is None:
+                return
+            history = validate_native_history_receipt(
+                started, response, session, current, stock_code,
+                interval, start_at, end_at or None, requested_count=count,
+                nxt_available=eligibility,
+                selected_source="INTEGRATED" if source == "SOR" else source,
+                source_plan=data.get("source_plan"))
+            if history is not None:
+                window._native_history = history
+                window.refresh_projection()
+
+        try:
+            started = request(
+                self.stock_code, str(data.get("stock_name") or ""),
+                interval=interval, count=count, callback=received,
+                **({"nxt_available": True} if eligibility else {}),
+            )
+        except Exception:
+            return
+        for response in buffered:
+            received(response)
 
 
 def open_stock_instance_chart(
