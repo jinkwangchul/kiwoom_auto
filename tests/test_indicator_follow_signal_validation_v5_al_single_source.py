@@ -1832,6 +1832,67 @@ def test_completed_m3_regular_display_requires_exact_native_filter(case):
     assert result["display_candles"] == expected
 
 
+@pytest.mark.parametrize("case", ["suffix", "missing_middle", "forged", "reordered", "wrong_source"])
+def test_marking_regular_m3_worker_uses_verified_full_display(case, monkeypatch):
+    from copy import deepcopy
+    from tests.test_indicator_follow_v2_display_only_integrated_flow import ValidationSettingsSnapshot
+
+    monkeypatch.setattr(flow_module, "_trace_v5_marking", lambda *_args, **_kwargs: None)
+    flow, session, pool, market = _after_forming_case("M3", 3)
+    market.project_broker_sor_m1_calculation = lambda **_kw: pytest.fail(
+        "completed M3 marking must not request M1 projection")
+    settings = ValidationSettingsSnapshot({
+        "bar": {"bar_minutes": 3}, "validation_timeframe": {"key": "M3"},
+        "validation_market_scope": {"regular_market_only": True},
+    })
+    session.request.settings_snapshot = settings
+    pool["candles"] = [
+        dict(pool["candles"][0], time=f"{day}{clock}")
+        for day, clock in (("20261021", "090000"), ("20261021", "093000"),
+                           ("20261021", "153900"), ("20261023", "090000"),
+                           ("20261023", "093000"), ("20261023", "153900"),
+                           ("20261023", "195700"))
+    ]
+    pool["requested_count"] = len(pool["candles"])
+    flow._now_factory = lambda: datetime(2026, 10, 24, 5, 25,
+                                         tzinfo=ZoneInfo("Asia/Seoul"))
+    regular = flow_module._krx_regular_session_candles(pool["candles"])
+    display = deepcopy(regular[-2:])
+    if case == "missing_middle":
+        display = deepcopy([regular[0], regular[-1]])
+    elif case == "forged":
+        display[0]["volume"] += 1
+    elif case == "reordered":
+        display.reverse()
+    elif case == "wrong_source":
+        pool["candles"][0]["volume"] += 1
+    window = SimpleNamespace(stock=session.request.stock, _marking_generation=1,
+                             _marking_key="regular-m3", _disable_marking=lambda **_kw: None,
+                             marking_display_check=SimpleNamespace(setToolTip=lambda _s: None))
+    key = id(window)
+    flow._open_windows[key] = window
+    flow._validation_sessions[key] = session
+    flow._historical_pools[key] = pool
+    flow._request_generation[key] = 1
+    request = {"settings": settings, "generation": 1, "key": "regular-m3",
+               "calculation": deepcopy(pool["candles"]), "display": display,
+               "times": (display[0]["time"], display[-1]["time"]),
+               "range": (0, 1), "descriptors": ()}
+    if case == "wrong_source":
+        request["calculation"][0]["volume"] -= 1
+    payloads = []
+    flow.marking_completed.disconnect()
+    flow.marking_completed.connect(payloads.append)
+    with patch.object(flow_module, "Thread", side_effect=lambda *, target, **_kw: SimpleNamespace(start=target)):
+        flow._start_marking(window, request)
+    assert len(payloads) == 1
+    if case == "suffix":
+        assert payloads[0]["error"] == ""
+        assert payloads[0]["snapshot"].to_candles()[-1]["time"] == display[-1]["time"]
+    else:
+        assert "MARKING_SOURCE_CHANGED" in payloads[0]["error"]
+
+
 @pytest.mark.parametrize("timeframe,minutes", [
     ("M5", 5), ("M10", 10), ("M30", 30),
     ("M60", 60), ("M120", 120), ("M240", 240),

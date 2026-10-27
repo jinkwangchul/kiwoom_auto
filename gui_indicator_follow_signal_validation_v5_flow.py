@@ -12692,8 +12692,21 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             or any(calculation_by_time.get(row["time"]) != row
                                    for row in display)):
                         raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+                    checked_display = display
+                    scope = settings.to_dict().get("validation_market_scope")
+                    if (isinstance(scope, dict)
+                            and scope.get("regular_market_only") is True
+                            and session.request.timeframe_key.startswith("M")
+                            and session.request.timeframe_key != "M5"
+                            and not detached_premarket
+                            and pool.get("market_source") in {"INTEGRATED", "NXT", "KRX"}):
+                        full_regular = _krx_regular_session_candles(calculation)
+                        if (not display or len(display) > len(full_regular)
+                                or display != full_regular[-len(display):]):
+                            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+                        checked_display = full_regular
                     checked_view = dict(
-                        checked_view, candles=calculation, display_candles=display,
+                        checked_view, candles=calculation, display_candles=checked_display,
                         display_only_integrated=False,
                     )
                     if detached_premarket:
