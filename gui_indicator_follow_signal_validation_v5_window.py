@@ -161,6 +161,7 @@ _CROSSHAIR_BOX = QColor(17, 24, 39, 205)
 _MAX_SIGNAL_VALIDATION_VISIBLE_CANDLE_SPAN = 3_500.0
 _DISPLAY_BADGE_WIDTH = 68
 _DISPLAY_BADGE_IDLE_TEXT_COLOR = "#404040"
+_BASIC_HEADER_SEPARATOR_STYLE = "font-size: 10pt; font-weight: normal; color: #64748b; padding: 0px;"
 _VALID_FILTER_DISPLAY_TOOLTIP = (
     "현재 UI에서 활성화된 모든 매수·매도 필터를 강조합니다. "
     "마킹·기간·신호 결과와 무관합니다."
@@ -8575,11 +8576,9 @@ class IndicatorFollowSignalValidationV5Window(
     @staticmethod
     def _new_basic_header_spaced_separator() -> QLabel:
         separator = QLabel("|")
-        separator.setFixedSize(12, 30)
+        separator.setFixedSize(18, 30)
         separator.setAlignment(Qt.AlignCenter)
-        separator.setStyleSheet(
-            "font-size: 13pt; font-weight: bold; color: #000000; padding: 0px 1px;"
-        )
+        separator.setStyleSheet(_BASIC_HEADER_SEPARATOR_STYLE)
         return separator
 
     def _build_validation_execution_controls(self) -> None:
@@ -9087,9 +9086,6 @@ class IndicatorFollowSignalValidationV5Window(
         self._sell_collapsed_height = collapsed_height
 
     def _normalize_v2_header_internal_geometry(self) -> None:
-        separator_style = (
-            "font-size: 13pt; font-weight: bold; color: #000000; padding: 0px 1px;"
-        )
         header_contracts = (
             ("basic", self.basic_header_widget, self.basic_toggle_button, "기본설정"),
             ("buy", self.buy_header_widget, self.buy_title, "매수설정"),
@@ -9117,9 +9113,9 @@ class IndicatorFollowSignalValidationV5Window(
             title_widget.setAlignment(Qt.AlignCenter)
             separator = header_layout.itemAt(1).widget()
             separator.setText("|")
-            separator.setFixedSize(12, 30)
+            separator.setFixedSize(18, 30)
             separator.setAlignment(Qt.AlignCenter)
-            separator.setStyleSheet(separator_style)
+            separator.setStyleSheet(_BASIC_HEADER_SEPARATOR_STYLE)
             setattr(self, f"{name}_header_separator", separator)
 
     def eventFilter(self, watched, event):

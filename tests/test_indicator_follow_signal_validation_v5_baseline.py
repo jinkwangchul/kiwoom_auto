@@ -436,12 +436,26 @@ def test_v5_header_pipes_share_spacing_and_separate_liquidation(case):
              if isinstance(widget, window_module.QLabel) and widget.text() == "|"]
     assert layout.spacing() == 8
     assert len(pipes) == 6
+    window.basic_header_widget.resize(2000, 40)
+    assert layout.activate()
     first_pipe = pipes[0]
     for pipe in pipes:
         assert pipe.contentsMargins() == first_pipe.contentsMargins()
         assert pipe.styleSheet() == first_pipe.styleSheet()
-        assert pipe.minimumWidth() == pipe.maximumWidth() == 12
+        assert pipe.minimumWidth() == pipe.maximumWidth() == 18
         assert pipe.minimumHeight() == pipe.maximumHeight() == 30
+        assert pipe.font().pointSize() == 10
+        assert not pipe.font().bold()
+        assert pipe.font() == first_pipe.font()
+        assert "padding: 0px;" in pipe.styleSheet()
+        assert pipe.fontMetrics().horizontalAdvance("|") <= 18
+        index = widgets.index(pipe)
+        left, right = widgets[index - 1], widgets[index + 1]
+        assert pipe.geometry().left() - left.geometry().right() - 1 == 8
+        assert right.geometry().left() - pipe.geometry().right() - 1 == 8
+        assert pipe.alignment() & window_module.Qt.AlignHCenter
+        glyph_margin = (pipe.width() - pipe.fontMetrics().horizontalAdvance("|")) / 2
+        assert glyph_margin >= 0
     assert widgets.index(window.validation_regular_market_separator) + 1 == widgets.index(
         window.validation_range_liquidation_check)
     assert widgets.index(window.validation_range_liquidation_check) + 1 == widgets.index(
