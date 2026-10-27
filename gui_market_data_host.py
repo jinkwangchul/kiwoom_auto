@@ -931,21 +931,30 @@ class MarketDataHost(QObject):
                 )
                 due = latest is None or latest < expected_start
             if due:
+                request_count = min(required_count + 1, DEFAULT_CANDLES_MAX_COUNT)
+                if len(cached) >= required_count:
+                    request_count = min(
+                        _DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT,
+                        request_count,
+                    )
+                    if latest is not None and expected_start is not None:
+                        if latest.date() < expected_start.date():
+                            request_count = min(required_count + 1, 300, DEFAULT_CANDLES_MAX_COUNT)
+                        elif latest.date() == expected_start.date() and latest < expected_start:
+                            elapsed_slots = int(
+                                (expected_start - latest).total_seconds() // (interval * 60)
+                            )
+                            request_count = min(
+                                max(_DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT, elapsed_slots + 2),
+                                required_count + 1,
+                                300,
+                                DEFAULT_CANDLES_MAX_COUNT,
+                            )
                 specs.append(
                     {
                         "timeframe_minutes": interval,
                         "required_count": required_count,
-                        "request_count": (
-                            min(
-                                required_count + 1,
-                                DEFAULT_CANDLES_MAX_COUNT,
-                            )
-                            if len(cached) < required_count
-                            else min(
-                                _DIRECT_TIMEFRAME_INCREMENTAL_REQUEST_COUNT,
-                                DEFAULT_CANDLES_MAX_COUNT,
-                            )
-                        ),
+                        "request_count": request_count,
                     }
                 )
         return tuple(specs)

@@ -9,6 +9,46 @@ from routines.지표추종매매.routine import market_bar_projection_request
 
 
 class ProductionIndicatorWarmup300ContractTests(unittest.TestCase):
+    def test_native_same_day_gap_requests_overlap_without_changing_cache(self) -> None:
+        bars = [{"timestamp": "2026-10-27 09:00"}] * 299 + [
+            {"timestamp": "2026-10-27 10:00"}
+        ]
+        host = SimpleNamespace(
+            _candle_standby_timeframe_requirements_by_stock={"005930": {3: 300}},
+            _direct_timeframe_candles={("005930", 3): bars},
+        )
+        before = list(bars)
+        specs = MarketDataHost.direct_timeframe_refresh_specs(
+            host, "005930", "2026-10-27 10:18"
+        )
+        self.assertEqual(7, specs[0]["request_count"])
+        self.assertEqual(before, bars)
+        self.assertIs(before[-1], bars[-1])
+        self.assertEqual(
+            (), MarketDataHost.direct_timeframe_refresh_specs(
+                host, "005930", "2026-10-27 10:03"
+            ),
+        )
+
+    def test_native_next_day_backfill_and_same_day_cap(self) -> None:
+        bars = [{"timestamp": "2026-10-26 15:27"} for _ in range(300)]
+        host = SimpleNamespace(
+            _candle_standby_timeframe_requirements_by_stock={"005930": {3: 300}},
+            _direct_timeframe_candles={("005930", 3): bars},
+        )
+        self.assertEqual(
+            300, MarketDataHost.direct_timeframe_refresh_specs(
+                host, "005930", "2026-10-27 09:06"
+            )[0]["request_count"],
+        )
+        bars[-1] = {"timestamp": "2026-10-27 09:00"}
+        host._candle_standby_timeframe_requirements_by_stock["005930"][3] = 100
+        self.assertEqual(
+            101, MarketDataHost.direct_timeframe_refresh_specs(
+                host, "005930", "2026-10-27 15:30"
+            )[0]["request_count"],
+        )
+
     def test_verified_native_standby_history_does_not_repeat_full_fetch(self) -> None:
         host = SimpleNamespace(
             _candle_standby_timeframe_requirements_by_stock={"005930": {3: 300}},
