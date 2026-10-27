@@ -12890,6 +12890,7 @@ class IndicatorFollowSignalValidationV5Window(
         # and series without rebuilding the Canvas or replaying signals.
         self._refresh_filter_display_projection()
     def _on_validation_timeframe_changed(self, *_args) -> None:
+        self._clear_validation_result("과거 시세 데이터 조회 중...")
         self._on_validation_context_changed(normal_base=True)
 
     def _on_validation_execution_policy_changed(self, *_args) -> None:

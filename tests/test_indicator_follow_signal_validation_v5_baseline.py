@@ -1,6 +1,7 @@
 """Focused V5 behavior baseline with all persistence dependencies isolated."""
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta
 import json
 import os
@@ -298,6 +299,90 @@ def test_v5_flow_owns_injected_stores_and_purges_startup_evictions(case):
     assert flow.recent_stocks == (case.stock,)
     assert history.deleted == ["000660"]
     assert flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS == {}
+
+
+def test_v5_timeframe_change_clears_selected_liquidation_result_before_new_base(case):
+    window = window_for(case)
+    rows = candles()
+    for offset, row in enumerate(rows[-5:]):
+        row["time"] = f"2026102709{offset:02d}00"
+    rows[-1]["close"] = 150_000.0
+    with QSignalBlocker(window.basic_signal_interval_combo):
+        window.basic_signal_interval_combo.setCurrentText("1")
+    install(window, rows)
+    window._result_settings_snapshot = None
+
+    def entry(side, index):
+        return window_module.ValidationReplayEntry(
+            evaluation_side=side, evaluation_index=index,
+            evaluation_time=rows[index]["time"], signal=side,
+            reason="fixture", signal_index=index,
+            signal_time=rows[index]["time"], delay_bar=0,
+            matched_groups=[], details=[],
+            trace={"conditions": [], "groups": [], "aggregations": []},
+        )
+
+    window._set_validation_range(595, 598)
+    window._range_replay_entries_available = True
+    with patch.object(window, "_marker_entries_for_display", return_value=[
+        entry("BUY", 596), entry("SELL", 597), entry("BUY", 598),
+    ]), patch.object(window, "_refresh_signal_tooltips_only"), \
+            patch.object(window_module.QTimer, "singleShot"):
+        window._refresh_validation_range_results()
+        window.validation_range_liquidation_check.setChecked(True)
+        assert window.completed_cycle_table.item(1, 0).text() == "청산"
+        assert window.result_summary_label.text()
+        assert window.estimated_return_label.text()
+        old_canvas = window.canvas
+
+        with patch.object(window, "_request_validation", return_value=object()) as request:
+            window.basic_signal_interval_combo.setCurrentText("3")
+            request.assert_called_once_with(
+                normal_base=True, preserve_chart=False, preserve_marking=False,
+            )
+
+        assert window._normal_base_timeframe_key == "M1"
+        assert window.validation_range is None
+        assert window._validation_range_times is None
+        assert window._validation_range_anchor_index is None
+        assert window._validation_range_anchor_time is None
+        assert window.completed_cycles == ()
+        assert window.completed_cycle_table.rowCount() == 0
+        assert window.result_summary_label.text() == ""
+        assert window.estimated_return_label.text() == ""
+        assert window.canvas is None
+        assert window.chart_scroll_area.widget() is None
+        assert window.chart_stack.currentWidget() is window.loading_label
+        assert window.validation_range_liquidation_check.isChecked()
+
+    stamp = datetime(2026, 10, 27, 9, 0)
+    m3_rows = [
+        {
+            "time": (stamp + timedelta(minutes=3 * (i - 4))).strftime("%Y%m%d%H%M%S"),
+            "open": 150_000.0 + i,
+            "high": 150_010.0 + i,
+            "low": 149_990.0 + i,
+            "close": 150_001.0 + i,
+            "volume": 100 + i,
+        }
+        for i in range(4, 8)
+    ]
+    assert {rows[595]["time"], rows[598]["time"]} <= {row["time"] for row in m3_rows}
+    rules = deepcopy(case._seed().settings_snapshot.to_dict())
+    rules["bar"]["bar_minutes"] = 3
+    rules["validation_timeframe"] = {
+        "key": "M3", "kind": "MINUTE", "minutes": 3, "label": "3분",
+    }
+    m3_settings = window_module.ValidationSettingsSnapshot(rules)
+    window.set_historical_candle_pool(m3_rows, chart_candle_count=len(m3_rows))
+    window.install_normal_base(m3_settings, "M3")
+    assert window.canvas is not old_canvas
+    assert window.validation_range is None
+    assert window._validation_range_times is None
+    assert window.completed_cycles == ()
+    assert window.completed_cycle_table.rowCount() == 0
+    assert window.estimated_return_label.text() == ""
+    assert window.canvas._liquidation_marker_records() == []
 
 
 def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
