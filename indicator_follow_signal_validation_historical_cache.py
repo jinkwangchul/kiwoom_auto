@@ -103,6 +103,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         timeframe_minutes: object,
         requested_count: object,
         timeframe_key: object | None = None,
+        *, market_data_identity: object = "",
     ) -> Path:
         code, timeframe, key, count = self._identity(
             stock_code,
@@ -110,7 +111,12 @@ class IndicatorFollowSignalValidationHistoricalCache:
             requested_count,
             timeframe_key,
         )
+        source_identity = str(market_data_identity or "").strip()
+        if source_identity not in ("", code, f"{code}_AL", f"{code}_NX"):
+            raise ValueError("unsupported market data identity")
         safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code).strip("_") or "stock"
+        if source_identity in (f"{code}_AL", f"{code}_NX"):
+            safe_code += source_identity[len(code):]
         token = str(timeframe) if key == f"M{timeframe}" else key
         return self.root / f"{safe_code}_{token}_{count}.json"
 
@@ -254,7 +260,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
                     "reason_code": "NO_CACHE_ARTIFACTS",
                 }
             artifact_pattern = re.compile(
-                rf"{re.escape(safe_code)}_"
+                rf"{re.escape(safe_code)}_(?:AL_|NX_)?"
                 r"(?:1|3|5|10|15|30|60|120|240|D1|W1|MO1|Y1)_"
                 r"[1-9][0-9]*\.json(?:\.market-source\.json)?"
             )
@@ -288,6 +294,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         timeframe_minutes: object,
         requested_count: object,
         timeframe_key: object | None = None,
+        *, market_data_identity: object = "",
     ) -> ValidationHistoricalCacheEntry | None:
         with _CACHE_WRITE_LOCK:
             try:
@@ -297,13 +304,15 @@ class IndicatorFollowSignalValidationHistoricalCache:
                     requested_count,
                     timeframe_key,
                 )
-                path = self.path_for(code, timeframe, count, key)
+                path = self.path_for(code, timeframe, count, key,
+                                     market_data_identity=market_data_identity)
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 if not self._payload_is_current_unlocked(code, payload):
                     return None
                 return self._entry_from_payload(
                     payload,
                     expected_identity=(code, timeframe, key, count),
+                    expected_market_data_identity=market_data_identity,
                 )
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 return None
@@ -314,6 +323,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         timeframe_minutes: object,
         minimum_count: object,
         timeframe_key: object | None = None,
+        *, market_data_identity: object = "",
     ) -> ValidationHistoricalCacheEntry | None:
         """Return the smallest valid cache entry that covers minimum_count."""
         with _CACHE_WRITE_LOCK:
@@ -324,10 +334,16 @@ class IndicatorFollowSignalValidationHistoricalCache:
                     minimum_count,
                     timeframe_key,
                 )
-                exact = self.load(code, timeframe, count, key)
+                exact = self.load(code, timeframe, count, key,
+                                  market_data_identity=market_data_identity)
                 if exact is not None:
                     return exact
                 safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code).strip("_") or "stock"
+                source_identity = str(market_data_identity or "").strip()
+                if source_identity not in ("", code, f"{code}_AL", f"{code}_NX"):
+                    return None
+                if source_identity in (f"{code}_AL", f"{code}_NX"):
+                    safe_code += source_identity[len(code):]
                 token = str(timeframe) if key == f"M{timeframe}" else key
                 pattern = re.compile(
                     rf"{re.escape(safe_code)}_{re.escape(token)}_([1-9][0-9]*)\.json"
@@ -354,6 +370,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
                                     key,
                                     candidate_count,
                                 ),
+                                expected_market_data_identity=market_data_identity,
                             )
                             if self._payload_is_current_unlocked(code, payload)
                             else None
@@ -390,6 +407,42 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 market_source=market_source,
             )
 
+    def capture_store_lease(self, stock_code: object) -> tuple[str, str]:
+        """Capture the current per-stock cache state for a guarded later write."""
+        code = str(stock_code or "").strip()
+        if not code:
+            raise ValueError("stock_code is required")
+        with _CACHE_WRITE_LOCK:
+            state = self._read_cache_state_unlocked(code)
+            if state is None:
+                return ("ABSENT", "")
+            return (str(state["state"]), str(state["generation"]))
+
+    def store_if_lease_current(
+        self, *, cache_lease: object, stock_code: object, stock_name: object,
+        timeframe_minutes: object, requested_count: object, candles: object,
+        timeframe_key: object | None = None, market_data_identity: object = "",
+        market_source: object = "", after_store: object = None,
+    ) -> bool:
+        """Store data and its source marker in one lease-checked transaction."""
+        code = str(stock_code or "").strip()
+        if not code or not isinstance(cache_lease, tuple) or len(cache_lease) != 2:
+            return False
+        expected = (str(cache_lease[0]), str(cache_lease[1]))
+        with _CACHE_WRITE_LOCK:
+            state = self._read_cache_state_unlocked(code)
+            current = (("ABSENT", "") if state is None
+                       else (str(state["state"]), str(state["generation"])))
+            if expected != current or current[0] == _CACHE_STATE_INVALIDATED:
+                return False
+            stored = self.store(stock_code=code, stock_name=stock_name,
+                timeframe_minutes=timeframe_minutes, requested_count=requested_count,
+                candles=candles, timeframe_key=timeframe_key,
+                market_data_identity=market_data_identity, market_source=market_source)
+            if not stored:
+                return False
+            return after_store() is True if callable(after_store) else True
+
     def _store_unlocked(
         self,
         *,
@@ -410,6 +463,14 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 requested_count,
                 timeframe_key,
             )
+            source_identity = str(market_data_identity or "").strip()
+            source = str(market_source or "").strip()
+            if (source_identity == f"{code}_AL" and source != "INTEGRATED") or (
+                source_identity == f"{code}_NX" and source != "NXT"
+            ) or (
+                source_identity in ("", code) and source not in ("", "KRX")
+            ) or source_identity not in ("", code, f"{code}_AL", f"{code}_NX"):
+                return False
             normalized = merge_validation_candles([], candles, count)
             if not normalized:
                 return False
@@ -442,7 +503,8 @@ class IndicatorFollowSignalValidationHistoricalCache:
             }
             if generation:
                 payload["cache_generation"] = generation
-            path = self.path_for(code, timeframe, count, key)
+            path = self.path_for(code, timeframe, count, key,
+                                 market_data_identity=source_identity)
             path.parent.mkdir(parents=True, exist_ok=True)
             serialized = json.dumps(
                 payload,
@@ -467,6 +529,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
             persisted = self._entry_from_payload(
                 persisted_payload,
                 expected_identity=(code, timeframe, key, count),
+                expected_market_data_identity=source_identity,
             )
             if persisted is None or list(persisted.candles) != normalized:
                 return False
@@ -480,7 +543,8 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 generation=generation,
             ):
                 return False
-            return self.load(code, timeframe, count, key) is not None
+            return self.load(code, timeframe, count, key,
+                             market_data_identity=source_identity) is not None
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
         finally:
@@ -497,6 +561,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         requested_count: object,
         settings_hash: object,
         timeframe_key: object | None = None,
+        *, market_data_identity: object = "",
     ) -> list[dict[str, object]] | None:
         with _CACHE_WRITE_LOCK:
             try:
@@ -509,13 +574,15 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 clean_hash = str(settings_hash or "").strip()
                 if not clean_hash:
                     return None
-                path = self.path_for(code, timeframe, count, key)
+                path = self.path_for(code, timeframe, count, key,
+                                     market_data_identity=market_data_identity)
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 if not self._payload_is_current_unlocked(code, payload):
                     return None
                 if self._entry_from_payload(
                     payload,
                     expected_identity=(code, timeframe, key, count),
+                    expected_market_data_identity=market_data_identity,
                 ) is None:
                     return None
                 by_hash = payload.get("signal_entries_by_settings_hash")
@@ -545,6 +612,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         settings_hash: object,
         entries: object,
         timeframe_key: object | None = None,
+        market_data_identity: object = "",
     ) -> bool:
         with _CACHE_WRITE_LOCK:
             return self._store_signal_entries_unlocked(
@@ -554,6 +622,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 settings_hash=settings_hash,
                 entries=entries,
                 timeframe_key=timeframe_key,
+                market_data_identity=market_data_identity,
             )
 
     def _store_signal_entries_unlocked(
@@ -565,6 +634,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         settings_hash: object,
         entries: object,
         timeframe_key: object | None = None,
+        market_data_identity: object = "",
     ) -> bool:
         temp_path: Path | None = None
         try:
@@ -588,13 +658,15 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 sort_keys=True,
                 separators=(",", ":"),
             ))
-            path = self.path_for(code, timeframe, count, key)
+            path = self.path_for(code, timeframe, count, key,
+                                 market_data_identity=market_data_identity)
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not self._payload_is_current_unlocked(code, payload):
                 return False
             if self._entry_from_payload(
                 payload,
                 expected_identity=(code, timeframe, key, count),
+                expected_market_data_identity=market_data_identity,
             ) is None:
                 return False
             by_hash = payload.get("signal_entries_by_settings_hash")
@@ -629,6 +701,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
                 count,
                 clean_hash,
                 key,
+                market_data_identity=market_data_identity,
             ) == normalized_entries
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
@@ -644,6 +717,7 @@ class IndicatorFollowSignalValidationHistoricalCache:
         payload: object,
         *,
         expected_identity: tuple[str, int, str, int],
+        expected_market_data_identity: object = "",
     ) -> ValidationHistoricalCacheEntry | None:
         if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
             return None
@@ -681,6 +755,17 @@ class IndicatorFollowSignalValidationHistoricalCache:
         ):
             return None
         if payload_key.startswith("M") and payload_minutes != expected_identity[1]:
+            return None
+        expected_source = str(expected_market_data_identity or "").strip()
+        if expected_source in (f"{expected_identity[0]}_AL", f"{expected_identity[0]}_NX"):
+            market_source = "NXT" if expected_source.endswith("_NX") else "INTEGRATED"
+            if (payload.get("market_data_identity") != expected_source
+                    or payload.get("market_source") != market_source):
+                return None
+        elif expected_source not in ("", expected_identity[0]):
+            return None
+        elif (str(payload.get("market_data_identity") or "") not in ("", expected_identity[0])
+              or str(payload.get("market_source") or "") not in ("", "KRX")):
             return None
         raw_candles = payload.get("candles")
         if not isinstance(raw_candles, list) or not raw_candles:

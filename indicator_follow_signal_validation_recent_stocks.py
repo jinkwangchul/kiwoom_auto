@@ -182,6 +182,22 @@ class IndicatorFollowSignalValidationRecentStockStore:
         self._write_recent_stocks()
         return True
 
+    def retain_prefix(self, stocks: object) -> bool:
+        source = stocks if isinstance(stocks, (list, tuple)) else ()
+        retained: list[ValidationStockRef] = []
+        for stock in source:
+            if not isinstance(stock, ValidationStockRef):
+                return False
+            retained.append(ValidationStockRef(stock.code, stock.name))
+        normalized = tuple(retained)
+        if normalized != self._recent_stocks[:len(normalized)]:
+            return False
+        if normalized == self._recent_stocks:
+            return False
+        self._recent_stocks = normalized
+        self._write_recent_stocks()
+        return True
+
     def _write_recent_stocks(self) -> None:
         payload = [
             {"code": stock.code, "name": stock.name}
