@@ -13767,7 +13767,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 def _present_signal_validation_failure(owner: object, message: str) -> None:
     if message == "SERVER_NOT_CONNECTED":
         return
-    text = f"검증차트2: {str(message or '실패')}"
+    text = f"검증차트: {str(message or '실패')}"
     status_message = getattr(owner, "statusBarMessage", None)
     if callable(status_message):
         status_message(text)

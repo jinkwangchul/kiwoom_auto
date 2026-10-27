@@ -232,7 +232,7 @@ def _histogram_condition(parameter_json: str) -> Mapping[str, Any] | None:
 
 
 class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
-    """V2-owned read-only candle projection and selection boundary."""
+    """Read-only candle projection and selection boundary."""
 
     bar_selected = pyqtSignal(int)
     validation_range_drag_started = pyqtSignal(int)
@@ -1727,7 +1727,7 @@ def _krx_regular_session_candles(
 class IndicatorFollowSignalValidationChartCanvas(
     _IndicatorFollowSignalValidationChartCanvasBase
 ):
-    """V2 scroll canvas containing Candle, markers, and static filter series."""
+    """Chart scroll canvas containing Candle, markers, and static filter series."""
 
     _LEFT = 12
     _TOP = 58
@@ -7532,7 +7532,7 @@ class IndicatorFollowSignalValidationChartCanvas(
 
 
 class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
-    """V2-only price labels fixed outside the horizontal scroll viewport."""
+    """Price labels fixed outside the horizontal scroll viewport."""
 
     price_scale_wheel_requested = pyqtSignal(float, int)
 
@@ -7780,7 +7780,7 @@ class IndicatorFollowSignalValidationFixedPriceAxis(QWidget):
 
 
 class IndicatorFollowSignalValidationStockDisplay(QWidget):
-    """Plain stock identity display for the V2 compact header."""
+    """Plain stock identity display for the compact chart header."""
 
     full_stock_selection_requested = pyqtSignal()
 
@@ -7850,7 +7850,7 @@ class IndicatorFollowSignalValidationStockDisplay(QWidget):
 
 
 class IndicatorFollowSignalValidationRecentStockRow(QWidget):
-    """Single-line, stock-by-stock view of the retained V2 recent-stock MRU."""
+    """Single-line, stock-by-stock view of the retained recent-stock MRU."""
 
     stock_activated = pyqtSignal(object)
     stock_remove_requested = pyqtSignal(object)
@@ -8907,7 +8907,7 @@ class IndicatorFollowSignalValidationV5Window(
                 combo.setStyleSheet(base_style)
 
     def _build_signal_validation_control_tab(self) -> None:
-        """Build the compact V2 shell while reusing only BUY/SELL signal builders."""
+        """Build the compact chart shell while reusing only BUY/SELL signal builders."""
         self.control_tab = QWidget()
         outer = QVBoxLayout(self.control_tab)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -10235,7 +10235,7 @@ class IndicatorFollowSignalValidationV5Window(
         self.rules = deepcopy(self.rules_data)
         # Entry restoration must retain unresolved legacy operands for an
         # explicit operator re-selection.  The strict apply projection is for
-        # applying a validated V2 candidate back to its parent dialog.
+        # applying a validated chart candidate back to its parent dialog.
         self.restore_signal_validation_entry_ui_state(
             self._signal_validation_seed.to_ui_state()
         )
@@ -10252,7 +10252,7 @@ class IndicatorFollowSignalValidationV5Window(
         )
 
     def _sync_control_page_size(self) -> None:
-        """Keep V2 height in sync without shrinking its no-scroll page width."""
+        """Keep control page height in sync without shrinking its no-scroll page width."""
         if not hasattr(self, "control_page"):
             return
 
@@ -10433,7 +10433,7 @@ class IndicatorFollowSignalValidationV5Window(
         self._historical_candle_count = candle_count
 
     def commit_entry_state(self) -> _ValidationEntryState:
-        """Capture the immutable V2-open baseline exactly once."""
+        """Capture the immutable chart-open baseline exactly once."""
         if self._entry_state is None:
             ui_state = project_signal_validation_ui_state(
                 self._signal_validation_seed.to_ui_state()

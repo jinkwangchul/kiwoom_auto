@@ -313,6 +313,18 @@ def test_v5_binder_reuses_owner_and_dialog_connection():
     assert not hasattr(owner, "_indicator_follow_signal_validation_flow")
 
 
+def test_v5_failure_uses_single_chart_status_label():
+    from gui_indicator_follow_signal_validation_v5_flow import (
+        _present_signal_validation_failure,
+    )
+
+    messages = []
+    owner = SimpleNamespace(statusBarMessage=messages.append)
+    _present_signal_validation_failure(owner, "TEST_FAIL")
+
+    assert messages == ["검증차트: TEST_FAIL"]
+
+
 def test_settings_dialog_exposes_v5_without_v4_entry_and_preserves_seed():
     ensure_qapplication()
     project_root = Path(__file__).resolve().parents[1]

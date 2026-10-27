@@ -1502,7 +1502,7 @@ class IndicatorFollowRoutineSettingsDialog(
         except Exception:
             QMessageBox.warning(
                 self,
-                "검증차트5",
+                "검증차트",
                 "현재 편집 설정으로 V5 신호검증 데이터를 만들 수 없습니다.",
             )
             return None
@@ -1639,7 +1639,7 @@ class IndicatorFollowRoutineSettingsDialog(
         }
 
     def apply_signal_validation_candidate_ui_state(self, state):
-        """Apply one already-projected V2 candidate to the in-memory Working UI only."""
+        """Apply one already-projected chart candidate to the in-memory Working UI only."""
         return self._apply_projected_signal_validation_ui_state(state)
 
     def restore_settings_undo_snapshot(self):
@@ -3467,7 +3467,7 @@ class IndicatorFollowRoutineSettingsDialog(
         return errors
 
     def apply_signal_validation_ui_state(self, state):
-        """Apply only V2-visible signal controls in memory; never touch execution settings."""
+        """Apply only chart-visible signal controls in memory; never touch execution settings."""
         state = self._prepare_buy_bollinger_sign_ui_state_for_load(state)
         try:
             from indicator_follow_signal_validation_projection import (
@@ -3486,7 +3486,7 @@ class IndicatorFollowRoutineSettingsDialog(
         return self._apply_projected_signal_validation_ui_state(projected)
 
     def restore_signal_validation_entry_ui_state(self, state):
-        """Restore an already accepted V2 Entry projection in memory only."""
+        """Restore an already accepted chart entry projection in memory only."""
         state = self._prepare_buy_bollinger_sign_ui_state_for_load(state)
         try:
             from indicator_follow_signal_validation_projection import (
