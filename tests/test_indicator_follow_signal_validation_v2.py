@@ -3632,10 +3632,11 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
         self.assertIsNotNone(ma200_series[0])
         self.assertAlmostEqual(200.5, ma200_series[0])
 
-    def test_v2_entry_button_remains_after_legacy_entry_retirement(self):
+    def test_v5_entry_is_sole_button_after_v2_retirement(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             rules_path.write_text(json.dumps(self.rules, ensure_ascii=False), encoding="utf-8")
+            original_rules = rules_path.read_bytes()
             for mode in ("registration", "edit"):
                 kwargs = dict(
                     rules_path=rules_path,
@@ -3649,9 +3650,7 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                 with patch.object(dialog_module.QTimer, "singleShot"):
                     dialog = dialog_module.IndicatorFollowRoutineSettingsDialog(**kwargs)
                 self.widgets.append(dialog)
-                new_payloads = []
                 v5_payloads = []
-                dialog.signal_validation_requested.connect(new_payloads.append)
                 dialog.signal_validation_v5_requested.connect(v5_payloads.append)
                 dialog.buy_signal_expr_line.setText("A or D")
                 for group_name in "abc":
@@ -3663,34 +3662,27 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                         dialog,
                         f"sell_signal_condition_{group_name}_gap_right_combo",
                     ).setCurrentText("현재가")
-                dialog.signal_validation_button.click()
+                self.assertFalse(hasattr(dialog, "signal_validation_button"))
+                self.assertFalse(hasattr(dialog, "signal_validation_requested"))
+                self.assertFalse(hasattr(dialog, "_handle_signal_validation_clicked"))
                 self.assertFalse(hasattr(dialog, "validation_chart_button"))
                 self.assertFalse(hasattr(dialog, "validation_chart_requested"))
-                self.assertEqual("검증차트2", dialog.signal_validation_button.text())
-                self.assertEqual(1, len(new_payloads))
-                self.assertIsInstance(new_payloads[0], IndicatorFollowSignalValidationSeed)
-                self.assertEqual(
-                    "A or D",
-                    new_payloads[0].to_ui_state()["basic"]["buy_signal_expr_line"],
-                )
-                signal_bar = new_payloads[0].settings_snapshot.to_dict()["bar"]
-                self.assertEqual(self.rules["bar"]["buy_delay_bar"], signal_bar["buy_delay_bar"])
-                self.assertEqual(self.rules["bar"]["sell_delay_bar"], signal_bar["sell_delay_bar"])
-
                 dialog.signal_validation_v5_button.click()
-                self.assertEqual("검증차트5", dialog.signal_validation_v5_button.text())
+                self.assertEqual("검증차트", dialog.signal_validation_v5_button.text())
                 self.assertEqual(1, len(v5_payloads))
                 self.assertIsInstance(v5_payloads[0], IndicatorFollowSignalValidationSeed)
                 self.assertEqual(
-                    new_payloads[0].settings_snapshot.rules_hash,
-                    v5_payloads[0].settings_snapshot.rules_hash,
+                    "A or D",
+                    v5_payloads[0].to_ui_state()["basic"]["buy_signal_expr_line"],
                 )
-                self.assertEqual(
-                    new_payloads[0].to_ui_state(),
-                    v5_payloads[0].to_ui_state(),
-                )
+                signal_bar = v5_payloads[0].settings_snapshot.to_dict()["bar"]
+                self.assertEqual(self.rules["bar"]["buy_delay_bar"], signal_bar["buy_delay_bar"])
+                self.assertEqual(self.rules["bar"]["sell_delay_bar"], signal_bar["sell_delay_bar"])
+                second_seed = dialog._handle_signal_validation_v5_clicked()
+                self.assertEqual(v5_payloads[0].settings_snapshot.rules_hash, second_seed.settings_snapshot.rules_hash)
+                self.assertEqual(original_rules, rules_path.read_bytes())
 
-    def test_routine_settings_shell_owns_optional_v2_flow_binding(self):
+    def test_routine_settings_shell_owns_only_v5_flow_binding(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
             rules_path.write_text(
@@ -3702,11 +3694,8 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
             self.widgets.append(owner)
             with (
                 patch.object(dialog_module.QTimer, "singleShot"),
-                patch.object(
-                    flow_module,
-                    "bind_indicator_follow_signal_validation_flow",
-                    return_value=object(),
-                ) as bind,
+                patch.object(flow_module, "bind_indicator_follow_signal_validation_flow") as v2_bind,
+                patch("gui_indicator_follow_signal_validation_v5_flow.bind_indicator_follow_signal_validation_v5_flow", return_value=object()) as v5_bind,
             ):
                 dialog = dialog_module.IndicatorFollowRoutineSettingsDialog(
                     rules_path=rules_path,
@@ -3717,7 +3706,9 @@ class IndicatorFollowSignalValidationV2Test(unittest.TestCase):
                     settings_mode="registration",
                 )
             self.widgets.append(dialog)
-        bind.assert_called_once_with(owner, dialog)
+        v2_bind.assert_not_called()
+        v5_bind.assert_called_once_with(owner, dialog)
+        self.assertFalse(hasattr(owner, "_indicator_follow_signal_validation_flow"))
 
     def test_seed_and_signal_only_projection_are_detached_and_strict(self):
         source = {

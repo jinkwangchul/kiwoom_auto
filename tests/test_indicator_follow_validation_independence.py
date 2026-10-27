@@ -344,9 +344,6 @@ class IndicatorFollowValidationIndependenceTest(unittest.TestCase):
                 blocked = {{
                     "gui_indicator_follow_signal_validation_flow",
                     "gui_indicator_follow_signal_validation_window",
-                    "indicator_follow_signal_validation_projection",
-                    "indicator_follow_signal_validation_presentation",
-                    "indicator_follow_signal_validation_recent_stocks",
                 }}
 
                 class V2Blocker(importlib.abc.MetaPathFinder):
@@ -378,7 +375,12 @@ class IndicatorFollowValidationIndependenceTest(unittest.TestCase):
                     definition_id="indicator_follow",
                     settings_mode="registration",
                 )
-                assert dialog.signal_validation_button.isEnabled() is False
+                assert not hasattr(dialog, "signal_validation_button")
+                assert not hasattr(dialog, "signal_validation_requested")
+                assert dialog.signal_validation_v5_button.isEnabled()
+                assert not hasattr(owner, "_indicator_follow_signal_validation_flow")
+                assert hasattr(owner, "_indicator_follow_signal_validation_v5_flow")
+                assert "gui_indicator_follow_signal_validation_flow" not in sys.modules
                 assert isinstance(dialog.collect_indicator_follow_ui_state(), dict)
                 preview = dialog.build_engine_rules_preview_from_current_ui_state()
                 assert isinstance(preview, dict)

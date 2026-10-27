@@ -76,12 +76,9 @@ class IndicatorFollowSettingsSectionDefaultsTest(unittest.TestCase):
                     self._assert_initial_section_state(dialog)
                     self.assertEqual(save_text, dialog.save_button.text())
                     self.assertGreater(dialog.reload_button.receivers(dialog.reload_button.clicked), 0)
-                    self.assertGreater(
-                        dialog.signal_validation_button.receivers(
-                            dialog.signal_validation_button.clicked
-                        ),
-                        0,
-                    )
+                    self.assertFalse(hasattr(dialog, "signal_validation_button"))
+                    self.assertFalse(hasattr(dialog, "signal_validation_requested"))
+                    self.assertFalse(hasattr(dialog, "_handle_signal_validation_clicked"))
                     self.assertFalse(hasattr(dialog, "signal_validation_v3_button"))
                     self.assertFalse(hasattr(dialog, "signal_validation_v3_requested"))
                     self.assertFalse(hasattr(dialog, "signal_validation_v4_button"))
@@ -92,7 +89,7 @@ class IndicatorFollowSettingsSectionDefaultsTest(unittest.TestCase):
                         ),
                         0,
                     )
-                    self.assertEqual("검증차트5", dialog.signal_validation_v5_button.text())
+                    self.assertEqual("검증차트", dialog.signal_validation_v5_button.text())
                     self.assertFalse(hasattr(dialog, "validation_chart_button"))
                     self.assertGreater(dialog.save_button.receivers(dialog.save_button.clicked), 0)
                     self.assertGreater(dialog.close_button.receivers(dialog.close_button.clicked), 0)

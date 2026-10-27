@@ -25,7 +25,6 @@ from tests.qt_test_support import ensure_qapplication
 
 
 class _RequestDialog(QObject):
-    signal_validation_requested = pyqtSignal(object)
     signal_validation_v5_requested = pyqtSignal(object)
 
 
@@ -279,9 +278,6 @@ def test_v5_picker_registration_status_uses_one_fresh_local_snapshot_per_result(
 
 
 def test_v5_modules_are_standalone_and_flow_uses_v5_window():
-    from gui_indicator_follow_signal_validation_window import (
-        IndicatorFollowSignalValidationWindow,
-    )
     from gui_indicator_follow_signal_validation_v5_flow import (
         IndicatorFollowSignalValidationV5Flow,
     )
@@ -289,7 +285,7 @@ def test_v5_modules_are_standalone_and_flow_uses_v5_window():
         IndicatorFollowSignalValidationV5Window,
     )
 
-    assert IndicatorFollowSignalValidationV5Window is not IndicatorFollowSignalValidationWindow
+    assert IndicatorFollowSignalValidationV5Window.__module__ == "gui_indicator_follow_signal_validation_v5_window"
     assert importlib.util.find_spec("gui_indicator_follow_signal_validation_v4_flow") is None
     assert importlib.util.find_spec("gui_indicator_follow_signal_validation_v4_window") is None
     assert (
@@ -298,10 +294,7 @@ def test_v5_modules_are_standalone_and_flow_uses_v5_window():
     )
 
 
-def test_v5_and_v2_binders_keep_separate_owner_state():
-    from gui_indicator_follow_signal_validation_flow import (
-        bind_indicator_follow_signal_validation_flow,
-    )
+def test_v5_binder_reuses_owner_and_dialog_connection():
     from gui_indicator_follow_signal_validation_v5_flow import (
         bind_indicator_follow_signal_validation_v5_flow,
     )
@@ -311,12 +304,13 @@ def test_v5_and_v2_binders_keep_separate_owner_state():
     owner.kiwoom_api = None
     request_dialog = _RequestDialog()
 
-    v2_flow = bind_indicator_follow_signal_validation_flow(owner, request_dialog)
     v5_flow = bind_indicator_follow_signal_validation_v5_flow(owner, request_dialog)
+    again = bind_indicator_follow_signal_validation_v5_flow(owner, request_dialog)
 
-    assert v2_flow is owner._indicator_follow_signal_validation_flow
     assert v5_flow is owner._indicator_follow_signal_validation_v5_flow
-    assert v5_flow is not v2_flow
+    assert again is v5_flow
+    assert request_dialog.receivers(request_dialog.signal_validation_v5_requested) == 1
+    assert not hasattr(owner, "_indicator_follow_signal_validation_flow")
 
 
 def test_settings_dialog_exposes_v5_without_v4_entry_and_preserves_seed():
@@ -344,7 +338,10 @@ def test_settings_dialog_exposes_v5_without_v4_entry_and_preserves_seed():
         assert not hasattr(dialog, "signal_validation_v4_button")
         assert not hasattr(dialog, "signal_validation_v4_requested")
         assert not hasattr(dialog, "_handle_signal_validation_v4_clicked")
-        assert dialog.signal_validation_v5_button.text() == "검증차트5"
+        assert not hasattr(dialog, "signal_validation_button")
+        assert not hasattr(dialog, "signal_validation_requested")
+        assert not hasattr(dialog, "_handle_signal_validation_clicked")
+        assert dialog.signal_validation_v5_button.text() == "검증차트"
 
         v5_payloads = []
         dialog.signal_validation_v5_requested.connect(v5_payloads.append)
@@ -368,6 +365,8 @@ def test_missing_optional_v5_disables_only_v5_entry():
     real_import = builtins.__import__
 
     def import_without_v5(name, *args, **kwargs):
+        if name == "gui_indicator_follow_signal_validation_flow":
+            raise AssertionError("retired V2 flow was imported")
         if name == "gui_indicator_follow_signal_validation_v4_flow":
             raise AssertionError("retired V4 flow was imported")
         if name == "gui_indicator_follow_signal_validation_v5_flow":
@@ -389,8 +388,11 @@ def test_missing_optional_v5_disables_only_v5_entry():
         )
 
     try:
+        assert not hasattr(dialog, "signal_validation_button")
+        assert not hasattr(dialog, "signal_validation_requested")
         assert not hasattr(dialog, "signal_validation_v4_button")
         assert not dialog.signal_validation_v5_button.isEnabled()
+        assert not hasattr(owner, "_indicator_follow_signal_validation_flow")
         assert not hasattr(owner, "_indicator_follow_signal_validation_v4_flow")
         assert not hasattr(owner, "_indicator_follow_signal_validation_v5_flow")
     finally:
