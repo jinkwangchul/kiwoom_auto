@@ -131,6 +131,7 @@ _DOWN = QColor("#3b82f6")
 _FLAT = QColor("#9ca3af")
 _BUY = QColor("#22c55e")
 _SELL = QColor("#f59e0b")
+_LIQUIDATION_SELL = QColor("#ef4444")
 _SELECTION_LINE = QColor("#fde047")
 _VALIDATION_RANGE_SELECTION = QColor(96, 165, 250, 34)
 _VALIDATION_RANGE_LINE = QColor("#60a5fa")
@@ -2753,6 +2754,18 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._validation_range = (start, end)
         self.update()
 
+    def _liquidation_marker_records(self) -> list[dict[str, Any]]:
+        if self._validation_range is None:
+            return []
+        end = self._validation_range[1]
+        if not self._is_index_visible(end):
+            return []
+        return [
+            {"evaluation_index": end, "side": "SELL", "virtual_liquidation": True}
+            for cycle in self._completed_cycle_average_lines
+            if cycle.is_liquidation and cycle.sell_index == end
+        ]
+
     def set_completed_cycle_average_lines(
         self,
         cycles: tuple[IndicatorFollowValidationCompletedCycle, ...],
@@ -4266,6 +4279,20 @@ class IndicatorFollowSignalValidationChartCanvas(
             max(0.0, slot_width - 1.0),
         )
         return max(1.0, slot_width - effective_gap)
+
+    def selection_end_time_record(self) -> dict[str, Any] | None:
+        if self._validation_range is None:
+            return None
+        end = self._validation_range[1]
+        if not self._is_index_visible(end):
+            return None
+        x = self._x_for_index(end)
+        if not self.plot_left <= x <= self.width() - self._RIGHT:
+            return None
+        timestamp = _parse_candle_time(self._candles[end].get("time"))
+        if timestamp is None:
+            return None
+        return {"index": end, "x": x, "label": timestamp.strftime("%m/%d %H:%M")}
 
     def time_axis_records(self) -> list[dict[str, Any]]:
         start, end = self._visible_index_bounds()
@@ -7359,7 +7386,7 @@ class IndicatorFollowSignalValidationChartCanvas(
         }
         marker_pens = {side: QPen(color, 1) for side, color in (("BUY", _BUY), ("SELL", _SELL))}
         marker_brushes = {side: QBrush(color) for side, color in (("BUY", _BUY), ("SELL", _SELL))}
-        for marker in self._visible_marker_records():
+        for marker in (*self._visible_marker_records(), *self._liquidation_marker_records()):
             index = marker.get("evaluation_index")
             side = marker.get("side")
             if isinstance(index, bool) or not isinstance(index, int):
@@ -7376,8 +7403,12 @@ class IndicatorFollowSignalValidationChartCanvas(
                 marker_side = "SELL"
             else:
                 continue
-            painter.setPen(marker_pens[marker_side])
-            painter.setBrush(marker_brushes[marker_side])
+            if marker.get("virtual_liquidation"):
+                painter.setPen(QPen(_LIQUIDATION_SELL, 1))
+                painter.setBrush(QBrush(_LIQUIDATION_SELL))
+            else:
+                painter.setPen(marker_pens[marker_side])
+                painter.setBrush(marker_brushes[marker_side])
             painter.drawPolygon(marker_shapes[marker_side].translated(x, y))
         painter.restore()
 
@@ -7386,8 +7417,6 @@ class IndicatorFollowSignalValidationChartCanvas(
         self._draw_lower_panes(painter)
 
         time_axis_records = self.time_axis_records()
-        if not time_axis_records:
-            return
         painter.setPen(_TEXT)
         font = painter.font()
         font.setPointSize(max(7, font.pointSize() - 1))
@@ -7400,6 +7429,19 @@ class IndicatorFollowSignalValidationChartCanvas(
                 Qt.AlignHCenter | Qt.AlignTop,
                 record["label"],
             )
+        end_record = self.selection_end_time_record()
+        if end_record is not None:
+            label = end_record["label"]
+            badge_width = painter.fontMetrics().horizontalAdvance(label) + 12
+            badge_left = max(
+                float(self.plot_left),
+                min(float(end_record["x"]) - badge_width / 2,
+                    float(self.width() - self._RIGHT) - badge_width),
+            )
+            badge = QRectF(badge_left, label_top, badge_width, 22)
+            painter.fillRect(badge, _BACKGROUND)
+            painter.setPen(_VALIDATION_RANGE_LINE)
+            painter.drawText(badge, Qt.AlignCenter, label)
 
 
     def _static_chart_state_key(self) -> tuple[Any, ...]:
@@ -8533,8 +8575,11 @@ class IndicatorFollowSignalValidationV5Window(
     @staticmethod
     def _new_basic_header_spaced_separator() -> QLabel:
         separator = QLabel("|")
-        separator.setContentsMargins(12, 0, 12, 0)
+        separator.setFixedSize(12, 30)
         separator.setAlignment(Qt.AlignCenter)
+        separator.setStyleSheet(
+            "font-size: 13pt; font-weight: bold; color: #000000; padding: 0px 1px;"
+        )
         return separator
 
     def _build_validation_execution_controls(self) -> None:
@@ -8735,6 +8780,9 @@ class IndicatorFollowSignalValidationV5Window(
         self.validation_regular_market_separator = (
             self._new_basic_header_spaced_separator()
         )
+        self.validation_liquidation_separator = (
+            self._new_basic_header_spaced_separator()
+        )
         self.validation_regular_market_only_check = QCheckBox("정규장만 표시")
         self.validation_regular_market_only_check.setChecked(False)
         self.validation_range_liquidation_check = QCheckBox("청산")
@@ -8751,6 +8799,7 @@ class IndicatorFollowSignalValidationV5Window(
             self.validation_trading_cost_box,
             self.validation_regular_market_separator,
             self.validation_range_liquidation_check,
+            self.validation_liquidation_separator,
             self.validation_regular_market_only_check,
         ):
             self.basic_header_row.insertWidget(
@@ -8968,7 +9017,7 @@ class IndicatorFollowSignalValidationV5Window(
         )
         self.basic_signal_interval_combo.view().setMinimumWidth(timeframe_combo_width)
         header_row.addWidget(self.basic_toggle_button)
-        header_row.addWidget(QLabel("|"))
+        header_row.addWidget(self._new_basic_header_spaced_separator())
         header_row.addWidget(self.compact_stock_display)
         header_row.addWidget(self._new_basic_header_spaced_separator())
         header_row.addWidget(QLabel("기준봉"))

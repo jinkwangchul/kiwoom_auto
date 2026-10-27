@@ -341,6 +341,9 @@ def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
         original_summary = window.estimated_return_label.text()
         assert not window.validation_range_liquidation_check.isChecked()
         assert len(original_cycles) == 1
+        assert window.canvas._liquidation_marker_records() == []
+        end_label = window.canvas.selection_end_time_record()
+        assert end_label["label"] == "10/27 09:04"
         assert window.completed_cycle_table.item(0, 0).text() == "1"
 
         tooltip_calls = tooltips.call_count
@@ -355,6 +358,9 @@ def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
         assert forced.buy_indexes == (598,)
         assert forced.sell_index == 599
         assert forced.sell_price == 150_000.0
+        assert window.canvas._liquidation_marker_records() == [
+            {"evaluation_index": 599, "side": "SELL", "virtual_liquidation": True}]
+        assert window.canvas.selection_end_time_record() == end_label
         assert window.completed_cycle_table.item(1, 0).text() == "청산"
         assert window.completed_cycle_table.item(1, 5).text() == "10/27 09:04"
         assert window.completed_cycle_table.item(1, 6).text() == "150,000"
@@ -372,6 +378,7 @@ def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
         window._refresh_validation_range_results()
         assert len(window.completed_cycles) == 1
         assert not window.completed_cycles[0].is_liquidation
+        assert window.canvas._liquidation_marker_records() == []
         window._validation_range = (596, 599)
         window._refresh_validation_range_results()
 
@@ -380,6 +387,8 @@ def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
         assert tooltips.call_count == tooltip_calls
         assert window.completed_cycles == original_cycles
         assert tuple(window.canvas._completed_cycle_average_lines) == original_cycles
+        assert window.canvas._liquidation_marker_records() == []
+        assert window.canvas.selection_end_time_record() == end_label
         assert window.estimated_return_label.text() == original_summary
         window.validation_range_liquidation_check.setChecked(True)
         window._validation_range = None
@@ -417,3 +426,96 @@ def test_v5_execution_cycle_projection_marks_only_forced_last_cycle(case):
     assert len(cycles) == 1
     assert cycles[0].is_liquidation
     assert cycles[0].buy_quantity == 3
+
+
+def test_v5_header_pipes_share_spacing_and_separate_liquidation(case):
+    window = window_for(case)
+    layout = window.basic_header_row
+    widgets = [layout.itemAt(index).widget() for index in range(layout.count())]
+    pipes = [widget for widget in widgets
+             if isinstance(widget, window_module.QLabel) and widget.text() == "|"]
+    assert layout.spacing() == 8
+    assert len(pipes) == 6
+    first_pipe = pipes[0]
+    for pipe in pipes:
+        assert pipe.contentsMargins() == first_pipe.contentsMargins()
+        assert pipe.styleSheet() == first_pipe.styleSheet()
+        assert pipe.minimumWidth() == pipe.maximumWidth() == 12
+        assert pipe.minimumHeight() == pipe.maximumHeight() == 30
+    assert widgets.index(window.validation_regular_market_separator) + 1 == widgets.index(
+        window.validation_range_liquidation_check)
+    assert widgets.index(window.validation_range_liquidation_check) + 1 == widgets.index(
+        window.validation_liquidation_separator)
+    assert widgets.index(window.validation_liquidation_separator) + 1 == widgets.index(
+        window.validation_regular_market_only_check)
+
+
+def test_v5_liquidation_sell_marker_is_visual_only_and_viewport_bound(case):
+    from PyQt5.QtGui import QPainter, QPixmap
+
+    rows = candles(8)
+    markers = [{"evaluation_index": 2, "side": "BUY"},
+               {"evaluation_index": 4, "side": "SELL"}]
+    canvas = window_module.IndicatorFollowSignalValidationChartCanvas(
+        rows, markers, timeframe_key="M1")
+    case.widgets.append(canvas)
+    canvas.resize(800, 400)
+    canvas.set_validation_range(2, 7)
+    assert canvas._liquidation_marker_records() == []
+    cycle = window_module.IndicatorFollowValidationCompletedCycle(
+        cycle_number=1, buy_indexes=(6,), buy_start_index=6,
+        buy_end_index=6, buy_count=1, average_buy_price=100_006.0,
+        sell_index=7, sell_price=100_007.0, estimated_return_percent=0.0,
+        is_liquidation=True)
+    canvas.set_completed_cycle_average_lines((cycle,))
+    original = canvas.marker_records()
+    assert canvas._liquidation_marker_records() == [
+        {"evaluation_index": 7, "side": "SELL", "virtual_liquidation": True}]
+    assert canvas.marker_count("SELL") == 1
+    assert canvas.marker_records() == original
+    pixmap = QPixmap(canvas.size())
+    painter = QPainter(pixmap)
+    try:
+        canvas._paint_static_chart(painter, canvas.price_scale())
+    finally:
+        painter.end()
+    assert not pixmap.isNull()
+    canvas.set_time_view(0, 5)
+    assert canvas._liquidation_marker_records() == []
+    canvas.set_time_view(3, 5)
+    assert len(canvas._liquidation_marker_records()) == 1
+    canvas.set_completed_cycle_average_lines((
+        window_module.IndicatorFollowValidationCompletedCycle(
+            cycle_number=1, buy_indexes=(6,), buy_start_index=6,
+            buy_end_index=6, buy_count=1, average_buy_price=100_006.0,
+            sell_index=7, sell_price=100_007.0, estimated_return_percent=0.0),))
+    assert canvas._liquidation_marker_records() == []
+    canvas.set_completed_cycle_average_lines((cycle,))
+    canvas.set_validation_range(None, None)
+    assert canvas._liquidation_marker_records() == []
+    assert canvas.marker_records() == original
+
+
+def test_v5_selected_end_time_label_uses_exact_bar_and_follows_view(case):
+    rows = candles(8)
+    rows[7]["time"] = "20261027163300"
+    canvas = window_module.IndicatorFollowSignalValidationChartCanvas(
+        rows, [], timeframe_key="M1")
+    case.widgets.append(canvas)
+    canvas.resize(800, 400)
+    assert canvas.selection_end_time_record() is None
+    canvas.set_validation_range(2, 7)
+    record = canvas.selection_end_time_record()
+    assert record == {"index": 7, "x": canvas._x_for_index(7),
+                      "label": "10/27 16:33"}
+    canvas.set_time_view(0, 5)
+    assert canvas.selection_end_time_record() is None
+    canvas.set_validation_range(2, 4)
+    left_x = canvas.selection_end_time_record()["x"]
+    canvas.set_time_view(3, 5)
+    assert canvas.selection_end_time_record()["x"] != left_x
+    assert canvas.selection_end_time_record()["x"] == canvas._x_for_index(4)
+    canvas._candles[4]["time"] = "bad"
+    assert canvas.selection_end_time_record() is None
+    canvas.set_validation_range(None, None)
+    assert canvas.selection_end_time_record() is None
