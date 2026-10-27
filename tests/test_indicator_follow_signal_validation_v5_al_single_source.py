@@ -1780,6 +1780,58 @@ def test_completed_m3_direct_al_auction_gaps_only_pass_off_session(case):
     assert pool == original
 
 
+@pytest.mark.parametrize("case", ["valid", "valid_range", "missing", "forged", "reordered",
+                                  "afterhours", "scope_off"])
+def test_completed_m3_regular_display_requires_exact_native_filter(case):
+    from copy import deepcopy
+
+    flow, session, pool, market = _after_forming_case("M3", 3)
+    market.project_broker_sor_m1_calculation = lambda **_kw: pytest.fail(
+        "completed M3 must not request M1 projection")
+    pool["candles"] = [
+        dict(pool["candles"][0], time=f"{day}{clock}")
+        for day, clock in (("20261021", "090000"), ("20261021", "153000"),
+                           ("20261021", "153900"), ("20261023", "090000"),
+                           ("20261023", "153000"), ("20261023", "153900"),
+                           ("20261023", "195700"))
+    ]
+    pool["requested_count"] = len(pool["candles"])
+    session.request.settings_snapshot = SimpleNamespace(to_dict=lambda: {
+        "bar": {"bar_minutes": 3},
+        "validation_market_scope": {"regular_market_only": case != "scope_off"},
+    })
+    flow._now_factory = lambda: datetime(2026, 10, 24, 5, 25,
+                                         tzinfo=ZoneInfo("Asia/Seoul"))
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    assert frozen[2]["projection"] == "DIRECT_COMPLETED_TIMEFRAME"
+    view = flow._validation_pool_for_session(session, pool, target_count=(
+        4 if case == "valid_range" else len(pool["candles"])))
+    expected = flow_module._krx_regular_session_candles(view["candles"])
+    assert [row["time"] for row in expected] == (
+        ["20261023090000"] if case == "valid_range"
+        else ["20261021090000", "20261023090000"])
+    if case == "scope_off":
+        view["display_candles"] = expected
+    else:
+        assert view["display_candles"] == expected
+    if case == "missing":
+        view["display_candles"] = expected[1:]
+    elif case == "forged":
+        view["display_candles"] = deepcopy(expected)
+        view["display_candles"][0]["volume"] += 1
+    elif case == "reordered":
+        view["display_candles"] = list(reversed(expected))
+    elif case == "afterhours":
+        view["display_candles"] = [*expected, view["candles"][-1]]
+    if case not in {"valid", "valid_range"}:
+        with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
+            flow._sor_m1_calculation_view(session, pool, view, frozen)
+        return
+    result = flow._sor_m1_calculation_view(session, pool, view, frozen)
+    assert result["candles"] == view["candles"]
+    assert result["display_candles"] == expected
+
+
 @pytest.mark.parametrize("timeframe,minutes", [
     ("M5", 5), ("M10", 10), ("M30", 30),
     ("M60", 60), ("M120", 120), ("M240", 240),

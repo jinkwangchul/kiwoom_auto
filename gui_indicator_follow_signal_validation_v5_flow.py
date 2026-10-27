@@ -8819,11 +8819,18 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_UNAVAILABLE")
             stamps = [str(row.get("time") or "") for row in historical
                       if isinstance(row, dict)]
+            settings = getattr(session.request, "settings_snapshot", None)
+            rules = settings.to_dict() if settings is not None else {}
+            scope = rules.get("validation_market_scope") if isinstance(rules, dict) else None
+            regular_only = (isinstance(scope, dict)
+                            and scope.get("regular_market_only") is True)
+            expected_display = (_krx_regular_session_candles(historical)
+                                if regular_only else historical[-len(display):])
             if (len(stamps) != len(historical)
                     or any(len(stamp) != 14 or not stamp.isdigit() for stamp in stamps)
                     or stamps != sorted(set(stamps))
                     or any(row.get("is_complete") is False for row in historical)
-                    or (display != historical[-len(display):] and not direct_m5_special)):
+                    or (display != expected_display and not direct_m5_special)):
                 raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
             if direct_m5_special:
                 source_rows = source_pool.get("candles")
