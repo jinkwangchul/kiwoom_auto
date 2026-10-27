@@ -222,6 +222,7 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
                     "projection": "FORMING_BASE_BAR",
                     "warmup_bars": 35,
                 },
+                "calculation_market_source": "SOR",
             }],
             preserve_stock_codes=("035420",),
         )

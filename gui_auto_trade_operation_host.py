@@ -7,6 +7,7 @@ from collections import deque
 from datetime import datetime
 import json
 import logging
+import os
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
@@ -52,6 +53,7 @@ from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
 from stock_code_contract import normalize_stock_code
 from stock_repository import StockRepository
+from stock_market_source_plan import calculation_market_source_for_stock
 from event_journal_production import (
     append_production_event,
     observe_owner_failure_transition,
@@ -137,6 +139,12 @@ class AutoTradeOperationHost(QObject):
             self._kiwoom_api(),
             self._market_data_execution_entry,
         )
+        self._no_order_sor_monitor = None
+        try:
+            from sor_no_order_monitor import NoOrderSorMonitor
+            self._no_order_sor_monitor = NoOrderSorMonitor(self._market_data_host, self)
+        except Exception:
+            pass  # Optional evidence cannot prevent operation host creation.
         self._market_data_ready_signal_bound = False
         self._market_data_comparison_signal_bound = False
         self._bind_market_data_host_signals_once()
@@ -269,6 +277,11 @@ class AutoTradeOperationHost(QObject):
 
     def shutdown(self) -> dict[str, object]:
         self._shutting_down = True
+        if self._no_order_sor_monitor is not None:
+            try:
+                self._no_order_sor_monitor.shutdown()
+            except Exception:
+                pass
         self._market_data_host.shutdown()
         self._bar_commit_trigger_queue.clear()
         return self.stop_operation_timers()
@@ -403,6 +416,12 @@ class AutoTradeOperationHost(QObject):
                 )
             )
             supported_codes = set(projection.target_stock_codes)
+            diagnostic_code = (
+                "005930"
+                if os.environ.get("KIWOOM_V5_SOR_TICK_EVIDENCE") == "1"
+                and os.environ.get("KIWOOM_V5_SOR_DIAGNOSTIC_STOCK_CODE") == "005930"
+                else ""
+            )
             standby_requirements: list[dict[str, object]] = []
             standby_skips: list[dict[str, str]] = []
             standby_errors: list[dict[str, str]] = []
@@ -468,11 +487,20 @@ class AutoTradeOperationHost(QObject):
                         request_reader(rules),
                         require_warmup=True,
                     )
-                    standby_requirements.append({
+                    requirement = {
                         "stock_code": code,
                         "rules": rules,
                         "projection_request": request,
-                    })
+                    }
+                    calculation_source = calculation_market_source_for_stock(
+                        repository.project_root, code, datetime.now(SEOUL_TIMEZONE),
+                    )
+                    if not calculation_source:
+                        raise ValueError("MARKET_SOURCE_PLAN_UNAVAILABLE")
+                    requirement["calculation_market_source"] = calculation_source
+                    if code == diagnostic_code:
+                        requirement["diagnostic_sor_m1"] = True
+                    standby_requirements.append(requirement)
                 except Exception as exc:
                     standby_errors.append({
                         "stock_code": code,
@@ -484,6 +512,7 @@ class AutoTradeOperationHost(QObject):
                         str(item.get("stock_code") or "").strip()
                         for item in standby_errors
                         if str(item.get("stock_code") or "").strip()
+                        and item.get("error") != "MARKET_SOURCE_PLAN_UNAVAILABLE"
                     }
                 )
             )
@@ -550,6 +579,12 @@ class AutoTradeOperationHost(QObject):
 
     def nxt_display_live_price_state(self, stock_code: str):
         return self._market_data_host.nxt_display_live_price_state(stock_code)
+
+    def sor_display_live_price_state(self, stock_code: str):
+        return self._market_data_host.sor_display_live_price_state(stock_code)
+
+    def set_mini_chart_observation_lease(self, window_key: object, stock_code: object):
+        return self._market_data_host.set_mini_chart_observation_lease(window_key, stock_code)
 
     def production_current_price_evidence(
         self,
