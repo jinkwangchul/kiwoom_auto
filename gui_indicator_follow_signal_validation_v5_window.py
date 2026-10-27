@@ -520,7 +520,10 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
                 effective_span >= _MAX_SIGNAL_VALIDATION_VISIBLE_CANDLE_SPAN
                 and not (
                     getattr(owner, "_historical_pool_installed", False)
-                    and int(getattr(owner, "_historical_candle_count", 0)) < 5000
+                    and (
+                        int(getattr(owner, "_historical_candle_count", 0)) < 5000
+                        or getattr(owner, "_visible_start_index", 0) > 0
+                    )
                 )
             ):
                 event.accept()
@@ -9419,13 +9422,12 @@ class IndicatorFollowSignalValidationV5Window(
     def _maybe_request_history_extension(
         self, *, source: str = "navigation", continued_wheel_prepend: bool = False,
     ) -> None:
+        if self._historical_candle_count >= 5000:
+            return
         if (
             source == "wheel"
             and self._visible_candle_span >= self._MAX_VISIBLE_CANDLE_SPAN
-            and (
-                self._historical_candle_count >= 5000
-                or self._history_extension_intent_source == "navigation"
-            )
+            and self._history_extension_intent_source == "navigation"
         ):
             return
         self._history_extension_intent_generation += 1
