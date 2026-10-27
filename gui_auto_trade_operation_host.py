@@ -27,6 +27,8 @@ from auto_trade_order_execution_boundary import (
 
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
+    is_operation_excluded,
+    is_review_required_state,
     is_review_required_stock_dir,
     unique_review_reasons,
     operator_review_location,
@@ -492,6 +494,38 @@ class AutoTradeOperationHost(QObject):
                     })
                     continue
                 try:
+                    stock_dir = repository.project_root / str(stock.stock_path)
+                    config_path = stock_dir / "config.json"
+                    state_path = stock_dir / "state.json"
+                    if not config_path.exists() or not state_path.exists():
+                        raise ValueError("STANDBY_CLASSIFICATION_UNAVAILABLE")
+                    config = read_json_dict(config_path)
+                    state = read_json_dict(state_path)
+                    if not config or not state or "holding_qty" not in state:
+                        raise ValueError("STANDBY_CLASSIFICATION_UNAVAILABLE")
+                    try:
+                        holding_qty = int(state["holding_qty"])
+                    except (TypeError, ValueError, OverflowError):
+                        raise ValueError("STANDBY_POSITION_UNCERTAIN") from None
+                    if holding_qty < 0:
+                        raise ValueError("STANDBY_POSITION_UNCERTAIN")
+                    # WAITING has a legacy review display label; require an explicit review flag.
+                    review_state = (
+                        {**state, "status": ""}
+                        if str(state.get("status", "")).strip().upper() == "WAITING"
+                        else state
+                    )
+                    if holding_qty == 0 and (
+                        is_operation_excluded(config) or is_review_required_state(review_state)
+                    ):
+                        standby_skips.append({
+                            "stock_code": code,
+                            "reason_code": (
+                                "OPERATION_EXCLUDED" if is_operation_excluded(config)
+                                else "REVIEW_REQUIRED"
+                            ),
+                        })
+                        continue
                     instance_id = str(
                         getattr(stock, "assigned_routine_instance_id", "") or ""
                     ).strip()
@@ -535,6 +569,14 @@ class AutoTradeOperationHost(QObject):
                         request_reader(rules),
                         require_warmup=True,
                     )
+                    request = {
+                        **request,
+                        "history_target_bars": max(
+                            300,
+                            request.get("history_target_bars", 0),
+                            request["warmup_bars"],
+                        ),
+                    }
                     requirement = {
                         "stock_code": code,
                         "rules": rules,

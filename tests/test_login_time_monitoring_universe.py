@@ -13,6 +13,7 @@ import pytest
 import gui_stock_data
 from candle_timeframe_aggregation import SEOUL_TIMEZONE
 from gui_auto_trade_operation_host import AutoTradeOperationHost
+from gui_market_data_host import MarketDataHost
 from gui_operation_ui_context import sync_auto_trade_monitoring_universe
 from gui_windows import MainWindow
 from stock_market_source_plan import initialize_stock_market_source_plan, read_stock_market_source_plan
@@ -187,6 +188,7 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             ),
         }
         repository = Mock()
+        repository.project_root = Path(".")
         repository.realtime_monitoring_universe.return_value = projection
         repository.list_current_registered_stocks.return_value = records
         market = SimpleNamespace(
@@ -215,6 +217,15 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             Path,
             "read_text",
             return_value=json.dumps({"bar": {"bar_minutes": 5}}),
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
+            "gui_auto_trade_operation_host.read_json_dict",
+            side_effect=lambda path: ({"holding_qty": 0, "status": "WAITING"}
+                                      if path.name == "state.json"
+                                      else {"operation_excluded": False}),
         ), patch(
             "routine_package_contract.load_routine_callable",
             side_effect=load_callable,
@@ -231,6 +242,7 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
                 "projection_request": {
                     "projection": "FORMING_BASE_BAR",
                     "warmup_bars": 35,
+                    "history_target_bars": 300,
                 },
                 "calculation_market_source": "SOR",
             }],
@@ -250,6 +262,7 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             source_record_count=1,
         )
         repository = Mock()
+        repository.project_root = Path(".")
         repository.realtime_monitoring_universe.return_value = projection
         repository.list_current_registered_stocks.return_value = [
             _record("035420", instance_id="INSTANCE-BROKEN")
@@ -284,6 +297,15 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
             Path,
             "read_text",
             return_value=json.dumps({"bar": {"bar_minutes": 5}}),
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
+            "gui_auto_trade_operation_host.read_json_dict",
+            side_effect=lambda path: ({"holding_qty": 0, "status": "WAITING"}
+                                      if path.name == "state.json"
+                                      else {"operation_excluded": False}),
         ), patch(
             "routine_package_contract.load_routine_callable",
             side_effect=ValueError("bad routine declaration"),
@@ -298,6 +320,99 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
         self.assertTrue(market.refresh_operation_candles.call_args.kwargs["drain_all"])
         self.assertEqual((), result["standby_requirement_stock_codes"])
         self.assertEqual("035420", result["standby_requirement_errors"][0]["stock_code"])
+
+    def test_selected_history_floor_and_standby_exclusions_leave_realtime_targets(self) -> None:
+        codes = ("005930", "000660", "035420", "005380", "012330")
+        records = [_record(code, instance_id=code) for code in codes]
+        projection = SimpleNamespace(
+            target_stock_codes=codes,
+            initial_snapshot_target_stock_codes=codes,
+            unsupported_stock_codes=(),
+            source_record_count=len(codes),
+        )
+        repository = Mock(project_root=Path("."))
+        repository.realtime_monitoring_universe.return_value = projection
+        repository.list_current_registered_stocks.return_value = records
+        market = SimpleNamespace(
+            sync_monitoring_targets=Mock(return_value={"ok": True}),
+            sync_candle_standby_requirements=Mock(return_value={"ok": True}),
+            refresh_operation_candles=Mock(return_value={"accepted": True}),
+        )
+        host = SimpleNamespace(_market_data_host=market)
+        states = {
+            "005930": {"status": "WAITING", "holding_qty": 0},
+            "000660": {"status": "RUNNING", "holding_qty": 0},
+            "035420": {"status": "WAITING", "holding_qty": 0},
+            "005380": {"status": "REVIEW_REQUIRED", "holding_qty": 0},
+            "012330": {"status": "REVIEW_REQUIRED", "holding_qty": 2},
+        }
+
+        def stock_data(path):
+            code = path.parent.name[:6]
+            if path.name == "state.json":
+                return states[code]
+            return {"operation_excluded": code == "035420"}
+
+        def instance(instance_id):
+            return SimpleNamespace(definition_id="candle", rules_path=Path(f"{instance_id}.json"))
+
+        definition = SimpleNamespace(locators={"evaluation": {
+            "market_bar_projection_callable": "declare",
+        }})
+        requests = []
+
+        def declare(rules):
+            request = {"projection": "FORMING_BASE_BAR", "warmup_bars": rules["warmup"]}
+            requests.append(request)
+            return request
+
+        with patch("gui_auto_trade_operation_host.StockRepository", return_value=repository), patch.object(
+            Path, "exists", return_value=True,
+        ), patch("gui_auto_trade_operation_host.read_json_dict", side_effect=stock_data), patch(
+            "routine_instance_registry.routine_instance_by_id", side_effect=instance,
+        ), patch("routine_instance_registry.routine_definition_by_id", return_value=definition), patch.object(
+            Path, "read_text",
+            autospec=True,
+            side_effect=lambda path, **_: json.dumps({
+                "bar": {"bar_minutes": 3 if path.stem == "005930" else 1},
+                "warmup": 420 if path.stem == "000660" else 20,
+            }),
+        ), patch("routine_package_contract.load_routine_callable", return_value=declare), patch(
+            "gui_auto_trade_operation_host.calculation_market_source_for_stock", return_value="SOR",
+        ):
+            result = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
+            again = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
+
+        requirements = market.sync_candle_standby_requirements.call_args.args[0]
+        self.assertEqual((), result["standby_requirement_errors"])
+        self.assertEqual((), tuple(item for item in result["standby_requirement_skips"] if item["stock_code"] == "005930"))
+        by_code = {item["stock_code"]: item for item in requirements}
+        self.assertEqual({"005930", "000660", "012330"}, set(by_code))
+        self.assertEqual(300, by_code["005930"]["projection_request"]["history_target_bars"])
+        self.assertEqual(420, by_code["000660"]["projection_request"]["history_target_bars"])
+        self.assertEqual(
+            (3, 300),
+            MarketDataHost._direct_timeframe_requirement(
+                by_code["005930"]["rules"], by_code["005930"]["projection_request"],
+            )[:2],
+        )
+        self.assertEqual(
+            (1, 420),
+            MarketDataHost._direct_timeframe_requirement(
+                by_code["000660"]["rules"], by_code["000660"]["projection_request"],
+            )[:2],
+        )
+        self.assertEqual(20, by_code["005930"]["projection_request"]["warmup_bars"])
+        self.assertEqual(20, requests[0]["warmup_bars"])
+        self.assertNotIn("history_target_bars", requests[0])
+        self.assertEqual(codes, result["monitoring_target_stock_codes"])
+        self.assertEqual(codes, again["monitoring_target_stock_codes"])
+        self.assertEqual(codes, market.sync_monitoring_targets.call_args.args[0])
+        self.assertEqual(("035420", "005380"), result["standby_requirement_skipped_stock_codes"])
+        self.assertEqual(
+            market.sync_candle_standby_requirements.call_args_list[0].args,
+            market.sync_candle_standby_requirements.call_args_list[1].args,
+        )
 
 
 class LoginTimeMonitoringIntegrationTests(unittest.TestCase):
