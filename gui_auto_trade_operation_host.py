@@ -51,9 +51,13 @@ from gui_review_utils import (
 from gui_auto_trade_policy import auto_trade_setting_start_target_decision
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
-from stock_code_contract import normalize_stock_code
+from stock_code_contract import is_broker_action_stock_code, normalize_stock_code
 from stock_repository import StockRepository
-from stock_market_source_plan import calculation_market_source_for_stock
+from stock_market_source_plan import (
+    calculation_market_source_for_stock,
+    initialize_stock_market_source_plan,
+    read_stock_market_source_plan,
+)
 from event_journal_production import (
     append_production_event,
     observe_owner_failure_transition,
@@ -148,6 +152,10 @@ class AutoTradeOperationHost(QObject):
         self._market_data_ready_signal_bound = False
         self._market_data_comparison_signal_bound = False
         self._bind_market_data_host_signals_once()
+        library_sync = getattr(owner, "stock_library_sync_service", None)
+        connect = getattr(getattr(library_sync, "sync_finished", None), "connect", None)
+        if callable(connect):
+            connect(self._on_stock_library_sync_finished)
 
     def parent(self):
         return self._owner
@@ -401,6 +409,46 @@ class AutoTradeOperationHost(QObject):
         ):
             result["operation_timer_stop_result"] = self.stop_operation_timers()
         return result
+
+    def _on_stock_library_sync_finished(self, payload: object) -> None:
+        if not isinstance(payload, dict) or payload.get("state") != "SUCCEEDED":
+            return
+        try:
+            session = self._kiwoom_api().broker_session_snapshot()
+            identity = (session.connection_epoch, session.login_session_id)
+            if (session.connected is not True or identity[0] <= 0 or not identity[1]
+                    or (payload.get("connection_epoch"), payload.get("session_id")) != identity):
+                return
+            from gui_stock_data import STOCK_LIBRARY_READY, load_stock_library_snapshot
+
+            repository = StockRepository()
+            snapshot = load_stock_library_snapshot(repository.project_root)
+            if snapshot.state != STOCK_LIBRARY_READY:
+                return
+            library = {item["code"]: item for item in snapshot.records}
+            now = datetime.now(SEOUL_TIMEZONE)
+            changed = False
+            for stock in repository.list_current_registered_stocks():
+                code, name = stock.code, stock.name
+                item = library.get(code)
+                if (not is_broker_action_stock_code(code) or item is None
+                        or item.get("name") != name
+                        or type(item.get("nxt_available")) is not bool):
+                    continue
+                try:
+                    if read_stock_market_source_plan(repository.project_root, code, now.date()) is not None:
+                        continue
+                    initialize_stock_market_source_plan(
+                        repository.project_root, code, name, trading_day=now.date(),
+                        decided_at=now, nxt_available=item["nxt_available"],
+                    )
+                    changed = True
+                except (OSError, TypeError, ValueError):
+                    LOGGER.exception("Registered stock source plan recovery failed for %s", code)
+            if changed:
+                self.sync_monitoring_universe_for_current_session()
+        except (AttributeError, OSError, TypeError, ValueError):
+            LOGGER.exception("Registered stock source plan recovery evidence unavailable")
 
     def sync_monitoring_universe_for_current_session(self) -> dict[str, object]:
         """Sync all current registered Stocks without evaluating operation readiness."""
