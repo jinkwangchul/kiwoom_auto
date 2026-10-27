@@ -67,6 +67,7 @@ from pnl_ui_refresh import (
 )
 from quick_chart_native_history import (
     apply_native_history_projection,
+    apply_verified_shared_chart_cache,
     merge_native_history_increment,
     native_history_completed_slot,
     native_history_request_count,
@@ -1977,8 +1978,9 @@ class StockInstanceChartWindow(QDialog):
         else:
             candle_provider = _production_candle_provider(parent)
             provider_host = getattr(candle_provider, "__self__", None)
-            if (callable(getattr(provider_host, "quickchart_native_history", None))
-                    and callable(getattr(provider_host, "remember_quickchart_native_history", None))):
+            if (callable(getattr(provider_host, "verified_selected_native_chart_cache", None))
+                    or (callable(getattr(provider_host, "quickchart_native_history", None))
+                        and callable(getattr(provider_host, "remember_quickchart_native_history", None)))):
                 self._native_history_host = provider_host
             self._native_history_api = getattr(provider_host, "kiwoom_api", None)
             if candle_provider is None:
@@ -3445,6 +3447,7 @@ class StockInstanceChartWindow(QDialog):
         timeline = projected.get("operation_timeline")
         plan = projected.get("source_plan")
         if (session is not None and self._native_history_host is not None
+                and callable(getattr(self._native_history_host, "quickchart_native_history", None))
                 and isinstance(timeline, dict) and isinstance(plan, dict)
                 and timeline.get("status") in {"WAITING", "ONGOING", "ENDED", "END_UNKNOWN"}
                 and type(projected.get("bar_minutes")) is int):
@@ -3459,6 +3462,21 @@ class StockInstanceChartWindow(QDialog):
                         self.stock_code, projected["bar_minutes"], candidate, start, end)
                     if history is not None:
                         self._native_histories[candidate] = history
+        if (session is not None and self._native_history_host is not None
+                and callable(getattr(self._native_history_host,
+                                     "verified_selected_native_chart_cache", None))
+                and isinstance(plan, dict)
+                and projected.get("source_plan_status") == "READY"
+                and isinstance(timeline, dict) and timeline.get("status") == "WAITING"
+                and not self._native_histories
+                and not self._projection_has_renderable_candle(projected)):
+            now = datetime.now(SEOUL_TIMEZONE)
+            snapshot = self._native_history_host.verified_selected_native_chart_cache(
+                self.stock_code, projected.get("bar_minutes"), plan, now)
+            if (isinstance(snapshot, dict)
+                    and session == (snapshot.get("connection_epoch"), snapshot.get("login_session_id"))):
+                projected = apply_verified_shared_chart_cache(
+                    projected, snapshot, now=now)
         histories = list(self._native_histories.values()) if (
             projected.get("operation_timeline", {}).get("status") == "WAITING"
         ) else [self._native_histories.get(source)]
@@ -3547,7 +3565,9 @@ class StockInstanceChartWindow(QDialog):
             else:
                 earlier = None
             selected_source = "INTEGRATED" if selected["source"] == "SOR" else selected["source"]
-            if selected_source in self._native_histories and earlier is not None:
+            if (selected_source in self._native_histories
+                    or (selected_source == "INTEGRATED"
+                        and data.get("shared_al_request_covered") is True)) and earlier is not None:
                 selected = earlier
         source = selected["source"]
         route = {"SOR": "request_minute_candles_display_only_integrated",
@@ -3563,6 +3583,8 @@ class StockInstanceChartWindow(QDialog):
             return
         now = datetime.now(SEOUL_TIMEZONE)
         native_source = "INTEGRATED" if source == "SOR" else source
+        if native_source == "INTEGRATED" and data.get("shared_al_request_covered") is True:
+            return
         prior = self._native_histories.get(native_source)
         if prior is not None and (prior.get("stock_code") != self.stock_code
                                   or prior.get("timeframe_minutes") != interval
@@ -3621,7 +3643,8 @@ class StockInstanceChartWindow(QDialog):
                 if prior is not None:
                     history = merge_native_history_increment(prior, history)
                 if history is not None:
-                    if window._native_history_host is not None:
+                    if (window._native_history_host is not None and callable(getattr(
+                            window._native_history_host, "remember_quickchart_native_history", None))):
                         window._native_history_host.remember_quickchart_native_history(
                             history, started, response, count, eligibility,
                             data.get("source_plan"))

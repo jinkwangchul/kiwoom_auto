@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import QApplication
 
 from candle_manager import canonical_candle_content_hash
 from quick_chart_native_history import (
+    apply_verified_shared_chart_cache,
     apply_native_history_projection,
     merge_native_history_increment,
     native_history_completed_slot,
@@ -305,6 +306,155 @@ def test_waiting_m1_keeps_more_than_300_actual_native_closes(tmp_path):
     assert shown["operation_timeline"]["start_at"] == ""
 
 
+def test_shared_al_cache_displays_while_direct_history_remains_independent(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    now = datetime(2026, 10, 27, 14, 0, tzinfo=SEOUL)
+    plan = initialize_stock_market_source_plan(tmp_path, "005930", "Samsung",
+                                               trading_day=now.date(), decided_at=now,
+                                               nxt_available=True)
+    rows = [{"bar_time": (now.replace(hour=9, minute=0) + timedelta(minutes=i)).isoformat(),
+             "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10,
+             "timeframe_minutes": 1, "is_complete": True, "trade_date": now.date().isoformat(),
+             "display_only": True, "market_source": "INTEGRATED",
+             "market_data_identity": "005930_AL"} for i in range(300)]
+
+    class Api:
+        def __init__(self):
+            self.calls = []
+
+        def broker_session_snapshot(self):
+            return SimpleNamespace(connected=True, connection_epoch=7, login_session_id="session-7")
+
+        def request_minute_candles_display_only_nxt(self, *args, **kwargs):
+            self.calls.append("NXT")
+            return {"ok": False}
+
+        def request_minute_candles_display_only_integrated(self, *args, **kwargs):
+            self.calls.append("AL")
+            return {"ok": False}
+
+    class Market:
+        kiwoom_api = Api()
+        _current_display_session_identity = MarketDataHost._current_display_session_identity
+        _current_display_candles = MarketDataHost._current_display_candles
+        verified_selected_native_chart_cache = MarketDataHost.verified_selected_native_chart_cache
+        _display_timeframe_candles = {("005930", 1): tuple(rows)}
+        _display_timeframe_session_identity = {("005930", 1): (7, "session-7")}
+
+        def project_routine_candles(self, **_kwargs):
+            raise AssertionError("test supplies projection")
+
+    market = Market()
+    base = {"stock_code": "005930", "trade_date": now.date().isoformat(),
+            "source_plan": plan, "source_plan_status": "READY",
+            "instance_id": "instance-1", "bar_minutes": 1,
+            "nxt_available": True, "projection_status": "NO_DAY_DATA",
+            "chart_candle_source": "SOURCE_UNAVAILABLE", "candles": [],
+            "buy_signal_markers": [], "sell_signal_markers": [],
+            "operation_timeline": {"status": "WAITING", "start_at": "", "end_at": ""}}
+    with patch("gui_market_data_host.PROJECT_ROOT", tmp_path), patch(
+            "gui_stock_instance_chart_window._production_candle_provider",
+            return_value=market.project_routine_candles), patch(
+            "gui_stock_instance_chart_window.project_stock_instance_day", return_value=base), patch(
+            "gui_stock_instance_chart_window.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        window = StockInstanceChartWindow("005930", now.date().isoformat())
+        try:
+            assert window.last_projection["chart_candle_source"] == "COMMON_HOST_VERIFIED_AL_DISPLAY_PARTIAL"
+            assert len(window.chart.close_series) > 0
+            assert market.kiwoom_api.calls == ["NXT"]
+            assert window.last_projection["operation_timeline"]["start_at"] == ""
+            assert window.chart.buy_series == window.chart.sell_series == []
+            snapshot = market.verified_selected_native_chart_cache("005930", 1, plan, now)
+            assert apply_verified_shared_chart_cache(base, snapshot, now=now)["shared_al_request_covered"] is True
+            late = apply_verified_shared_chart_cache(base, snapshot,
+                                                     now=now.replace(hour=20, minute=30))
+            assert len(late["candles"]) == 300
+            assert late["chart_history_coverage"] == "PARTIAL"
+            ongoing = {**base, "operation_timeline": {"status": "ONGOING",
+                "start_at": "2026-10-27T09:00:00+09:00", "end_at": ""},
+                "buy_signal_markers": [{"bar_time": rows[0]["bar_time"]}],
+                "sell_signal_markers": [{"bar_time": rows[-1]["bar_time"]}]}
+            shown_ongoing = apply_verified_shared_chart_cache(ongoing, snapshot, now=now)
+            assert shown_ongoing["buy_signal_markers"] == ongoing["buy_signal_markers"]
+            assert shown_ongoing["sell_signal_markers"] == ongoing["sell_signal_markers"]
+            assert apply_verified_shared_chart_cache(base, {**snapshot, "connection_epoch": 8}, now=now) == base
+            assert market.verified_selected_native_chart_cache("005930", 3, plan, now) is None
+            assert market.verified_selected_native_chart_cache("000660", 1, plan, now) is None
+            assert apply_verified_shared_chart_cache(
+                {**base, "source_plan": None}, snapshot, now=now)["candles"] == []
+            assert market.verified_selected_native_chart_cache(
+                "005930", 1, {**plan, "nxt_available": False}, now) is None
+            assert market.verified_selected_native_chart_cache(
+                "005930", 1, plan, now - timedelta(days=1)) is None
+            extra = [{**rows[-1], "bar_time": (now + timedelta(minutes=i)).isoformat()}
+                     for i in range(20)]
+            market._display_timeframe_candles[("005930", 1)] = (*rows, *extra)
+            assert len(market.verified_selected_native_chart_cache(
+                "005930", 1, plan, now + timedelta(minutes=20))["rows"]) == 320
+            market._display_timeframe_session_identity[("005930", 1)] = (8, "session-8")
+            assert market.verified_selected_native_chart_cache("005930", 1, plan, now) is None
+            market._display_timeframe_session_identity[("005930", 1)] = (7, "session-7")
+            market._display_timeframe_candles[("005930", 1)] = (*rows, {**rows[-1], "market_source": "NXT"})
+            assert market.verified_selected_native_chart_cache("005930", 1, plan, now) is None
+            app.processEvents()
+        finally:
+            window.close()
+        market._display_timeframe_candles[("005930", 1)] = tuple(rows[:10])
+        partial = StockInstanceChartWindow("005930", now.date().isoformat())
+        try:
+            assert len(partial.chart.close_series) == 10
+            assert partial.last_projection["shared_al_request_covered"] is False
+            assert market.kiwoom_api.calls[-1] == "AL"
+        finally:
+            partial.close()
+
+
+def test_shared_m3_cache_skips_prior_days_but_rejects_future_day(tmp_path):
+    now = datetime(2026, 10, 27, 19, 0, tzinfo=SEOUL)
+    plan = initialize_stock_market_source_plan(tmp_path, "005930", "Samsung",
+                                               trading_day=now.date(), decided_at=now,
+                                               nxt_available=True)
+    today = [now.replace(hour=9, minute=0) + timedelta(minutes=3 * i)
+             for i in range(120)] + [now.replace(hour=15, minute=40) + timedelta(minutes=3 * i)
+                                  for i in range(60)]
+    yesterday = [now.replace(hour=9, minute=0) - timedelta(days=1) + timedelta(minutes=3 * i)
+                 for i in range(90)]
+    older = [now.replace(hour=9, minute=0) - timedelta(days=2) + timedelta(minutes=3 * i)
+             for i in range(30)]
+    rows = tuple({"bar_time": stamp.isoformat(), "trade_date": stamp.date().isoformat(),
+                  "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10,
+                  "timeframe_minutes": 3, "is_complete": True, "display_only": True,
+                  "market_source": "INTEGRATED", "market_data_identity": "005930_AL"}
+                 for stamp in (*older, *yesterday, *today))
+
+    class Market:
+        kiwoom_api = SimpleNamespace(broker_session_snapshot=lambda: SimpleNamespace(
+            connected=True, connection_epoch=7, login_session_id="session-7"))
+        _current_display_session_identity = MarketDataHost._current_display_session_identity
+        _current_display_candles = MarketDataHost._current_display_candles
+        verified_selected_native_chart_cache = MarketDataHost.verified_selected_native_chart_cache
+        _display_timeframe_candles = {("005930", 3): rows}
+        _display_timeframe_session_identity = {("005930", 3): (7, "session-7")}
+
+    market = Market()
+    with patch("gui_market_data_host.PROJECT_ROOT", tmp_path):
+        snapshot = market.verified_selected_native_chart_cache("005930", 3, plan, now)
+        assert snapshot is not None
+        assert len(snapshot["rows"]) == 180
+        assert {row["bar_time"] for row in snapshot["rows"]} == {stamp.isoformat() for stamp in today}
+        base = {"stock_code": "005930", "trade_date": now.date().isoformat(),
+                "source_plan": plan, "bar_minutes": 3, "nxt_available": True,
+                "candles": [], "operation_timeline": {"status": "WAITING", "start_at": "", "end_at": ""}}
+        shown = apply_verified_shared_chart_cache(base, snapshot, now=now)
+        assert {row["bar_time"] for row in shown["candles"]} == {stamp.isoformat() for stamp in today}
+        assert market._display_timeframe_candles[("005930", 3)] is rows
+        market._display_timeframe_candles[("005930", 3)] = (*rows, {
+            **rows[-1], "bar_time": (now + timedelta(days=1)).isoformat(),
+            "trade_date": (now + timedelta(days=1)).date().isoformat()})
+        assert market.verified_selected_native_chart_cache("005930", 3, plan, now) is None
+
+
 def test_waiting_merges_separate_verified_nxt_and_sor_without_gap_bars(tmp_path):
     now = datetime(2026, 10, 27, 10, 4, tzinfo=SEOUL)
     plan = initialize_stock_market_source_plan(tmp_path, "005930", "Samsung",
@@ -397,6 +547,57 @@ def test_increment_requires_identical_native_overlap_and_preserves_history():
     changed = dict(newer)
     changed["candles"] = [{**newer["candles"][0], "close": 999}, newer["candles"][1]]
     assert merge_native_history_increment(old, changed) is None
+
+
+def test_host_keeps_verified_native_history_after_forty_incremental_receipts(tmp_path):
+    plan = initialize_stock_market_source_plan(
+        tmp_path, "005930", "Samsung", trading_day=datetime(2026, 10, 27).date(),
+        decided_at=datetime(2026, 10, 27, 9, tzinfo=SEOUL), nxt_available=True)
+
+    class Host:
+        _quickchart_native_histories = OrderedDict()
+        quickchart_native_history = MarketDataHost.quickchart_native_history
+        remember_quickchart_native_history = MarketDataHost.remember_quickchart_native_history
+
+        def _current_display_session_identity(self):
+            return self.session
+
+    host = Host()
+    host.session = (7, "session-7")
+    history = None
+    start = "2026-10-27T09:00:00+09:00"
+    for index in range(40):
+        rows = [_raw("2026-10-27", f"{9 + minute // 60:02d}{minute % 60:02d}00", 100 + minute)
+                for minute in range(max(0, index - 2), index + 1)]
+        started, response = _receipt(list(reversed(rows)))
+        as_of = datetime(2026, 10, 27, 9, index + 1, tzinfo=SEOUL).isoformat()
+        started["request_as_of"] = response["request_as_of"] = as_of
+        response["received_at"] = as_of
+        response["interval"] = 1
+        part = validate_native_history_receipt(
+            started, response, host.session, host.session, "005930", 1, start, None,
+            requested_count=5000, nxt_available=True, selected_source="INTEGRATED",
+            source_plan=plan)
+        assert part is not None
+        history = merge_native_history_increment(history, part) if history else part
+        assert history is not None
+        assert host.remember_quickchart_native_history(
+            history, started, response, 5000, True, plan)
+    assert len(host._quickchart_native_histories) == 1
+    assert len(next(iter(host._quickchart_native_histories.values()))["receipt"][1]["rows"]) == 3
+    assert host.quickchart_native_history("005930", 1, "INTEGRATED", start, "") == history
+
+    prior = host.quickchart_native_history("005930", 1, "INTEGRATED", start, "")
+    changed = dict(history)
+    changed["candles"] = [*history["candles"][:-1], {**history["candles"][-1], "close": 999}]
+    changed["source_content_sha256"] = canonical_candle_content_hash(changed["candles"])
+    assert not host.remember_quickchart_native_history(
+        changed, started, response, 5000, True, plan)
+    assert host.quickchart_native_history("005930", 1, "INTEGRATED", start, "") == prior
+    host.session = (8, "session-8")
+    assert not host.remember_quickchart_native_history(
+        history, started, response, 5000, True, plan)
+    assert host.quickchart_native_history("005930", 1, "INTEGRATED", start, "") is None
 
 
 def test_production_window_requests_native_m3_and_displays_uncached_closes(tmp_path):

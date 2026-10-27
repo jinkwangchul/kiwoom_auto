@@ -1851,6 +1851,85 @@ class MarketDataHost(QObject):
             return []
         return list(cache.get(key, ()))
 
+    def verified_selected_native_chart_cache(
+        self, stock_code: str, timeframe_minutes: int, plan: dict[str, Any] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Copy today's admitted AL closes for read-only chart display."""
+        session = MarketDataHost._current_display_session_identity(self)
+        if (session is None or not is_broker_action_stock_code(stock_code)
+                or type(timeframe_minutes) is not int or timeframe_minutes <= 0):
+            return None
+        now = as_of or datetime.now(SEOUL_TIMEZONE)
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            return None
+        now = now.astimezone(SEOUL_TIMEZONE)
+        day = now.date()
+        try:
+            current_plan = read_stock_market_source_plan(PROJECT_ROOT, stock_code, day)
+        except (OSError, ValueError, TypeError):
+            return None
+        if plan is None:
+            plan = current_plan
+        if (not isinstance(plan, dict) or plan != current_plan
+                or plan.get("stock_code") != stock_code
+                or plan.get("trading_date") != day.isoformat()
+                or plan.get("nxt_available") is not True
+                or not isinstance(plan.get("sessions"), list)
+                or not any(isinstance(item, dict) and item.get("source") == "SOR"
+                           for item in plan["sessions"])):
+            return None
+        cache = _host_attr(self, "_display_timeframe_candles", {})
+        key = (stock_code, timeframe_minutes)
+        if not isinstance(cache, dict) or key not in cache:
+            return None
+        rows = []
+        for original in MarketDataHost._current_display_candles(self, stock_code, timeframe_minutes):
+            if not isinstance(original, dict):
+                return None
+            stamp = candle_market_datetime(original)
+            if stamp is None or stamp.date() > day or stamp.utcoffset() != timedelta(hours=9):
+                return None
+            try:
+                values = [original[key] for key in ("open", "high", "low", "close", "volume")]
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (original.get("market_source") != "INTEGRATED"
+                    or original.get("market_data_identity") != f"{stock_code}_AL"
+                    or type(original.get("timeframe_minutes")) is not int
+                    or original.get("timeframe_minutes") != timeframe_minutes
+                    or original.get("is_complete") is not True
+                    or original.get("display_only") is not True
+                    or original.get("trade_date") != stamp.date().isoformat()
+                    or any(type(value) not in (int, float) or not isfinite(value) for value in values)
+                    or values[2] <= 0 or values[4] < 0
+                    or not values[2] <= values[0] <= values[1]
+                    or not values[2] <= values[3] <= values[1]):
+                return None
+            if stamp.date() < day:
+                continue
+            try:
+                selected = source_for_time(plan, stamp)
+                completed = native_bar_end(plan, stamp, timeframe_minutes)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (selected is None or selected["source"] != "SOR"
+                    or selected["market_data_identity"] != f"{stock_code}_AL"
+                    or completed is None or completed > now):
+                return None
+            rows.append(dict(original))
+        if not rows or len({row["bar_time"] for row in rows}) != len(rows):
+            return None
+        rows.sort(key=lambda row: row["bar_time"])
+        witness = {"stock_code": stock_code, "trade_date": day.isoformat(),
+                   "timeframe_minutes": timeframe_minutes,
+                   "connection_epoch": session[0], "login_session_id": session[1]}
+        return {**witness, "market_source": "INTEGRATED",
+                "market_data_identity": f"{stock_code}_AL", "rows": rows,
+                "provenance": "SHARED_VERIFIED_AL_NATIVE_CACHE",
+                "source_plan_sha256": canonical_candle_content_hash([plan]),
+                "source_content_sha256": canonical_candle_content_hash([witness, *rows])}
+
     def install_display_timeframe_candles(
         self,
         stock_code: object,

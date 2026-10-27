@@ -44,6 +44,119 @@ def waiting_display_start(plan: object) -> str:
         return ""
 
 
+def apply_verified_shared_chart_cache(
+    base: dict[str, Any], snapshot: dict[str, Any] | None, *, now: datetime,
+) -> dict[str, Any]:
+    """Display only same-day, plan-matched completed AL rows already admitted by the host."""
+    if not isinstance(base, dict) or not isinstance(snapshot, dict) or now.tzinfo is None:
+        return base
+    plan = base.get("source_plan")
+    timeline = base.get("operation_timeline")
+    rows = snapshot.get("rows")
+    day = now.astimezone(SEOUL_TIMEZONE).date().isoformat()
+    witness = {key: snapshot.get(key) for key in (
+        "stock_code", "trade_date", "timeframe_minutes", "connection_epoch", "login_session_id")}
+    if (not isinstance(plan, dict) or not isinstance(timeline, dict)
+            or timeline.get("status") not in {"WAITING", "ONGOING", "ENDED", "END_UNKNOWN"}
+            or plan.get("stock_code") != base.get("stock_code")
+            or plan.get("trading_date") != day or plan.get("nxt_available") is not True
+            or not isinstance(plan.get("sessions"), list)
+            or not all(isinstance(item, dict) for item in plan["sessions"])
+            or base.get("trade_date") != day or base.get("nxt_available") is not True
+            or type(base.get("bar_minutes")) is not int or base["bar_minutes"] <= 0
+            or snapshot.get("stock_code") != base.get("stock_code")
+            or snapshot.get("trade_date") != day
+            or snapshot.get("timeframe_minutes") != base.get("bar_minutes")
+            or type(snapshot.get("connection_epoch")) is not int
+            or snapshot["connection_epoch"] <= 0
+            or not isinstance(snapshot.get("login_session_id"), str)
+            or not snapshot["login_session_id"]
+            or snapshot.get("market_source") != "INTEGRATED"
+            or snapshot.get("market_data_identity") != f"{base.get('stock_code')}_AL"
+            or snapshot.get("provenance") != "SHARED_VERIFIED_AL_NATIVE_CACHE"
+            or snapshot.get("source_plan_sha256") != canonical_candle_content_hash([plan])
+            or not isinstance(rows, list) or not rows
+            or snapshot.get("source_content_sha256") != canonical_candle_content_hash([witness, *rows])):
+        return base
+    waiting = timeline["status"] == "WAITING"
+    start = _seoul_time(waiting_display_start(plan) if waiting else timeline.get("start_at"))
+    end = _seoul_time(timeline.get("end_at")) if timeline.get("end_at") else now.astimezone(SEOUL_TIMEZONE)
+    if start is None or end is None or end < start:
+        return base
+    by_time = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            return base
+        stamp = candle_market_datetime(row)
+        try:
+            selected = source_for_time(plan, stamp) if stamp else None
+            completed = native_bar_end(plan, stamp, base["bar_minutes"]) if stamp else None
+            values = [row[key] for key in ("open", "high", "low", "close", "volume")]
+        except (KeyError, TypeError, ValueError):
+            return base
+        if (stamp is None or selected is None or selected["source"] != "SOR"
+                or selected["market_data_identity"] != snapshot["market_data_identity"]
+                or stamp.date().isoformat() != day or completed is None or completed > now
+                or row.get("trade_date") != day or row.get("timeframe_minutes") != base["bar_minutes"]
+                or row.get("is_complete") is not True or row.get("display_only") is not True
+                or row.get("market_source") != "INTEGRATED"
+                or row.get("market_data_identity") != snapshot["market_data_identity"]
+                or any(type(value) not in (int, float) or not isfinite(value) for value in values)
+                or values[2] <= 0 or values[4] < 0
+                or not values[2] <= values[0] <= values[1]
+                or not values[2] <= values[3] <= values[1]
+                or stamp in by_time):
+            return base
+        if start <= stamp <= end:
+            by_time[stamp] = dict(row)
+    if not by_time:
+        return base
+    proven_base = base.get("chart_candle_source") in {
+        "CALCULATION_SOR_AL", "INTEGRATED_DISPLAY_ONLY", "CALCULATION_KRX_NATIVE",
+        "CALCULATION_NXT_NATIVE", "BROKER_AL_NATIVE_CHART_HISTORY",
+        "BROKER_NXT_NATIVE_CHART_HISTORY", "BROKER_VERIFIED_MULTI_SOURCE_CHART_HISTORY",
+    } and base.get("projection_status") == "VALID"
+    if proven_base:
+        for row in base.get("candles", []):
+            stamp = candle_market_datetime(row)
+            if stamp is None or not start <= stamp <= end:
+                continue
+            if stamp in by_time and any(row.get(key) != by_time[stamp].get(key)
+                                        for key in ("open", "high", "low", "close", "volume")):
+                return base
+            by_time[stamp] = dict(row)
+    al_sessions = [item for item in plan["sessions"] if item["source"] == "SOR"]
+    al_start = _seoul_time(f"{day}T{al_sessions[0]['start_time']}+09:00") if al_sessions else None
+    needed_start = max(start, al_start) if al_start else None
+    needed_latest = MarketDataHost._expected_latest_completed_display_start(now, base["bar_minutes"])
+    al_times = {stamp for stamp in by_time
+                if (source_for_time(plan, stamp) or {}).get("source") == "SOR"}
+    covered = (needed_start is not None and needed_latest is not None
+               and start.date().isoformat() == day and bool(al_times)
+               and min(al_times) <= needed_start and max(al_times) >= needed_latest)
+    if covered:
+        slot = needed_start
+        while slot <= needed_latest:
+            if ((source_for_time(plan, slot) or {}).get("source") == "SOR"
+                    and slot not in al_times):
+                covered = False
+                break
+            slot += timedelta(minutes=base["bar_minutes"])
+    updated = dict(base)
+    updated["candles"] = [by_time[key] for key in sorted(by_time)]
+    updated["projection_status"] = "VALID"
+    updated["chart_candle_source"] = "COMMON_HOST_VERIFIED_AL_DISPLAY_PARTIAL"
+    updated["chart_domain_label"] = "SOR _AL (partial)"
+    updated["chart_history_coverage"] = "PARTIAL"
+    updated["shared_al_request_covered"] = bool(covered)
+    updated["operation_timeline"] = dict(timeline)
+    updated["operation_timeline"]["native_history_incomplete"] = True
+    if waiting:
+        updated["buy_signal_markers"] = []
+        updated["sell_signal_markers"] = []
+    return updated
+
+
 def native_history_source(plan: object, now: datetime) -> dict[str, str] | None:
     """Use a past chart's last approved session, and today's actual session."""
     if not isinstance(plan, dict) or now.tzinfo is None:
@@ -333,6 +446,19 @@ def apply_native_history_projection(
                     and row.get("market_source") == (
                         "INTEGRATED" if source_for_time(plan, bar_time)["source"] == "SOR"
                         else source_for_time(plan, bar_time)["source"])):
+                by_time.setdefault(bar_time, dict(row))
+    if base.get("chart_candle_source") == "COMMON_HOST_VERIFIED_AL_DISPLAY_PARTIAL":
+        for row in base.get("candles", []):
+            bar_time = candle_market_datetime(row)
+            if (bar_time is None or not start <= bar_time <= end
+                    or not isinstance(plan, dict)
+                    or (source_for_time(plan, bar_time) or {}).get("source") != "SOR"
+                    or row.get("market_source") != "INTEGRATED"
+                    or row.get("market_data_identity") != f"{base.get('stock_code')}_AL"):
+                continue
+            previous = by_time.get(bar_time)
+            if previous is None or all(previous.get(key) == row.get(key)
+                                       for key in ("open", "high", "low", "close", "volume")):
                 by_time.setdefault(bar_time, dict(row))
     if not by_time:
         return base
