@@ -23,6 +23,8 @@ from candle_manager import (
 )
 from candle_timeframe_aggregation import candle_market_datetime
 from stock_repository import StockRepository
+from stock_repository import PROJECT_ROOT
+from stock_market_source_plan import read_stock_market_source_plan, source_for_time
 
 
 BAR_COMMITTED = "BAR_COMMITTED"
@@ -195,6 +197,32 @@ def normalize_opt10080_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     timed_candles = [candles_by_time[key] for key in sorted(candles_by_time)]
     return untimed_candles + timed_candles
+
+
+def filter_verified_krx_opt10080_rows(code: str, name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Admit bare-code broker rows only where the frozen plan assigns that code to KRX."""
+    if not isinstance(name, str) or len(code) != 6 or not code.isascii() or not code.isdigit():
+        return []
+    accepted = []
+    plans: dict[object, dict[str, object] | None] = {}
+    for row in rows:
+        normalized = normalize_opt10080_rows([row])
+        bar_time = candle_market_datetime(normalized[0]) if normalized else None
+        if bar_time is None:
+            continue
+        day = bar_time.date()
+        if day not in plans:
+            try:
+                plans[day] = read_stock_market_source_plan(PROJECT_ROOT, code, day)
+            except (OSError, TypeError, ValueError):
+                plans[day] = None
+        plan = plans[day]
+        if plan is None or plan.get("stock_code") != code or (name.strip() and plan.get("stock_name") != name):
+            continue
+        session = source_for_time(plan, bar_time)
+        if session is not None and session.get("source") == "KRX" and session.get("market_data_identity") == code:
+            accepted.append(row)
+    return accepted
 
 
 def _commit_normalized_minute_candles_for_stock(

@@ -27,8 +27,10 @@ else:
 from candle_manager import DEFAULT_CANDLES_MAX_COUNT
 from account_funds_foundation import ACCOUNT_AUTHENTICATION_REQUIRED
 from kiwoom_candle_adapter import (
+    CanonicalMinuteCandleCommitResult,
     commit_minute_candles_for_stock,
     commit_realtime_primary_bar_for_stock,
+    filter_verified_krx_opt10080_rows,
 )
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
@@ -5386,14 +5388,22 @@ class KiwoomApi(QObject):
                     result["received_at"] = received_at
                     result["request_as_of"] = pending.get("request_as_of")
             else:
+                accepted_rows = filter_verified_krx_opt10080_rows(
+                    str(pending.get("code", "")), str(pending.get("name", "")), rows,
+                )
                 commit = commit_minute_candles_for_stock(
                     str(pending.get("code", "")),
                     str(pending.get("name", "")),
-                    rows,
+                    accepted_rows,
                     max_count=int(pending.get("max_count") or DEFAULT_CANDLES_MAX_COUNT),
                     rqname=str(rqname),
                     trcode=str(trcode),
                     connection_epoch=int(pending.get("request_connection_epoch") or 0),
+                ) if accepted_rows else CanonicalMinuteCandleCommitResult(
+                    ok=False, changed=False, readback_verified=False, path="",
+                    saved_count=0, canonical_content_hash="",
+                    error_kind="NO_VERIFIED_KRX_CANDLES",
+                    error="opt10080 response contains no rows matching a verified KRX source plan",
                 )
                 result = {
                     "ok": commit.ok,
@@ -5402,7 +5412,8 @@ class KiwoomApi(QObject):
                     "name": pending.get("name", ""),
                     "rqname": str(rqname),
                     "trcode": str(trcode),
-                    "rows_count": len(rows),
+                    "rows_count": len(accepted_rows),
+                    "response_rows_count": len(rows),
                     "saved_count": commit.saved_count,
                     "commit_verified": bool(commit.ok and commit.readback_verified),
                     "changed": commit.changed,

@@ -11,7 +11,11 @@ from PyQt5.QtCore import QCoreApplication, QObject
 
 from candle_manager import commit_candles
 import auto_candle_refresh
+import gui_auto_trade_operation_host
 from gui_auto_trade_operation_host import AutoTradeOperationHost
+from stock_market_source_plan import initialize_stock_market_source_plan
+from candle_timeframe_aggregation import SEOUL_TIMEZONE
+from datetime import datetime
 import routine_signal_probe
 import routine_signal_queue
 
@@ -59,6 +63,12 @@ class BarCommitFastPathTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.root_patch = patch.object(gui_auto_trade_operation_host, "PROJECT_ROOT", Path(self.temp.name))
+        self.root_patch.start()
+        day = datetime(2026, 8, 20, 9, tzinfo=SEOUL_TIMEZONE)
+        for code, name in (("005930", "Test"), ("006400", "Other")):
+            initialize_stock_market_source_plan(Path(self.temp.name), code, name,
+                                                trading_day=day.date(), decided_at=day, nxt_available=False)
         self.stock_dir = Path(self.temp.name) / "005930_Test"
         commit = commit_candles(self.stock_dir, [_candle()])
         self.assertTrue(commit.ok)
@@ -68,7 +78,15 @@ class BarCommitFastPathTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.host.shutdown()
+        self.root_patch.stop()
         self.temp.cleanup()
+
+    def test_old_opt10080_after_close_trigger_fails_closed(self) -> None:
+        event = self.ready_event(bar_time="2026-08-20T19:56:00+09:00")
+        with patch("routine_signal_probe.probe_execution_stock_for_committed_bar") as probe:
+            result = self.host._process_bar_commit_trigger(event)
+        self.assertEqual("UNVERIFIED_KRX_BAR_TIME", result["reason_code"])
+        probe.assert_not_called()
 
     def payload(self, *, rqname: str = "rq-A", commit_identity: str = "commit-A", **changes):
         payload = {

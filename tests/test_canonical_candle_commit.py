@@ -11,6 +11,8 @@ from unittest.mock import patch
 import candle_manager
 from candle_manager import append_candle, commit_candles, load_candles
 import kiwoom_candle_adapter
+from stock_market_source_plan import initialize_stock_market_source_plan
+from candle_timeframe_aggregation import SEOUL_TIMEZONE
 
 
 def _candles(count: int, *, close_offset: int = 0) -> list[dict[str, object]]:
@@ -183,6 +185,28 @@ class CanonicalCandleFileCommitTests(unittest.TestCase):
 class CanonicalMinuteCandleIdentityTests(unittest.TestCase):
     def _repository(self, stock_dir: Path):
         return type("Repository", (), {"resolve_stock_dir": lambda _self, _code, _name="": stock_dir})()
+
+    def test_frozen_krx_filter_accepts_only_verified_bar_time_and_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            day = datetime(2026, 10, 27, 9, tzinfo=SEOUL_TIMEZONE)
+            for code, nxt in (("012210", False), ("005930", True)):
+                initialize_stock_market_source_plan(root, code, "Test", trading_day=day.date(),
+                                                    decided_at=day, nxt_available=nxt)
+            bars = [dict(_candles(1)[0], time=f"20261027{clock}00")
+                    for clock in ("1759", "1956")]
+            old = dict(_candles(1)[0], time="20261026090000")
+            with patch.object(kiwoom_candle_adapter, "PROJECT_ROOT", root):
+                self.assertEqual(_rows(bars[:1]), kiwoom_candle_adapter.filter_verified_krx_opt10080_rows(
+                    "012210", "Test", _rows([old] + bars)))
+                self.assertEqual(_rows(bars[:1]), kiwoom_candle_adapter.filter_verified_krx_opt10080_rows(
+                    "012210", "", _rows(bars)))
+                self.assertEqual([], kiwoom_candle_adapter.filter_verified_krx_opt10080_rows(
+                    "012210", "", _rows(bars[1:])))
+                self.assertEqual([], kiwoom_candle_adapter.filter_verified_krx_opt10080_rows(
+                    "005930", "Test", _rows(bars)))
+                self.assertEqual([], kiwoom_candle_adapter.filter_verified_krx_opt10080_rows(
+                    "012210", "Wrong", _rows(bars)))
 
     def test_existing_merge_and_same_stock_concurrent_updates_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

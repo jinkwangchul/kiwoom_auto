@@ -43,6 +43,8 @@ from gui_auto_trade_status_ops import (
     auto_trade_update_stock_status,
 )
 from candle_manager import canonical_candle_content_hash, load_candles
+from stock_repository import PROJECT_ROOT
+from stock_market_source_plan import read_stock_market_source_plan, source_for_time
 from execution_universe import project_execution_universe
 from gui_market_data_host import MarketDataHost
 from gui_review_utils import (
@@ -786,6 +788,17 @@ class AutoTradeOperationHost(QObject):
             return self._bar_commit_result(event, reason_code="MALFORMED_BAR_COMMIT_TRIGGER")
         stock_code = str(event.get("stock_code") or "").strip()
         stock_name = str(event.get("stock_name") or "").strip()
+        if event.get("source") == "opt10080":
+            try:
+                bar_time = datetime.fromisoformat(str(event.get("bar_time") or ""))
+                plan = read_stock_market_source_plan(PROJECT_ROOT, stock_code, bar_time.astimezone(SEOUL_TIMEZONE).date())
+                session = source_for_time(plan, bar_time) if plan is not None else None
+            except (OSError, TypeError, ValueError):
+                session = None
+                plan = None
+            if (plan is None or plan.get("stock_name") != stock_name or session is None
+                    or session.get("source") != "KRX" or session.get("market_data_identity") != stock_code):
+                return self._bar_commit_result(event, reason_code="UNVERIFIED_KRX_BAR_TIME")
         stock_dir = Path(str(event.get("stock_dir") or ""))
         expected_path = (stock_dir / "candles.json").resolve()
         if expected_path != Path(str(event.get("canonical_path") or "")).resolve():
