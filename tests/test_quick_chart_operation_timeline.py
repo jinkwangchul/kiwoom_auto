@@ -24,6 +24,7 @@ from mock_validation_quick_chart import (_mock_operation_timeline,
                                          _projection as mock_projection)
 from stock_instance_day_projection import (project_stock_instance_day, project_operation_timeline,
                                            _production_operation_timeline)
+from stock_market_source_plan import initialize_stock_market_source_plan
 from tests.test_mock_indicator_follow_adapter import _buy_rules
 from tests.test_mock_validation_host_ui import _Api, _reference
 
@@ -37,6 +38,14 @@ NOW = datetime(2026, 10, 20, 14, 1, tzinfo=SEOUL)
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _frozen_sor_days(root: Path, *days: str) -> None:
+    for day in days:
+        at = datetime.fromisoformat(f"{day}T09:00:00+09:00")
+        initialize_stock_market_source_plan(root, "005930", "Test",
+                                            trading_day=at.date(), decided_at=at,
+                                            nxt_available=True)
 
 
 def _bar(day: str, clock: str, close: int) -> dict[str, object]:
@@ -161,6 +170,7 @@ def test_refresh_replaces_stale_start_when_stock_becomes_waiting():
 def test_active_m3_uses_all_witnessed_native_sor_sessions_without_m1_rebuild():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
+        _frozen_sor_days(root, "2026-10-19", "2026-10-20", "2026-10-21")
         stock_dir = root / "stocks" / "005930_Test"
         _write(stock_dir / "config.json", {"assigned_routine_instance_id": "instance-1"})
         _write(stock_dir / "state.json", {"status": "RUNNING"})
@@ -229,6 +239,7 @@ def test_active_m3_uses_all_witnessed_native_sor_sessions_without_m1_rebuild():
 def test_production_projection_uses_verified_stock_journal_and_sor_without_guessing_end():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
+        _frozen_sor_days(root, "2026-10-19", "2026-10-20")
         stock_dir = root / "stocks" / "005930_Test"
         _write(stock_dir / "config.json", {"assigned_routine_instance_id": "instance-1"})
         _write(stock_dir / "state.json", {"status": "RUNNING"})
@@ -368,6 +379,7 @@ def test_production_projection_uses_verified_stock_journal_and_sor_without_guess
 def test_mock_projection_and_common_widget_show_two_days_without_production_ownership():
     app = QApplication.instance() or QApplication([])
     with TemporaryDirectory() as temporary:
+        _frozen_sor_days(Path(temporary), "2026-10-19", "2026-10-20")
         clock = {"now": datetime(2026, 10, 19, 10, 0, 17, tzinfo=SEOUL)}
         api = _Api()
         host = MockValidationHost(api, project_root=Path(temporary),

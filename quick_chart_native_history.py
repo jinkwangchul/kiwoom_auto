@@ -23,14 +23,25 @@ def _seoul_time(value: object) -> datetime | None:
 
 
 def native_history_request_count(start_at: str, through: datetime, interval: int) -> int:
-    """Bound one governed continuation request generously by calendar span."""
+    """Bound one governed continuation request by actual session-day capacity."""
     start = _seoul_time(start_at)
     if start is None or through.tzinfo is None or interval not in (1, 3, 5, 10, 15, 30, 60, 120, 240):
         return 0
     days = (through.astimezone(SEOUL_TIMEZONE).date() - start.date()).days + 1
     if days <= 0:
         return 0
-    return min(DEFAULT_CANDLES_MAX_COUNT, days * ((1440 + interval - 1) // interval) + 1)
+    return min(5000, DEFAULT_CANDLES_MAX_COUNT,
+               days * ((720 + interval - 1) // interval) + 1)
+
+
+def waiting_display_start(plan: object) -> str:
+    """Return the frozen first session opening, without changing operation state."""
+    try:
+        return datetime.fromisoformat(
+            f"{plan['trading_date']}T{plan['sessions'][0]['start_time']}+09:00"
+        ).isoformat()
+    except (KeyError, IndexError, TypeError, ValueError):
+        return ""
 
 
 def native_history_source(plan: object, now: datetime) -> dict[str, str] | None:
@@ -43,6 +54,10 @@ def native_history_source(plan: object, now: datetime) -> dict[str, str] | None:
         if day < local.date():
             end = datetime.fromisoformat(f"{day.isoformat()}T{plan['sessions'][-1]['end_time']}+09:00")
             local = end - timedelta(seconds=1)
+        elif day == local.date():
+            end = datetime.fromisoformat(f"{day.isoformat()}T{plan['sessions'][-1]['end_time']}+09:00")
+            if local >= end:
+                local = end - timedelta(seconds=1)
         return source_for_time(plan, local)
     except (KeyError, TypeError, ValueError, IndexError):
         return None
@@ -169,6 +184,9 @@ def validate_native_history_receipt(
         if not nxt_available and stamp[-2:] != "00":
             return None
         bar_time = candle_market_datetime(normalized)
+        if (source_plan is not None and start.date().isoformat() == source_plan.get("trading_date")
+                and bar_time is not None and bar_time.date() < start.date()):
+            continue
         values = tuple(normalized.get(key) for key in ("open", "high", "low", "close", "volume"))
         if (bar_time is None or bar_time.utcoffset() != timedelta(hours=9)
                 or any(type(value) not in (int, float) or not isfinite(value) for value in values)
@@ -268,14 +286,16 @@ def apply_native_history_projection(
         "INTEGRATED" if base.get("nxt_available") else "KRX")
     expected_identity = (selected["market_data_identity"] if selected else
                          f"{base.get('stock_code')}_AL" if base.get("nxt_available") else base.get("stock_code"))
+    waiting = isinstance(timeline, dict) and timeline.get("status") == "WAITING"
+    display_start = waiting_display_start(plan) if waiting else timeline.get("start_at") if isinstance(timeline, dict) else ""
     if (not isinstance(timeline, dict)
-            or timeline.get("status") not in {"ONGOING", "ENDED", "END_UNKNOWN"}
+            or timeline.get("status") not in {"WAITING", "ONGOING", "ENDED", "END_UNKNOWN"}
             or type(base.get("nxt_available")) is not bool
             or base.get("stock_code") != history.get("stock_code")
-            or history.get("market_data_identity") != expected_identity
-            or history.get("market_source") != expected_source
+            or (not waiting and history.get("market_data_identity") != expected_identity)
+            or (not waiting and history.get("market_source") != expected_source)
             or base.get("bar_minutes") != history.get("timeframe_minutes")
-            or timeline.get("start_at") != history.get("operation_start")
+            or display_start != history.get("operation_start")
             or (timeline.get("end_at") or "") != history.get("operation_end")
             or not isinstance(history.get("candles"), list)
             or history.get("source_content_sha256") != canonical_candle_content_hash(history["candles"])):
@@ -287,7 +307,12 @@ def apply_native_history_projection(
     by_time = {}
     for row in history["candles"]:
         bar_time = candle_market_datetime(row)
-        if bar_time is not None and start <= bar_time <= end:
+        selected_at_bar = source_for_time(plan, bar_time) if waiting and isinstance(plan, dict) and bar_time else None
+        if (bar_time is not None and start <= bar_time <= end
+                and (not waiting or (selected_at_bar is not None
+                     and selected_at_bar["market_data_identity"] == history["market_data_identity"]
+                     and selected_at_bar["source"] == (
+                         "SOR" if history["market_source"] == "INTEGRATED" else history["market_source"])))):
             by_time[bar_time] = dict(row)
     if (base.get("chart_candle_source") in {"CALCULATION_SOR_AL", "INTEGRATED_DISPLAY_ONLY",
                                            "CALCULATION_KRX_NATIVE", "CALCULATION_NXT_NATIVE"}
@@ -298,20 +323,58 @@ def apply_native_history_projection(
                     and row.get("market_source") == expected_source
                     and row.get("market_data_identity") == expected_identity):
                 by_time[bar_time] = dict(row)
+    if waiting and base.get("chart_candle_source", "").startswith("BROKER_"):
+        for row in base.get("candles", []):
+            bar_time = candle_market_datetime(row)
+            if (bar_time is not None and start <= bar_time <= end
+                    and source_for_time(plan, bar_time) is not None
+                    and row.get("market_data_identity") == source_for_time(plan, bar_time)["market_data_identity"]
+                    and row.get("market_source") == (
+                        "INTEGRATED" if source_for_time(plan, bar_time)["source"] == "SOR"
+                        else source_for_time(plan, bar_time)["source"])):
+                by_time.setdefault(bar_time, dict(row))
     if not by_time:
         return base
     candles = [by_time[key] for key in sorted(by_time)]
     updated = dict(base)
     updated["candles"] = candles
     updated["projection_status"] = "VALID"
-    updated["chart_domain_label"] = "NXT _NX" if expected_source == "NXT" else "SOR _AL" if base["nxt_available"] else "KRX"
+    updated["chart_domain_label"] = "NXT _NX" if history["market_source"] == "NXT" else "SOR _AL" if base["nxt_available"] else "KRX"
     updated["chart_candle_source"] = (
-        "BROKER_NXT_NATIVE_CHART_HISTORY" if expected_source == "NXT" else
+        "BROKER_NXT_NATIVE_CHART_HISTORY" if history["market_source"] == "NXT" else
         "BROKER_AL_NATIVE_CHART_HISTORY" if base["nxt_available"]
         else "BROKER_KRX_NATIVE_CHART_HISTORY")
     updated["chart_history_receipt"] = {key: history[key] for key in (
         "request_id", "received_at", "oldest_returned", "has_more",
         "request_limit_reached", "source_content_sha256", "connection_epoch")}
+    if waiting:
+        if len({row["market_source"] for row in candles}) > 1:
+            updated["chart_domain_label"] = "NXT _NX + SOR _AL"
+            updated["chart_candle_source"] = "BROKER_VERIFIED_MULTI_SOURCE_CHART_HISTORY"
+        receipts = dict(base.get("chart_history_receipts") or {})
+        receipts[history["market_source"]] = updated["chart_history_receipt"]
+        updated["chart_history_receipts"] = receipts
+        expected = {
+            "INTEGRATED" if session["source"] == "SOR" else session["source"]
+            for session in plan["sessions"]
+            if datetime.fromisoformat(
+                f"{plan['trading_date']}T{session['start_time']}+09:00") <= now
+        }
+        updated["operation_timeline"] = dict(timeline)
+        updated["operation_timeline"]["native_history_incomplete"] = (
+            any(receipt["has_more"] or receipt["request_limit_reached"]
+                for receipt in receipts.values())
+            or not expected <= receipts.keys()
+        )
+        updated["chart_history_coverage"] = (
+            "PARTIAL" if updated["operation_timeline"]["native_history_incomplete"]
+            else "VERIFIED_SOURCES"
+        )
+        if updated["chart_history_coverage"] == "PARTIAL":
+            updated["chart_domain_label"] += " (partial)"
+        updated["buy_signal_markers"] = []
+        updated["sell_signal_markers"] = []
+        return updated
     updated["operation_timeline"] = project_operation_timeline(
         history["operation_start"], history["operation_end"] or None,
         now=now, source_dates={day.date().isoformat() for day in by_time},

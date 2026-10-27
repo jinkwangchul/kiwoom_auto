@@ -70,6 +70,7 @@ from quick_chart_native_history import (
     merge_native_history_increment,
     native_history_completed_slot,
     native_history_request_count,
+    waiting_display_start,
     native_history_source,
     validate_native_history_receipt,
 )
@@ -3437,13 +3438,20 @@ class StockInstanceChartWindow(QDialog):
         selected = native_history_source(projected.get("source_plan"), datetime.now(SEOUL_TIMEZONE))
         source = ({"SOR": "INTEGRATED"}.get(selected["source"], selected["source"])
                   if selected else "")
-        history = self._native_histories.get(source)
-        if history is not None and session == (
-            history.get("connection_epoch"), history.get("login_session_id")
-        ):
-            projected = apply_native_history_projection(
-                projected, history, now=datetime.now(SEOUL_TIMEZONE))
-        elif history is not None:
+        histories = list(self._native_histories.values()) if (
+            projected.get("operation_timeline", {}).get("status") == "WAITING"
+        ) else [self._native_histories.get(source)]
+        for history in histories:
+            if history is not None and session == (
+                history.get("connection_epoch"), history.get("login_session_id")
+            ):
+                projected = apply_native_history_projection(
+                    projected, history, now=datetime.now(SEOUL_TIMEZONE))
+            elif history is not None:
+                self._native_histories.clear()
+                self._native_history = None
+                break
+        if not histories and self._native_history is not None:
             self._native_histories.clear()
             self._native_history = None
         refresh_status = self._projection_refresh_status(projected)
@@ -3505,13 +3513,28 @@ class StockInstanceChartWindow(QDialog):
         selected = native_history_source(plan, datetime.now(SEOUL_TIMEZONE))
         if selected is None:
             return
+        waiting = timeline.get("status") == "WAITING"
+        if waiting:
+            start_at = waiting_display_start(plan)
+            if not start_at or plan.get("trading_date") != datetime.now(SEOUL_TIMEZONE).date().isoformat():
+                return
+            for earlier in plan["sessions"]:
+                if earlier["source"] != selected["source"]:
+                    earlier_source = "INTEGRATED" if earlier["source"] == "SOR" else earlier["source"]
+                    if earlier_source not in self._native_histories:
+                        break
+            else:
+                earlier = None
+            selected_source = "INTEGRATED" if selected["source"] == "SOR" else selected["source"]
+            if selected_source in self._native_histories and earlier is not None:
+                selected = earlier
         source = selected["source"]
         route = {"SOR": "request_minute_candles_display_only_integrated",
                  "NXT": "request_minute_candles_display_only_nxt",
                  "KRX": "request_minute_candles_display_only_krx"}.get(source, "")
         request = getattr(self._native_history_api, route, None)
         if (self._chart_closed or session is None or not callable(request)
-                or timeline.get("status") not in {"ONGOING", "ENDED", "END_UNKNOWN"}
+                or timeline.get("status") not in {"WAITING", "ONGOING", "ENDED", "END_UNKNOWN"}
                 or type(eligibility) is not bool
                 or not str(data.get("instance_id") or "").strip()
                 or type(interval) is not int or not isinstance(start_at, str)
@@ -3527,7 +3550,7 @@ class StockInstanceChartWindow(QDialog):
                                   or prior.get("operation_end") != end_at
                                   or (prior.get("connection_epoch"), prior.get("login_session_id")) != session):
             prior = None
-        active = timeline.get("status") in {"ONGOING", "END_UNKNOWN"}
+        active = timeline.get("status") in {"WAITING", "ONGOING", "END_UNKNOWN"}
         slot = native_history_completed_slot(plan, now, interval, source) if active else None
         if prior is not None and slot is None:
             return

@@ -146,6 +146,7 @@ def test_historical_quick_chart_still_requests_selected_native_history(tmp_path)
         _chart_closed = False
         stock_code = CODE
         _native_history_attempt = None
+        _native_histories = {}
         _native_history_api = SimpleNamespace(request_minute_candles_display_only_krx=
             lambda *args, **kwargs: calls.append((args, kwargs)) or {"ok": True})
     data = {"stock_code": CODE, "instance_id": "one", "bar_minutes": 5,
