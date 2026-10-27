@@ -4683,7 +4683,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             marker_path = self._validation_cache_source_marker_path(
                 session.request.stock, session.request.timeframe_minutes,
                 timeframe_key, requested_count)
-            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (AttributeError, OSError, ValueError, TypeError) as exc:
+                raise ValueError("SOR_DIRECT_CACHE_COMPLETION_UNVERIFIED") from exc
+            if not isinstance(marker, dict):
+                raise ValueError("SOR_DIRECT_CACHE_COMPLETION_UNVERIFIED")
             direct_selected_query = marker.get("direct_selected_query")
             if not self._direct_selected_query_valid(
                     direct_selected_query, session.request.stock, timeframe_key,
@@ -7517,6 +7522,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         source_identity = self._pool_computation_source_identity(pool)
         rows = deepcopy(pool["candles"])
         warmup = required_validation_history_context_bars(session.request.settings_snapshot.to_dict())
+        direct_native = (pool.get("market_source") == "INTEGRATED"
+                         and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"})
+        fresh_response = None
 
         def prepend(older):
             nonlocal rows, deficit
@@ -7571,20 +7579,67 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     or self._request_generation.get(window_key, 0) != generation
                     or self._pool_computation_source_identity(original_pool) != source_identity):
                 return
-            enriched = self._pool_from_candles(
-                session, rows, requested_count=max(len(rows), int(original_pool["requested_count"])),
-                request_id=str(original_pool["request_id"]),
-                market_data_identity=str(original_pool["market_data_identity"]),
-                market_source=str(original_pool["market_source"]),
-                source_verified_at=original_pool.get("source_verified_at"),
-                direct_selected_query=original_pool.get("direct_selected_query"),
-                selected_direct_forming_snapshot=original_pool.get("selected_direct_forming_snapshot"))
-            enriched_view = dict(view, candles=(
-                [*rows, view["candles"][-1]]
-                if view.get("calculation_source") == "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT"
-                and view["candles"][-1]["time"] > rows[-1]["time"] else rows),
-                display_candles=display)
-            if enriched_view.get("calculation_source") == "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT":
+            if direct_native:
+                if not self._direct_selected_query_valid(
+                        original_pool.get("direct_selected_query"), session.request.stock,
+                        session.request.timeframe_key, session.request.timeframe_minutes,
+                        str(original_pool["market_data_identity"]), original_pool["candles"]):
+                    self._fail_window(window, "SOR_DIRECT_CACHE_COMPLETION_UNVERIFIED")
+                    return
+                enriched = original_pool
+                enriched_view = view
+                if (fresh_response is not None
+                        and (view.get("calculation_source")
+                             != "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT"
+                             or fresh_response[2] is not None)):
+                    snapshot, query, forming = fresh_response
+                    try:
+                        enriched = self._pool_from_candles(
+                            session, rows,
+                            requested_count=max(len(rows), int(snapshot.requested_count)),
+                            request_id=str(snapshot.request_id),
+                            market_data_identity=str(snapshot.market_data_identity),
+                            market_source=str(snapshot.market_source),
+                            source_verified_at=query["request_as_of"],
+                            direct_selected_query=query,
+                            selected_direct_forming_snapshot=forming)
+                    except ValueError:
+                        enriched = original_pool
+                    else:
+                        enriched_view = dict(view, candles=rows, display_candles=display)
+                        if view.get("calculation_source") == "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT":
+                            current = forming["candle"]
+                            enriched_view["candles"] = [*rows, current]
+                            enriched_view["display_candles"] = [
+                                *(rows[-(len(display) - 1):] if len(display) > 1 else []),
+                                current]
+                        enriched_view["snapshot"] = ValidationHistoricalSnapshot(
+                            stock=session.request.stock,
+                            timeframe_minutes=session.request.timeframe_minutes,
+                            timeframe_key=session.request.timeframe_key,
+                            requested_count=len(enriched_view["candles"]),
+                            request_id=str(snapshot.request_id),
+                            rows=self._historical_rows_from_candles(
+                                enriched_view["candles"]),
+                            market_data_identity=str(snapshot.market_data_identity),
+                            market_source=str(snapshot.market_source),
+                            request_as_of=query["request_as_of"])
+            else:
+                enriched = self._pool_from_candles(
+                    session, rows, requested_count=max(len(rows), int(original_pool["requested_count"])),
+                    request_id=str(original_pool["request_id"]),
+                    market_data_identity=str(original_pool["market_data_identity"]),
+                    market_source=str(original_pool["market_source"]),
+                    source_verified_at=original_pool.get("source_verified_at"),
+                    direct_selected_query=original_pool.get("direct_selected_query"),
+                    selected_direct_forming_snapshot=original_pool.get("selected_direct_forming_snapshot"))
+                enriched_view = dict(view, candles=(
+                    [*rows, view["candles"][-1]]
+                    if view.get("calculation_source") == "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT"
+                    and view["candles"][-1]["time"] > rows[-1]["time"] else rows),
+                    display_candles=display)
+            if (not direct_native and enriched_view.get("calculation_source")
+                    == "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT"):
                 enriched_view["snapshot"] = ValidationHistoricalSnapshot(
                     stock=session.request.stock,
                     timeframe_minutes=session.request.timeframe_minutes,
@@ -7594,7 +7649,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     rows=self._historical_rows_from_candles(enriched_view["candles"]),
                     market_data_identity=str(original_pool["market_data_identity"]),
                     market_source=str(original_pool["market_source"]),
-                    request_as_of=original_pool["selected_direct_forming_snapshot"]["request_as_of"])
+                    request_as_of=enriched["selected_direct_forming_snapshot"]["request_as_of"])
             if on_ready is not None:
                 on_ready(enriched, enriched_view, deficit)
                 return
@@ -7629,6 +7684,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._active_providers[request_key] = provider
 
             def completed(result):
+                nonlocal fresh_response
                 if self._active_providers.get(request_key) is not provider:
                     return
                 self._active_providers.pop(request_key, None)
@@ -7636,10 +7692,23 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     return
                 self._retain_broker_al_m1_result(window_key, result)
                 before = len(rows)
+                fresh_response = None
                 if self._historical_result_matches_validation_source(result, session.request.stock):
                     try:
-                        incoming, _, _ = self._direct_selected_history_parts(result.snapshot)
+                        incoming, forming, query = self._direct_selected_history_parts(result.snapshot)
                         prepend(incoming)
+                        if (direct_native and query is not None
+                                and result.snapshot.request_id != "VALIDATION_CACHE_RESTORE"
+                                and len(incoming) >= len(rows)
+                                and incoming[-len(rows):] == rows
+                                and [row["time"] for row in rows]
+                                    == sorted({row["time"] for row in rows})
+                                and self._direct_selected_query_valid(
+                                    query, session.request.stock,
+                                    session.request.timeframe_key,
+                                    session.request.timeframe_minutes,
+                                    str(original_pool["market_data_identity"]), incoming)):
+                            fresh_response = (result.snapshot, query, forming)
                     except Exception:
                         incoming = []
                     if deficit and len(rows) > before and len(incoming) >= request_count:
