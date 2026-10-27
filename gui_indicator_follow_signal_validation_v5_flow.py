@@ -2131,19 +2131,15 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._native_selected_pending[key] = (session, updated,
                                                   self._request_generation.get(key, 0))
             self._publish_pending_native_selected(key)
-            if (source == "INTEGRATED" and interval == 1
-                    and not getattr(window, "_normal_base_ready", False)):
-                from gui_market_data_host import MarketDataHost
+            self._resume_cold_m1_source(key)
 
-                if MarketDataHost._current_display_candles(market, code, 1):
-                    self._use_pool_for_window(window, session, updated, evaluation_count=100)
-
-    def _native_selected_window_ready(self, window, key: int) -> bool:
+    def _native_selected_window_ready(self, window, key: int, *,
+                                      require_base_ready: bool = True) -> bool:
         marking = getattr(window, "marking_display_check", None)
         marked = getattr(marking, "isChecked", None)
         busy = getattr(window, "is_chart_interaction_busy", None)
         return (
-            getattr(window, "_normal_base_ready", False)
+            (not require_base_ready or getattr(window, "_normal_base_ready", False))
             and getattr(window, "_normal_base_requested", False)
             and getattr(window, "_replay_snapshot", None) is None
             and getattr(window, "validation_range", None) is None
@@ -2153,6 +2149,58 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             and key not in self._history_browse_active
             and not getattr(window, "_marking_pool_publication_pending", False)
         )
+
+    def _resume_cold_m1_source(self, key: int) -> bool:
+        if key in self._prepare_active or key in self._prepare_pending:
+            return False
+        pending = self._native_selected_pending.get(key)
+        window = self._open_windows.get(key)
+        if pending is None or window is None or getattr(window, "_normal_base_ready", False):
+            return False
+        session, pool, generation = pending
+        if (not isinstance(session, ValidationSession) or not isinstance(pool, dict)
+                or session.request.timeframe_key != "M1"
+                or self._validation_sessions.get(key) is not session
+                or self._request_generation.get(key, 0) != generation
+                or getattr(window, "stock", None) != session.request.stock
+                or not self._window_accepts_results(window)
+                or not self._native_selected_window_ready(
+                    window, key, require_base_ready=False)):
+            return False
+        proof = pool.get("native_live_snapshot")
+        code = session.request.stock.code
+        current_pool = self._historical_pools.get(key)
+        market = self._v5_lease_hosts.get(key)
+        owner = self.parent()
+        getter = getattr(owner, "existing_market_data_host", None)
+        current_market = getter() if callable(getter) else None
+        read = getattr(market, "native_selected_observation_snapshot", None)
+        if (not isinstance(proof, dict) or proof.get("market_source") != "INTEGRATED"
+                or proof.get("timeframe_minutes") != 1
+                or pool.get("market_source") != "INTEGRATED"
+                or pool.get("market_data_identity") != f"{code}_AL"
+                or not isinstance(current_pool, dict)
+                or current_pool.get("stock") != session.request.stock
+                or current_pool.get("timeframe_key") != "M1"
+                or current_pool.get("market_source") != "INTEGRATED"
+                or current_pool.get("market_data_identity") != f"{code}_AL"
+                or current_pool.get("request_id") != pool.get("request_id")
+                or current_pool.get("candles") is not pool.get("candles")
+                or self._validation_source_by_code.get(code) is not True
+                or market is not self._sor_m1_observed_host
+                or market is None or market is not current_market
+                or not callable(read)
+                or read(key, code, 1, proof.get("request_id")) != proof
+                or not _v5_host_native_proof_is_current(
+                    session.request.stock, proof, self._broker, self._now_factory())):
+            return False
+        from gui_market_data_host import MarketDataHost
+
+        if not MarketDataHost._current_display_candles(market, code, 1):
+            return False
+        self._native_selected_pending.pop(key, None)
+        self._use_pool_for_window(window, session, pool, evaluation_count=100)
+        return True
 
     def _publish_pending_native_selected(self, key: int) -> None:
         pending = self._native_selected_pending.get(key)
@@ -2246,7 +2294,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or self._historical_pools.get(key) is not pool
                 or self._request_generation.get(key, 0) != generation
                 or getattr(window, "stock", None) != session.request.stock
-                or not self._native_selected_window_ready(window, key)
+                or not self._native_selected_window_ready(
+                    window, key, require_base_ready=not (
+                        session.request.timeframe_key == "M1"
+                        and proof.get("market_source") == "INTEGRATED"))
                 or proof.get("request_id") != request_id
                 or proof.get("timeframe_minutes") != session.request.timeframe_minutes
                 or pool.get("market_source") != proof.get("market_source")
@@ -2729,6 +2780,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return
         if window_key in self._native_selected_pending:
             self._publish_pending_native_selected(window_key)
+            self._resume_cold_m1_source(window_key)
             if window_key in self._prepare_active:
                 return
         pending_history = self._history_extension_pending.get(window_key)
@@ -10559,6 +10611,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             observe("prepare_error", window=window)
             self._prepare_active.pop(window_key, None)
             self._range_replay_pending.pop(window_key, None)
+            if (error == "SOR_M1_BLOCKED:SOR_M1_SOURCE_UNAVAILABLE"
+                    and self._resume_cold_m1_source(window_key)):
+                return
             self._fail_window(window, f"SIGNAL_SCAN_ERROR: {error}")
             return
         session = payload.get("session")

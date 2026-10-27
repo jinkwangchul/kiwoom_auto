@@ -1385,6 +1385,12 @@ class MarketDataHost(QObject):
         receipts = _host_attr(self, "_native_observation_receipt_by_stock", None)
         if isinstance(receipts, dict):
             receipts.pop(key, None)
+        v5_m1_handoff = (
+            source == "INTEGRATED" and interval == 1 and request_receipt is not None
+            and any(value == code and
+                    _host_attr(self, "_v5_observation_timeframes", {}).get(window_key) == 1
+                    for window_key, value in
+                    _host_attr(self, "_v5_observation_leases", {}).items()))
         if request_receipt is not None:
             if not isinstance(receipts, dict):
                 receipts = {}
@@ -1397,14 +1403,11 @@ class MarketDataHost(QObject):
                 "request_id": request_id, "session_identity": identity,
                 "watch_generation": _host_attr(self, "_v5_watch_generation", None),
                 "tr_forming_candle": forming,
-                "tick_anchor_sequence": (tick_anchor_sequence if forming is not None else None),
+                "tick_anchor_sequence": (None if v5_m1_handoff and forming is None
+                                         else tick_anchor_sequence),
                 "tick_revision": 0,
             })
-        if (source == "INTEGRATED" and interval == 1 and request_receipt is not None
-                and any(value == code and
-                        _host_attr(self, "_v5_observation_timeframes", {}).get(window_key) == 1
-                        for window_key, value in
-                        _host_attr(self, "_v5_observation_leases", {}).items())):
+        if v5_m1_handoff:
             accepted_times = {row["time"] for row in completed}
             if forming is not None:
                 accepted_times.add(forming["time"])
