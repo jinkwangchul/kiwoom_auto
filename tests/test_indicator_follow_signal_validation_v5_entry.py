@@ -4,6 +4,7 @@ import builtins
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -286,12 +287,31 @@ def test_v5_modules_are_standalone_and_flow_uses_v5_window():
     )
 
     assert IndicatorFollowSignalValidationV5Window.__module__ == "gui_indicator_follow_signal_validation_v5_window"
+    assert dialog_module.IndicatorFollowRoutineSettingsDialog in IndicatorFollowSignalValidationV5Window.__bases__
     assert importlib.util.find_spec("gui_indicator_follow_signal_validation_v4_flow") is None
     assert importlib.util.find_spec("gui_indicator_follow_signal_validation_v4_window") is None
     assert (
         IndicatorFollowSignalValidationV5Flow.__init__.__kwdefaults__["window_factory"]
         is IndicatorFollowSignalValidationV5Window
     )
+    import_check = subprocess.run(
+        [sys.executable, "-B", "-c", """
+import builtins
+real_import = builtins.__import__
+def without_v2(name, *args, **kwargs):
+    if name in {
+        'gui_indicator_follow_signal_validation_window',
+        'gui_indicator_follow_signal_validation_flow',
+    }:
+        raise AssertionError(f'retired V2 module imported: {name}')
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = without_v2
+import gui_indicator_follow_signal_validation_v5_window
+import gui_indicator_follow_signal_validation_v5_flow
+"""],
+        capture_output=True, text=True, check=False,
+    )
+    assert import_check.returncode == 0, import_check.stderr
 
 
 def test_v5_binder_reuses_owner_and_dialog_connection():

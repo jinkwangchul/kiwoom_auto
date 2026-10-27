@@ -17,9 +17,6 @@ from gui_indicator_follow_signal_validation_v5_flow import (
     ValidationRequest, ValidationSession, ValidationSettingsSnapshot,
     ValidationStockRef,
 )
-from gui_indicator_follow_signal_validation_window import (
-    IndicatorFollowSignalValidationChartCanvas as OriginalCanvas,
-)
 from tests.test_v5_direct_forming_tail_20261026 import AS_OF, _flow, _session
 
 
@@ -158,9 +155,8 @@ def test_m1_snapshot_event_cannot_republish_a_selected_m3_window(monkeypatch):
     })
 
 
-@pytest.mark.parametrize("canvas_type", [V5Canvas, OriginalCanvas])
 @pytest.mark.parametrize("release_before_drag", [False, True])
-def test_double_click_drag_selects_period_without_panning(canvas_type, release_before_drag):
+def test_double_click_drag_selects_period_without_panning(release_before_drag):
     app = QApplication.instance() or QApplication([])
     first = datetime(2026, 10, 26, 9)
     candles = [
@@ -168,7 +164,7 @@ def test_double_click_drag_selects_period_without_panning(canvas_type, release_b
          "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10}
         for i in range(20)
     ]
-    canvas = canvas_type(candles, [], timeframe_key="M1")
+    canvas = V5Canvas(candles, [], timeframe_key="M1")
     canvas.resize(800, 360)
     canvas.show()
     app.processEvents()
