@@ -7500,6 +7500,25 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         start = max(0, first - warmup)
         result = dict(view, candles=rows[start:], display_candles=display)
         result["requested_count"] = len(result["candles"])
+        rules = session.request.settings_snapshot.to_dict()
+        scope = rules.get("validation_market_scope") if isinstance(rules, dict) else None
+        regular_only = isinstance(scope, dict) and scope.get("regular_market_only") is True
+        result.pop("_normal_regular_display_source_proof", None)
+        if (regular_only and pool.get("market_source") == "INTEGRATED"
+                and self._direct_selected_query_valid(
+                    pool.get("direct_selected_query"), session.request.stock,
+                    session.request.timeframe_key, session.request.timeframe_minutes,
+                    str(pool.get("market_data_identity")), pool.get("candles"))
+                and result["candles"] == pool["candles"][-len(result["candles"]):]
+                and display == _krx_regular_session_candles(result["candles"])[-len(display):]):
+            result["_normal_regular_display_source_proof"] = (
+                self._pool_computation_source_identity(pool),
+                self._marking_revision_candle_identity(result["candles"]),
+                self._marking_revision_candle_identity(display),
+                len(result["candles"]), result["candles"][0]["time"],
+                result["candles"][-1]["time"], len(display),
+                display[0]["time"], display[-1]["time"],
+            )
         result["snapshot"] = ValidationHistoricalSnapshot(
             stock=session.request.stock,
             timeframe_minutes=session.request.timeframe_minutes,
@@ -7613,17 +7632,37 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             enriched_view["display_candles"] = [
                                 *(rows[-(len(display) - 1):] if len(display) > 1 else []),
                                 current]
-                        enriched_view["snapshot"] = ValidationHistoricalSnapshot(
-                            stock=session.request.stock,
-                            timeframe_minutes=session.request.timeframe_minutes,
-                            timeframe_key=session.request.timeframe_key,
-                            requested_count=len(enriched_view["candles"]),
-                            request_id=str(snapshot.request_id),
-                            rows=self._historical_rows_from_candles(
-                                enriched_view["candles"]),
-                            market_data_identity=str(snapshot.market_data_identity),
-                            market_source=str(snapshot.market_source),
-                            request_as_of=query["request_as_of"])
+                        elif (isinstance(
+                                session.request.settings_snapshot.to_dict().get(
+                                    "validation_market_scope"), dict) and
+                                session.request.settings_snapshot.to_dict()[
+                                    "validation_market_scope"].get(
+                                        "regular_market_only") is True):
+                            try:
+                                selected = self._validation_pool_for_session(
+                                    session, enriched, target_count=len(rows))
+                                enriched_view, _ = self._normal_base_history_view(
+                                    session, enriched, history_target, selected)
+                                if (not any(row.get("display_only_special") for row in
+                                            enriched_view["display_candles"])
+                                        and "_normal_regular_display_source_proof"
+                                        not in enriched_view):
+                                    raise ValueError("REGULAR_DISPLAY_SOURCE_UNVERIFIED")
+                            except ValueError:
+                                enriched = original_pool
+                                enriched_view = view
+                        if enriched is not original_pool:
+                            enriched_view["snapshot"] = ValidationHistoricalSnapshot(
+                                stock=session.request.stock,
+                                timeframe_minutes=session.request.timeframe_minutes,
+                                timeframe_key=session.request.timeframe_key,
+                                requested_count=len(enriched_view["candles"]),
+                                request_id=str(snapshot.request_id),
+                                rows=self._historical_rows_from_candles(
+                                    enriched_view["candles"]),
+                                market_data_identity=str(snapshot.market_data_identity),
+                                market_source=str(snapshot.market_source),
+                                request_as_of=query["request_as_of"])
             else:
                 enriched = self._pool_from_candles(
                     session, rows, requested_count=max(len(rows), int(original_pool["requested_count"])),
@@ -8895,11 +8934,29 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             and scope.get("regular_market_only") is True)
             expected_display = (_krx_regular_session_candles(historical)
                                 if regular_only else historical[-len(display):])
+            bounded_regular = False
+            proof = view.get("_normal_regular_display_source_proof")
+            if (regular_only and display != expected_display and not direct_m5_special
+                    and isinstance(proof, tuple) and len(proof) == 9
+                    and self._direct_selected_query_valid(
+                        source_pool.get("direct_selected_query"), session.request.stock,
+                        timeframe_key, session.request.timeframe_minutes,
+                        f"{code}_AL", source_pool.get("candles"))
+                    and historical == source_pool["candles"][-len(historical):]
+                    and display == expected_display[-len(display):]):
+                bounded_regular = proof == (
+                    self._pool_computation_source_identity(source_pool),
+                    self._marking_revision_candle_identity(historical),
+                    self._marking_revision_candle_identity(display),
+                    len(historical), historical[0]["time"], historical[-1]["time"],
+                    len(display), display[0]["time"], display[-1]["time"],
+                )
             if (len(stamps) != len(historical)
                     or any(len(stamp) != 14 or not stamp.isdigit() for stamp in stamps)
                     or stamps != sorted(set(stamps))
                     or any(row.get("is_complete") is False for row in historical)
-                    or (display != expected_display and not direct_m5_special)):
+                    or (display != expected_display and not direct_m5_special
+                        and not bounded_regular)):
                 raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
             if direct_m5_special:
                 source_rows = source_pool.get("candles")

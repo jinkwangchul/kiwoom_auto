@@ -690,6 +690,10 @@ def test_normal_base_enrichment_uses_only_fresh_complete_native_m3_source(
 
     flow = _flow()
     session = _session()
+    session = ValidationSession(replace(session.request, settings_snapshot=ValidationSettingsSnapshot({
+        "bar": {"bar_minutes": 3}, "validation_timeframe": {"key": "M3"},
+        "validation_market_scope": {"regular_market_only": True},
+    })), operation_active_reader=lambda: False)
     flow._validation_source_by_code["005930"] = True
     flow._historical_cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path)
     source_rows = [dict(ROWS[0], time=(datetime(2026, 10, 26, 15, 0)
@@ -712,6 +716,7 @@ def test_normal_base_enrichment_uses_only_fresh_complete_native_m3_source(
     window = SimpleNamespace()
     flow._open_windows[id(window)] = window
     flow._request_generation[id(window)] = 0
+    flow._history_targets[id(window)] = 8
     response_rows = source_rows if complete_response else source_rows[:3]
     response = _result(session, AS_OF, response_rows, request_id="fresh-m3")
     _, _, fresh_query = flow._direct_selected_history_parts(response.snapshot)
@@ -725,8 +730,6 @@ def test_normal_base_enrichment_uses_only_fresh_complete_native_m3_source(
     flow._historical_provider_factory = lambda *_a, **_k: Provider()
     monkeypatch.setattr(flow_module, "required_validation_history_context_bars",
                         lambda *_a: 3)
-    monkeypatch.setattr(flow, "_normal_base_history_view", lambda *_a, **_k:
-                        (dict(pool, candles=saved, display_candles=saved), 3))
     used = []
     monkeypatch.setattr(flow, "_use_pool_for_window", lambda *_a, **kwargs:
                         used.append((_a[2], kwargs["_normal_view"])))
@@ -734,6 +737,10 @@ def test_normal_base_enrichment_uses_only_fresh_complete_native_m3_source(
     assert calls == [11]
     assert len(used) == 1
     used_pool, used_view = used[0]
+    flow._now_factory = lambda: datetime(2026, 10, 27, 5, 0,
+                                         tzinfo=ZoneInfo("Asia/Seoul"))
+    frozen = flow._sor_m1_calculation_snapshot(session, used_pool)
+    assert flow._sor_m1_calculation_view(session, used_pool, used_view, frozen) is used_view
     if complete_response:
         assert used_pool["candles"] == source_rows
         assert used_pool["request_id"] == "fresh-m3"
@@ -748,6 +755,43 @@ def test_normal_base_enrichment_uses_only_fresh_complete_native_m3_source(
         "005930", 3, 8, "M3", market_data_identity="005930_AL").read_bytes() == cache_before
     assert not flow._validation_cache_source_marker_path(
         session.request.stock, 3, "M3", 11).exists()
+
+
+def test_normal_base_regular_display_suffix_requires_bound_source_proof(monkeypatch):
+    import gui_indicator_follow_signal_validation_v5_flow as flow_module
+
+    flow = _flow()
+    session = _session()
+    session = ValidationSession(replace(session.request, settings_snapshot=ValidationSettingsSnapshot({
+        "bar": {"bar_minutes": 3}, "validation_timeframe": {"key": "M3"},
+        "validation_market_scope": {"regular_market_only": True},
+    })), operation_active_reader=lambda: False)
+    flow._validation_source_by_code["005930"] = True
+    flow._now_factory = lambda: datetime(2026, 10, 27, 5, 0,
+                                         tzinfo=ZoneInfo("Asia/Seoul"))
+    rows = [dict(ROWS[0], time=f"2026102309{minute:02d}00")
+            for minute in (0, 3, 6, 9, 12, 15)]
+    _, _, query = flow._direct_selected_history_parts(_result(session, AS_OF, rows).snapshot)
+    pool = flow._pool_from_candles(session, rows, requested_count=len(rows),
+        request_id="opt10080_005930_direct_m3", market_data_identity="005930_AL",
+        market_source="INTEGRATED", direct_selected_query=query)
+    monkeypatch.setattr(flow_module, "required_validation_history_context_bars", lambda *_: 3)
+    view, deficit = flow._normal_base_history_view(session, pool, 2)
+    assert deficit == 0
+    assert len(view["display_candles"]) == 2
+    assert len(flow_module._krx_regular_session_candles(view["candles"])) > 2
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    assert flow._sor_m1_calculation_view(session, pool, view, frozen) is view
+    unbound = dict(view)
+    unbound.pop("_normal_regular_display_source_proof", None)
+    with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY_PROVENANCE_INVALID"):
+        flow._sor_m1_calculation_view(session, pool, unbound, frozen)
+    for changed in (dict(view, display_candles=view["display_candles"][1:]),
+                    dict(view, display_candles=[view["display_candles"][0],
+                                                view["display_candles"][0]]),
+                    dict(view, market_data_identity="005930")):
+        with pytest.raises(ValueError, match="SOR_DIRECT_HISTORY"):
+            flow._sor_m1_calculation_view(session, pool, changed, frozen)
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
