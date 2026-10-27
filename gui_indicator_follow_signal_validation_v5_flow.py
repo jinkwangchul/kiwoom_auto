@@ -12577,7 +12577,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if deficit:
                     raise ValueError("MARKING_SOURCE_UNAVAILABLE")
                 source_rows = source_view["candles"]
-            elif source_session.request.timeframe_key in {"D1", "W1", "MO1", "Y1"}:
+            elif (source_session.request.timeframe_key in {"D1", "W1", "MO1", "Y1"}
+                  or (source_session.request.timeframe_key == "M5"
+                      and pool.get("market_source") == "INTEGRATED"
+                      and pool.get("market_data_identity") == f"{window.stock.code}_AL"
+                      and any(str(row.get("time") or "").endswith("153500")
+                              for row in source_rows))):
                 source_view = self._validation_pool_for_session(
                     source_session, pool,
                     target_count=max(len(source_rows), len(request["calculation"])))
@@ -12697,7 +12702,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     if (isinstance(scope, dict)
                             and scope.get("regular_market_only") is True
                             and session.request.timeframe_key.startswith("M")
-                            and session.request.timeframe_key != "M5"
+                            and (session.request.timeframe_key != "M5"
+                                 or (pool.get("market_source") == "INTEGRATED"
+                                     and pool.get("market_data_identity") ==
+                                     f"{session.request.stock.code}_AL"))
                             and not detached_premarket
                             and pool.get("market_source") in {"INTEGRATED", "NXT", "KRX"}):
                         full_regular = _krx_regular_session_candles(calculation)

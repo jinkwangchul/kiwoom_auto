@@ -1893,6 +1893,82 @@ def test_marking_regular_m3_worker_uses_verified_full_display(case, monkeypatch)
         assert "MARKING_SOURCE_CHANGED" in payloads[0]["error"]
 
 
+@pytest.mark.parametrize("case", ["valid", "missing_query", "corrupt_query"])
+def test_marking_regular_m5_worker_uses_native_calculation_without_1535(case, monkeypatch):
+    from copy import deepcopy
+    from tests.test_indicator_follow_v2_display_only_integrated_flow import ValidationSettingsSnapshot
+
+    monkeypatch.setattr(flow_module, "_trace_v5_marking", lambda *_args, **_kwargs: None)
+    flow, session, pool, _market = _after_forming_case("M5", 5)
+    settings = ValidationSettingsSnapshot({
+        "bar": {"bar_minutes": 5}, "validation_timeframe": {"key": "M5"},
+        "validation_market_scope": {"regular_market_only": True},
+    })
+    session.request.settings_snapshot = settings
+    pool["candles"] = [
+        dict(pool["candles"][0], time=f"{day}{clock}", close=100, open=100,
+             high=100, low=100, volume=(1 if clock == "153500" else 10))
+        for day in ("20261021", "20261023")
+        for clock in ("090000", "090500", "153000", "153500", "154000", "195500")
+    ]
+    pool["market_source"] = "INTEGRATED"
+    pool["market_data_identity"] = f"{session.request.stock.code}_AL"
+    pool["requested_count"] = len(pool["candles"])
+    pool["signal_entries_by_settings_hash"] = {}
+    pool["signal_entries_signature_by_settings_hash"] = {}
+    pool["direct_selected_query"] = {
+        "stock_code": session.request.stock.code, "timeframe_key": "M5",
+        "timeframe_minutes": 5, "market_data_identity": pool["market_data_identity"],
+        "market_source": "INTEGRATED", "request_id": "direct-m5-marking",
+        "request_as_of": "2026-10-23T20:01:00+09:00",
+        "last_completed_time": pool["candles"][-1]["time"],
+    }
+    flow._now_factory = lambda: datetime(2026, 10, 24, 5, 25,
+                                         tzinfo=ZoneInfo("Asia/Seoul"))
+    if case == "missing_query":
+        pool.pop("direct_selected_query")
+    elif case == "corrupt_query":
+        pool["direct_selected_query"]["last_completed_time"] = "20261023090000"
+    original = deepcopy(pool)
+    if case == "valid":
+        calculation = flow._validation_pool_for_session(
+            session, pool, target_count=len(pool["candles"]))["candles"]
+    else:
+        calculation = [row for row in pool["candles"]
+                       if not row["time"].endswith("153500")]
+    regular = flow_module._krx_regular_session_candles(calculation)
+    display = deepcopy(regular[-2:])
+    errors = []
+    window = SimpleNamespace(stock=session.request.stock, _marking_generation=1,
+                             _marking_key="regular-m5",
+                             _disable_marking=lambda **_kw: errors.append("disabled"),
+                             marking_display_check=SimpleNamespace(setToolTip=errors.append))
+    key = id(window)
+    flow._open_windows[key] = window
+    flow._validation_sessions[key] = session
+    flow._historical_pools[key] = pool
+    flow._request_generation[key] = 1
+    request = {"settings": settings, "generation": 1, "key": "regular-m5",
+               "calculation": deepcopy(calculation), "display": display,
+               "times": (display[0]["time"], display[-1]["time"]),
+               "range": (0, 1), "descriptors": ()}
+    payloads = []
+    flow.marking_completed.disconnect()
+    flow.marking_completed.connect(payloads.append)
+    with patch.object(flow_module, "Thread", side_effect=lambda *, target, **_kw: SimpleNamespace(start=target)):
+        flow._start_marking(window, request)
+    assert pool == original
+    if case == "valid":
+        assert errors == []
+        assert len(payloads) == 1 and payloads[0]["error"] == ""
+        rows = payloads[0]["snapshot"].to_candles()
+        assert rows[-1]["time"] == display[-1]["time"]
+        assert all(not row["time"].endswith("153500") for row in rows)
+    else:
+        assert not payloads
+        assert errors and "SPECIAL_BAR_PROVENANCE_INVALID" in errors[-1]
+
+
 @pytest.mark.parametrize("timeframe,minutes", [
     ("M5", 5), ("M10", 10), ("M30", 30),
     ("M60", 60), ("M120", 120), ("M240", 240),
