@@ -71,6 +71,45 @@ def test_first_m3_forming_crosses_minute_but_expires_at_bar_end_and_sixty_second
         proof, received + timedelta(seconds=60))
 
 
+def test_next_day_native_receipt_requires_fresh_direct_history_before_publication(
+        tmp_path, monkeypatch):
+    flow, _, prepared, failures, clock, _ = native._run_nxt(
+        tmp_path, monkeypatch, interval=3, history_count=1000)
+    assert not failures and prepared
+    window = prepared[0]["window"]
+    key = id(window)
+    clock[0] = clock[0] + timedelta(days=1)
+    flow._historical_pools[key] = dict(
+        flow._historical_pools[key],
+        source_verified_at=(clock[0] - timedelta(days=1)).isoformat())
+    proof = {"market_source": "NXT", "market_data_identity": "005930_NX",
+             "request_id": "next-day-native", "tick_revision": 0,
+             "forming_candle": None, "completed_candles": [],
+             "request_receipt": ({"request_as_of": clock[0].isoformat()}, {})}
+    event = {"source": "NATIVE_SELECTED_COMPLETED_ACCEPTED",
+             "stock_code": "005930", "timeframe_minutes": 3,
+             "request_id": proof["request_id"], "market_source": "NXT",
+             "market_data_identity": "005930_NX", "forming_candle": None,
+             "completed_candles": []}
+    market = SimpleNamespace(native_selected_observation_snapshot=lambda *_: proof)
+    owner = QObject()
+    owner.existing_market_data_host = lambda: market
+    flow.setParent(owner)
+    flow._fixture_owner = owner
+    flow._sor_m1_observed_host = market
+    flow._v5_lease_hosts[key] = market
+    flow._last_run_requests[key] = IndicatorFollowSignalValidationRunRequest(
+        prepared[0]["session"].request.settings_snapshot, 5)
+    refreshes = []
+    with (patch.object(v5, "_v5_host_native_proof_is_current", return_value=True),
+          patch.object(flow, "_run_validation", side_effect=lambda *args: refreshes.append(args))):
+        flow._handle_native_selected_snapshot_accepted(event)
+    assert len(refreshes) == 1
+    assert refreshes[0][0] is window
+    assert refreshes[0][1].force_historical_refresh is True
+    assert key not in flow._native_selected_pending
+
+
 def test_between_tr_al_tick_reaches_v5_current_filter_without_history_fetch(
         tmp_path, monkeypatch):
     import routines.지표추종매매.routine as routine
@@ -612,6 +651,13 @@ def test_actual_host_native_selected_event_reaches_final_publication(
         assert published_candles[-1][-1]["time"] == (
             f"20261026{hour:02d}{forming_minute:02d}00")
         assert published_candles[-1][-1]["is_complete"] is True
+        broker_final = host_module.normalize_opt10080_rows(completed_rows)[0]
+        assert {field: published_candles[-1][-1][field] for field in
+                ("open", "high", "low", "close", "volume")} == {
+                    field: broker_final[field] for field in
+                    ("open", "high", "low", "close", "volume")}
+        assert published_candles[-1][-1]["close"] != 116
+        assert selected_closes[-1] == broker_final["close"]
         assert historical["candles"] == historical_before
         next_time = clock[0].replace(second=10)
         clock[0] = next_time

@@ -2111,6 +2111,17 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         force_historical_refresh=False)
                     self._run_validation(window, next_run)
                 continue
+            verified_at = self._source_snapshot_datetime(pool.get("source_verified_at"))
+            observed_at = datetime.fromisoformat(proof["request_receipt"][0]["request_as_of"])
+            if verified_at is None or verified_at.date() != observed_at.date():
+                # A new trading day needs a direct historical TR for yesterday's final bar.
+                self._native_selected_pending.pop(key, None)
+                run = self._last_run_requests.get(key)
+                if isinstance(run, IndicatorFollowSignalValidationRunRequest):
+                    self._run_validation(window, IndicatorFollowSignalValidationRunRequest(
+                        run.settings_snapshot, run.candle_count,
+                        force_historical_refresh=True))
+                continue
             pending = self._native_selected_pending.get(key)
             base = pending[1] if pending and pending[0] is session else pool
             previous_proof = base.get("native_live_snapshot")
