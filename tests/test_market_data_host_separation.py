@@ -822,6 +822,46 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         ):
             self.assertIn(expected, tooltip)
 
+    def test_nxt_display_drain_yields_after_bounded_batch_without_reordering(self) -> None:
+        self.market._realtime_shadow_session_identity = (7, "SESSION-7")
+        self.market.MAX_NXT_DISPLAY_TICK_DRAIN_BATCH = 2
+        scheduled = []
+        processed = []
+        original = self.market._process_nxt_display_tick
+
+        def record(payload):
+            processed.append(int(payload["receive_sequence"]))
+            return original(payload)
+
+        with patch.object(
+            self.market,
+            "_process_nxt_display_tick",
+            side_effect=record,
+        ), patch(
+            "gui_market_data_host.QTimer.singleShot",
+            side_effect=lambda _ms, callback: scheduled.append(callback),
+        ):
+            for sequence in (1, 2, 3, 4, 5):
+                self.owner.kiwoom_api.nxt_display_tick_received.emit(
+                    self._nxt_tick_payload(sequence=sequence, price=260000 + sequence)
+                )
+
+            self.assertEqual(1, len(scheduled))
+            scheduled.pop(0)()
+            self.assertEqual([1, 2], processed)
+            self.assertEqual(3, len(self.market._nxt_display_tick_queue))
+            self.assertEqual(1, len(scheduled))
+
+            scheduled.pop(0)()
+            self.assertEqual([1, 2, 3, 4], processed)
+            self.assertEqual(1, len(self.market._nxt_display_tick_queue))
+            self.assertEqual(1, len(scheduled))
+
+            scheduled.pop(0)()
+            self.assertEqual([1, 2, 3, 4, 5], processed)
+            self.assertEqual(0, len(self.market._nxt_display_tick_queue))
+            self.assertEqual(0, len(scheduled))
+
     def test_realtime_fields_override_snapshot_and_blank_fields_keep_snapshot(self) -> None:
         observed: list[dict[str, object]] = []
         self.market.market_data_observed.connect(observed.append)
@@ -1058,6 +1098,46 @@ class MarketDataHostSeparationTests(unittest.TestCase):
 
         state = self.market.high_resolution_market_state("005930")
         self.assertEqual((70000, 100), (state.last_price, state.last_receive_sequence))
+
+    def test_raw_tick_drain_yields_after_bounded_batch_without_reordering(self) -> None:
+        self._activate_raw_session()
+        self.market.MAX_RAW_TICK_DRAIN_BATCH = 2
+        scheduled = []
+        processed = []
+        original = self.market._process_raw_realtime_tick
+
+        def record(payload):
+            processed.append(int(payload["receive_sequence"]))
+            return original(payload)
+
+        with patch.object(
+            self.market,
+            "_process_raw_realtime_tick",
+            side_effect=record,
+        ), patch(
+            "gui_market_data_host.QTimer.singleShot",
+            side_effect=lambda _ms, callback: scheduled.append(callback),
+        ):
+            for sequence in (1, 2, 3, 4, 5):
+                self.owner.kiwoom_api.realtime_shadow_tick_received.emit(
+                    self._raw_tick_payload(sequence=sequence, price=sequence)
+                )
+
+            self.assertEqual(1, len(scheduled))
+            scheduled.pop(0)()
+            self.assertEqual([1, 2], processed)
+            self.assertEqual(3, len(self.market._raw_tick_queue))
+            self.assertEqual(1, len(scheduled))
+
+            scheduled.pop(0)()
+            self.assertEqual([1, 2, 3, 4], processed)
+            self.assertEqual(1, len(self.market._raw_tick_queue))
+            self.assertEqual(1, len(scheduled))
+
+            scheduled.pop(0)()
+            self.assertEqual([1, 2, 3, 4, 5], processed)
+            self.assertEqual(0, len(self.market._raw_tick_queue))
+            self.assertEqual(0, len(scheduled))
 
     def test_raw_tick_metrics_and_overflow_are_observable(self) -> None:
         self._activate_raw_session()

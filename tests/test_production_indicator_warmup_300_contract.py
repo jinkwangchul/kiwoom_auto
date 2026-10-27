@@ -2,12 +2,27 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from gui_market_data_host import MarketDataHost
 from routines.지표추종매매.routine import market_bar_projection_request
 
 
 class ProductionIndicatorWarmup300ContractTests(unittest.TestCase):
+    def test_verified_native_standby_history_does_not_repeat_full_fetch(self) -> None:
+        host = SimpleNamespace(
+            _candle_standby_timeframe_requirements_by_stock={"005930": {3: 300}},
+            _direct_timeframe_candles={},
+        )
+        minute_key = "2026-10-27 08:00"
+        first = MarketDataHost.direct_timeframe_refresh_specs(host, "005930", minute_key)
+        self.assertEqual(300, first[0]["required_count"])
+        self.assertEqual(301, first[0]["request_count"])
+        host._direct_timeframe_candles[("005930", 3)] = [{} for _ in range(300)]
+        self.assertEqual(
+            (), MarketDataHost.direct_timeframe_refresh_specs(host, "005930", minute_key)
+        )
+
     def test_live_rsi_declares_300_timeframe_history_without_v5_preload(self) -> None:
         rules = {
             "bar": {"bar_minutes": 5},
