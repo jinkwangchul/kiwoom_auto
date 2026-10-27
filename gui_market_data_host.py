@@ -1600,6 +1600,8 @@ class MarketDataHost(QObject):
             return
         try:
             plan = read_stock_market_source_plan(PROJECT_ROOT, code, market_time.date())
+            if plan is None:
+                return
             selected = [source_for_time(plan, instant) for instant in
                         (market_time, received, datetime.now(SEOUL_TIMEZONE))]
         except (TypeError, ValueError, KeyError):

@@ -421,6 +421,66 @@ def test_al_tick_extends_only_sequence_anchored_direct_m3_forming_bar():
         assert host._native_observation_completed_by_stock[("005930", 3, "INTEGRATED")]["candles"] == ()
 
 
+def test_krx_native_selected_tick_requires_market_source_plan():
+    at = datetime(2026, 10, 27, 16, 26, 10, tzinfo=SEOUL_TIMEZONE)
+    tick_at = at + timedelta(seconds=1)
+    events = []
+    registration = SimpleNamespace(
+        active=True, connection_epoch=7, login_session_id="offline",
+        target_stock_codes=("005930",),
+    )
+    host = SimpleNamespace(
+        _current_display_session_identity=lambda: (7, "offline"),
+        _v5_observation_leases={"chart": "005930"},
+        _v5_observation_timeframes={"chart": 3},
+        _native_observation_forming_by_stock={},
+        _native_observation_receipt_by_stock={},
+        kiwoom_api=SimpleNamespace(
+            _realtime_shadow_registration=registration,
+            broker_session_snapshot=lambda: SimpleNamespace(
+                connected=True, connection_epoch=7, login_session_id="offline")),
+        market_data_observed=SimpleNamespace(emit=events.append),
+    )
+    tick = dict(stock_code="005930", broker_code_identity="005930",
+                market_source="KRX", market_datetime=tick_at.isoformat(),
+                received_at=tick_at.isoformat(), native_receive_sequence=5,
+                current_price=110, trade_volume_abs=3, cumulative_volume=103)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at + timedelta(seconds=2)
+
+    with patch("gui_market_data_host.datetime", Clock), \
+            patch("gui_market_data_host.read_stock_market_source_plan", return_value=None):
+        MarketDataHost._extend_native_selected_al_forming(host, tick)
+    assert host._native_observation_forming_by_stock == {}
+    assert host._native_observation_receipt_by_stock == {}
+    assert events == []
+
+    candle = dict(time="20261027162400", native_bar_end=at.replace(minute=27).isoformat(),
+                  high=105, low=99, close=101, volume=100)
+    key = ("005930", 3)
+    host._native_observation_forming_by_stock[key] = dict(
+        candle=candle, session_identity=(7, "offline"), request_id="krx-m3",
+        tick_registration=registration, tick_anchor_sequence=4,
+        received_at=at - timedelta(seconds=1), tick_last_market_time=at,
+        tick_last_sequence=4, tick_last_cumulative_volume=100,
+    )
+    host._native_observation_receipt_by_stock[key] = dict(
+        session_identity=(7, "offline"), request_id="krx-m3",
+        market_source="KRX", market_data_identity="005930",
+        tr_forming_candle=dict(candle), completed_candles=[],
+    )
+    plan = _build("005930", "Samsung", at.date(), at.isoformat(), False)
+    with patch("gui_market_data_host.datetime", Clock), \
+            patch("gui_market_data_host.read_stock_market_source_plan", return_value=plan):
+        MarketDataHost._extend_native_selected_al_forming(host, tick)
+    assert host._native_observation_receipt_by_stock[key]["forming_candle"]["close"] == 110
+    assert host._native_observation_receipt_by_stock[key]["tick_revision"] == 5
+    assert [event["source"] for event in events] == ["NATIVE_SELECTED_TICK_ACCEPTED"]
+
+
 @pytest.mark.parametrize("initial_counts", [{}, {"005930": 0}])
 def test_first_al_tick_accepts_valid_zero_anchor_with_empty_or_explicit_counter(
         initial_counts):
