@@ -6277,6 +6277,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         prepared_presentation: object | None = None,
         prepared_view_pool: dict[str, object] | None = None,
         normal_base_presentation: object | None = None,
+        m1_marking_basis: object = None,
     ) -> bool:
         window_key = id(window)
         publication_generation = self._request_generation.get(window_key, 0)
@@ -6550,6 +6551,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 window, session, pool, view_pool, publication_generation)
         except Exception:
             pass  # Replay basis is optional; a failed binding cannot undo the chart.
+        try:
+            self._remember_published_m1_marking_basis(
+                window, session, pool, view_pool, publication_generation,
+                m1_marking_basis)
+        except Exception:
+            window._v5_m1_marking_basis = None
         return True
 
     @staticmethod
@@ -6736,6 +6743,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         verified_source_identity: tuple[object, ...] | None = None,
         sor_m1_calculation_snapshot: object = None,
         expected_sor_m1_calculation: object = None,
+        marking_view_check: Callable[[dict[str, object]], dict[str, object]] | None = None,
     ) -> ValidationReplayResult:
         if not isinstance(pool, dict):
             raise ValueError("HISTORICAL_POOL_UNAVAILABLE")
@@ -6779,6 +6787,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 )
             if not active_pool.get("sor_tail_calculation_complete"):
                 raise ValueError("SOR_VERIFIED_BLOCKED:REPLAY_VIEW_UNVERIFIED")
+        if marking_view_check is not None:
+            active_pool = marking_view_check(active_pool)
         candles = active_pool.get("candles")
         if not isinstance(candles, list) or not candles:
             raise ValueError("HISTORICAL_POOL_EMPTY")
@@ -7678,6 +7688,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 detached_pool.update(deepcopy(request["dispatch_snapshot"]))
                 view, _ = self._normal_base_history_view(
                     session, detached_pool, history_target, request.get("normal_base_view"))
+                marking_source_view = view
                 live_key = request.get("live_m1_snapshot_key")
                 if live_key is not None:
                     try:
@@ -7721,6 +7732,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     cancel_predicate=lambda: not current())
                 payload["prepared_view_pool"] = view
                 payload["normal_base_presentation"] = (descriptors, cache)
+                if (session.request.timeframe_key == "M1" and live_key is not None
+                        and view.get("sor_m1_calculation_complete") is True):
+                    payload["m1_marking_basis"] = (
+                        marking_source_view, request.get("sor_m1_calculation_snapshot"))
                 if request.get("live_native_request_id") is not None:
                     candles = view.get("candles")
                     native_signal = {"unavailable": True}
@@ -8209,6 +8224,90 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             and (int(stamp[8:10]) * 60 + int(stamp[10:12]) - 930) % 15 == 0
             for stamp in prior if stamp[8:12] >= "1530"
         )
+
+    def _remember_published_m1_marking_basis(self, window, session, pool, view,
+                                             generation, basis):
+        window._v5_m1_marking_basis = None
+        if (session.request.stock.code != "005930"
+                or session.request.timeframe_key != "M1"
+                or self._verified_sor_tail_provider is not None
+                or pool.get("native_live_snapshot") is not None
+                or not isinstance(basis, tuple) or len(basis) != 2):
+            return
+        source_view, frozen = basis
+        publication = pool.get("_dispatch_snapshot")
+        calculation = getattr(window, "_calculation_candles", None)
+        display = getattr(window, "_candles", None)
+        snapshot = view.get("snapshot")
+        if (self._open_windows.get(id(window)) is not window
+                or self._historical_pools.get(id(window)) is not pool
+                or self._validation_sessions.get(id(window)) is not session
+                or self._request_generation.get(id(window), 0) != generation
+                or not isinstance(publication, tuple) or len(publication) != 4
+                or publication[3] != self._pool_computation_source_identity(pool)
+                or not isinstance(source_view, dict)
+                or source_view.get("timeframe_key") != "M1"
+                or source_view.get("market_data_identity") != "005930_AL"
+                or source_view.get("market_source") != "INTEGRATED"
+                or not isinstance(frozen, tuple) or len(frozen) != 3
+                or frozen[0] != publication[3]
+                or not isinstance(frozen[1], datetime)
+                or not isinstance(frozen[2], dict)
+                or frozen[2].get("projection") != "FORMING_BASE_BAR"
+                or frozen[2].get("available") is not True
+                or frozen[2].get("forming_snapshot_source") not in _V5_SOR_FORMING_SOURCES
+                or view.get("calculation_source")
+                   != "SELECTED_HISTORY_WITH_BROKER_AL_CONFIRMED_M1_TODAY"
+                or view.get("sor_m1_calculation_complete") is not True
+                or not isinstance(calculation, list) or not calculation
+                or not isinstance(display, list) or not display
+                or calculation != view.get("candles")
+                or display != view.get("display_candles", [])[-len(display):]
+                or not isinstance(snapshot, ValidationHistoricalSnapshot)
+                or snapshot.to_rows() != self._historical_rows_from_candles(calculation)):
+            return
+        packed = pickle.dumps((source_view, frozen, calculation, display), protocol=4)
+        window._v5_m1_marking_basis = (
+            pool, session, generation, publication, packed)
+
+    def _published_m1_marking_basis(self, window, session, pool, generation,
+                                    request):
+        basis = getattr(window, "_v5_m1_marking_basis", None)
+        if basis is None:
+            return None
+        if not isinstance(basis, tuple) or len(basis) != 5:
+            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+        bound_pool, bound_session, bound_generation, publication, packed = basis
+        if (bound_pool is not pool or bound_session is not session
+                or bound_generation != generation
+                or self._historical_pools.get(id(window)) is not pool
+                or self._validation_sessions.get(id(window)) is not session
+                or self._request_generation.get(id(window), 0) != generation
+                or pool.get("_dispatch_snapshot") is not publication
+                or not isinstance(publication, tuple) or len(publication) != 4
+                or not isinstance(publication[2], dict)
+                or publication[3] != self._pool_computation_source_identity(pool)
+                or publication[2].get("direct_selected_query")
+                   != pool.get("direct_selected_query")
+                or publication[2].get("selected_direct_forming_snapshot")
+                   != pool.get("selected_direct_forming_snapshot")
+                or not isinstance(packed, bytes)):
+            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+        try:
+            source_view, frozen, calculation, display = pickle.loads(packed)
+        except (pickle.UnpicklingError, EOFError, TypeError, ValueError) as exc:
+            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED") from exc
+        if (not isinstance(source_view, dict)
+                or not isinstance(frozen, tuple) or len(frozen) != 3
+                or frozen[0] != publication[3]
+                or not isinstance(calculation, list)
+                or not isinstance(display, list)
+                or calculation != getattr(window, "_calculation_candles", None)
+                or display != getattr(window, "_candles", None)
+                or calculation != request.get("calculation")
+                or display != request.get("display")):
+            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+        return source_view, frozen, basis
 
     def _remember_published_direct_current(self, window, session, pool, view,
                                            generation):
@@ -9482,6 +9581,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         worker_pool.pop("_dispatch_snapshot", None)
         projected_cache = worker_pool.pop("production_projected_view_cache", None)
         prepared_projected_cache = None
+        payload_base = {}
         projection_as_of = self._now_factory()
         target_count = history_target + required_validation_history_context_bars(
             session.request.settings_snapshot.to_dict()
@@ -9585,10 +9685,18 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 session, worker_pool, view_pool, as_of,
                 dispatch_source_identity,
             )
+            marking_source_view = view_pool
             view_pool = self._sor_m1_calculation_view(
                 session, worker_pool, view_pool,
                 request.get("sor_m1_calculation_snapshot"),
             )
+            frozen = request.get("sor_m1_calculation_snapshot")
+            if (session.request.timeframe_key == "M1"
+                    and isinstance(frozen, tuple) and len(frozen) == 3
+                    and isinstance(frozen[2], dict)
+                    and frozen[2].get("projection") == "FORMING_BASE_BAR"
+                    and view_pool.get("sor_m1_calculation_complete") is True):
+                payload_base["m1_marking_basis"] = (marking_source_view, frozen)
             historical_snapshot = view_pool.get("snapshot")
             active_signal_signature = self._signal_view_signature(
                 view_pool, source_identity=dispatch_source_identity,
@@ -9633,7 +9741,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 )
                 return
 
-        payload_base = {
+        payload_base.update({
             "window_key": window_key,
             "generation": generation,
             "prepare_token": token,
@@ -9642,7 +9750,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             "evaluation_count": evaluation_count,
             "settings_hash": settings_hash,
             "history_target": history_target,
-        }
+        })
         self._prepare_active[window_key] = token
 
         @_perf_stage("worker.prepare_result", owner=window)
@@ -10510,7 +10618,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 installed = self._apply_pool_to_window(
                     window, session, pool, evaluation_count=payload["evaluation_count"],
                     signal_entries=None, prepared_view_pool=payload["prepared_view_pool"],
-                    normal_base_presentation=payload["normal_base_presentation"])
+                    normal_base_presentation=payload["normal_base_presentation"],
+                    m1_marking_basis=payload.get("m1_marking_basis"))
                 status_attempted = False
                 if (installed and live_native_id is not None
                         and self._live_native_snapshot_is_current(
@@ -10658,6 +10767,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 replay_snapshot=replay_snapshot,
                 prepared_presentation=prepared_presentation,
                 prepared_view_pool=payload.get("prepared_view_pool"),
+                m1_marking_basis=payload.get("m1_marking_basis"),
             )
         except Exception as exc:
             applied = False
@@ -12368,7 +12478,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             readiness = session.readiness()
             if not readiness.allowed:
                 raise ValueError(str(readiness.reason))
-            source_rows = pool.get("candles", ())
+            published_m1 = (
+                self._published_m1_marking_basis(
+                    window, source_session, pool, request_generation, request)
+                if session.request.stock.code == "005930"
+                and session.request.timeframe_key == "M1" else None
+            )
+            source_rows = (published_m1[0].get("candles", ()) if published_m1
+                           else pool.get("candles", ()))
             if pool.get("native_live_snapshot") is not None:
                 source_view, deficit = self._normal_base_history_view(
                     source_session, pool,
@@ -12413,13 +12530,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 publication[3] if isinstance(publication, tuple)
                 and len(publication) == 4 else ()
             )
-            direct_snapshot = (
+            direct_snapshot = (published_m1[1] if published_m1 else
                 self._sor_m1_calculation_snapshot(session, pool)
                 if (session.request.stock.code == "005930"
                     and session.request.timeframe_key in {"M1", "M3"}
                     and pool.get("native_live_snapshot") is None)
-                else None
-            )
+                else None)
         except (TypeError, ValueError, KeyError) as exc:
             _trace_v5_marking("marking_failed", key, request.get("generation"),
                               request_generation, reason=str(exc), phase="precheck",
@@ -12432,12 +12548,19 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return (self._open_windows.get(key) is window
                     and self._request_generation.get(key, 0) == request_generation
                     and window._marking_generation == generation
-                    and window._marking_key == request["key"])
+                    and window._marking_key == request["key"]
+                    and (published_m1 is None or getattr(
+                        window, "_v5_m1_marking_basis", None) is published_m1[2]))
 
         @_perf_stage("worker.marking", owner=window)
         def prepare():
             payload = dict(window_key=key, generation=generation, key=request["key"],
                            request_generation=request_generation, snapshot=None, error="")
+            if published_m1 is not None:
+                payload["m1_marking_basis"] = published_m1[2]
+                payload["m1_source_session"] = source_session
+                payload["m1_source_pool"] = pool
+                payload["m1_request"] = request
             try:
                 if not current():
                     _trace_v5_marking("marking_stale", key, generation,
@@ -12453,7 +12576,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if source_candles != source_rows[-len(source_candles):]:
                     raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
                 replay_view = dict(
-                    pool, candles=source_candles,
+                    published_m1[0] if published_m1 else pool,
+                    candles=source_candles,
                     display_candles=list(source_candles),
                     display_only_integrated=False,
                 )
@@ -12464,47 +12588,51 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     replay_view = self._verified_sor_view_for_session(
                         session, pool, replay_view, now, source_identity,
                     )
-                if (session.request.timeframe_key == "M1"
-                        and direct_snapshot is not None
-                        and pool.get("selected_direct_forming_snapshot") is not None):
-                    replay_view = self._sor_m1_calculation_view(
-                        session, pool, replay_view, direct_snapshot,
-                        request["calculation"],
-                    )
-                proven = {row["time"]: row for row in replay_view["candles"]}
                 calculation = request["calculation"]
                 display = request["display"]
-                calculation_times = [row["time"] for row in calculation]
-                display_times = [row["time"] for row in display]
-                calculation_by_time = {row["time"]: row for row in calculation}
-                if (len(proven) != len(replay_view["candles"])
-                        or calculation_times != sorted(set(calculation_times))
-                        or display_times != sorted(set(display_times))
-                        or any((verified.get(row["time"]) if row["time"] in verified
-                                else proven.get(row["time"])) != row
-                               for row in calculation)
-                        or any(calculation_by_time.get(row["time"]) != row
-                               for row in display)):
-                    raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-                replay_view = dict(
-                    replay_view, candles=calculation, display_candles=display,
-                    display_only_integrated=False,
-                )
-                if detached_premarket:
-                    replay_view["market_source"] = "VALIDATION_COMPOSITE"
-                    replay_view["market_data_identity"] = (
-                        f"{session.request.stock.code}_AL_NXT_PRE_VALIDATION"
+                def check_marking_view(checked_view):
+                    if (published_m1 is not None
+                            and (pool.get("_dispatch_snapshot") is not publication
+                                 or source_identity != self._pool_computation_source_identity(pool))):
+                        raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+                    proven = {row["time"]: row for row in checked_view["candles"]}
+                    calculation_times = [row["time"] for row in calculation]
+                    display_times = [row["time"] for row in display]
+                    calculation_by_time = {row["time"]: row for row in calculation}
+                    if (len(proven) != len(checked_view["candles"])
+                            or calculation_times != sorted(set(calculation_times))
+                            or display_times != sorted(set(display_times))
+                            or any((verified.get(row["time"]) if row["time"] in verified
+                                    else proven.get(row["time"])) != row
+                                   for row in calculation)
+                            or any(calculation_by_time.get(row["time"]) != row
+                                   for row in display)):
+                        raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
+                    checked_view = dict(
+                        checked_view, candles=calculation, display_candles=display,
+                        display_only_integrated=False,
                     )
-                    replay_view["snapshot"] = ValidationHistoricalSnapshot(
-                        stock=session.request.stock,
-                        timeframe_minutes=session.request.timeframe_minutes,
-                        timeframe_key=session.request.timeframe_key,
-                        requested_count=len(calculation),
-                        request_id=str(replay_view.get("request_id") or "POOL"),
-                        rows=self._historical_rows_from_candles(calculation),
-                        market_data_identity=replay_view["market_data_identity"],
-                        market_source=replay_view["market_source"],
-                    )
+                    if detached_premarket:
+                        checked_view["market_source"] = "VALIDATION_COMPOSITE"
+                        checked_view["market_data_identity"] = (
+                            f"{session.request.stock.code}_AL_NXT_PRE_VALIDATION"
+                        )
+                        checked_view["snapshot"] = ValidationHistoricalSnapshot(
+                            stock=session.request.stock,
+                            timeframe_minutes=session.request.timeframe_minutes,
+                            timeframe_key=session.request.timeframe_key,
+                            requested_count=len(calculation),
+                            request_id=str(checked_view.get("request_id") or "POOL"),
+                            rows=self._historical_rows_from_candles(calculation),
+                            market_data_identity=checked_view["market_data_identity"],
+                            market_source=checked_view["market_source"],
+                        )
+                    return checked_view
+
+                deferred_check = (session.request.timeframe_key == "M1"
+                                  and direct_snapshot is not None)
+                if not deferred_check:
+                    replay_view = check_marking_view(replay_view)
                 result = self._prepare_replay_result_from_pool(
                     session, pool if direct_snapshot is not None else replay_view,
                     history_target=len(request["display"]),
@@ -12512,7 +12640,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     prepared_view_pool=replay_view, cancel_predicate=lambda: not current(),
                     sor_m1_calculation_snapshot=direct_snapshot,
                     expected_sor_m1_calculation=(
-                        calculation if direct_snapshot is not None else None))
+                        calculation if direct_snapshot is not None else None),
+                    marking_view_check=(check_marking_view if deferred_check else None))
                 snapshot = result.snapshot
                 # Build only marking comparisons; normal filters retain their original cache.
                 rows = snapshot.to_candles()
@@ -12584,11 +12713,18 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         window = self._open_windows.get(payload["window_key"])
         if (window is None or payload["generation"] != window._marking_generation
                 or payload["key"] != window._marking_key
-                or payload["request_generation"] != self._request_generation.get(id(window), 0)):
+                or payload["request_generation"] != self._request_generation.get(id(window), 0)
+                or ("m1_marking_basis" in payload
+                    and payload["m1_marking_basis"] is not getattr(
+                        window, "_v5_m1_marking_basis", None))):
             _trace_v5_marking("marking_stale", payload["window_key"],
                               payload["generation"], payload["request_generation"])
             return
         try:
+            if "m1_marking_basis" in payload:
+                self._published_m1_marking_basis(
+                    window, payload["m1_source_session"], payload["m1_source_pool"],
+                    payload["request_generation"], payload["m1_request"])
             if payload.get("error"):
                 raise ValueError(payload["error"])
             published = window.apply_marking_snapshot(
