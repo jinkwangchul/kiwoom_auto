@@ -162,6 +162,7 @@ class ValidationVirtualCycle:
     sell_quantity: int
     estimated_return_percent: float
     trading_cost_amount: float = 0.0
+    is_liquidation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +358,60 @@ class ValidationVirtualPositionTracker:
         self.quantity_series.append(self.holding_quantity)
         self.contributor_series.append(list(self.buy_indexes))
 
+    def _close_position(
+        self,
+        index: int,
+        candle: Mapping[str, Any],
+        fill_price: float,
+        *,
+        is_liquidation: bool = False,
+    ) -> None:
+        if self.holding_quantity > 0 and self.average_buy_price is not None:
+            sell_quantity = self.holding_quantity
+            sell_amount = fill_price * sell_quantity
+            gross_return_percent = (
+                (fill_price - self.average_buy_price)
+                / self.average_buy_price
+                * 100.0
+            )
+            trading_cost_percent = (
+                float(self.policy["trading_cost_percent"])
+                if self.policy["trading_cost_enabled"] is True
+                else 0.0
+            )
+            trading_cost_amount = (
+                self.cumulative_buy_cost * trading_cost_percent / 100.0
+            )
+            estimated_return = gross_return_percent - trading_cost_percent
+            self.fills.append(ValidationVirtualFill(
+                "SELL", index, str(candle.get("time") or ""), fill_price,
+                sell_quantity, sell_amount, None,
+                "RANGE_END_LIQUIDATION" if is_liquidation else "SINGLE_HOGA",
+            ))
+            self.cycles.append(ValidationVirtualCycle(
+                len(self.cycles) + 1,
+                tuple(self.buy_indexes),
+                self.buy_indexes[0],
+                self.buy_indexes[-1],
+                len(self.buy_indexes),
+                self.holding_quantity,
+                self.cumulative_buy_cost,
+                self.average_buy_price,
+                index,
+                fill_price,
+                sell_quantity,
+                estimated_return,
+                trading_cost_amount,
+                is_liquidation,
+            ))
+        self.holding_quantity = 0
+        self.average_buy_price = None
+        self.confirmed_round = 0
+        self.cumulative_buy_cost = 0.0
+        self.base_buy_cost = 0.0
+        self.previous_buy_budget = 0.0
+        self.buy_indexes = []
+
     def _apply_index(
         self,
         index: int,
@@ -378,54 +433,8 @@ class ValidationVirtualPositionTracker:
             self.holding_quantity,
         )
         if selection.selected_side == "SELL":
-            if (
-                self.holding_quantity > 0
-                and self.average_buy_price is not None
-                and fill_price is not None
-            ):
-                sell_quantity = self.holding_quantity
-                sell_amount = fill_price * sell_quantity
-                gross_return_percent = (
-                    (fill_price - self.average_buy_price)
-                    / self.average_buy_price
-                    * 100.0
-                )
-                trading_cost_percent = (
-                    float(self.policy["trading_cost_percent"])
-                    if self.policy["trading_cost_enabled"] is True
-                    else 0.0
-                )
-                trading_cost_amount = (
-                    self.cumulative_buy_cost * trading_cost_percent / 100.0
-                )
-                estimated_return = gross_return_percent - trading_cost_percent
-                self.fills.append(ValidationVirtualFill(
-                    "SELL", index, str(candle.get("time") or ""), fill_price,
-                    sell_quantity, sell_amount, None, "SINGLE_HOGA",
-                ))
-                self.cycles.append(ValidationVirtualCycle(
-                    len(self.cycles) + 1,
-                    tuple(self.buy_indexes),
-                    self.buy_indexes[0],
-                    self.buy_indexes[-1],
-                    len(self.buy_indexes),
-                    self.holding_quantity,
-                    self.cumulative_buy_cost,
-                    self.average_buy_price,
-                    index,
-                    fill_price,
-                    sell_quantity,
-                    estimated_return,
-                    trading_cost_amount,
-                ))
             if fill_price is not None:
-                self.holding_quantity = 0
-                self.average_buy_price = None
-                self.confirmed_round = 0
-                self.cumulative_buy_cost = 0.0
-                self.base_buy_cost = 0.0
-                self.previous_buy_budget = 0.0
-                self.buy_indexes = []
+                self._close_position(index, candle, fill_price)
             return
 
         if selection.selected_side != "BUY":
@@ -577,6 +586,8 @@ class ValidationVirtualPositionTracker:
         self,
         candles: list[dict[str, Any]],
         entries: list[Any],
+        *,
+        force_liquidation_at_end: bool = False,
     ) -> ValidationExecutionSimulation:
         if candles:
             signals_by_index = self._build_signal_index(candles, entries)
@@ -592,6 +603,13 @@ class ValidationVirtualPositionTracker:
                     signals_by_index=signals_by_index,
                 )
                 self._processed_through = next_index
+            if force_liquidation_at_end and self.holding_quantity > 0:
+                end_price = validation_virtual_fill_price(candles[last_index])
+                if end_price is not None:
+                    self._close_position(
+                        last_index, candles[last_index], end_price,
+                        is_liquidation=True,
+                    )
         return ValidationExecutionSimulation(
             tuple(self.fills),
             tuple(self.cycles),
@@ -606,7 +624,11 @@ def simulate_validation_execution(
     candles: list[dict[str, Any]],
     entries: list[Any],
     policy: Mapping[str, Any] | None = None,
+    *,
+    force_liquidation_at_end: bool = False,
 ) -> ValidationExecutionSimulation:
     """Replay signal entries into a detached virtual Position; never writes runtime state."""
     tracker = ValidationVirtualPositionTracker(policy)
-    return tracker.finalize(candles, entries)
+    return tracker.finalize(
+        candles, entries, force_liquidation_at_end=force_liquidation_at_end,
+    )

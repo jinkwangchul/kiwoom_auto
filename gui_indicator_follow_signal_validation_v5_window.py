@@ -792,6 +792,7 @@ class IndicatorFollowValidationCompletedCycle:
     buy_quantity: int = 0
     buy_cost: float = 0.0
     trading_cost_amount: float = 0.0
+    is_liquidation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1528,8 +1529,13 @@ def validation_execution_cycles(
     candles: list[dict[str, Any]],
     entries: list[ValidationReplayEntry],
     execution_policy: dict[str, Any],
+    *,
+    force_liquidation_at_end: bool = False,
 ) -> list[IndicatorFollowValidationCompletedCycle]:
-    simulation = simulate_validation_execution(candles, entries, execution_policy)
+    simulation = simulate_validation_execution(
+        candles, entries, execution_policy,
+        force_liquidation_at_end=force_liquidation_at_end,
+    )
     return [
         IndicatorFollowValidationCompletedCycle(
             cycle_number=cycle.cycle_number,
@@ -1544,6 +1550,7 @@ def validation_execution_cycles(
             buy_quantity=cycle.buy_quantity,
             buy_cost=cycle.buy_cost,
             trading_cost_amount=cycle.trading_cost_amount,
+            is_liquidation=cycle.is_liquidation,
         )
         for cycle in simulation.cycles
     ]
@@ -8730,11 +8737,20 @@ class IndicatorFollowSignalValidationV5Window(
         )
         self.validation_regular_market_only_check = QCheckBox("정규장만 표시")
         self.validation_regular_market_only_check.setChecked(False)
+        self.validation_range_liquidation_check = QCheckBox("청산")
+        self.validation_range_liquidation_check.setChecked(False)
+        self.validation_range_liquidation_check.setObjectName(
+            "signalValidationRangeLiquidationCheck"
+        )
+        self.validation_range_liquidation_check.setToolTip(
+            "기간선택 마지막 봉의 종가로 남은 보유주식을 전량 가상청산합니다. 실제 주문과 신호는 변경하지 않습니다."
+        )
 
         for header_item in (
             self.validation_trading_cost_separator,
             self.validation_trading_cost_box,
             self.validation_regular_market_separator,
+            self.validation_range_liquidation_check,
             self.validation_regular_market_only_check,
         ):
             self.basic_header_row.insertWidget(
@@ -10590,6 +10606,7 @@ class IndicatorFollowSignalValidationV5Window(
         display_only_checkboxes = (
             self.marking_display_check,
             self.validation_regular_market_only_check,
+            self.validation_range_liquidation_check,
             self.filter_display_check,
         )
         for checkbox in self.findChildren(QCheckBox):
@@ -10607,6 +10624,9 @@ class IndicatorFollowSignalValidationV5Window(
         )
         self.validation_regular_market_only_check.toggled.connect(
             self._on_validation_regular_market_display_changed
+        )
+        self.validation_range_liquidation_check.toggled.connect(
+            self._on_validation_range_liquidation_changed
         )
 
     @staticmethod
@@ -15870,6 +15890,7 @@ class IndicatorFollowSignalValidationV5Window(
             buy_quantity=cycle.buy_quantity,
             buy_cost=cycle.buy_cost,
             trading_cost_amount=cycle.trading_cost_amount,
+            is_liquidation=cycle.is_liquidation,
         )
 
     def _replay_timeframe_display_text(self) -> str:
@@ -15879,14 +15900,20 @@ class IndicatorFollowSignalValidationV5Window(
         key = getattr(snapshot, "timeframe_key", f"M{snapshot.timeframe_minutes}")
         return f"{timeframe_display_label(key)}\ubd09"
 
-    def _refresh_validation_range_results(self) -> None:
+    def _on_validation_range_liquidation_changed(self, *_args) -> None:
+        self._refresh_validation_range_results(refresh_tooltips=False)
+
+    def _refresh_validation_range_results(
+        self, *, refresh_tooltips: bool = True,
+    ) -> None:
         if (
             (self._replay_snapshot is None and not self._range_replay_entries_available)
             or not self._candles
         ):
             return
         self._populate_completed_cycles()
-        self._refresh_signal_tooltips_only()
+        if refresh_tooltips:
+            self._refresh_signal_tooltips_only()
         bounds = self._effective_validation_range()
         if bounds is None:
             self.result_summary_label.setText(
@@ -16280,10 +16307,38 @@ class IndicatorFollowSignalValidationV5Window(
                     selected_candles,
                     local_entries,
                     dict(execution_policy),
+                    force_liquidation_at_end=(
+                        self.validation_range_liquidation_check.isChecked()
+                    ),
                 )
                 if isinstance(execution_policy, Mapping)
                 else completed_validation_cycles(selected_candles, local_entries)
             )
+            if (
+                not isinstance(execution_policy, Mapping)
+                and self.validation_range_liquidation_check.isChecked()
+            ):
+                forced_cycles = simulate_validation_execution(
+                    selected_candles, local_entries,
+                    force_liquidation_at_end=True,
+                ).cycles
+                if forced_cycles and forced_cycles[-1].is_liquidation:
+                    forced = forced_cycles[-1]
+                    local_cycles.append(IndicatorFollowValidationCompletedCycle(
+                        cycle_number=len(local_cycles) + 1,
+                        buy_indexes=forced.buy_indexes,
+                        buy_start_index=forced.buy_start_index,
+                        buy_end_index=forced.buy_end_index,
+                        buy_count=forced.buy_count,
+                        average_buy_price=forced.average_buy_price,
+                        sell_index=forced.sell_index,
+                        sell_price=forced.sell_price,
+                        estimated_return_percent=forced.estimated_return_percent,
+                        buy_quantity=forced.buy_quantity,
+                        buy_cost=forced.buy_cost,
+                        trading_cost_amount=forced.trading_cost_amount,
+                        is_liquidation=True,
+                    ))
             self._completed_cycles = [
                 replace(
                     cycle,
@@ -16311,7 +16366,7 @@ class IndicatorFollowSignalValidationV5Window(
             invested_amount = _completed_cycle_invested_amount(cycle)
             profit_amount = _completed_cycle_profit_amount(cycle)
             values = (
-                str(cycle.cycle_number),
+                "청산" if cycle.is_liquidation else str(cycle.cycle_number),
                 self._cycle_buy_range(cycle),
                 str(cycle.buy_count),
                 (

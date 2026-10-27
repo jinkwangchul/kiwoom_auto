@@ -302,3 +302,118 @@ def test_v5_flow_owns_injected_stores_and_purges_startup_evictions(case):
         flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS
         is not v2_flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS
     )
+
+
+def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
+    window = window_for(case)
+    rows = candles()
+    for offset, row in enumerate(rows[-5:]):
+        row["time"] = f"2026102709{offset:02d}00"
+    rows[-1]["close"] = 150_000.0
+    install(window, rows)
+    window._result_settings_snapshot = None  # Exercise the legacy completed-cycle branch.
+
+    def entry(side, index):
+        return window_module.ValidationReplayEntry(
+            evaluation_side=side,
+            evaluation_index=index,
+            evaluation_time=rows[index]["time"],
+            signal=side,
+            reason="fixture",
+            signal_index=index,
+            signal_time=rows[index]["time"],
+            delay_bar=0,
+            matched_groups=[],
+            details=[],
+            trace={"conditions": [], "groups": [], "aggregations": []},
+        )
+
+    entries = [entry("BUY", 595), entry("BUY", 596),
+               entry("SELL", 597), entry("BUY", 598)]
+    window._set_validation_range(596, 599)
+    window._range_replay_entries_available = True
+    with patch.object(window, "_marker_entries_for_display", return_value=entries), \
+            patch.object(window, "_refresh_signal_tooltips_only") as tooltips, \
+            patch.object(window_module.QTimer, "singleShot"), \
+            patch.object(window, "_on_signal_validation_ui_changed") as revalidate:
+        window._refresh_validation_range_results()
+        original_cycles = window.completed_cycles
+        original_summary = window.estimated_return_label.text()
+        assert not window.validation_range_liquidation_check.isChecked()
+        assert len(original_cycles) == 1
+        assert window.completed_cycle_table.item(0, 0).text() == "1"
+
+        tooltip_calls = tooltips.call_count
+        window.validation_range_liquidation_check.setChecked(True)
+        assert tooltips.call_count == tooltip_calls
+        assert window.validation_range == (596, 599)
+        assert len(window.completed_cycles) == 2
+        assert window.completed_cycles[0] == original_cycles[0]
+        assert tuple(window.canvas._completed_cycle_average_lines) == window.completed_cycles
+        forced = window.completed_cycles[-1]
+        assert forced.is_liquidation
+        assert forced.buy_indexes == (598,)
+        assert forced.sell_index == 599
+        assert forced.sell_price == 150_000.0
+        assert window.completed_cycle_table.item(1, 0).text() == "청산"
+        assert window.completed_cycle_table.item(1, 5).text() == "10/27 09:04"
+        assert window.completed_cycle_table.item(1, 6).text() == "150,000"
+        assert window.estimated_return_label.text() != original_summary
+        assert [(item.signal, item.evaluation_index) for item in entries] == [
+            ("BUY", 595), ("BUY", 596), ("SELL", 597), ("BUY", 598),
+        ]
+
+        window._validation_range = (596, 598)
+        window._refresh_validation_range_results()
+        assert window.completed_cycles[-1].is_liquidation
+        assert window.completed_cycles[-1].sell_index == 598
+        assert window.completed_cycles[-1].sell_price == rows[598]["close"]
+        window._validation_range = (596, 597)
+        window._refresh_validation_range_results()
+        assert len(window.completed_cycles) == 1
+        assert not window.completed_cycles[0].is_liquidation
+        window._validation_range = (596, 599)
+        window._refresh_validation_range_results()
+
+        tooltip_calls = tooltips.call_count
+        window.validation_range_liquidation_check.setChecked(False)
+        assert tooltips.call_count == tooltip_calls
+        assert window.completed_cycles == original_cycles
+        assert tuple(window.canvas._completed_cycle_average_lines) == original_cycles
+        assert window.estimated_return_label.text() == original_summary
+        window.validation_range_liquidation_check.setChecked(True)
+        window._validation_range = None
+        window._refresh_validation_range_results()
+        assert window.completed_cycles == ()
+        assert window.canvas._completed_cycle_average_lines == ()
+        assert window.completed_cycle_table.rowCount() == 0
+
+        rules = case._seed().settings_snapshot.to_dict()
+        rules["validation_execution"] = {
+            "enabled": True, "first_buy_quantity": 3,
+        }
+        window._result_settings_snapshot = window_module.ValidationSettingsSnapshot(rules)
+        window._validation_range = (596, 599)
+        window._refresh_validation_range_results()
+        assert window.completed_cycles[-1].is_liquidation
+        assert window.completed_cycles[-1].buy_quantity == 3
+        assert window.completed_cycles[-1].buy_cost == rows[598]["close"] * 3
+        revalidate.assert_not_called()
+
+
+def test_v5_execution_cycle_projection_marks_only_forced_last_cycle(case):
+    rows = candles(3)
+    entries = [window_module.ValidationReplayEntry(
+        evaluation_side="BUY", evaluation_index=0,
+        evaluation_time=rows[0]["time"], signal="BUY", reason="fixture",
+        signal_index=0, signal_time=rows[0]["time"], delay_bar=0,
+        matched_groups=[], details=[],
+        trace={"conditions": [], "groups": [], "aggregations": []},
+    )]
+    cycles = window_module.validation_execution_cycles(
+        rows, entries, {"enabled": True, "first_buy_quantity": 3},
+        force_liquidation_at_end=True,
+    )
+    assert len(cycles) == 1
+    assert cycles[0].is_liquidation
+    assert cycles[0].buy_quantity == 3

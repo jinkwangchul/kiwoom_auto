@@ -323,6 +323,106 @@ class ValidationVirtualExecutionTest(unittest.TestCase):
         self.assertEqual(1, len(simulation.cycles))
         self.assertEqual(0, simulation.open_quantity)
 
+    def test_range_end_liquidation_is_opt_in_and_uses_position_cost(self):
+        candles = _candles([100, 100, 120])
+        entries = [_entry("BUY", 0, candles), _entry("BUY", 1, candles)]
+        policy = {
+            "enabled": True,
+            "first_buy_quantity": 2,
+            "repeat_mode": "BUDGET",
+            "budget_ratio": 2.0,
+            "trading_cost_enabled": True,
+            "trading_cost_percent": 0.2,
+        }
+        original = [(entry.signal, entry.evaluation_index) for entry in entries]
+        off = simulate_validation_execution(candles, entries, policy)
+        explicit_off = simulate_validation_execution(
+            candles, entries, policy, force_liquidation_at_end=False,
+        )
+        on = simulate_validation_execution(
+            candles, entries, policy, force_liquidation_at_end=True,
+        )
+
+        self.assertEqual(off, explicit_off)
+        self.assertEqual((), off.cycles)
+        self.assertEqual(6, off.open_quantity)
+        self.assertEqual(1, len(on.cycles))
+        cycle, = on.cycles
+        self.assertTrue(cycle.is_liquidation)
+        self.assertEqual((0, 1), cycle.buy_indexes)
+        self.assertEqual(2, cycle.buy_count)
+        self.assertEqual(6, cycle.buy_quantity)
+        self.assertEqual(600.0, cycle.buy_cost)
+        self.assertEqual(120.0, cycle.sell_price)
+        self.assertEqual(6, cycle.sell_quantity)
+        self.assertAlmostEqual(1.2, cycle.trading_cost_amount)
+        self.assertAlmostEqual(19.8, cycle.estimated_return_percent)
+        self.assertEqual("RANGE_END_LIQUIDATION", on.fills[-1].reason)
+        self.assertEqual(0, on.open_quantity)
+        self.assertIsNone(on.open_average_price)
+        self.assertEqual(0, on.confirmed_buy_round)
+        self.assertEqual(original, [(entry.signal, entry.evaluation_index) for entry in entries])
+
+    def test_range_end_liquidation_preserves_natural_cycles_and_does_not_double_sell(self):
+        candles = _candles([100, 110, 90, 120])
+        entries = [
+            _entry("BUY", 0, candles), _entry("SELL", 1, candles),
+            _entry("BUY", 2, candles),
+        ]
+        on = simulate_validation_execution(
+            candles, entries, force_liquidation_at_end=True,
+        )
+        self.assertEqual(2, len(on.cycles))
+        self.assertFalse(on.cycles[0].is_liquidation)
+        self.assertEqual(110.0, on.cycles[0].sell_price)
+        self.assertTrue(on.cycles[1].is_liquidation)
+        self.assertEqual(3, on.cycles[1].sell_index)
+        closed = simulate_validation_execution(
+            candles, entries + [_entry("SELL", 3, candles)],
+            force_liquidation_at_end=True,
+        )
+        self.assertEqual(2, len(closed.cycles))
+        self.assertFalse(any(cycle.is_liquidation for cycle in closed.cycles))
+        self.assertEqual("SINGLE_HOGA", closed.fills[-1].reason)
+
+    def test_range_end_liquidation_needs_open_shares_and_valid_end_close(self):
+        candles = _candles([100, 120])
+        self.assertEqual((), simulate_validation_execution(
+            candles, [], force_liquidation_at_end=True,
+        ).cycles)
+        for close in (0, -1, float("nan"), float("inf"), None):
+            with self.subTest(close=close):
+                invalid = [dict(candle) for candle in candles]
+                invalid[-1]["close"] = close
+                result = simulate_validation_execution(
+                    invalid, [_entry("BUY", 0, invalid)],
+                    force_liquidation_at_end=True,
+                )
+                self.assertEqual((), result.cycles)
+                self.assertEqual(1, result.open_quantity)
+        self.assertEqual((), simulate_validation_execution(
+            [], [], force_liquidation_at_end=True,
+        ).cycles)
+
+    def test_range_end_buy_is_processed_before_forced_sell_without_carry_in(self):
+        candles = _candles([100, 110, 120])
+        entries = [_entry("BUY", 0, candles), _entry("BUY", 2, candles)]
+        local_candles = candles[1:]
+        local_entries = [SimpleNamespace(
+            evaluation_index=1, evaluation_time=local_candles[1]["time"],
+            signal="BUY",
+        )]
+        result = simulate_validation_execution(
+            local_candles, local_entries, force_liquidation_at_end=True,
+        )
+        self.assertEqual([("BUY", 1), ("SELL", 1)], [
+            (fill.side, fill.evaluation_index) for fill in result.fills
+        ])
+        self.assertEqual((1,), result.cycles[0].buy_indexes)
+        self.assertEqual(120.0, result.cycles[0].buy_cost)
+        self.assertTrue(result.cycles[0].is_liquidation)
+        self.assertEqual([0, 2], [entry.evaluation_index for entry in entries])
+
     def test_incremental_tracker_uses_quantity_weighted_average_before_sell(self):
         candles = _candles([100, 50, 80])
         entries = [
