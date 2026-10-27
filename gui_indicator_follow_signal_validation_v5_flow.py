@@ -2131,6 +2131,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._native_selected_pending[key] = (session, updated,
                                                   self._request_generation.get(key, 0))
             self._publish_pending_native_selected(key)
+            if (source == "INTEGRATED" and interval == 1
+                    and not getattr(window, "_normal_base_ready", False)):
+                from gui_market_data_host import MarketDataHost
+
+                if MarketDataHost._current_display_candles(market, code, 1):
+                    self._use_pool_for_window(window, session, updated, evaluation_count=100)
 
     def _native_selected_window_ready(self, window, key: int) -> bool:
         marking = getattr(window, "marking_display_check", None)

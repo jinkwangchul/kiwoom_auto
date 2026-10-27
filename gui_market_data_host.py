@@ -1397,9 +1397,26 @@ class MarketDataHost(QObject):
                 "request_id": request_id, "session_identity": identity,
                 "watch_generation": _host_attr(self, "_v5_watch_generation", None),
                 "tr_forming_candle": forming,
-                "tick_anchor_sequence": tick_anchor_sequence,
+                "tick_anchor_sequence": (tick_anchor_sequence if forming is not None else None),
                 "tick_revision": 0,
             })
+        if (source == "INTEGRATED" and interval == 1 and request_receipt is not None
+                and any(value == code and
+                        _host_attr(self, "_v5_observation_timeframes", {}).get(window_key) == 1
+                        for window_key, value in
+                        _host_attr(self, "_v5_observation_leases", {}).items())):
+            accepted_times = {row["time"] for row in completed}
+            if forming is not None:
+                accepted_times.add(forming["time"])
+            selected_rows = [row for row in rows if any(
+                item["time"] in accepted_times for item in normalize_opt10080_rows([row]))]
+            MarketDataHost.install_display_timeframe_candles(
+                self, code, 1, selected_rows, as_of=request_as_of,
+                market_data_identity=expected_identity, market_source=source,
+                display_only=True, request_as_of=request_as_of.isoformat(),
+                received_at=received_at.isoformat(), connection_epoch=identity[0],
+                login_session_id=identity[1],
+            )
         try:
             self.market_data_observed.emit({
                 "source": ("NATIVE_SELECTED_FORMING_ACCEPTED" if forming is not None
