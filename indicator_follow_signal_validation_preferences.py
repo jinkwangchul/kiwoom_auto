@@ -1,4 +1,4 @@
-"""V2-only chart preference persistence."""
+"""V5 chart preferences with read-through legacy recovery."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ from typing import Any, Mapping
 
 from PyQt5.QtCore import QSettings
 
-PREFERENCES_SETTINGS_KEY = "ui/signal_validation_v2/preferences"
+PREFERENCES_SETTINGS_KEY = "ui/signal_validation_v5/preferences"
+LEGACY_PREFERENCES_SETTINGS_KEY = "ui/signal_validation_v2/preferences"
 _SCHEMA = "indicator_follow_signal_validation_preferences"
 _VERSION = 1
 
@@ -53,13 +54,16 @@ def _integer(value: object, default: int) -> int:
 
 
 class IndicatorFollowSignalValidationPreferenceStore:
-    """Own the single V2 QSettings preference document."""
+    """Read V5 preferences or legacy values and write the V5 document."""
 
     def __init__(self, *, settings: object | None = None) -> None:
         self._settings = settings if settings is not None else _default_settings()
 
     def load(self) -> dict[str, Any]:
-        source = _payload(self._settings.value(PREFERENCES_SETTINGS_KEY, ""))
+        raw = self._settings.value(PREFERENCES_SETTINGS_KEY, None)
+        if raw is None:
+            raw = self._settings.value(LEGACY_PREFERENCES_SETTINGS_KEY, "")
+        source = _payload(raw)
         execution = source.get("validation_execution")
         market = source.get("validation_market_scope")
         display = source.get("filter_display")

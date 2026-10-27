@@ -1,4 +1,4 @@
-"""V2-only recent-stock preference and read-only library projection."""
+"""V5 recent-stock preferences with read-through legacy recovery."""
 
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from gui_stock_data import (
 from routines.지표추종매매.routine_validation_contract import ValidationStockRef
 
 
-RECENT_STOCKS_SETTINGS_KEY = "ui/signal_validation_v2/recent_stocks"
+RECENT_STOCKS_SETTINGS_KEY = "ui/signal_validation_v5/recent_stocks"
+LEGACY_RECENT_STOCKS_SETTINGS_KEY = "ui/signal_validation_v2/recent_stocks"
 MAX_RECENT_STOCKS = 20
 
 
@@ -41,7 +42,7 @@ def _normalized_identity(code: object, name: object) -> ValidationStockRef | Non
 
 
 class IndicatorFollowSignalValidationRecentStockStore:
-    """Own the single V2 QSettings writer and verified library read model."""
+    """Read V5 or legacy recents and write V5 verified library identities."""
 
     def __init__(
         self,
@@ -95,7 +96,9 @@ class IndicatorFollowSignalValidationRecentStockStore:
 
     def _load_recent_stocks(self) -> tuple[ValidationStockRef, ...]:
         try:
-            raw_value = self._settings.value(RECENT_STOCKS_SETTINGS_KEY, "")
+            raw_value = self._settings.value(RECENT_STOCKS_SETTINGS_KEY, None)
+            if raw_value is None:
+                raw_value = self._settings.value(LEGACY_RECENT_STOCKS_SETTINGS_KEY, "")
             payload = json.loads(str(raw_value or ""))
         except Exception:
             return ()

@@ -10,6 +10,7 @@ from PyQt5.QtCore import QSettings
 
 from indicator_follow_signal_validation_preferences import (
     IndicatorFollowSignalValidationPreferenceStore,
+    LEGACY_PREFERENCES_SETTINGS_KEY,
     PREFERENCES_SETTINGS_KEY,
 )
 
@@ -79,7 +80,7 @@ class IndicatorFollowSignalValidationPreferenceStoreTest(unittest.TestCase):
             settings.sync()
             self.assertEqual({}, store.load())
 
-    def test_store_serializes_one_v2_local_settings_key(self):
+    def test_store_serializes_one_v5_local_settings_key(self):
         with tempfile.TemporaryDirectory() as directory:
             store, settings = self._store(directory)
             store.save({
@@ -103,6 +104,73 @@ class IndicatorFollowSignalValidationPreferenceStoreTest(unittest.TestCase):
                 payload["validation_market_scope"],
             )
             self.assertIn("validation_execution", payload)
+
+    def test_legacy_only_reads_values_without_creating_v5_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, settings = self._store(directory)
+            legacy = json.dumps({
+                "validation_execution": {
+                    "enabled": False, "first_buy_quantity": 0,
+                    "round_budget_value": 0, "budget_ratio": 0,
+                    "trading_cost_enabled": False, "trading_cost_percent": 0,
+                },
+                "validation_market_scope": {"regular_market_only": False},
+                "filter_display": {"enabled": False},
+                "settings_hash": "keep-this-document-unchanged",
+            })
+            settings.setValue(LEGACY_PREFERENCES_SETTINGS_KEY, legacy)
+            settings.sync()
+
+            loaded = store.load()
+            self.assertEqual(False, loaded["averaging_enabled"])
+            self.assertEqual("0", loaded["first_buy_quantity"])
+            self.assertEqual("0.0", loaded["round_value"])
+            self.assertEqual("0.0", loaded["budget_ratio"])
+            self.assertEqual(False, loaded["trading_cost_enabled"])
+            self.assertEqual("0.0", loaded["trading_cost_percent"])
+            self.assertEqual(False, loaded["regular_market_only"])
+            self.assertEqual(False, loaded["filter_display_enabled"])
+            self.assertFalse(settings.contains(PREFERENCES_SETTINGS_KEY))
+            self.assertEqual(legacy, settings.value(LEGACY_PREFERENCES_SETTINGS_KEY))
+
+    def test_v5_present_wins_and_malformed_v5_does_not_restore_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, settings = self._store(directory)
+            old = json.dumps({"validation_execution": {"enabled": True}})
+            settings.setValue(LEGACY_PREFERENCES_SETTINGS_KEY, old)
+            settings.setValue(PREFERENCES_SETTINGS_KEY, json.dumps({
+                "validation_execution": {"enabled": False},
+            }))
+            self.assertFalse(store.load()["averaging_enabled"])
+            settings.setValue(PREFERENCES_SETTINGS_KEY, "{broken")
+            self.assertEqual({}, store.load())
+            self.assertEqual(old, settings.value(LEGACY_PREFERENCES_SETTINGS_KEY))
+
+    def test_save_writes_only_v5_once_and_preserves_legacy(self):
+        class Settings:
+            def __init__(self):
+                self.values = {LEGACY_PREFERENCES_SETTINGS_KEY: "legacy"}
+                self.writes = []
+                self.syncs = 0
+
+            def value(self, key, default=None):
+                return self.values.get(key, default)
+
+            def setValue(self, key, value):
+                self.writes.append(key)
+                self.values[key] = value
+
+            def sync(self):
+                self.syncs += 1
+
+        settings = Settings()
+        store = IndicatorFollowSignalValidationPreferenceStore(settings=settings)
+        self.assertEqual({}, store.load())
+        self.assertEqual([], settings.writes)
+        store.save({"filter_display_enabled": False})
+        self.assertEqual([PREFERENCES_SETTINGS_KEY], settings.writes)
+        self.assertEqual(1, settings.syncs)
+        self.assertEqual("legacy", settings.values[LEGACY_PREFERENCES_SETTINGS_KEY])
 
 
 if __name__ == "__main__":

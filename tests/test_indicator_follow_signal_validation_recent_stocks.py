@@ -27,6 +27,7 @@ from gui_stock_data import (
     StockLibraryLoadSnapshot,
 )
 from indicator_follow_signal_validation_recent_stocks import (
+    LEGACY_RECENT_STOCKS_SETTINGS_KEY,
     RECENT_STOCKS_SETTINGS_KEY,
     IndicatorFollowSignalValidationRecentStockStore,
 )
@@ -143,6 +144,75 @@ class IndicatorFollowSignalValidationRecentStocksTest(unittest.TestCase):
                 recent_stock_store=restored,
             )
             self.assertEqual(restored.recent_stocks[0], flow.last_selected_stock)
+
+    def test_legacy_only_restores_verified_names_without_startup_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "recent.ini"), QSettings.IniFormat)
+            legacy = json.dumps([
+                {"code": "000001", "name": "old name"},
+                {"code": "000001", "name": "duplicate"},
+                {"code": "999999", "name": "missing"},
+                {"code": "000002", "name": "old name"},
+            ])
+            settings.setValue(LEGACY_RECENT_STOCKS_SETTINGS_KEY, legacy)
+            settings.sync()
+            store = IndicatorFollowSignalValidationRecentStockStore(
+                settings=settings, snapshot_loader=_loader([_record(1), _record(2)]),
+            )
+            self.assertEqual(("000001", "000002"), tuple(
+                stock.code for stock in store.recent_stocks
+            ))
+            self.assertEqual("종목1", store.recent_stocks[0].name)
+            self.assertFalse(settings.contains(RECENT_STOCKS_SETTINGS_KEY))
+            self.assertEqual(legacy, settings.value(LEGACY_RECENT_STOCKS_SETTINGS_KEY))
+
+    def test_v5_empty_or_malformed_does_not_restore_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "recent.ini"), QSettings.IniFormat)
+            old = '[{"code":"000001","name":"old"}]'
+            settings.setValue(LEGACY_RECENT_STOCKS_SETTINGS_KEY, old)
+            settings.setValue(RECENT_STOCKS_SETTINGS_KEY, '[{"code":"000002","name":"old"}]')
+            loader = _loader([_record(1), _record(2)])
+            self.assertEqual("000002", IndicatorFollowSignalValidationRecentStockStore(
+                settings=settings, snapshot_loader=loader,
+            ).recent_stocks[0].code)
+            for new_value in ("[]", "{broken"):
+                settings.setValue(RECENT_STOCKS_SETTINGS_KEY, new_value)
+                self.assertEqual((), IndicatorFollowSignalValidationRecentStockStore(
+                    settings=settings, snapshot_loader=loader,
+                ).recent_stocks)
+            self.assertEqual(old, settings.value(LEGACY_RECENT_STOCKS_SETTINGS_KEY))
+
+    def test_legacy_activation_writes_only_v5_and_syncs_once(self):
+        class Settings:
+            def __init__(self):
+                self.values = {LEGACY_RECENT_STOCKS_SETTINGS_KEY:
+                    '[{"code":"000001","name":"old"}]'}
+                self.writes = []
+                self.syncs = 0
+
+            def value(self, key, default=None):
+                return self.values.get(key, default)
+
+            def setValue(self, key, value):
+                self.writes.append(key)
+                self.values[key] = value
+
+            def sync(self):
+                self.syncs += 1
+
+        settings = Settings()
+        store = IndicatorFollowSignalValidationRecentStockStore(
+            settings=settings, snapshot_loader=_loader([_record(1), _record(2)]),
+        )
+        self.assertEqual([], settings.writes)
+        self.assertTrue(store.activate(ValidationStockRef("000002", "old")))
+        self.assertEqual([RECENT_STOCKS_SETTINGS_KEY], settings.writes)
+        self.assertEqual(1, settings.syncs)
+        self.assertEqual('[{"code":"000001","name":"old"}]',
+                         settings.values[LEGACY_RECENT_STOCKS_SETTINGS_KEY])
+        self.assertEqual(["000002", "000001"], [item["code"] for item in
+                         json.loads(settings.values[RECENT_STOCKS_SETTINGS_KEY])])
 
     def test_twenty_first_activation_evicts_only_oldest_and_persists_twenty(self):
         settings = _FakeSettings("")
