@@ -161,6 +161,108 @@ def compare_three_consumer_signals(
     return _result("MATCH", event_count=len(v5["events"]))
 
 
+def compare_quickchart_marker_projection(source: Any, chart: Any) -> dict[str, Any]:
+    """Compare recorded engine events with a read-only quickchart projection."""
+    def result(status: str, **details: Any) -> dict[str, Any]:
+        return {"status": status,
+                "scope": "READ_ONLY_CHART_MARKER_PROJECTION_COMPARISON",
+                "live_gui_parity": False, "broker_attested": False, **details}
+
+    if not isinstance(source, dict) or not isinstance(chart, dict):
+        return result("BLOCKED", reason="MISSING_EVIDENCE")
+    consumer = source.get("consumer")
+    stock = source.get("stock")
+    frame = source.get("timeframe")
+    identity = source.get("market_data_identity")
+    if (consumer not in ("PRODUCTION", "MOCK") or set(source) != FIELDS
+            or not isinstance(source.get("origin_proof"), str)
+            or not source["origin_proof"].strip()
+            or source["origin_proof"] != source["origin_proof"].strip()
+            or not isinstance(stock, str) or not re.fullmatch(r"[0-9]{6}", stock)
+            or frame not in ("M3", "M5")
+            or not isinstance(source.get("rules_hash"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["rules_hash"])
+            or not _valid_time(source.get("cutoff"))
+            or source.get("source_proof") != SOURCE_PROOF
+            or identity not in (stock, f"{stock}_AL", f"{stock}_NX")
+            or not isinstance(source.get("events"), list)):
+        return result("BLOCKED", reason="INVALID_SOURCE")
+    expected = []
+    for event in source["events"]:
+        if (not isinstance(event, dict) or set(event) != {"time", "side"}
+                or not _valid_time(event["time"]) or event["time"] > source["cutoff"]
+                or event["side"] not in ("BUY", "SELL")
+                or (expected and event["time"] < expected[-1][0])):
+            return result("BLOCKED", reason="INVALID_SOURCE_EVENTS")
+        expected.append((event["time"], event["side"]))
+    if len(expected) != len(set(expected)):
+        return result("BLOCKED", reason="DUPLICATE_SOURCE_EVENT")
+
+    supply = chart.get("candle_availability")
+    plan = chart.get("source_plan")
+    timeline = chart.get("operation_timeline")
+    if (chart.get("stock_code") != stock or chart.get("bar_minutes") != int(frame[1:])
+            or chart.get("source_plan_status") != "READY"
+            or not isinstance(plan, dict) or plan.get("stock_code") != stock
+            or not isinstance(plan.get("sessions"), list)
+            or not isinstance(supply, dict) or supply.get("available") is not True
+            or supply.get("market_data_identity") != identity
+            or supply.get("source_proof") != SOURCE_PROOF
+            or supply.get("timeframe_minutes") != int(frame[1:])
+            or not isinstance(timeline, dict)
+            or timeline.get("status") not in ("WAITING", "ONGOING", "ENDED", "END_UNKNOWN")):
+        return result("BLOCKED", reason="CHART_PROVENANCE_UNPROVEN")
+    source_name = {stock: "KRX", f"{stock}_AL": "SOR",
+                   f"{stock}_NX": "NXT"}[identity]
+    if supply.get("market_source") != {"SOR": "INTEGRATED", "KRX": "KRX",
+                                       "NXT": "NXT"}[source_name]:
+        return result("BLOCKED", reason="SOURCE_IDENTITY_MISMATCH")
+    for stamp, _side in expected:
+        day = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}"
+        clock = f"{stamp[8:10]}:{stamp[10:12]}:{stamp[12:14]}"
+        if day != plan.get("trading_date") or not any(
+            isinstance(session, dict) and session.get("source") == source_name
+            and session.get("market_data_identity") == identity
+            and isinstance(session.get("start_time"), str)
+            and isinstance(session.get("end_time"), str)
+            and session["start_time"] <= clock < session["end_time"]
+            for session in plan["sessions"]
+        ):
+            return result("BLOCKED", reason="SOURCE_PLAN_MISMATCH")
+
+    actual = []
+    for side, key in (("BUY", "buy_signal_markers"),
+                      ("SELL", "sell_signal_markers")):
+        markers = chart.get(key)
+        if not isinstance(markers, list):
+            return result("BLOCKED", reason="MARKERS_UNPROVEN")
+        for marker in markers:
+            if not isinstance(marker, dict):
+                return result("BLOCKED", reason="MARKER_INVALID")
+            try:
+                parsed = datetime.fromisoformat(marker["signal_bar_time"])
+                stamp = parsed.strftime("%Y%m%d%H%M%S")
+            except (KeyError, TypeError, ValueError):
+                return result("BLOCKED", reason="MARKER_TIME_INVALID")
+            if (parsed.tzinfo is None or parsed.utcoffset().total_seconds() != 32400
+                    or marker.get("signal_timeframe_minutes") != int(frame[1:])
+                    or marker.get("signal") not in (None, side)
+                    or not _valid_time(stamp) or stamp > source["cutoff"]):
+                return result("BLOCKED", reason="MARKER_PROVENANCE_INVALID")
+            if consumer == "MOCK" and marker.get("rules_hash") != source["rules_hash"]:
+                return result("BLOCKED", reason="MARKER_RULES_MISMATCH")
+            actual.append((stamp, side))
+    if len(actual) != len(set(actual)):
+        return result("MISMATCH", reason="DUPLICATE_MARKER")
+    if timeline["status"] == "WAITING" and actual:
+        return result("MISMATCH", reason="WAITING_MARKERS")
+    if timeline["status"] == "WAITING" and expected:
+        return result("BLOCKED", reason="SOURCE_EVENTS_WITHOUT_OPERATION")
+    if sorted(actual) != sorted(expected):
+        return result("MISMATCH", expected=sorted(expected), actual=sorted(actual))
+    return result("MATCH", event_count=len(expected))
+
+
 def _unique_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     obj: dict[str, Any] = {}
     for key, value in pairs:

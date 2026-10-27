@@ -7,6 +7,11 @@ import pytest
 
 import sor_three_consumer_signal_audit as audit
 from sor_three_consumer_signal_audit import compare_three_consumer_signals, main
+from stock_instance_day_projection import _marker_from_record
+from stock_market_source_plan import _build
+from datetime import date
+from mock_validation_quick_chart import _signal_markers
+from mock_validation_contract import payload_hash
 from routines.지표추종매매.routine_validation_contract import ValidationStockRef
 from routines.지표추종매매.routine_validation_replay import (
     ValidationReplayEntry, ValidationReplaySnapshot,
@@ -33,6 +38,70 @@ def three(events=None):
 
 def event(time, side):
     return {"time": time, "side": side}
+
+
+def test_quickchart_actual_record_markers_match_native_m3_without_live_claim():
+    source = evidence("PRODUCTION", [event("20261024090300", "BUY")])
+    source.update(stock="000660", timeframe="M3", cutoff="20261024090600",
+                  market_data_identity="000660_AL")
+    marker = _marker_from_record({
+        "id": "recorded-1", "signal": "BUY", "signal_bar_time": "2026-10-24T09:03:00+09:00",
+        "signal_bar_close": 100, "signal_timeframe_minutes": 3,
+        "signal_trade_date": "2026-10-24"})
+    chart = {
+        "stock_code": "000660", "bar_minutes": 3, "source_plan_status": "READY",
+        "source_plan": _build("000660", "Test", date(2026, 10, 24),
+                              "2026-10-24T08:00:00+09:00", True),
+        "candle_availability": {"available": True, "market_data_identity": "000660_AL",
+                                "market_source": "INTEGRATED", "source_proof": audit.SOURCE_PROOF,
+                                "timeframe_minutes": 3},
+        "operation_timeline": {"status": "ONGOING"},
+        "buy_signal_markers": [marker], "sell_signal_markers": [],
+    }
+    assert audit.compare_quickchart_marker_projection(source, chart) == {
+        "status": "MATCH", "scope": "READ_ONLY_CHART_MARKER_PROJECTION_COMPARISON",
+        "live_gui_parity": False, "broker_attested": False, "event_count": 1}
+    assert audit.compare_quickchart_marker_projection(source, {
+        **chart, "buy_signal_markers": []})["status"] == "MISMATCH"
+    assert audit.compare_quickchart_marker_projection(source, {
+        **chart, "buy_signal_markers": [marker, marker]})["status"] == "MISMATCH"
+    assert audit.compare_quickchart_marker_projection(source, {
+        **chart, "candle_availability": {**chart["candle_availability"],
+                                      "market_data_identity": "000660_NX"}})["status"] == "BLOCKED"
+    waiting = {**chart, "operation_timeline": {"status": "WAITING"},
+               "buy_signal_markers": []}
+    assert audit.compare_quickchart_marker_projection({**source, "events": []}, waiting)["status"] == "MATCH"
+    assert audit.compare_quickchart_marker_projection(source, waiting)["status"] == "BLOCKED"
+    assert compare_three_consumer_signals(*three())["status"] == "MATCH"
+
+
+def test_quickchart_mock_record_marker_checks_rules_and_source():
+    rules = {"bar": {"bar_minutes": 5}}
+    source = evidence("MOCK", [event("20261024090500", "SELL")])
+    source.update(stock="000660", timeframe="M5", cutoff="20261024091000",
+                  market_data_identity="000660_AL", rules_hash=payload_hash(rules))
+    document = {"session": {"stock_code": "000660"},
+                "mock_operation_lifecycle": {"instance_operations": {
+                    "A": {"operation_session_id": "operation-A"}}}}
+    recorded = {"event_id": "recorded-mock-1", "event_type": "ROUTINE_EVALUATED",
+                "stock_code": "000660", "routine_instance_id": "A",
+                "payload": {"signal": "SELL", "signal_bar_time": "2026-10-24T09:05:00+09:00",
+                            "signal_trade_date": "2026-10-24", "signal_bar_close": 100,
+                            "signal_timeframe_minutes": 5,
+                            "operation_identity": "operation-A", "rules_hash": payload_hash(rules)}}
+    buy, sell = _signal_markers(document, instance_id="A", rules=rules,
+                                trade_date="2026-10-24", events=[recorded])
+    chart = {"stock_code": "000660", "bar_minutes": 5, "source_plan_status": "READY",
+             "source_plan": _build("000660", "Test", date(2026, 10, 24),
+                                   "2026-10-24T08:00:00+09:00", True),
+             "candle_availability": {"available": True, "market_data_identity": "000660_AL",
+                                     "market_source": "INTEGRATED", "source_proof": audit.SOURCE_PROOF,
+                                     "timeframe_minutes": 5},
+             "operation_timeline": {"status": "ONGOING"},
+             "buy_signal_markers": buy, "sell_signal_markers": sell}
+    assert audit.compare_quickchart_marker_projection(source, chart)["status"] == "MATCH"
+    assert audit.compare_quickchart_marker_projection(source, {
+        **chart, "sell_signal_markers": [{**sell[0], "rules_hash": "b" * 64}]})["status"] == "BLOCKED"
 
 
 def v5_replay(*, complete=True):
