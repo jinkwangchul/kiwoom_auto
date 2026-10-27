@@ -1,5 +1,5 @@
 """Explicit V5 selection freezes one shared plan; offline broker only."""
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 from types import SimpleNamespace
@@ -16,7 +16,7 @@ import stock_market_source_plan as plans
 from candle_timeframe_aggregation import SEOUL_TIMEZONE
 from quick_chart_native_history import native_history_source
 from stock_instance_day_projection import chart_market_session_projection
-from tests.test_indicator_follow_signal_validation_v2 import (
+from tests.v5_validation_test_support import (
     _FakeHost, _FakePicker, _FakeWindow, _MemoryRecentStockStore,
 )
 from tests.qt_test_support import ensure_qapplication
@@ -63,7 +63,7 @@ def selection(tmp_path, monkeypatch):
     def native_request(source, identity, code, name, **kwargs):
         calls.append((source, identity, code, kwargs["interval"]))
         rows = v5.IndicatorFollowSignalValidationV5Flow._historical_rows_from_candles([
-            dict(time=NOW.replace(hour=9, minute=i * 5).strftime("%Y%m%d%H%M%S"),
+            dict(time=(NOW - timedelta(days=1)).replace(hour=9, minute=i * 5).strftime("%Y%m%d%H%M%S"),
                  open=100+i, high=102+i, low=99+i, close=101+i, volume=10)
             for i in range(10)
         ])

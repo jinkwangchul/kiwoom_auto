@@ -224,12 +224,11 @@ def test_injected_provider_reaches_worker_scan_and_replay_with_one_latest_view()
     from indicator_follow_validation_history_contract import (
         required_validation_history_context_bars,
     )
-    from tests import test_indicator_follow_signal_validation_v2 as legacy
+    from tests.v5_validation_test_support import _FakeHost, _MemoryRecentStockStore, v5_rules
     from tests.qt_test_support import ensure_qapplication
 
     ensure_qapplication()
-    legacy.IndicatorFollowSignalValidationV2Test.setUpClass()
-    rules = deepcopy(legacy.IndicatorFollowSignalValidationV2Test.rules)
+    rules = v5_rules()
     rules["bar"]["bar_minutes"] = 5
     rules["validation_timeframe"] = {
         "key": "M5", "kind": "MINUTE", "minutes": 5, "label": "M5",
@@ -258,11 +257,12 @@ def test_injected_provider_reaches_worker_scan_and_replay_with_one_latest_view()
             return ()
 
     flow = flow_module.IndicatorFollowSignalValidationV5Flow(
-        object(), host=legacy._FakeHost(stock), historical_count=2,
-        recent_stock_store=legacy._MemoryRecentStockStore(),
+        object(), host=_FakeHost(stock), historical_count=2,
+        recent_stock_store=_MemoryRecentStockStore(),
         replay_factory=lambda _session: Replay(),
         verified_sor_tail_provider=provider,
     )
+    flow._validation_source_by_code[stock.code] = True
     flow._now_factory = lambda: now
     window = SimpleNamespace(_normal_base_requested=False)
     key = id(window)

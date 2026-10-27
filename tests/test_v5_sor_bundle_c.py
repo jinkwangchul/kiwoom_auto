@@ -12,14 +12,13 @@ import gui_indicator_follow_signal_validation_v5_flow as module
 from tests.test_indicator_follow_validation_v5_sor_tail_bridge import (
     KEYS, evidence, view,
 )
-from tests import test_indicator_follow_signal_validation_v2 as legacy
+from tests.v5_validation_test_support import _FakeHost, _MemoryRecentStockStore, v5_rules
 from tests.qt_test_support import ensure_qapplication
 
 
 def prepared(key="M5"):
     ensure_qapplication()
-    legacy.IndicatorFollowSignalValidationV2Test.setUpClass()
-    rules = deepcopy(legacy.IndicatorFollowSignalValidationV2Test.rules)
+    rules = v5_rules()
     minutes = view(evidence(key)[1], key)["timeframe_minutes"]
     rules["bar"]["bar_minutes"] = minutes
     rules["validation_timeframe"] = {
@@ -46,10 +45,11 @@ def prepared(key="M5"):
         return replace(batch, history_sha256=sha)
 
     flow = module.IndicatorFollowSignalValidationV5Flow(
-        object(), host=legacy._FakeHost(stock), historical_count=2,
-        recent_stock_store=legacy._MemoryRecentStockStore(),
+        object(), host=_FakeHost(stock), historical_count=2,
+        recent_stock_store=_MemoryRecentStockStore(),
         verified_sor_tail_provider=provider,
     )
+    flow._validation_source_by_code[stock.code] = True
     flow._now_factory = lambda: now
     identity = flow._pool_computation_source_identity(raw)
     raw["_dispatch_snapshot"] = (

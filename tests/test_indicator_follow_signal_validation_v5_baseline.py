@@ -11,18 +11,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt5.QtCore import QRectF, QSignalBlocker
 
-import gui_indicator_follow_signal_validation_flow as v2_flow_module
+import gui_indicator_follow_routine_settings_dialog as dialog_module
 import gui_indicator_follow_signal_validation_v5_flow as flow_module
 import gui_indicator_follow_signal_validation_v5_window as window_module
-from tests import test_indicator_follow_signal_validation_v2 as legacy
-from tests.qt_test_support import ensure_qapplication
+from tests.v5_validation_test_support import V5ValidationCase, _FakeHost
 
 
 @pytest.fixture
 def case():
-    cls = legacy.IndicatorFollowSignalValidationV2Test
+    cls = V5ValidationCase
     cls.setUpClass()
-    instance = cls(methodName="runTest")
+    instance = cls()
     instance.setUp()
     try:
         yield instance
@@ -31,7 +30,7 @@ def case():
 
 
 def window_for(case):
-    with patch.object(legacy.dialog_module.QTimer, "singleShot"):
+    with patch.object(dialog_module.QTimer, "singleShot"):
         window = window_module.IndicatorFollowSignalValidationV5Window(
             case.stock,
             case._seed(),
@@ -287,7 +286,7 @@ def test_v5_flow_owns_injected_stores_and_purges_startup_evictions(case):
     history = HistoricalCache()
     flow = flow_module.IndicatorFollowSignalValidationV5Flow(
         object(),
-        host=legacy._FakeHost(case.stock),
+        host=_FakeHost(case.stock),
         recent_stock_store=recent,
         preference_store=preferences,
         historical_cache=history,
@@ -298,10 +297,7 @@ def test_v5_flow_owns_injected_stores_and_purges_startup_evictions(case):
     assert flow._historical_cache is history
     assert flow.recent_stocks == (case.stock,)
     assert history.deleted == ["000660"]
-    assert (
-        flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS
-        is not v2_flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS
-    )
+    assert flow_module._SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS == {}
 
 
 def test_v5_range_liquidation_toggle_updates_only_selected_results(case):
