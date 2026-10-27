@@ -12,6 +12,8 @@ from PyQt5.QtWidgets import QApplication
 from candle_manager import canonical_candle_content_hash
 from quick_chart_native_history import (
     apply_native_history_projection,
+    merge_native_history_increment,
+    native_history_completed_slot,
     native_history_request_count,
     validate_native_history_receipt,
 )
@@ -72,10 +74,15 @@ def test_native_receipt_adds_every_returned_direct_close_and_keeps_missing_dates
     base = {"stock_code": "005930", "trade_date": "2026-10-25",
             "instance_id": "instance-1", "bar_minutes": 3, "nxt_available": True,
             "projection_status": "VALID", "chart_candle_source": "CALCULATION_SOR_AL",
+            "buy_signal_markers": [{"bar_time": START, "price": 101}],
+            "sell_signal_markers": [{"bar_time": "2026-10-23T19:57:00+09:00", "price": 103}],
             "candles": [{"bar_time": "2026-10-23T19:57:00+09:00", "close": 103}],
             "operation_timeline": timeline}
     shown = apply_native_history_projection(base, history, now=NOW)
     assert [row["close"] for row in shown["candles"]] == [101, 102, 103]
+    assert shown["buy_signal_markers"] == base["buy_signal_markers"]
+    assert shown["sell_signal_markers"] == base["sell_signal_markers"]
+    assert shown["operation_timeline"]["start_at"] == base["operation_timeline"]["start_at"]
     assert shown["operation_timeline"]["source_dates"] == [
         "2026-09-11", "2026-09-14", "2026-10-23"]
     assert "2026-09-15" in shown["operation_timeline"]["unverified_calendar_dates"]
@@ -148,7 +155,7 @@ def test_sor_native_m1_1535_receipt_carries_display_only_special_provenance():
     )
 
 
-def test_native_receipt_rejects_wrong_session_timeframe_and_broken_rows():
+def test_native_receipt_rejects_wrong_session_timeframe_and_broken_rows(tmp_path):
     started, response = _receipt([_raw("2026-09-11", "100300", 101)])
     args = (started, response, (7, "session-7"), (7, "session-7"),
             "005930", 3, START, None)
@@ -160,6 +167,16 @@ def test_native_receipt_rejects_wrong_session_timeframe_and_broken_rows():
                                            *args[4:]) is None
     assert validate_native_history_receipt(started, {**response, "rows": [
         {**response["rows"][0], "저가": "200"}]}, *args[2:]) is None
+
+
+    plan = initialize_stock_market_source_plan(
+        tmp_path, "005930", "Samsung", trading_day=NOW.date(),
+        decided_at=NOW, nxt_available=True)
+    nx_started = {**started, "market_source": "NXT", "market_data_identity": "005930_NX"}
+    nx_response = {**response, "market_source": "NXT", "market_data_identity": "005930_NX"}
+    assert validate_native_history_receipt(
+        nx_started, nx_response, *args[2:], selected_source="NXT",
+        source_plan=plan) is None
 
 
 def test_waiting_projection_cannot_admit_old_broker_history():
@@ -198,6 +215,39 @@ def test_request_count_cutoff_marks_partial_first_day_without_has_more():
                 START, None, now=NOW, source_dates=set(), active=True)}
     shown = apply_native_history_projection(base, history, now=NOW)
     assert shown["operation_timeline"]["native_history_incomplete"] is True
+
+
+def test_completed_slot_uses_source_session_and_skips_auction_gaps(tmp_path):
+    day = datetime(2026, 10, 27, 9, 0, tzinfo=SEOUL)
+    plan = initialize_stock_market_source_plan(
+        tmp_path, "005930", "Samsung", trading_day=day.date(),
+        decided_at=day, nxt_available=True)
+    assert native_history_completed_slot(plan, day, 3, "SOR") is None
+    assert native_history_completed_slot(plan, day.replace(minute=3), 3, "SOR") == day.replace(minute=3)
+    assert native_history_completed_slot(plan, day.replace(hour=8, minute=55), 3, "NXT") is None
+    assert native_history_completed_slot(plan, day.replace(hour=15, minute=25), 3, "SOR") is None
+    assert native_history_completed_slot(plan, day.replace(hour=15, minute=35), 3, "SOR") is None
+    assert native_history_completed_slot(plan, day.replace(hour=15, minute=40), 3, "SOR") is None
+
+
+def test_increment_requires_identical_native_overlap_and_preserves_history():
+    started, response = _receipt([_raw("2026-10-23", "195700", 103),
+                                  _raw("2026-09-11", "100300", 101)])
+    old = validate_native_history_receipt(started, response, (7, "session-7"),
+                                          (7, "session-7"), "005930", 3, START, None)
+    assert old is not None
+    newer = dict(old)
+    newer["candles"] = [old["candles"][-1],
+                        {**old["candles"][-1], "bar_time": "2026-10-23T20:00:00+09:00", "close": 104,
+                         "high": 105}]
+    newer["source_content_sha256"] = canonical_candle_content_hash(newer["candles"])
+    merged = merge_native_history_increment(old, newer)
+    assert merged is not None
+    assert [row["close"] for row in merged["candles"]] == [101, 103, 104]
+    assert merge_native_history_increment(old, {**newer, "candles": newer["candles"][1:]}) is None
+    changed = dict(newer)
+    changed["candles"] = [{**newer["candles"][0], "close": 999}, newer["candles"][1]]
+    assert merge_native_history_increment(old, changed) is None
 
 
 def test_production_window_requests_native_m3_and_displays_uncached_closes(tmp_path):
@@ -243,6 +293,93 @@ def test_production_window_requests_native_m3_and_displays_uncached_closes(tmp_p
             market.kiwoom_api.kwargs["callback"](response)
             assert [close for _time, close in window.chart.close_series] == [101, 102, 103]
             assert window.last_projection["chart_history_receipt"]["request_id"] == started["rqname"]
+            app.processEvents()
+        finally:
+            window.close()
+
+
+def test_ongoing_window_fetches_only_bounded_new_native_slot(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    clock_time = {"now": datetime(2026, 10, 27, 10, 4, tzinfo=SEOUL)}
+
+    class Api:
+        def __init__(self):
+            self.calls = []
+
+        def broker_session_snapshot(self):
+            return SimpleNamespace(connected=True, connection_epoch=7,
+                                   login_session_id="session-7")
+
+        def request_minute_candles_display_only_integrated(self, code, name, **kwargs):
+            self.calls.append(kwargs)
+            started, _ = _receipt([])
+            started["rqname"] = f"opt10080_005930_{len(self.calls)}"
+            started["request_as_of"] = clock_time["now"].isoformat()
+            return started
+
+    class Market:
+        kiwoom_api = Api()
+
+        def project_routine_candles(self, **_kwargs):
+            raise AssertionError("projection is supplied by test")
+
+    market = Market()
+    now = clock_time["now"]
+    plan = initialize_stock_market_source_plan(
+        tmp_path, "005930", "Samsung", trading_day=now.date(),
+        decided_at=now, nxt_available=True)
+    base = {"stock_code": "005930", "trade_date": now.date().isoformat(),
+            "source_plan": plan, "instance_id": "instance-1", "bar_minutes": 3,
+            "nxt_available": True, "projection_status": "NO_DAY_DATA",
+            "chart_candle_source": "SOURCE_UNAVAILABLE", "candles": [],
+            "operation_timeline": project_operation_timeline(
+                "2026-10-27T09:00:00+09:00", None, now=now,
+                source_dates=set(), active=True)}
+    with patch("gui_stock_instance_chart_window._production_candle_provider",
+               return_value=market.project_routine_candles), patch(
+                   "gui_stock_instance_chart_window.project_stock_instance_day",
+                   return_value=base), patch("gui_stock_instance_chart_window.datetime", wraps=datetime) as clock:
+        clock.now.side_effect = lambda _tz: clock_time["now"]
+        window = StockInstanceChartWindow("005930", now.date().isoformat())
+        try:
+            assert len(market.kiwoom_api.calls) == 1
+
+            def reply(index, times):
+                call = market.kiwoom_api.calls[index]
+                started, response = _receipt([_raw("2026-10-27", stamp, close)
+                                              for stamp, close in times])
+                response.update(request_id=f"opt10080_005930_{index + 1}",
+                                rqname=f"opt10080_005930_{index + 1}",
+                                request_as_of=(datetime(2026, 10, 27, 10, 4 + 3 * index,
+                                                        tzinfo=SEOUL).isoformat()),
+                                received_at=clock_time["now"].isoformat())
+                call["callback"](response)
+
+            reply(0, [("095700", 101), ("100000", 102)])
+            assert [value for _, value in window.chart.close_series] == [101, 102]
+            window.refresh_projection()
+            assert len(market.kiwoom_api.calls) == 1
+            clock_time["now"] = now + timedelta(minutes=3)
+            window.refresh_projection()
+            assert len(market.kiwoom_api.calls) == 2
+            assert market.kiwoom_api.calls[1]["count"] == 3
+            reply(1, [("100000", 102), ("100300", 103)])
+            assert [value for _, value in window.chart.close_series] == [101, 102, 103]
+            window.refresh_projection()
+            assert len(market.kiwoom_api.calls) == 2
+            clock_time["now"] = now + timedelta(minutes=6)
+            window.refresh_projection()
+            assert len(market.kiwoom_api.calls) == 3
+            base["operation_timeline"] = {**base["operation_timeline"], "status": "STOPPED"}
+            window.refresh_projection()
+            assert len(market.kiwoom_api.calls) == 3
+            base["source_plan"] = None
+            window.refresh_projection()
+            assert len(market.kiwoom_api.calls) == 3
+            window.close()
+            reply(2, [("100300", 103), ("100600", 104)])
+            assert window._native_history is None
+            assert window._native_histories == {}
             app.processEvents()
         finally:
             window.close()

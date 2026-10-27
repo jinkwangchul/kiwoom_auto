@@ -48,6 +48,65 @@ def native_history_source(plan: object, now: datetime) -> dict[str, str] | None:
         return None
 
 
+def native_history_completed_slot(
+    plan: object, now: datetime, interval: int, source: str,
+) -> datetime | None:
+    """Return the last finished native slot in an active, regular source session."""
+    if (not isinstance(plan, dict) or now.tzinfo is None
+            or type(interval) is not int or interval <= 0):
+        return None
+    try:
+        local = now.astimezone(SEOUL_TIMEZONE)
+        if plan["trading_date"] != local.date().isoformat():
+            return None
+        selected = source_for_time(plan, local)
+        if (selected is None or selected["source"] != source
+                or selected["name"] not in {"REGULAR", "NXT_PRE", "NXT_AFTER",
+                                             "KRX_AFTER_CLOSE", "KRX_SINGLE_PRICE"}):
+            return None
+        begin = datetime.fromisoformat(
+            f"{plan['trading_date']}T{selected['start_time']}+09:00")
+        elapsed = int((local - begin).total_seconds() // (interval * 60))
+        return begin + timedelta(minutes=elapsed * interval) if elapsed > 0 else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def merge_native_history_increment(
+    previous: dict[str, Any], incoming: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Admit a bounded native tail only when its verified rows overlap exactly."""
+    fields = ("stock_code", "timeframe_minutes", "market_data_identity",
+              "market_source", "operation_start", "operation_end",
+              "connection_epoch", "login_session_id")
+    if (not isinstance(previous, dict) or not isinstance(incoming, dict)
+            or any(previous.get(key) != incoming.get(key) for key in fields)
+            or not isinstance(previous.get("candles"), list)
+            or not isinstance(incoming.get("candles"), list)
+            or not previous["candles"] or not 1 <= len(incoming["candles"]) <= 3
+            or previous.get("source_content_sha256") != canonical_candle_content_hash(previous["candles"])
+            or incoming.get("source_content_sha256") != canonical_candle_content_hash(incoming["candles"])):
+        return None
+    old = {row["bar_time"]: row for row in previous["candles"]}
+    tail = {row["bar_time"]: row for row in incoming["candles"]}
+    if len(old) != len(previous["candles"]) or len(tail) != len(incoming["candles"]):
+        return None
+    latest = max(old)
+    overlap = set(old) & set(tail)
+    if (latest not in overlap or any(old[stamp] != tail[stamp] for stamp in overlap)
+            or any(stamp < latest and stamp not in old for stamp in tail)
+            or len(old) + sum(stamp not in old for stamp in tail) > 10000):
+        return None
+    merged = dict(incoming)
+    merged["candles"] = [*previous["candles"],
+                         *(tail[stamp] for stamp in sorted(tail) if stamp not in old)]
+    merged["source_content_sha256"] = canonical_candle_content_hash(merged["candles"])
+    merged["oldest_returned"] = previous.get("oldest_returned", "")
+    merged["has_more"] = previous.get("has_more", False)
+    merged["request_limit_reached"] = previous.get("request_limit_reached", False)
+    return merged
+
+
 def validate_native_history_receipt(
     started: dict[str, Any], response: dict[str, Any],
     request_session: tuple[int, str], current_session: tuple[int, str],
@@ -117,6 +176,17 @@ def validate_native_history_receipt(
                 or not values[2] <= values[0] <= values[1]
                 or not values[2] <= values[3] <= values[1]):
             return None
+        if source_plan is not None:
+            try:
+                plan_time = datetime.fromisoformat(
+                    f"{source_plan['trading_date']}T{bar_time:%H:%M:%S}+09:00")
+                planned = source_for_time(source_plan, plan_time)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (planned is None or planned.get("source") != (
+                    "SOR" if source == "INTEGRATED" else source)
+                    or planned.get("market_data_identity") != identity):
+                return None
         oldest = min(oldest, bar_time) if oldest else bar_time
         minute = bar_time.hour * 60 + bar_time.minute
         if source == "NXT":

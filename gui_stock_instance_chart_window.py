@@ -67,6 +67,8 @@ from pnl_ui_refresh import (
 )
 from quick_chart_native_history import (
     apply_native_history_projection,
+    merge_native_history_increment,
+    native_history_completed_slot,
     native_history_request_count,
     native_history_source,
     validate_native_history_receipt,
@@ -1966,6 +1968,7 @@ class StockInstanceChartWindow(QDialog):
         self.trade_date = str(trade_date or _today_trade_date()).strip()
         self._native_history_api = None
         self._native_history: dict[str, Any] | None = None
+        self._native_histories: dict[str, dict[str, Any]] = {}
         self._native_history_attempt: tuple[Any, ...] | None = None
         if projection_provider is not None:
             self._projection_provider = projection_provider
@@ -2435,6 +2438,7 @@ class StockInstanceChartWindow(QDialog):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._chart_closed = True
         self._native_history = None
+        self._native_histories.clear()
         header_timer = self._operation_header_refresh_timer
         if header_timer is not None:
             header_timer.stop()
@@ -3430,13 +3434,17 @@ class StockInstanceChartWindow(QDialog):
             self._apply_projection_error()
             return
         session = self._native_chart_session()
-        history = self._native_history
+        selected = native_history_source(projected.get("source_plan"), datetime.now(SEOUL_TIMEZONE))
+        source = ({"SOR": "INTEGRATED"}.get(selected["source"], selected["source"])
+                  if selected else "")
+        history = self._native_histories.get(source)
         if history is not None and session == (
             history.get("connection_epoch"), history.get("login_session_id")
         ):
             projected = apply_native_history_projection(
                 projected, history, now=datetime.now(SEOUL_TIMEZONE))
         elif history is not None:
+            self._native_histories.clear()
             self._native_history = None
         refresh_status = self._projection_refresh_status(projected)
         if refresh_status != CHART_PROJECTION_VALID:
@@ -3509,11 +3517,25 @@ class StockInstanceChartWindow(QDialog):
                 or type(interval) is not int or not isinstance(start_at, str)
                 or data.get("stock_code") != self.stock_code):
             return
-        count = native_history_request_count(start_at, datetime.now(SEOUL_TIMEZONE), interval)
+        now = datetime.now(SEOUL_TIMEZONE)
+        native_source = "INTEGRATED" if source == "SOR" else source
+        prior = self._native_histories.get(native_source)
+        if prior is not None and (prior.get("stock_code") != self.stock_code
+                                  or prior.get("timeframe_minutes") != interval
+                                  or prior.get("market_data_identity") != selected["market_data_identity"]
+                                  or prior.get("operation_start") != start_at
+                                  or prior.get("operation_end") != end_at
+                                  or (prior.get("connection_epoch"), prior.get("login_session_id")) != session):
+            prior = None
+        active = timeline.get("status") in {"ONGOING", "END_UNKNOWN"}
+        slot = native_history_completed_slot(plan, now, interval, source) if active else None
+        if prior is not None and slot is None:
+            return
+        count = 3 if prior is not None else native_history_request_count(start_at, now, interval)
         if not count:
             return
         key = (self.stock_code, data["instance_id"], interval,
-               start_at, end_at, session, eligibility, source)
+               start_at, end_at, session, eligibility, source, slot)
         if key == self._native_history_attempt:
             return
         self._native_history_attempt = key
@@ -3541,11 +3563,15 @@ class StockInstanceChartWindow(QDialog):
                 started, response, session, current, stock_code,
                 interval, start_at, end_at or None, requested_count=count,
                 nxt_available=eligibility,
-                selected_source="INTEGRATED" if source == "SOR" else source,
+                selected_source=native_source,
                 source_plan=data.get("source_plan"))
             if history is not None:
-                window._native_history = history
-                window.refresh_projection()
+                if prior is not None:
+                    history = merge_native_history_increment(prior, history)
+                if history is not None:
+                    window._native_histories[native_source] = history
+                    window._native_history = history
+                    window.refresh_projection()
 
         try:
             started = request(
