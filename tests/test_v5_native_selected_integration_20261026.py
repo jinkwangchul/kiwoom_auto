@@ -76,7 +76,8 @@ def test_between_tr_al_tick_reaches_v5_current_filter_without_history_fetch(
     import routines.지표추종매매.routine as routine
 
     flow, _, prepared, failures, clock, broker_session = native._run_nxt(
-        tmp_path, monkeypatch, interval=3, history_count=1000)
+        tmp_path, monkeypatch, interval=3, history_count=1000,
+        request_clock=lambda now: now.replace(year=2026, month=10, day=26))
     assert not failures and len(prepared) == 1
     window = prepared[0]["window"]
     key = id(window)
@@ -248,7 +249,8 @@ def test_actual_host_native_selected_event_reaches_final_publication(
 
     flow, _, prepared, failures, clock, broker_session = native._run_nxt(
         tmp_path, monkeypatch, source="KRX" if source == "KRX" else "NXT",
-        interval=minutes, history_count=1000)
+        interval=minutes, history_count=1000,
+        request_clock=lambda now: now.replace(year=2026, month=10, day=26))
     assert not failures and len(prepared) == 1
     window = prepared[0]["window"]
     session, historical = prepared[0]["session"], prepared[0]["pool"]
@@ -746,7 +748,8 @@ def test_open_nx_window_requests_al_history_once_on_first_al_proof(tmp_path, mon
 
 def test_open_nx_window_acquires_al_once_then_publishes_native_m3(tmp_path, monkeypatch):
     flow, _, prepared, failures, clock, broker_session = native._run_nxt(
-        tmp_path, monkeypatch, interval=3, history_count=1000)
+        tmp_path, monkeypatch, interval=3, history_count=1000,
+        request_clock=lambda now: now.replace(year=2026, month=10, day=26))
     assert not failures and prepared
     window = prepared[0]["window"]
     key = id(window)
