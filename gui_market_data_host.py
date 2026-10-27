@@ -2649,6 +2649,29 @@ class MarketDataHost(QObject):
                     self, source=source):
                 request_next(index + 1)
                 return
+            receipt = _host_attr(self, "_native_observation_receipt_by_stock", {}).get(
+                (code, interval))
+            if isinstance(receipt, dict) and isinstance(receipt.get("request_id"), str):
+                proof = MarketDataHost._copy_native_selected_proof(
+                    self, code, interval, receipt["request_id"])
+                forming = proof.get("forming_candle") if isinstance(proof, dict) else None
+                try:
+                    bar_start = datetime.strptime(
+                        forming["time"], "%Y%m%d%H%M%S").replace(tzinfo=SEOUL_TIMEZONE)
+                    bar_end = datetime.fromisoformat(forming["native_bar_end"])
+                    current_proof = (
+                        proof["stock_code"] == code
+                        and proof["timeframe_minutes"] == interval
+                        and proof["market_source"] == source
+                        and proof["market_data_identity"] == selected["market_data_identity"]
+                        and proof["session_identity"] == identity
+                        and proof["tick_anchor_sequence"] is not None
+                        and bar_start <= dispatch_at < bar_end)
+                except (KeyError, TypeError, ValueError):
+                    current_proof = False
+                if current_proof:
+                    request_next(index + 1)
+                    return
             key = (code, interval, source)
             last = self._v5_native_last_attempt.get(key)
             if last is not None and timedelta(0) <= dispatch_at - last < timedelta(seconds=10):

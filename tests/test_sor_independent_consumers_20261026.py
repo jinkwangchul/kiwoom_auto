@@ -113,6 +113,47 @@ def _tick(host, broker, clock, sequence=1, price=150):
         host._on_v5_al_tick_received(event)
 
 
+def test_refresh_reuses_verified_native_bar_until_boundary(monkeypatch):
+    host, broker, clock = _host(monkeypatch)
+    host.sync_candle_observation_targets([_requirement()])
+    host._refresh_v5_observation(now=clock[0])
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    with patch.object(host_module, "datetime", Clock):
+        broker.finish()
+        _tick(host, broker, clock)
+        clock[0] += timedelta(minutes=1)
+        host._refresh_v5_observation(now=clock[0])
+        assert broker.requests == [(CODE, 3, 3)]
+        assert host.native_selected_current_snapshot(CODE, 3, consumer="MOCK")[
+            "forming_candle"]["close"] == 150
+        clock[0] = datetime(2026, 10, 26, 9, 6, tzinfo=SEOUL_TIMEZONE)
+        host._refresh_v5_observation(now=clock[0])
+    assert broker.requests == [(CODE, 3, 3), (CODE, 3, 3)]
+
+
+def test_refresh_requests_again_when_tick_continuity_breaks(monkeypatch):
+    host, broker, clock = _host(monkeypatch)
+    host.sync_candle_observation_targets([_requirement()])
+    host._refresh_v5_observation(now=clock[0])
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    with patch.object(host_module, "datetime", Clock):
+        broker.finish()
+        clock[0] += timedelta(minutes=1)
+        broker._v5_al_receive_sequence_by_code[CODE] = 1
+        host._refresh_v5_observation(now=clock[0])
+    assert broker.requests == [(CODE, 3, 3), (CODE, 3, 3)]
+
+
 def test_no_v5_production_and_mock_share_native_current_and_survive_window_close(monkeypatch):
     host, broker, clock = _host(monkeypatch)
     assert host.sync_candle_standby_requirements([_requirement()])["ok"] is True

@@ -686,6 +686,7 @@ class KiwoomApi(QObject):
         self._tr_governor_last_rqname = ""
         self._tr_governor_last_trcode = ""
         self._tr_governor_dispatch_history: deque[float] = deque(maxlen=4096)
+        self._candle_tr_dispatch_history: deque[float] = deque()
         self._tr_governor_last_queue_wait_ms = 0.0
         self._tr_governor_max_queue_wait_ms = 0.0
         self._tr_governor_timeout_count = 0
@@ -2011,6 +2012,8 @@ class KiwoomApi(QObject):
             self._tr_governor_last_trcode = ""
         if not hasattr(self, "_tr_governor_dispatch_history"):
             self._tr_governor_dispatch_history = deque(maxlen=4096)
+        if not hasattr(self, "_candle_tr_dispatch_history"):
+            self._candle_tr_dispatch_history = deque()
         if not hasattr(self, "_tr_governor_last_queue_wait_ms"):
             self._tr_governor_last_queue_wait_ms = 0.0
         if not hasattr(self, "_tr_governor_max_queue_wait_ms"):
@@ -2120,6 +2123,43 @@ class KiwoomApi(QObject):
         if not self._tr_request_queue:
             return {"ok": True, "status": "IDLE"}
 
+        rejected = None
+        original_remaining = len(self._tr_request_queue)
+        for _ in range(original_remaining):
+            request = self._tr_request_queue[0]
+            if str(request.get("trcode") or "").lower() != "opt10080":
+                break
+            now = monotonic()
+            history = self._candle_tr_dispatch_history
+            while history and history[0] <= now - 3600:
+                history.popleft()
+            if (len(history) < 600 and
+                    sum(stamp > now - 60 for stamp in history) < 40):
+                break
+            self._tr_request_queue.popleft()
+            original_remaining -= 1
+            self._record_tr_governor_error("CANDLE_TR_BUDGET_EXCEEDED")
+            on_failed = request.get("on_failed")
+            self._tr_governor_dispatching = True
+            try:
+                if callable(on_failed):
+                    rejected = on_failed(-1, "CANDLE_TR_BUDGET_EXCEEDED")
+                else:
+                    rqname = str(request.get("rqname") or "")
+                    pending = self._pending_tr.pop(rqname, None)
+                    self._release_pending_tr_screen(rqname, pending)
+                    rejected = {"ok": False, "status": "REQUEST_FAILED",
+                                "rqname": rqname, "error": "CANDLE_TR_BUDGET_EXCEEDED"}
+            finally:
+                self._tr_governor_dispatching = False
+        if (rejected is not None and original_remaining == 0 and self._tr_request_queue
+                and str(self._tr_request_queue[0].get("trcode") or "").lower()
+                == "opt10080"):
+            self._schedule_tr_governor_dispatch(self.TR_GOVERNOR_MIN_INTERVAL_MS)
+            return rejected
+        if not self._tr_request_queue:
+            return rejected or {"ok": True, "status": "IDLE"}
+
         now_ms = self._tr_governor_now_ms()
         last_ms = self._tr_last_dispatch_monotonic_ms
         if last_ms is not None:
@@ -2179,6 +2219,8 @@ class KiwoomApi(QObject):
                         str(field),
                         str(value),
                     )
+                if str(request.get("trcode") or "").lower() == "opt10080":
+                    self._candle_tr_dispatch_history.append(monotonic())
                 result = self._control.dynamicCall(
                     "CommRqData(QString, QString, int, QString)",
                     rqname,
