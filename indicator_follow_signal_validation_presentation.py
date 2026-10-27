@@ -137,6 +137,10 @@ def _buy_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _enabled_text(enabled: Any, text: str) -> str:
+    return text if enabled is True else f"{text} (미사용)"
+
+
 def _sell_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
     groups = _state(ui_state, "sell_ui", "signal_conditions")
     a = _state(groups, "condition_a")
@@ -184,7 +188,61 @@ def _sell_settings(ui_state: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str]]:
+def _buy_ocr_detail_text(
+    entry: ValidationReplayEntry,
+    fields: Mapping[str, str],
+    rules: Mapping[str, Any] | None,
+) -> str:
+    filters = _state(rules or {}, "buy", "filters")
+    ocr_conditions = _state(filters, "ocr").get("conditions")
+    configured = ocr_conditions if isinstance(ocr_conditions, list) else []
+    trace_by_path = {
+        str(payload.get("path") or ""): payload
+        for payload in _trace_payloads(entry)
+    }
+    parts: list[str] = []
+    for index, raw_detail in enumerate(
+        str(fields.get("condition_details") or "").split("|")
+    ):
+        detail = raw_detail.strip()
+        detail = re.sub(r"^(?:PASS|FAIL)_?", "", detail, flags=re.IGNORECASE)
+        detail = re.sub(r"^OSC_?", "", detail, flags=re.IGNORECASE)
+        if detail in {"TURN_UP", "TURN_DOWN"}:
+            parts.append(chart_operator_label(detail))
+            continue
+        match = re.fullmatch(r"(>=|<=|>|<|==|=|GT|GTE|LT|LTE|EQ|ABOVE|BELOW)_(.+)", detail)
+        if match is None:
+            if detail:
+                parts.append(_operator_text_in(detail))
+            continue
+        operator, threshold = match.groups()
+        condition = configured[index] if index < len(configured) else {}
+        prior_bar = (
+            isinstance(condition, Mapping)
+            and condition.get("bar_offset") == 1
+        )
+        payload = trace_by_path.get(f"buy.filters.ocr.conditions[{index}]")
+        observed = _operand_actual(payload.get("left_operand")) if isinstance(payload, Mapping) else "-"
+        threshold_text = _number_text(threshold)
+        criterion = " ".join(
+            part for part in (
+                "기준",
+                "이전 봉" if prior_bar else "",
+                threshold_text,
+                chart_operator_label(operator),
+            ) if part
+        )
+        parts.append(
+            f"관측 {observed} / {criterion}"
+            if observed != "-" else criterion
+        )
+    return " / ".join(parts) or "-"
+
+
+def _buy_detail_values(
+    entry: ValidationReplayEntry,
+    rules: Mapping[str, Any] | None = None,
+) -> dict[str, tuple[str, str]]:
     by_type: dict[str, Mapping[str, str]] = {}
     for detail in entry.details:
         fields = _parse_detail_fields(detail)
@@ -204,11 +262,7 @@ def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str
             continue
         enabled = fields.get("enabled", True)
         if filter_type == "OCR":
-            actual = (
-                _operator_text_in(fields.get("condition_details") or "-")
-                .replace("OSC", "OCR")
-                .replace("|", " / ")
-            )
+            actual = _buy_ocr_detail_text(entry, fields, rules)
         elif filter_type == "BOLLINGER":
             close_price = _text(fields.get("close_price"))
             bollinger_value = _text(fields.get("bollinger_value"))
@@ -228,7 +282,9 @@ def _buy_detail_values(entry: ValidationReplayEntry) -> dict[str, tuple[str, str
                 f"현재가 {current_value} / 이평 {ma_value}"
             )
         else:
-            actual = _text(fields.get("evaluated_value"))
+            actual = _number_text(
+                fields.get("evaluated_value"), decimal_places=2
+            )
         reason = str(fields.get("reason") or "").strip().lower()
         if str(enabled).strip().lower() == "false" or reason == "disabled":
             result = "미사용"
@@ -511,7 +567,6 @@ def _condition_operand_label(value: Any) -> str:
         return "신호가"
     return chart_operand_label(token)
 
-
 def _sell_condition_setting_text(
     condition: Mapping[str, Any],
     payload: Mapping[str, Any],
@@ -605,8 +660,63 @@ def _sell_condition_setting_text(
     return f"{prefix} {operator_label}".strip()
 
 
-def _number_text(value: Any) -> str:
-    if isinstance(value, bool) or value in (None, ""):
+def _configured_condition_criteria(
+    conditions: Any,
+    rules: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return only complete configured criteria; never infer one from a trace."""
+    if not isinstance(conditions, list) or not conditions:
+        return ()
+    criteria: list[str] = []
+    for condition in conditions:
+        if not isinstance(condition, Mapping):
+            return ()
+        target = str(condition.get("target") or "").strip()
+        operator = str(condition.get("operator") or "").strip().upper()
+        if not target or not operator:
+            return ()
+        if operator == "PERCENT_GAP":
+            if any(condition.get(key) in (None, "") for key in (
+                "compare_target", "direction", "value", "compare_mode",
+            )):
+                return ()
+        elif operator not in {
+            "TURN_UP", "TURN_DOWN", "CROSS_UP", "CROSS_DOWN",
+            "TREND_UP", "TREND_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN",
+        } and not condition.get("compare_target") and all(
+            condition.get(key) in (None, "") for key in ("value", "threshold")
+        ):
+            return ()
+        criterion = _sell_condition_setting_text(condition, {}, rules)
+        if not criterion:
+            return ()
+        if criterion not in criteria:
+            criteria.append(criterion)
+    return tuple(criteria)
+
+
+def _configured_evidence_label(base_label: str, criteria: tuple[str, ...]) -> str:
+    """List criteria neutrally: their AST, not punctuation, defines their logic."""
+    compact = []
+    for criterion in criteria:
+        text = criterion
+        if text == base_label:
+            continue
+        if text.startswith(f"{base_label} "):
+            text = text[len(base_label) + 1:]
+        if text and text not in compact:
+            compact.append(text)
+    if base_label == "OCR":
+        compact.sort(key=lambda text: "전환" in text)
+        return f"{base_label}: {' '.join(compact)}" if compact else base_label
+    return f"{base_label}: {' / '.join(compact)}" if compact else base_label
+
+def _number_text(value: Any, *, decimal_places: int = 4) -> str:
+    if (
+        isinstance(value, bool)
+        or value in (None, "")
+        or (isinstance(value, str) and value.strip().lower() in {"none", "null"})
+    ):
         return "-"
     try:
         number = float(value)
@@ -616,7 +726,8 @@ def _number_text(value: Any) -> str:
         return "-"
     if number.is_integer():
         return f"{int(number):,}"
-    return f"{number:,.4f}".rstrip("0").rstrip(".")
+    text = f"{number:,.{max(decimal_places, 0)}f}".rstrip("0").rstrip(".")
+    return "0" if text in {"-0", ""} else text
 
 
 def _operand_label(operand: Any) -> str:
@@ -654,7 +765,6 @@ def _condition_actual_evidence(payload: Mapping[str, Any]) -> str:
                 percent_text = f"{(comparison - basis) / basis * 100.0:+.2f}%"
         except (TypeError, ValueError):
             pass
-
         left_display = left_value
         right_display = right_value
         if left_label == "추정평단":
@@ -898,7 +1008,7 @@ def _buy_evidence_records(
     filters = _state(rules, "buy", "filters")
     composite = _state(filters, "composite")
     expression = composite.get("expression")
-    values = _buy_detail_values(entry)
+    values = _buy_detail_values(entry, rules)
     boolean_values = {
         letter: values.get(letter, ("-", "미평가"))[1] == "통과"
         for letter in _BUY_EVIDENCE_FILTERS
@@ -918,7 +1028,14 @@ def _buy_evidence_records(
                     key for condition in config.get("conditions", [])
                     if (key := _canonical_condition_key(condition))
                 ) or (f"buy-filter:{filter_key}",)
-                records.append((label, actual, condition_keys))
+                criteria = _configured_condition_criteria(
+                    config.get("conditions"), rules,
+                )
+                records.append((
+                    _configured_evidence_label(label, criteria) if criteria else label,
+                    "" if criteria else actual,
+                    condition_keys,
+                ))
 
     condition_payloads = _trace_payloads(entry)
     group_payloads = _trace_groups(entry)
@@ -933,9 +1050,11 @@ def _buy_evidence_records(
         for payload in _selected_group_payloads(group_payload, condition_payloads):
             rule = _rule_at_path(rules, str(payload.get("path") or ""))
             key = _canonical_condition_key(rule) or _payload_evidence_key(payload)
+            criterion = _configured_condition_criteria([rule], rules)
+            label = _filter_name_from_payload(payload)
             records.append((
-                _filter_name_from_payload(payload),
-                _condition_actual_evidence(payload),
+                _configured_evidence_label(label, criterion) if criterion else label,
+                "" if criterion else _condition_actual_evidence(payload),
                 (key,),
             ))
     return records
@@ -949,7 +1068,27 @@ def _sell_evidence_records(
     expression = aggregation.get("ui_signal_expression")
     expression_values = aggregation.get("ui_expression_values")
     if not isinstance(expression, Mapping) or not isinstance(expression_values, Mapping):
-        return []
+        condition_payloads = _trace_payloads(entry)
+        group_payloads = _trace_groups(entry)
+        matched_paths = {
+            str(path or "") for path in aggregation.get("matched_group_paths", [])
+        }
+        records: list[tuple[str, str, tuple[str, ...]]] = []
+        for group_payload in group_payloads:
+            path = str(group_payload.get("path") or "")
+            if not path.startswith("sell.signals.") or path not in matched_paths:
+                continue
+            for payload in _selected_group_payloads(group_payload, condition_payloads):
+                rule = _rule_at_path(rules, str(payload.get("path") or ""))
+                key = _canonical_condition_key(rule) or _payload_evidence_key(payload)
+                criterion = _configured_condition_criteria([rule], rules)
+                label = _filter_name_from_payload(payload)
+                records.append((
+                    _configured_evidence_label(label, criterion) if criterion else label,
+                    "" if criterion else _condition_actual_evidence(payload),
+                    (key,),
+                ))
+        return records
     passed, survivors = _expression_survivors(expression.get("ast"), expression_values)
     if not passed:
         return []
@@ -994,30 +1133,24 @@ def _sell_evidence_records(
             for prefix, payloads in selected_by_prefix.items():
                 base_label = _SELL_EVIDENCE_FILTERS.get(prefix, prefix or "조건")
                 criterion_labels: list[str] = []
+                configured = True
                 for payload in payloads:
                     expression_id = str(
                         payload.get("expression_id") or ""
                     ).strip().upper()
                     condition = rule_conditions.get(expression_id, {})
-                    criterion = _sell_condition_setting_text(
-                        condition if isinstance(condition, Mapping) else {},
-                        payload,
-                        rules,
-                    )
-                    if criterion and criterion not in criterion_labels:
-                        criterion_labels.append(criterion)
-                label = " + ".join(criterion_labels) if criterion_labels else base_label
-
-                if prefix == "GAP":
-                    actual = _condition_actual_evidence(payloads[0])
-                elif prefix == "OCR":
-                    actual = " / ".join(_condition_actual_evidence(item) for item in payloads)
-                elif prefix == "ARRAY":
-                    actual = " / ".join(
-                        _condition_actual_evidence(item) for item in payloads
-                    )
-                else:
-                    actual = " / ".join(_condition_actual_evidence(item) for item in payloads)
+                    criteria = _configured_condition_criteria([condition], rules)
+                    if not criteria:
+                        configured = False
+                    elif criteria[0] not in criterion_labels:
+                        criterion_labels.append(criteria[0])
+                label = (
+                    _configured_evidence_label(base_label, tuple(criterion_labels))
+                    if configured else base_label
+                )
+                actual = "" if configured else " / ".join(
+                    _condition_actual_evidence(item) for item in payloads
+                )
                 condition_keys = tuple(
                     _canonical_condition_key(rule_conditions.get(
                         str(payload.get("expression_id") or "").strip().upper(),
@@ -1068,13 +1201,12 @@ def signal_evidence_lines_for_entry(
 ) -> tuple[str, ...]:
     """Return only operator-visible evidence for one already-produced signal."""
     records = signal_evidence_records_for_entry(entry, settings_rules)
-    if entry.evaluation_side == "SELL":
-        return tuple(
-            f"▪ {record.label} / {record.actual}"
-            for record in records
-        )
     return tuple(
-        f"▪ {record.label} {record.actual}"
+        f"▪ {record.label}" if not record.actual else (
+            f"▪ {record.label} / {record.actual}"
+            if entry.evaluation_side == "SELL"
+            else f"▪ {record.label} {record.actual}"
+        )
         for record in records
     )
 

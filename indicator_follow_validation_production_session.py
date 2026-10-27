@@ -73,6 +73,16 @@ def production_minute_source_plan(
         or warmup_bars < 0
     ):
         raise ValueError("history target and warmup must be valid bar counts")
+    if target_minutes > 1:
+        return {
+            "ready": False,
+            "status": "FILTER_SIGNAL_BACKTEST_BLOCKED",
+            "source_timeframe_key": f"M{target_minutes}",
+            "target_timeframe_key": f"M{target_minutes}",
+            "requested_source_count": history_target_bars + warmup_bars,
+            "maximum_source_count": MAXIMUM_MINUTE_CANDLES,
+            "reason": "DIRECT_SOR_TIMEFRAME_REQUIRED",
+        }
     requirement = required_minute_candles(
         target_minutes,
         history_target_bars + warmup_bars,
@@ -159,7 +169,14 @@ def project_production_calculation_candles(
     *,
     as_of: datetime | None = None,
 ) -> dict[str, Any]:
-    """Use Production's session-anchored aggregator for completed signal bars."""
+    """Reject M1-derived completed signal bars; use direct SOR _AL history."""
+    if target_minutes > 1:
+        return {
+            "ready": False,
+            "candles": [],
+            "forming_bar_status": "FORMING_BAR_PARITY_NOT_VERIFIED",
+            "reason": "DIRECT_SOR_TIMEFRAME_REQUIRED",
+        }
     if (
         not isinstance(production_contract, dict)
         or production_contract.get("status") != PRODUCTION_SESSION_READY
@@ -179,26 +196,19 @@ def project_production_calculation_candles(
             "forming_bar_status": "FORMING_BAR_PARITY_NOT_VERIFIED",
             "reason": "PRODUCTION_SESSION_WINDOWS_UNAVAILABLE",
         }
-    projected = aggregate_minute_candles(
-        minute_candles,
-        target_minutes,
-        now=as_of,
-        session_windows=windows,
-    )
     completed = [
         {
             "time": datetime.fromisoformat(str(candle["bar_time"]))
             .strftime("%Y%m%d%H%M%S"),
-            "open": candle["open"],
-            "high": candle["high"],
-            "low": candle["low"],
-            "close": candle["close"],
-            "volume": candle["volume"],
-            "session": candle["session"],
+            "open": candle["open"], "high": candle["high"],
+            "low": candle["low"], "close": candle["close"],
+            "volume": candle["volume"], "session": candle["session"],
             "is_complete": True,
         }
-        for candle in projected
-        if candle.get("is_complete") is True
+        for candle in aggregate_minute_candles(
+            minute_candles, 1, now=as_of, session_windows=windows,
+        )
+        if candle["is_complete"] is True
     ]
     return {
         "ready": bool(completed),

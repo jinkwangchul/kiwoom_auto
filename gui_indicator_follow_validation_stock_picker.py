@@ -94,6 +94,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
         project_root: str | Path | None = None,
         snapshot_loader: Callable[[Path | None], StockLibraryLoadSnapshot] | None = None,
         market_snapshot_api: object | None = None,
+        registration_status_reader: Callable[[tuple[dict[str, object], ...]], dict[str, str]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("검증 종목 선택")
@@ -113,6 +114,7 @@ class IndicatorFollowValidationStockPicker(QDialog):
             if market_snapshot_api is not None
             else getattr(parent, "kiwoom_api", None)
         )
+        self._registration_status_reader = registration_status_reader
 
         self.search_input = QLineEdit(self)
         self.btn_search = QPushButton("검색", self)
@@ -403,15 +405,28 @@ class IndicatorFollowValidationStockPicker(QDialog):
         self.result_table.clearSelection()
         self.result_table.setRowCount(len(records))
         self._visible_stock_codes = set()
+        registration_statuses: dict[str, str] = {}
+        if records and self._registration_status_reader is not None:
+            try:
+                resolved = self._registration_status_reader(records)
+                if isinstance(resolved, dict):
+                    registration_statuses = resolved
+            except Exception:
+                pass  # Unknown local state must not appear as an assignment.
         for row, record in enumerate(records):
             status = stock_status_full_text(record.get("status"))
             status_display = stock_browser_status_display_text(
                 self.result_table,
                 status,
             )
+            registration_status = record.get("registration_status", "-")
+            if self._registration_status_reader is not None:
+                registration_status = registration_statuses.get(
+                    normalize_browser_code(record.get("code")), "-"
+                )
             values = stock_browser_display_values(
                 record,
-                registration_status=record.get("registration_status", "-"),
+                registration_status=registration_status,
             )
             values = values[:-1] + (status_display,)
             for column, value in enumerate(values):
