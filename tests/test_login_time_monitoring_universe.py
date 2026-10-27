@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 
+import pytest
+
+import gui_stock_data
+from candle_timeframe_aggregation import SEOUL_TIMEZONE
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_operation_ui_context import sync_auto_trade_monitoring_universe
 from gui_windows import MainWindow
+from stock_market_source_plan import initialize_stock_market_source_plan, read_stock_market_source_plan
 from stock_repository import StockRecord, StockRepository
 
 
@@ -211,6 +218,9 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
         ), patch(
             "routine_package_contract.load_routine_callable",
             side_effect=load_callable,
+        ), patch(
+            "gui_auto_trade_operation_host.calculation_market_source_for_stock",
+            return_value="SOR",
         ):
             result = AutoTradeOperationHost.sync_monitoring_universe_for_current_session(host)
 
@@ -222,6 +232,7 @@ class MonitoringUniverseProjectionTests(unittest.TestCase):
                     "projection": "FORMING_BASE_BAR",
                     "warmup_bars": 35,
                 },
+                "calculation_market_source": "SOR",
             }],
             preserve_stock_codes=("035420",),
         )
@@ -451,6 +462,133 @@ class LoginTimeMonitoringIntegrationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["changed"])
         host.sync_monitoring_universe_for_current_session.assert_called_once_with()
+
+
+def _verified_library(root: Path, rows: list[dict[str, object]]) -> None:
+    runtime = root / "runtime"
+    runtime.mkdir(exist_ok=True)
+    payload = json.dumps(rows).encode("utf-8")
+    (runtime / "stock_library.json").write_bytes(payload)
+    (runtime / "stock_library_meta.json").write_text(json.dumps({
+        "sync_state": "READY",
+        "final_count": len(rows),
+        "content_sha256": hashlib.sha256(payload).hexdigest(),
+    }), encoding="utf-8")
+
+
+def _library_row(code: str, name: str, nxt_available: object) -> dict[str, object]:
+    return {"code": code, "name": name, "market": "KOSPI",
+            "chosung": name, "nxt_available": nxt_available}
+
+
+def _recovery_host() -> SimpleNamespace:
+    session = SimpleNamespace(connected=True, connection_epoch=7, login_session_id="S7")
+    return SimpleNamespace(
+        _kiwoom_api=lambda: SimpleNamespace(broker_session_snapshot=lambda: session),
+        sync_monitoring_universe_for_current_session=Mock(),
+    )
+
+
+def test_verified_library_recovers_only_matching_registered_sources_once(tmp_path):
+    now = datetime.now(SEOUL_TIMEZONE)
+    rows = [_library_row("000660", "SK hynix", True),
+            _library_row("005380", "Hyundai", False),
+            _library_row("005930", "Samsung", True),
+            _library_row("012210", "Correct name", True),
+            _library_row("122350", "Unverified", None),
+            _library_row("111111", "Not registered", True),
+            _library_row("0009K0", "Unsupported", True)]
+    _verified_library(tmp_path, rows)
+    records = [StockRecord(code=code, name=name, routine="", enabled=True,
+                           stock_path=f"stocks/{code}_{name}",
+                           assigned_routine_instance_id="I1")
+               for code, name in [("000660", "SK hynix"), ("005380", "Hyundai"),
+                                  ("005930", "Samsung"), ("012210", "Old name"),
+                                  ("122350", "Unverified"),
+                                  ("0009K0", "Unsupported")]]
+    repo = StockRepository(tmp_path)
+    repo.list_current_registered_stocks = Mock(return_value=records)
+    initialize_stock_market_source_plan(tmp_path, "005930", "Samsung",
+                                        trading_day=now.date(), decided_at=now,
+                                        nxt_available=False)
+    config = tmp_path / "stocks" / "000660_SK hynix" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b'{"assigned_routine_instance_id":"I1","custom":7}')
+    before = {path.relative_to(tmp_path): path.read_bytes()
+              for path in tmp_path.rglob("*") if path.is_file()}
+    host = _recovery_host()
+    payload = {"state": "SUCCEEDED", "connection_epoch": 7, "session_id": "S7"}
+    with patch("gui_auto_trade_operation_host.StockRepository", return_value=repo), patch(
+        "gui_stock_data.load_stock_library_snapshot",
+        wraps=gui_stock_data.load_stock_library_snapshot,
+    ) as load:
+        AutoTradeOperationHost._on_stock_library_sync_finished(host, payload)
+        AutoTradeOperationHost._on_stock_library_sync_finished(host, payload)
+    assert load.call_count == 2
+    host.sync_monitoring_universe_for_current_session.assert_called_once_with()
+    assert read_stock_market_source_plan(tmp_path, "000660", now.date())["nxt_available"] is True
+    assert read_stock_market_source_plan(tmp_path, "005380", now.date())["nxt_available"] is False
+    assert read_stock_market_source_plan(tmp_path, "005930", now.date())["nxt_available"] is False
+    for code in ("012210", "122350", "111111"):
+        assert read_stock_market_source_plan(tmp_path, code, now.date()) is None
+    after = {path.relative_to(tmp_path): path.read_bytes()
+             for path in tmp_path.rglob("*") if path.is_file()}
+    assert all(after[path] == data for path, data in before.items())
+    assert {path.as_posix() for path in after.keys() - before.keys()} == {
+        f"runtime/market_source_plans/anchors/{code}.json" for code in ("000660", "005380")
+    } | {
+        f"runtime/market_source_plans/{now.date().isoformat()}/{code}.json"
+        for code in ("000660", "005380")
+    }
+
+
+@pytest.mark.parametrize("payload,connected,verified", [
+    ({"state": "FAILED", "connection_epoch": 7, "session_id": "S7"}, True, True),
+    ({"state": "SUCCEEDED", "connection_epoch": 6, "session_id": "S7"}, True, True),
+    ({"state": "SUCCEEDED", "connection_epoch": 7, "session_id": "OLD"}, True, True),
+    ({"state": "SUCCEEDED", "connection_epoch": 7, "session_id": "S7"}, False, True),
+    ({"state": "SUCCEEDED", "connection_epoch": 7, "session_id": "S7"}, True, False),
+])
+def test_recovery_requires_current_success_and_verified_snapshot(tmp_path, payload, connected, verified):
+    _verified_library(tmp_path, [_library_row("000660", "SK hynix", True)])
+    if not verified:
+        (tmp_path / "runtime" / "stock_library_meta.json").write_text(
+            '{"sync_state":"READY","final_count":1,"content_sha256":"bad"}', encoding="utf-8")
+    repo = StockRepository(tmp_path)
+    repo.list_current_registered_stocks = Mock(return_value=[
+        StockRecord(code="000660", name="SK hynix", routine="", enabled=True,
+                    stock_path="stocks/000660_SK hynix", assigned_routine_instance_id="I1")])
+    host = _recovery_host()
+    host._kiwoom_api = lambda: SimpleNamespace(broker_session_snapshot=lambda: SimpleNamespace(
+        connected=connected, connection_epoch=7, login_session_id="S7"))
+    before = {path.relative_to(tmp_path): path.read_bytes()
+              for path in tmp_path.rglob("*") if path.is_file()}
+    with patch("gui_auto_trade_operation_host.StockRepository", return_value=repo):
+        AutoTradeOperationHost._on_stock_library_sync_finished(host, payload)
+    host.sync_monitoring_universe_for_current_session.assert_not_called()
+    assert {path.relative_to(tmp_path): path.read_bytes()
+            for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_corrupt_stock_plan_does_not_block_other_registered_stock(tmp_path):
+    now = datetime.now(SEOUL_TIMEZONE)
+    _verified_library(tmp_path, [_library_row("000080", "Broken", True),
+                                 _library_row("000660", "SK hynix", True)])
+    anchor = tmp_path / "runtime" / "market_source_plans" / "anchors" / "000080.json"
+    anchor.parent.mkdir(parents=True)
+    anchor.write_bytes(b"{}")
+    repo = StockRepository(tmp_path)
+    repo.list_current_registered_stocks = Mock(return_value=[
+        StockRecord(code=code, name=name, routine="", enabled=True,
+                    stock_path=f"stocks/{code}_{name}", assigned_routine_instance_id="I1")
+        for code, name in (("000080", "Broken"), ("000660", "SK hynix"))])
+    host = _recovery_host()
+    with patch("gui_auto_trade_operation_host.StockRepository", return_value=repo):
+        AutoTradeOperationHost._on_stock_library_sync_finished(host, {
+            "state": "SUCCEEDED", "connection_epoch": 7, "session_id": "S7"})
+    assert anchor.read_bytes() == b"{}"
+    assert read_stock_market_source_plan(tmp_path, "000660", now.date())["nxt_available"] is True
+    host.sync_monitoring_universe_for_current_session.assert_called_once_with()
 
 
 if __name__ == "__main__":
