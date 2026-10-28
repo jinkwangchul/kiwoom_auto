@@ -8445,6 +8445,88 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return None
         return frozen
 
+    def _ensure_published_direct_current_snapshot(self, window, session, pool, generation):
+        """Recover an absent M3 binding from the same immutable broker receipt."""
+        frozen = self._published_direct_current_snapshot(
+            window, session, pool, generation)
+        if frozen is not None:
+            return frozen
+        # A present but invalid binding must stay rejected; never replace
+        # a corrupted or stale publication with an inferred one.
+        if getattr(window, "_v5_direct_current_replay_basis", None) is not None:
+            return None
+        if (not isinstance(pool, dict)
+                or not isinstance(session, ValidationSession)
+                or session.request.stock.code != "005930"
+                or session.request.timeframe_key != "M3"
+                or pool.get("native_live_snapshot") is not None
+                or self._verified_sor_tail_provider is not None
+                or self._validation_source_by_code.get("005930") is not True
+                or self._open_windows.get(id(window)) is not window
+                or self._validation_sessions.get(id(window)) is not session
+                or self._historical_pools.get(id(window)) is not pool
+                or self._request_generation.get(id(window), 0) != generation):
+            return None
+        publication = pool.get("_dispatch_snapshot")
+        receipt = pool.get("selected_direct_forming_snapshot")
+        query = pool.get("direct_selected_query")
+        calculation = getattr(window, "_calculation_candles", None)
+        if (not isinstance(publication, tuple) or len(publication) != 4
+                or not isinstance(publication[2], dict)
+                or not isinstance(receipt, dict)
+                or not isinstance(query, dict)
+                or not isinstance(calculation, list) or not calculation
+                or publication[3] != self._pool_computation_source_identity(pool)
+                or publication[2].get("selected_direct_forming_snapshot") != receipt
+                or publication[2].get("direct_selected_query") != query
+                or not isinstance(receipt.get("candle"), dict)
+                or calculation[-1].get("time") != receipt["candle"].get("time")):
+            return None
+        received = self._source_snapshot_datetime(receipt.get("request_as_of"))
+        if received is None:
+            return None
+        candidate_frozen = (
+            publication[3], received, {"projection": "DIRECT_COMPLETED_TIMEFRAME"})
+        try:
+            view = self._validation_pool_for_session(
+                session, pool, target_count=len(calculation))
+            proven = self._sor_m1_calculation_view(
+                session, pool, view, candidate_frozen)
+            sidecar = self._integrated_display_sidecars.get(
+                self._integrated_display_sidecar_key(session))
+            premarket = self._verified_validation_premarket_candles(
+                session, sidecar)
+            if premarket and proven.get("validation_composite_calculation") is not True:
+                proven = self._compose_verified_nxt_pre(
+                    session, proven, premarket, sidecar, pool.get("candles"))
+            proven_rows = proven.get("candles")
+            if (not isinstance(proven_rows, list)
+                    or len(proven_rows) < len(calculation)
+                    or proven_rows[-len(calculation):] != calculation
+                    or proven.get("calculation_source")
+                       != "SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT"):
+                return None
+            snapshot = ValidationHistoricalSnapshot(
+                stock=session.request.stock,
+                timeframe_minutes=session.request.timeframe_minutes,
+                timeframe_key=session.request.timeframe_key,
+                requested_count=len(calculation),
+                request_id=f"{pool.get('request_id') or 'POOL'}:VERIFIED_CURRENT",
+                rows=self._historical_rows_from_candles(calculation),
+                market_data_identity=str(proven.get("market_data_identity") or ""),
+                market_source=str(proven.get("market_source") or ""),
+                request_as_of=receipt["request_as_of"],
+            )
+            verified_view = dict(
+                proven, snapshot=snapshot,
+                _direct_current_calculation_snapshot=candidate_frozen)
+            self._remember_published_direct_current(
+                window, session, pool, verified_view, generation)
+            return self._published_direct_current_snapshot(
+                window, session, pool, generation)
+        except (TypeError, ValueError, KeyError):
+            return None
+
     def _sor_m1_calculation_snapshot(self, session, pool, *, live_forming=False):
         """Freeze M1 only for the current forming bar; completed minute bars stay direct."""
         code = session.request.stock.code
@@ -12649,7 +12731,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 == selected_candle.get("time")
             )
             published_direct_current = (
-                self._published_direct_current_snapshot(
+                self._ensure_published_direct_current_snapshot(
                     window, source_session, pool, request_generation)
                 if marking_direct_current else None
             )
@@ -13414,7 +13496,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         published_direct_calculation = None
         if replaying_direct_current:
             try:
-                published_direct_calculation = self._published_direct_current_snapshot(
+                published_direct_calculation = self._ensure_published_direct_current_snapshot(
                     window, request.get("source_session"), pool, request_generation)
             except Exception:
                 pass  # Invalid binding remains blocked by the replay worker.

@@ -305,8 +305,9 @@ def test_completed_direct_m3_marking_replays_selected_al_rows(monkeypatch):
 
 @pytest.mark.parametrize("corrupt", [False, True])
 @pytest.mark.parametrize("with_premarket", [False, True])
+@pytest.mark.parametrize("missing_basis", [False, True])
 def test_expired_direct_m3_marking_uses_bound_published_current(
-    monkeypatch, corrupt, with_premarket
+    monkeypatch, corrupt, with_premarket, missing_basis
 ):
     """A frozen, published forming M3 bar must remain valid for Mark after its interval."""
     import gui_indicator_follow_signal_validation_v5_flow as flow_module
@@ -342,6 +343,8 @@ def test_expired_direct_m3_marking_uses_bound_published_current(
         }
         flow._integrated_display_sidecars[
             flow._integrated_display_sidecar_key(session)] = sidecar
+        assert flow._verified_validation_premarket_candles(
+            session, sidecar) == [pre]
         published = flow._compose_verified_nxt_pre(
             session, published, [pre], sidecar, pool["candles"])
         assert published["validation_composite_calculation"] is True
@@ -358,8 +361,11 @@ def test_expired_direct_m3_marking_uses_bound_published_current(
     flow._validation_sessions[key] = session
     flow._historical_pools[key] = pool
     flow._request_generation[key] = 1
-    flow._remember_published_direct_current(window, session, pool, published, 1)
-    assert flow._published_direct_current_snapshot(window, session, pool, 1) == frozen
+    if missing_basis:
+        window._v5_direct_current_replay_basis = None
+    else:
+        flow._remember_published_direct_current(window, session, pool, published, 1)
+        assert flow._published_direct_current_snapshot(window, session, pool, 1) == frozen
     flow._now_factory = lambda: at.replace(hour=20, minute=3)
     request = dict(
         settings=session.request.settings_snapshot,
@@ -370,6 +376,12 @@ def test_expired_direct_m3_marking_uses_bound_published_current(
     if corrupt:
         window._calculation_candles[-1]["close"] += 1
         request["calculation"][-1]["close"] += 1
+    if missing_basis and not corrupt:
+        restored = flow._ensure_published_direct_current_snapshot(
+            window, session, pool, 1)
+        assert restored is not None
+        assert restored[0] == frozen[0]
+        assert restored[2] == frozen[2]
     observed, payloads = [], []
 
     class StopReplay:
@@ -396,6 +408,70 @@ def test_expired_direct_m3_marking_uses_bound_published_current(
         assert observed == [flow._historical_rows_from_candles(rows)[-1]], (
             payloads[-1]["error"] if payloads else tooltips)
         assert payloads[-1]["error"] == "STOP_AFTER_BOUND_M3_MARKING_INPUT"
+
+
+@pytest.mark.parametrize("with_premarket", [False, True])
+def test_direct_m3_5901_calculation_recovers_immutable_receipt_for_marking(with_premarket):
+    """A full 5,901-bar chart may bind its visible current bar after initial publish."""
+    at = datetime(2026, 10, 26, 19, 59, 54, tzinfo=ZoneInfo("Asia/Seoul"))
+    history = []
+    day = datetime(2026, 6, 1)
+    while day.date() <= datetime(2026, 10, 23).date():
+        if day.weekday() < 5:
+            for minute in range(15 * 60 + 39, 20 * 60, 3):
+                history.append(dict(ROWS[0], time=day.strftime("%Y%m%d")
+                                    + f"{minute // 60:02d}{minute % 60:02d}00"))
+        day += timedelta(days=1)
+    prior_count = 5898 if with_premarket else 5899
+    rows = [*history[-prior_count:],
+            dict(ROWS[1], time="20261026195400"),
+            dict(ROWS[2], time="20261026195700")]
+    flow, session = _flow(), _session()
+    flow._validation_source_by_code["005930"] = True
+    completed, forming, query = flow._direct_selected_history_parts(
+        _result(session, at, rows).snapshot)
+    pool = flow._pool_from_candles(
+        session, completed, requested_count=5900,
+        request_id=query["request_id"], market_data_identity="005930_AL",
+        market_source="INTEGRATED", direct_selected_query=query,
+        selected_direct_forming_snapshot=forming)
+    flow._pool_dispatch_snapshot(pool)
+    flow._now_factory = lambda: at.replace(second=58)
+    view = flow._validation_pool_for_session(
+        session, pool, target_count=5901)
+    published = flow._sor_m1_calculation_view(
+        session, pool, view, flow._sor_m1_calculation_snapshot(session, pool))
+    if with_premarket:
+        pre = dict(ROWS[0], time="20261026080000")
+        sidecar = {
+            "stock_code": "005930", "timeframe_key": "M3",
+            "timeframe_minutes": 3, "market_data_identity": "005930_AL",
+            "market_source": "INTEGRATED", "display_only": True,
+            "verified_nxt_eligible": True, "request_as_of": at.isoformat(),
+            "candles": [pre],
+        }
+        flow._integrated_display_sidecars[
+            flow._integrated_display_sidecar_key(session)] = sidecar
+        published = flow._compose_verified_nxt_pre(
+            session, published, [pre], sidecar, pool["candles"])
+    assert len(published["candles"]) == 5901
+    window = SimpleNamespace(
+        _calculation_candles=deepcopy(published["candles"]),
+        _v5_direct_current_replay_basis=None)
+    key = id(window)
+    flow._open_windows[key] = window
+    flow._validation_sessions[key] = session
+    flow._historical_pools[key] = pool
+    flow._request_generation[key] = 1
+    flow._now_factory = lambda: at.replace(hour=20, minute=3)
+    bound = flow._ensure_published_direct_current_snapshot(
+        window, session, pool, 1)
+    assert bound is not None
+    assert bound[0] == pool["_dispatch_snapshot"][3]
+    assert bound[1] == at
+    assert bound[2] == {"projection": "DIRECT_COMPLETED_TIMEFRAME"}
+    window._calculation_candles[-1]["close"] += 1
+    assert flow._published_direct_current_snapshot(window, session, pool, 1) is None
 
 
 def test_direct_m3_acquisition_keeps_current_response_separate_from_completed_view(monkeypatch):
@@ -451,7 +527,7 @@ def test_direct_current_stays_usable_in_same_bucket_and_never_ages_into_history(
 
 
 @pytest.mark.parametrize("changed", [
-    None, "display_corrupt", "forged_query", "source_flip", "broken_basis",
+    None, "missing_basis", "display_corrupt", "forged_query", "source_flip", "broken_basis",
     "stale_generation", "stale_session", "stale_source", "stale_view",
     "stale_broken_basis", "native_same_bar",
 ])
@@ -565,6 +641,8 @@ def test_expired_direct_m3_range_replay_uses_its_published_verified_view(monkeyp
         pool["direct_selected_query"]["request_id"] = "forged"
     elif changed == "source_flip":
         flow._validation_source_by_code["005930"] = False
+    elif changed == "missing_basis":
+        window._v5_direct_current_replay_basis = None
     elif changed == "broken_basis":
         window._v5_direct_current_replay_basis = (
             *window._v5_direct_current_replay_basis[:4], object())
@@ -608,7 +686,8 @@ def test_expired_direct_m3_range_replay_uses_its_published_verified_view(monkeyp
         assert payloads[-1]["error"] == "SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED"
         return
     if changed != "native_same_bar":
-        assert replay_frozen and replay_frozen[-1][1] == calculation_at
+        assert replay_frozen and replay_frozen[-1][1] == (
+            at if changed == "missing_basis" else calculation_at)
         assert forming["request_as_of"] == at.isoformat()
         assert observed == [flow._historical_rows_from_candles(rows)[-1]], payloads[-1]["error"]
     else:
@@ -618,7 +697,7 @@ def test_expired_direct_m3_range_replay_uses_its_published_verified_view(monkeyp
     failures = []
     monkeypatch.setattr(flow, "_window_accepts_results", lambda _window: True)
     monkeypatch.setattr(flow, "_fail_window", lambda _window, reason: failures.append(reason))
-    if changed in {None, "native_same_bar"}:
+    if changed in {None, "missing_basis", "native_same_bar"}:
         flow._on_range_replay_completed(payloads[-1])
         assert failures == ["REPLAY_ERROR: STOP_AFTER_VERIFIED_REPLAY_INPUT"]
         if changed == "native_same_bar":
