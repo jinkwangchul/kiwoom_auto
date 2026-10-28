@@ -12630,12 +12630,40 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 publication[3] if isinstance(publication, tuple)
                 and len(publication) == 4 else ()
             )
-            direct_snapshot = (published_m1[1] if published_m1 else
+            # A displayed direct M3 current bar is a published, immutable
+            # receipt. Mark must reuse the same bound receipt as range replay;
+            # the wall-clock snapshot may already be in a later bar.
+            selected_receipt = pool.get("selected_direct_forming_snapshot")
+            selected_candle = (
+                selected_receipt.get("candle")
+                if isinstance(selected_receipt, dict) else None
+            )
+            marking_direct_current = (
+                session.request.stock.code == "005930"
+                and session.request.timeframe_key == "M3"
+                and pool.get("native_live_snapshot") is None
+                and isinstance(selected_candle, dict)
+                and isinstance(request.get("calculation"), list)
+                and bool(request["calculation"])
+                and request["calculation"][-1].get("time")
+                == selected_candle.get("time")
+            )
+            published_direct_current = (
+                self._published_direct_current_snapshot(
+                    window, source_session, pool, request_generation)
+                if marking_direct_current else None
+            )
+            if marking_direct_current and published_direct_current is None:
+                raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
+            direct_snapshot = (
+                published_direct_current if published_direct_current is not None
+                else published_m1[1] if published_m1 else
                 self._sor_m1_calculation_snapshot(session, pool)
                 if (session.request.stock.code == "005930"
                     and session.request.timeframe_key in {"M1", "M3"}
                     and pool.get("native_live_snapshot") is None)
-                else None)
+                else None
+            )
         except (TypeError, ValueError, KeyError) as exc:
             _trace_v5_marking("marking_failed", key, request.get("generation"),
                               request_generation, reason=str(exc), phase="precheck",
@@ -12745,8 +12773,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         )
                     return checked_view
 
-                deferred_check = (session.request.timeframe_key == "M1"
-                                  and direct_snapshot is not None)
+                deferred_check = (
+                    (session.request.timeframe_key == "M1"
+                     and direct_snapshot is not None)
+                    or published_direct_current is not None
+                )
                 if not deferred_check:
                     replay_view = check_marking_view(replay_view)
                 result = self._prepare_replay_result_from_pool(
@@ -12756,7 +12787,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     prepared_view_pool=replay_view, cancel_predicate=lambda: not current(),
                     sor_m1_calculation_snapshot=direct_snapshot,
                     expected_sor_m1_calculation=(
-                        calculation if direct_snapshot is not None else None),
+                        calculation
+                        if direct_snapshot is not None
+                        and (published_direct_current is None or not detached_premarket)
+                        else None),
                     marking_view_check=(check_marking_view if deferred_check else None))
                 snapshot = result.snapshot
                 # Build only marking comparisons; normal filters retain their original cache.

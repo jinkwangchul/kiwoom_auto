@@ -303,6 +303,101 @@ def test_completed_direct_m3_marking_replays_selected_al_rows(monkeypatch):
     assert payloads[-1]["error"] == "STOP_AFTER_DIRECT_M3_INPUT"
 
 
+@pytest.mark.parametrize("corrupt", [False, True])
+@pytest.mark.parametrize("with_premarket", [False, True])
+def test_expired_direct_m3_marking_uses_bound_published_current(
+    monkeypatch, corrupt, with_premarket
+):
+    """A frozen, published forming M3 bar must remain valid for Mark after its interval."""
+    import gui_indicator_follow_signal_validation_v5_flow as flow_module
+
+    at = datetime(2026, 10, 26, 19, 59, 54, tzinfo=ZoneInfo("Asia/Seoul"))
+    rows = [ROWS[0],
+            dict(ROWS[1], time="20261026195400"),
+            dict(ROWS[2], time="20261026195700")]
+    flow = _flow()
+    session = _session()
+    flow._validation_source_by_code["005930"] = True
+    completed, forming, query = flow._direct_selected_history_parts(
+        _result(session, at, rows).snapshot)
+    pool = flow._pool_from_candles(
+        session, completed, requested_count=5900,
+        request_id=query["request_id"], market_data_identity="005930_AL",
+        market_source="INTEGRATED", direct_selected_query=query,
+        selected_direct_forming_snapshot=forming)
+    flow._pool_dispatch_snapshot(pool)
+    flow._now_factory = lambda: at.replace(second=58)
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    published = flow._sor_m1_calculation_view(
+        session, pool, flow._validation_pool_for_session(
+            session, pool, target_count=5900), frozen)
+    if with_premarket:
+        pre = dict(ROWS[0], time="20261026080000")
+        sidecar = {
+            "stock_code": "005930", "timeframe_key": "M3",
+            "timeframe_minutes": 3, "market_data_identity": "005930_AL",
+            "market_source": "INTEGRATED", "display_only": True,
+            "verified_nxt_eligible": True, "request_as_of": at.isoformat(),
+            "candles": [pre],
+        }
+        flow._integrated_display_sidecars[
+            flow._integrated_display_sidecar_key(session)] = sidecar
+        published = flow._compose_verified_nxt_pre(
+            session, published, [pre], sidecar, pool["candles"])
+        assert published["validation_composite_calculation"] is True
+    tooltips = []
+    window = SimpleNamespace(
+        stock=session.request.stock,
+        _calculation_candles=deepcopy(published["candles"]),
+        _candles=deepcopy(published["candles"]),
+        _marking_generation=1, _marking_key="mark",
+        _disable_marking=lambda **_kwargs: None,
+        marking_display_check=SimpleNamespace(setToolTip=tooltips.append))
+    key = id(window)
+    flow._open_windows[key] = window
+    flow._validation_sessions[key] = session
+    flow._historical_pools[key] = pool
+    flow._request_generation[key] = 1
+    flow._remember_published_direct_current(window, session, pool, published, 1)
+    assert flow._published_direct_current_snapshot(window, session, pool, 1) == frozen
+    flow._now_factory = lambda: at.replace(hour=20, minute=3)
+    request = dict(
+        settings=session.request.settings_snapshot,
+        calculation=deepcopy(window._calculation_candles),
+        display=deepcopy(window._candles), generation=1, key="mark",
+        range=(0, len(window._candles)-1),
+        times=(rows[0]["time"], rows[-1]["time"]), descriptors=())
+    if corrupt:
+        window._calculation_candles[-1]["close"] += 1
+        request["calculation"][-1]["close"] += 1
+    observed, payloads = [], []
+
+    class StopReplay:
+        def evaluate(self, snapshot, **_kwargs):
+            observed.append(snapshot.to_rows()[-1])
+            raise RuntimeError("STOP_AFTER_BOUND_M3_MARKING_INPUT")
+
+    class InlineThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    flow._replay_factory = lambda _session: StopReplay()
+    monkeypatch.setattr(flow_module, "Thread", InlineThread)
+    flow.marking_completed.disconnect()
+    flow.marking_completed.connect(payloads.append)
+    flow._start_marking(window, request)
+    if corrupt:
+        assert observed == []
+        assert any("DISPLAYED_CALCULATION_CHANGED" in tip for tip in tooltips)
+    else:
+        assert observed == [flow._historical_rows_from_candles(rows)[-1]], (
+            payloads[-1]["error"] if payloads else tooltips)
+        assert payloads[-1]["error"] == "STOP_AFTER_BOUND_M3_MARKING_INPUT"
+
+
 def test_direct_m3_acquisition_keeps_current_response_separate_from_completed_view(monkeypatch):
     flow = _flow()
     session = _session()
