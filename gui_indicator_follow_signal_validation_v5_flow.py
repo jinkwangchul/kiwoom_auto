@@ -8741,19 +8741,30 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             unmixed = view.get("_validation_sor_view")
             if not isinstance(unmixed, dict):
                 raise ValueError("SOR_M1_BLOCKED:COMPOSITE_SOURCE_UNAVAILABLE")
+            # The published expectation includes verified NXT PRE rows.
+            # Compare it only after restoring those rows to the direct AL view.
             projected = self._sor_m1_calculation_view(
-                session, source_pool, unmixed, frozen, expected_calculation,
+                session, source_pool, unmixed, frozen, None,
                 live_calendar=live_calendar, normal_base_only=normal_base_only,
             )
             sidecar = self._integrated_display_sidecars.get(
                 self._integrated_display_sidecar_key(session)
             )
-            return self._compose_verified_nxt_pre(
+            combined = self._compose_verified_nxt_pre(
                 session, projected,
                 self._verified_validation_premarket_candles(session, sidecar),
                 sidecar,
                 source_pool.get("candles"),
             )
+            calculation = combined.get("candles")
+            if (expected_calculation is not None
+                    and (not isinstance(expected_calculation, list)
+                         or not expected_calculation
+                         or not isinstance(calculation, list)
+                         or expected_calculation
+                         != calculation[-len(expected_calculation):])):
+                raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
+            return combined
         if frozen is None:
             code = session.request.stock.code
             if (self._verified_sor_tail_provider is None

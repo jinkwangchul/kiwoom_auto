@@ -18,6 +18,9 @@ from routines.지표추종매매.routine_validation_historical import (
 )
 from indicator_follow_signal_validation_historical_cache import ValidationHistoricalCacheEntry
 from tests.test_indicator_follow_signal_validation_v5_integrated_history_scroll import _flow
+from tests.test_indicator_follow_signal_validation_v5_baseline import (
+    case, install, window_for,
+)
 from tests.test_indicator_follow_v2_display_only_integrated_flow import (
     ValidationRequest, ValidationSession, ValidationSettingsSnapshot, ValidationStockRef,
 )
@@ -602,6 +605,51 @@ def test_direct_m3_period_replay_reconstructs_full_published_warmup():
             expected_sor_m1_calculation=corrupted)
 
 
+def test_direct_m3_composite_period_replay_uses_full_published_calculation():
+    flow = _flow()
+    session = _session()
+    flow._validation_source_by_code["005930"] = True
+    completed, forming, query = flow._direct_selected_history_parts(
+        _result(session, AS_OF).snapshot)
+    pool = flow._pool_from_candles(
+        session, completed, requested_count=5900,
+        request_id=query["request_id"],
+        market_data_identity="005930_AL", market_source="INTEGRATED",
+        direct_selected_query=query, selected_direct_forming_snapshot=forming)
+    flow._now_factory = lambda: AS_OF.replace(minute=22)
+    frozen = flow._sor_m1_calculation_snapshot(session, pool)
+    base = flow._validation_pool_for_session(
+        session, pool, target_count=5900)
+    direct = flow._sor_m1_calculation_view(session, pool, base, frozen)
+    premarket = dict(ROWS[0], time="20261026080000")
+    sidecar = {
+        "stock_code": "005930", "timeframe_key": "M3",
+        "timeframe_minutes": 3, "market_data_identity": "005930_AL",
+        "market_source": "INTEGRATED", "display_only": True,
+        "verified_nxt_eligible": True, "request_as_of": AS_OF.isoformat(),
+        "candles": [premarket],
+    }
+    flow._integrated_display_sidecars[
+        flow._integrated_display_sidecar_key(session)] = sidecar
+    assert flow._verified_validation_premarket_candles(
+        session, sidecar) == [premarket]
+    composite_base = flow._compose_verified_nxt_pre(
+        session, base, [premarket], sidecar, pool["candles"])
+    published = flow._compose_verified_nxt_pre(
+        session, direct, [premarket], sidecar, pool["candles"])
+    assert composite_base["validation_composite_calculation"] is True
+    assert premarket in published["candles"]
+
+    replay = flow._sor_m1_calculation_view(
+        session, pool, composite_base, frozen, deepcopy(published["candles"]))
+    assert replay["candles"] == published["candles"]
+    changed = deepcopy(published["candles"])
+    changed[1]["close"] += 1
+    with pytest.raises(ValueError, match="DISPLAYED_CALCULATION_CHANGED"):
+        flow._sor_m1_calculation_view(
+            session, pool, composite_base, frozen, changed)
+
+
 def test_direct_current_normal_base_keeps_calculation_and_rejects_tampered_receipt():
     flow = _flow()
     session = _session()
@@ -991,3 +1039,42 @@ def test_partial_cache_cannot_age_into_completed_history_without_direct_query(tm
     marker["direct_selected_query"]["market_data_identity"] = "005930"
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
     assert flow._cached_history(session.request.stock, 3, "M3", 5900) is None
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_v5_timeframe_change_clears_pending_period_before_request(case, completed):
+    window = window_for(case)
+    install(window)
+    window._validation_range_anchor_index = 10
+    window._validation_range_anchor_time = str(window._candles[10]["time"])
+    if completed:
+        window._set_validation_range(10, 18)
+        assert window._validation_range_times is not None
+    else:
+        assert window._validation_range is None
+
+    combo = window.basic_signal_interval_combo
+    target = next(
+        value for value in ("3분", "5분", "10분")
+        if value != combo.currentText() and combo.findText(value) >= 0
+    )
+    combo.setCurrentText(target)
+
+    assert window._validation_range is None
+    assert window._validation_range_times is None
+    assert window._validation_range_anchor_index is None
+    assert window._validation_range_anchor_time is None
+
+
+def test_v5_period_replay_error_keeps_existing_chart(case):
+    window = window_for(case)
+    install(window)
+    assert window.canvas is not None
+    assert window.chart_stack.currentWidget() is window.chart_view
+    assert window._replay_snapshot is None
+
+    message = "REPLAY_ERROR: SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED"
+    window.show_validation_error(message)
+
+    assert window.validation_status_label.text() == message
+    assert window.chart_stack.currentWidget() is window.chart_view
