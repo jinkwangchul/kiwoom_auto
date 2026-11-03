@@ -8604,10 +8604,19 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                        if isinstance(active_pool, dict) else None)
         if unavailable:
             raise ValueError(f"{unavailable}: 자료 부족")
-        active_pool = self._sor_m1_calculation_view(
-            session, pool, active_pool, sor_m1_calculation_snapshot,
-            None if historical_only_until is not None else expected_sor_m1_calculation,
+        selected_wm_range = (
+            chart_range is not None and sor_m1_calculation_snapshot is None
+            and session.request.timeframe_key in {"W1", "MO1"}
+            and isinstance(pool.get("direct_selected_query"), dict)
+            and (pool.get("market_source") == "INTEGRATED"
+                 or self._period_session_scope(session.request.settings_snapshot,
+                                               session.request.timeframe_key) == "REGULAR")
         )
+        if not selected_wm_range:
+            active_pool = self._sor_m1_calculation_view(
+                session, pool, active_pool, sor_m1_calculation_snapshot,
+                None if historical_only_until is not None else expected_sor_m1_calculation,
+            )
         if historical_only_until is not None:
             # A completed selected range cannot depend on a later forming bar.
             # Still compare its native OHLCV against every overlapping displayed row.
@@ -8762,6 +8771,29 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 evaluation_start = chart_indexes[start]
                 evaluation_end = chart_indexes[end]
             count = evaluation_end - evaluation_start + 1
+
+        if selected_wm_range:
+            # Validate the original pool and mapped prefix before any evaluation.
+            now = self._source_snapshot_datetime(self._now_factory())
+            try:
+                day = datetime.strptime(candles[evaluation_end]["time"], "%Y%m%d%H%M%S").date()
+                start = (now.date() - timedelta(days=now.weekday())
+                         if session.request.timeframe_key == "W1"
+                         else now.date().replace(day=1))
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                raise ValueError("SOR_M1_BLOCKED:SOURCE_UNAVAILABLE") from None
+            if day < start:
+                if (not isinstance(expected_sor_m1_calculation, list)
+                        or not expected_sor_m1_calculation
+                        or not self._selected_wm_view_verified(
+                            session, pool, active_pool, now,
+                            expected_sor_m1_calculation,
+                            completed_prefix=candles[:evaluation_end + 1])):
+                    raise ValueError("SOR_M1_BLOCKED:SOURCE_UNAVAILABLE")
+            else:
+                active_pool = self._sor_m1_calculation_view(
+                    session, pool, active_pool, sor_m1_calculation_snapshot,
+                    expected_sor_m1_calculation)
 
         if type(marking_diagnostic) is dict:
             marking_diagnostic.update(evaluation_start=evaluation_start, evaluation_end=evaluation_end)
@@ -11044,6 +11076,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     def _fresh_selected_wm_view(self, session, source_pool, view, as_of,
                                 expected_calculation):
         """Accept native current W1/MO1 only with this run's live period receipt."""
+        return self._selected_wm_view_verified(
+            session, source_pool, view, as_of, expected_calculation)
+
+    def _selected_wm_view_verified(self, session, source_pool, view, as_of,
+                                   expected_calculation, *, completed_prefix=None):
         key = session.request.timeframe_key
         if key not in {"W1", "MO1"}:
             return False
@@ -11080,11 +11117,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         broker.login_session_id.encode("utf-8")).hexdigest()
                     or selected is None or received is None or observed is None
                     or (selection is not None and not selection.selected_at <= selected)
-                    or selected.date() != as_of.date() or selected.date() != observed.date()
                     or not selected <= received <= as_of
                     or not received <= observed
-                    or not timedelta(0) <= as_of - selected < timedelta(minutes=1)
-                    or not timedelta(0) <= observed - selected < timedelta(minutes=1)
+                    or (completed_prefix is None and (
+                        selected.date() != as_of.date() or selected.date() != observed.date()
+                        or not timedelta(0) <= as_of - selected < timedelta(minutes=1)
+                        or not timedelta(0) <= observed - selected < timedelta(minutes=1)))
                     or any(pool.get("request_id") != query.get("request_id")
                            or pool.get("direct_selected_query") != query
                            for pool in (original, source_pool, view))
@@ -11099,10 +11137,23 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         not isinstance(expected_calculation, list) or not expected_calculation
                         or expected_calculation != historical[-len(expected_calculation):]))):
                 return False
-            period_start = (as_of.date() - timedelta(days=as_of.weekday())
-                            if key == "W1" else as_of.date().replace(day=1))
             dates = [datetime.strptime(row["time"], "%Y%m%d%H%M%S").date()
                      for row in rows]
+            if completed_prefix is not None:
+                completed = query.get("last_completed_time")
+                starts = [(at.date() - timedelta(days=at.weekday())
+                           if key == "W1" else at.date().replace(day=1))
+                          for at in (selected, received, as_of, observed)]
+                return (bool(completed_prefix) and isinstance(completed, str)
+                        and all(row.get("is_complete") is not True
+                                for row, day in zip(rows, dates) if day >= starts[0])
+                        and all(row.get("is_complete") is not False
+                                and row["time"] <= completed
+                                and all(datetime.strptime(row["time"], "%Y%m%d%H%M%S").date()
+                                        < start for start in starts)
+                                for row in completed_prefix))
+            period_start = (as_of.date() - timedelta(days=as_of.weekday())
+                            if key == "W1" else as_of.date().replace(day=1))
             # A current native period stays current; receipt freshness never completes it.
             return (any(day >= period_start for day in dates)
                     and all(row.get("is_complete") is not True if day >= period_start
@@ -16955,7 +17006,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         )
         displayed_calculation = (
             deepcopy(window_calculation)
-            if sor_m1_calculation_snapshot is not None else None
+            if (sor_m1_calculation_snapshot is not None
+                or session.request.timeframe_key in {"W1", "MO1"}) else None
         )
         if (sor_m1_calculation_snapshot is not None
                 and not isinstance(displayed_calculation, list)):
