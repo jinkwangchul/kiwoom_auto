@@ -5,11 +5,16 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 import gui_indicator_follow_signal_validation_v5_flow as v5
+from engines.condition_engine import evaluate_condition, evaluate_group
+from engines.indicator_engine import simple_ma
 from routines.지표추종매매 import routine_validation_historical as historical
+from tests.test_display_only_integrated_history import _frozen_source_plan
 from tests.test_v5_pre_al_first_contract_20261101 import case as _source_case
 
 
@@ -201,20 +206,114 @@ def test_current_period_stamp_before_today_still_requires_fresh_receipt(wm, key,
 
 @pytest.mark.parametrize("key", ["W1", "MO1"])
 @pytest.mark.parametrize("regular", [False, True], ids=["FULL", "REG"])
-@pytest.mark.parametrize("verified", [False, True])
-def test_marking_cannot_bypass_receipt_or_actual_warmup(wm, key, regular, verified):
+def test_marking_cannot_bypass_missing_receipt(wm, key, regular):
     c = wm.acquire(key, regular)
-    if not verified:
-        c.flow._verified_al_period_receipts.clear()
-    expected_error = "MARKING_WARMUP_INSUFFICIENT" if verified else "SOR_M1_BLOCKED:SOURCE_UNAVAILABLE"
+    c.flow._verified_al_period_receipts.clear()
     # Exercise the real marking replay entry before any evaluator or virtual trade.
-    with pytest.raises(ValueError, match=expected_error):
+    with pytest.raises(ValueError, match="SOR_M1_BLOCKED:SOURCE_UNAVAILABLE"):
         c.flow._prepare_replay_result_from_pool(c.session, c.pool,
             history_target=2, prepared_view_pool=c.view,
             expected_sor_m1_calculation=c.rows[-2:],
             chart_range=(0, 1),
             chart_range_times=tuple(row["time"] for row in c.rows[-2:]),
             require_full_warmup_for_marking=True)
+
+
+def _marking_replay(c, end):
+    with _frozen_source_plan() as root, patch("routine_signal_probe.PROJECT_ROOT", root):
+        return c.flow._prepare_replay_result_from_pool(c.session, c.pool,
+            history_target=len(c.view["candles"]), prepared_view_pool=c.view,
+            expected_sor_m1_calculation=c.view["candles"], chart_range=(0, end),
+            chart_range_times=(c.view["candles"][0]["time"], c.view["candles"][end]["time"]),
+            require_full_warmup_for_marking=True)
+
+
+@pytest.mark.parametrize("key", ["W1", "MO1"])
+@pytest.mark.parametrize("regular", [False, True], ids=["FULL", "REG"])
+def test_verified_short_marking_without_filters_keeps_selection_and_has_no_signals(wm, key, regular):
+    c = wm.acquire(key, regular)
+    result = _marking_replay(c, 1)
+    assert result.ok and result.snapshot is not None
+    snapshot = result.snapshot
+    assert snapshot.to_candles() == c.rows[-2:]
+    assert (snapshot.evaluated_start_index, snapshot.evaluated_end_index) == (0, 1)
+    assert [(e.evaluation_side, e.evaluation_index, e.evaluation_time, e.signal)
+            for e in snapshot.to_entries()] == [
+        ("SELL", 0, "20261001000000", None), ("BUY", 0, "20261001000000", None),
+        ("SELL", 1, "20261102000000", None), ("BUY", 1, "20261102000000", None)]
+    assert len(c.calls) == 1
+
+
+def _ma3_group(mode):
+    ma = dict(target="MA", period=3, operator=">", value=100)
+    if mode in {"not", "failed-not"}:
+        ma.update(value=102, **{"not": True})
+    if mode == "failed-not":
+        ma["operator"] = "UNSUPPORTED"
+    conditions = [ma]
+    if mode in {"and", "or"}:
+        conditions.insert(0, dict(target="CLOSE", operator=">", value=100))
+    return dict(enabled=True, name="MA3 boundary", logic="OR" if mode == "or" else "AND",
+                conditions=conditions)
+
+
+@pytest.mark.parametrize("mode,before,ready", [
+    ("ma", (False, False), (True, True)),
+    ("not", (False, False), (True, True)),
+    ("and", (False, False), (True, True)),
+    ("or", (True, True), (True, True)),
+    ("failed-not", (False, True), (False, True)),
+])
+def test_condition_engine_uses_actual_ma3_boundary_and_preserves_unknown(mode, before, ready):
+    # Engine evidence: two samples lack MA3; (101 + 101 + 101) / 3 = 101.
+    series = {"CLOSE": [101.0, 101.0, 101.0], "MA3": simple_ma([101.0, 101.0, 101.0], 3)}
+    assert series["MA3"] == [None, None, 101.0]
+    group = _ma3_group(mode)
+    condition = group["conditions"][-1]
+    for index, expected in ((1, before), (2, ready)):
+        result = evaluate_condition(condition, series, index, readiness_safe=True)
+        condition_expected = (False, False) if mode == "or" and index == 1 else expected
+        assert (result.passed, result.available) == condition_expected
+        combined = evaluate_group(group, series, index, readiness_safe=True)
+        assert (combined.passed, combined.available) == expected
+
+
+@pytest.mark.parametrize("key", ["W1", "MO1"])
+@pytest.mark.parametrize("regular", [False, True], ids=["FULL", "REG"])
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+@pytest.mark.parametrize("mode,expected_indices", [
+    ("ma", [2]), ("not", [2]), ("and", [2]), ("or", [0, 1, 2]), ("failed-not", []),
+])
+def test_real_v5_marking_suppresses_only_unready_required_filters(
+        wm, key, regular, side, mode, expected_indices):
+    c = wm.acquire(key, regular)
+    group = _ma3_group(mode)
+    rules = c.session.request.settings_snapshot.to_dict()
+    rules.update(enabled=True, indicators={"moving_averages": [3]},
+        buy={"delay_bar": 0, "groups": [group] if side == "BUY" else []},
+        sell={"signals": {"macd_sell": {"enabled": side == "SELL",
+            "order_delay_bars": 0, "groups": [group]}, "profit_rate_sell": {"enabled": False}}})
+    settings = v5.ValidationSettingsSnapshot(rules)
+    # Use the real draft-policy session handoff, retaining the source selection and receipt.
+    c.session = c.flow._range_replay_session(
+        SimpleNamespace(_marking_current_settings=lambda: settings), c.session)
+    c.view = c.flow._validation_pool_for_session(c.session, c.pool, target_count=3)
+    assert c.view["candles"] == c.rows[-3:]
+
+    # Flow evidence: real indicator building, condition evaluation and BUY/SELL replay.
+    for end, expected_signals in ((1, [0, 1] if mode == "or" else []), (2, expected_indices)):
+        result = _marking_replay(c, end)
+        assert result.ok and result.snapshot is not None
+        snapshot = result.snapshot
+        assert snapshot.to_candles() == c.rows[1:end + 2]
+        assert (snapshot.evaluated_start_index, snapshot.evaluated_end_index) == (0, end)
+        entries = snapshot.to_entries()
+        assert [(e.evaluation_side, e.evaluation_index) for e in entries] == (
+            [("SELL", 0), ("BUY", 0), ("SELL", 1), ("BUY", 1)] if end == 1 else
+            [("SELL", 0), ("BUY", 0), ("SELL", 1), ("BUY", 1), ("SELL", 2), ("BUY", 2)])
+        assert [(e.signal, e.evaluation_index) for e in entries if e.signal] == [
+            (side, index) for index in expected_signals]
+    assert len(c.calls) == 1
 
 
 @pytest.mark.parametrize("key", ["D1", "Y1"])
