@@ -1,0 +1,128 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_flow.py b/gui_indicator_follow_signal_validation_v5_flow.py
+--- a/gui_indicator_follow_signal_validation_v5_flow.py
++++ b/gui_indicator_follow_signal_validation_v5_flow.py
+@@ -5831,7 +5831,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+             return False
+         if (persisted_source == "INTEGRATED"
+                 and persisted_identity == f"{stock.code}_AL"
+-                and timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1", "M3"}
++                and timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
+                 and prior_verified_completed_count is not None
+                 and len(candles) < prior_verified_completed_count):
+             # Keep the verified disk history and sidecar; evaluate only the fresh pool.
+@@ -14916,7 +14916,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+                     and not m3_completed_refresh
+                     and not history_extension
+                     and not (
+-                        timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1", "M3"}
++                        timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
+                         and source_selection.market_source == "INTEGRATED"
+                     )
+                     and isinstance(result, ValidationHistoricalResult)
+@@ -14997,7 +14997,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+                     prior_verified_completed_count=(
+                         len(cached_pool["candles"])
+                         if persistent is not None and isinstance(cached_pool, dict)
+-                        and timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1", "M3"}
++                        and timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
+                         and source_selection.market_source == "INTEGRATED"
+                         and (persistent.stock_code, persistent.timeframe_key,
+                              persistent.timeframe_minutes, persistent.market_data_identity,
+diff --git a/tests/test_v5_m3_fresh_completed_refresh_20261102.py b/tests/test_v5_m3_fresh_completed_refresh_20261102.py
+--- a/tests/test_v5_m3_fresh_completed_refresh_20261102.py
++++ b/tests/test_v5_m3_fresh_completed_refresh_20261102.py
+@@ -17,15 +17,15 @@ NOW = datetime.fromisoformat("2026-11-02T16:14:00+09:00")
+ TARGET = 5900
+ 
+ 
+-def _rows():
++def _rows(now=NOW):
+     rows = []
+-    day = NOW.date() - timedelta(days=100)
+-    while day <= NOW.date():
++    day = now.date() - timedelta(days=100)
++    while day <= now.date():
+         if day.weekday() < 5:
+             for minute in [*range(8 * 60, 8 * 60 + 50, 3),
+                            *range(9 * 60, 15 * 60 + 30, 3), *range(15 * 60 + 39, 20 * 60, 3)]:
+-                at = datetime.combine(day, datetime.min.time(), NOW.tzinfo) + timedelta(minutes=minute)
+-                if at <= NOW:
++                at = datetime.combine(day, datetime.min.time(), now.tzinfo) + timedelta(minutes=minute)
++                if at <= now:
+                     rows.append(dict(time=at.strftime("%Y%m%d%H%M%S"), open=100.0,
+                                      high=101.0, low=99.0, close=100.0, volume=10.0))
+         day += timedelta(days=1)
+@@ -73,6 +73,72 @@ def _blocked(case):
+     assert case.flow._historical_pools == {}
+ 
+ 
++def test_000250_m3_native_5900_with_forming_tail_displays_fresh_completed_keeps_cache(monkeypatch):
++    stock = v5.ValidationStockRef("000250", "Samchundang")
++    # Construct the shared broker fixture with this stock in its request closures.
++    with monkeypatch.context() as setup:
++        setup.setattr(v5, "ValidationStockRef", lambda *_a: stock)
++        case = _source_case.__wrapped__(monkeypatch, Path("unused-offline-m3-refresh"))
++    case.clock[0] = datetime.fromisoformat("2026-11-04T09:33:00+09:00")
++
++    class Clock(datetime):
++        @classmethod
++        def now(cls, tz=None):
++            return case.clock[0].astimezone(tz)
++
++    monkeypatch.setattr(historical, "datetime", Clock)
++    rows = _rows(case.clock[0])
++    fresh = rows[-TARGET:]
++    cached = [row for row in rows if row["time"] < "20261104000000"][-TARGET:]
++    query = dict(stock_code=stock.code, timeframe_key="M3", timeframe_minutes=3,
++                 market_data_identity="000250_AL", market_source="INTEGRATED",
++                 request_id="old-M3", request_as_of="2026-11-04T01:05:00+09:00",
++                 last_completed_time=cached[-1]["time"])
++    cache = v5.ValidationHistoricalCacheEntry(
++        stock.code, stock.name, 3, "M3", TARGET, tuple(deepcopy(cached)),
++        query["request_as_of"], "000250_AL", "INTEGRATED")
++    monkeypatch.setattr(case.flow, "_cached_history", lambda *_a, **_kw: cache)
++    monkeypatch.setattr(case.flow, "_cached_signal_entries", lambda *_a, **_kw: None)
++    monkeypatch.setattr(case.flow, "_validation_cache_source_marker_path",
++                        lambda *_a, **_kw: SimpleNamespace(
++                            read_text=lambda **_opts: json.dumps(dict(direct_selected_query=query))))
++    monkeypatch.setattr(v5, "signal_validation_trace_enabled", lambda: False)
++    monkeypatch.setattr(v5, "trace_signal_validation_event", lambda *_a, **_kw: None)
++    # Exercise the real persistence guard without allowing any disk write.
++    writes = []
++    case.flow._historical_cache = SimpleNamespace(store=lambda *_a, **kw: writes.append(kw))
++
++    def persist(*args, **kwargs):
++        case.persisted.append(deepcopy(kwargs))
++        return type(case.flow)._persist_history(case.flow, *args, **kwargs)
++
++    monkeypatch.setattr(case.flow, "_persist_history", persist)
++
++    window = case.start(key="M3", force=False)
++    generation = case.flow._request_generation[id(window)]
++    assert len(cache.candles) == len(fresh) == TARGET
++    assert [call["options"]["count"] for call in case.calls] == [TARGET]
++    case.reply(0, fresh)
++
++    assert not case.failures, case.failures
++    assert len(case.calls) == len(case.prepared) == 1
++    request = case.prepared[0]
++    pool = request["pool"]
++    assert request["generation"] == generation
++    assert pool is case.flow._historical_pools[id(window)]
++    assert pool["market_data_identity"] == "000250_AL"
++    assert pool["market_source"] == "INTEGRATED"
++    assert pool["candles"] == fresh[:-1] and len(pool["candles"]) == TARGET - 1
++    assert pool["selected_direct_forming_snapshot"]["candle"] == fresh[-1]
++    assert pool["request_id"] == pool["direct_selected_query"]["request_id"] == case.calls[0]["started"]["rqname"]
++    assert pool["direct_selected_query"]["request_id"] != query["request_id"]
++    assert len(case.persisted) == 1
++    assert case.persisted[0]["prior_verified_completed_count"] == TARGET
++    assert not writes
++    assert list(cache.candles) == cached
++    assert query["request_id"] == "old-M3"
++
++
+ def test_m3_forming_tail_is_covered_by_single_native_full_request(m3):
+     m3.start_m3(regular_only=True)
+     assert [call["options"]["count"] for call in m3.calls] == [TARGET + 1]
+
