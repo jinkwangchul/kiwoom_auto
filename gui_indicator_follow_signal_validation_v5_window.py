@@ -8945,11 +8945,20 @@ class IndicatorFollowSignalValidationV5Window(
             "기간선택 마지막 봉의 종가로 남은 보유주식을 전량 가상청산합니다. 실제 주문과 신호는 변경하지 않습니다."
         )
 
+        self.validation_regular_market_dummy_separator = (
+            self._new_basic_header_spaced_separator()
+        )
+        self.validation_regular_market_dummy_check = QCheckBox("정규장만 표시")
+        self.validation_regular_market_dummy_check.setChecked(False)
+        self.validation_regular_market_dummy_check.setFocusPolicy(Qt.TabFocus)
+
         for header_item in (
             self.validation_trading_cost_separator,
             self.validation_trading_cost_box,
             self.validation_regular_market_separator,
             self.validation_range_liquidation_check,
+            self.validation_regular_market_dummy_separator,
+            self.validation_regular_market_dummy_check,
         ):
             self.basic_header_row.insertWidget(
                 self.basic_header_row.count() - 1,
@@ -10783,6 +10792,7 @@ class IndicatorFollowSignalValidationV5Window(
         )
         display_only_checkboxes = (
             self.validation_range_liquidation_check,
+            self.validation_regular_market_dummy_check,
             self.filter_display_check,
         )
         for checkbox in self.findChildren(QCheckBox):

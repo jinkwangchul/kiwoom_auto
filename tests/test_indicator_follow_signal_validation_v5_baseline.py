@@ -1121,7 +1121,7 @@ def test_v5_header_pipes_share_spacing_and_separate_liquidation(case):
     pipes = [widget for widget in widgets
              if isinstance(widget, window_module.QLabel) and widget.text() == "|"]
     assert layout.spacing() == 8
-    assert len(pipes) == 5
+    assert len(pipes) == 6
     window.basic_header_widget.resize(2000, 40)
     assert layout.activate()
     first_pipe = pipes[0]
@@ -1144,6 +1144,15 @@ def test_v5_header_pipes_share_spacing_and_separate_liquidation(case):
         assert glyph_margin >= 0
     assert widgets.index(window.validation_regular_market_separator) + 1 == widgets.index(
         window.validation_range_liquidation_check)
+    dummy = window.validation_regular_market_dummy_check
+    index = widgets.index(window.validation_range_liquidation_check)
+    assert widgets[index + 1] is pipes[-1]
+    assert widgets[index + 2] is dummy
+    assert type(dummy) is window_module.QCheckBox
+    assert dummy.text() == "정규장만 표시"
+    assert dummy.isEnabled() and dummy.isCheckable() and not dummy.isChecked()
+    assert dummy.styleSheet() == dummy.toolTip() == dummy.objectName() == ""
+    assert dummy.focusPolicy() == window_module.Qt.TabFocus
     assert not hasattr(window, "validation_regular_market_only_check")
 
 

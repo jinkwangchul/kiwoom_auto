@@ -2,12 +2,12 @@
 from copy import deepcopy
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from PyQt5.QtCore import QEvent, QPoint, QPointF, QSignalBlocker, Qt
 from PyQt5.QtGui import QMouseEvent
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
 from tests.test_v5_async_marking_range_interleaving_20261031 import no_external_effects
@@ -138,6 +138,95 @@ def test_range_drag_runs_replay_without_marking_control(view):
     r.flow._on_range_replay_completed(r.calculate())
     assert w.completed_cycles[0].buy_indexes == (2,)
     assert w.completed_cycles[0].average_buy_price == 228500
+
+
+@pytest.mark.parametrize("liquidation", [False, True])
+def test_regular_market_dummy_preserves_range_and_pending_editor(view, liquidation):
+    r = view
+    w = r.window
+    dummy = w.validation_regular_market_dummy_check
+    w.validation_range_liquidation_check.setChecked(liquidation)
+    w.resize(2200, 960)
+    w.show()
+    w.activateWindow()
+    QApplication.processEvents()
+    w._confirmed_signal_ui_fingerprint = w._current_signal_ui_fingerprint()
+    r.drag()
+    r.flow._on_range_replay_completed(r.calculate())
+    for _ in range(100):
+        QApplication.processEvents()
+        if (w._visualization_projection_active is None
+                and w._visualization_projection_pending is None):
+            break
+        QTest.qWait(10)
+    assert w._visualization_projection_active is None
+    assert w._visualization_projection_pending is None
+    save = Mock()
+    w._validation_preferences_store = SimpleNamespace(save=save)
+    signals = [QSignalSpy(signal) for signal in (
+        w.validation_run_requested, w.validation_range_changed,
+        w.validation_range_evaluation_requested, w.historical_extension_requested,
+        w.settings_apply_requested, w.chart_input_invalidated)]
+    publication = w._v5_marking_display_publication
+
+    def state():
+        return deepcopy((w.collect_indicator_follow_ui_state(),
+            w._validation_preferences_snapshot(), w._current_signal_ui_fingerprint(),
+            w._confirmed_signal_ui_fingerprint, w.validation_range,
+            w.canvas.validation_range, w._chart_marker_records(), w.completed_cycles,
+            w.completed_cycle_table.rowCount(), w.estimated_return_label.text(),
+            w._range_replay_entries_available, w._candles, w._calculation_candles,
+            w.visualization_descriptors, w.visualization_cache.series,
+            r.flow._request_generation, r.flow._range_replay_generation,
+            r.flow._range_replay_pending, w._pending_validation_ui_fingerprint,
+            w._validated_ui_fingerprint, w.basic_signal_interval_combo.currentText()))
+
+    before = state()
+    assert before[0]["validation_market_scope"]["regular_market_only"] is False
+    assert dummy.focusPolicy() == Qt.TabFocus
+    previous = dummy.previousInFocusChain()
+    while not (previous.isVisible() and previous.isEnabled()
+               and previous.focusPolicy() & Qt.TabFocus):
+        previous = previous.previousInFocusChain()
+        assert previous is not dummy
+    previous.setFocus()
+    QApplication.processEvents()
+    QTest.keyClick(previous, Qt.Key_Tab)
+    assert QApplication.focusWidget() is dummy
+    for checked in (True, False):
+        QTest.keyClick(dummy, Qt.Key_Space)
+        QApplication.processEvents()
+        assert dummy.isChecked() is checked
+        assert state() == before
+    QTest.keyClick(dummy, Qt.Key_Backtab, Qt.ShiftModifier)
+    assert QApplication.focusWidget() is previous
+    assert state() == before
+    editor = w.buy_signal_expr_line
+    editor.setFocus()
+    QApplication.processEvents()
+    assert QApplication.focusWidget() is editor
+    editor.setText(editor.text() + " ")
+    before = state()
+    assert before[2] != before[3]  # A real unconfirmed editor draft.
+    with patch.object(w, "_queue_signal_validation_ui_confirmation") as queued:
+        for checked in (True, False):
+            QTest.mouseClick(dummy, Qt.LeftButton)
+            QApplication.processEvents()
+            assert dummy.isChecked() is checked
+            assert QApplication.focusWidget() is editor
+            assert state() == before
+        queued.assert_not_called()
+    assert w._v5_marking_display_publication is publication
+    assert r.flow._marking_publication_is_current(w, publication)
+    assert r.jobs == r.payloads == []
+    assert all(len(spy) == 0 for spy in signals)
+    save.assert_not_called()
+    # Tab-away is an editor confirmation trigger, separate from dummy toggles.
+    with patch.object(w, "_queue_signal_validation_ui_confirmation") as queued:
+        QTest.keyClick(editor, Qt.Key_Tab)
+        QApplication.processEvents()
+        assert QApplication.focusWidget() is not editor
+        queued.assert_called_with()
 
 
 @pytest.mark.parametrize("liquidation", [False, True])
