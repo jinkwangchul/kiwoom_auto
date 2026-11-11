@@ -119,6 +119,97 @@ from indicator_follow_signal_validation_runtime_trace import (
     trace_signal_validation_event,
 )
 
+_V5_DISPLAY_CALC_DIAGNOSTIC_LOCK = Lock()
+_V5_DISPLAY_CALC_DIAGNOSTIC_ATTEMPTED = False
+
+
+def _trace_v5_display_calc_first_failure(exc):
+    # Temporary one-attempt diagnostic; remove after the user's live capture.
+    global _V5_DISPLAY_CALC_DIAGNOSTIC_ATTEMPTED
+    with _V5_DISPLAY_CALC_DIAGNOSTIC_LOCK:
+        if _V5_DISPLAY_CALC_DIAGNOSTIC_ATTEMPTED:
+            return
+        _V5_DISPLAY_CALC_DIAGNOSTIC_ATTEMPTED = True
+
+    def scalar(value):
+        if type(value) is str:
+            return value[:80]
+        if value is None or type(value) in (bool, int):
+            return value
+        if type(value) is float and math.isfinite(value):
+            return value
+        return None
+
+    details = dict(raise_function="", raise_line=0,
+                   comparison_unavailable="RAISE_FRAME_UNAVAILABLE")
+    tb = frame = frame_locals = None
+    try:
+        tb = exc.__traceback__
+        if tb is not None:
+            while tb.tb_next is not None:
+                tb = tb.tb_next
+            frame = tb.tb_frame
+            frame_locals = frame.f_locals
+            details.update(raise_function=frame.f_code.co_name[:80],
+                           raise_line=tb.tb_lineno)
+            expected = frame_locals.get("expected_calculation")
+            view = frame_locals.get("view")
+            candles = view.get("candles") if type(view) is dict else None
+            # Baseline 98c15d4: only this raise compares the view's exact suffix.
+            if (frame.f_code.co_name != "_sor_m1_calculation_view"
+                    or tb.tb_lineno != frame.f_code.co_firstlineno + 18):
+                details["comparison_unavailable"] = "OTHER_RAISE_BRANCH"
+            elif (type(expected) is not list or type(candles) is not list
+                    or frame_locals.get("candles") is not candles):
+                details["comparison_unavailable"] = "MATCHING_ARRAYS_UNAVAILABLE"
+            elif not expected:
+                details["comparison_unavailable"] = "EMPTY_EXPECTED_SHORT_CIRCUIT"
+            elif not all(type(row) is dict for row in (*expected, *candles)):
+                details["comparison_unavailable"] = "NON_DICT_ROW"
+            else:
+                suffix = candles[-len(expected):]
+                details.update(comparison_unavailable="", expected_len=len(expected),
+                               view_len=len(candles), view_suffix_len=len(suffix),
+                               first_mismatch_index=None, first_differing_key="",
+                               expected_field_present=False, view_field_present=False,
+                               expected_value=None, view_value=None,
+                               other_row_fields=False)
+                fields = ("time", "open", "high", "low", "close", "volume")
+                for index in range(max(len(expected), len(suffix))):
+                    left = expected[index] if index < len(expected) else None
+                    right = suffix[index] if index < len(suffix) else None
+                    if left == right:
+                        continue
+                    details["first_mismatch_index"] = index
+                    if left is None or right is None:
+                        details["first_differing_key"] = "ROW_MISSING"
+                        break
+                    for key in fields:
+                        if ((key in left) != (key in right)
+                                or left.get(key) != right.get(key)):
+                            details.update(first_differing_key=key,
+                                           expected_field_present=key in left,
+                                           view_field_present=key in right,
+                                           expected_value=scalar(left.get(key)),
+                                           view_value=scalar(right.get(key)))
+                            break
+                    details["other_row_fields"] = any(
+                        (key in left) != (key in right) or left.get(key) != right.get(key)
+                        for key in left.keys() | right.keys() if key not in fields)
+                    if not details["first_differing_key"]:
+                        details["first_differing_key"] = "OTHER_ROW_FIELDS"
+                    break
+    except Exception:
+        details["comparison_unavailable"] = "EXTRACTION_FAILED"
+    finally:
+        tb = frame = frame_locals = None
+    try:
+        trace_signal_validation_event(
+            "v5_sor_block", stage="v5_display_calc_first_failure", **details)
+    except Exception:
+        pass
+
+
 _SOR_AL_M1_DIAGNOSTIC_PATH = (
     Path(__file__).resolve().parent / "runtime" / "diagnostics" / "v5_sor_al_m1.jsonl"
 )
@@ -17358,6 +17449,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     snapshot_entry_count=len(result.snapshot.to_entries()),
                 )
             except Exception as exc:
+                if str(exc) == "SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED":
+                    try:
+                        _trace_v5_display_calc_first_failure(exc)
+                    except Exception:
+                        pass
                 payload["error"] = str(exc)
                 trace_signal_validation_event(
                     "flow.range_replay.error",
