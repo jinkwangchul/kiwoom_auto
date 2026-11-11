@@ -2005,7 +2005,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     validation_failed = pyqtSignal(str)
     signal_scan_completed = pyqtSignal(object)
     range_replay_completed = pyqtSignal(object)
-    marking_completed = pyqtSignal(object)
     history_browse_completed = pyqtSignal(object)
     history_cache_completed = pyqtSignal(object)
     history_fetch_completed = pyqtSignal(object)
@@ -2144,7 +2143,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             tuple[str, str, int], int
         ] = {}
         self._validation_history_purge_generation: dict[str, int] = {}
-        self._marking_source_revisions: dict[int, dict[str, object]] = {}
         self._last_run_requests: dict[int, IndicatorFollowSignalValidationRunRequest] = {}
         self._sor_m1_observed_host = None
         self._sor_m1_last_snapshot: dict[int, tuple[object, ...]] = {}
@@ -2161,7 +2159,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._purge_validation_history_for_stock(code)
         self.signal_scan_completed.connect(self._on_signal_scan_completed)
         self.range_replay_completed.connect(self._on_range_replay_completed)
-        self.marking_completed.connect(self._on_marking_completed)
         self.history_browse_completed.connect(self._on_history_browse_completed)
         self.history_cache_completed.connect(self._on_history_cache_completed)
         self.history_fetch_completed.connect(self._on_history_fetch_completed)
@@ -2425,9 +2422,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 set_budget_retry_check(
                     lambda ref=window_ref: self._can_retry_validation_budget(ref())
                 )
-            marking_signal = getattr(window, "marking_evaluation_requested", None)
-            if callable(getattr(marking_signal, "connect", None)):
-                marking_signal.connect(lambda request, ref=window_ref: self._start_marking(ref(), request))
             run_signal.connect(
                 lambda snapshot, ref=window_ref: self._run_validation(ref(), snapshot)
             )
@@ -3148,8 +3142,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         for key, window in tuple(self._open_windows.items()):
             session = self._validation_sessions.get(key)
             pool = self._historical_pools.get(key)
-            marking = getattr(window, "marking_display_check", None)
-            marked = getattr(marking, "isChecked", None)
             busy = getattr(window, "is_chart_interaction_busy", None)
             if (
                 not isinstance(session, ValidationSession)
@@ -3165,7 +3157,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 or not getattr(window, "_normal_base_requested", False)
                 or getattr(window, "_replay_snapshot", None) is not None
                 or getattr(window, "validation_range", None) is not None
-                or not callable(marked) or marked()
                 or not callable(busy) or busy()
                 or not self._window_accepts_results(window)
                 or key in self._range_replay_active
@@ -3285,17 +3276,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
 
     def _native_selected_window_ready(self, window, key: int, *,
                                       require_base_ready: bool = True) -> bool:
-        marking = getattr(window, "marking_display_check", None)
-        marked = getattr(marking, "isChecked", None)
         busy = getattr(window, "is_chart_interaction_busy", None)
         return (
             (not require_base_ready or getattr(window, "_normal_base_ready", False))
             and getattr(window, "_normal_base_requested", False)
             and getattr(window, "_replay_snapshot", None) is None
             and getattr(window, "validation_range", None) is None
-            and callable(marked) and (not marked() or (
-                getattr(window, "_marking_policy_refresh_pending", False)
-                and getattr(window, "_v5_marking_binding_pending", False)))
             and callable(busy) and not busy()
             and key not in self._range_replay_active
             and key not in self._history_browse_active
@@ -3388,8 +3374,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                      and current.get("_dispatch_snapshot")
                      is current["_v5_native_work"]["dispatch"]))
             and (marking_generation is None or (
-                window.marking_display_check.isChecked()
-                and getattr(window, "_marking_generation", None) == marking_generation
+                getattr(window, "_marking_generation", None) == marking_generation
                 and getattr(window, "_v5_marking_display_publication", None)
                 is owner["display_publication"]))
             and pool.get("native_live_snapshot") == work["proof"]
@@ -3456,11 +3441,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                          base_ready=bool(getattr(window, "_normal_base_ready", False)),
                          marking_generation=(getattr(window, "_marking_generation", None)
                                              if recovering else None))
-            if not getattr(window, "_v5_native_cancel_connected", False):
-                connect = getattr(getattr(window.marking_display_check, "toggled", None), "connect", None)
-                if callable(connect):
-                    connect(lambda checked, k=key: None if checked else self._native_selected_pending.pop(k, None))
-                    window._v5_native_cancel_connected = True
         self._pool_dispatch_snapshot(pool)
         pool["_v5_native_work"] = dict(owner=owner, proof=deepcopy(proof),
                                        dispatch=pool["_dispatch_snapshot"], state="WAITING")
@@ -3563,8 +3543,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         candle = sealed.get("candle") if isinstance(sealed, dict) else None
         identity = snapshot_key[:2] if isinstance(snapshot_key, tuple) else ()
         current_session = getattr(market, "_current_display_session_identity", None)
-        marking = getattr(window, "marking_display_check", None)
-        marked = getattr(marking, "isChecked", None)
         busy = getattr(window, "is_chart_interaction_busy", None)
         return (
             isinstance(snapshot_key, tuple) and len(snapshot_key) == 4
@@ -3581,7 +3559,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             and getattr(window, "_normal_base_ready", False)
             and getattr(window, "_replay_snapshot", None) is None
             and getattr(window, "validation_range", None) is None
-            and callable(marked) and not marked()
             and callable(busy) and not busy()
             and self._window_accepts_results(window)
             and market is self._sor_m1_observed_host
@@ -3990,7 +3967,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if window_key in self._request_generation:
             self._request_generation[window_key] += 1
         self._prepare_pending.pop(window_key, None)
-        self._marking_source_revisions.pop(window_key, None)
         self._range_replay_pending.pop(window_key, None)
         self._active_run_identity.pop(window_key, None)
         self._filter_valid_evidence_pending.pop(window_key, None)
@@ -4250,16 +4226,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_NATIVE_PENDING")
                 return
         window = self._open_windows.get(window_key)
-        if (getattr(window, "_marking_policy_refresh_pending", False)
-                and self._published_direct_current_snapshot(
-                    window, self._validation_sessions.get(window_key),
-                    self._historical_pools.get(window_key),
-                    self._request_generation.get(window_key, 0)) is not None):
-            resume_marking = getattr(window, "_resume_marking_policy_refresh", None)
-            if callable(resume_marking):
-                resume_marking()
         pending_range = self._range_replay_pending.pop(window_key, None)
         if pending_range is not None:
+            if getattr(window, "_v5_marking_binding_pending", False):
+                self._range_replay_pending[window_key] = pending_range
+                return
             window = pending_range.get("window")
             requested_range = pending_range.get("range")
             if (
@@ -4361,7 +4332,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self._request_generation.pop(window_key, None)
         self._prepare_active.pop(window_key, None)
         self._prepare_pending.pop(window_key, None)
-        self._marking_source_revisions.pop(window_key, None)
         self._prepare_deferred.pop(window_key, None)
         self._range_replay_generation.pop(window_key, None)
         self._range_replay_active.pop(window_key, None)
@@ -5014,7 +4984,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             and getattr(window, "_normal_base_requested", False)
             and getattr(window, "_replay_snapshot", None) is None
             and getattr(window, "validation_range", None) is None
-            and not window.marking_display_check.isChecked()
             and not self._range_replay_active.get(key)
             and not self._history_browse_active.get(key)
             and isinstance(pool, dict)
@@ -5036,8 +5005,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 )
                 return
         if (
-            window.marking_display_check.isChecked()
-            or getattr(window, "validation_range", None) is not None
+            getattr(window, "validation_range", None) is not None
             or getattr(window, "_replay_snapshot", None) is not None
         ):
             # Preserve frozen evidence: never show a newer NXT source
@@ -5046,12 +5014,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 "flow.integrated_display.pending_active_evidence",
                 window_key=key, timeframe=session.request.timeframe_key,
             )
-            if (
-                window.marking_display_check.isChecked()
-                and getattr(window, "validation_range", None) is None
-                and getattr(window, "_replay_snapshot", None) is None
-            ):
-                self._start_marking_source_revision(window, session)
             return
         # No display-only publish: calculation and chart share one source.
 
@@ -5064,499 +5026,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             separators=(",", ":"), allow_nan=False,
         ).encode("utf-8")).hexdigest()
 
-    def _start_marking_source_revision(
-        self,
-        window: object,
-        session: ValidationSession,
-        *,
-        candidate_view_pool: dict[str, object] | None = None,
-        normal_base_presentation: object | None = None,
-        revision_token: object | None = None,
-    ) -> bool:
-        """Prepare one source-bound marking revision without hiding old evidence."""
-        window_key = id(window)
-        pool = self._historical_pools.get(window_key)
-        sidecar_key = self._integrated_display_sidecar_key(session)
-        integrated_revision = candidate_view_pool is None
-        sidecar = (
-            self._integrated_display_sidecars.get(sidecar_key)
-            if integrated_revision else None
-        )
-        settings = getattr(window, "_marking_settings", None)
-        times = getattr(window, "_marking_times", None)
-        old_key = getattr(window, "_marking_key", None)
-        old_snapshot = getattr(window, "_marking_snapshot", None)
-        old_comparison = getattr(window, "_marking_comparison_cache", None)
-        generation = getattr(window, "_marking_generation", None)
-        source_start = getattr(window, "_marking_source_start", None)
-        if (
-            self._open_windows.get(window_key) is not window
-            or self._validation_sessions.get(window_key) is not session
-            or not isinstance(pool, dict)
-            or (integrated_revision and not isinstance(sidecar, dict))
-            or (
-                not integrated_revision
-                and not isinstance(candidate_view_pool, dict)
-            )
-            or not isinstance(settings, ValidationSettingsSnapshot)
-            or not isinstance(times, tuple) or len(times) != 2
-            or not all(str(value or "") for value in times)
-            or old_key is None
-            or not isinstance(old_snapshot, ValidationReplaySnapshot)
-            or old_comparison is None
-            or isinstance(generation, bool) or not isinstance(generation, int)
-            or not str(source_start or "")
-            or (
-                integrated_revision
-                and (
-                    sidecar.get("verified_nxt_eligible") is not True
-                    or sidecar.get("market_data_identity")
-                    != f"{session.request.stock.code}_AL"
-                    or sidecar.get("market_source") != "INTEGRATED"
-                )
-            )
-        ):
-            trace_signal_validation_event(
-                "flow.marking_source_revision.blocked",
-                window_key=window_key,
-                reason="IDENTITY_OR_VERIFICATION_UNAVAILABLE",
-            )
-            return False
-        request_generation = self._request_generation.get(window_key, 0)
-        history_target = self._history_targets.get(
-            window_key, self._historical_count,
-        )
-        rules = settings.to_dict()
-        regular_only = bool(
-            window.validation_regular_market_only_check.isChecked()
-        )
-        descriptors = tuple(window._filter_display_descriptors(rules))
-        source_calculation = (
-            candidate_view_pool.get("candles")
-            if isinstance(candidate_view_pool, dict) else None
-        )
-        source_display = (
-            candidate_view_pool.get("display_candles", source_calculation)
-            if isinstance(candidate_view_pool, dict) else None
-        )
-        if isinstance(source_display, list):
-            source_display = source_display[-history_target:]
-        sidecar_candles = (
-            sidecar.get("candles") if isinstance(sidecar, dict) else None
-        )
-        try:
-            calculation_content = self._marking_revision_candle_identity(
-                source_calculation
-            )
-            display_content = self._marking_revision_candle_identity(
-                source_display
-            )
-            sidecar_content = (
-                self._marking_revision_candle_identity(sidecar_candles)
-                if integrated_revision else ""
-            )
-        except (TypeError, ValueError, OverflowError):
-            calculation_content = ""
-            display_content = ""
-            sidecar_content = ""
-        if (
-            (integrated_revision and not sidecar_content)
-            or (
-                not integrated_revision
-                and (not calculation_content or not display_content)
-            )
-        ):
-            trace_signal_validation_event(
-                "flow.marking_source_revision.blocked",
-                window_key=window_key,
-                reason=(
-                    "SIDECAR_CONTENT_INVALID"
-                    if integrated_revision else "CANDIDATE_CONTENT_INVALID"
-                ),
-            )
-            return False
-        source_identity = (
-            (
-                sidecar.get("market_data_identity"),
-                sidecar.get("market_source"),
-                sidecar.get("request_as_of"),
-                sidecar.get("coverage_count"),
-                sidecar_content,
-                True,
-            )
-            if integrated_revision
-            else (
-                "CANONICAL",
-                calculation_content,
-                display_content,
-                candidate_view_pool.get("display_only_integrated") is True,
-            )
-        )
-        revision_identity = (
-            session.request.stock.code,
-            session.request.timeframe_key,
-            session.request.timeframe_minutes,
-            settings.rules_hash,
-            id(session),
-            self._pool_computation_source_identity(pool),
-            source_identity,
-            request_generation,
-            generation,
-            times,
-            source_start,
-            old_key,
-        )
-        existing = self._marking_source_revisions.get(window_key)
-        same_revision = (
-            isinstance(existing, dict)
-            and existing.get("identity") == revision_identity
-            and existing.get("pool") is pool
-        )
-        preparing_same = (
-            same_revision
-            and existing.get("status") == "preparing"
-            and (revision_token is None or existing.get("token") is revision_token)
-            and window._owns_marking_source_revision(existing.get("token"))
-        )
-        # The owner token is deliberately released on success. Repeated
-        # callbacks for the same verified sidecar must still skip the full
-        # worker, but only while the published frozen evidence is unchanged.
-        published_same = (
-            same_revision and integrated_revision and revision_token is None
-            and existing.get("status") == "published"
-            and existing.get("source_kind") == "integrated"
-            and existing.get("sidecar") is sidecar
-            and existing.get("published_key") == old_key
-            and existing.get("published_snapshot") is old_snapshot
-            and existing.get("published_source_content") == (
-                self._marking_revision_candle_identity(window._calculation_candles),
-                self._marking_revision_candle_identity(window._candles),
-            )
-            and getattr(window, "_marking_source_revision_owner", None) is None
-            and self._open_windows.get(window_key) is window
-            and self._validation_sessions.get(window_key) is session
-            and self._request_generation.get(window_key, 0) == request_generation
-            and window.marking_display_check.isChecked()
-            and window.validation_regular_market_only_check.isChecked() == regular_only
-        )
-        if preparing_same or published_same:
-            trace_signal_validation_event(
-                "flow.marking_source_revision.deduplicated",
-                window_key=window_key,
-                status=str(existing.get("status") or ""),
-            )
-            return True
-        if (
-            isinstance(existing, dict)
-            and existing.get("identity") == revision_identity
-            and existing.get("status") == "published"
-            and not integrated_revision
-        ):
-            complete = getattr(
-                window,
-                "complete_pending_marking_source_publication",
-                None,
-            )
-            if callable(complete) and complete(
-                generation=generation,
-                key=old_key,
-                times=times,
-                settings=settings,
-            ):
-                trace_signal_validation_event(
-                    "flow.marking_source_revision.reused",
-                    window_key=window_key,
-                )
-                return True
-        token = revision_token
-        if token is None:
-            token = window.defer_marking_source_revision(
-                generation=generation, key=old_key, times=times, settings=settings,
-                source_start=source_start, flow=self, request_generation=request_generation,
-                session=session,
-            )
-        if token is None or not window._owns_marking_source_revision(token):
-            return False
-        if isinstance(existing, dict) and existing.get("status") == "preparing":
-            existing["status"] = "cancelled"
-            existing["reason"] = "SUPERSEDED"
-        state = {
-            "identity": revision_identity,
-            "token": token,
-            "status": "preparing",
-            "sidecar": sidecar,
-            "sidecar_content": sidecar_content,
-            "source_kind": "integrated" if integrated_revision else "canonical",
-            "calculation_content": calculation_content,
-            "display_content": display_content,
-            "candidate_installed": window.marking_source_revision_installed(token),
-            "pool": pool,
-            "window_source_content": (
-                self._marking_revision_candle_identity(window._calculation_candles),
-                self._marking_revision_candle_identity(window._candles),
-            ),
-        }
-        installed_calculation = window._calculation_candles
-        installed_display = window._candles
-        self._marking_source_revisions[window_key] = state
-        worker_pool = deepcopy(pool)
-        worker_sidecar = deepcopy(sidecar) if integrated_revision else None
-        worker_view = (
-            deepcopy(candidate_view_pool) if not integrated_revision else None
-        )
-        marking_source_identity = revision_identity[5]
-        source_query = deepcopy(pool.get("direct_selected_query"))
-
-        def current() -> bool:
-            active = self._marking_source_revisions.get(window_key)
-            current_sidecar = (
-                self._integrated_display_sidecars.get(sidecar_key)
-                if integrated_revision else None
-            )
-            return (
-                isinstance(active, dict)
-                and active.get("token") is token
-                and active.get("identity") == revision_identity
-                and window._owns_marking_source_revision(token, check_ui=False)
-                and window._calculation_candles is installed_calculation
-                and window._candles is installed_display
-                and self._open_windows.get(window_key) is window
-                and self._request_generation.get(window_key, 0)
-                == request_generation
-                and self._history_targets.get(
-                    window_key,
-                    self._historical_count,
-                ) == history_target
-                and self._validation_sessions.get(window_key) is session
-                and self._historical_pools.get(window_key) is pool
-                and pool.get("direct_selected_query") == source_query
-                and getattr(window, "_marking_generation", None) == generation
-                and getattr(window, "_marking_key", None) == old_key
-                and getattr(window, "_marking_times", None) == times
-                and getattr(window, "_marking_settings", None) is settings
-                and getattr(window, "_marking_source_start", None) == source_start
-                and getattr(window, "_marking_snapshot", None) is old_snapshot
-                and getattr(window, "_marking_comparison_cache", None)
-                is old_comparison
-                and (
-                    not integrated_revision
-                    or current_sidecar is sidecar
-                )
-            )
-
-        def cancel_state(reason: str) -> None:
-            active = self._marking_source_revisions.get(window_key)
-            if isinstance(active, dict) and active.get("token") is token:
-                active["status"] = "cancelled"
-                active["reason"] = reason
-                trace_signal_validation_event(
-                    "flow.marking_source_revision.cancelled",
-                    window_key=window_key,
-                    reason=reason,
-                )
-
-        def prepare() -> None:
-            payload = {
-                "source_revision": True,
-                "window_key": window_key,
-                "revision_token": token,
-                "revision_identity": revision_identity,
-                "generation": generation,
-                "key": old_key,
-                "request_generation": request_generation,
-                "session": session,
-                "pool": pool,
-                "history_target": history_target,
-                "times": times,
-                "source_start": source_start,
-                "settings": settings,
-                "snapshot": None,
-                "comparison": None,
-                "error": "",
-                "source_query": source_query,
-            }
-
-            def emit_completion() -> None:
-                try:
-                    self.marking_completed.emit(payload)
-                except RuntimeError:
-                    cancel_state("FLOW_DESTROYED")
-
-            try:
-                if (not current()
-                        or self._pool_computation_source_identity(pool) != marking_source_identity):
-                    cancel_state("STALE_BEFORE_PREPARE")
-                    payload["error"] = "MARKING_SOURCE_REVISION_STALE_BEFORE_PREPARE"
-                    payload["cancelled"] = True
-                    emit_completion()
-                    return
-                # Bind preparation to the accepted canonical candidate or the
-                # exact verified integrated sidecar captured for this revision.
-                if worker_view is not None:
-                    view, deficit = worker_view, 0
-                else:
-                    view, deficit = self._normal_base_history_view(
-                        session,
-                        worker_pool,
-                        history_target,
-                        sidecar_override=worker_sidecar,
-                    )
-                if self._verified_sor_tail_provider is not None:
-                    now = self._now_factory()
-                    now = (now.replace(tzinfo=SEOUL_TIMEZONE) if now.tzinfo is None
-                           else now.astimezone(SEOUL_TIMEZONE))
-                    view = self._verified_sor_view_for_session(
-                        session, worker_pool, view, now, marking_source_identity,
-                    )
-                calculation = view.get("candles")
-                display = view.get("display_candles", calculation)
-                if not isinstance(calculation, list) or not calculation:
-                    raise ValueError("MARKING_SOURCE_REVISION_CALCULATION_UNAVAILABLE")
-                if not isinstance(display, list) or not display:
-                    raise ValueError("MARKING_SOURCE_REVISION_DISPLAY_UNAVAILABLE")
-                display = display[-history_target:]
-                display_integrated = view.get("display_only_integrated") is True
-                indexes = (
-                    _calculation_indexes_for_mixed_display(calculation, display)
-                    if display_integrated
-                    else _calculation_indexes_for_display(calculation, display)
-                )
-                candidate_display = [
-                    candle for candle in display
-                    if times[0] <= str(candle.get("time") or "") <= times[1]
-                ]
-                warmup = required_validation_history_context_bars(rules)
-                bounds = (_calculation_bounds_for_display_range(
-                    calculation, candidate_display, 0, len(candidate_display) - 1)
-                    if candidate_display else None)
-                if bounds is None:
-                    raise ValueError("MARKING_SOURCE_REVISION_DISPLAY_UNAVAILABLE")
-                first = next((i for i, row in enumerate(calculation)
-                              if row["time"] >= display[0]["time"]), len(calculation))
-                deficit = max(deficit, warmup - first, 0)
-                if deficit:
-                    canonical, _ = self._normal_base_history_view(
-                        session, worker_pool, history_target,
-                        sidecar_override=worker_sidecar if integrated_revision else _SIDECAR_UNSET)
-                    if (calculation != canonical["candles"]
-                            or display != canonical["display_candles"]):
-                        raise ValueError(
-                            "MARKING_SOURCE_REVISION_HISTORY_CONTENT_MISMATCH")
-                payload["normal_base_warmup_deficit"] = deficit
-                candidate_key = window._marking_source_key_for_candles(
-                    window.stock.code,
-                    settings,
-                    times,
-                    regular_only=regular_only,
-                    calculation_candles=calculation,
-                    display_candles=candidate_display,
-                    prefix_start=source_start,
-                )
-                if candidate_key == old_key:
-                    snapshot = old_snapshot
-                    comparison = old_comparison
-                    recalculated = False
-                else:
-                    result = self._prepare_replay_result_from_pool(
-                        session,
-                        view,
-                        history_target=history_target,
-                        chart_range=(0, 0),
-                        chart_range_times=times,
-                        prepared_view_pool=view,
-                        cancel_predicate=lambda: not current(),
-                        require_full_warmup_for_marking=True,
-                    )
-                    if result.ok is not True or result.snapshot is None:
-                        raise ValueError(self._failure_text(
-                            "MARKING_SOURCE_REVISION", result,
-                        ))
-                    snapshot = result.snapshot
-                    rows = snapshot.to_candles()
-                    comparison_cache, _ = _build_validation_projection_data(
-                        rows,
-                        snapshot.to_entries(),
-                        [],
-                        tuple(range(len(rows))),
-                        rules,
-                        tuple(
-                            descriptor for descriptor in descriptors
-                            if descriptor.family == FAMILY_PRICE_COMPARISON
-                        ),
-                        cancel_predicate=lambda: not current(),
-                    )
-                    comparison = (
-                        tuple(str(row.get("time") or "") for row in rows),
-                        comparison_cache,
-                    )
-                    recalculated = True
-                # Match initial underfilled rendering on this exact revised source.
-                normal_cache, _ = _build_validation_projection_data(
-                    calculation, [], [], indexes, rules, descriptors,
-                    cancel_predicate=lambda: not current(),
-                )
-                normal_presentation = (descriptors, normal_cache)
-                if (not current()
-                        or self._pool_computation_source_identity(pool) != marking_source_identity):
-                    cancel_state("STALE_AFTER_PREPARE")
-                    payload["error"] = "MARKING_SOURCE_REVISION_STALE_AFTER_PREPARE"
-                    payload["cancelled"] = True
-                    emit_completion()
-                    return
-                payload.update(
-                    calculation=calculation,
-                    display=display,
-                    display_only_integrated=display_integrated,
-                    candidate_key=candidate_key,
-                    candidate_display=candidate_display,
-                    snapshot=snapshot,
-                    comparison=comparison,
-                    normal_base_presentation=normal_presentation,
-                    calculation_identity=self._pool_computation_source_identity(view),
-                    calculation_content=self._marking_revision_candle_identity(
-                        calculation
-                    ),
-                    display_identity=self._marking_revision_candle_identity(display),
-                    recalculated=recalculated,
-                )
-            except Exception as exc:
-                payload["error"] = str(exc)
-            if not current():
-                cancel_state("STALE_AFTER_ERROR")
-                payload["error"] = (
-                    payload["error"]
-                    or "MARKING_SOURCE_REVISION_STALE_AFTER_ERROR"
-                )
-                payload["cancelled"] = True
-                emit_completion()
-                return
-            emit_completion()
-
-        trace_signal_validation_event(
-            "flow.marking_source_revision.started",
-            window_key=window_key,
-            request_generation=request_generation,
-            marking_generation=generation,
-            timeframe=session.request.timeframe_key,
-            frozen_times=times,
-        )
-        try:
-            Thread(
-                target=prepare,
-                name="indicator-follow-v5-marking-source-revision",
-                daemon=True,
-            ).start()
-        except Exception as exc:
-            state["status"] = "error"
-            state["error"] = str(exc)
-            trace_signal_validation_event(
-                "flow.marking_source_revision.failed",
-                window_key=window_key,
-                reason=str(exc),
-            )
-            window.fail_marking_source_revision(revision_token=token, error=exc)
-            return False
-        return True
 
     def _ensure_integrated_display_sidecar(
         self,
@@ -9185,49 +8654,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             )
             if callable(capture_anchor):
                 restore_premarket_anchor = capture_anchor()
-        marking_revision_pending = bool(
-            normal_base_presentation is not None
-            and getattr(window, "_marking_times", None) is not None
-            and getattr(window, "_marking_snapshot", None) is not None
-            and window.marking_display_check.isChecked()
-        )
-        # install_normal_base may synchronously resume Mark before its receipt is bound.
+        # Range replay waits until the normal chart and receipt are bound.
         window._v5_marking_binding_pending = True
-        if (getattr(window, "_marking_times", None) is not None
-                and getattr(window, "_marking_snapshot", None) is None
-                and not getattr(window, "_marking_policy_refresh_pending", False)
-                and not self._marking_publication_is_current(
-                    window, getattr(window, "_v5_marking_display_publication", None))):
-            refresh_marking = getattr(window, "_prepare_marking_policy_refresh", None)
-            if callable(refresh_marking):
-                refresh_marking()
-        marking_revision_token = None
-        if marking_revision_pending:
-            defer_revision = getattr(
-                window,
-                "defer_marking_source_revision",
-                None,
-            )
-            if callable(defer_revision):
-                marking_revision_token = defer_revision(
-                    generation=getattr(window, "_marking_generation", None),
-                    key=getattr(window, "_marking_key", None),
-                    times=getattr(window, "_marking_times", None),
-                    settings=getattr(window, "_marking_settings", None),
-                    source_start=getattr(window, "_marking_source_start", None),
-                    flow=self, request_generation=publication_generation, session=session,
-                )
-            marking_revision_pending = marking_revision_token is not None
-
-        def fail_pending_revision(error: object) -> None:
-            if not marking_revision_pending:
-                return
-            fail = getattr(window, "fail_marking_source_revision", None)
-            if callable(fail):
-                fail(
-                    revision_token=marking_revision_token,
-                    error=error,
-                )
 
         apply_atomic_result = getattr(
             window,
@@ -9325,7 +8753,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     elif callable(set_signal_entries):
                         set_signal_entries(list(signal_entries))
         except Exception as exc:
-            fail_pending_revision(exc)
             raise
         window._native_m5_regular_close_times = (
             tuple(view_pool.get("native_m5_regular_close_times", ()))
@@ -9354,28 +8781,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     session.request.settings_snapshot,
                     session.request.timeframe_key,
                     presentation=normal_base_presentation,
-                    defer_marking_source_revision=marking_revision_pending,
                     reuse_canvas=normal_base_reuse_canvas,
                     **({"session_view_anchor": session_view_anchor}
                        if session_view_anchor is not None else {}),
                 )
-                if marking_revision_pending:
-                    started = self._start_marking_source_revision(
-                        window,
-                        session,
-                        candidate_view_pool=view_pool,
-                        normal_base_presentation=normal_base_presentation,
-                        revision_token=marking_revision_token,
-                    )
-                    if (
-                        not started
-                        and getattr(window, "_marking_times", None) is not None
-                    ):
-                        fail_pending_revision(
-                            "MARKING_SOURCE_REVISION_START_FAILED"
-                        )
             except Exception as exc:
-                fail_pending_revision(exc)
                 raise
         elif replay_snapshot is not None:
             if not atomic_result_applied:
@@ -9471,18 +8881,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         except (AttributeError, RuntimeError, TypeError):
             pass
         window._v5_marking_binding_pending = False
-        try:
-            if getattr(window, "_marking_policy_refresh_pending", False) is True:
-                _trace_v5_marking(
-                    "marking_native_publication", window_key,
-                    getattr(window, "_marking_generation", None), publication_generation,
-                    phase="publication", reason="PUBLICATION_BOUND",
-                    timeframe_key=session.request.timeframe_key,
-                    market_data_identity=pool.get("market_data_identity"),
-                    diagnostic={"binding_pending": False, "policy_refresh_pending": True},
-                )
-        except Exception:
-            pass  # Diagnostic collection and emission cannot change publication.
         # The acquisition-time M3 rollover proof belongs to this first
         # publication, not to later prepares of the retained history pool.
         checks = self.__dict__.get("_v5_m3_rollover_checks", {})
@@ -9510,69 +8908,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             )
         except Exception:
             pass  # Diagnostics cannot undo an accepted publication.
-        if (previous_m1_basis is not None
-                and getattr(window, "_v5_m1_marking_basis", None) is not None
-                and window._v5_m1_marking_basis is not previous_m1_basis
-                and getattr(window, "_marking_times", None) is not None
-                and getattr(window, "_marking_snapshot", None) is None
-                and not getattr(window, "_marking_policy_refresh_pending", False)):
-            refresh_marking = getattr(window, "_prepare_marking_policy_refresh", None)
-            if callable(refresh_marking):
-                refresh_marking()
-        refresh_intent = pool.get("_completed_direct_marking_intent")
-        if (pool.get("native_live_snapshot") is not None
-                and not self._marking_publication_is_current(window, previous_binding)
-                and getattr(window, "_marking_policy_refresh_pending", False)
-                and window.marking_display_check.isChecked()
-                and view_pool.get("candles")):
-            # Replay the entire new publication, retaining the selected interval.
-            window._marking_source_start = view_pool["candles"][0]["time"]
-        if (isinstance(refresh_intent, tuple)
-                and refresh_intent == (getattr(window, "_marking_generation", None),
-                                       getattr(window, "_marking_times", None))
-                and getattr(window, "_marking_policy_refresh_pending", False)
-                and window.marking_display_check.isChecked()
-                and view_pool.get("candles")):
-            # This is a fresh replay of the new TR prefix, never a marker graft.
-            window._marking_source_start = view_pool["candles"][0]["time"]
-        self._resume_bound_selected_range(window)
-        resume_marking = getattr(window, "_resume_marking_policy_refresh", None)
-        if callable(resume_marking):
-            try:
-                generations = {
-                    "marking_generation": getattr(window, "_marking_generation", None),
-                    "publication_request_generation": publication_generation,
-                }
-                trace_signal_validation_event(
-                    "v5.marking.resume_hook", window_key=window_key,
-                    resume_hook_invoked=True,
-                    binding_pending=bool(getattr(window, "_v5_marking_binding_pending", False)),
-                    policy_refresh_pending=bool(getattr(window, "_marking_policy_refresh_pending", False)),
-                    **{name: value if type(value) is int and 0 <= value <= 1_000_000
-                       else None for name, value in generations.items()},
-                )
-            except Exception:
-                pass  # The existing resume hook still runs exactly once.
-            marking_resumed = resume_marking()
-            try:
-                if (marking_resumed is True
-                        or getattr(window, "_marking_policy_refresh_pending", False) is True):
-                    _trace_v5_marking(
-                        "marking_policy_resume", window_key,
-                        getattr(window, "_marking_generation", None), publication_generation,
-                        phase="resume", reason=("RESUMED" if marking_resumed is True
-                                                else "RESUME_REJECTED"),
-                        resumed=marking_resumed, timeframe_key=session.request.timeframe_key,
-                        market_data_identity=pool.get("market_data_identity"),
-                        diagnostic={"binding_pending": getattr(window, "_v5_marking_binding_pending", False),
-                                    "policy_refresh_pending": getattr(window, "_marking_policy_refresh_pending", False)},
-                    )
-            except Exception:
-                pass  # Preserve the existing post-resume handling.
-            if (pool.get("native_live_snapshot") is not None
-                    and getattr(window, "_marking_policy_refresh_pending", False)):
-                # A published version cannot keep retrying an unavailable selected interval.
-                window._disable_marking(clear_cache=True)
         set_incomplete_notice = getattr(window, "set_v5_incomplete_current_data", None)
         if callable(set_incomplete_notice):
             set_incomplete_notice(view_pool.get("_v5_m3_current_data_incomplete_last"))
@@ -15132,7 +14467,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._prepare_active.pop(window_key, None)
             self._range_replay_pending.pop(window_key, None)
             window._disable_marking(clear_cache=True)
-            window.marking_display_check.setToolTip("MARKING_COMPLETED_DIRECT_REFRESH_NOT_VERIFIED")
             return
         if (payload.get("normal_base") is True
                 and isinstance(session, ValidationSession) and isinstance(pool, dict)):
@@ -15244,6 +14578,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 observe("interaction_deferred", window=window)
                 self._prepare_deferred[window_key] = (interaction_epoch, dict(payload))
                 return
+            installed = False
+            failure_message = ""
             try:
                 if isinstance(native_work, dict):
                     native_work["state"] = "BOUND"
@@ -15287,8 +14623,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         pass  # Status is optional; a failed observer cannot undo the chart.
             except Exception as exc:
                 observe("install_error", window=window)
-                self._range_replay_pending.pop(window_key, None)
-                self._fail_window(window, f"NORMAL_BASE_VIEW_ERROR: {exc}")
+                failure_message = f"NORMAL_BASE_VIEW_ERROR: {exc}"
             else:
                 if installed and live_native_id is not None:
                     self._native_selected_last[window_key] = (
@@ -15298,7 +14633,23 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 observe("installed" if installed else "install_rejected", window=window,
                         status_attempted=status_attempted)
             finally:
-                self._prepare_active.pop(window_key, None)
+                if ((not installed or failure_message)
+                        and self._prepare_active.get(window_key) is token
+                        and self._open_windows.get(window_key) is window
+                        and self._request_generation.get(window_key) == generation
+                        and self._validation_sessions.get(window_key) is session
+                        and self._historical_pools.get(window_key) is pool
+                        and pool.get("_dispatch_snapshot") is payload.get("dispatch_publication")
+                        and window_key not in self._prepare_pending):
+                    if not installed:
+                        # Retire this failed selection before releasing its publication wait.
+                        self._invalidate_window_range(window, getattr(window, "validation_range", None))
+                        self._clear_window_candle_preview(window_key, token)
+                        window._v5_marking_binding_pending = False
+                    window._preserve_chart_for_pending_validation = getattr(window, "canvas", None) is not None
+                    self._fail_window(window, failure_message or "NORMAL_BASE_VIEW_ERROR: publication rejected")
+                if self._prepare_active.get(window_key) is token:
+                    self._prepare_active.pop(window_key, None)
             self._start_pending_window_work(window_key)
             return
         if "source_identity_content_cache" in payload:
@@ -17701,15 +17052,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 prior_verified_completed_count=prior_verified_completed_count,
                 source_selection=getattr(persistence_session, "source_selection", None),
             )
-        if (session.request.timeframe_key == "M3" and not history_browse
-                and getattr(window, "_marking_timeframe_failed", False)):
-            scope = session.request.settings_snapshot.to_dict().get("validation_market_scope", {})
-            identity = (session.request.stock.code, "M3", session.request.settings_snapshot.rules_hash,
-                        scope.get("regular_market_only") is True)
-            check = getattr(window, "marking_display_check", None)
-            if (identity == getattr(window, "_marking_timeframe_failure_identity", None)
-                    and check is not None and check.isChecked()):
-                window._marking_timeframe_pending = identity
         return self._install_acquired_pool(
             window,
             session,
@@ -17991,19 +17333,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         except (AttributeError, TypeError, ValueError, KeyError, IndexError):
             return None
 
-    def _resume_bound_selected_range(self, window):
-        intent = getattr(window, "_v5_range_rebind_pending", None)
-        if intent is None or getattr(window, "_v5_marking_binding_pending", False):
-            return
-        identity = self._selected_range_binding_identity(window)
-        if identity is None:
-            return
-        window._v5_range_rebind_pending = None
-        if intent != (identity[3][1], identity[3][3],
-                      getattr(window, "_v5_range_selection_generation", 0)):
-            return
-        if not getattr(window, "_range_replay_entries_available", False):
-            self._run_cached_range_replay(window, *window.validation_range)
 
     def _refresh_completed_direct_bar(self, window, session, pool) -> bool:
         """Replace a once-forming publication once, through the native TR budget."""
@@ -18046,7 +17375,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             try:
                 window._v5_marking_binding_pending = False
                 window._disable_marking(clear_cache=True)
-                window.marking_display_check.setToolTip(reason)
             except RuntimeError:
                 pass  # A closed subscriber cannot retain markers.
 
@@ -18070,12 +17398,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 return True
             previous = attempt["subscribers"].get(key)
             if previous is not None and previous[0]():
-                if (window.marking_display_check.isChecked()
-                        and not getattr(window, "_marking_policy_refresh_pending", False)):
-                    refresh = getattr(window, "_prepare_marking_policy_refresh", None)
-                    if callable(refresh):
-                        refresh()
-                    window._v5_marking_binding_pending = True
                 return True
         pending = self._v5_native_tr_pending.get(key, set()) - (
             {attempt["token"]} if attempt is not None else set())
@@ -18239,8 +17561,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 candidate["_completed_direct_refresh_receipt"] = pickle.dumps(
                     (response_snapshot, response_forming, native_receipt), protocol=4)
                 candidate["_completed_direct_refresh_broker"] = broker_identity
-                candidate["_completed_direct_marking_intent"] = (
-                    getattr(window, "_marking_generation", None), getattr(window, "_marking_times", None))
                 normal_view = None
                 if getattr(window, "_normal_base_requested", False):
                     normal_view, deficit = self._normal_base_history_view(
@@ -18264,11 +17584,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if not 0 < requested_count <= DEFAULT_CANDLES_MAX_COUNT:
                 raise ValueError("HISTORICAL_REQUEST_COUNT_EXCEEDS_LIMIT")
             count = min(DEFAULT_CANDLES_MAX_COUNT, requested_count + 1)
-            refresh = getattr(window, "_prepare_marking_policy_refresh", None)
-            if callable(refresh):
-                refresh()
-            if not window.marking_display_check.isChecked():
-                window._disable_marking(clear_cache=True)
             window._v5_marking_binding_pending = True
             if key in self._v5_manual_retry_required:
                 self._v5_manual_retry_required.discard(key)
@@ -18297,959 +17612,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 block(str(exc))
         return True
 
-    def _start_marking(self, window, request) -> None:
-        if window is None or self._open_windows.get(id(window)) is not window:
-            return
-        if getattr(window, "_marking_timeframe_pending", None) is not None:
-            return  # The window queues ON against the selected timeframe's publication.
-        key = id(window)
-        request_generation = self._request_generation.get(key, 0)
-        source_session = self._validation_sessions.get(key)
-        diagnostic = _v5_marking_diagnostic_state(window, request)
-        diagnostic["native_current"] = {"collection": "unavailable"}
-        try:
-            diagnostic["selection_generation"] = getattr(
-                getattr(source_session, "source_selection", None), "generation", None)
-            diagnostic["native_current"] = _v5_marking_native_diagnostic(
-                self._historical_pools.get(key),
-                getattr(window, "_v5_marking_display_publication", None),
-                key in self._native_selected_pending)
-        except Exception:
-            pass
-        _trace_v5_marking("marking_requested", key, request.get("generation"),
-                          request_generation,
-                          diagnostic=diagnostic,
-                          timeframe_key=(source_session.request.timeframe_key
-                                         if isinstance(source_session, ValidationSession)
-                                         else None),
-                          calculation_count=(len(request["calculation"]) if isinstance(
-                              request.get("calculation"), (list, tuple)) else None),
-                          display_count=(len(request["display"]) if isinstance(
-                              request.get("display"), (list, tuple)) else None))
-        pool = self._historical_pools.get(key)
-        if (isinstance(source_session, ValidationSession)
-                and isinstance(pool, dict)
-                and not self._source_selection_is_current(
-                    getattr(source_session, "source_selection", None))):
-            try:
-                generations = {
-                    "marking_generation": request.get("generation"),
-                    "request_generation": request_generation,
-                    "selection_generation": getattr(
-                        getattr(source_session, "source_selection", None), "generation", None),
-                    "current_request_generation": self._request_generation.get(key),
-                }
-                trace_signal_validation_event(
-                    "v5.marking.source_selection_deferred", window_key=key,
-                    reason="STALE_SOURCE_SELECTION", worker_start_deferred=True,
-                    worker_started=False,
-                    **{name: value if type(value) is int and 0 <= value <= 1_000_000
-                       else None for name, value in generations.items()},
-                )
-            except Exception:
-                pass  # Diagnostics cannot suppress the original native requery.
-            window._on_validation_context_changed(
-                normal_base=bool(
-                    getattr(window, "_normal_base_requested", False)
-                    or getattr(window, "_range_replay_from_normal_base", False)),
-                preserve_chart=True,
-                preserve_marking=True,
-            )
-            return
-        if ((key in getattr(self, "_native_selected_pending", {})
-             or key in getattr(self, "_prepare_active", {})
-             or (isinstance(pool, dict) and pool.get("native_live_snapshot") is not None
-                 and getattr(window, "_normal_base_requested", False)))
-                and isinstance(source_session, ValidationSession)
-                and source_session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES
-                and isinstance(pool, dict)
-                and pool.get("market_source") == "INTEGRATED"
-                and pool.get("market_data_identity") == f"{source_session.request.stock.code}_AL"
-                and (key in self._native_selected_pending
-                     or not self._marking_publication_is_current(
-                         window, getattr(window, "_v5_marking_display_publication", None)))):
-            # Preserve ON intent until the new display and receipt binding exist.
-            refresh_marking = getattr(window, "_prepare_marking_policy_refresh", None)
-            pending = self._native_selected_pending.get(key)
-            candidate = pending[1] if pending is not None else pool
-            _trace_v5_native_decision(self, key, "marking_native_candidate", "CANDIDATE_STATE",
-                                      candidate=candidate, pending=pending)
-            identity = self._selected_range_binding_identity(window)
-            retain_range = (identity is not None
-                            and identity == getattr(window, "_v5_range_result_identity", None)
-                            and getattr(window, "_range_replay_entries_available", False)
-                            and candidate is pool
-                            and (pending is None or (pending[0] is source_session
-                                                     and pending[2] == request_generation)))
-            if callable(refresh_marking) and refresh_marking(preserve_range_results=retain_range):
-                if not retain_range and getattr(window, "_validation_range_times", None):
-                    # Retire queued old trades before waiting for a verified replacement.
-                    self._range_replay_generation[key] = self._range_replay_generation.get(key, 0) + 1
-                    self._range_replay_pending.pop(key, None)
-                    window._v5_range_rebind_pending = (
-                        request["settings"].rules_hash, window._validation_range_times,
-                        getattr(window, "_v5_range_selection_generation", 0))
-                window._v5_marking_binding_pending = True
-                try:
-                    _trace_v5_marking(
-                        "marking_native_pending", key, request.get("generation"), request_generation,
-                        phase="native_pending", reason="NATIVE_REBIND_PENDING",
-                        timeframe_key=source_session.request.timeframe_key,
-                        market_data_identity=pool.get("market_data_identity"),
-                        diagnostic={"marking_generation": getattr(window, "_marking_generation", None),
-                                    "selection_generation": getattr(getattr(source_session, "source_selection", None), "generation", None),
-                                    "native_query_pending": key in self._native_selected_pending,
-                                    "prepare_active": key in self._prepare_active,
-                                    "binding_pending": True, "policy_refresh_pending":
-                                    getattr(window, "_marking_policy_refresh_pending", False)},
-                    )
-                except Exception:
-                    pass  # Diagnostic collection cannot change the native retry path.
-                # Rebinding ON must not replace an in-flight prepare's work/token.
-                if (key in self._prepare_active
-                        and candidate.get("_v5_native_work", {}).get("token")
-                        is self._prepare_active[key]):
-                    candidate = dict(candidate)
-                if candidate.get("native_live_snapshot") is not None:
-                    if pending is not None:
-                        self._native_selected_pending.pop(key, None)
-                    if not self._queue_native_selected(
-                            window, source_session, candidate, request_generation):
-                        _trace_v5_native_decision(self, key, "marking_native_candidate", "QUEUE_REJECTED",
-                                                  candidate=candidate, pending=pending,
-                                                  publish_result="REJECTED")
-                        window._disable_marking(clear_cache=True)
-                        window.marking_display_check.setToolTip("MARKING_SOURCE_UNAVAILABLE")
-                    else:
-                        _trace_v5_native_decision(self, key, "marking_native_candidate", "QUEUE_ACCEPTED",
-                                                  candidate=candidate, pending=pending)
-                        self._start_pending_window_work(key)
-                return
-            _trace_v5_native_decision(self, key, "marking_native_candidate", "REFRESH_NOT_ACCEPTED",
-                                      candidate=candidate, pending=pending)
-        if self._refresh_completed_direct_bar(window, source_session, pool):
-            return
-        try:
-            if source_session is None or not isinstance(pool, dict):
-                raise ValueError("MARKING_SOURCE_UNAVAILABLE")
-            settings = request["settings"]
-            minutes = settings.to_dict()["bar"]["bar_minutes"]
-            if minutes != source_session.request.timeframe_minutes:
-                raise ValueError("MARKING_TIMEFRAME_MISMATCH")
-            self._require_selected_timeframe_pool(source_session, pool)
-            session = ValidationSession(ValidationRequest(window.stock, settings, minutes),
-                                        operation_active_reader=self._operation_active_reader)
-            session.source_selection = getattr(source_session, "source_selection", None)
-            readiness = session.readiness()
-            if not readiness.allowed:
-                raise ValueError(str(readiness.reason))
-            published_m1 = (
-                self._published_m1_marking_basis(
-                    window, source_session, pool, request_generation, request)
-                if session.request.timeframe_key == "M1" else None
-            )
-            source_rows = (published_m1[0].get("candles", ()) if published_m1
-                           else pool.get("candles", ()))
-            source_view = None
-            if (pool.get("market_source") == "NXT"
-                    and pool.get("nxt_proven_al_history")):
-                source_view = self._validation_pool_for_session(
-                    source_session, pool,
-                    target_count=max(len(source_rows), len(request["calculation"])))
-                if source_view.get("validation_nxt_history_calculation") is True:
-                    source_rows = source_view["candles"]
-            elif pool.get("native_live_snapshot") is not None:
-                source_view, deficit = self._normal_base_history_view(
-                    source_session, pool,
-                    self._history_targets.get(key, self._historical_count))
-                if deficit:
-                    raise ValueError("MARKING_SOURCE_UNAVAILABLE")
-                source_rows = source_view["candles"]
-            elif (source_session.request.timeframe_key in {"D1", "W1", "MO1", "Y1"}
-                  or (source_session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES
-                      and settings.to_dict().get("validation_market_scope", {}).get(
-                          "regular_market_only") is True)
-                  or (source_session.request.timeframe_key == "M5"
-                      and pool.get("market_source") == "INTEGRATED"
-                      and pool.get("market_data_identity") == f"{window.stock.code}_AL"
-                      and any(str(row.get("time") or "").endswith("153500")
-                              for row in source_rows))):
-                source_view = self._validation_pool_for_session(
-                    source_session, pool,
-                    target_count=max(len(source_rows), len(request["calculation"])))
-                source_rows = source_view["candles"]
-            calculation_scope, display_scope, source_rows, marking_prefix_scoped = (
-                _v5_marking_historical_prefix_inputs(
-                    session.request.timeframe_key,
-                    pool.get("native_live_snapshot"),
-                    request.get("times"),
-                    request.get("calculation"),
-                    request.get("display"),
-                    source_rows,
-                )
-            )
-            diagnostic["historical_prefix_scoped"] = marking_prefix_scoped
-            source_by_time = {
-                str(row.get("time") or ""): row
-                for row in source_rows
-            }
-            detached_premarket = [
-                row for row in calculation_scope
-                if (
-                    "0800" <= str(row.get("time") or "")[8:12] < "0850"
-                    and str(row.get("time") or "") not in source_by_time
-                )
-            ]
-            verified = {}
-            if detached_premarket:
-                sidecar = self._integrated_display_sidecars.get(
-                    self._integrated_display_sidecar_key(session)
-                )
-                verified = {
-                    row["time"]: row
-                    for row in self._verified_validation_premarket_candles(
-                        session, sidecar
-                    )
-                }
-                first_mismatch = next((row for row in detached_premarket
-                                       if verified.get(row["time"]) != row), None)
-                if first_mismatch is not None:
-                    try:
-                        _trace_v5_marking(
-                            "marking_premarket_first_mismatch", key, request.get("generation"),
-                            request_generation, diagnostic=diagnostic,
-                            timeframe_key=session.request.timeframe_key,
-                            premarket_mismatch=_v5_premarket_mismatch_detail(
-                                session, source_session, pool, request, source_rows,
-                                source_by_time, verified, sidecar, first_mismatch))
-                    except Exception:
-                        pass  # Evidence collection must preserve the original rejection/OFF.
-                    raise ValueError("MARKING_PREMARKET_SOURCE_NOT_VERIFIED")
-            generation = request["generation"]
-            request_generation = self._request_generation.get(key, 0)
-            publication = pool.get("_dispatch_snapshot")
-            source_identity = (
-                publication[3] if isinstance(publication, tuple)
-                and len(publication) == 4 else ()
-            )
-            # A displayed direct M3 current bar is a published, immutable
-            # receipt. Mark must reuse the same bound receipt as range replay;
-            # the wall-clock snapshot may already be in a later bar.
-            selected_receipt = pool.get("selected_direct_forming_snapshot")
-            selected_candle = (
-                selected_receipt.get("candle")
-                if isinstance(selected_receipt, dict) else None
-            )
-            marking_direct_current = (
-                session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"}
-                and pool.get("market_source") == "INTEGRATED"
-                and pool.get("market_data_identity") == f"{session.request.stock.code}_AL"
-                and pool.get("native_live_snapshot") is None
-                and isinstance(selected_candle, dict)
-                and isinstance(request.get("calculation"), list)
-                and bool(request["calculation"])
-                and request["calculation"][-1].get("time")
-                == selected_candle.get("time")
-            )
-            published_direct_current = (
-                self._ensure_published_direct_current_snapshot(
-                    window, source_session, pool, request_generation)
-                if marking_direct_current else None
-            )
-            if marking_direct_current and published_direct_current is None:
-                raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
-            direct_snapshot = (
-                published_direct_current if published_direct_current is not None
-                else published_m1[1] if published_m1 else
-                self._sor_m1_calculation_snapshot(session, pool)
-                if (session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES
-                    and pool.get("native_live_snapshot") is None)
-                else None
-            )
-        except (TypeError, ValueError, KeyError) as exc:
-            _trace_v5_marking("marking_failed", key, request.get("generation"),
-                              request_generation, reason=str(exc), phase="precheck",
-                              error=exc, diagnostic=diagnostic,
-                              basis_mismatches=getattr(exc, "basis_mismatches", ()),
-                              exception_type=("ValueError" if isinstance(exc, _V5M1MarkingBasisError)
-                                              else type(exc).__name__))
-            window._disable_marking(clear_cache=True)
-            window.marking_display_check.setToolTip(str(exc))
-            return
-
-        try:
-            diagnostic["direct_snapshot_present"] = direct_snapshot is not None
-            if (isinstance(direct_snapshot, tuple) and len(direct_snapshot) == 3
-                    and isinstance(direct_snapshot[2], dict)):
-                diagnostic["projection"] = direct_snapshot[2].get("projection")
-        except Exception:
-            pass
-        source_binding = (pool, source_session, request_generation, publication)
-        try:
-            diagnostic_direct_basis = getattr(window, "_v5_direct_current_replay_basis", None)
-        except Exception:
-            diagnostic_direct_basis = "unavailable"
-
-        def current():
-            return (self._open_windows.get(key) is window
-                    and self._marking_publication_is_current(window, source_binding)
-                    and window.marking_display_check.isChecked()
-                    and self._request_generation.get(key, 0) == request_generation
-                    and window._marking_generation == generation
-                    and window._marking_key == request["key"]
-                    and (published_m1 is None or getattr(
-                        window, "_v5_m1_marking_basis", None) is published_m1[2]))
-
-        @_perf_stage("worker.marking", owner=window)
-        def prepare():
-            worker_diagnostic = dict(diagnostic)
-            payload = dict(window_key=key, generation=generation, key=request["key"],
-                           request_generation=request_generation, snapshot=None, error="",
-                           marking_source_binding=source_binding)
-            if published_direct_current is not None:
-                payload["direct_marking_snapshot"] = published_direct_current
-            if published_m1 is not None:
-                payload["m1_marking_basis"] = published_m1[2]
-                payload["m1_source_session"] = source_session
-                payload["m1_source_pool"] = pool
-                payload["m1_request"] = request
-            worker_predicate = "UNKNOWN_WORKER_SUBPATH"
-            comparison_detail = None
-            mismatching_row_index = None
-
-            def note_rejection(code, result):
-                nonlocal worker_predicate
-                rejected = bool(result)
-                if rejected:
-                    worker_predicate = code
-                return rejected
-
-            def note_row_difference(index, result):
-                nonlocal mismatching_row_index
-                different = bool(result)
-                if different:
-                    mismatching_row_index = index
-                return different
-
-            def collect_comparison_detail(proven=None):
-                nonlocal comparison_detail
-                try:
-                    detail = _v5_marking_comparison_detail(
-                        worker_predicate, calculation_scope, source_rows, source_candles,
-                        proven=proven, verified=verified, mismatch_index=mismatching_row_index)
-                    receipt = selected_receipt if isinstance(selected_receipt, dict) else {}
-                    query = pool.get("direct_selected_query")
-                    bound = diagnostic_direct_basis
-                    binding_shape = isinstance(bound, tuple) and len(bound) == 6
-                    publication_shape = isinstance(publication, tuple) and len(publication) == 4
-                    published_content = (publication[2] if publication_shape
-                                         and isinstance(publication[2], dict) else {})
-                    prerequisites = dict(
-                        eligible_timeframe=session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES - {"M1"},
-                        integrated_source=pool.get("market_source") == "INTEGRATED",
-                        al_identity=pool.get("market_data_identity") == f"{session.request.stock.code}_AL",
-                        no_native_live_snapshot=pool.get("native_live_snapshot") is None,
-                        selected_candle_available=isinstance(selected_candle, dict),
-                        calculation_list=isinstance(request.get("calculation"), list),
-                        calculation_nonempty=bool(request["calculation"]),
-                        tail_time_matches=(isinstance(selected_candle, dict)
-                                           and bool(request["calculation"])
-                                           and request["calculation"][-1].get("time") == selected_candle.get("time")))
-                    reasons = ("TIMEFRAME_INELIGIBLE", "SOURCE_NOT_INTEGRATED", "IDENTITY_NOT_AL",
-                               "NATIVE_LIVE_SNAPSHOT_PRESENT", "SELECTED_CANDLE_UNAVAILABLE",
-                               "CALCULATION_NOT_LIST", "CALCULATION_EMPTY", "TAIL_TIME_MISMATCH")
-                    native = dict(prerequisites,
-                        publication_shape_valid=publication_shape,
-                        publication_reference_matches=pool.get("_dispatch_snapshot") is publication,
-                        selected_receipt_available=isinstance(selected_receipt, dict),
-                        query_available=isinstance(query, dict),
-                        published_receipt_available=isinstance(
-                            published_content.get("selected_direct_forming_snapshot"), dict),
-                        receipt_query_as_of_matches=(receipt["request_as_of"] == query["request_as_of"]
-                                                    if isinstance(query, dict) and "request_as_of" in query
-                                                    and "request_as_of" in receipt else "unavailable"),
-                        binding_available=bound is not None if type(bound) is not str else "unavailable",
-                        binding_shape_valid=binding_shape,
-                        binding_pool_matches=bound[0] is pool if binding_shape else "unavailable",
-                        binding_session_matches=bound[1] is source_session if binding_shape else "unavailable",
-                        binding_generation_matches=bound[2] == request_generation if binding_shape else "unavailable",
-                        binding_publication_matches=bound[3] is publication if binding_shape else "unavailable",
-                        published_direct_current_available=published_direct_current is not None,
-                        direct_snapshot_available=direct_snapshot is not None,
-                        m1_basis_available=published_m1 is not None,
-                        direct_current_reason=next((reason for flag, reason in zip(prerequisites.values(), reasons)
-                                                    if not flag), "ELIGIBLE"),
-                        deferred_reason=("PUBLISHED_DIRECT_SNAPSHOT" if published_direct_current is not None
-                                         else "M1_DIRECT_SNAPSHOT" if session.request.timeframe_key == "M1"
-                                         and direct_snapshot is not None else "NO_M1_OR_PUBLISHED_DIRECT_SNAPSHOT"),
-                        binding_validation="unavailable", tick_proof_validation="unavailable")
-                    identity = pool.get("market_data_identity")
-                    if type(identity) is str and re.fullmatch(r"[0-9A-Z]{6}(?:_AL|_NX)?", identity):
-                        native["market_data_identity"] = identity
-                    # Only hashes identify requests; raw receipt/session contents never enter the log.
-                    for name, data in (("pool", pool), ("receipt", receipt), ("query", query)):
-                        identifier = data.get("request_id") if isinstance(data, dict) else None
-                        if type(identifier) is str and len(identifier) <= 1024:
-                            native[name + "_request_sha256"] = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
-                    detail["native_current"] = native
-                    comparison_detail = detail
-                except Exception:
-                    pass  # Optional evidence must preserve the original rejection.
-
-            try:
-                if not current():
-                    if signal_validation_trace_enabled():
-                        try:
-                            trace_signal_validation_event(
-                                "v5.marking.worker_stale",
-                                phase="entry",
-                                window_key=key,
-                                generation=generation,
-                                request_generation=request_generation,
-                                checks={
-                                    "window": self._open_windows.get(key) is window,
-                                    "pool": self._historical_pools.get(key) is pool,
-                                    "session": self._validation_sessions.get(key) is source_session,
-                                    "request_generation": self._request_generation.get(key, 0) == request_generation,
-                                    "source_selection": self._source_selection_is_current(
-                                        getattr(source_session, "source_selection", None)),
-                                    "dispatch_snapshot": pool.get("_dispatch_snapshot") is publication,
-                                    "marking_generation": window._marking_generation == generation,
-                                    "marking_key": window._marking_key == request["key"],
-                                    "m1_basis": (published_m1 is None or getattr(
-                                        window, "_v5_m1_marking_basis", None) is published_m1[2]),
-                                },
-                            )
-                        except Exception:
-                            pass  # Diagnostics must not affect marking behavior.
-                    _trace_v5_marking("marking_stale", key, generation,
-                                      request_generation)
-                    return
-                source_candles = [
-                    source_by_time[row["time"]]
-                    for row in calculation_scope
-                    if row["time"] in source_by_time
-                ]
-                if (note_rejection("SOURCE_EMPTY", not source_candles)
-                        or note_rejection("SOURCE_DUPLICATE_TIMES",
-                                          len(source_by_time) != len(source_rows))):
-                    raise ValueError("MARKING_SOURCE_UNAVAILABLE")
-                if source_candles != source_rows[-len(source_candles):]:
-                    worker_predicate = "SOURCE_SUFFIX"
-                    collect_comparison_detail()
-                    raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-                replay_display = list(source_candles)
-                scope = settings.to_dict().get("validation_market_scope")
-                if (session.request.timeframe_key == "M1"
-                        and isinstance(scope, dict)
-                        and scope.get("regular_market_only") is True):
-                    replay_display = _krx_regular_session_candles(source_candles)
-                marking_nxt_composite = (
-                    isinstance(source_view, dict)
-                    and source_view.get("validation_nxt_history_calculation") is True
-                )
-                replay_view = dict(
-                    source_view if (marking_nxt_composite
-                                    or (isinstance(source_view, dict)
-                                        and "_regular_minute_source_view" in source_view)) else
-                    published_m1[0] if published_m1 else pool,
-                    candles=source_candles,
-                    display_candles=replay_display,
-                    display_only_integrated=False,
-                )
-                if self._period_session_scope(
-                        session.request.settings_snapshot,
-                        session.request.timeframe_key) == "REGULAR":
-                    # The marker calculation is an authenticated source suffix.
-                    replay_view["_regular_period_proven_source"] = pool.get(
-                        "_regular_period_proven_source", pool)
-                if self._verified_sor_tail_provider is not None:
-                    now = self._now_factory()
-                    now = (now.replace(tzinfo=SEOUL_TIMEZONE) if now.tzinfo is None
-                           else now.astimezone(SEOUL_TIMEZONE))
-                    replay_view = self._verified_sor_view_for_session(
-                        session, pool, replay_view, now, source_identity,
-                    )
-                calculation = calculation_scope
-                display = display_scope
-                def check_marking_view(checked_view):
-                    nonlocal worker_predicate
-                    if (published_m1 is not None
-                            and (note_rejection("M1_PUBLICATION_REFERENCE",
-                                                pool.get("_dispatch_snapshot") is not publication)
-                                 or note_rejection("M1_SOURCE_IDENTITY", source_identity
-                                                   != self._pool_computation_source_identity(pool)))):
-                        raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-                    special_display = {}
-                    if (session.request.timeframe_key == "M5"
-                            and any(row.get("display_only_special") == NATIVE_CLOSING_PRICE_SPECIAL
-                                    for row in display)):
-                        # Reuse only the validated display projection of this publication.
-                        if (note_rejection("M5_PUBLICATION_SHAPE", not isinstance(publication, tuple))
-                                or note_rejection("M5_PUBLICATION_SHAPE", len(publication) != 4)
-                                or note_rejection("M5_PUBLICATION_REFERENCE",
-                                                  pool.get("_dispatch_snapshot") is not publication)
-                                or note_rejection("M5_PUBLICATION_CONTENT_SHAPE",
-                                                  not isinstance(publication[2], dict))
-                                or note_rejection("M5_PUBLICATION_CANDLE_CONTENT",
-                                                  publication[2].get("candles") != pool.get("candles"))
-                                or note_rejection("M5_PUBLICATION_DIRECT_QUERY",
-                                                  publication[2].get("direct_selected_query")
-                                                  != pool.get("direct_selected_query"))
-                                or note_rejection("M5_SOURCE_IDENTITY", source_identity
-                                                  != self._pool_computation_source_identity(pool))):
-                            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-                        published_pool = dict(pool, **publication[2])
-                        trusted_view = self._validation_pool_for_session(
-                            session, published_pool, target_count=len(published_pool["candles"]))
-                        special_display = {
-                            row["time"]: row for row in trusted_view.get("display_candles", ())
-                            if row.get("display_only_special") == NATIVE_CLOSING_PRICE_SPECIAL
-                        }
-                    proven = {row["time"]: row for row in checked_view["candles"]}
-                    display_binding = getattr(window, "_v5_marking_display_publication", None)
-                    native_forming_time = (
-                        _v5_marking_native_m1_forming_tail(
-                            session.request.timeframe_key, f"{session.request.stock.code}_AL",
-                            pool.get("native_live_snapshot"), calculation, checked_view["candles"],
-                        )
-                        if pool.get("market_source") == "INTEGRATED"
-                        and pool.get("market_data_identity") == f"{session.request.stock.code}_AL"
-                        and isinstance(display_binding, tuple) and len(display_binding) == 4
-                        and display_binding[0] is pool and display_binding[1] is source_session
-                        and display_binding[2] == request_generation
-                        and display_binding[3] is publication
-                        and self._marking_publication_is_current(window, display_binding)
-                        and calculation == getattr(window, "_calculation_candles", None)
-                        and display == getattr(window, "_candles", None)
-                        else None
-                    )
-                    calculation_times = [row["time"] for row in calculation]
-                    display_times = [row["time"] for row in display]
-                    calculation_by_time = {row["time"]: row for row in calculation}
-                    if (note_rejection("PROVEN_DUPLICATE_TIMES",
-                                       len(proven) != len(checked_view["candles"]))
-                            or note_rejection("CALCULATION_TIME_AXIS",
-                                              calculation_times != sorted(set(calculation_times)))
-                            or note_rejection("DISPLAY_TIME_AXIS",
-                                              display_times != sorted(set(display_times)))
-                            or note_rejection("VERIFIED_ROW_CONTENT", any(
-                                note_row_difference(index,
-                                    (verified.get(row["time"]) if row["time"] in verified
-                                     else proven.get(row["time"])) != row
-                                    and not (index == len(calculation) - 1
-                                             and native_forming_time == row["time"]
-                                             and row["time"] not in verified
-                                             and row["time"] not in proven))
-                                for index, row in enumerate(calculation)))
-                            or note_rejection("DISPLAY_CALCULATION", any(
-                                calculation_by_time.get(row["time"], special_display.get(row["time"]))
-                                != row for row in display))):
-                        if worker_predicate == "VERIFIED_ROW_CONTENT":
-                            collect_comparison_detail(proven)
-                        raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-                    checked_display = display
-                    scope = settings.to_dict().get("validation_market_scope")
-                    if (isinstance(scope, dict)
-                            and scope.get("regular_market_only") is True
-                            and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES
-                            and (session.request.timeframe_key != "M5"
-                                 or (pool.get("market_source") == "INTEGRATED"
-                                     and pool.get("market_data_identity") ==
-                                     f"{session.request.stock.code}_AL"))
-                            and not detached_premarket
-                            and pool.get("market_source") in {"INTEGRATED", "NXT", "KRX"}):
-                        full_regular = _krx_regular_session_candles(
-                            calculation, native_m5_close_times=
-                            checked_view.get("native_m5_regular_close_times", ()))
-                        if (calculation != full_regular
-                                or not display or len(display) > len(full_regular)
-                                or display != full_regular[-len(display):]):
-                            worker_predicate = "REGULAR_ONLY_SUFFIX"
-                            raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-                        checked_display = full_regular
-                    checked_view = dict(
-                        checked_view, candles=calculation, display_candles=checked_display,
-                        display_only_integrated=bool(special_display),
-                        # Frozen marking input is not a newly admitted live partial.
-                        **({"native_forming_included": False} if native_forming_time else {}),
-                    )
-                    if detached_premarket:
-                        checked_view["market_source"] = "VALIDATION_COMPOSITE"
-                        checked_view["market_data_identity"] = (
-                            f"{session.request.stock.code}_AL_NXT_PRE_VALIDATION"
-                        )
-                        checked_view["snapshot"] = ValidationHistoricalSnapshot(
-                            stock=session.request.stock,
-                            timeframe_minutes=session.request.timeframe_minutes,
-                            timeframe_key=session.request.timeframe_key,
-                            requested_count=len(calculation),
-                            request_id=str(checked_view.get("request_id") or "POOL"),
-                            rows=self._historical_rows_from_candles(calculation),
-                            market_data_identity=checked_view["market_data_identity"],
-                            market_source=checked_view["market_source"],
-                        )
-                    return checked_view
-
-                deferred_check = (
-                    (session.request.timeframe_key == "M1"
-                     and direct_snapshot is not None)
-                    or published_direct_current is not None
-                )
-                if not deferred_check:
-                    replay_view = check_marking_view(replay_view)
-                result = self._prepare_replay_result_from_pool(
-                    session, pool if (direct_snapshot is not None
-                                      or marking_nxt_composite) else replay_view,
-                    history_target=len(display),
-                    chart_range=request["range"], chart_range_times=request["times"],
-                    prepared_view_pool=replay_view, cancel_predicate=lambda: not current(),
-                    sor_m1_calculation_snapshot=direct_snapshot,
-                    expected_sor_m1_calculation=(
-                        calculation
-                        if (session.request.timeframe_key in {"W1", "MO1"}
-                            or direct_snapshot is not None
-                            and (published_direct_current is None or not detached_premarket))
-                        else None),
-                    marking_view_check=(check_marking_view if deferred_check else None),
-                    require_full_warmup_for_marking=True,
-                    reuse_displayed_wm_snapshot=session.request.timeframe_key in {"W1", "MO1"},
-                    marking_diagnostic=worker_diagnostic)
-                snapshot = result.snapshot
-                # Build only marking comparisons; normal filters retain their original cache.
-                rows = snapshot.to_candles()
-                replay_entries = snapshot.to_entries()
-                cache, _ = _build_validation_projection_data(
-                    rows, replay_entries, [], tuple(range(len(rows))),
-                    settings.to_dict(), request["descriptors"],
-                    cancel_predicate=lambda: not current())
-                payload["snapshot"] = snapshot
-                payload["comparison"] = (tuple(c["time"] for c in rows), cache)
-                if (minutes in SUPPORTED_BAR_MINUTES
-                        and session.request.timeframe_key == f"M{minutes}"
-                        and not detached_premarket):
-                    try:
-                        marker_path = self._validation_cache_source_marker_path(
-                            session.request.stock, minutes, session.request.timeframe_key,
-                            int(pool.get("requested_count") or 0),
-                            market_data_identity=self._session_period_source(session)[0])
-                        if (marker_path is not None and marker_path.is_file()
-                                and marker_path.stat().st_size <= 4096):
-                            source_marker = json.loads(marker_path.read_text(encoding="utf-8"))
-                            evidence = build_v5_records(
-                                pool, source_marker, snapshot, rows, replay_entries,
-                                generation=generation,
-                                request_generation=request_generation,
-                                window_key=key)
-                            if evidence:
-                                payload["sor_m3_evidence_lines"] = "".join(
-                                    json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
-                                    for record in evidence)
-                                payload["sor_evidence_timeframe"] = session.request.timeframe_key
-                    except (OSError, ValueError, TypeError):
-                        pass  # Optional evidence cannot interrupt marking.
-            except Exception as exc:
-                payload["error"] = str(exc)
-                failure_type = type(exc).__name__
-                failure_error = exc
-            if current():
-                if payload["error"]:
-                    try:
-                        _trace_v5_marking("marking_failed", key, generation,
-                                          request_generation, reason=payload["error"],
-                                          phase="worker", exception_type=failure_type,
-                                          error=failure_error, diagnostic=worker_diagnostic,
-                                          worker_predicate=worker_predicate,
-                                          timeframe_key=session.request.timeframe_key,
-                                          direct_current=marking_direct_current,
-                                          deferred_check=(
-                                              (session.request.timeframe_key == "M1"
-                                               and direct_snapshot is not None)
-                                              or published_direct_current is not None),
-                                          comparison_detail=comparison_detail)
-                    except Exception:
-                        pass  # Serialization/writing failures cannot suppress marking OFF.
-                else:
-                    _trace_v5_marking("marking_calculated", key, generation,
-                                      request_generation,
-                                      timeframe_key=session.request.timeframe_key,
-                                      calculation_count=snapshot.candle_count,
-                                      display_count=len(request["display"]),
-                                      entry_count=len(snapshot._entries))
-                try:
-                    self.marking_completed.emit(payload)
-                except RuntimeError:
-                    _trace_v5_marking("marking_stale", key, generation,
-                                      request_generation)
-            else:
-                _trace_v5_marking("marking_stale", key, generation,
-                                  request_generation)
-
-        try:
-            _trace_v5_marking(
-                "marking_worker_dispatch", key, generation, request_generation,
-                phase="thread_start", reason="WORKER_DISPATCH_ATTEMPT",
-                timeframe_key=session.request.timeframe_key,
-                market_data_identity=pool.get("market_data_identity"),
-            )
-        except Exception:
-            pass  # Trace failure must never enter the worker-start failure handler.
-        try:
-            Thread(target=prepare, name="indicator-follow-v5-marking", daemon=True).start()
-        except Exception as exc:
-            _trace_v5_marking("marking_failed", key, generation,
-                              request_generation, reason=str(exc), phase="thread_start",
-                              exception_type=type(exc).__name__, error=exc,
-                              diagnostic=diagnostic)
-            window._disable_marking(clear_cache=True)
-            window.marking_display_check.setToolTip(str(exc))
-
-    def _on_marking_completed(self, payload) -> None:
-        if isinstance(payload, dict) and payload.get("source_revision") is True:
-            self._on_marking_source_revision_completed(payload)
-            return
-        window = self._open_windows.get(payload["window_key"])
-        if (window is None or payload["generation"] != window._marking_generation
-                or payload["key"] != window._marking_key
-                or payload["request_generation"] != self._request_generation.get(id(window), 0)
-                or ("m1_marking_basis" in payload
-                    and payload["m1_marking_basis"] is not getattr(
-                        window, "_v5_m1_marking_basis", None))):
-            _trace_v5_marking("marking_stale", payload["window_key"],
-                              payload["generation"], payload["request_generation"])
-            return
-        if ("marking_source_binding" in payload
-                and not self._marking_publication_is_current(
-                    window, payload["marking_source_binding"])):
-            # A replaced source is cancellation, including an already queued failure.
-            refresh_marking = getattr(window, "_prepare_marking_policy_refresh", None)
-            if callable(refresh_marking) and refresh_marking():
-                window._v5_marking_binding_pending = True
-            return
-        try:
-            if "direct_marking_snapshot" in payload:
-                pool, session, generation, _ = payload["marking_source_binding"]
-                if self._published_direct_current_snapshot(
-                        window, session, pool, generation) != payload["direct_marking_snapshot"]:
-                    raise ValueError("SOR_VERIFIED_BLOCKED:MARKING_SOURCE_CHANGED")
-            if "m1_marking_basis" in payload:
-                self._published_m1_marking_basis(
-                    window, payload["m1_source_session"], payload["m1_source_pool"],
-                    payload["request_generation"], payload["m1_request"])
-            if payload.get("error"):
-                raise ValueError(payload["error"])
-            published = window.apply_marking_snapshot(
-                payload["generation"], payload["key"], payload["snapshot"],
-                payload["comparison"])
-            if published:
-                self._resume_bound_selected_range(window)
-            if published:
-                _replace_v5_marking_warmup_status(window, "마킹 계산 완료")
-            if published and payload.get("sor_m3_evidence_lines"):
-                token = (payload["generation"], payload["request_generation"], payload["key"])
-                key = payload["window_key"]
-                if self._sor_m3_marking_published.get(key) != token:
-                    timeframe = payload.get("sor_evidence_timeframe", "M3")
-                    queued = (_queue_v5_m3_evidence(payload["sor_m3_evidence_lines"])
-                              if timeframe == "M3" else _queue_v5_m3_evidence(
-                                  payload["sor_m3_evidence_lines"], timeframe=timeframe))
-                    if queued:
-                        self._sor_m3_marking_published[key] = token
-            _trace_v5_marking("marking_published" if published else "marking_stale",
-                              payload["window_key"], payload["generation"],
-                              payload["request_generation"])
-        except (TypeError, ValueError, KeyError) as exc:
-            if not payload.get("error"):
-                _trace_v5_marking("marking_failed", payload["window_key"],
-                                  payload["generation"], payload["request_generation"],
-                                  reason=str(exc), phase="publication",
-                                  basis_mismatches=getattr(exc, "basis_mismatches", ()),
-                                  exception_type=("ValueError" if isinstance(exc, _V5M1MarkingBasisError)
-                                                  else type(exc).__name__))
-            window._disable_marking(clear_cache=True)
-            window.marking_display_check.setToolTip(str(exc))
-            missing_warmup = _v5_marking_warmup_missing(str(exc))
-            if missing_warmup is not None:
-                status_label = getattr(window, "validation_status_label", None)
-                set_text = getattr(status_label, "setText", None)
-                if callable(set_text):
-                    set_text(f"마킹 자료 부족: 웜업 {missing_warmup}봉 부족")
-            else:
-                _replace_v5_marking_warmup_status(
-                    window, "마킹 실패: 마킹 버튼 도움말 확인",
-                )
-
-    def _on_marking_source_revision_completed(self, payload: object) -> None:
-        if not isinstance(payload, dict):
-            return
-        window_key = payload.get("window_key")
-        token = payload.get("revision_token")
-        state = (
-            self._marking_source_revisions.get(window_key)
-            if isinstance(window_key, int) and not isinstance(window_key, bool)
-            else None
-        )
-        if (not isinstance(state, dict) or state.get("token") is not token
-                or state.get("status") not in {"preparing", "cancelled"}):
-            return
-        window = self._open_windows.get(window_key)
-        session = payload.get("session")
-        pool = payload.get("pool")
-
-        def fail_installed_candidate(error: object) -> None:
-            if window is None:
-                return
-            fail = getattr(window, "fail_marking_source_revision", None)
-            if callable(fail):
-                fail(
-                    revision_token=token,
-                    error=error,
-                )
-
-        if (
-            window is None
-            or not window._owns_marking_source_revision(token)
-            or self._request_generation.get(window_key, 0)
-            != payload.get("request_generation")
-            or self._history_targets.get(
-                window_key,
-                self._historical_count,
-            ) != payload.get("history_target")
-            or self._validation_sessions.get(window_key) is not session
-            or self._historical_pools.get(window_key) is not pool
-            or not self._source_selection_is_current(getattr(session, "source_selection", None))
-            or state.get("identity") != payload.get("revision_identity")
-            or self._pool_computation_source_identity(pool) != state["identity"][5]
-            or pool.get("direct_selected_query") != payload.get("source_query")
-            or (
-                state.get("source_kind") == "integrated"
-                and self._integrated_display_sidecars.get(
-                    self._integrated_display_sidecar_key(session)
-                ) is not state.get("sidecar")
-            )
-        ):
-            state["status"] = "rejected"
-            fail_installed_candidate("MARKING_SOURCE_REVISION_STALE_FLOW_IDENTITY")
-            trace_signal_validation_event(
-                "flow.marking_source_revision.rejected",
-                window_key=window_key,
-                reason="STALE_FLOW_IDENTITY",
-            )
-            return
-        error = str(payload.get("error") or "").strip()
-        try:
-            calculation = payload.get("calculation")
-            display = payload.get("display")
-            if error:
-                raise ValueError(error)
-            if (
-                self._marking_revision_candle_identity(window._calculation_candles),
-                self._marking_revision_candle_identity(window._candles),
-            ) != state["window_source_content"]:
-                raise ValueError("MARKING_SOURCE_REVISION_INSTALLED_SOURCE_CHANGED")
-            current_sidecar = state.get("sidecar")
-            if (
-                self._marking_revision_candle_identity(calculation)
-                != payload.get("calculation_content")
-                or self._marking_revision_candle_identity(display)
-                != payload.get("display_identity")
-            ):
-                raise ValueError("MARKING_SOURCE_REVISION_CONTENT_MISMATCH")
-            if state.get("source_kind") == "integrated":
-                if (
-                    not isinstance(current_sidecar, dict)
-                    or self._marking_revision_candle_identity(
-                        current_sidecar.get("candles")
-                    ) != state.get("sidecar_content")
-                    or (
-                        current_sidecar.get("market_data_identity"),
-                        current_sidecar.get("market_source"),
-                        current_sidecar.get("request_as_of"),
-                        current_sidecar.get("coverage_count"),
-                        state.get("sidecar_content"),
-                        current_sidecar.get("verified_nxt_eligible"),
-                    ) != state["identity"][6]
-                ):
-                    raise ValueError("MARKING_SOURCE_REVISION_CONTENT_MISMATCH")
-            elif (
-                payload.get("calculation_content")
-                != state.get("calculation_content")
-                or payload.get("display_identity")
-                != state.get("display_content")
-            ):
-                raise ValueError("MARKING_SOURCE_REVISION_CONTENT_MISMATCH")
-            publish = getattr(window, "publish_marking_source_revision", None)
-            if not callable(publish):
-                raise ValueError("MARKING_SOURCE_REVISION_API_UNAVAILABLE")
-            accepted = publish(
-                revision_token=token,
-                generation=payload["generation"],
-                previous_key=payload["key"],
-                candidate_key=payload["candidate_key"],
-                times=payload["times"],
-                source_start=payload["source_start"],
-                settings=payload["settings"],
-                calculation_candles=calculation,
-                display_candles=display,
-                display_only_integrated=payload["display_only_integrated"],
-                snapshot=payload["snapshot"],
-                comparison=payload["comparison"],
-                normal_base_presentation=payload["normal_base_presentation"],
-                chart_candle_count=payload["history_target"],
-                timeframe_key=session.request.timeframe_key,
-            )
-            if not accepted:
-                state["status"] = "rejected"
-                fail_installed_candidate(
-                    "MARKING_SOURCE_REVISION_STALE_MARKING_IDENTITY"
-                )
-                trace_signal_validation_event(
-                    "flow.marking_source_revision.rejected",
-                    window_key=window_key,
-                    reason="STALE_MARKING_IDENTITY",
-                )
-                return
-        except Exception as exc:
-            state["status"] = "error"
-            state["error"] = str(exc)
-            state["candidate_installed"] = window.marking_source_revision_installed(token)
-            fail_installed_candidate(exc)
-            trace_signal_validation_event(
-                "flow.marking_source_revision.failed",
-                window_key=window_key,
-                reason=str(exc),
-            )
-            return
-        state["status"] = "published"
-        state["candidate_installed"] = True
-        state["published_key"] = window._marking_key
-        state["published_snapshot"] = window._marking_snapshot
-        state["published_source_content"] = (
-            self._marking_revision_candle_identity(window._calculation_candles),
-            self._marking_revision_candle_identity(window._candles),
-        )
-        state["recalculated"] = payload.get("recalculated") is True
-        deficit = payload.get("normal_base_warmup_deficit", 0)
-        state["normal_base_warmup_deficit"] = deficit
-        status_label = getattr(window, "validation_status_label", None)
-        if status_label is not None:
-            status_label.setText(
-                "가용 이력으로 마킹 계산 완료 · 조건별 준비 여부 적용")
-            summary_label = getattr(window, "result_summary_label", None)
-            if summary_label is not None:
-                summary_label.setToolTip(status_label.text())
-        trace_signal_validation_event(
-            "flow.marking_source_revision.published",
-            window_key=window_key,
-            request_generation=payload.get("request_generation"),
-            marking_generation=payload.get("generation"),
-            recalculated=payload.get("recalculated") is True,
-            normal_base_warmup_deficit=deficit,
-            history_context_target_met=deficit == 0,
-            filter_readiness_policy="PER_OPERAND",
-            calculation_identity=payload.get("calculation_identity"),
-            display_identity=payload.get("display_identity"),
-        )
 
     def _run_cached_range_replay(
         self,
@@ -19258,9 +17620,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         end_index: int,
     ) -> None:
         if window is None:
-            return
-        if (getattr(window, "_v5_range_rebind_pending", None) is not None
-                and getattr(window, "_v5_marking_binding_pending", False)):
             return
         window_key = id(window)
         if window_key not in self._open_windows:
@@ -19337,6 +17696,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if (
             window_key in self._prepare_active
             or window_key in self._range_replay_active
+            or getattr(window, "_v5_marking_binding_pending", False)
         ):
             self._range_replay_pending[window_key] = request
             return
@@ -20097,15 +18457,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         window._signal_marker_entries_available = False
         window._preserve_chart_for_pending_validation = getattr(window, "canvas", None) is not None
         disable_marking = getattr(window, "_disable_marking", None)
-        check = getattr(window, "marking_display_check", None)
         if callable(disable_marking):
-            marking_on = check.isChecked() if check is not None else False
-            if check is not None:
-                with QSignalBlocker(check):
-                    disable_marking(clear_cache=True, refresh=False)
-                    check.setChecked(marking_on)
-            else:
-                disable_marking(clear_cache=True, refresh=False)
+            disable_marking(clear_cache=True, refresh=False)
         clear_evidence = getattr(window, "_clear_pending_execution_result_evidence", None)
         if callable(clear_evidence):
             clear_evidence()

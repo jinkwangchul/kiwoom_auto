@@ -167,7 +167,7 @@ _DISPLAY_BADGE_IDLE_TEXT_COLOR = "#404040"
 _BASIC_HEADER_SEPARATOR_STYLE = "font-size: 10pt; font-weight: normal; color: #64748b; padding: 0px;"
 _VALID_FILTER_DISPLAY_TOOLTIP = (
     "현재 UI에서 활성화된 모든 매수·매도 필터를 강조합니다. "
-    "마킹·기간·신호 결과와 무관합니다."
+    "기간·신호 결과와 무관합니다."
 )
 
 _cycle_label_numpy_module = None
@@ -381,10 +381,9 @@ class _IndicatorFollowSignalValidationChartCanvasBase(QWidget):
         for marker in self._markers:
             index = marker.get("evaluation_index")
             side = str(marker.get("side") or "").strip().upper()
-            if marker.get("provenance") != "marking":
-                tooltip = str(tooltips.get((index, side), ""))
-                title, separator, rest = tooltip.partition(" ")
-                marker["tooltip"] = {"BUY": "\uB9E4\uC218", "SELL": "\uB9E4\uB3C4"}.get(title, title) + separator + rest
+            tooltip = str(tooltips.get((index, side), ""))
+            title, separator, rest = tooltip.partition(" ")
+            marker["tooltip"] = {"BUY": "\uB9E4\uC218", "SELL": "\uB9E4\uB3C4"}.get(title, title) + separator + rest
         self._rebuild_marker_index()
 
     def marker_count(self, side: str | None = None) -> int:
@@ -4269,11 +4268,6 @@ class IndicatorFollowSignalValidationChartCanvas(
                 continue
             marker_x = self._x_for_index(index)
             if abs(x - marker_x) <= 7 and abs(y - marker_y) <= 11:
-                overlapping = [m for _, m in self._markers_by_index.get(index, ())
-                               if m.get("side") == side]
-                preferred = "manual" if self._validation_range is not None else "marking"
-                marker = next((m for m in overlapping
-                               if m.get("provenance") == preferred), marker)
                 return marker
         return None
 
@@ -8236,7 +8230,6 @@ class IndicatorFollowSignalValidationV5Window(
 
     validation_run_requested = pyqtSignal(object)
     validation_range_evaluation_requested = pyqtSignal(int, int)
-    marking_evaluation_requested = pyqtSignal(object)
     historical_extension_requested = pyqtSignal()
     settings_apply_requested = pyqtSignal(object)
     stock_selection_requested = pyqtSignal()
@@ -8592,11 +8585,6 @@ class IndicatorFollowSignalValidationV5Window(
             self.chart_summary_label.fontMetrics().horizontalAdvance("\u2026")
         )
         self.chart_summary_label.setToolTip(self.chart_summary_label.text())
-        self.marking_display_check = QPushButton("마킹")
-        self.marking_display_check.setObjectName("signalValidationMarkingEnabled")
-        _configure_display_badge(self.marking_display_check, summary_font)
-        self.marking_display_check.setChecked(False)
-        self.marking_display_check.toggled.connect(self._on_marking_toggled)
         self.filter_display_check = QPushButton("필터")
         self.filter_display_check.setObjectName("signalValidationFilterDisplayEnabled")
         _configure_display_badge(self.filter_display_check, summary_font)
@@ -8639,7 +8627,6 @@ class IndicatorFollowSignalValidationV5Window(
             label.text_changed.connect(self._window_title_timer.start)
         self._window_title_timer.start()
         action_row.addWidget(self.chart_summary_label, 1)
-        action_row.addWidget(self.marking_display_check)
         action_row.addWidget(self.filter_display_check)
         action_row.addWidget(self.filter_display_valid_check)
         action_row.addWidget(self.reset_button)
@@ -9464,16 +9451,6 @@ class IndicatorFollowSignalValidationV5Window(
                 abs_tol=1e-12,
             )
         )
-        marking_check = getattr(self, "marking_display_check", None)
-        if (
-            user_horizontal_navigation
-            and time_view_changed
-            and (
-                self._marking_times is not None
-                or (marking_check is not None and marking_check.isChecked())
-            )
-        ):
-            self._disable_marking(reason="horizontal_navigation")
         self._cancel_pending_time_navigation()
         self._cancel_pending_wheel_zoom(reset_intent=False)
         self._visible_start_index = start
@@ -10834,7 +10811,6 @@ class IndicatorFollowSignalValidationV5Window(
             self.validation_trading_cost_enabled_check,
         )
         display_only_checkboxes = (
-            self.marking_display_check,
             self.validation_regular_market_only_check,
             self.validation_range_liquidation_check,
             self.filter_display_check,
@@ -12231,28 +12207,6 @@ class IndicatorFollowSignalValidationV5Window(
             raise ValueError("; ".join(warnings))
         return build_signal_validation_snapshot(preview["preview_rules"], ui_state=ui_state)
 
-    def _trace_marking_toggle(self, route: str, *, checked: bool,
-                              cache_hit: bool = False, snapshot_applied: bool = False,
-                              request_emitted: bool = False,
-                              error: BaseException | None = None) -> None:
-        try:
-            from gui_indicator_follow_signal_validation_v5_flow import _trace_v5_marking
-            _trace_v5_marking(
-                "marking_ui", id(self), self._marking_generation, None,
-                route=route, timeframe_key=self._normal_base_timeframe_key,
-                error=error,
-                diagnostic={
-                    **_v5_marking_diagnostic_state(self),
-                    "checkbox_on": bool(checked),
-                    "cache_present": self._marking_cache is not None,
-                    "cache_hit": bool(cache_hit),
-                    "snapshot_applied": bool(snapshot_applied),
-                    "timeframe_pending": self._marking_timeframe_pending is not None,
-                    "request_emitted": bool(request_emitted),
-                },
-            )
-        except Exception:
-            pass  # Diagnostics must not change marking behavior.
 
     def _trace_validation_range_clear(self, source: str, reason: str, *, defer: bool = False):
         try:
@@ -12272,7 +12226,6 @@ class IndicatorFollowSignalValidationV5Window(
                 del frame
             diagnostic = {
                 "range_start": previous[0], "range_end": previous[1],
-                "checkbox_on": bool(self.marking_display_check.isChecked()),
             }
             window_key, generation = id(self), self._marking_generation
             timeframe = self._normal_base_timeframe_key
@@ -12294,172 +12247,11 @@ class IndicatorFollowSignalValidationV5Window(
             pass  # Diagnostics must not change range clearing behavior.
         return None
 
-    def _on_marking_toggled(self, checked: bool) -> None:
-        self._marking_source_revision_owner = None
-        self._trace_marking_toggle("enter_on" if checked else "enter_off", checked=checked)
-        if not checked:
-            pending = self._marking_timeframe_pending
-            self._disable_marking(reason="checkbox_off")
-            if pending is not None and self._pending_result_settings_snapshot is not None:
-                self._marking_timeframe_pending = pending
-            return
-        transition_pending = self._marking_timeframe_pending
-        confirmation_tooltip = getattr(
-            self, "_marking_confirmation_error_tooltip", "",
-        )
-        if confirmation_tooltip and self.marking_display_check.toolTip() == confirmation_tooltip:
-            self.marking_display_check.setToolTip("")
-        self._marking_confirmation_error_tooltip = ""
-        if not self._flush_pending_signal_validation_ui_confirmation():
-            detail = getattr(self, "_signal_ui_confirmation_error_detail", "")
-            self.marking_display_check.setToolTip(detail)
-            self._marking_confirmation_error_tooltip = detail
-            with QSignalBlocker(self.marking_display_check):
-                self.marking_display_check.setChecked(False)
-            self._trace_marking_toggle("confirmation_rejected", checked=False)
-            return
-        self._trace_marking_toggle("confirmation_complete", checked=True)
-        # Confirmation may retire an older Mark.  This click is explicitly a
-        # request for a fresh Mark, so retain the user's checked state before
-        # capturing the new settings snapshot.
-        with QSignalBlocker(self.marking_display_check):
-            self.marking_display_check.setChecked(True)
-        if not self.marking_display_check.isChecked():
-            with QSignalBlocker(self.marking_display_check):
-                self.marking_display_check.setChecked(True)
-        canvas = getattr(self, "canvas", None)
-        try:
-            if transition_pending is not None:
-                if self._marking_current_settings().rules_hash != transition_pending[2]:
-                    raise ValueError("MARKING_SETTINGS_CHANGED")
-                self._marking_timeframe_pending = transition_pending
-            if self._marking_timeframe_pending is not None:
-                self._trace_marking_toggle("timeframe_deferred", checked=True)
-                return
-            if self._marking_timeframe_failed:
-                raise ValueError("MARKING_TIMEFRAME_PENDING")
-            if canvas is None or self._chart_results_suspended:
-                raise ValueError("MARKING_CHART_UNAVAILABLE")
-            left, right = canvas._visible_index_bounds()
-            if not 0 <= left < right <= len(self._candles):
-                raise ValueError("MARKING_RANGE_UNAVAILABLE")
-            times = (str(self._candles[left]["time"]), str(self._candles[right - 1]["time"]))
-            settings = self._marking_current_settings()
-            key = self._marking_source_key(settings, times)
-            self._marking_generation += 1
-            self._marking_times = times
-            self._marking_key = key
-            # Completed evidence belongs to this frozen prefix. Older prepends
-            # remap timestamps; a new ON captures the expanded prefix afresh.
-            self._marking_source_start = str(self._calculation_candles[0]["time"])
-            self._marking_display_source = _detached_validation_candles([
-                candle for candle in self._candles
-                if times[0] <= str(candle.get("time") or "") <= times[1]
-            ])
-            self._marking_display_reprojection_pending = False
-            self._marking_pool_publication_pending = False
-            self._marking_policy_refresh_pending = False
-            self._marking_settings = settings
-            self._invalidate_visualization_projection_data()
-            if self._marking_cache is not None and self._marking_cache[0] == key:
-                _, snapshot, comparison = self._marking_cache
-                applied = self.apply_marking_snapshot(self._marking_generation, key, snapshot, comparison)
-                self._trace_marking_toggle("cache_reused", checked=True,
-                                           cache_hit=True, snapshot_applied=bool(applied))
-            else:
-                self.marking_evaluation_requested.emit({
-                    "generation": self._marking_generation, "key": key,
-                    "times": times, "range": (left, right - 1), "settings": settings,
-                    "calculation": _detached_validation_candles(self._calculation_candles),
-                    "display": _detached_validation_candles(self._candles),
-                    "mixed": self._display_only_integrated_active,
-                    "descriptors": tuple(d for d in self._filter_display_descriptors(settings.to_dict())
-                                         if d.family == FAMILY_PRICE_COMPARISON),
-                })
-                self._trace_marking_toggle("request_emitted", checked=True,
-                                           request_emitted=True)
-                QTimer.singleShot(1, self._refresh_filter_display_projection)
-        except (TypeError, ValueError, KeyError) as exc:
-            self._disable_marking(clear_cache=True)
-            self.marking_display_check.setToolTip(str(exc))
-            self._trace_marking_toggle("error", checked=False, error=exc)
 
     def _disable_marking(self, *, clear_cache: bool = False, refresh: bool = True,
                          reason: str = "context_reset") -> None:
         self._marking_source_revision_owner = None
         active = self._marking_times is not None
-        check = getattr(self, "marking_display_check", None)
-        checkbox_on = bool(check is not None and check.isChecked())
-        # Diagnostic only: capture the exact transition owner before mutation.
-        # No stack inspection or output when tracing is disabled.
-        if (active or checkbox_on) and signal_validation_trace_enabled():
-            try:
-                caller_path = []
-                flow_request_generation = None
-                flow_history_target = None
-                failure_type = None
-                failure_detail = None
-                frame = sys._getframe(1)
-                try:
-                    for _ in range(7):
-                        if frame is None:
-                            break
-                        code = frame.f_code
-                        filename = code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
-                        caller_path.append((filename, code.co_name, frame.f_lineno))
-                        owner = frame.f_locals.get("self")
-                        generations = getattr(owner, "_request_generation", None)
-                        if isinstance(generations, dict) and id(self) in generations:
-                            flow_request_generation = generations.get(id(self))
-                            targets = getattr(owner, "_history_targets", None)
-                            if isinstance(targets, dict):
-                                flow_history_target = targets.get(id(self))
-                        error = frame.f_locals.get("exc")
-                        if isinstance(error, BaseException) and failure_type is None:
-                            failure_type = type(error).__name__
-                            failure_detail = str(error)[:160]
-                        frame = frame.f_back
-                finally:
-                    del frame
-                trace_signal_validation_event(
-                    "window.marking.disabled.caller",
-                    window_key=id(self),
-                    stock_code=self.stock.code,
-                    reason=reason, clear_cache=bool(clear_cache),
-                    refresh=bool(refresh), active=bool(active),
-                    checkbox_on=checkbox_on,
-                    caller_path=caller_path,
-                    failure_type=failure_type,
-                    failure_detail=failure_detail,
-                    marking_generation=self._marking_generation,
-                    flow_request_generation=flow_request_generation,
-                    flow_history_target=flow_history_target,
-                    chart_interaction_epoch=self._chart_interaction_epoch,
-                    visualization_data_epoch=self._visualization_data_epoch,
-                    history_intent_generation=self._history_extension_intent_generation,
-                    history_intent_source=self._history_extension_intent_source,
-                    timeframe=self._normal_base_timeframe_key,
-                    frozen_times=self._marking_times,
-                    frozen_source_start=self._marking_source_start,
-                    frozen_display=trace_candle_signature(self._marking_display_source),
-                    calculation=trace_candle_signature(self._calculation_candles),
-                    display=trace_candle_signature(self._candles),
-                    visible_start=self._visible_start_index,
-                    visible_span=self._visible_candle_span,
-                    chart_candle_count=self._historical_candle_count,
-                )
-            except Exception:
-                # Diagnostics must not affect marking, GUI or broker execution.
-                pass
-        if _PERF_ENABLED:
-            marking_probe = _perf_phase(self)
-            if marking_probe is not None:
-                check = getattr(self, "marking_display_check", None)
-                marking_probe.checkpoint(
-                    'marking.disabled', reason=reason, active=bool(active),
-                    checkbox_on=check.isChecked() if check is not None else False,
-                    clear_cache=bool(clear_cache),
-                )
         self._marking_generation += 1
         self._marking_times = None
         self._marking_key = None
@@ -12469,331 +12261,20 @@ class IndicatorFollowSignalValidationV5Window(
         self._marking_pool_publication_pending = False
         self._marking_policy_refresh_pending = False
         self._marking_timeframe_pending = None
-        self._v5_marking_binding_pending = False
+        # The normal chart publisher owns _v5_marking_binding_pending.
         self._marking_snapshot = None
         self._marking_settings = None
         self._marking_comparison_cache = None
         if clear_cache:
             self._marking_cache = None
         self._refresh_valid_filter_emphasis()
-        check = getattr(self, "marking_display_check", None)
-        if check is not None:
-            with QSignalBlocker(check):
-                check.setChecked(False)
         if active and refresh:
             self._invalidate_visualization_projection_data()
             self._refresh_marking_projection()
             self._refresh_filter_display_projection()
 
-    def _owns_marking_source_revision(
-        self, token, *, check_flow=True, check_ui=True,
-    ) -> bool:
-        """Keep local cleanup ownership distinct from publication authority."""
-        owner = self._marking_source_revision_owner
-        if not isinstance(owner, dict) or token is not owner["token"]:
-            return False
-        if (self._marking_generation != owner["generation"]
-                or self._marking_key not in (owner["key"], owner.get("candidate_key"))
-                or self._marking_times != owner["times"]
-                or self._marking_settings is not owner["settings"]
-                or self._marking_source_start != owner["source_start"]):
-            return False
-        if check_ui and (
-            not self.marking_display_check.isChecked()
-            or self._normal_base_timeframe_key != owner["session"].request.timeframe_key
-            or self.validation_regular_market_only_check.isChecked() != owner["key"][4]
-        ):
-            return False
-        flow = owner["flow"]
-        return not check_flow or (
-            flow._open_windows.get(id(self)) is self
-            and flow._validation_sessions.get(id(self)) is owner["session"]
-            and flow._request_generation.get(id(self), 0) == owner["request_generation"]
-        )
-
-    def defer_marking_source_revision(
-        self, *, generation, key, times, settings, source_start,
-        flow, request_generation, session,
-    ):
-        if (not isinstance(key, tuple) or len(key) != 6
-                or not isinstance(settings, ValidationSettingsSnapshot)
-                or not isinstance(times, tuple) or len(times) != 2
-                or not all(isinstance(stamp, str) and stamp for stamp in times)
-                or generation != self._marking_generation or key != self._marking_key
-                or times != self._marking_times
-                or settings is not self._marking_settings
-                or source_start != self._marking_source_start or not source_start
-                or not isinstance(self._marking_snapshot, ValidationReplaySnapshot)
-                or self._marking_comparison_cache is None
-                or not self.marking_display_check.isChecked()
-                or flow._open_windows.get(id(self)) is not self
-                or flow._validation_sessions.get(id(self)) is not session
-                or flow._request_generation.get(id(self), 0) != request_generation
-                or self._normal_base_timeframe_key != session.request.timeframe_key):
-            return None
-        previous = self._marking_source_revision_owner
-        installed = bool(previous and self._owns_marking_source_revision(
-            previous["token"], check_flow=False) and previous["candidate_installed"])
-        token = object()
-        self._marking_source_revision_owner = dict(
-            token=token, generation=generation, key=key, times=times,
-            settings=settings, source_start=source_start, flow=flow,
-            request_generation=request_generation, session=session,
-            candidate_installed=installed, publishing=False, projection_ready=False,
-        )
-        return token
-
-    def marking_source_revision_installed(self, token) -> bool:
-        return bool(self._owns_marking_source_revision(
-            token, check_flow=False, check_ui=False,
-        ) and self._marking_source_revision_owner["candidate_installed"])
-
-    def _mark_revision_candidate_installed(self) -> None:
-        owner = self._marking_source_revision_owner
-        if owner and self._owns_marking_source_revision(owner["token"], check_flow=False):
-            owner["candidate_installed"] = True
-
-    def _marking_revision_projection_pending(self) -> bool:
-        owner = self._marking_source_revision_owner
-        return bool(owner and owner["candidate_installed"] and not owner["projection_ready"]
-                    and self._owns_marking_source_revision(
-                        owner["token"], check_flow=False, check_ui=False,
-                    ))
-
-    def fail_marking_source_revision(self, *, revision_token, error) -> bool:
-        if not self._owns_marking_source_revision(
-            revision_token, check_flow=False, check_ui=False,
-        ):
-            return False
-        installed = self._marking_source_revision_owner["candidate_installed"]
-        self._marking_source_revision_owner = None
-        if installed:
-            self._disable_marking(clear_cache=True, refresh=False,
-                                  reason="source_revision_failed")
-            self._invalidate_visualization_projection_data()
-            try:
-                self._refresh_marking_projection()
-                self._refresh_filter_display_projection()
-            except Exception:
-                # A failed refresh must not retain already drawn evidence.
-                self._visualization_cache = self._clip_comparison_cache(
-                    self._visualization_descriptors, self._visualization_cache)
-                if self.canvas is not None:
-                    self.canvas.set_visualization_projection(
-                        self._visualization_descriptors, self._visualization_cache,
-                        {}, self._chart_marker_records(),
-                        self._visualization_lower_filter_presentations)
-                    self.canvas.clear_evidence_pin()
-                    self.canvas.clear_marker_tooltip()
-        self.marking_display_check.setToolTip(str(error))
-        return True
-
-    def complete_pending_marking_source_publication(self, **_identity) -> bool:
-        # Reuse without a fully verified publication would expose old evidence.
-        return False
-
-    def _revalidate_marking_source(self) -> None:
-        if (
-            self._marking_times is None
-            or self._marking_atomic_publication_active
-            or self._marking_policy_refresh_pending
-            or (self._marking_revision_projection_pending()
-                and not self._marking_source_revision_owner["publishing"])
-        ):
-            return
-        source_match = False
-        display_times_match = None
-        try:
-            frozen = self._marking_display_source
-            if not isinstance(frozen, list):
-                raise ValueError("MARKING_SOURCE_DISPLAY_UNAVAILABLE")
-            # The stored interval is the source identity; a viewport can omit it.
-            source_match = self._marking_source_key(
-                self._marking_settings, self._marking_times,
-                prefix_start=self._marking_source_start, frozen_display=frozen,
-            ) == self._marking_key
-            valid = source_match
-            visible = [
-                candle for candle in self._candles
-                if self._marking_times[0] <= str(candle.get("time") or "") <= self._marking_times[1]
-            ]
-            if valid and visible and not self._marking_display_reprojection_pending:
-                left, right = str(visible[0]["time"]), str(visible[-1]["time"])
-                display_times_match = tuple(str(candle.get("time") or "") for candle in visible) == tuple(
-                    str(candle.get("time") or "") for candle in frozen
-                    if left <= str(candle.get("time") or "") <= right
-                )
-                valid = display_times_match
-        except (TypeError, ValueError, KeyError):
-            valid = False
-        if not valid:
-            trace_signal_validation_event(
-                "window.marking.revalidation_failed",
-                source_match=source_match,
-                display_times_match=display_times_match,
-                marking_times=self._marking_times,
-                source_prefix_start=self._marking_source_start,
-                calculation=trace_candle_signature(self._calculation_candles),
-                display=trace_candle_signature(self._candles),
-            )
-            self._disable_marking(clear_cache=True, refresh=False,
-                                  reason="source_revalidation_failed")
-
-    def apply_marking_snapshot(self, generation, key, snapshot, comparison) -> bool:
-        if generation != self._marking_generation or key != self._marking_key:
-            return False
-        self._revalidate_marking_source()
-        if key != self._marking_key:
-            self._refresh_marking_projection()
-            self._refresh_filter_display_projection()
-            return False
-        if (not isinstance(snapshot, ValidationReplaySnapshot)
-                or snapshot.stock != self.stock
-                or snapshot.settings_hash != self._marking_settings.rules_hash):
-            raise ValueError("MARKING_RESULT_IDENTITY_MISMATCH")
-        self._marking_snapshot = snapshot
-        self._marking_comparison_cache = comparison
-        self._marking_cache = (key, snapshot, comparison)
-        self._invalidate_visualization_projection_data()
-        self._refresh_marking_projection()
-        self._refresh_valid_filter_emphasis()
-        self._refresh_filter_display_projection()
-        return True
-
-    def publish_marking_source_revision(
-        self,
-        *,
-        revision_token,
-        generation,
-        previous_key,
-        candidate_key,
-        times,
-        source_start,
-        settings,
-        calculation_candles,
-        display_candles,
-        display_only_integrated,
-        snapshot,
-        comparison,
-        normal_base_presentation,
-        chart_candle_count,
-        timeframe_key,
-    ) -> bool:
-        """Publish one fully prepared marking/candle revision in one GUI turn."""
-        if (
-            not self._owns_marking_source_revision(revision_token)
-            or generation != self._marking_generation
-            or previous_key != self._marking_key
-            or times != self._marking_times
-            or source_start != self._marking_source_start
-            or settings is not self._marking_settings
-            or not self.marking_display_check.isChecked()
-        ):
-            return False
-        if (
-            not isinstance(settings, ValidationSettingsSnapshot)
-            or not isinstance(snapshot, ValidationReplaySnapshot)
-            or snapshot.stock != self.stock
-            or snapshot.settings_hash != settings.rules_hash
-            or not isinstance(calculation_candles, list)
-            or not calculation_candles
-            or not isinstance(display_candles, list)
-            or not display_candles
-            or not isinstance(comparison, tuple)
-            or len(comparison) != 2
-            or not isinstance(normal_base_presentation, tuple)
-            or len(normal_base_presentation) != 2
-        ):
-            raise ValueError("MARKING_SOURCE_REVISION_RESULT_INVALID")
-        candidate_display = [
-            candle for candle in display_candles
-            if times[0] <= str(candle.get("time") or "") <= times[1]
-        ]
-        verified_key = self._marking_source_key_for_candles(
-            self.stock.code,
-            settings,
-            times,
-            regular_only=self.validation_regular_market_only_check.isChecked(),
-            calculation_candles=calculation_candles,
-            display_candles=candidate_display,
-            prefix_start=source_start,
-        )
-        if verified_key != candidate_key:
-            raise ValueError("MARKING_SOURCE_REVISION_KEY_MISMATCH")
-
-        # A canonical revision may reinstall the same accepted REG publication.
-        # Preserve only its hidden FULL axis, never one from a different source.
-        full_display = (
-            _detached_validation_candles(self._display_only_integrated_candles)
-            if (not display_only_integrated
-                and timeframe_key == self._normal_base_timeframe_key
-                and calculation_candles == self._calculation_candles
-                and display_candles == self._candles)
-            else []
-        )
-        owner = self._marking_source_revision_owner
-        owner["candidate_key"] = candidate_key
-        owner["publishing"] = True
-        self._marking_atomic_publication_active = True
-        try:
-            self.set_historical_candle_pool(
-                calculation_candles,
-                chart_candle_count=chart_candle_count,
-            )
-            self.set_historical_display_candles(
-                display_candles,
-                display_only_integrated=bool(display_only_integrated),
-            )
-            if display_only_integrated:
-                self._display_only_integrated_candles = (
-                    _detached_validation_candles(display_candles)
-                )
-            else:
-                self._display_only_integrated_candles = full_display[-chart_candle_count:]
-            self._marking_key = candidate_key
-            self._marking_times = times
-            self._marking_source_start = source_start
-            self._marking_display_source = _detached_validation_candles(
-                candidate_display
-            )
-            self._marking_settings = settings
-            self._marking_snapshot = snapshot
-            self._marking_comparison_cache = comparison
-            self._marking_cache = (candidate_key, snapshot, comparison)
-            self.install_normal_base(
-                settings,
-                timeframe_key,
-                presentation=normal_base_presentation,
-            )
-            self._marking_display_reprojection_pending = False
-            self._marking_pool_publication_pending = False
-        finally:
-            self._marking_atomic_publication_active = False
-        self._revalidate_marking_source()
-        if self._marking_key != candidate_key:
-            raise ValueError("MARKING_SOURCE_REVISION_REVALIDATION_FAILED")
-        owner["projection_ready"] = True
-        self._invalidate_visualization_projection_data()
-        self._refresh_marking_projection()
-        self._refresh_filter_display_projection()
-        # Revalidation and projection callbacks can silently retire or replace
-        # the candidate. A token cannot be released as a successful publish
-        # until the complete GUI turn still owns the exact replay evidence.
-        if (
-            self._marking_source_revision_owner is not owner
-            or not self._owns_marking_source_revision(revision_token)
-            or self._marking_key != candidate_key
-            or self._marking_times != times
-            or self._marking_source_start != source_start
-            or self._marking_settings is not settings
-            or self._marking_snapshot is not snapshot
-        ):
-            raise ValueError("MARKING_SOURCE_REVISION_POST_REFRESH_INVALID")
-        self._marking_source_revision_owner = None
-        return True
 
     def _chart_marker_records(self) -> list[dict[str, Any]]:
-        self._revalidate_marking_source()
         manual_entries = self._marker_entries_for_display()
         if manual_entries:
             self._ensure_signal_tooltips_current()
@@ -12802,51 +12283,18 @@ class IndicatorFollowSignalValidationV5Window(
             record["provenance"] = "manual"
             title, separator, rest = record["tooltip"].partition(" ")
             record["tooltip"] = {"BUY": "\uB9E4\uC218", "SELL": "\uB9E4\uB3C4"}.get(title, title) + separator + rest
-        if self._marking_snapshot is None or self._marking_revision_projection_pending():
-            return records
-        calculation, entries = self._mapped_replay_entries(self._marking_snapshot)
-        rules = self._marking_settings.to_dict()
-        lines = self._validation_execution_tooltip_lines(rules, calculation_entries=calculation)
-        tooltips = {}
-        for entry in entries:
-            if entry.signal != entry.evaluation_side:
-                continue
-            key = (entry.evaluation_index, entry.signal)
-            tooltips[key] = "\n".join((signal_evidence_tooltip(entry, rules), *lines.get(key, ())))
-        marking = _marker_records(self._candles, entries, tooltips)
-        for record in marking:
-            record["provenance"] = "marking"
-            title, separator, rest = record["tooltip"].partition(" ")
-            record["tooltip"] = {"BUY": "\uB9E4\uC218", "SELL": "\uB9E4\uB3C4"}.get(title, title) + separator + rest
-        return records + marking
+        return records
 
     def _clip_comparison_cache(self, descriptors, cache):
-        self._revalidate_marking_source()
         if cache is None:
             return None
         comparison_ids = {d.identity for d in descriptors if d.family == FAMILY_PRICE_COMPARISON}
-        average_ids = {
-            d.identity for d in descriptors
-            if any(str(d.parameters.get("condition", {}).get(key) or "").upper() == "AVG_PRICE"
-                   for key in ("target", "compare_target"))
-        }
         manual = self._validation_range_times
-        marking = None if self._marking_revision_projection_pending() else self._marking_times
-        marked_series = {}
-        if marking is not None and self._marking_comparison_cache is not None:
-            times, marking_cache = self._marking_comparison_cache
-            lookup = {stamp: i for i, stamp in enumerate(times)}
-            marked_series = {(identity, channel): tuple(
-                values[lookup[c["time"]]] if c["time"] in lookup else None for c in self._candles
-            ) for identity, channel, values in marking_cache.series}
         series = []
         for identity, channel, values in cache.series:
             if identity in comparison_ids or channel == "AVG_PRICE":
-                marked = marked_series.get((identity, channel), ())
                 values = tuple(
                     value if manual and manual[0] <= self._candles[i]["time"] <= manual[1]
-                    else marked[i] if channel != "AVG_PRICE" and identity not in average_ids and marked and marking
-                    and marking[0] <= self._candles[i]["time"] <= marking[1]
                     else None
                     for i, value in enumerate(values)
                 )
@@ -13153,23 +12601,10 @@ class IndicatorFollowSignalValidationV5Window(
             # midnight-stamped daily/weekly/monthly/yearly bars by time.
             self._discard_chart_input()
             self._clear_validation_range_interaction()
-            # Reset marking; a later manual ON waits for the new native result.
             self._marking_timeframe_failed = False
-            run_request = self._on_validation_context_changed(
+            self._on_validation_context_changed(
                 normal_base=True, preserve_chart=True,
             )
-            pending = (run_request.settings_snapshot
-                       if isinstance(run_request, IndicatorFollowSignalValidationRunRequest)
-                       else None)
-            if isinstance(pending, ValidationSettingsSnapshot):
-                identity = (
-                    self.stock.code, timeframe_key, pending.rules_hash,
-                    self.validation_regular_market_only_check.isChecked(),
-                )
-                self._marking_timeframe_pending = identity
-                # Also clear pending for a broker cache published synchronously
-                # while validation_run_requested was being emitted.
-                QTimer.singleShot(0, lambda: self._resume_published_timeframe_marking(identity))
             return
         if not self._calculation_candles or getattr(self, "canvas", None) is None:
             self._disable_marking(clear_cache=True, refresh=False)
@@ -13413,7 +12848,6 @@ class IndicatorFollowSignalValidationV5Window(
         self._marking_timeframe_failed = False
         self._timeframe_transition_pending = True
         try:
-            # A timeframe change resets marking; only a later manual ON may resume it.
             self._on_validation_context_changed(
                 normal_base=False, preserve_chart=True,
             )
@@ -13477,29 +12911,6 @@ class IndicatorFollowSignalValidationV5Window(
                 widget.setEnabled(True)
         self._timeframe_transition_enabled_children = ()
 
-    def _resume_published_timeframe_marking(self, identity: tuple) -> None:
-        published = self._result_settings_snapshot
-        ready_for_timeframe = (
-            self._normal_base_requested
-            and self._normal_base_ready
-            and self._normal_base_timeframe_key == identity[1]
-        ) or (
-            isinstance(self._replay_snapshot, ValidationReplaySnapshot)
-            and self._replay_snapshot.stock == self.stock
-            and self._replay_snapshot.timeframe_key == identity[1]
-            and self._replay_snapshot.settings_hash == identity[2]
-        )
-        if (self._marking_timeframe_pending == identity
-                and identity[0] == self.stock.code
-                and getattr(self, "_timeframe_transition_target", None) is None
-                and ready_for_timeframe
-                and isinstance(published, ValidationSettingsSnapshot)
-                and published.rules_hash == identity[2]
-                and self.validation_regular_market_only_check.isChecked() == identity[3]
-                and not self._marking_timeframe_failed):
-            self._marking_timeframe_pending = None
-            if self.marking_display_check.isChecked():
-                self._on_marking_toggled(True)
 
     def _on_validation_execution_policy_changed(self, *_args) -> None:
         self._on_validation_context_changed(
@@ -13522,17 +12933,13 @@ class IndicatorFollowSignalValidationV5Window(
         preserve_marking: bool = False,
         session_republish: bool = False,
     ) -> IndicatorFollowSignalValidationRunRequest | None:
-        marking_preserved = bool(
-            preserve_marking and self._prepare_marking_policy_refresh()
-        )
-        if not marking_preserved:
-            self._disable_marking(clear_cache=True)
+        self._disable_marking(clear_cache=True)
         self._invalidate_user_background_results()
         self._settings_apply_after_validation = apply_after_validation
         run_request = self._request_validation(
             normal_base=normal_base,
             preserve_chart=preserve_chart,
-            preserve_marking=marking_preserved,
+            preserve_marking=False,
             session_republish=session_republish,
         )
         if run_request is None:
@@ -13751,153 +13158,7 @@ class IndicatorFollowSignalValidationV5Window(
             canvas.set_marker_records([])
         self.estimated_return_label.setText("")
 
-    def _prepare_marking_policy_refresh(self, *, preserve_range_results: bool = False) -> bool:
-        if (
-            not self.marking_display_check.isChecked()
-            or self._marking_times is None
-        ):
-            return False
-        self._marking_generation += 1
-        self._marking_key = None
-        self._marking_snapshot = None
-        self._marking_settings = None
-        self._marking_comparison_cache = None
-        self._marking_cache = None
-        self._marking_display_reprojection_pending = False
-        self._marking_pool_publication_pending = False
-        self._marking_policy_refresh_pending = True
-        self._invalidate_visualization_projection_data()
-        if not preserve_range_results:
-            self._clear_pending_execution_result_evidence()
-        return True
 
-    def _resume_marking_policy_refresh(self) -> bool:
-        def trace_resume(phase, reason):
-            try:
-                pending = bool(self._marking_policy_refresh_pending)
-                binding_pending = bool(self._v5_marking_binding_pending)
-                if reason == "PENDING_OR_BINDING":
-                    reason = "BINDING_PENDING" if pending else "NOT_PENDING"
-                binding = getattr(self, "_v5_marking_display_publication", None)
-                generations = {
-                    "marking_generation": self._marking_generation,
-                    "publication_request_generation": (
-                        binding[2] if isinstance(binding, tuple) and len(binding) == 4 else None),
-                }
-                flags = {
-                    "policy_refresh_pending": pending,
-                    "binding_pending": binding_pending,
-                    "checkbox_on": bool(self.marking_display_check.isChecked()),
-                    "times_present": self._marking_times is not None,
-                    "result_settings_valid": isinstance(
-                        self._result_settings_snapshot, ValidationSettingsSnapshot),
-                    "replay_snapshot_present": isinstance(
-                        self._replay_snapshot, ValidationReplaySnapshot),
-                    "normal_base_ready": bool(
-                        self._normal_base_requested and self._normal_base_ready),
-                }
-                if reason == "SETTINGS":
-                    flags["replay_settings_match"] = (
-                        not isinstance(replay_snapshot, ValidationReplaySnapshot)
-                        or settings.rules_hash == replay_snapshot.settings_hash)
-                    flags["result_settings_match"] = (
-                        isinstance(self._result_settings_snapshot, ValidationSettingsSnapshot)
-                        and settings.rules_hash == self._result_settings_snapshot.rules_hash)
-                trace_signal_validation_event(
-                    "window.marking.resume", window_key=id(self), phase=phase, reason=reason,
-                    **flags,
-                    **{name: value if type(value) is int and 0 <= value <= 1_000_000
-                       else None for name, value in generations.items()},
-                )
-            except Exception:
-                pass  # Collection and emission cannot change any resume guard.
-
-        trace_resume("entry", "ENTRY")
-        if (not self._marking_policy_refresh_pending
-                or self._v5_marking_binding_pending):
-            trace_resume("blocked", "PENDING_OR_BINDING")
-            return False
-        try:
-            settings = self._marking_current_settings()
-            replay_snapshot = self._replay_snapshot
-            normal_base_ready = bool(
-                self._normal_base_requested and self._normal_base_ready
-            )
-            if (
-                not self.marking_display_check.isChecked()
-                or self._marking_times is None
-                or not isinstance(
-                    self._result_settings_snapshot,
-                    ValidationSettingsSnapshot,
-                )
-                or (
-                    not normal_base_ready
-                    and not isinstance(replay_snapshot, ValidationReplaySnapshot)
-                )
-                or (
-                    isinstance(replay_snapshot, ValidationReplaySnapshot)
-                    and settings.rules_hash != replay_snapshot.settings_hash
-                )
-                or settings.rules_hash
-                != self._result_settings_snapshot.rules_hash
-            ):
-                trace_resume("blocked", "SETTINGS")
-                return False
-            times = self._marking_times
-            source_start = self._marking_source_start
-            calculation_times = {
-                str(candle.get("time") or "")
-                for candle in self._calculation_candles
-            }
-            if source_start not in calculation_times:
-                raise ValueError("MARKING_SOURCE_PREFIX_UNAVAILABLE")
-            indexes_by_time = {
-                str(candle.get("time") or ""): index
-                for index, candle in enumerate(self._candles)
-            }
-            if times[0] not in indexes_by_time or times[1] not in indexes_by_time:
-                raise ValueError("MARKING_TIMESTAMP_UNAVAILABLE")
-            left, right = indexes_by_time[times[0]], indexes_by_time[times[1]]
-            if not 0 <= left <= right < len(self._candles):
-                raise ValueError("MARKING_RANGE_UNAVAILABLE")
-            display_source = _detached_validation_candles(
-                self._candles[left : right + 1]
-            )
-            key = self._marking_source_key(
-                settings,
-                times,
-                prefix_start=source_start,
-                frozen_display=display_source,
-            )
-            self._marking_key = key
-            self._marking_display_source = display_source
-            self._marking_settings = settings
-            self._marking_policy_refresh_pending = False
-            self.marking_evaluation_requested.emit({
-                "generation": self._marking_generation,
-                "key": key,
-                "times": times,
-                "range": (left, right),
-                "settings": settings,
-                "calculation": _detached_validation_candles(
-                    self._calculation_candles
-                ),
-                "display": _detached_validation_candles(self._candles),
-                "mixed": self._display_only_integrated_active,
-                "descriptors": tuple(
-                    descriptor
-                    for descriptor in self._filter_display_descriptors(
-                        settings.to_dict()
-                    )
-                    if descriptor.family == FAMILY_PRICE_COMPARISON
-                ),
-            })
-            trace_resume("resumed", "RESUMED")
-            return True
-        except (TypeError, ValueError, KeyError) as exc:
-            trace_resume("blocked", "SOURCE_OR_RANGE")
-            self.marking_display_check.setToolTip(str(exc))
-            return False
 
     @staticmethod
     def _operator_warning_detail(value: object) -> str:
@@ -14341,7 +13602,6 @@ class IndicatorFollowSignalValidationV5Window(
             self._marking_timeframe_failure_identity = failure_identity
             self._disable_marking(clear_cache=True)
             self._marking_timeframe_failed = True
-            self.marking_display_check.setToolTip(str(message or "VALIDATION_FAILED"))
         self.validation_status_label.setText(operator_message)
         if self._replay_snapshot is None and not preserve_chart:
             self.loading_label.setText(operator_message)
@@ -14939,7 +14199,6 @@ class IndicatorFollowSignalValidationV5Window(
         self._historical_pool_signature = pool_signature
         self._calculation_candles = _detached_validation_candles(candles)
         self._native_m5_regular_close_times = ()
-        self._mark_revision_candidate_installed()
         self._display_only_integrated_candles = []
         self._display_only_integrated_active = False
         self._historical_pool_installed = True
@@ -15063,7 +14322,6 @@ class IndicatorFollowSignalValidationV5Window(
             else None
         )
         self._candles = _detached_validation_candles(display_candles)
-        self._mark_revision_candidate_installed()
         if cycles is not None:
             self._completed_cycles = cycles
             table = self.completed_cycle_table
@@ -15365,7 +14623,7 @@ class IndicatorFollowSignalValidationV5Window(
     def _marker_entries_for_display(self) -> list[ValidationReplayEntry]:
         # Full-validation entries may be retained for internal calculation,
         # but only an explicitly completed local range may publish idle
-        # BUY/SELL triangles. Marking has its separate frozen projection.
+        # BUY/SELL triangles.
         bounds = self._effective_validation_range()
         if not self._range_replay_entries_available or bounds is None:
             return []
@@ -15712,7 +14970,6 @@ class IndicatorFollowSignalValidationV5Window(
     def install_normal_base(
         self, settings_snapshot: ValidationSettingsSnapshot, timeframe_key: str, *,
         presentation: tuple[tuple[ValidationFilterDescriptor, ...], ValidationIndicatorSeriesCache] | None = None,
-        defer_marking_source_revision: bool = False,
         reuse_canvas: bool = False,
         session_view_anchor: tuple[_EntryChartViewAnchor, tuple[str, ...]] | None = None,
     ) -> None:
@@ -15766,7 +15023,6 @@ class IndicatorFollowSignalValidationV5Window(
             self._visualization_active_by_marker = {}
             self._visualization_current_key = self._visualization_projection_key(self._visualization_descriptors)
             self._visualization_data_error = ""
-        self._revalidate_marking_source()
         self._visualization_cache = self._clip_comparison_cache(self._visualization_descriptors, self._visualization_cache)
         self._refresh_lower_filter_presentations(
             settings_snapshot.to_dict(),
@@ -15815,9 +15071,6 @@ class IndicatorFollowSignalValidationV5Window(
             timeframe_key=timeframe_key, settings_snapshot=settings_snapshot,
         )
         self._refresh_filter_display_projection()
-        self._marking_pool_publication_pending = self._marking_revision_projection_pending()
-        if not defer_marking_source_revision and not self._marking_pool_publication_pending:
-            self._resume_marking_policy_refresh()
         if self._marking_timeframe_failed:
             identity = (self.stock.code, timeframe_key, settings_snapshot.rules_hash,
                         self.validation_regular_market_only_check.isChecked())
@@ -15831,21 +15084,6 @@ class IndicatorFollowSignalValidationV5Window(
                     and current_settings_hash == settings_snapshot.rules_hash):
                 self._marking_timeframe_failed = False
                 self._marking_timeframe_failure_identity = None
-        pending = self._marking_timeframe_pending
-        if pending == (self.stock.code, timeframe_key, settings_snapshot.rules_hash,
-                       self.validation_regular_market_only_check.isChecked()):
-            def resume_marking():
-                if (self._marking_timeframe_pending != pending
-                        or self.stock.code != pending[0]
-                        or self._normal_base_timeframe_key != pending[1]
-                        or self._result_settings_snapshot.rules_hash != pending[2]
-                        or self.validation_regular_market_only_check.isChecked() != pending[3]
-                        or normalize_validation_timeframe(self.basic_signal_interval_combo.currentText())["key"] != pending[1]):
-                    return
-                self._marking_timeframe_pending = None
-                if self.marking_display_check.isChecked():
-                    self._on_marking_toggled(True)
-            QTimer.singleShot(0, resume_marking)
         if self._validation_range is not None:
             self.validation_range_evaluation_requested.emit(*self._validation_range)
 
@@ -15885,8 +15123,7 @@ class IndicatorFollowSignalValidationV5Window(
                 }
                 or self._replay_snapshot is not None
                 or getattr(self, "_v5_incomplete_current_data_last", None) is not None
-                or self.validation_range is not None
-                or self.marking_display_check.isChecked()):
+                or self.validation_range is not None):
             return
         signal = result.get("signal")
         selection = signal if isinstance(signal, str) and signal in {"BUY", "SELL"} else "none"
@@ -16275,13 +15512,6 @@ class IndicatorFollowSignalValidationV5Window(
                 ):
                     self._marking_timeframe_failed = False
                     self._marking_timeframe_failure_identity = None
-            self._resume_marking_policy_refresh()
-            marking_pending = self._marking_timeframe_pending
-            if marking_pending is not None:
-                QTimer.singleShot(
-                    0,
-                    lambda identity=marking_pending: self._resume_published_timeframe_marking(identity),
-                )
         self._refresh_v5_incomplete_current_data_notice()
 
     def apply_range_replay_snapshot(
@@ -16910,6 +16140,11 @@ class IndicatorFollowSignalValidationV5Window(
     def _refresh_validation_range_results(
         self, *, refresh_tooltips: bool = True,
     ) -> None:
+        if self._effective_validation_range() is None:
+            self._populate_completed_cycles()
+            self.estimated_return_label.setText("")
+            self.result_summary_label.setText(self._chart_summary_text())
+            return
         if (
             (self._replay_snapshot is None and not self._range_replay_entries_available)
             or not self._candles
@@ -17221,9 +16456,6 @@ class IndicatorFollowSignalValidationV5Window(
         return True
 
     def _refresh_signal_tooltips_only(self) -> None:
-        if self._marking_snapshot is not None:
-            self._refresh_marking_projection()
-            return
         canvas = getattr(self, "canvas", None)
         if canvas is None or self._replay_snapshot is None:
             return
