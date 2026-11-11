@@ -205,12 +205,9 @@ def test_native_decision_publisher_reports_existing_outcome_once(
     records = r.records("marking_native_publisher")
     attempted = branch in {"waiting", "preparing", "completed", "completed_clear", "publish_error",
                            "other_prepare", "superseded"}
-    if logging_failure:
-        assert records == []
-    else:
-        assert records[-1]["reason"] == reason
-        assert records[-1]["publish_result"] == result
-        assert records[-1]["publish_attempted"] is attempted
+    assert records == []
+    assert work["state"] == ("WAITING" if not attempted or branch in {
+        "waiting", "other_prepare"} else "PREPARING")
     assert published == ([True] if attempted else [])
     assert dropped == ([False] if branch in {"window", "owner"} else
                        [True] if branch in {"receipt", "prepared_receipt"} else [])
@@ -238,21 +235,21 @@ def test_native_decision_collection_failure_leaves_drain_unchanged(native_decisi
     assert r.queued == []
 
 
-def test_native_decision_dedup_resets_only_for_new_generation(native_decision_case):
+def test_native_drain_does_not_trace_across_generations(native_decision_case):
     r = native_decision_case
     r.flow._prepare_active[r.key] = object()
     for _ in range(100):
         r.flow._start_pending_window_work(r.key)
-    assert len(r.records("marking_native_drain")) == 1
+    assert r.records("marking_native_drain") == []
     r.window._marking_generation += 1
     r.flow._start_pending_window_work(r.key)
     r.flow._request_generation[r.key] += 1
     r.flow._start_pending_window_work(r.key)
-    assert len(r.records("marking_native_drain")) == 3
+    assert r.records("marking_native_drain") == []
     r.window._marking_policy_refresh_pending = False
     r.window._v5_marking_binding_pending = False
     r.flow._start_pending_window_work(r.key)
-    assert len(r.records("marking_native_drain")) == 3
+    assert r.records("marking_native_drain") == []
 
 
 @pytest.mark.parametrize("branch, reason", [
@@ -280,8 +277,7 @@ def test_native_decision_drain_keeps_original_wait_and_exception_behavior(
     monkeypatch.setattr(r.flow, "_published_direct_current_snapshot", lambda *args: None)
     r.flow._start_pending_window_work(r.key)
     records = r.records("marking_native_drain")
-    assert records[-1]["reason"] == reason
-    assert records[-1]["diagnostic"]["pending_tr_tokens_count"] == 2
+    assert records == []
     before = list(r.queued)
     for _ in range(5):
         r.flow._start_pending_window_work(r.key)

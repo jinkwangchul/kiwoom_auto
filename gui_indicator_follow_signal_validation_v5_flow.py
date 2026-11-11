@@ -67,7 +67,6 @@ from gui_indicator_follow_signal_validation_v5_window import (
     _calculation_indexes_for_display,
     _calculation_indexes_for_mixed_display,
     _krx_regular_session_candles,
-    _v5_marking_diagnostic_state,
     prepare_signal_validation_presentation,
 )
 from indicator_follow_signal_validation_execution import ValidationVirtualPositionTracker
@@ -623,93 +622,6 @@ _V5_NATIVE_SNAPSHOT_CHECKS = (
     "snapshot_host_proof_current",
     "snapshot_forming_fresh",
 )
-
-
-def _trace_v5_native_decision(flow, key, event, reason, *, candidate=None, pending=None,
-                              publish_attempted=False, publish_result="NOT_ATTEMPTED",
-                              queue_check=None, snapshot_check=None,
-                              observation_present=None, observation_is_dict=None):
-    try:
-        current_pending = flow._native_selected_pending.get(key)
-        if pending is None:
-            pending = current_pending
-        window = flow._open_windows.get(key)
-        valid_pending = type(pending) is tuple and len(pending) == 3
-        if window is None and valid_pending and type(pending[1]) is dict:
-            window = pending[1].get("_v5_native_work", {}).get("owner", {}).get("window")
-        if window is None:
-            return
-        generation = flow._request_generation.get(key)
-        marking_generation = getattr(window, "_marking_generation", None)
-        context = (generation, marking_generation)
-        cache = window.__dict__.get("_v5_native_decision_trace")
-        if not (event == "marking_native_candidate"
-                or (publish_attempted and cache is not None and cache[0] == context)
-                or getattr(window, "_marking_policy_refresh_pending", False) is True
-                or getattr(window, "_v5_marking_binding_pending", False) is True):
-            return
-        pool = flow._historical_pools.get(key)
-        if candidate is None:
-            candidate = pending[1] if valid_pending else pool
-        session = flow._validation_sessions.get(key)
-        state = dict(
-            candidate_native_snapshot_present=(type(candidate) is dict
-                                               and candidate.get("native_live_snapshot") is not None),
-            candidate_is_pool=candidate is pool,
-            pending_tuple_present=valid_pending,
-            pending_session_current=valid_pending and pending[0] is session,
-            pending_generation_current=valid_pending and pending[2] == generation,
-            native_query_pending=key in flow._native_selected_pending,
-            pending_tr_tokens_count=len(flow._v5_native_tr_pending.get(key, ())),
-            prepare_active=key in flow._prepare_active,
-            prepare_pending=key in flow._prepare_pending,
-        )
-        if reason == "QUEUE_REJECTED" and queue_check in _V5_NATIVE_QUEUE_CHECKS:
-            state[queue_check] = False
-        if reason == "SNAPSHOT_NOT_CURRENT" and snapshot_check in _V5_NATIVE_SNAPSHOT_CHECKS:
-            state[snapshot_check] = False
-            if snapshot_check == "snapshot_observation_matches":
-                if type(observation_present) is bool:
-                    state["observation_present"] = observation_present
-                if type(observation_is_dict) is bool:
-                    state["observation_is_dict"] = observation_is_dict
-        if reason == "CANDIDATE_STATE":
-            reason = ("CANDIDATE_READY" if state["candidate_native_snapshot_present"]
-                      else "CANDIDATE_SNAPSHOT_MISSING")
-        elif reason == "PREPARE_OR_WINDOW_WAIT":
-            reason = ("PREPARE_ACTIVE" if state["prepare_active"] else
-                      "PREPARE_PENDING" if state["prepare_pending"] else "WINDOW_NOT_READY")
-        elif reason == "WORK_ACTIVE":
-            reason = "PREPARE_ACTIVE" if state["prepare_active"] else "RANGE_REPLAY_ACTIVE"
-        elif reason == "PUBLISH_OUTCOME":
-            work = candidate.get("_v5_native_work", {}) if type(candidate) is dict else {}
-            publish_result = ("PENDING_CLEARED" if current_pending is None else
-                              "SUPERSEDED" if current_pending is not pending else
-                              "PREPARING" if state["prepare_active"]
-                              and flow._prepare_active.get(key) is work.get("token") else "WAITING")
-            reason = "PUBLISH_" + publish_result
-        if reason not in _V5_NATIVE_DECISION_REASONS:
-            return
-        # A fixed reason set per marking/request generation never traces every tick.
-        if cache is None or cache[0] != context:
-            cache = (context, set())
-            window.__dict__["_v5_native_decision_trace"] = cache
-        decision = (event, reason)
-        if decision in cache[1]:
-            return
-        cache[1].add(decision)
-        _trace_v5_marking(
-            event, key, marking_generation, generation, reason=reason,
-            phase={"marking_native_candidate": "candidate",
-                   "marking_native_publisher": "publisher",
-                   "marking_native_drain": "pending_work"}.get(event),
-            timeframe_key=getattr(getattr(session, "request", None), "timeframe_key", None),
-            market_data_identity=(candidate.get("market_data_identity")
-                                  if type(candidate) is dict else None),
-            diagnostic=state, publish_attempted=publish_attempted, publish_result=publish_result,
-        )
-    except Exception:
-        pass  # Never call authority/readiness guards or change their exception handling.
 
 
 def _record_v5_marking(event, window_key, generation, request_generation, **fields):
@@ -3387,13 +3299,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         key = id(window)
 
         def rejected(check):
-            try:
-                _trace_v5_native_decision(
-                    self, key, "marking_native_candidate", "QUEUE_REJECTED",
-                    candidate=pool, publish_result="REJECTED", queue_check=check,
-                )
-            except Exception:
-                pass
             return True  # Preserve the original failed predicate and short-circuit.
 
         proof = pool.get("native_live_snapshot")
@@ -3493,25 +3398,18 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         pending = self._native_selected_pending.get(key)
         window = self._open_windows.get(key)
         if pending is None:
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "PENDING_ABSENT")
             return
         if window is None:
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "WINDOW_MISSING",
-                                      pending=pending, publish_result="REJECTED")
             self._drop_native_selected(key, pending)
             return
         session, pool, generation = pending
         if not self._native_selected_owner_is_current(window, session, pool, generation):
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "OWNER_NOT_CURRENT",
-                                      pending=pending, publish_result="REJECTED")
             self._drop_native_selected(key, pending)
             return
         proof = pool["native_live_snapshot"]
         work = pool["_v5_native_work"]
         if not self._live_native_snapshot_is_current(
                 window, session, pool, proof["request_id"], generation):
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "SNAPSHOT_NOT_CURRENT",
-                                      pending=pending, publish_result="REJECTED")
             self._drop_native_selected(key, pending, invalid=True)
             return
         if (key in self._prepare_active or key in self._prepare_pending
@@ -3519,37 +3417,23 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     window, key, require_base_ready=not (
                         work["owner"]["base_ready"]
                         and work["owner"]["marking_generation"] is not None))):
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "PREPARE_OR_WINDOW_WAIT")
             return
-        _diagnostic_publish_attempted = False
         try:
             view, deficit = self._normal_base_history_view(
                 session, pool, self._history_targets.get(key, self._historical_count))
             if deficit:
-                _trace_v5_native_decision(self, key, "marking_native_publisher", "HISTORY_DEFICIT")
                 return
             if not self._live_native_snapshot_is_current(
                     window, session, pool, proof["request_id"], generation, view):
-                _trace_v5_native_decision(self, key, "marking_native_publisher",
-                                          "PREPARED_SNAPSHOT_NOT_CURRENT", pending=pending,
-                                          publish_result="REJECTED")
                 self._drop_native_selected(key, pending, invalid=True)
                 return
             work["state"] = "PREPARING"
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "PUBLISH_ATTEMPT",
-                                      pending=pending, publish_attempted=True, publish_result="ATTEMPTED")
-            _diagnostic_publish_attempted = True
             self._use_pool_for_window(window, session, pool, evaluation_count=100,
                                       _normal_view=view)
             if (self._native_selected_pending.get(key) is pending
                     and self._prepare_active.get(key) is not work.get("token")):
                 work["state"] = "WAITING"
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "PUBLISH_OUTCOME",
-                                      pending=pending, publish_attempted=True)
         except ValueError:
-            _trace_v5_native_decision(self, key, "marking_native_publisher", "PUBLISH_VALUE_ERROR",
-                                      pending=pending, publish_attempted=_diagnostic_publish_attempted,
-                                      publish_result="ERROR")
             return
 
     def _live_sor_snapshot_is_current(self, window, session, pool, snapshot_key):
@@ -3599,16 +3483,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         read = getattr(market, "native_selected_observation_snapshot", None)
 
         def rejected(check):
-            try:
-                _trace_v5_native_decision(
-                    self, key, "marking_native_candidate", "SNAPSHOT_NOT_CURRENT",
-                    candidate=pool, publish_result="REJECTED", snapshot_check=check,
-                    **({"observation_present": observation is not None,
-                        "observation_is_dict": isinstance(observation, dict)}
-                       if check == "snapshot_observation_matches" else {}),
-                )
-            except Exception:
-                pass
             return True  # Preserve the original failed predicate and short-circuit.
 
         if ((not isinstance(proof, dict)
@@ -4193,7 +4067,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     def _start_pending_window_work(self, window_key: int) -> None:
         draining = self.__dict__.setdefault("_native_selected_draining", set())
         if window_key in draining:
-            _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_REENTRANT")
             return
         draining.add(window_key)
         try:
@@ -4206,12 +4079,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             window_key in self._prepare_active
             or window_key in self._range_replay_active
         ):
-            _trace_v5_native_decision(self, window_key, "marking_native_drain", "WORK_ACTIVE")
             return
         deferred = self._prepare_pending.get(window_key, {})
         if deferred.get("run_request") is not None:
             if self._v5_native_tr_pending.get(window_key):
-                _trace_v5_native_decision(self, window_key, "marking_native_drain", "TR_TOKENS_PENDING")
                 return
             self._prepare_pending.pop(window_key, None)
             window, request = deferred["window"], deferred["run_request"]
@@ -4222,19 +4093,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     and self._window_accepts_results(window)):
                 self._complete_history_extension(window_key, success=False)
                 self._run_validation(window, request, _resume_generation=deferred["generation"])
-            _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_RUN_REQUEST")
             return
         pending_prepare = self._prepare_pending.pop(window_key, None)
         if self._prepare_request_is_current(pending_prepare):
             self._range_replay_pending.pop(window_key, None)
             self._start_pool_prepare(pending_prepare)
-            _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_PREPARE_REQUEST")
             return
         if window_key in self._native_selected_pending:
             self._publish_pending_native_selected(window_key)
             if (window_key in self._native_selected_pending
                     or window_key in self._prepare_active):
-                _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_NATIVE_PENDING")
                 return
         window = self._open_windows.get(window_key)
         pending_range = self._range_replay_pending.pop(window_key, None)
@@ -4255,7 +4123,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 pending_range["range_uses_timestamps"] = timestamp_capable
                 pending_range["range_times"] = requested_times
             self._start_range_replay(pending_range)
-            _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_RANGE_REQUEST")
             return
         pending_history = self._history_extension_pending.get(window_key)
         window = self._open_windows.get(window_key)
@@ -4265,8 +4132,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             or any(key[0] == window_key for key in self._active_providers)
             or self._window_busy_epoch(window) is not None
         ):
-            _trace_v5_native_decision(self, window_key, "marking_native_drain",
-                                      "DRAIN_COMPLETE" if pending_history is None else "DRAIN_HISTORY_WAIT")
             return
         self._history_extension_pending.pop(window_key, None)
         needed = getattr(window, "_history_extension_is_needed", None)
@@ -4277,7 +4142,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             and needed()
         ):
             self._request_history_extension(window)
-        _trace_v5_native_decision(self, window_key, "marking_native_drain", "DRAIN_HISTORY_REQUEST")
 
     @staticmethod
     def _request_initial_validation(window: object) -> None:
@@ -10156,49 +10020,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         generation = self._request_generation.get(window_key, 0)
         request_key = (window_key, generation)
 
-        def trace_regular_warmup(phase, *, error=None, **counts):
-            return
-            try:
-                if error is not None:
-                    kind = type(error).__name__
-                    counts["exception_type"] = (
-                        kind if kind in {"RuntimeError", "ValueError", "TypeError",
-                                        "AttributeError", "KeyError", "OSError",
-                                        "TimeoutError", "ConnectionError"}
-                        else "OTHER"
-                    )
-                for key in (
-                    "incoming_first_time", "incoming_last_time",
-                    "missing_display_first_time", "missing_display_last_time",
-                ):
-                    if key in counts:
-                        stamp = counts[key]
-                        if not (isinstance(stamp, str)
-                                and re.fullmatch(r"[0-9]{14}", stamp)):
-                            counts[key] = ""
-                for key in ("source_result_reason", "source_result_error_code"):
-                    if key in counts:
-                        value = counts[key]
-                        if not (isinstance(value, str)
-                                and re.fullmatch(
-                                    r"(?:TR_|V5_|HISTORY_|HISTORICAL_|SOURCE_|BROKER_)[A-Z0-9_]{1,72}",
-                                    value)
-                                and not re.search(r"[0-9]{4,}", value)):
-                            counts[key] = ""
-                trace_signal_validation_event(
-                    "v5_historical_boundary",
-                    stage="native_warmup_handoff",
-                    timeframe=session.request.timeframe_key,
-                    generation=generation,
-                    phase=phase,
-                    pool_rows_count=len(rows),
-                    display_count=len(display),
-                    initial_warmup_deficit=deficit,
-                    **counts,
-                )
-            except Exception:
-                pass  # Diagnostics cannot affect the native source gate.
-
         def publish(source_error_code=None):
             if (self._open_windows.get(window_key) is not window
                     or self._request_generation.get(window_key, 0) != generation
@@ -10315,14 +10136,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 **self._broker_al_m1_provider_options(session),
             )
             request_latest = provider.request_latest
-        except Exception as exc:
-            trace_regular_warmup("provider_init_error", error=exc)
+        except Exception:
             publish()
             return True
-
-        native_retry_cap = None
-        native_retry_attempts = 0
-        previous_native_deficit = deficit
 
         def request_more(request_count):
             if (self._open_windows.get(window_key) is not window
@@ -10343,11 +10159,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 return
             self._active_providers[request_key] = provider
             native_tr_token = object()
-            callback_consumed = False
 
             def completed(result):
-                nonlocal fresh_native, callback_consumed
-                nonlocal native_retry_cap, native_retry_attempts, previous_native_deficit
+                nonlocal fresh_native
                 self._finish_v5_native_tr(window_key, native_tr_token, verified=(
                     isinstance(result, ValidationHistoricalResult) and result.ok is True),
                     error=getattr(result, "error", None))
@@ -10357,7 +10171,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if self._request_generation.get(window_key, 0) != generation:
                     return
                 if native_minute_restore or frozen_m5_extension:
-                    retry_count = None
                     handoff_stage = "source_identity"
                     handoff_snapshot = getattr(result, "snapshot", None)
                     handoff_incoming_count = None
@@ -10365,11 +10178,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     handoff_first_display_index = None
                     candidate_deficit = None
                     handoff_reason = ""
-                    handoff_incoming_first_time = ""
-                    handoff_incoming_last_time = ""
-                    handoff_missing_display_count = None
-                    handoff_missing_display_first_time = ""
-                    handoff_missing_display_last_time = ""
                     try:
                         if frozen_m5_extension:
                             self._direct_tr_snapshot(session, original_pool)
@@ -10387,7 +10195,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         handoff_incoming_count = len(incoming)
                         handoff_stage = "quantity_provenance"
                         proven_response_count = (snapshot.rows_count if frozen_m5_extension else len(incoming))
-                        native_minutes = session.request.timeframe_minutes
                         if (not self._direct_selected_query_valid(
                                     query, session.request.stock,
                                     session.request.timeframe_key,
@@ -10433,9 +10240,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         candidate_view, candidate_deficit = self._normal_base_history_view(
                             session, candidate, history_target,
                             dict(candidate_selected, display_candles=fresh_display))
-                        if candidate_deficit and not terminal_short_response:
-                            if retry_count is not None:
-                                raise ValueError("HISTORY_SOURCE_WARMUP_INSUFFICIENT")
                         handoff_stage = "receipt_binding"
                         for bound in (candidate, candidate_view):
                             bound["snapshot"] = ValidationHistoricalSnapshot(
@@ -10468,10 +10272,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             source_result_ok=getattr(result, "ok", None),
                             source_result_reason=getattr(result, "reason", None),
                         )
-                    if retry_count is not None:
-                        self._active_providers[request_key] = provider
-                        QTimer.singleShot(0, lambda: request_more(retry_count))
-                        return
                     publish(None)
                     return
                 self._retain_broker_al_m1_result(window_key, result)
@@ -10490,7 +10290,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 publish()
 
             try:
-                trace_regular_warmup("request", requested_count=request_count)
                 if window_key in self._v5_manual_retry_required:
                     if (
                         self._v5_manual_retry_authorized_generation.get(window_key)
@@ -10512,10 +10311,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     )
                 self._begin_v5_native_tr(window_key, native_tr_token)
                 request_latest(request_count, completed)
-            except Exception as exc:
+            except Exception:
                 self._finish_v5_native_tr(window_key, native_tr_token)
-                trace_regular_warmup(
-                    "request_dispatch_error", requested_count=request_count, error=exc)
                 self._active_providers.pop(request_key, None)
                 publish()
 

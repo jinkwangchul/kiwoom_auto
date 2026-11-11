@@ -1,6 +1,16 @@
 # SOR·NXT·KRX 통합 캔들 / 차트검증 V5·실매매 공용엔진 — 현행 작업 프롬프트
 
-현행 작업 기준: 2026-11-11 기능축소 **1·2·3순위 한정 코드 반영·독립 변경 감사 완료**. 3순위는 V5 전용 틱 소비 제외와 **실제 직접 TR CURRENT 조회값의 표시·계산 동결**이다. 아래의 **확정 방향 / 실제 검증 범위 / 잔여 미확인**을 구분한다. 실제 GUI·전체 13개 기준봉 runtime·기존 M3 증빙 오류 해결 또는 실매매 정상 운영을 완료로 간주하지 않는다.
+현행 작업 기준: 2026-11-12 기능축소 **1·2·3순위 코드 반영과 4순위 진단 코드 정리·한정 회귀·독립 감사 완료, 최신 코드 실제 GUI 확인 대기**. V5는 실제 직접 TR CURRENT의 조회값을 표시·계산에 동결한다. 실제 GUI·전체 13개 기준봉 runtime·기존 M3 증빙 오류 해결 또는 실매매 정상 운영을 완료로 간주하지 않는다.
+
+## 2026-11-12 4순위 코드 정리 완료 — 실제 GUI 확인 대기
+
+- 사용자 진행 승인에 따라 **진단 전용·사장 코드만 정리**한다. CLI Astra 조사와 웹앱 Astra·Terra 방향 감사 완료, 구현은 Sol 단독이다.
+- **허용 4파일:** V5 flow/window, 기존 `tests/test_v5_marking_signal_diagnostics.py`, `tests/test_indicator_follow_signal_validation_v5_diagnostic_range_trace.py`. 새 파일·공용 코드·실매매 경로 수정은 하지 않는다.
+- flow의 `_trace_v5_native_decision`·21개 호출·전용 중복억제 상태, 무조건 return 뒤의 `trace_regular_warmup`·3개 호출·전용 사장 변수/불가능 분기, window의 `_trace_range_replay_parity_evidence`·호출·전용 import를 정리한다. 실제 `rejected(check)`의 `return True`·단락평가 순서·callback 소비·publication/drain/원천/세대/취소/CURRENT 동결 보호와 공용 writer는 유지한다.
+- **변경 전 기준:** scoped commit `7eba48f450d95d6e0a919402970abdb8447cb7db`, ref `refs/heads/recovery/v5_diagnostics_phase4-20261112-96916241`. P3 보관본에 기존 진단 테스트 원본 1개를 추가한 12경로 한정 기록이며 전체 프로젝트 복원점이 아니다. 기존 브랜치·HEAD·index·다른 WIP는 유지한다.
+- **코드 결과:** Sol이 위 4파일만 수정했다. flow 203줄·window 133줄, **프로그램 코드 336줄 순감소**와 기존 테스트 113줄 순감소(총 449줄)다. 범위 밖 fixture가 소비하는 `signal_validation_trace_enabled` import 1개는 유지했다. 신규 파일·공용/실매매 코드 변경은 없다.
+- **검증·감사:** 진단 제거 전 RED(2 failed·1 passed) 확인 후 지정된 P3 동결·기간선택·진단·원천/세대·M15 handoff 8대상 **151 passed, 20.14초, exit 0**를 확인했다. CLI Astra는 before `7eba48f450d95d6e0a919402970abdb8447cb7db` → code review tree `48ab45c9c15215049c0fa76fd34ffc61bf2b7eb4`의 4파일 삭제를 독립 검토해 **APPROVE, Critical/Important 0**으로 판정했다. source/receipt/generation·실제 callback·publication/drain/거절 조건 및 실제 BUY/SELL 결과 검증을 유지했다.
+- **다음 실제 확인:** 기존 PID14952의 시작은 현재 source 수정 전이므로 최신 코드 GUI 증거가 아니다. **프로그램 재시작 승인 및 최신 코드 로드 확인 후 실제 차트 확인**을 진행한다. 자동 재시작·브로커/주문·TR 실행은 하지 않았다. 기존 W1/MO1 2검사·M5 fixture 3검사의 최종 통과 및 M3 reader=None 실환경 해결을 이번 151개 PASS로 대체하지 않는다.
 
 ## 2026-11-11 기능축소 작업연계 — 최우선 상태와 승인 범위
 
@@ -29,7 +39,7 @@
 
 ### 검사·진단 정리 기준
 - **전용성이 확인된 부분만 제거 후보:** 독립 마킹 토글·전용 대기/재시도/캐시·전환 stack trace, 정규장 토글 전용 재투영·재계산·설정 적용. 실제 남는 호출자를 분리한 뒤 승인 범위에서 정리하며 함수·파일 전체 삭제를 먼저 결정하지 않는다.
-- **선택적 축소 후보:** `_trace_marking_toggle`, `_trace_v5_marking`, `_trace_v5_native_decision`, `_trace_range_replay_parity_evidence`, 원천 실패 설명용 trace. 공유 writer·이전 flow·host/API의 실제 사용 경로는 보존한다. 진단 정리 자체를 기능 완성의 선행조건으로 삼거나 미측정 성능 향상을 단정하지 않는다.
+- **진단 정리 상태(2026-11-12):** `_trace_v5_native_decision`·`_trace_range_replay_parity_evidence` 및 사장 warmup 진단은 4순위에서 제거했다. `_trace_marking_toggle`은 기존에도 정의·호출이 없었다. 살아 있는 `_trace_v5_marking`, 공유 writer·이전 flow·host/API의 실제 사용 경로는 보존한다. 추가 진단 정리를 기능 완성의 선행조건으로 늘리거나 미측정 성능 향상을 단정하지 않는다.
 - **유지 필수인 보호 목적:** 원천/종목/시장/세션/요청·응답/순서/OHLCV 증빙, 요청 세대·취소·늦은 결과 차단, 기간선택 결과 identity·freshness, 필터 준비도·자료 부족 구분. queue 진입·live_current 적용·scan 완료는 별도 비동기 경계지만 모든 기존 비교식을 그대로 유지하라는 뜻은 아니다. 위 수신봉 방침에 따라 실제 필요한 보호는 남기고, 근거가 확인된 중복 전수검사·과잉 차단만 축소한다.
 - **테스트:** 폐지 기능의 공존 기대·진단 문구 검사는 조정 후보이나, 기간선택 결과·해제·drain·receipt·실매매 공용 보호 검사는 유지한다. 테스트 파일 삭제와 실행부 단순화는 별개이며 현재는 삭제하지 않았다.
 
@@ -39,7 +49,7 @@
 - **3순위 구현·독립 감사 완료 범위 (2026-11-11):** Codex Sol 단독으로 V5 flow와 새 전용 테스트 `tests/test_v5_tr_snapshot_freeze_20261111.py`만 수정·생성했다. 실제 직접 TR의 CURRENT 수신본을 영수증·원본내용·요청 세대에 묶어 **조회값 그대로 표시·지표·필터·기간선택 계산에 유지**하고 V5의 native tick·M1 parity tick 소비 및 공유 M1 live 투영 의존을 제거했다. 새 인증 TR·원천 전환·취소·실제 세션 검증은 유지했다. 공용 host/API·관제 실매매/모의/간이차트·V5 window는 변경하지 않았다. Astra 최초 변경 감사의 중요 5건(기존 게시본 재표시, 과거 이력 병합 전 검증, worker 최종 설치 세션 검증, M5 직접봉 확장 영수증, KRX FULL 기간봉 수신증빙)을 정정했고, 마지막 KRX FULL/REGULAR validator 분기까지 독립 재감사 **APPROVE**를 받았다.
 - **3순위 최신 한정 검증:** 기존 소스 변경 후 신규 P3 테스트 57개·기간선택 25개·기존 증빙 보호 4개, **총 86개 동시 통과**(Python 3.11 32-bit, 오프스크린, 실제 ActiveX/브로커 미사용). 최종 KRX 분기 정정은 새 테스트 1개에서 RED→GREEN 및 기존 86개 별도 통과(1 deselected)를 확인했다. 서로 다른 시점의 결과를 87개 동시 통과라고 표현하지 않는다. legacy `test_incomplete_hidden_warmup_prefix_is_rejected[False-W1/False-MO1]`의 기존 2건 실패는 변조 입력의 조기 거절 위치 차이로 보고되었으나 최종 전체 재검증·해당 두 검사 통과는 확인하지 않았다. 실제 GUI·13개 기준봉 실수신/runtime·M3 `reader=None`·실매매 운영은 미확인이다.
 - **2순위 보완 1차 결과:** 검토된 코드 tree는 `0712a571d376913e418a0a0a0c927e381f6d06b9` → `220c0242e139b0c75127174fd267e6f0d387b063`다. flow의 기존 장 종료 후 FULL M1 검증·반환만 복구했고 REGULAR 투영은 복구하지 않았다. history-pool 12개·sparse-axis 4개 변조는 각각 독립적인 정상 FULL 통과 대조군에서 실제 보호 검사에 도달하며, stale/legacy 거절은 별도로 유지했다. 기존 closed-session M1 파일은 수정 없이 실행했다. 보완 후 해당 경로 27개 통과(3.49초, exit 0), 이 diff만 재감사했다. 이전 176개 전체를 보완 후 재실행한 것은 아니며 두 결과를 합산하지 않는다.
-- **비차단 잔여 정리:** flow의 퇴역 warmup 진단 본문/호출과 retry/callback 지역변수 잔존은 Minor로 기록하며 후순위 전용 진단 정리에서 다룬다. M5 fixture 3건의 정정 제안은 현 수정 허용 파일 밖이므로 이번 보완에서 실행하지 않으며 위 미확인 상태를 유지한다.
+- **2순위 당시 비차단 잔여:** flow의 퇴역 warmup 진단·retry/callback 사장 변수는 **2026-11-12 4순위에서 정리 완료**했다. M5 fixture 3건의 정정 제안은 해당 수정 허용 파일 밖이므로 실행하지 않았으며 위 미확인 상태를 유지한다.
 - **2순위 검증 기록:** 첫 구현 후보(보완 전)의 한정 176개 노드 실행은 173개 통과·3개 실패(53.59초, exit 1)다. 실패는 `test_full_m5_display_and_normal_base_keep_native_special_separate[True/False]`와 `test_full_m5_special_rows_do_not_satisfy_hidden_context_envelope`이며, 해당 파일은 수정하지 않았다. 변경 전 snapshot F/W를 메모리에서 읽어 같은 3개를 실행해도 fixture의 `_native_m5_response_receipts` 부재로 실패했다. 이는 변경 전 동일 실패 재현이며 운영 결함·이번 변경 무관의 확정 판정이 아니다. 해당 M5 보존/deficit 1 본검증은 도달하지 못했으므로 통과로 기록하지 않는다.
 - **2순위 구현 경계:** 생산 수정은 V5 flow/window 두 파일, 테스트 수정은 기존 `test_v5_hts_native_regular_period_20261030.py`·`test_v5_replay_sparse_display_axis_20261101.py`·`test_v5_history_pool_policy_20261031.py`·`test_indicator_follow_signal_validation_v5_baseline.py`·`test_v5_marking_range_independence_20261110.py`로 한정한다. V5 수집·요청 진입에서 옛 ON 설정을 복사/불변 생성자로 OFF 해석하고 UI·토글·session_republish 전용 경로만 제거한다. AL/KRX 모두 REGULAR 증빙·투영 캐시를 FULL pool로 만들기 전에 거절하며, 일반 전환·원천 검사·표시 전용 봉 제외·1순위 publication 실패 소유권을 유지한다. 테스트의 폐기 토글 기대만 정정하고 원천·세션·세대·취소 보호를 약화하지 않는다.
 - **2순위 되돌리기 기준:** 구현 전 commit `9d794a75bee220b7bdcd95abc49fda6876cba20e`, ref `refs/heads/recovery/v5_full_scope_phase2-20261111-610abb83`. 1순위 보관본에 이번 허용 테스트 원본 3개를 추가한 지정 10경로 한정 기록이며 전체 프로젝트 복원점이 아니다. 기존 WIP·활성 브랜치·실제 index는 유지한다.
@@ -47,7 +57,7 @@
 - **1순위 변경 파일:** V5 `gui_indicator_follow_signal_validation_v5_flow.py`·`gui_indicator_follow_signal_validation_v5_window.py`, 기존 `tests/test_v5_marking_range_independence_20261110.py`·`tests/test_v5_marking_signal_diagnostics.py`, 이 현행 문서다. freshness·regular-period 보호 테스트와 공용 host/API·실매매·모의·간이차트·정규장 옵션·CURRENT·틱 정책은 변경하지 않았다.
 - **1순위 되돌리기 기준:** 변경 전 commit `14396ee02dc7e545b0304cfde5252cc27a26ee61`, 작업별 보관 ref `refs/heads/recovery/v5_range_phase1-20261111-1502db9e`. 이 기록은 지정 6개 코드/테스트와 현행 SOR의 7개 경로 한정이며 전체 프로젝트 복원점이 아니다. 현재 WIP·활성 브랜치·index를 덮어쓰는 전체 checkout/reset에 사용하지 않는다.
 - **1순위 구현 경계:** V5 flow/window의 독립 마킹 UI·실행·자동 재개·기간선택 무효화 경로만 제거한다. 공용 publication·receipt 바인딩과 실제 준비 중 대기는 보존하고, 유효한 바인딩 후 기존 drain에서 기간선택을 한 번 실행한다. 선택 해제는 가상 결과만 지운다. 기존 관련 테스트 4개의 폐지 계약 기대만 조정하며, 원천·세대·취소·CURRENT·정규장 보호를 약화하지 않는다. 허용한 6개 코드/테스트 파일 외 변경이 필요하면 별도 승인 전 멈춘다.
-- **승인된 우선순위:** 짧은 방침 반영 → ① 사용 가능한 기간선택 확보와 독립 마킹 분리/축소 → ② 정규장 옵션 경로 정리 → ③ V5 전용 틱 소비 제거·네이티브 CURRENT 조회 시점 동결 → ④ 잔여 전용 진단 정리·최종 핵심 확인. ①·②·③은 **승인된 축소 범위의 코드 반영과 한정 독립 변경 감사까지 완료**했다. ④는 잔여 V5 전용 진단 정리 및 실제 핵심 경로 확인이며, 1·2·3순위를 이유 없이 다시 구현하거나 전체 V5 완료로 확대 보고하지 않는다.
+- **승인된 우선순위:** ① 기간선택 확보·독립 마킹 분리 → ② 정규장 옵션 제거·OFF/FULL → ③ V5 전용 틱 소비 제거·CURRENT 조회값 동결 → ④ 전용 진단 정리·최종 핵심 확인. ①~③ 코드 반영과 ④의 코드 정리·한정 회귀·독립 변경 감사는 완료했다. **남은 우선 작업은 재시작 승인 후 최신 코드의 실제 차트 핵심 기능 확인**이다. 완료한 축소 코드를 이유 없이 다시 구현하거나 전체 V5 완료로 확대 보고하지 않는다.
 - 구현은 Codex Sol 단일 담당, 코드·오류 분석은 Codex CLI Astra, 기술 감사는 웹앱 Astra, 계약·방향 감사는 웹앱 Terra가 맡는다. 하나의 승인 범위 안에서는 기능별로 연속 진행하고 각 변경의 핵심 영향만 확인한 뒤 마지막에 필요한 통합 확인을 한다.
 - 새로운 광범위 조사·진단 코드·전수 검증을 자동 선행과제로 만들지 않는다. 필요한 복원·회귀 확인은 보존하고, 새 위험·공용 엔진 영향·범위 확대가 확인되면 사용자에게 확인한다.
 - 완료 범위는 **승인된 축소 후 기능**으로 갱신한다. 폐지할 독립 마킹과 미결정 옵션을 과거 계약만 보고 다시 구현 목표로 되살리지 않는다. 13개 기준봉 로딩·필터·기간선택·결과 해제·전환/재진입·탐색과 공용 경계 보존은 실제 확인 범위대로 보고한다.
