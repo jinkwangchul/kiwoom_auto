@@ -73,7 +73,6 @@ from indicator_follow_signal_validation_projection import (
     project_signal_validation_rules,
     project_signal_validation_ui_state,
     project_validation_execution_state,
-    project_validation_market_scope,
     require_resolved_buy_bollinger_sign_selection,
     require_expression_aware_sell_price_selections,
 )
@@ -8331,7 +8330,6 @@ class IndicatorFollowSignalValidationV5Window(
         self._historical_pool_signature: tuple[int, str, str] | None = None
         self._preserve_view_on_next_replay = False
         self._pending_history_extension_view_anchor: _HistoryExtensionViewAnchor | None = None
-        self._session_display_republish_pending: ValidationSettingsSnapshot | None = None
         self._history_browse_installing = False
         self._pending_prepared_presentation: PreparedSignalValidationPresentation | None = None
         self._pending_prepared_visualization_epoch: int | None = None
@@ -8938,11 +8936,6 @@ class IndicatorFollowSignalValidationV5Window(
         self.validation_regular_market_separator = (
             self._new_basic_header_spaced_separator()
         )
-        self.validation_liquidation_separator = (
-            self._new_basic_header_spaced_separator()
-        )
-        self.validation_regular_market_only_check = QCheckBox("정규장만 표시")
-        self.validation_regular_market_only_check.setChecked(False)
         self.validation_range_liquidation_check = QCheckBox("청산")
         self.validation_range_liquidation_check.setChecked(False)
         self.validation_range_liquidation_check.setObjectName(
@@ -8957,8 +8950,6 @@ class IndicatorFollowSignalValidationV5Window(
             self.validation_trading_cost_box,
             self.validation_regular_market_separator,
             self.validation_range_liquidation_check,
-            self.validation_liquidation_separator,
-            self.validation_regular_market_only_check,
         ):
             self.basic_header_row.insertWidget(
                 self.basic_header_row.count() - 1,
@@ -9625,7 +9616,6 @@ class IndicatorFollowSignalValidationV5Window(
             canvas.discard_pointer_interaction()
 
     def _invalidate_user_background_results(self) -> None:
-        self._session_display_republish_pending = None
         self.clear_candle_preview(self._candle_preview_token)
         self._cancel_visualization_projection_work()
         self.chart_input_invalidated.emit()
@@ -10295,14 +10285,10 @@ class IndicatorFollowSignalValidationV5Window(
         state = super().collect_indicator_follow_ui_state()
         if hasattr(self, "validation_repeat_mode_combo"):
             state["validation_execution"] = self._collect_validation_execution_state()
-        if hasattr(self, "validation_regular_market_only_check"):
-            state["validation_market_scope"] = project_validation_market_scope({
-                "validation_market_scope": {
-                    "regular_market_only": (
-                        self.validation_regular_market_only_check.isChecked()
-                    ),
-                },
-            })
+        scope = state.get("validation_market_scope")
+        scope = dict(scope) if isinstance(scope, Mapping) else {}
+        scope["regular_market_only"] = False
+        state["validation_market_scope"] = scope
         return state
 
     def _apply_projected_signal_validation_ui_state(self, projected):
@@ -10364,17 +10350,6 @@ class IndicatorFollowSignalValidationV5Window(
         self.validation_trading_cost_percent_line.setText(
             str(policy["trading_cost_percent"])
         )
-
-        market_scope = project_validation_market_scope(
-            projected if isinstance(projected, dict) else {}
-        )
-        regular_blocker = QSignalBlocker(
-            self.validation_regular_market_only_check
-        )
-        self.validation_regular_market_only_check.setChecked(
-            market_scope["regular_market_only"]
-        )
-        del regular_blocker
 
         result.setdefault("applied", []).append("validation_execution")
         result.setdefault("applied", []).append("validation_market_scope")
@@ -10645,7 +10620,6 @@ class IndicatorFollowSignalValidationV5Window(
             "active_compare": self.validation_active_compare_combo.currentText(),
             "trading_cost_enabled": self.validation_trading_cost_enabled_check.isChecked(),
             "trading_cost_percent": self.validation_trading_cost_percent_line.text(),
-            "regular_market_only": self.validation_regular_market_only_check.isChecked(),
             "filter_display_enabled": self.filter_display_check.isChecked(),
         }
 
@@ -10672,7 +10646,6 @@ class IndicatorFollowSignalValidationV5Window(
             self.validation_active_compare_combo,
             self.validation_trading_cost_enabled_check,
             self.validation_trading_cost_percent_line,
-            self.validation_regular_market_only_check,
             self.filter_display_check,
         )
         blockers = [QSignalBlocker(control) for control in controls]
@@ -10680,7 +10653,6 @@ class IndicatorFollowSignalValidationV5Window(
             bool_fields = (
                 ("averaging_enabled", self.validation_averaging_enabled_check),
                 ("trading_cost_enabled", self.validation_trading_cost_enabled_check),
-                ("regular_market_only", self.validation_regular_market_only_check),
                 ("filter_display_enabled", self.filter_display_check),
             )
             for key, control in bool_fields:
@@ -10723,7 +10695,6 @@ class IndicatorFollowSignalValidationV5Window(
         controls = (
             self.validation_averaging_enabled_check,
             self.validation_trading_cost_enabled_check,
-            self.validation_regular_market_only_check,
             self.filter_display_check,
         )
         for control in controls:
@@ -10811,7 +10782,6 @@ class IndicatorFollowSignalValidationV5Window(
             self.validation_trading_cost_enabled_check,
         )
         display_only_checkboxes = (
-            self.validation_regular_market_only_check,
             self.validation_range_liquidation_check,
             self.filter_display_check,
         )
@@ -10827,9 +10797,6 @@ class IndicatorFollowSignalValidationV5Window(
         )
         self.validation_trading_cost_enabled_check.toggled.connect(
             self._on_validation_execution_policy_changed
-        )
-        self.validation_regular_market_only_check.toggled.connect(
-            self._on_validation_regular_market_display_changed
         )
         self.validation_range_liquidation_check.toggled.connect(
             self._on_validation_range_liquidation_changed
@@ -12188,7 +12155,7 @@ class IndicatorFollowSignalValidationV5Window(
             self.stock.code,
             settings,
             times,
-            regular_only=self.validation_regular_market_only_check.isChecked(),
+            regular_only=False,
             calculation_candles=self._calculation_candles,
             display_candles=display,
             prefix_start=prefix_start,
@@ -12561,154 +12528,6 @@ class IndicatorFollowSignalValidationV5Window(
             canvas._visualization_descriptors,
         ))
 
-    def _on_validation_regular_market_display_changed(self, *_args) -> None:
-        try:
-            current_ui_state = self.collect_indicator_follow_ui_state()
-            previous_ui_state = dict(current_ui_state)
-            previous_market_scope = dict(
-                current_ui_state.get("validation_market_scope", {})
-            )
-            previous_market_scope["regular_market_only"] = (
-                not self.validation_regular_market_only_check.isChecked()
-            )
-            previous_ui_state["validation_market_scope"] = previous_market_scope
-            # Acknowledge this display toggle only when no other draft changed.
-            if self._signal_ui_fingerprint(previous_ui_state) == self._confirmed_signal_ui_fingerprint:
-                self._confirmed_signal_ui_fingerprint = (
-                    self._signal_ui_fingerprint(current_ui_state)
-                )
-        except Exception:
-            pass
-        timeframe_key = normalize_validation_timeframe(
-            self.basic_signal_interval_combo.currentText()
-        )["key"]
-        # A display-only toggle acts on the published chart, not a stale
-        # selection widget. A pending native request still owns its new key.
-        published_snapshot = self._replay_snapshot
-        published_key = (
-            published_snapshot.timeframe_key
-            if isinstance(published_snapshot, ValidationReplaySnapshot)
-            else getattr(self, "_normal_base_timeframe_key", None)
-        )
-        if (self._pending_result_settings_snapshot is None
-                and bool(self._calculation_candles)
-                and getattr(self, "canvas", None) is not None
-                and isinstance(published_key, str) and published_key):
-            timeframe_key = published_key
-        if timeframe_key in {"D1", "W1", "MO1", "Y1"}:
-            # Native HTS regular-only candles have different OHLCV from full
-            # periods. The checkbox must reload OPT10101~04, not filter
-            # midnight-stamped daily/weekly/monthly/yearly bars by time.
-            self._discard_chart_input()
-            self._clear_validation_range_interaction()
-            self._marking_timeframe_failed = False
-            self._on_validation_context_changed(
-                normal_base=True, preserve_chart=True,
-            )
-            return
-        if not self._calculation_candles or getattr(self, "canvas", None) is None:
-            self._disable_marking(clear_cache=True, refresh=False)
-            self._clear_validation_range_interaction()
-            self._on_validation_context_changed(normal_base=True, preserve_chart=True)
-            return
-        # Capture the view before range clearing can restore the normal base.
-        view = self._current_chart_view_state()
-        center_position = view.visible_start_index + view.visible_candle_span / 2.0
-        center_index = min(len(self._candles) - 1, max(0, math.floor(center_position)))
-        center_time = (
-            _parse_candle_time(self._candles[center_index].get("time"))
-            if self._candles else None
-        )
-        center_fraction = center_position - center_index
-        selected = view.selected_evaluation_index
-        selected_time = (
-            self._candles[selected].get("time")
-            if isinstance(selected, int) and not isinstance(selected, bool)
-            and 0 <= selected < len(self._candles) else None
-        )
-        self._disable_marking(clear_cache=True, refresh=False)
-        self._clear_validation_range_interaction()
-        replay_snapshot = self._replay_snapshot
-        if (
-            (not isinstance(replay_snapshot, ValidationReplaySnapshot)
-             and not self._normal_base_ready and not self._range_replay_from_normal_base)
-            or not self._calculation_candles
-        ):
-            return
-        regular_only = self.validation_regular_market_only_check.isChecked()
-        display_only_integrated = (
-            not regular_only and bool(self._display_only_integrated_candles)
-        )
-        chart_count = min(
-            self._historical_candle_count,
-            len(self._display_only_integrated_candles) if display_only_integrated
-            else len(self._calculation_candles),
-        )
-        display_candles = (
-            self._display_only_integrated_candles[-chart_count:]
-            if display_only_integrated
-            else self._calculation_candles[-chart_count:]
-        )
-        if regular_only:
-            # Select from the complete verified calculation axis before
-            # applying the display cap; filtering a capped FULL tail loses
-            # older available regular-session bars.
-            display_candles = _krx_regular_session_candles(
-                self._calculation_candles,
-                native_m5_close_times=(self._native_m5_regular_close_times
-                                       if timeframe_key == "M5" else ()),
-            )[-self._historical_candle_count:]
-        if not display_candles:
-            self._replay_snapshot = None
-            self._normal_base_ready = False
-            self._on_validation_context_changed(normal_base=replay_snapshot is None)
-            return
-        # Range replay and derived cycles belong to the previous visible domain.
-        self._clear_range_replay_override()
-        self._completed_cycles = []
-        self._signal_tooltips = {}
-        self._signal_tooltip_provenance = None
-        self.set_historical_display_candles(
-            display_candles,
-            display_only_integrated=display_only_integrated,
-            preserve_completed_cycles=False,
-        )
-        self._preserve_view_on_next_replay = True
-        self._replay_snapshot = None
-        # Withdraw the previous scope's indicators/signals while its replacement runs.
-        self._visualization_descriptors = ()
-        self._visualization_cache = None
-        self._visualization_active_by_marker = {}
-        self._visualization_lower_filter_presentations = ()
-        self._install_normal_chart_canvas(timeframe_key, [], defer_scrollbar_sync=True)
-        # A display filter changes index/price domains; retain time, not the old Y view.
-        timed_indexes = [
-            (stamp, index)
-            for index, candle in enumerate(self._candles)
-            if (stamp := _parse_candle_time(candle.get("time"))) is not None
-        ]
-        start = view.visible_start_index
-        span = self._clamped_visible_candle_span(view.visible_candle_span)
-        if center_time is not None and timed_indexes:
-            _, center_index = min(
-                timed_indexes, key=lambda item: abs(item[0] - center_time),
-            )
-            start = center_index + center_fraction - span / 2.0
-        self._set_time_view(
-            start, span,
-            manually_adjusted=view.time_scale_manually_adjusted,
-            auto_fit_price=True,
-        )
-        self._selected_index = next((
-            index for index, candle in enumerate(self._candles)
-            if selected_time is not None and candle.get("time") == selected_time
-        ), None)
-        self.canvas.set_selected_index(self._selected_index)
-        self._refresh_validation_range_results()
-        self._on_validation_context_changed(
-            normal_base=replay_snapshot is None, preserve_chart=True,
-            session_republish=True,
-        )
 
     def _queue_signal_validation_ui_confirmation(self) -> None:
         if getattr(self, "_signal_ui_confirmation_queued", False):
@@ -12931,7 +12750,6 @@ class IndicatorFollowSignalValidationV5Window(
         normal_base: bool = False,
         preserve_chart: bool = False,
         preserve_marking: bool = False,
-        session_republish: bool = False,
     ) -> IndicatorFollowSignalValidationRunRequest | None:
         self._disable_marking(clear_cache=True)
         self._invalidate_user_background_results()
@@ -12940,7 +12758,6 @@ class IndicatorFollowSignalValidationV5Window(
             normal_base=normal_base,
             preserve_chart=preserve_chart,
             preserve_marking=False,
-            session_republish=session_republish,
         )
         if run_request is None:
             self._settings_apply_after_validation = False
@@ -13054,11 +12871,9 @@ class IndicatorFollowSignalValidationV5Window(
         normal_base: bool = False,
         preserve_chart: bool = False,
         preserve_marking: bool = False,
-        session_republish: bool = False,
         request_origin: str = "context",
     ) -> IndicatorFollowSignalValidationRunRequest | None:
         self._validation_budget_blocked = False
-        self._session_display_republish_pending = None
         if not preserve_marking:
             self._disable_marking(clear_cache=True)
         self.clear_candle_preview(self._candle_preview_token)
@@ -13132,8 +12947,6 @@ class IndicatorFollowSignalValidationV5Window(
         if self._replay_snapshot is None and not keep_chart_visible:
             self.chart_stack.setCurrentWidget(self.loading_label)
         self._set_primary_validation_action_state("validate", enabled=False)
-        if session_republish:
-            self._session_display_republish_pending = snapshot
         previous_origin = self._validation_request_origin
         self._validation_request_origin = str(request_origin or "context")
         if getattr(self, "_timeframe_transition_pending", False):
@@ -13394,7 +13207,6 @@ class IndicatorFollowSignalValidationV5Window(
     ) -> IndicatorFollowSignalValidationRunRequest | None:
         """Replay the immutable, entry-approved snapshot without Candidate approval."""
         self._validation_budget_blocked = False
-        self._session_display_republish_pending = None
         if self.stock is None:
             self.show_validation_error(
                 "상단 종목 영역을 두 번 클릭하여 검증 종목을 선택하세요."
@@ -13581,7 +13393,6 @@ class IndicatorFollowSignalValidationV5Window(
             "TR 한도 초과: 자동 요청 중단 · [초기화] 버튼으로 수동 재시도"
             if budget_tr_blocked else error_code
         )
-        self._session_display_republish_pending = None
         self.clear_candle_preview(self._candle_preview_token)
         preserve_chart = bool(
             (
@@ -13597,7 +13408,7 @@ class IndicatorFollowSignalValidationV5Window(
         failure_identity = self._marking_timeframe_pending
         if failure_identity is None and transition_target is not None:
             failure_identity = (*transition_target,
-                                self.validation_regular_market_only_check.isChecked())
+                                False)
         if failure_identity is not None:
             self._marking_timeframe_failure_identity = failure_identity
             self._disable_marking(clear_cache=True)
@@ -13792,7 +13603,6 @@ class IndicatorFollowSignalValidationV5Window(
 
     def _clear_validation_result(self, message: str) -> None:
         self._finish_timeframe_transition_lock()
-        self._session_display_republish_pending = None
         self._preserve_chart_for_pending_validation = False
         self._disable_marking(clear_cache=True, refresh=False)
         self.clear_candle_preview(self._candle_preview_token)
@@ -14044,45 +13854,7 @@ class IndicatorFollowSignalValidationV5Window(
             primary_action_state=self._primary_validation_action_state,
         )
 
-    def _capture_session_republish_view_anchor(self):
-        if self.canvas is None or not self._candles:
-            return None
-        state = self._current_chart_view_state()
-        position = state.visible_start_index + state.visible_candle_span / 2.0
-        index = min(len(self._candles) - 1, max(0, math.floor(position)))
-        selected = state.selected_evaluation_index
-        return (
-            _EntryChartViewAnchor(
-                view_state=state,
-                center_time=str(self._candles[index].get("time") or ""),
-                center_fraction=position - index,
-                selected_time=(str(self._candles[selected].get("time") or "")
-                               if isinstance(selected, int) and not isinstance(selected, bool)
-                               and 0 <= selected < len(self._candles) else None),
-            ),
-            tuple(str(row.get("time") or "") for row in self._candles),
-        )
 
-    def _restore_session_republish_view_anchor(self, anchor: _EntryChartViewAnchor) -> None:
-        timed_indexes = [
-            (stamp, index) for index, row in enumerate(self._candles)
-            if (stamp := _parse_candle_time(row.get("time"))) is not None
-        ]
-        center_time = _parse_candle_time(anchor.center_time)
-        if center_time is None or not timed_indexes:
-            return
-        _, index = min(timed_indexes, key=lambda item: abs(item[0] - center_time))
-        selected = next((i for i, row in enumerate(self._candles)
-                         if row.get("time") == anchor.selected_time), None)
-        state = replace(
-            anchor.view_state,
-            visible_start_index=index + anchor.center_fraction - anchor.view_state.visible_candle_span / 2.0,
-            selected_evaluation_index=selected,
-        )
-        self._restore_chart_view_state(state)
-        self._set_time_view(state.visible_start_index, state.visible_candle_span,
-                            manually_adjusted=state.time_scale_manually_adjusted,
-                            auto_fit_price=True)
 
     def _restore_history_extension_view_anchor(
         self,
@@ -14398,8 +14170,6 @@ class IndicatorFollowSignalValidationV5Window(
             self._historical_candle_count,
         )
         if not projected:
-            return
-        if self.validation_regular_market_only_check.isChecked():
             return
         self.set_historical_display_candles(
             projected,
@@ -14971,7 +14741,6 @@ class IndicatorFollowSignalValidationV5Window(
         self, settings_snapshot: ValidationSettingsSnapshot, timeframe_key: str, *,
         presentation: tuple[tuple[ValidationFilterDescriptor, ...], ValidationIndicatorSeriesCache] | None = None,
         reuse_canvas: bool = False,
-        session_view_anchor: tuple[_EntryChartViewAnchor, tuple[str, ...]] | None = None,
     ) -> None:
         """Publish candle/indicator readiness without manufacturing replay evidence."""
         if not isinstance(settings_snapshot, ValidationSettingsSnapshot):
@@ -15055,17 +14824,12 @@ class IndicatorFollowSignalValidationV5Window(
         self.estimated_return_label.setText("")
         self.result_summary_label.setToolTip(self.validation_status_label.text())
         self._set_primary_validation_action_state("validate")
-        if (not timeframe_changed and session_view_anchor is not None
-                and session_view_anchor[1] != tuple(
-                    str(row.get("time") or "") for row in self._candles)):
-            self._restore_session_republish_view_anchor(session_view_anchor[0])
-        elif anchor is not None:
+        if anchor is not None:
             self._restore_history_extension_view_anchor(anchor)
         elif view is not None:
             self._restore_chart_view_state(view)
         else:
             self.select_evaluation_index(len(self._candles) - 1)
-        self._session_display_republish_pending = None
         self._capture_entry_chart_view_state()
         self._resume_history_wheel_zoom(
             timeframe_key=timeframe_key, settings_snapshot=settings_snapshot,
@@ -15073,7 +14837,7 @@ class IndicatorFollowSignalValidationV5Window(
         self._refresh_filter_display_projection()
         if self._marking_timeframe_failed:
             identity = (self.stock.code, timeframe_key, settings_snapshot.rules_hash,
-                        self.validation_regular_market_only_check.isChecked())
+                        False)
             try:
                 current_settings_hash = self._marking_current_settings().rules_hash
             except (TypeError, ValueError, KeyError):
@@ -15150,7 +14914,6 @@ class IndicatorFollowSignalValidationV5Window(
             raise TypeError("replay_snapshot must be ValidationReplaySnapshot")
         if replay_snapshot.stock != self.stock:
             raise ValueError("replay stock identity mismatch")
-        self._session_display_republish_pending = None
         self._preserve_chart_for_pending_validation = False
         trace_signal_validation_event(
             "window.replay_snapshot.begin",
@@ -15496,7 +15259,7 @@ class IndicatorFollowSignalValidationV5Window(
                 identity = (
                     self.stock.code, replay_snapshot.timeframe_key,
                     replay_snapshot.settings_hash,
-                    self.validation_regular_market_only_check.isChecked(),
+                    False,
                 )
                 try:
                     current_settings_hash = self._marking_current_settings().rules_hash
@@ -16024,22 +15787,7 @@ class IndicatorFollowSignalValidationV5Window(
                     "_restore_validation_range_from_times", "endpoints_missing", defer=True,
                 )
                 self._validation_range = None
-                source_times = {str(candle.get("time") or "")
-                                for candle in self._calculation_candles}
-                missing_endpoints = [
-                    candle for candle in self._calculation_candles
-                    if str(candle.get("time") or "") in (start_time, end_time)
-                    and str(candle.get("time") or "") not in by_time
-                ]
-                if (self.validation_regular_market_only_check.isChecked()
-                        and start_time in source_times and end_time in source_times
-                        and not _krx_regular_session_candles(missing_endpoints)):
-                    overlap = [index for stamp, index in by_time.items()
-                               if start_time <= stamp <= end_time]
-                    if overlap:
-                        self._validation_range = (min(overlap), max(overlap))
-                else:
-                    self._validation_range_times = None
+                self._validation_range_times = None
                 if self._validation_range is None and trace_clear is not None:
                     trace_clear()
             else:

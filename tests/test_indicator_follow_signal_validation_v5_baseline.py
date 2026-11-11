@@ -76,8 +76,6 @@ def timeframe_pending(case, monkeypatch, request):
     case.widgets.append(window)
     with QSignalBlocker(window.basic_signal_interval_combo):
         window.basic_signal_interval_combo.setCurrentText("3")
-    with QSignalBlocker(window.validation_regular_market_only_check):
-        window.validation_regular_market_only_check.setChecked(True)
     settings = window._marking_current_settings()
     clock = [datetime.fromisoformat("2026-11-09T15:48:00+09:00")]
     plan = _build(stock.code, stock.name, clock[0].date(), clock[0].isoformat(), True)
@@ -220,6 +218,7 @@ def test_v5_timeframe_pending_stale_callback_preserves_new_token(timeframe_pendi
     assert len(item.calls) == 2 and not item.published
 
 
+@pytest.mark.parametrize("timeframe_pending", [1000], indirect=True)
 def test_v5_timeframe_pending_unproven_completion_requires_manual_recovery(timeframe_pending):
     item = timeframe_pending
     item.select(30)
@@ -457,7 +456,6 @@ def test_v5_long_summaries_keep_all_actions_in_one_compact_row(case, client_size
     assert window.width() == target_width
     assert window.height() == target_height
     buttons = (
-        window.marking_display_check,
         window.filter_display_check,
         window.filter_display_valid_check,
         window.reset_button,
@@ -480,9 +478,9 @@ def test_v5_long_summaries_keep_all_actions_in_one_compact_row(case, client_size
                for left, right in zip(buttons, buttons[1:]))
     summary = window.chart_summary_label
     action_row = window._signal_validation_action_layout
-    assert action_row.count() == 7
+    assert action_row.count() == 6
     assert action_row.itemAt(0).widget() is summary
-    assert [action_row.itemAt(index).widget() for index in range(1, 7)] == list(buttons)
+    assert [action_row.itemAt(index).widget() for index in range(1, 6)] == list(buttons)
     assert window.layout().count() == 3
     assert window.layout().itemAt(1).layout() is action_row
     assert window.layout().itemAt(2).widget() is window.result_widget
@@ -552,7 +550,7 @@ def test_v5_chart_summary_before_selection_uses_current_stock_and_timeframe(case
     assert window.chart_summary_label.text() == "\u25B6 005930 삼성전자 | 5분봉"
 
 
-@pytest.mark.parametrize("clear_action", ["reset", "timeframe", "regular_only", "drag"])
+@pytest.mark.parametrize("clear_action", ["reset", "timeframe", "drag"])
 def test_v5_chart_summary_clears_range_metrics(case, clear_action):
     window = window_for(case)
     with QSignalBlocker(window.basic_signal_interval_combo):
@@ -573,8 +571,6 @@ def test_v5_chart_summary_clears_range_metrics(case, clear_action):
         window.reset_button.click()
     elif clear_action == "timeframe":
         window.basic_signal_interval_combo.setCurrentText("5분")
-    elif clear_action == "regular_only":
-        window.validation_regular_market_only_check.toggle()
     else:
         window._begin_validation_range_drag(590)
     assert window.validation_range is None
@@ -1125,7 +1121,7 @@ def test_v5_header_pipes_share_spacing_and_separate_liquidation(case):
     pipes = [widget for widget in widgets
              if isinstance(widget, window_module.QLabel) and widget.text() == "|"]
     assert layout.spacing() == 8
-    assert len(pipes) == 6
+    assert len(pipes) == 5
     window.basic_header_widget.resize(2000, 40)
     assert layout.activate()
     first_pipe = pipes[0]
@@ -1148,10 +1144,7 @@ def test_v5_header_pipes_share_spacing_and_separate_liquidation(case):
         assert glyph_margin >= 0
     assert widgets.index(window.validation_regular_market_separator) + 1 == widgets.index(
         window.validation_range_liquidation_check)
-    assert widgets.index(window.validation_range_liquidation_check) + 1 == widgets.index(
-        window.validation_liquidation_separator)
-    assert widgets.index(window.validation_liquidation_separator) + 1 == widgets.index(
-        window.validation_regular_market_only_check)
+    assert not hasattr(window, "validation_regular_market_only_check")
 
 
 def test_v5_liquidation_sell_marker_is_visual_only_and_viewport_bound(case):
@@ -1425,13 +1418,12 @@ def test_v5_m15_detail_replay_splits_proven_forming_native_tail():
                  "_pool_computation_source_identity", "_sor_m15_after_anchor_verified",
                  "_historical_rows_from_candles"):
         setattr(flow, name, getattr(flow_type, name))
-    for name in ("_require_selected_timeframe_pool", "_regular_minute_evaluation_view"):
+    for name in ("_require_selected_timeframe_pool",):
         setattr(flow, name, MethodType(getattr(flow_type, name), flow))
     native_inputs = []
 
     def revalidate(session, pool, view, frozen, *args, **kwargs):
-        if not regular_only or kwargs.get("_native_scope"):
-            native_inputs.append(deepcopy(view))
+        native_inputs.append(deepcopy(view))
         return flow_type._sor_m1_calculation_view(flow, session, pool, view, frozen,
                                                *args, **kwargs)
 

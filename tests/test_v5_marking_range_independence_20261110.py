@@ -152,7 +152,7 @@ def test_range_clear_removes_virtual_results_preserves_chart(view, liquidation):
     before = (deepcopy(w._candles), deepcopy(w._calculation_candles),
         w.visualization_descriptors,
         tuple(s for s in w.visualization_cache.series if s[1] != "AVG_PRICE"),
-        w.filter_display_check.isChecked(), w.validation_regular_market_only_check.isChecked())
+        w.filter_display_check.isChecked())
     # Complete real work but hold its GUI callback across clear.
     r.drag()
     late = r.calculate()
@@ -167,7 +167,7 @@ def test_range_clear_removes_virtual_results_preserves_chart(view, liquidation):
     assert w.estimated_return_label.text() == ""
     assert (w._candles, w._calculation_candles, w.visualization_descriptors,
         tuple(s for s in w.visualization_cache.series if s[1] != "AVG_PRICE"),
-        w.filter_display_check.isChecked(), w.validation_regular_market_only_check.isChecked()) == before
+        w.filter_display_check.isChecked()) == before
     assert w.discard_validation_stock_if_matches(w.stock.code)
     w._refresh_validation_range_results()
     assert w.completed_cycle_table.rowCount() == 0

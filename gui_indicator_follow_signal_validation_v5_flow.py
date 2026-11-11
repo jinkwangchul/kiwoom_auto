@@ -1655,7 +1655,6 @@ def _select_v5_source(stock, timeframe_key, integrated, regular_only, now,
     if type(integrated) is not bool:
         raise ValueError("NXT_ELIGIBILITY_NOT_VERIFIED")
     now = now.astimezone(SEOUL_TIMEZONE)
-    regular_period = regular_only and timeframe_key in {"D1", "W1", "MO1", "Y1"}
     source = "INTEGRATED" if integrated else "KRX"
     identity = f"{stock.code}_AL" if integrated else stock.code
     native_session = ""
@@ -1666,7 +1665,7 @@ def _select_v5_source(stock, timeframe_key, integrated, regular_only, now,
                 or plan["stock_name"] != stock.name):
             raise ValueError("SOR_SOURCE_UNAVAILABLE")
     return _V5SourceSelection(stock, timeframe_key, window_key, generation,
-                              "REGULAR" if regular_period else "FULL",
+                              "FULL",
                               identity, source, integrated, now, native_session, expires_at)
 
 
@@ -1682,7 +1681,6 @@ class _V5SelectedSourceRequester:
         self.stock = stock
         self.timeframe_key = timeframe_key
         self.integrated = integrated
-        self.regular_period = bool(regular_only) and timeframe_key in {"D1", "W1", "MO1", "Y1"}
         self.on_verified_period_response = on_verified_period_response
         self.now_factory = now_factory or (lambda: datetime.now(SEOUL_TIMEZONE))
         self.on_verified_native_response = on_verified_native_response
@@ -1690,12 +1688,11 @@ class _V5SelectedSourceRequester:
         self.request_is_current = request_is_current
         self._stale_request_callback = None
         self.source_selection = source_selection or _select_v5_source(
-            stock, timeframe_key, integrated, regular_only, self.now_factory())
+            stock, timeframe_key, integrated, False, self.now_factory())
         if (self.source_selection.stock != stock
                 or self.source_selection.timeframe_key != timeframe_key
                 or self.source_selection.nxt_available is not integrated
-                or self.source_selection.market_session_scope != (
-                    "REGULAR" if self.regular_period else "FULL")):
+                or self.source_selection.market_session_scope != "FULL"):
             raise ValueError("V5_BROKER_REQUEST_IDENTITY_INVALID")
         self.market_source = self.source_selection.market_source
         self.source_selection.require_current(self.now_factory())
@@ -1726,9 +1723,9 @@ class _V5SelectedSourceRequester:
             callback({"ok": False, "error": "V5_BROKER_REQUESTER_UNAVAILABLE"})
             return None
         al_period_candidate = (
-            (self.market_source == "INTEGRATED" or self.regular_period)
+            self.market_source == "INTEGRATED"
             and not minute and callable(self.on_verified_al_period_response))
-        capture_candidate = (self.market_source == "INTEGRATED" and not self.regular_period
+        capture_candidate = (self.market_source == "INTEGRATED"
                              and not minute and self.timeframe_key in {"W1", "MO1", "Y1"}
                              and callable(self.on_verified_period_response))
         request_started_at = self.now_factory() if (capture_candidate or al_period_candidate) else None
@@ -1749,9 +1746,6 @@ class _V5SelectedSourceRequester:
         expected_identity = self.source_selection.market_data_identity
         expected_trcode = (
             "opt10080" if minute else (
-                {"D1": "opt10101", "W1": "opt10102",
-                 "MO1": "opt10103", "Y1": "opt10104"}
-                if self.regular_period else
                 {"D1": "opt10081", "W1": "opt10082",
                  "MO1": "opt10083", "Y1": "opt10094"}
             ).get(self.timeframe_key)
@@ -1827,9 +1821,9 @@ class _V5SelectedSourceRequester:
                 and response.get("market_data_identity") == expected_identity
                 and response.get("market_source") == expected_source
                 and response.get("trcode") == expected_trcode
-                and (not self.regular_period
-                     or (started.get("market_session_scope") == "REGULAR"
-                         and response.get("market_session_scope") == "REGULAR"))
+                and (minute or (
+                    started.get("market_session_scope", "FULL") == "FULL"
+                    and response.get("market_session_scope", "FULL") == "FULL"))
                 and response.get("type") == ("minute_candles" if minute else "period_candles")
                 and (response.get("interval") == interval if minute else
                      response.get("timeframe_key") == self.timeframe_key)
@@ -1926,11 +1920,7 @@ class _V5SelectedSourceRequester:
         if timeframe_key != self.timeframe_key:
             callback({"ok": False, "error": "V5_BROKER_REQUEST_IDENTITY_INVALID"})
             return None
-        return self._request("request_period_candles_read_only_regular_integrated"
-                             if self.regular_period and self.integrated else
-                             "request_period_candles_read_only_regular"
-                             if self.regular_period else
-                             "request_period_candles_read_only_nxt" if self.market_source == "NXT"
+        return self._request("request_period_candles_read_only_nxt" if self.market_source == "NXT"
                              else "request_period_candles_read_only_integrated" if self.integrated
                              else "request_period_candles_read_only",
                              code, name, count, callback)
@@ -3940,16 +3930,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         self.__dict__.get("_v5_direct_m1_requests", {}).pop(window_key, None)
         self.__dict__.get("_v5_m3_rollover_checks", {}).pop(window_key, None)
         window = self._open_windows.get(window_key)
-        if window is not None:
-            binding = getattr(window, "_v5_marking_display_publication", None)
-            basis = getattr(window, "_v5_session_display_basis", None)
-            # Carry source evidence once; the old publication still becomes stale.
-            window._v5_session_display_source_proof = (
-                (binding, basis, self._request_generation.get(window_key, 0) + 1)
-                if isinstance(basis, tuple) and len(basis) in (2, 3)
-                and basis[0] is binding
-                and self._marking_publication_is_current(window, binding) else None)
-            window._session_display_republish_pending = None
         disable_marking = getattr(window, "_disable_marking", None)
         if (
             callable(disable_marking)
@@ -4513,23 +4493,24 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     @staticmethod
     def _nxt_premarket_source_allowed(now: datetime, rules: dict[str, object]) -> bool:
         """Use native PRE only on weekdays when its session is requested."""
-        if now.weekday() >= 5 or now.hour != 8 or now.minute >= 50:
-            return False
-        scope = rules.get("validation_market_scope")
-        return not (isinstance(scope, dict)
-                    and scope.get("regular_market_only") is True)
+        return now.weekday() < 5 and now.hour == 8 and now.minute < 50
 
     @staticmethod
     def _period_session_scope(settings_snapshot: object, timeframe_key: str) -> str:
-        """The HTS period source is distinct from minute display filtering."""
-        if timeframe_key not in {"D1", "W1", "MO1", "Y1"}:
-            return "FULL"
-        rules = (settings_snapshot.to_dict()
-                 if callable(getattr(settings_snapshot, "to_dict", None))
-                 else settings_snapshot if isinstance(settings_snapshot, dict) else {})
-        scope = rules.get("validation_market_scope")
-        return ("REGULAR" if isinstance(scope, dict)
-                and scope.get("regular_market_only") is True else "FULL")
+        """V5 always uses the acquired native FULL period source."""
+        return "FULL"
+
+    def _require_full_period_receipt_scope(self, query, request_id=None) -> None:
+        recorded = self.__dict__.get("_verified_al_period_receipts", {})
+        query_id = query.get("request_id") if isinstance(query, dict) else None
+        for identity in (request_id, query_id):
+            receipt = recorded.get(identity) if isinstance(identity, str) else None
+            if isinstance(receipt, dict) and receipt.get("market_session_scope") == "REGULAR":
+                raise ValueError("PERIOD_RECEIPT_SCOPE_MISMATCH")
+        if (isinstance(query, dict)
+                and (query.get("market_session_scope", "FULL") != "FULL"
+                     or query.get("trcode") in ("opt10101", "opt10102", "opt10103", "opt10104"))):
+            raise ValueError("PERIOD_RECEIPT_SCOPE_MISMATCH")
 
     def _session_period_source(self, session: ValidationSession) -> tuple[str, str]:
         stock = session.request.stock
@@ -4541,13 +4522,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 raise ValueError("VALIDATION_SOURCE_SELECTION_MISMATCH")
             selection.require_current(self._now_factory())
             return selection.market_data_identity, selection.market_source
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) == "REGULAR":
-            eligibility = self._validation_source_by_code.get(stock.code)
-            if type(eligibility) is not bool:
-                raise ValueError("NXT_ELIGIBILITY_NOT_VERIFIED")
-            return ((f"{stock.code}_AL", "INTEGRATED") if eligibility
-                    else (stock.code, "KRX"))
         return (self._validation_market_data_identity(stock),
                 self._validation_market_source(stock))
 
@@ -4560,15 +4534,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return False
         try:
             selection.require_current(self._now_factory())
-            session = self._validation_sessions.get(selection.window_key)
-            republish = getattr(session, "_v5_session_display_snapshot", None)
-            if (getattr(session, "source_selection", None) is selection
-                    and isinstance(republish, tuple) and len(republish) == 3):
-                broker_session = self._broker.broker_session_snapshot()
-                if (broker_session.connected is not True
-                        or republish[2] != (broker_session.connection_epoch,
-                                            broker_session.login_session_id)):
-                    return False
         except (AttributeError, RuntimeError, ValueError):
             return False
         return True
@@ -5033,8 +4998,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         session: ValidationSession,
         target_count: int,
     ) -> None:
-        if getattr(session, "_v5_session_display_snapshot", None) is not None:
-            return
         timeframe = normalize_validation_timeframe(
             session.request.timeframe_key,
             fallback_minutes=session.request.timeframe_minutes,
@@ -5271,6 +5234,15 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         market_session_scope: str = "FULL",
         source_selection=None,
     ) -> bool:
+        if isinstance(pool, dict):
+            query = pool.get("direct_selected_query")
+            if "_regular_minute_source_view" in pool:
+                return False
+            if timeframe_key in {"D1", "W1", "MO1", "Y1"}:
+                try:
+                    self._require_full_period_receipt_scope(query, pool.get("request_id"))
+                except ValueError:
+                    return False
         regular_period = (market_session_scope == "REGULAR"
                           and timeframe_key in {"D1", "W1", "MO1", "Y1"})
         if source_selection is not None:
@@ -6486,13 +6458,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             session.request.settings_snapshot, timeframe_key)
         if (pool_identity != expected_identity or pool_source != expected_source):
             raise ValueError("MARKET_SOURCE_IDENTITY_INVALID")
-        if (market_session_scope == "REGULAR"
-                and (not isinstance(direct_selected_query, dict)
-                     or direct_selected_query.get("market_session_scope") != "REGULAR"
-                     or not self._direct_al_period_query_valid(
-                         direct_selected_query, session.request.stock, timeframe_key,
-                         session.request.timeframe_minutes, pool_identity, candles))):
-            raise ValueError("REGULAR_PERIOD_RECEIPT_UNVERIFIED")
+        if timeframe_key in {"D1", "W1", "MO1", "Y1"}:
+            self._require_full_period_receipt_scope(direct_selected_query, request_id)
         native_receipt = None
         native_forming = None
         native_cache_receipt = None
@@ -6611,6 +6578,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 verified_at = self._source_snapshot_datetime(self._now_factory())
             except Exception:
                 verified_at = None
+        if timeframe_key in {"D1", "W1", "MO1", "Y1"}:
+            self._require_full_period_receipt_scope(direct_selected_query, request_id)
         snapshot = ValidationHistoricalSnapshot(
             stock=session.request.stock,
             timeframe_minutes=session.request.timeframe_minutes,
@@ -6815,114 +6784,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             session.request.settings_snapshot, session.request.timeframe_key)
         if pool.get("market_session_scope", "FULL") != market_session_scope:
             raise ValueError("VALIDATION_POOL_PERIOD_SCOPE_MISMATCH")
-        native_view = pool.get("_regular_minute_source_view")
-        if native_view is not None:
-            scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-            if (not isinstance(scope, dict) or scope.get("regular_market_only") is not True
-                    or session.request.timeframe_key not in _LIVE_MINUTE_TIMEFRAMES
-                    or not isinstance(native_view, dict) or native_view is pool
-                    or "_regular_minute_source_view" in native_view):
-                raise ValueError("REGULAR_MINUTE_SOURCE_UNVERIFIED")
-            self._require_selected_timeframe_pool(session, native_view)
-            regular = _krx_regular_session_candles(
-                native_view.get("candles", []), native_m5_close_times=
-                native_view.get("native_m5_regular_close_times", ()))
-            selected = pool.get("candles")
-            display = pool.get("display_candles")
-            native_display = _krx_regular_session_candles(
-                native_view.get("display_candles", native_view.get("candles", [])),
-                native_m5_close_times=native_view.get("native_m5_regular_close_times", ()))
-            if (not isinstance(selected, list) or len(selected) > len(regular)
-                    or selected != (regular[-len(selected):] if selected else [])
-                    or not isinstance(display, list) or len(display) > len(native_display)
-                    or display != (native_display[-len(display):] if display else [])
-                    or any(pool.get(field) != native_view.get(field) for field in (
-                        "stock", "timeframe_key", "timeframe_minutes", "market_source",
-                        "market_data_identity", "request_id", "direct_selected_query",
-                        "native_minute_receipt", "native_cache_receipt", "native_live_snapshot",
-                        "selected_direct_forming_snapshot", "source_coverage_sufficient",
-                        "calculation_source", "production_calculation_cache_identity",
-                        "native_m5_regular_close_times"))):
-                # Diagnostic only: preserve the original fail-closed source guard.
-                try:
-                    def _safe_stamp(row):
-                        stamp = row.get("time") if isinstance(row, dict) else None
-                        return (stamp if isinstance(stamp, str)
-                                and re.fullmatch(r"[0-9]{14}", stamp) else "")
-
-                    def _signature(rows):
-                        return {
-                            "count": len(rows) if isinstance(rows, list) else None,
-                            "first_time": _safe_stamp(rows[0])
-                            if isinstance(rows, list) and rows else "",
-                            "last_time": _safe_stamp(rows[-1])
-                            if isinstance(rows, list) and rows else "",
-                        }
-
-                    def _first_difference(actual, expected):
-                        if not isinstance(actual, list):
-                            return {"index": None, "selected_time": "", "native_time": ""}
-                        first = next((
-                            index for index, (left, right)
-                            in enumerate(zip(actual, expected)) if left != right
-                        ), None)
-                        if first is None and len(actual) != len(expected):
-                            first = min(len(actual), len(expected))
-                        return {
-                            "index": first,
-                            "selected_time": _safe_stamp(actual[first])
-                            if first is not None and first < len(actual) else "",
-                            "native_time": _safe_stamp(expected[first])
-                            if first is not None and first < len(expected) else "",
-                        }
-
-                    expected_calculation = (
-                        regular[-len(selected):] if isinstance(selected, list) and selected else []
-                    )
-                    expected_display = (
-                        native_display[-len(display):]
-                        if isinstance(display, list) and display else []
-                    )
-                    metadata_fields = (
-                        "stock", "timeframe_key", "timeframe_minutes", "market_source",
-                        "market_data_identity", "request_id", "direct_selected_query",
-                        "native_minute_receipt", "native_cache_receipt", "native_live_snapshot",
-                        "selected_direct_forming_snapshot", "source_coverage_sufficient",
-                        "calculation_source", "production_calculation_cache_identity",
-                    )
-                    trace_signal_validation_event(
-                        "v5_sor_block",
-                        reason="REGULAR_MINUTE_SOURCE_SUFFIX_UNVERIFIED",
-                        timeframe=session.request.timeframe_key,
-                        calculation_suffix_mismatch=(
-                            not isinstance(selected, list)
-                            or len(selected) > len(regular)
-                            or selected != expected_calculation
-                        ),
-                        display_suffix_mismatch=(
-                            not isinstance(display, list)
-                            or len(display) > len(native_display)
-                            or display != expected_display
-                        ),
-                        metadata_mismatch_fields=[
-                            field for field in metadata_fields
-                            if pool.get(field) != native_view.get(field)
-                        ],
-                        calculation_selected=_signature(selected),
-                        calculation_regular_native=_signature(regular),
-                        display_selected=_signature(display),
-                        display_regular_native=_signature(native_display),
-                        calculation_first_mismatch=_first_difference(
-                            selected, expected_calculation,
-                        ),
-                        display_first_mismatch=_first_difference(
-                            display, expected_display,
-                        ),
-                    )
-                except Exception:
-                    pass  # Diagnostics must not alter the original exception.
-                raise ValueError("REGULAR_MINUTE_SOURCE_SUFFIX_UNVERIFIED")
-            return
+        query = pool.get("direct_selected_query")
+        if session.request.timeframe_key in {"D1", "W1", "MO1", "Y1"}:
+            self._require_full_period_receipt_scope(query, pool.get("request_id"))
+        if "_regular_minute_source_view" in pool:
+            raise ValueError("REGULAR_MINUTE_SOURCE_UNVERIFIED")
         if pool.get("validation_nxt_history_calculation") is True:
             native = pool.get("_validation_nxt_view")
             if (not isinstance(native, dict)
@@ -6968,13 +6834,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     or pool.get("market_data_identity")
                        != f"{stock.code}_AL_NXT_PRE_VALIDATION"):
                 raise ValueError("NXT_AL_PROVEN_CALCULATION_MISMATCH")
-            scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-            expected_display = (
-                _krx_regular_session_candles(candles)
-                if (isinstance(scope, dict) and scope.get("regular_market_only") is True
-                    and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES)
-                else candles
-            )
+            expected_display = candles
             if shown != expected_display[-len(shown):]:
                 raise ValueError("NXT_AL_PROVEN_DISPLAY_MISMATCH")
             return
@@ -6983,13 +6843,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         expected_identity, expected_source = self._session_period_source(session)
         if source != expected_source or identity != expected_identity:
             raise ValueError("VALIDATION_POOL_MARKET_IDENTITY_MISMATCH")
-        if ((source == "INTEGRATED" or market_session_scope == "REGULAR")
+        if (source == "INTEGRATED"
                 and session.request.timeframe_key in {"D1", "W1", "MO1", "Y1"}):
-            proven_pool = (
-                pool.get("_regular_period_proven_source")
-                if market_session_scope == "REGULAR"
-                else pool.get("_full_period_proven_source")
-            )
+            proven_pool = pool.get("_full_period_proven_source")
             proof_rows = pool.get("candles")
             if proven_pool is not None:
                 source_rows = (proven_pool.get("candles")
@@ -7008,10 +6864,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         or not isinstance(shown_rows, list) or not shown_rows
                         or len(shown_rows) > len(source_rows)
                         or shown_rows != source_rows[-len(shown_rows):]):
-                    raise ValueError(
-                        "REGULAR_PERIOD_SOURCE_SUFFIX_UNVERIFIED"
-                        if market_session_scope == "REGULAR"
-                        else "SOR_DIRECT_PERIOD_SOURCE_SUFFIX_UNVERIFIED")
+                    raise ValueError("SOR_DIRECT_PERIOD_SOURCE_SUFFIX_UNVERIFIED")
                 proof_rows = source_rows
             query = pool.get("direct_selected_query")
             if (not isinstance(query, dict)
@@ -7065,41 +6918,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         session.request.stock, receipt, forming, self._broker, now):
                     raise ValueError("NATIVE_FORMING_RECEIPT_EXPIRED")
 
-    def _regular_minute_evaluation_view(self, session, view, *, target_count=None):
-        scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-        if (not isinstance(scope, dict) or scope.get("regular_market_only") is not True
-                or session.request.timeframe_key not in _LIVE_MINUTE_TIMEFRAMES):
-            return view
-        if "_regular_minute_source_view" in view:
-            self._require_selected_timeframe_pool(session, view)
-            return view
-        # Keep receipt/native inputs intact; only this axis enters V5 evaluation.
-        close_times = view.get("native_m5_regular_close_times", ())
-        rows = _krx_regular_session_candles(
-            view["candles"], native_m5_close_times=close_times)
-        display = _krx_regular_session_candles(
-            view.get("display_candles", view["candles"]), native_m5_close_times=close_times)
-        native = view
-        if display != view.get("display_candles", view["candles"]):
-            native = dict(view, display_candles=display)
-            if session.request.timeframe_key == "M5":
-                native["display_only_integrated"] = False
-        if target_count is not None:
-            rows, display = rows[-target_count:], display[-target_count:]
-        result = dict(native, candles=rows, display_candles=display,
-                      requested_count=len(rows), _regular_minute_source_view=native)
-        result["snapshot"] = ValidationHistoricalSnapshot(
-            stock=session.request.stock,
-            timeframe_minutes=session.request.timeframe_minutes,
-            timeframe_key=session.request.timeframe_key,
-            requested_count=max(1, len(rows)),
-            request_id=str(view.get("request_id") or "POOL"),
-            rows=self._historical_rows_from_candles(rows),
-            market_data_identity=str(view.get("market_data_identity") or ""),
-            market_source=str(view.get("market_source") or ""),
-            request_as_of=getattr(view.get("snapshot"), "request_as_of", None),
-        )
-        return result
 
     def _validation_pool_for_session(
         self,
@@ -7113,7 +6931,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if not isinstance(pool, dict):
             return pool
         self._require_selected_timeframe_pool(session, pool)
-        pool = pool.get("_regular_minute_source_view", pool)
         rules = session.request.settings_snapshot.to_dict()
         raw_candles = pool.get("candles")
         if not isinstance(raw_candles, list):
@@ -7130,16 +6947,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         timeframe = normalize_validation_timeframe(
             session.request.timeframe_key,
             fallback_minutes=session.request.timeframe_minutes,
-        )
-        scope = (
-            rules.get("validation_market_scope")
-            if isinstance(rules, dict)
-            else None
-        )
-        regular_minute = (
-            isinstance(scope, dict)
-            and scope.get("regular_market_only") is True
-            and timeframe["kind"] == "MINUTE"
         )
         normalized_raw = [
             dict(candle) for candle in raw_candles if isinstance(candle, dict)
@@ -7270,9 +7077,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             "validation_premarket_content_hash",
         )
         if (
-            not regular_minute
-            and len(normalized_raw) <= target_count
-            and not any(key in pool for key in obsolete_projection_keys)
+            (len(normalized_raw) <= target_count) and (not any(key in pool for key in obsolete_projection_keys))
         ):
             if special_present:
                 selected = dict(pool, candles=calculation_raw,
@@ -7302,16 +7107,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     display_target_count=target_count), target_count)
         target_minutes = session.request.timeframe_minutes
         target_key = session.request.timeframe_key
-        projected = calculation_raw if regular_minute else calculation_raw[-target_count:]
+        projected = calculation_raw[-target_count:]
         derived = dict(pool)
         if target_key in {"D1", "W1", "MO1", "Y1"}:
             # Projected periods are suffixes, never new broker responses.
             # Keep the original response's hash and rows for each proof check.
-            if self._period_session_scope(
-                    session.request.settings_snapshot, target_key) == "REGULAR":
-                derived["_regular_period_proven_source"] = pool.get(
-                    "_regular_period_proven_source", pool)
-            elif pool.get("market_source") == "INTEGRATED":
+            if pool.get("market_source") == "INTEGRATED":
                 derived["_full_period_proven_source"] = pool.get(
                     "_full_period_proven_source", pool)
         derived["timeframe_minutes"] = target_minutes
@@ -7321,16 +7122,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         for key in obsolete_projection_keys:
             derived.pop(key, None)
         if direct_m5_special:
-            # Retain this publication's verified special rows even while REG hides them.
+            # Retain this publication's verified display-only special rows.
             derived["native_m5_special_display"] = [
                 row for row in display_raw if row.get("display_only_special")]
-        derived["display_candles"] = (
-            _krx_regular_session_candles(projected, native_m5_close_times=
-                pool.get("native_m5_regular_close_times", ())) if regular_minute
-            else display_raw[-target_count:]
-        )
-        if (special_present and not regular_minute
-                and (not direct_m5_special or any(
+        derived["display_candles"] = display_raw[-target_count:]
+        if (special_present and (not direct_m5_special or any(
                     row.get("display_only_special") for row in derived["display_candles"]))):
             derived["display_only_integrated"] = True
         derived["signal_entries_by_settings_hash"] = pool.setdefault(
@@ -7360,7 +7156,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             session, self._compose_verified_nxt_pre(
                 session, derived, premarket, sidecar, normalized_raw,
                 display_target_count=target_count), target_count)
-        return self._regular_minute_evaluation_view(session, selected, target_count=target_count)
+        return selected
 
     def _nxt_pre_sidecar_identity(self, sidecar: object) -> tuple[object, ...]:
         if not isinstance(sidecar, dict):
@@ -7513,9 +7309,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 return view
         except (TypeError, ValueError):
             return view
-        scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-        if isinstance(scope, dict) and scope.get("regular_market_only") is True:
-            return view
         if (evidence.get("stock") != session.request.stock
                 or evidence.get("session_id") != id(session)
                 or evidence.get("timeframe_key") != session.request.timeframe_key
@@ -7623,13 +7416,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         *, display_target_count: int | None = None,
     ) -> dict[str, object]:
         """Keep the AL view intact and add only absent proven PRE timestamps."""
-        scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-        if (session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES
-                and isinstance(scope, dict) and scope.get("regular_market_only") is True):
-            return sor_view
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) == "REGULAR":
-            return sor_view
         if (sor_view.get("market_source") == "NXT"
                 and sor_view.get("nxt_proven_al_history")):
             # Only finished prior AL buckets may precede the selected native
@@ -7646,11 +7432,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             key, prefix, historical=True)):
                     raise ValueError("NXT_AL_PROVEN_HISTORY_OVERLAP")
                 calculation = joined[-(display_target_count or self._historical_count):]
-                scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-                regular_only = isinstance(scope, dict) and scope.get("regular_market_only") is True
-                visible = (_krx_regular_session_candles(calculation)
-                           if regular_only and key in _LIVE_MINUTE_TIMEFRAMES
-                           else calculation)
+                visible = calculation
                 display = visible[-min(5000, display_target_count or self._historical_count):]
                 composite = dict(
                     sor_view,
@@ -7692,9 +7474,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             display.update({row["time"]: dict(row)
                             for row in sor_view.get("display_candles", sor_view["candles"])})
             rows = [display[stamp] for stamp in sorted(display)]
-            scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-            if isinstance(scope, dict) and scope.get("regular_market_only") is True:
-                rows = _krx_regular_session_candles(rows)
             return dict(sor_view, display_candles=rows[-(display_target_count or self._historical_count):],
                         display_only_integrated=True)
         sor = sor_view.get("candles")
@@ -7716,11 +7495,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             return sor_view
         calculation = sorted([*sor, *missing], key=lambda row: row["time"])
         rules = session.request.settings_snapshot.to_dict()
-        scope = rules.get("validation_market_scope")
-        regular_only = isinstance(scope, dict) and scope.get("regular_market_only") is True
         display_source = sor_view.get("display_candles", sor)
-        display = (_krx_regular_session_candles(calculation)
-                   if regular_only else sorted([*display_source, *missing],
+        display = (sorted([*display_source, *missing],
                                                key=lambda row: row["time"]))
         composite = dict(sor_view)
         composite.update(
@@ -7864,15 +7640,13 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                          self._broker.broker_session_snapshot().login_session_id))):
             pool = dict(pool)
             pool.pop("_retained_native_nx_display", None)
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) != "REGULAR":
-            shared = dict(pool)
-            shared.pop("_retained_native_nx_display", None)
-            shared.pop("_v5_direct_m1_request", None)
-            _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[
-                self._shared_pool_key(session.request.stock,
-                                      str(pool.get("timeframe_key") or ""), source_selection=getattr(session, "source_selection", None))
-            ] = shared
+        shared = dict(pool)
+        shared.pop("_retained_native_nx_display", None)
+        shared.pop("_v5_direct_m1_request", None)
+        _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[
+            self._shared_pool_key(session.request.stock,
+                                  str(pool.get("timeframe_key") or ""), source_selection=getattr(session, "source_selection", None))
+        ] = shared
         old_pool = self._historical_pools.get(window_key)
         transition = self._native_source_transition.get(window_key)
         transition_used = False
@@ -8526,18 +8300,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             window, session, pool,
             direct_current_view if isinstance(direct_current_view, dict) else {},
             generation)
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) != "REGULAR":
-            shared = dict(pool)
-            shared.pop("_retained_native_nx_display", None)
-            shared.pop("_v5_direct_m1_request", None)
-            _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[
-                self._shared_pool_key(
-                    session.request.stock,
-                    str(pool.get("timeframe_key") or ""),
-                    source_selection=getattr(session, "source_selection", None),
-                )
-            ] = shared
+        shared = dict(pool)
+        shared.pop("_retained_native_nx_display", None)
+        shared.pop("_v5_direct_m1_request", None)
+        _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS[
+            self._shared_pool_key(
+                session.request.stock,
+                str(pool.get("timeframe_key") or ""),
+                source_selection=getattr(session, "source_selection", None),
+            )
+        ] = shared
         replacement_reason = payload.get("replacement_reason")
         if replacement_reason is not None:
             self._trace_pool_replaced(
@@ -8630,18 +8402,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 len(signal_entries) if isinstance(signal_entries, (tuple, list)) else None
             ),
         )
-        session_view_anchor = None
-        if (normal_base_presentation is not None
-                and getattr(window, "_session_display_republish_pending", None)
-                is session.request.settings_snapshot
-                and getattr(window, "_pending_result_settings_snapshot", None)
-                is session.request.settings_snapshot
-                and session.request.timeframe_key
-                == getattr(window, "_normal_base_timeframe_key", "")):
-            capture_session_anchor = getattr(window, "_capture_session_republish_view_anchor", None)
-            if callable(capture_session_anchor):
-                # Capture against the old display before either pool setter replaces it.
-                session_view_anchor = capture_session_anchor()
         restore_premarket_anchor = None
         if (
             normal_base_presentation is not None
@@ -8782,8 +8542,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     session.request.timeframe_key,
                     presentation=normal_base_presentation,
                     reuse_canvas=normal_base_reuse_canvas,
-                    **({"session_view_anchor": session_view_anchor}
-                       if session_view_anchor is not None else {}),
                 )
             except Exception as exc:
                 raise
@@ -8853,33 +8611,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             previous_publication_generation = None
         window._v5_marking_display_publication = (
             pool, session, publication_generation, pool.get("_dispatch_snapshot"))
-        window._v5_session_display_basis = None
-        try:
-            broker_session = self._broker.broker_session_snapshot()
-            if (broker_session.connected is True
-                    and broker_session.connection_epoch > 0
-                    and broker_session.login_session_id):
-                retained_basis = getattr(session, "_v5_session_display_basis", None)
-                # Only a verified toggle may carry the original span into a new publication.
-                retained_span = (
-                    retained_basis[2]
-                    if isinstance(retained_basis, tuple) and len(retained_basis) == 3
-                    and retained_basis[0] is previous_binding
-                    and previous_binding[0] is pool
-                    and retained_basis[1] == (broker_session.connection_epoch,
-                                              broker_session.login_session_id)
-                    and session._v5_session_display_snapshot[0]
-                        == pool.get("_dispatch_snapshot")[3] else None)
-                window._v5_session_display_basis = (
-                    window._v5_marking_display_publication,
-                    (broker_session.connection_epoch, broker_session.login_session_id),
-                    retained_span or (chart_candle_count,
-                     view_pool.get("display_candles", view_pool["candles"])[0]["time"],
-                     view_pool.get("display_candles", view_pool["candles"])[-1]["time"])
-                    if normal_base_presentation is not None
-                    and view_pool.get("display_candles", view_pool["candles"]) else None)
-        except (AttributeError, RuntimeError, TypeError):
-            pass
         window._v5_marking_binding_pending = False
         # The acquisition-time M3 rollover proof belongs to this first
         # publication, not to later prepares of the retained history pool.
@@ -9150,10 +8881,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             current = receipt.get("candle") if isinstance(receipt, dict) else None
             candles = active_pool.get("candles")
             display = active_pool.get("display_candles", candles)
-            native = active_pool.get("_regular_minute_source_view")
-            native_candles = (native.get("candles")
-                              if session.request.timeframe_key == "M15" and isinstance(native, dict)
-                              else candles)
+            native_candles = candles
             if (isinstance(current, dict)
                     and isinstance(candles, list) and candles
                     and isinstance(display, list) and display
@@ -9166,160 +8894,21 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 active_pool = dict(
                     active_pool, candles=candles[:-1] if candles[-1] == current else candles,
                     display_candles=display[:-1] if display[-1] == current else display)
-                if isinstance(native, dict):
-                    native_candles = native["candles"]
-                    native_display = native.get("display_candles", native_candles)
-                    active_pool["_regular_minute_source_view"] = dict(
-                        native, candles=native_candles[:-1],
-                        display_candles=(native_display[:-1]
-                                        if session.request.timeframe_key != "M15" or (
-                                            isinstance(native_display, list) and native_display
-                                            and native_display[-1] == current) else native_display))
         unavailable = (active_pool.get("validation_period_calculation_unavailable")
                        if isinstance(active_pool, dict) else None)
         if unavailable:
             raise ValueError(f"{unavailable}: 자료 부족")
-        completed_regular_native_range = False
-        scope = rules.get("validation_market_scope")
-        if (chart_range is not None and session.request.timeframe_key in {"M3", "M5"}
-                and isinstance(scope, dict) and scope.get("regular_market_only") is True
-                and pool.get("market_source") == "INTEGRATED"
-                and pool.get("native_live_snapshot") is None
-                and pool.get("selected_direct_forming_snapshot") is None
-                and isinstance(sor_m1_calculation_snapshot, tuple)
-                and len(sor_m1_calculation_snapshot) == 3
-                and sor_m1_calculation_snapshot[2] == {"projection": "DIRECT_COMPLETED_TIMEFRAME"}):
-            self._require_selected_timeframe_pool(session, pool)
-            self._require_selected_timeframe_pool(session, active_pool)
-            regular_range_reason = "LOAD_PUBLICATION"
-            regular_range_exception = ""
-            try:
-                publication = pool["_dispatch_snapshot"]
-                regular_range_reason = "LOAD_QUERY"
-                query = pool["direct_selected_query"]
-                regular_range_reason = "LOAD_NATIVE_ROWS"
-                native = active_pool["_regular_minute_source_view"]["candles"]
-                regular_range_reason = "NATIVE_SOURCE"
-                minutes = session.request.timeframe_minutes
-                native_source = (self._normal_base_native_m5_calculation_rows(
-                    session, pool, pool["candles"], native_proof=True)
-                    if session.request.timeframe_key == "M5" else pool["candles"])
-                regular_range_reason = "LOAD_ROWS"
-                rows = active_pool["candles"]
-                regular_range_reason = "RANGE_ENDPOINTS"
-                first, last = chart_range_times
-                regular_range_reason = "ROW_TIMES"
-                stamps = [row["time"] for row in rows]
-                regular_range_reason = "RANGE_ENDPOINT_INDEX"
-                start, end = stamps.index(first), stamps.index(last)
-                regular_range_reason = "SELECT_ROWS"
-                selected = rows[start:end + 1]
-                regular_range_reason = "EXPECTED_ROWS"
-                expected = [row for row in expected_sor_m1_calculation
-                            if first <= row["time"] <= last]
-                regular_range_reason = "SELECTED_TIMES"
-                times = [candle_market_datetime(row) for row in selected]
-                regular_range_reason = "COMPLETION_TIME"
-                completed_at = self._direct_selected_completion_time(selected[-1], minutes)
-                regular_range_reason = "REQUEST_TIME"
-                requested_at = self._source_snapshot_datetime(query["request_as_of"])
-                regular_range_reason = "CURRENT_TIME"
-                now = self._source_snapshot_datetime(self._now_factory())
-                completed_regular_native_range = (
-                    (regular_range_reason := "RANGE_TYPE")
-                    and isinstance(chart_range_times, tuple)
-                    and (regular_range_reason := "RANGE_LENGTH") and len(chart_range_times) == 2
-                    and (regular_range_reason := "EXPECTED_TYPE")
-                    and isinstance(expected_sor_m1_calculation, list)
-                    and (regular_range_reason := "PUBLICATION_TYPE") and isinstance(publication, tuple)
-                    and (regular_range_reason := "PUBLICATION_LENGTH") and len(publication) == 4
-                    and (regular_range_reason := "PUBLICATION_SOURCE")
-                    and publication[3] == sor_m1_calculation_snapshot[0]
-                    == ((regular_range_reason := "POOL_SOURCE"),
-                        self._pool_computation_source_identity(pool))[1]
-                    and (regular_range_reason := "PUBLICATION_ROWS")
-                    and publication[2]["candles"] == pool["candles"]
-                    and (regular_range_reason := "PUBLICATION_QUERY")
-                    and publication[2]["direct_selected_query"] == query
-                    and (regular_range_reason := "NATIVE_SUFFIX") and native == native_source[-len(native):]
-                    and (regular_range_reason := "DIRECT_QUERY") and self._direct_selected_query_valid(
-                        query, session.request.stock, session.request.timeframe_key, minutes,
-                        f"{session.request.stock.code}_AL", pool["candles"])
-                    and (regular_range_reason := "REQUEST_ID") and query["request_id"] == pool["request_id"]
-                    and (regular_range_reason := "ACTIVE_QUERY") and active_pool.get("direct_selected_query") == query
-                    and (regular_range_reason := "STAMP_ORDER") and stamps == sorted(set(stamps))
-                    and (regular_range_reason := "WARMUP") and start >= warmup_bars
-                    and (regular_range_reason := "RANGE_ORDER") and start <= end
-                    and (regular_range_reason := "SELECTED_ROWS") and selected == expected
-                    and (regular_range_reason := "SELECTED_FIRST") and selected[0]["time"] == first
-                    and (regular_range_reason := "SELECTED_LAST") and selected[-1]["time"] == last
-                    and (regular_range_reason := "COMPLETED_BY_REQUEST")
-                    and completed_at <= requested_at <= (
-                        (regular_range_reason := "REQUEST_SNAPSHOT"), sor_m1_calculation_snapshot[1])[1]
-                    and (regular_range_reason := "COMPLETED_BEFORE_NOW") and completed_at < now
-                    and all((regular_range_reason := "TIMESTAMP_PRESENT") and at is not None
-                            and (regular_range_reason := "WEEKDAY") and at.weekday() < 5 for at in times)
-                )
-                if session.request.timeframe_key == "M5":
-                    # Display-only closes cannot prove selected coverage or hidden warmup.
-                    completed_regular_native_range = completed_regular_native_range and (
-                        (regular_range_reason := "M5_NATIVE_RECEIPT")
-                        and self._native_m5_query_verified(session.request.stock, pool["candles"], query)
-                        and (regular_range_reason := "M5_REGULAR_ROWS")
-                        and rows == _krx_regular_session_candles(
-                            native, native_m5_close_times=active_pool.get(
-                                "native_m5_regular_close_times", ()))[-len(rows):]
-                        and all((regular_range_reason := "M5_DISPLAY_ONLY")
-                                and not row.get("display_only_special")
-                                and (regular_range_reason := "M5_CLOSE_TIME")
-                                and not row["time"].endswith("153500") for row in rows)
-                    )
-            except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
-                regular_range_exception = type(exc).__name__
-                completed_regular_native_range = False
-            if not completed_regular_native_range:
-                try:
-                    if session.request.timeframe_key == "M5":
-                        request_id_diagnostic = {}
-                        if regular_range_reason == "REQUEST_ID":
-                            pool_request_id = pool.get("request_id")
-                            query_request_id = query.get("request_id") if isinstance(query, dict) else None
-                            request_id_diagnostic = {
-                                "pool_request_id": pool_request_id,
-                                "query_request_id": query_request_id,
-                                "request_ids_equal": (pool_request_id == query_request_id
-                                                      if "request_id" in pool and isinstance(query, dict)
-                                                      and "request_id" in query else None),
-                                "pool_request_id_is_cache_restore": pool_request_id == "VALIDATION_CACHE_RESTORE",
-                            }
-                            diagnostic_snapshot = pool.get("snapshot")
-                            if isinstance(diagnostic_snapshot, ValidationHistoricalSnapshot):
-                                request_id_diagnostic["snapshot_request_id"] = diagnostic_snapshot.request_id
-                        trace_signal_validation_event(
-                            "v5_sor_block", stage="regular_selected_range_provenance",
-                            timeframe=session.request.timeframe_key, reason=regular_range_reason,
-                            exception_type=regular_range_exception,
-                            **request_id_diagnostic,
-                        )
-                except Exception:
-                    pass
-                raise ValueError("SOR_M1_BLOCKED:SOR_DIRECT_HISTORY_PROVENANCE_INVALID")
-            historical_only_until = last
         selected_wm_range = (
             chart_range is not None and sor_m1_calculation_snapshot is None
             and session.request.timeframe_key in {"W1", "MO1"}
             and isinstance(pool.get("direct_selected_query"), dict)
-            and (pool.get("market_source") == "INTEGRATED"
-                 or self._period_session_scope(session.request.settings_snapshot,
-                                               session.request.timeframe_key) == "REGULAR")
+            and pool.get("market_source") == "INTEGRATED"
         )
         if not selected_wm_range:
             active_pool = self._sor_m1_calculation_view(
                 session, pool, active_pool, sor_m1_calculation_snapshot,
                 None if historical_only_until is not None else expected_sor_m1_calculation,
                 _displayed_wm_snapshot=reuse_displayed_wm_snapshot,
-                **({"historical_only_until": historical_only_until}
-                   if completed_regular_native_range else {}),
             )
         if historical_only_until is not None:
             # A completed selected range cannot depend on a later forming bar.
@@ -9350,13 +8939,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 active_pool = self._verified_sor_view_for_session(
                     session, pool, active_pool, now, verified_source_identity,
                 )
-            if self._period_session_scope(
-                    session.request.settings_snapshot,
-                    session.request.timeframe_key) == "REGULAR":
-                # Native regular-period broker proof replaces the FULL SOR
-                # M1-tail contract; do not fabricate a tail completion flag.
-                self._require_selected_timeframe_pool(session, active_pool)
-            elif not active_pool.get("sor_tail_calculation_complete"):
+            if not active_pool.get("sor_tail_calculation_complete"):
                 raise ValueError("SOR_VERIFIED_BLOCKED:REPLAY_VIEW_UNVERIFIED")
         if marking_view_check is not None:
             active_pool = marking_view_check(active_pool)
@@ -10046,9 +9629,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         sidecar_override=_SIDECAR_UNSET,
     ):
         self._require_selected_timeframe_pool(session, pool)
-        regular_period = self._period_session_scope(
-            session.request.settings_snapshot, session.request.timeframe_key) == "REGULAR"
-        if regular_period and display_view is not None:
+        if (display_view is not None
+                and ("_regular_minute_source_view" in display_view
+                     or session.request.timeframe_key in {"D1", "W1", "MO1", "Y1"})):
             self._require_selected_timeframe_pool(session, display_view)
         warmup = required_validation_history_context_bars(session.request.settings_snapshot.to_dict())
         view = (self._validation_pool_for_session(
@@ -10057,8 +9640,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if display_view is None else (
                 dict(display_view)
                 if (display_view.get("validation_composite_calculation") is True
-                    or "_regular_minute_source_view" in display_view
-                    or regular_period
+                    or "_full_period_proven_source" in display_view
                     or (session.request.timeframe_key == "M5"
                         and pool.get("market_source") == "INTEGRATED"
                         and pool.get("market_data_identity")
@@ -10074,7 +9656,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     ) else pool["candles"]),
                     display_candles=display_view.get("display_candles", display_view["candles"]),
                     display_only_integrated=display_view.get("display_only_integrated") is True)))
-        view = self._regular_minute_evaluation_view(session, view)
         # The selected view owns the calculation axis, including its special-bar exclusion.
         rows = view["candles"]
         display = view.get("display_candles", view["candles"])[-history_target:]
@@ -10099,17 +9680,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if (session.request.timeframe_key != "M5"
                 or pool.get("market_source") != "INTEGRATED"
                 or pool.get("market_data_identity") != f"{session.request.stock.code}_AL"):
-            scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-            return (_krx_regular_session_candles(raw_rows)
-                    if (not native_proof and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES
-                        and isinstance(scope, dict) and scope.get("regular_market_only") is True)
-                    else raw_rows)
+            return raw_rows
         native = dict(pool, candles=raw_rows)
         view = self._validation_pool_for_session(
             session, native, target_count=len(raw_rows),
             sidecar_override=None)
-        return (view.get("_regular_minute_source_view", view)["candles"]
-                if native_proof else view["candles"])
+        return view["candles"]
 
     def _ensure_normal_base_history(self, window, session, pool, evaluation_count,
                                     *, display_view=None, on_ready=None):
@@ -10128,27 +9704,16 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         original_pool = pool
         source_identity = self._pool_computation_source_identity(pool)
         rows = deepcopy(pool["candles"])
-        scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-        regular_minute_native_handoff = (
-            session.request.timeframe_key in {"M3", "M5", "M10"}
-            and isinstance(scope, dict) and scope.get("regular_market_only") is True
-            and pool.get("market_data_identity") == self._session_period_source(session)[0]
-            and pool.get("market_source") == "INTEGRATED"
-        )
         # A larger native axis must travel with its own direct source receipt.
         native_minute_restore = (
             session.request.timeframe_key in {"M3", "M5", "M10", "M15", "M30"}
             and pool.get("market_data_identity") == self._session_period_source(session)[0]
             and pool.get("market_source") == "INTEGRATED"
-            and (pool.get("request_id") == "VALIDATION_CACHE_RESTORE"
-                 or (session.request.timeframe_key == "M5"
-                     and pool.get("cache_restore_marker") == "VALIDATION_CACHE_RESTORE")
-                 or session.request.timeframe_key in {"M15", "M30"}
-                 or regular_minute_native_handoff))
+            and ((pool.get("request_id") == "VALIDATION_CACHE_RESTORE") or (session.request.timeframe_key == "M5"
+                     and pool.get("cache_restore_marker") == "VALIDATION_CACHE_RESTORE") or (session.request.timeframe_key in {"M15", "M30"})))
         verified_native_handoff = (
             native_minute_restore
-            and (session.request.timeframe_key in {"M5", "M15", "M30"}
-                 or regular_minute_native_handoff))
+            and ((session.request.timeframe_key in {"M5", "M15", "M30"})))
         # Keep the original cache payload separate from verified cache-only growth.
         cache_origin = (deepcopy(pool.get("normal_base_cache_candles", pool["candles"]))
                         if native_minute_restore else None)
@@ -10247,10 +9812,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         # request more native history when that calculation context is missing.
         source_request_count = pool.get("requested_count")
         if (
-            fresh_native is None
-            and not regular_minute_native_handoff
-            and on_ready is None
-            and display_view is None
+            fresh_native is None and on_ready is None and display_view is None
             and isinstance(source_request_count, int)
             and not isinstance(source_request_count, bool)
             and source_request_count >= history_target + warmup
@@ -10269,8 +9831,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         request_key = (window_key, generation)
 
         def trace_regular_warmup(phase, *, error=None, **counts):
-            if not regular_minute_native_handoff:
-                return
+            return
             try:
                 if error is not None:
                     kind = type(error).__name__
@@ -10325,12 +9886,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     self._use_pool_for_window(
                         window, session, verified_pool,
                         evaluation_count=evaluation_count, _normal_view=verified_view)
-                return
-            if regular_minute_native_handoff:
-                # Do not publish cache-grown candles under the original native receipt.
-                error_code = (source_error_code if source_error_code in ("TR_BUDGET_EXCEEDED", "TR_TIMEOUT")
-                              else "REGULAR_NATIVE_WARMUP_UNVERIFIED")
-                self._fail_window(window, f"HISTORICAL: {error_code}")
                 return
             try:
                 enriched = self._pool_from_candles(
@@ -10405,19 +9960,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             publish()
             return True
         try:
-            requester_scope = session.request.settings_snapshot.to_dict().get(
-                "validation_market_scope"
-            )
-            requester_regular_only = (
-                isinstance(requester_scope, dict)
-                and requester_scope.get("regular_market_only") is True
-            )
             requester = _V5SelectedSourceRequester(
                 self._broker, session.request.stock, session.request.timeframe_key,
                 (session.source_selection.nxt_available if getattr(session, "source_selection", None)
                  else self._validation_source_by_code[session.request.stock.code]),
                 source_selection=getattr(session, "source_selection", None),
-                regular_only=requester_regular_only,
+                regular_only=False,
                 on_verified_period_response=self._capture_sor_period_prior_close,
                 now_factory=self._now_factory,
                 on_verified_native_response=self._remember_native_receipt,
@@ -10459,12 +10007,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             if self._v5_native_tr_pending.get(window_key):
                 self._reject_window_request(window, "V5_TIMEFRAME_TR_IN_PROGRESS")
                 return
-            if regular_minute_native_handoff and (
-                    self._active_providers.get(request_key) is not provider
-                    or self._pool_computation_source_identity(original_pool) != source_identity
-                    or not self._source_selection_is_current(
-                        getattr(session, "source_selection", None))):
-                return
             self._active_providers[request_key] = provider
             native_tr_token = object()
             callback_consumed = False
@@ -10475,19 +10017,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 self._finish_v5_native_tr(window_key, native_tr_token, verified=(
                     isinstance(result, ValidationHistoricalResult) and result.ok is True),
                     error=getattr(result, "error", None))
-                if ((regular_minute_native_handoff and callback_consumed)
-                        or self._active_providers.get(request_key) is not provider):
+                if ((self._active_providers.get(request_key) is not provider)):
                     return
-                if regular_minute_native_handoff:
-                    callback_consumed = True
                 self._active_providers.pop(request_key, None)
                 if self._request_generation.get(window_key, 0) != generation:
-                    return
-                if regular_minute_native_handoff and (
-                        self._open_windows.get(window_key) is not window
-                        or self._pool_computation_source_identity(original_pool) != source_identity
-                        or not self._source_selection_is_current(
-                            getattr(session, "source_selection", None))):
                     return
                 if native_minute_restore:
                     retry_count = None
@@ -10516,34 +10049,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         handoff_stage = "direct_rows"
                         incoming, forming, query = self._direct_selected_history_parts(snapshot)
                         handoff_incoming_count = len(incoming)
-                        if regular_minute_native_handoff and incoming:
-                            try:
-                                handoff_incoming_first_time = incoming[0]["time"]
-                                handoff_incoming_last_time = incoming[-1]["time"]
-                            except Exception:
-                                pass  # Diagnostic failure must not reject source rows.
                         handoff_stage = "quantity_provenance"
                         proven_response_count = len(incoming)
                         native_minutes = session.request.timeframe_minutes
-                        if (regular_minute_native_handoff
-                                and (session.request.timeframe_key, native_minutes)
-                                    in {("M3", 3), ("M5", 5), ("M10", 10)}
-                                and snapshot.rows_count == request_count
-                                and proven_response_count + 1 == request_count):
-                            as_of = self._source_snapshot_datetime(snapshot.request_as_of)
-                            if as_of is not None:
-                                selected, _ = project_validation_candles(
-                                    snapshot, as_of=as_of + timedelta(minutes=native_minutes))
-                                if (len(selected) == request_count
-                                        and selected[:-1] == incoming):
-                                    tail_start = candle_market_datetime(selected[-1])
-                                    tail_end = self._direct_selected_completion_time(
-                                        selected[-1], native_minutes)
-                                    if (tail_start is not None and tail_end is not None
-                                            and tail_start <= as_of < tail_end):
-                                        # Prove the raw forming row, but never count it
-                                        # as completed warmup or calculation history.
-                                        proven_response_count += 1
                         if (not self._direct_selected_query_valid(
                                     query, session.request.stock,
                                     session.request.timeframe_key,
@@ -10576,17 +10084,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             "display_candles", candidate_selected["candles"])
                             if row["time"] in display_times]
                         handoff_matched_display_count = len(fresh_display)
-                        if regular_minute_native_handoff:
-                            try:
-                                missing_times = sorted(
-                                    display_times - {row["time"] for row in fresh_display})
-                                handoff_missing_display_count = len(missing_times)
-                                handoff_missing_display_first_time = (
-                                    missing_times[0] if missing_times else "")
-                                handoff_missing_display_last_time = (
-                                    missing_times[-1] if missing_times else "")
-                            except Exception:
-                                pass  # Diagnostic failure must not change the display gate.
                         handoff_first_display_index = next(
                             (i for i, row in enumerate(incoming)
                              if display and row["time"] >= display[0]["time"]),
@@ -10598,26 +10095,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                             session, candidate, history_target,
                             dict(candidate_selected, display_candles=fresh_display))
                         if candidate_deficit and not terminal_short_response:
-                            if (regular_minute_native_handoff
-                                    and candidate_deficit < previous_native_deficit):
-                                if native_retry_cap is None:
-                                    native_retry_cap = min(
-                                        DEFAULT_CANDLES_MAX_COUNT,
-                                        request_count + max(
-                                            2 * _HISTORY_EXTENSION_STEP,
-                                            4 * candidate_deficit))
-                                if native_retry_attempts < 2:
-                                    growth_factor = (
-                                        3 if session.request.timeframe_key == "M3" else 2)
-                                    next_count = min(
-                                        native_retry_cap,
-                                        request_count + max(
-                                            _HISTORY_EXTENSION_STEP,
-                                            growth_factor * candidate_deficit))
-                                    if next_count > request_count:
-                                        retry_count = next_count
-                                        native_retry_attempts += 1
-                                        previous_native_deficit = candidate_deficit
                             if retry_count is not None:
                                 raise ValueError("HISTORY_SOURCE_WARMUP_INSUFFICIENT")
                         handoff_stage = "receipt_binding"
@@ -10635,40 +10112,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         fresh_native = candidate, candidate_view, candidate_deficit
                     except Exception as exc:
                         handoff_reason = str(exc) or type(exc).__name__
-                    if regular_minute_native_handoff:
-                        source_error_code = getattr(result, "error", None)
-                        if source_error_code == "historical candle request timed out":
-                            source_error_code = "TR_TIMEOUT"
-                        elif source_error_code == "CANDLE_TR_BUDGET_EXCEEDED":
-                            source_error_code = "TR_BUDGET_EXCEEDED"
-                        trace_regular_warmup(
-                            "response",
-                            source_result_reason=getattr(result, "reason", None),
-                            source_result_error_code=source_error_code,
-                            outcome=("accepted" if fresh_native is not None else "rejected"),
-                            rejection_stage=(
-                                "complete" if fresh_native is not None else handoff_stage),
-                            rejection_reason=(
-                                handoff_reason if handoff_reason in {
-                                    "HISTORY_SOURCE_IDENTITY_MISMATCH",
-                                    "HISTORY_SOURCE_TIMEFRAME_MISMATCH",
-                                    "HISTORY_SOURCE_INCOMPLETE_OR_UNVERIFIED",
-                                    "HISTORY_SOURCE_DISPLAY_INCOMPLETE",
-                                    "HISTORY_SOURCE_WARMUP_INSUFFICIENT",
-                                } else ("UNEXPECTED_EXCEPTION" if handoff_reason else "")),
-                            requested_count=request_count,
-                            response_rows_count=getattr(handoff_snapshot, "rows_count", None),
-                            incoming_count=handoff_incoming_count,
-                            matched_display_count=handoff_matched_display_count,
-                            first_display_index=handoff_first_display_index,
-                            incoming_first_time=handoff_incoming_first_time,
-                            incoming_last_time=handoff_incoming_last_time,
-                            missing_display_count=handoff_missing_display_count,
-                            missing_display_first_time=handoff_missing_display_first_time,
-                            missing_display_last_time=handoff_missing_display_last_time,
-                            remaining_warmup_deficit=candidate_deficit,
-                            result_ok=(getattr(result, "ok", None) is True),
-                        )
                     if session.request.timeframe_key in {"M15", "M30"}:
                         trace_signal_validation_event(
                             f"flow.{session.request.timeframe_key.lower()}.native_warmup_handoff",
@@ -10690,7 +10133,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         self._active_providers[request_key] = provider
                         QTimer.singleShot(0, lambda: request_more(retry_count))
                         return
-                    publish(source_error_code if regular_minute_native_handoff else None)
+                    publish(None)
                     return
                 self._retain_broker_al_m1_result(window_key, result)
                 before = len(rows)
@@ -10737,8 +10180,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 self._active_providers.pop(request_key, None)
                 publish()
 
-        if regular_minute_native_handoff:
-            self._active_providers[request_key] = provider
         request_more(min(DEFAULT_CANDLES_MAX_COUNT, max(len(rows), count) + deficit))
         return True
 
@@ -10755,12 +10196,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     ) -> None:
         if not self._source_selection_is_current(getattr(session, "source_selection", None)):
             return
-        republish = getattr(session, "_v5_session_display_snapshot", None)
-        if (_normal_view is None and isinstance(republish, tuple) and len(republish) == 3
-                and getattr(window, "_session_display_republish_pending", None)
-                is session.request.settings_snapshot
-                and republish[0] == self._pool_computation_source_identity(pool)):
-            _normal_view = getattr(session, "_v5_session_display_view", None)
         if (_normal_view is None and getattr(window, "_normal_base_requested", False)
                 and self._ensure_normal_base_history(
                     window, session, pool, evaluation_count)):
@@ -11090,22 +10525,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         *, _native_scope=False,
     ):
         """Bind a detached V5 calculation view to the dispatched source and tail."""
-        scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-        if (not _native_scope and isinstance(scope, dict)
-                and scope.get("regular_market_only") is True
-                and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES):
-            self._require_selected_timeframe_pool(session, view)
-            native = view.get("_regular_minute_source_view", view)
-            verified = self._verified_sor_view_for_session(
-                session, source_pool, native, as_of, dispatch_source_identity,
-                _native_scope=True)
-            return self._regular_minute_evaluation_view(
-                session, verified, target_count=max(1, len(view["candles"])))
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) == "REGULAR":
-            self._require_selected_timeframe_pool(session, source_pool)
-            self._require_selected_timeframe_pool(session, view)
-            return view
         if isinstance(source_pool, dict) and source_pool.get("market_source") in {"NXT", "KRX"}:
             self._require_selected_timeframe_pool(session, source_pool)
             self._require_selected_timeframe_pool(session, view)
@@ -11737,13 +11156,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
     def _sor_m1_calculation_snapshot(self, session, pool, *, live_forming=False,
                                      as_of_override=None):
         """Freeze M1 only for the current forming bar; completed minute bars stay direct."""
-        republish = getattr(session, "_v5_session_display_snapshot", None)
-        if (not live_forming and isinstance(republish, tuple) and len(republish) == 3
-                and republish[0] == self._pool_computation_source_identity(pool)):
-            return republish[1]
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) == "REGULAR":
-            return None
         code = session.request.stock.code
         if (self._verified_sor_tail_provider is not None
                 or self._validation_source_by_code.get(code) is not True
@@ -11895,9 +11307,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._require_selected_timeframe_pool(session, source_pool)
             self._require_selected_timeframe_pool(session, view)
             scope = self._period_session_scope(session.request.settings_snapshot, key)
-            original = source_pool.get(
-                "_regular_period_proven_source" if scope == "REGULAR"
-                else "_full_period_proven_source", source_pool)
+            original = source_pool.get("_full_period_proven_source", source_pool)
             self._require_selected_timeframe_pool(session, original)
             query = source_pool.get("direct_selected_query")
             rows = original.get("candles")
@@ -12149,14 +11559,15 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         _provenance_trace=None, _trace_call_path="DIRECT_CALL",
         historical_only_until=None, _displayed_wm_snapshot=False,
     ):
+        for candidate in (source_pool, view):
+            if isinstance(candidate, dict) and "_regular_minute_source_view" in candidate:
+                self._require_selected_timeframe_pool(session, candidate)
         if session.request.timeframe_key in {"M3", "M15"} and _provenance_trace is None:
             _provenance_trace = _V5M3ProvenanceTrace(
                 getattr(getattr(session, "source_selection", None), "generation", None))
         if (frozen is None and session.request.timeframe_key in {"W1", "MO1"}
                 and isinstance(source_pool, dict)
-                and (source_pool.get("market_source") == "INTEGRATED"
-                     or self._period_session_scope(session.request.settings_snapshot,
-                                                   session.request.timeframe_key) == "REGULAR")):
+                and ((source_pool.get("market_source") == "INTEGRATED"))):
             try:
                 now = self._source_snapshot_datetime(self._now_factory())
                 start = now.date()
@@ -12175,38 +11586,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         displayed_snapshot=_displayed_wm_snapshot):
                     raise ValueError("SOR_M1_BLOCKED:SOURCE_UNAVAILABLE")
                 return view
-        scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-        if (not _native_scope and isinstance(scope, dict)
-                and scope.get("regular_market_only") is True
-                and session.request.timeframe_key in _LIVE_MINUTE_TIMEFRAMES):
-            self._require_selected_timeframe_pool(session, view)
-            native = view.get("_regular_minute_source_view", view)
-            verified = self._sor_m1_calculation_view(
-                session, source_pool, native, frozen,
-                live_calendar=live_calendar, normal_base_only=normal_base_only,
-                _native_scope=True, _provenance_trace=_provenance_trace,
-                _trace_call_path=_trace_call_path,
-                historical_only_until=historical_only_until)
-            added = max(0, len(_krx_regular_session_candles(
-                verified["candles"], native_m5_close_times=
-                verified.get("native_m5_regular_close_times", ())))
-                - len(_krx_regular_session_candles(
-                    native["candles"], native_m5_close_times=
-                    native.get("native_m5_regular_close_times", ()))))
-            result = self._regular_minute_evaluation_view(
-                session, verified, target_count=max(1, len(view["candles"]) + added))
-            if (expected_calculation is not None
-                    and (not isinstance(expected_calculation, list) or not expected_calculation
-                         or expected_calculation != result["candles"][-len(expected_calculation):])):
-                raise ValueError("SOR_M1_BLOCKED:DISPLAYED_CALCULATION_CHANGED")
-            if verified is native and "_regular_minute_source_view" in view:
-                return view
-            return result
-        if self._period_session_scope(
-                session.request.settings_snapshot, session.request.timeframe_key) == "REGULAR":
-            self._require_selected_timeframe_pool(session, source_pool)
-            self._require_selected_timeframe_pool(session, view)
-            return view
         if (isinstance(source_pool, dict)
                 and source_pool.get("_restored_closed_m1") is True):
             if not self._closed_m1_pool_verified(source_pool):
@@ -12341,21 +11720,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                       if isinstance(row, dict)]
             settings = getattr(session.request, "settings_snapshot", None)
             rules = settings.to_dict() if settings is not None else {}
-            scope = rules.get("validation_market_scope") if isinstance(rules, dict) else None
-            regular_only = (isinstance(scope, dict)
-                            and scope.get("regular_market_only") is True)
-            expected_display = (_krx_regular_session_candles(
-                historical, native_m5_close_times=view.get("native_m5_regular_close_times", ()))
-                                if regular_only else historical[-len(display):])
-            if (timeframe_key == "M3" and regular_only
-                    and normal_base_only and _native_scope):
-                # Native warmup may advance the tail while preserving the displayed end.
-                display_end = display[-1].get("time") if isinstance(display[-1], dict) else None
-                end = next((index + 1 for index, row in enumerate(expected_display)
-                            if row.get("time") == display_end), 0)
-                expected_display = expected_display[max(0, end - len(display)):end]
-            elif regular_only and timeframe_key in {"M3", "M5", "M10", "M15", "M30"}:
-                expected_display = expected_display[-len(display):]
+            expected_display = (historical[-len(display):])
             query_valid = native_after_history = "NOT_EVALUATED"
 
             def provenance_failure(reason, row_index=None, row_session="NOT_EVALUATED"):
@@ -12368,7 +11733,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     if timeframe_key == "M3":
                         _provenance_trace.first_failure(
                             reason, call_path=_trace_call_path, native_scope=_native_scope,
-                            regular_only=regular_only, historical_count=len(historical),
+                            regular_only=False, historical_count=len(historical),
                             display_count=len(display), stamp_count=len(stamps),
                             row_index=row_index, row_session=row_session, query_valid=query_valid,
                             m3_after_anchor_verified=m3_after_anchor_verified,
@@ -12558,18 +11923,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if received <= as_of < end:
                     direct_current = candle
             if not live_higher_forming:
-                if (as_of.weekday() < 5
-                        # Only a bound, completed REG M3/M5 range can ignore a later AFTER tail.
-                        and not (historical_only_until is not None
-                                 and timeframe_key in {"M3", "M5"} and regular_only and _native_scope
-                                 and projected == {"projection": "DIRECT_COMPLETED_TIMEFRAME"}
-                                 and (native_after_history
-                                      or (timeframe_key == "M5" and broker_timed_history))
-                                 and receipt is None
-                                 and MarketDataHost._display_session_for_time(as_of) == "NXT_AFTER"
-                                 and historical_only_until in stamps)
-                        and MarketDataHost._display_session_for_time(as_of)
-                        in {"NXT_PRE", "KRX", "NXT_AFTER"}):
+                if ((as_of.weekday() < 5) and (MarketDataHost._display_session_for_time(as_of)
+                        in {"NXT_PRE", "KRX", "NXT_AFTER"})):
                     latest_direct = MarketDataHost._expected_latest_completed_display_start(
                         as_of, session.request.timeframe_minutes,
                         [*historical, receipt["candle"]] if isinstance(receipt, dict)
@@ -12660,12 +12015,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
                     current_display = ([*display, direct_current]
                                        if direct_m5_special else calculation)
-                    scope = session.request.settings_snapshot.to_dict().get("validation_market_scope")
-                    if (timeframe_key == "M5" and isinstance(scope, dict)
-                            and scope.get("regular_market_only") is True):
-                        current_display = _krx_regular_session_candles(
-                            current_display, native_m5_close_times=
-                            view.get("native_m5_regular_close_times", ()))
                     return dict(view, candles=calculation,
                                 display_candles=current_display[-5000:],
                                 calculation_source="SELECTED_DIRECT_AL_WITH_DIRECT_CURRENT",
@@ -12944,14 +12293,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                           and expected_calculation == historical[-len(expected_calculation):]))):
                 stamps = [str(row.get("time") or "") for row in rows
                           if isinstance(row, dict)]
-                settings = getattr(session.request, "settings_snapshot", None)
-                scope = (settings.to_dict().get("validation_market_scope")
-                         if settings is not None else None)
                 if (len(stamps) == len(rows) and stamps == sorted(set(stamps))
                         and all(len(stamp) == 14 and stamp.isdigit() for stamp in stamps)
-                        and display == (_krx_regular_session_candles(historical)
-                            if isinstance(scope, dict) and scope.get("regular_market_only") is True
-                            else historical)[-len(display):]
+                        and display == historical[-len(display):]
                         and all(row.get("is_complete") is not False
                                 and row.get("market_data_identity", f"{session.request.stock.code}_AL")
                                     == f"{session.request.stock.code}_AL"
@@ -13132,22 +12476,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 if row["time"].startswith(today)
             }
             first_today_candidate = min(today_candidates) if today_candidates else ""
-            settings = getattr(session.request, "settings_snapshot", None)
-            scope = (settings.to_dict().get("validation_market_scope")
-                     if callable(getattr(settings, "to_dict", None)) else None)
-            regular_m1 = (timeframe_key == "M1" and isinstance(scope, dict)
-                          and scope.get("regular_market_only") is True)
-            expected_display_rows = (
-                _krx_regular_session_candles(source) if regular_m1 else source
-            )
-            expected_display_times = (
-                [str(row.get("time") or "") for row in expected_display_rows]
-                if regular_m1 else source_times
-            )
             if (candidate_times != sorted(set(candidate_times))
                     or source_times != sorted(set(source_times))
-                    or display_times != expected_display_times[-len(display_times):]
-                    or (regular_m1 and display != expected_display_rows[-len(display):])):
+                    or display_times != source_times[-len(display_times):]):
                 raise ValueError("SOR_M1_BLOCKED:TARGET_TIMESTAMP_COVERAGE_MISMATCH")
             today_source_times = [stamp for stamp in source_times if stamp.startswith(today)]
             if not today_source_times and source_times[-1][:8] < today and not live_higher_forming:
@@ -13281,12 +12612,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                                else list(display))
         settings = getattr(session.request, "settings_snapshot", None)
         rules = settings.to_dict() if callable(getattr(settings, "to_dict", None)) else {}
-        scope = rules.get("validation_market_scope")
-        if (isinstance(scope, dict) and scope.get("regular_market_only") is True
-                and timeframe_key in _LIVE_MINUTE_TIMEFRAMES):
-            display_calculation = _krx_regular_session_candles(
-                display_calculation, native_m5_close_times=
-                view.get("native_m5_regular_close_times", ()))
         if live_calendar and (d1 or period):
             if (not display_calculation or display_calculation[-1]["time"]
                     != calculation[-1]["time"]):
@@ -13362,7 +12687,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         frozen = request["sor_m1_calculation_snapshot"]
         proof = frozen[2] if isinstance(frozen, tuple) and len(frozen) == 3 else None
         if (session.request.timeframe_key == "M1"
-                and getattr(session, "_v5_session_display_snapshot", None) is None
                 and pool.get("_v5_direct_m1_request") is not None
                 and isinstance(proof, dict) and proof.get("availability_state") in {
                     "SOR_M1_SOURCE_UNAVAILABLE", "SOR_M1_LAST_COMPLETED_MINUTE_MISSING",
@@ -13506,11 +12830,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                         prepared_projected_cache = (
                             projection_key, complete_after,
                             "COMPLETED_SOURCE" if as_of >= complete_after else as_of_minute,
-                            pickle.dumps({
-                                **{field: view_pool[field] for field in fields},
-                                **({"_regular_minute_source_view": view_pool["_regular_minute_source_view"]}
-                                   if "_regular_minute_source_view" in view_pool else {}),
-                            }, protocol=4),
+                            pickle.dumps({field: view_pool[field] for field in fields}, protocol=4),
                         )
             _trace_v5_historical_boundary(
                 "worker_view_ready", timeframe=session.request.timeframe_key,
@@ -14895,103 +14215,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             candle_content_hash,
         )
 
-    def _session_display_pool_reusable(self, window, session, pool, history_target) -> bool:
-        """Only a scope toggle may recalculate the same published native receipt."""
-        try:
-            if (session.request.timeframe_key not in _LIVE_MINUTE_TIMEFRAMES
-                    or getattr(window, "_session_display_republish_pending", None)
-                       is not session.request.settings_snapshot):
-                return False
-            basis = getattr(window, "_v5_session_display_basis", None)
-            binding = getattr(window, "_v5_marking_display_publication", None)
-            if (not isinstance(basis, tuple) or len(basis) not in (2, 3)
-                    or basis[0] is not binding):
-                return False
-            if not self._marking_publication_is_current(window, binding):
-                proof = window.__dict__.pop("_v5_session_display_source_proof", None)
-                key = id(window)
-                if (not isinstance(proof, tuple) or len(proof) != 3
-                        or proof[0] is not binding or proof[1] is not basis
-                        or proof[2] != self._request_generation.get(key)
-                        or self._open_windows.get(key) is not window
-                        or getattr(window, "stock", None) != session.request.stock
-                        or self._historical_pools.get(key) is not pool
-                        or self._validation_sessions.get(key) is not binding[1]
-                        or pool.get("_dispatch_snapshot") is not binding[3]):
-                    return False
-            previous_pool, previous, _, publication = binding
-            old_selection = getattr(previous, "source_selection", None)
-            selection = getattr(session, "source_selection", None)
-            now = self._now_factory().astimezone(SEOUL_TIMEZONE)
-            broker_session = self._broker.broker_session_snapshot()
-            if (previous_pool is not pool
-                    or previous.request.stock != session.request.stock
-                    or previous.request.timeframe_key != session.request.timeframe_key
-                    or not isinstance(old_selection, _V5SourceSelection)
-                    or not isinstance(selection, _V5SourceSelection)
-                    or old_selection.selected_at.date() != now.date()
-                    or any(getattr(old_selection, field) != getattr(selection, field)
-                           for field in ("stock", "timeframe_key", "window_key",
-                                         "market_session_scope", "market_data_identity",
-                                         "market_source", "nxt_available", "native_session"))
-                    or broker_session.connected is not True
-                    or basis[1] != (broker_session.connection_epoch, broker_session.login_session_id)
-                    or pool.get("native_live_snapshot") is not None
-                    or publication[3] != self._pool_computation_source_identity(pool)
-                    or publication[2].get("direct_selected_query") != pool.get("direct_selected_query")
-                    or publication[2].get("native_minute_receipt") != pool.get("native_minute_receipt")
-                    or any(row.get("is_complete") is False for row in pool["candles"])):
-                return False
-            old_rules = previous.request.settings_snapshot.to_dict()
-            rules = session.request.settings_snapshot.to_dict()
-            old_regular = old_rules.setdefault("validation_market_scope", {}).pop("regular_market_only", False)
-            regular = rules.setdefault("validation_market_scope", {}).pop("regular_market_only", False)
-            # Real Window snapshots also retain the same display flag in their UI state.
-            for candidate, expected in ((old_rules, old_regular), (rules, regular)):
-                ui_scope = candidate.get("indicator_follow_ui_state", {}).get(
-                    "state", {}).get("validation_market_scope")
-                if ui_scope is not None and ui_scope.pop("regular_market_only", False) != expected:
-                    return False
-            if old_regular == regular or old_rules != rules:
-                return False
-            self._require_selected_timeframe_pool(session, pool)
-            if pool.get("market_source") == "INTEGRATED":
-                if not self._direct_selected_query_valid(
-                        pool.get("direct_selected_query"), session.request.stock,
-                        session.request.timeframe_key, session.request.timeframe_minutes,
-                        selection.market_data_identity, pool["candles"]):
-                    return False
-            elif pool.get("market_source") != "KRX" or pool.get("native_minute_receipt") is None:
-                return False
-            display_view = None
-            if regular and len(basis) == 3 and basis[2] is not None:
-                published_target, first_time, last_time = basis[2]
-                if published_target != history_target:
-                    return False
-                # Filter the published span; hidden native warmup stays outside it.
-                display_view = self._validation_pool_for_session(
-                    session, pool, target_count=len(pool["candles"]), sidecar_override=None)
-                display_view = dict(display_view, display_candles=[
-                    row for row in display_view.get("display_candles", display_view["candles"])
-                    if first_time <= row["time"] <= last_time])
-            view, deficit = self._normal_base_history_view(
-                session, pool, history_target, display_view, sidecar_override=None)
-            if deficit or not view.get("display_candles"):
-                return False
-            source_as_of = self._source_snapshot_datetime(
-                pool["direct_selected_query"]["request_as_of"]
-                if pool.get("market_source") == "INTEGRATED"
-                else pool["native_minute_receipt"][0]["request_as_of"])
-            if source_as_of is None:
-                return False
-            frozen = self._sor_m1_calculation_snapshot(session, pool, as_of_override=source_as_of)
-            self._sor_m1_calculation_view(session, pool, view, frozen)
-            session._v5_session_display_snapshot = (publication[3], frozen, basis[1])
-            session._v5_session_display_view = view
-            session._v5_session_display_basis = basis
-            return True
-        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
-            return False
 
     def _run_validation(
         self,
@@ -15013,6 +14236,18 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         if (_resume_generation is not None
                 and self._request_generation.get(window_key) != _resume_generation):
             return
+        rules = run_request.settings_snapshot.to_dict()
+        scopes = [rules.get("validation_market_scope")]
+        embedded = rules.get("indicator_follow_ui_state")
+        if isinstance(embedded, dict) and isinstance(embedded.get("state"), dict):
+            scopes.append(embedded["state"].get("validation_market_scope"))
+        changed = False
+        for scope in scopes:
+            if isinstance(scope, dict) and scope.get("regular_market_only") is True:
+                scope["regular_market_only"] = False
+                changed = True
+        if changed:
+            run_request = replace(run_request, settings_snapshot=ValidationSettingsSnapshot(rules))
         history_extension_active_at_entry = (
             not history_extension and window_key in self._history_extension_inflight
         )
@@ -15043,7 +14278,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 history_extension=history_extension,
             )
             market_session_scope = self._period_session_scope(snapshot, requested_key)
-            regular_period = market_session_scope == "REGULAR"
             stock = getattr(window, "stock", None)
             if (
                 not isinstance(stock, ValidationStockRef)
@@ -15065,9 +14299,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             now = self._now_factory().astimezone(SEOUL_TIMEZONE)
             generation = (int(_resume_generation) if _resume_generation is not None
                           else self._request_generation.get(window_key, 0) + 1)
-            requester_scope = snapshot.to_dict().get("validation_market_scope")
-            requester_regular_only = (isinstance(requester_scope, dict)
-                                      and requester_scope.get("regular_market_only") is True)
             if (_resume_generation is not None
                     and _history_cache_result is not _HISTORY_CACHE_UNSET):
                 source_selection = _history_cache_result.get("source_selection")
@@ -15083,7 +14314,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             else:
                 try:
                     source_selection = _select_v5_source(
-                        stock, requested_key, eligibility, requester_regular_only, now,
+                        stock, requested_key, eligibility, False, now,
                         window_key=window_key, generation=generation)
                 except ValueError as exc:
                     self._fail_window(window, str(exc))
@@ -15164,17 +14395,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._history_exhaustion.pop(window_key, None)
         trace_enabled = signal_validation_trace_enabled()
         current_pool = self._historical_pools.get(window_key)
-        session_display_pool_match = (
-            not history_extension and not history_extension_active_at_entry
-            and not timeframe_changed and not force_historical_refresh
-            and _resume_generation is None
-            and self._session_display_pool_reusable(window, session, current_pool, historical_target)
-        )
         current_pool_match = False
         shared_pool = None
         shared_pool_loaded = False
         if not force_historical_refresh or trace_enabled:
-            current_pool_match = session_display_pool_match or self._pool_matches(
+            current_pool_match = self._pool_matches(
                 current_pool,
                 stock,
                 timeframe_key,
@@ -15183,8 +14408,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 source_selection=source_selection,
             )
         source_pool = current_pool
-        if (not regular_period and not force_historical_refresh
-                and not current_pool_match):
+        if not force_historical_refresh and not current_pool_match:
             shared_pool = _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS.get(
                 self._shared_pool_key(stock, timeframe_key, source_selection=source_selection)
             )
@@ -15192,20 +14416,17 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             source_pool = shared_pool
         reusable_pool_match = (
             not force_historical_refresh
-            and (session_display_pool_match or self._pool_matches(
+            and self._pool_matches(
                 source_pool, stock, timeframe_key, fetch_count,
                 market_session_scope=market_session_scope,
                 source_selection=source_selection,
-            ))
+            )
         )
         preloaded_persistent = _HISTORY_CACHE_UNSET
         preloaded_cached_pool = None
         persistent_cache_without_probe = False
         if (
-            not history_extension
-            and not reusable_pool_match
-            and not force_historical_refresh
-            and not regular_period
+            not history_extension and not reusable_pool_match and not force_historical_refresh
         ):
             try:
                 preloaded_persistent = self._cached_history(
@@ -15286,14 +14507,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 shared_pool = _SHARED_SIGNAL_VALIDATION_HISTORICAL_POOLS.get(
                     self._shared_pool_key(stock, timeframe_key, source_selection=source_selection)
                 )
-            shared_pool_match = (not regular_period and self._pool_matches(
+            shared_pool_match = self._pool_matches(
                 shared_pool,
                 stock,
                 timeframe_key,
                 fetch_count,
                 market_session_scope=market_session_scope,
                 source_selection=source_selection,
-            ))
+            )
             selected_pool_source = "none"
             selected_pool = None
             if not force_historical_refresh and current_pool_match:
@@ -15397,9 +14618,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             self._history_extension_inflight[window_key]["session"] = session
         if not force_historical_refresh:
             pool = source_pool
-            if session_display_pool_match or self._pool_matches(
+            if (self._pool_matches(
                     pool, stock, timeframe_key, fetch_count,
-                    market_session_scope=market_session_scope, source_selection=source_selection):
+                    market_session_scope=market_session_scope, source_selection=source_selection)):
                 if production_calculation_enabled:
                     pool = dict(pool)
                     pool["production_session_contract"] = deepcopy(production_contract)
@@ -15458,7 +14679,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                                 if callable(capture_lease) else _CACHE_LEASE_UNSET
                             )
                         persistent_entry = (
-                            None if regular_period else self._cached_history(
+                            self._cached_history(
                                 detached_stock,
                                 timeframe_minutes,
                                 timeframe_key,
@@ -15545,7 +14766,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         )
         if isinstance(history_cache_bundle, dict):
             persistent = history_cache_bundle.get("persistent")
-        elif force_historical_refresh or regular_period:
+        elif (force_historical_refresh):
             persistent = None
         elif preloaded_persistent is not _HISTORY_CACHE_UNSET:
             persistent = preloaded_persistent
@@ -15786,16 +15007,11 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                 m3_selected_response = (deepcopy(started), deepcopy(response), requested_count)
 
         try:
-            requester_scope = snapshot_rules.get("validation_market_scope")
-            requester_regular_only = (
-                isinstance(requester_scope, dict)
-                and requester_scope.get("regular_market_only") is True
-            )
             requester = _V5SelectedSourceRequester(
                 self._broker, stock, timeframe_key,
                 source_selection.nxt_available,
                 source_selection=source_selection,
-                regular_only=requester_regular_only,
+                regular_only=False,
                 on_verified_period_response=self._capture_sor_period_prior_close,
                 now_factory=self._now_factory,
                 on_verified_native_response=remember_refresh_receipt,
@@ -17102,7 +16318,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
                     )
                 ),
             )
-        pool = self._regular_minute_evaluation_view(session, pool)
         if not isinstance(pool.get("candles"), list):
             self._fail_window(window, "HISTORICAL_POOL_UNAVAILABLE")
             return
@@ -17812,23 +17027,6 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
             else:
                 indexes_by_time[candle_time] = index
         start_time, end_time = requested_times
-        regular_check = getattr(window, "validation_regular_market_only_check", None)
-        if (
-            regular_check is not None and regular_check.isChecked()
-            and current_times is not None
-            and (start_time not in indexes_by_time or end_time not in indexes_by_time)
-        ):
-            overlap = [index for stamp, index in indexes_by_time.items()
-                       if start_time <= stamp <= end_time]
-            if (
-                not overlap
-                or any(start_time <= stamp <= end_time for stamp in duplicate_times)
-                or getattr(window, "validation_range", None)
-                != (min(overlap), max(overlap))
-            ):
-                return False
-            request["range"] = (min(overlap), max(overlap))
-            return True
         if (
             start_time in duplicate_times
             or end_time in duplicate_times
@@ -18472,14 +17670,12 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
         previous = self._last_run_requests.get(key)
         if isinstance(previous, IndicatorFollowSignalValidationRunRequest):
             settings = previous.settings_snapshot
-            scope = settings.to_dict().get("validation_market_scope", {})
             window._marking_timeframe_failed = True
             window._marking_timeframe_failure_identity = (
                 window.stock.code, "M3", settings.rules_hash,
-                scope.get("regular_market_only") is True)
+                False)
 
     def _fail_window(self, window: object, message: str, *, range_replay: bool = False) -> None:
-        window._session_display_republish_pending = None
         text = str(message or "VALIDATION_BLOCKED")
         window_key = id(window)
         if (

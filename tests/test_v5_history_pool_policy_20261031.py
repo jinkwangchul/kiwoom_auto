@@ -9,6 +9,7 @@ import pytest
 
 import gui_indicator_follow_signal_validation_v5_flow as v5
 from tests.test_indicator_follow_signal_validation_v5_integrated_history_scroll import _flow
+from tests.test_v5_wm_direct_current_20261102 import wm
 
 
 POLICY = "indicator_follow_validation_v5_history_pool_policy"
@@ -276,111 +277,69 @@ def test_historical_source_mismatch_still_normalizes_response_source():
 @pytest.mark.parametrize("regular_only", [False, True])
 def test_display_toggle_reuses_only_unchanged_published_native_pool(
         flow, monkeypatch, key, minutes, regular_only):
+    from pathlib import Path
     from types import SimpleNamespace
 
     rules = {"bar": {"bar_minutes": minutes}, "validation_timeframe": {"key": key},
-             "validation_market_scope": {"regular_market_only": not regular_only}}
-    previous = v5.ValidationSession(
-        v5.ValidationRequest(STOCK, v5.ValidationSettingsSnapshot(rules), minutes),
+             "validation_market_scope": {"regular_market_only": regular_only}}
+    settings = v5.ValidationSettingsSnapshot(rules)
+    session = v5.ValidationSession(
+        v5.ValidationRequest(STOCK, settings, minutes),
         operation_active_reader=lambda: False)
-    rules["validation_market_scope"]["regular_market_only"] = regular_only
-    current = v5.ValidationSession(
-        v5.ValidationRequest(STOCK, v5.ValidationSettingsSnapshot(rules), minutes),
-        operation_active_reader=lambda: False)
-    window = SimpleNamespace(stock=STOCK,
-        _session_display_republish_pending=current.request.settings_snapshot)
-    broker_state = SimpleNamespace(connected=True, connection_epoch=7, login_session_id="offline")
-    flow._broker = SimpleNamespace(broker_session_snapshot=lambda: broker_state)
-    for session, generation in ((previous, 4), (current, 5)):
-        session.source_selection = v5._select_v5_source(
-            STOCK, key, True, False, NOW, window_key=id(window), generation=generation)
+    window = SimpleNamespace(stock=STOCK)
+    session.source_selection = v5._select_v5_source(
+        STOCK, key, True, regular_only, NOW, window_key=id(window), generation=4)
     rows = [{"time": f"202610{day:02d}{hour:02d}0000", "open": 100, "high": 102,
              "low": 99, "close": 101, "volume": 10}
             for day in range(20, 30) for hour in (8, 9)]
     query = dict(stock_code=STOCK.code, timeframe_key=key, timeframe_minutes=minutes,
                  market_data_identity="005930_AL", market_source="INTEGRATED",
-                 request_id="PUBLISHED-NATIVE", request_as_of="2026-10-29T20:01:00+09:00",
+                 request_id="PUBLISHED-NATIVE", request_as_of=NOW.isoformat(),
                  last_completed_time=rows[-1]["time"])
-    pool = flow._pool_from_candles(previous, rows, requested_count=len(rows),
+    pool = flow._pool_from_candles(session, rows, requested_count=len(rows),
         request_id=query["request_id"], market_data_identity="005930_AL",
         market_source="INTEGRATED", direct_selected_query=query,
-        source_verified_at=query["request_as_of"])
-    flow._open_windows[id(window)] = window
-    flow._historical_pools[id(window)] = pool
-    flow._validation_sessions[id(window)] = previous
-    flow._request_generation[id(window)] = 4
-    flow._pool_dispatch_snapshot(pool)
-    binding = (pool, previous, 4, pool["_dispatch_snapshot"])
-    window._v5_marking_display_publication = binding
-    window._v5_session_display_basis = (binding, (7, "offline"))
+        source_verified_at=NOW.isoformat())
     monkeypatch.setattr(v5, "required_validation_history_context_bars", lambda _: 2)
-    reuse = flow._session_display_pool_reusable
-    assert not flow._pool_matches(pool, STOCK, key, 5), "ordinary freshness stays strict"
-    assert reuse(window, current, pool, 3)
-    projected, deficit = flow._normal_base_history_view(current, pool, 3, sidecar_override=None)
-    assert not deficit
-    assert any(row["time"].endswith("080000") for row in projected["candles"]) is not regular_only
-    assert not reuse(window, current, pool, len(rows)), "missing warmup must request history"
-    window._session_display_republish_pending = None
-    assert not reuse(window, current, pool, 3), "ordinary validation cannot use this route"
-    window._session_display_republish_pending = current.request.settings_snapshot
-    broker_state.connection_epoch = 8
-    assert not reuse(window, current, pool, 3), "reconnected session cannot reuse"
-    broker_state.connection_epoch = 7
-    flow._request_generation[id(window)] = 5
-    assert not reuse(window, current, pool, 3), "stale generation cannot reuse"
-    flow._request_generation[id(window)] = 4
-    for rebound_stock, rebound_key, rebound_minutes in (
-            (v5.ValidationStockRef("000660", "Other"), key, minutes),
-            (STOCK, "M5" if key != "M5" else "M3", 5 if key != "M5" else 3)):
-        flow._validation_sessions[id(window)] = v5.ValidationSession(
-            v5.ValidationRequest(rebound_stock, v5.ValidationSettingsSnapshot({
-                "bar": {"bar_minutes": rebound_minutes},
-                "validation_timeframe": {"key": rebound_key}}), rebound_minutes),
-            operation_active_reader=lambda: False)
-        assert not reuse(window, current, pool, 3), "rebinding must invalidate the toggle basis"
-    flow._validation_sessions[id(window)] = previous
-    pool["candles"][0]["close"] = 100
-    assert not reuse(window, current, pool, 3), "changed original cannot reuse"
-    pool["candles"][0]["close"] = 101
-    pool["direct_selected_query"]["last_completed_time"] = "invalid"
-    assert not reuse(window, current, pool, 3), "changed receipt cannot reuse"
-    pool["direct_selected_query"]["last_completed_time"] = rows[-1]["time"]
+    projected, deficit = flow._normal_base_history_view(session, pool, 3, sidecar_override=None)
+    assert deficit == 0
+    assert projected["candles"] == rows[-5:]
+    assert projected["display_candles"] == rows[-3:]
+    assert pool["candles"] == rows and pool["direct_selected_query"] == query
+    assert session.source_selection.market_session_scope == "FULL"
+    # The ordinary FULL admission gate keeps M5's additional native callback requirement.
+    assert flow._pool_matches(pool, STOCK, key, 5) is (key != "M5")
+    stale = dict(pool, source_verified_at="2026-10-29T20:01:00+09:00")
+    assert not flow._pool_matches(stale, STOCK, key, 5)
+    old_projection = dict(pool, _regular_minute_source_view=pool)
+    assert not flow._pool_matches(old_projection, STOCK, key, 5)
+    with pytest.raises(ValueError, match="REGULAR_MINUTE_SOURCE_UNVERIFIED"):
+        flow._validation_pool_for_session(session, old_projection, target_count=3)
 
-    # Exercise the real router, stopping at its existing complete-calculation entry.
-    from pathlib import Path
-    monkeypatch.setattr(v5, "StockRepository", lambda _: SimpleNamespace(
-        resolve_stock_dir=lambda *_: Path(".")))
-    monkeypatch.setattr(v5, "read_json_dict", lambda _: {"calculation_market_source": "SOR"})
-    monkeypatch.setattr(flow, "_verified_nxt_validation_stock", lambda _: True)
-    monkeypatch.setattr(flow, "_sync_v5_observation_lease", lambda _: None)
-    monkeypatch.setattr(flow, "_cached_history", lambda *_a, **_kw: pytest.fail("unexpected cache lookup"))
-    flow._historical_provider_factory = lambda *_a, **_kw: pytest.fail("unexpected server request")
-    flow._operation_active_reader = lambda: False
-    flow._history_targets[id(window)] = 3
-    flow._last_run_requests[id(window)] = v5.IndicatorFollowSignalValidationRunRequest(
-        previous.request.settings_snapshot, 3)
-    installed = []
-    monkeypatch.setattr(flow, "_install_acquired_pool", lambda *a, **kw: installed.append((a, kw)))
-    flow._run_validation(window, v5.IndicatorFollowSignalValidationRunRequest(
-        current.request.settings_snapshot, 3))
-    assert len(installed) == 1
-    args, kwargs = installed[0]
-    assert args[0] is window and args[2] is pool
-    assert args[1].request.settings_snapshot is current.request.settings_snapshot
-    assert kwargs["history_browse"] is False
-    republished_session = args[1]
-    frozen = flow._sor_m1_calculation_snapshot(republished_session, pool)
-    if minutes > 1:
-        assert frozen[1].isoformat() == query["request_as_of"]
-    monkeypatch.setattr(flow, "_verified_nxt_display_stock", lambda _: True)
-    flow._broker.request_minute_candles_display_only_integrated = (
-        lambda *_a, **_kw: pytest.fail("display toggle must not fetch a sidecar"))
-    flow._ensure_integrated_display_sidecar(window, republished_session, 3)
-    flow._validation_sessions[id(window)] = republished_session
-    assert flow._source_selection_is_current(republished_session.source_selection)
-    broker_state.connection_epoch = 8
-    assert not flow._source_selection_is_current(republished_session.source_selection)
+    if key == "M1":
+        assert not flow._pool_matches(pool, STOCK, key, 5 + v5._V5_M1_REQUEST_BUFFER_BARS)
+    if key not in {"M1", "M5"}:
+        flow._open_windows[id(window)] = window
+        flow._historical_pools[id(window)] = pool
+        flow._validation_sessions[id(window)] = session
+        flow._request_generation[id(window)] = 4
+        flow._history_targets[id(window)] = 3
+        flow._operation_active_reader = lambda: False
+        monkeypatch.setattr(v5, "StockRepository", lambda _: SimpleNamespace(
+            resolve_stock_dir=lambda *_: Path(".")))
+        monkeypatch.setattr(v5, "read_json_dict", lambda _: {})
+        monkeypatch.setattr(flow, "_verified_nxt_validation_stock", lambda _: True)
+        monkeypatch.setattr(flow, "_sync_v5_observation_lease", lambda _: None)
+        monkeypatch.setattr(flow, "_cached_history", lambda *_a, **_kw: pytest.fail("unexpected cache lookup"))
+        flow._historical_provider_factory = lambda *_a, **_kw: pytest.fail("unexpected native request")
+        installed = []
+        monkeypatch.setattr(flow, "_install_acquired_pool", lambda *a, **kw: installed.append((a, kw)))
+        flow._run_validation(window, v5.IndicatorFollowSignalValidationRunRequest(settings, 3))
+        assert len(installed) == 1
+        assert installed[0][0][2] is pool
+        effective = installed[0][0][1].request.settings_snapshot.to_dict()
+        assert effective["validation_market_scope"] == {"regular_market_only": False}
+        assert settings.to_dict() == rules
 
 
 @pytest.mark.parametrize("history_target", [10, 5000])
@@ -389,196 +348,165 @@ def test_verified_native_warmup_retoggle_needs_no_second_handoff(
         flow, monkeypatch, history_target, invalidate_before_run):
     from pathlib import Path
     from types import SimpleNamespace
-    from PyQt5.QtCore import QObject, pyqtSignal
-
-    class InputSignals(QObject):
-        chart_input_invalidated = pyqtSignal()
-
-    class Window(SimpleNamespace):
-        pass
 
     rules = {"bar": {"bar_minutes": 3}, "validation_timeframe": {"key": "M3"},
-             "validation_market_scope": {"regular_market_only": True}}
-    previous = v5.ValidationSession(
+             "validation_market_scope": {"regular_market_only": False}}
+    session = v5.ValidationSession(
         v5.ValidationRequest(STOCK, v5.ValidationSettingsSnapshot(rules), 3),
         operation_active_reader=lambda: False)
-    window = Window(stock=STOCK, _normal_base_requested=True,
-                    install_normal_base=lambda *_a, **_kw: None)
-    signals = InputSignals()
-    window.chart_input_invalidated = signals.chart_input_invalidated
-    window._candle_preview_token = None
-    window.clear_candle_preview = lambda *_: None
-    window._cancel_visualization_projection_work = lambda: None
-    signals.chart_input_invalidated.connect(lambda: flow._invalidate_window_input(window))
-    flow._broker = SimpleNamespace(broker_session_snapshot=lambda: SimpleNamespace(
-        connected=True, connection_epoch=7, login_session_id="offline"))
-    previous.source_selection = v5._select_v5_source(
-        STOCK, "M3", True, True, NOW, window_key=id(window), generation=3)
-    base = [{"time": f"202610{day:02d}{hour:02d}0000", "open": 100, "high": 102,
-             "low": 99, "close": 101, "volume": 10}
-            for day in range(24, 29) for hour in (8, 9)]
-    if history_target == 5000:
-        base = [dict(base[0], time=f"202610{day:02d}{minute // 60:02d}{minute % 60:02d}00")
-                for day in range(4, 29) for minute in range(8 * 60, 20 * 60, 3)
-                if not (8 * 60 + 50 <= minute < 9 * 60
-                        or 15 * 60 + 30 <= minute < 15 * 60 + 40)
-                and not (invalidate_before_run and day == 4 and 9 * 60 <= minute < 13 * 60)]
-    expanded = [dict(base[0], time=stamp) for stamp in
-                (("20261003150000", "20261003150300") if history_target == 5000
-                 else ("20261023150000", "20261023150300"))] + base
+    window = SimpleNamespace(stock=STOCK, _normal_base_requested=True,
+        install_normal_base=lambda *_a, **_kw: None, _candle_preview_token=None,
+        clear_candle_preview=lambda *_: None)
+    session.source_selection = v5._select_v5_source(
+        STOCK, "M3", True, False, NOW, window_key=id(window), generation=3)
+    base = [dict(time=f"202610{day:02d}{minute // 60:02d}{minute % 60:02d}00",
+                 open=100, high=102, low=99, close=101, volume=10)
+            for day in range(4, 29) for minute in range(8 * 60, 20 * 60, 3)
+            if not (8 * 60 + 50 <= minute < 9 * 60
+                    or 15 * 60 + 30 <= minute < 15 * 60 + 40)
+            and not (invalidate_before_run and day == 4 and 9 * 60 <= minute < 13 * 60)]
+    if history_target == 10:
+        base = base[-10:]
+    rows = [dict(base[0], time=stamp) for stamp in
+            ("20261003150000", "20261003150300")] + base
     query = dict(stock_code=STOCK.code, timeframe_key="M3", timeframe_minutes=3,
                  market_data_identity="005930_AL", market_source="INTEGRATED",
-                 request_id="BEFORE-WARMUP", request_as_of="2026-10-29T20:01:00+09:00",
-                 last_completed_time=base[-1]["time"])
-    pool = flow._pool_from_candles(previous, base, requested_count=len(base),
+                 request_id="ACCEPTED-WARMUP", request_as_of=NOW.isoformat(),
+                 last_completed_time=rows[-1]["time"])
+    pool = flow._pool_from_candles(session, rows, requested_count=len(rows),
         request_id=query["request_id"], market_data_identity="005930_AL",
         market_source="INTEGRATED", direct_selected_query=query,
-        source_verified_at=query["request_as_of"])
-    flow._open_windows[id(window)] = window
-    flow._request_generation[id(window)] = 3
-    flow._history_targets[id(window)] = history_target
+        source_verified_at=NOW.isoformat())
     monkeypatch.setattr(v5, "required_validation_history_context_bars", lambda _: 2)
-    monkeypatch.setattr(v5, "_V5SelectedSourceRequester", lambda *_a, **_kw: object())
-    monkeypatch.setattr(flow, "_cached_history", lambda *_a, **_kw: None)
-    calls = []
-
-    def request_latest(count, callback):
-        calls.append(count)
-        assert len(calls) == 1, "verified warmup must not trigger a second native TR"
-        snapshot = v5.ValidationHistoricalSnapshot(
-            stock=STOCK, timeframe_minutes=3, timeframe_key="M3",
-            requested_count=count, request_id="ACCEPTED-WARMUP",
-            rows=flow._historical_rows_from_candles(expanded),
-            market_data_identity="005930_AL", market_source="INTEGRATED",
-            request_as_of=query["request_as_of"])
-        callback(v5.ValidationHistoricalResult(True, snapshot))
-
-    flow._historical_provider_factory = lambda *_a, **_kw: SimpleNamespace(
-        request_latest=request_latest)
-    ready = []
-    assert flow._ensure_normal_base_history(
-        window, previous, pool, history_target, on_ready=lambda *args: ready.append(args))
-    assert calls == [len(expanded)] and len(ready) == 1
-    verified_pool, verified_view, deficit = ready[0]
-    assert deficit == 0
-    assert len(verified_view["display_candles"]) == (
-        (3170 if invalidate_before_run else 3250) if history_target == 5000 else 5)
-    if history_target == 5000:
-        assert len(expanded) == (5747 if invalidate_before_run else 5827)
-        assert verified_view["display_candles"][0]["time"] == (
-            "20261004130000" if invalidate_before_run else "20261004090000")
-        assert base[-5000]["time"] > verified_view["display_candles"][0]["time"]
-
-    monkeypatch.setattr(flow, "_ensure_integrated_display_sidecar", lambda *_a: None)
-
-    def publish(session, view):
-        flow._historical_pools[id(window)] = verified_pool
-        flow._validation_sessions[id(window)] = session
-        flow._pool_dispatch_snapshot(verified_pool)
-        assert flow._apply_pool_to_window(
-            window, session, verified_pool, evaluation_count=history_target, signal_entries=None,
-            prepared_view_pool=view, normal_base_presentation=((), {}))
-
-    publish(previous, verified_view)
+    monkeypatch.setattr(flow, "_ensure_integrated_display_sidecar", lambda *_: None)
     monkeypatch.setattr(v5, "StockRepository", lambda _: SimpleNamespace(
         resolve_stock_dir=lambda *_: Path(".")))
-    monkeypatch.setattr(v5, "read_json_dict", lambda _: {"calculation_market_source": "SOR"})
+    monkeypatch.setattr(v5, "read_json_dict", lambda _: {})
     monkeypatch.setattr(flow, "_verified_nxt_validation_stock", lambda _: True)
     monkeypatch.setattr(flow, "_sync_v5_observation_lease", lambda _: None)
+    monkeypatch.setattr(flow, "_cached_history", lambda *_a, **_kw: pytest.fail("unexpected cache lookup"))
+    flow._historical_provider_factory = lambda *_a, **_kw: pytest.fail("accepted FULL warmup must not request again")
     flow._operation_active_reader = lambda: False
-    flow._last_run_requests[id(window)] = v5.IndicatorFollowSignalValidationRunRequest(
-        previous.request.settings_snapshot, history_target)
+    key = id(window)
+    flow._open_windows[key] = window
+    flow._historical_pools[key] = pool
+    flow._validation_sessions[key] = session
+    flow._request_generation[key] = 3
+    flow._history_targets[key] = history_target
+    view, deficit = flow._normal_base_history_view(session, pool, history_target)
+    assert deficit == 0
+    assert len(view["display_candles"]) == history_target
+    assert len(view["candles"]) == history_target + 2
+    assert view["display_candles"] == base[-history_target:]
+    assert not flow._ensure_normal_base_history(window, session, pool, history_target)
     prepared = []
     monkeypatch.setattr(flow, "_start_pool_prepare", prepared.append)
-
+    original = deepcopy(pool["candles"]), deepcopy(pool["direct_selected_query"])
     for turn, regular in enumerate((False, True, False, True), 1):
-        rules["validation_market_scope"]["regular_market_only"] = regular
-        settings = v5.ValidationSettingsSnapshot(rules)
-        old_binding = window._v5_marking_display_publication
-        old_generation = flow._request_generation[id(window)]
+        old_generation = flow._request_generation[key]
+        old_session = flow._validation_sessions[key]
+        old_job = dict(window=window, session=old_session, pool=pool, generation=old_generation)
+        assert flow._prepare_request_is_current(old_job)
         if invalidate_before_run:
-            assert flow._marking_publication_is_current(window, old_binding)
-            if prepared:
-                assert flow._prepare_request_is_current(prepared[-1])
-            # Run the real window invalidator and its connected production receiver.
-            v5.IndicatorFollowSignalValidationV5Window._invalidate_user_background_results(window)
-            assert flow._request_generation[id(window)] == old_generation + 1
-            assert not flow._marking_publication_is_current(window, old_binding)
-            assert not flow._source_selection_is_current(old_binding[1].source_selection)
-            if prepared:
-                assert not flow._prepare_request_is_current(prepared[-1])
-        window._session_display_republish_pending = settings
-        flow._run_validation(window, v5.IndicatorFollowSignalValidationRunRequest(settings, history_target))
-        assert calls == [len(expanded)], "retoggle must retain the accepted native receipt"
+            flow._invalidate_window_input(window)
+            assert not flow._prepare_request_is_current(old_job)
+        rules["validation_market_scope"]["regular_market_only"] = regular
+        incoming = v5.ValidationSettingsSnapshot(rules)
+        flow._run_validation(window, v5.IndicatorFollowSignalValidationRunRequest(incoming, history_target))
         assert len(prepared) == turn
         request = prepared[-1]
-        assert request["session"] is not old_binding[1]
-        assert flow._request_generation[id(window)] == old_generation + (2 if invalidate_before_run else 1)
-        assert not flow._marking_publication_is_current(window, old_binding)
-        assert request["pool"] is verified_pool
-        view, missing = flow._normal_base_history_view(
-            request["session"], verified_pool, history_target, request["normal_base_view"])
-        assert missing == 0
-        if regular:
-            assert request["normal_base_view"] is not None
-            assert view["display_candles"] == verified_view["display_candles"]
-            assert view["candles"] == verified_view["candles"]
-        else:
-            assert view["display_candles"] == base[-history_target:]
-        publish(request["session"], view)
-    assert calls == [len(expanded)]
+        assert flow._request_generation[key] == old_generation + (2 if invalidate_before_run else 1)
+        assert not flow._prepare_request_is_current(old_job)
+        assert request["pool"] is pool
+        assert request["session"].request.settings_snapshot.to_dict()["validation_market_scope"] == {
+            "regular_market_only": False}
+        assert incoming.to_dict() == rules
+        current, missing = flow._normal_base_history_view(
+            request["session"], pool, history_target, request.get("normal_base_view"))
+        assert missing == 0 and current["candles"] == view["candles"]
+        assert current["display_candles"] == view["display_candles"]
+        assert (pool["candles"], pool["direct_selected_query"]) == original
+
+
+@pytest.fixture
+def full_native_publication(wm, monkeypatch):
+    """Reuse the existing FULL requester/provider/callback receipt, without forging proof."""
+    c = wm.acquire("W1", False)
+    flow, session, pool = c.flow, c.session, c.pool
+    key = session.source_selection.window_key
+    c.window = flow._open_windows[key]
+    c.window.install_normal_base = lambda *_a, **_kw: None
+    c.window._marking_current_settings = lambda: session.request.settings_snapshot
+    c.window._validation_range_times = (c.rows[-2]["time"], c.rows[-1]["time"])
+    c.window.validation_range = (0, 1)
+    c.window._marking_source_key = lambda settings, times: (
+        v5.IndicatorFollowSignalValidationV5Window._marking_source_key_for_candles(
+            c.window.stock.code, settings, times, regular_only=False,
+            calculation_candles=c.view["candles"], display_candles=c.view["display_candles"]))
+    flow._history_targets[key] = 2
+    monkeypatch.setattr(v5, "required_validation_history_context_bars", lambda _: 2)
+    assert session.source_selection.market_session_scope == "FULL"
+    assert flow._sor_m1_calculation_view(session, pool, c.view, None) is c.view
+    assert flow._apply_pool_to_window(c.window, session, pool, evaluation_count=2,
+        signal_entries=None, prepared_view_pool=c.view, normal_base_presentation=((), {}))
+    c.binding = c.window._v5_marking_display_publication
+    assert flow._selected_range_binding_identity(c.window) is not None
+    return c
 
 
 @pytest.mark.parametrize("changed", [
     "content", "receipt", "source_identity", "source", "pool_timeframe", "selection_timeframe",
-    "stock", "epoch", "login", "disconnected", "session", "publication", "warmup",
-    "second_invalidation", "extra_generation",
+    "stock", "epoch", "login", "disconnected", "session", "publication",
 ])
-def test_invalidated_native_source_proof_refuses_changed_basis(flow, monkeypatch, changed):
-    from types import SimpleNamespace
+def test_full_native_source_mutations_reach_their_own_guards(full_native_publication, monkeypatch, changed):
+    from dataclasses import replace
 
-    rules = {"bar": {"bar_minutes": 3}, "validation_timeframe": {"key": "M3"},
-             "validation_market_scope": {"regular_market_only": True}}
-    previous = v5.ValidationSession(
-        v5.ValidationRequest(STOCK, v5.ValidationSettingsSnapshot(rules), 3),
-        operation_active_reader=lambda: False)
-    rules["validation_market_scope"]["regular_market_only"] = False
-    current = v5.ValidationSession(
-        v5.ValidationRequest(STOCK, v5.ValidationSettingsSnapshot(rules), 3),
-        operation_active_reader=lambda: False)
-    window = SimpleNamespace(stock=STOCK)
-    broker = SimpleNamespace(connected=True, connection_epoch=7, login_session_id="offline")
-    flow._broker = SimpleNamespace(broker_session_snapshot=lambda: broker)
-    for session, generation in ((previous, 3), (current, 5)):
-        session.source_selection = v5._select_v5_source(
-            STOCK, "M3", True, False, NOW, window_key=id(window), generation=generation)
-    rows = [{"time": f"202610{day:02d}{hour:02d}0000", "open": 100, "high": 102,
-             "low": 99, "close": 101, "volume": 10}
-            for day in range(20, 30) for hour in (8, 9)]
-    query = dict(stock_code=STOCK.code, timeframe_key="M3", timeframe_minutes=3,
-                 market_data_identity="005930_AL", market_source="INTEGRATED",
-                 request_id="NATIVE-PROOF", request_as_of="2026-10-29T20:01:00+09:00",
-                 last_completed_time=rows[-1]["time"])
-    pool = flow._pool_from_candles(previous, rows, requested_count=len(rows),
-        request_id=query["request_id"], market_data_identity="005930_AL",
-        market_source="INTEGRATED", direct_selected_query=query,
-        source_verified_at=query["request_as_of"])
-    flow._open_windows[id(window)] = window
-    flow._historical_pools[id(window)] = pool
-    flow._validation_sessions[id(window)] = previous
-    flow._request_generation[id(window)] = 3
-    flow._pool_dispatch_snapshot(pool)
-    binding = (pool, previous, 3, pool["_dispatch_snapshot"])
-    window._v5_marking_display_publication = binding
-    window._v5_session_display_basis = (binding, (7, "offline"))
-    monkeypatch.setattr(v5, "required_validation_history_context_bars", lambda _: 2)
-    flow._invalidate_window_input(window)
-    assert window._v5_session_display_source_proof is not None
-    assert not flow._marking_publication_is_current(window, binding)
+    c = full_native_publication
+    flow, session, pool, window = c.flow, c.session, c.pool, c.window
+    key = id(window)
+    publication = c.binding[3]
+    frozen = deepcopy(publication[2])
+    assert "_regular_minute_source_view" not in pool
+    assert flow._source_selection_is_current(session.source_selection)
+    assert flow._marking_publication_is_current(window, c.binding)
+    assert flow._selected_range_binding_identity(window) is not None
+    require_results, receipt_results, owner_results = [], [], []
+    require = flow._require_selected_timeframe_pool
+    fresh = flow._fresh_selected_wm_view
+    owned = flow._marking_publication_is_current
 
-    target = 3
+    def observe_require(*args):
+        try:
+            result = require(*args)
+        except ValueError as exc:
+            require_results.append(str(exc))
+            raise
+        require_results.append(None)
+        return result
+
+    def observe_receipt(*args, **kwargs):
+        result = fresh(*args, **kwargs)
+        receipt_results.append(result)
+        return result
+
+    def observe_owner(*args):
+        result = owned(*args)
+        owner_results.append(result)
+        return result
+
+    monkeypatch.setattr(flow, "_require_selected_timeframe_pool", observe_require)
+    monkeypatch.setattr(flow, "_fresh_selected_wm_view", observe_receipt)
+    monkeypatch.setattr(flow, "_marking_publication_is_current", observe_owner)
+    assert flow._validation_pool_for_session(session, pool, target_count=2)["candles"] == c.rows[-2:]
+    assert flow._sor_m1_calculation_view(session, pool, c.view, None) is c.view
+    assert flow._selected_range_binding_identity(window) is not None
+    assert require_results and all(result is None for result in require_results)
+    assert receipt_results == [True] and owner_results == [True]
+    require_results.clear()
+    owner_results.clear()
+
     if changed == "content":
-        pool["candles"][0]["close"] = 999
+        pool["candles"][0]["close"] = 100.5  # Still valid OHLCV; the original content proof must reject it.
     elif changed == "receipt":
         pool["direct_selected_query"]["last_completed_time"] = "invalid"
     elif changed == "source_identity":
@@ -587,31 +515,85 @@ def test_invalidated_native_source_proof_refuses_changed_basis(flow, monkeypatch
         pool["market_source"] = "NXT"
     elif changed == "pool_timeframe":
         pool["timeframe_key"] = "M1"
-        pool["timeframe_minutes"] = 1
     elif changed == "selection_timeframe":
-        current.source_selection = v5._select_v5_source(
-            STOCK, "M1", True, False, NOW, window_key=id(window), generation=5)
+        session.source_selection = replace(session.source_selection, timeframe_key="MO1")
     elif changed == "stock":
         window.stock = v5.ValidationStockRef("000660", "Other")
     elif changed == "epoch":
-        broker.connection_epoch = 8
+        c.broker_session.connection_epoch += 1
     elif changed == "login":
-        broker.login_session_id = "other"
+        c.broker_session.login_session_id = "other"
     elif changed == "disconnected":
-        broker.connected = False
+        c.broker_session.connected = False
     elif changed == "session":
-        flow._validation_sessions[id(window)] = current
+        flow._validation_sessions[key] = v5.ValidationSession(
+            session.request, operation_active_reader=lambda: False)
     elif changed == "publication":
         pool["_dispatch_snapshot"] = None
-    elif changed == "warmup":
-        target = len(rows)
-    elif changed == "second_invalidation":
+
+    assert flow._request_generation[key] == c.binding[2]
+    if changed in {"stock", "session", "publication"}:
+        assert flow._selected_range_binding_identity(window) is None
+        assert owner_results == [False]
+        assert require_results == [] and receipt_results == [True]
+    else:
+        assert flow._source_selection_is_current(session.source_selection)
+        assert owned(window, c.binding)
+        if changed in {"epoch", "login", "disconnected"}:
+            assert pool["candles"] == frozen["candles"]
+            assert pool["direct_selected_query"] == frozen["direct_selected_query"]
+            with pytest.raises(ValueError, match="^SOR_M1_BLOCKED:SOURCE_UNAVAILABLE$"):
+                flow._sor_m1_calculation_view(session, pool, c.view, None)
+            assert receipt_results == [True, False]
+        else:
+            reason = {
+                "content": "SOR_DIRECT_PERIOD_SOURCE_UNVERIFIED",
+                "receipt": "SOR_DIRECT_PERIOD_SOURCE_UNVERIFIED",
+                "source_identity": "VALIDATION_POOL_MARKET_IDENTITY_MISMATCH",
+                "source": "VALIDATION_POOL_MARKET_IDENTITY_MISMATCH",
+                "pool_timeframe": "VALIDATION_POOL_TIMEFRAME_MISMATCH",
+                "selection_timeframe": "VALIDATION_SOURCE_SELECTION_MISMATCH",
+            }[changed]
+            with pytest.raises(ValueError, match="^" + reason + "$"):
+                flow._validation_pool_for_session(session, pool, target_count=2)
+            assert require_results == [reason]
+            assert receipt_results == [True]
+    assert publication[2] == frozen
+
+
+@pytest.mark.parametrize("changed", ["second_invalidation", "extra_generation"])
+def test_full_native_publication_stale_controls(full_native_publication, changed):
+    c = full_native_publication
+    flow, session, pool, window = c.flow, c.session, c.pool, c.window
+    generation = flow._request_generation[id(window)]
+    before = deepcopy((pool["candles"], pool["direct_selected_query"]))
+    assert flow._source_selection_is_current(session.source_selection)
+    assert flow._marking_publication_is_current(window, c.binding)
+    if changed == "second_invalidation":
         flow._invalidate_window_input(window)
-    elif changed == "extra_generation":
+        assert flow._request_generation[id(window)] == generation + 1
+        flow._invalidate_window_input(window)
+        assert flow._request_generation[id(window)] == generation + 2
+    else:
         flow._request_generation[id(window)] += 1
-    window._session_display_republish_pending = current.request.settings_snapshot
-    assert not flow._session_display_pool_reusable(window, current, pool, target)
-    assert not flow._marking_publication_is_current(window, binding)
+    assert not flow._source_selection_is_current(session.source_selection)
+    assert not flow._apply_pool_to_window(
+        window, session, pool, evaluation_count=2, signal_entries=None)
+    assert not flow._marking_publication_is_current(window, c.binding)
+    assert (pool["candles"], pool["direct_selected_query"]) == before
+    assert len(c.calls) == 1
+
+
+def test_full_native_warmup_control_reports_missing_prefix(full_native_publication):
+    c = full_native_publication
+    view, missing = c.flow._normal_base_history_view(c.session, c.pool, 2)
+    assert missing == 0
+    assert view["candles"] == c.rows and view["display_candles"] == c.rows[-2:]
+    view, missing = c.flow._normal_base_history_view(c.session, c.pool, 4)
+    assert missing == 2
+    assert view["candles"] == view["display_candles"] == c.rows
+    assert c.flow._source_selection_is_current(c.session.source_selection)
+    assert c.flow._selected_range_binding_identity(c.window) is not None
 
 
 @pytest.mark.parametrize("change", ["replacement", "nested_rows"])
@@ -635,7 +617,9 @@ def test_krx_toggle_rejects_changed_published_native_receipt(flow, monkeypatch, 
         v5.ValidationRequest(STOCK, v5.ValidationSettingsSnapshot(rules), 3),
         operation_active_reader=lambda: False)
     window = SimpleNamespace(stock=STOCK,
-        _session_display_republish_pending=current.request.settings_snapshot)
+        _validation_range_times=("20261029090000", "20261029092700"), validation_range=(0, 9),
+        _marking_current_settings=lambda: current.request.settings_snapshot,
+        _marking_source_key=lambda settings, times: (settings.rules_hash, times))
     for session, generation in ((previous, 3), (current, 5)):
         session.source_selection = v5._select_v5_source(
             STOCK, "M3", False, False, NOW, window_key=id(window), generation=generation)
@@ -657,9 +641,8 @@ def test_krx_toggle_rejects_changed_published_native_receipt(flow, monkeypatch, 
     flow._pool_dispatch_snapshot(pool)
     binding = (pool, previous, 3, pool["_dispatch_snapshot"])
     window._v5_marking_display_publication = binding
-    window._v5_session_display_basis = (binding, (7, "offline"))
     monkeypatch.setattr(v5, "required_validation_history_context_bars", lambda _: 2)
-    assert flow._session_display_pool_reusable(window, current, pool, 3)
+    assert flow._selected_range_binding_identity(window) is not None
     original = deepcopy(pool["native_minute_receipt"])
     if change == "replacement":
         replacement = deepcopy(pool["native_minute_receipt"])
@@ -669,9 +652,10 @@ def test_krx_toggle_rejects_changed_published_native_receipt(flow, monkeypatch, 
         response["rows"][0]["close"] = 999
     # Both changes still satisfy the real metadata/session validator.
     flow._require_selected_timeframe_pool(current, pool)
+    assert flow._selected_range_binding_identity(window) is None
     flow._invalidate_window_input(window)
-    window._session_display_republish_pending = current.request.settings_snapshot
-    assert not flow._session_display_pool_reusable(window, current, pool, 3)
+    assert not flow._apply_pool_to_window(
+        window, previous, pool, evaluation_count=3, signal_entries=None)
     assert not flow._marking_publication_is_current(window, binding)
     assert binding[3][2]["native_minute_receipt"] == original
 
@@ -682,7 +666,7 @@ def real_window_case():
     yield from baseline.case.__wrapped__()
 
 
-def test_real_v5_checkbox_retoggle_keeps_native_original_and_stale_jobs_blocked(real_window_case):
+def test_real_v5_checkbox_retoggle_keeps_native_original_and_stale_jobs_blocked(real_window_case, monkeypatch):
     from datetime import timedelta
     from time import monotonic, sleep
     from types import SimpleNamespace
@@ -693,14 +677,19 @@ def test_real_v5_checkbox_retoggle_keeps_native_original_and_stale_jobs_blocked(
 
     case = real_window_case
     window = baseline.window_for(case)
-    with QSignalBlocker(window.basic_signal_interval_combo), QSignalBlocker(
-            window.validation_regular_market_only_check):
+    with QSignalBlocker(window.basic_signal_interval_combo):
         combo = window.basic_signal_interval_combo
         combo.setCurrentIndex(next(i for i in range(combo.count())
             if window_module.normalize_validation_timeframe(combo.itemText(i))["key"] == "M3"))
-        window.validation_regular_market_only_check.setChecked(True)
     flow = _flow()
     flow._operation_active_reader = lambda: False
+    projection_inputs = []
+    build_projection = v5._build_validation_projection_data
+    def capture_projection(calculation, *args, **kwargs):
+        result = build_projection(calculation, *args, **kwargs)
+        projection_inputs.append(deepcopy(calculation))
+        return result
+    monkeypatch.setattr(v5, "_build_validation_projection_data", capture_projection)
     now = datetime.now(v5.SEOUL_TIMEZONE).replace(hour=20, minute=1, second=0, microsecond=0)
     flow._now_factory = lambda: now
     # Read the existing frozen stock plan; never initialize/change project source state.
@@ -721,8 +710,8 @@ def test_real_v5_checkbox_retoggle_keeps_native_original_and_stale_jobs_blocked(
     def request_native(code, name, **kwargs):
         calls.append(kwargs["count"])
         assert kwargs["interval"] == 3 and kwargs["nxt_available"] is True
-        assert len(calls) <= 3, "checkbox must not repeat the accepted native handoff"
-        rows = base if len(calls) == 1 else expanded
+        assert len(calls) <= 2, "legacy preference must not repeat the accepted FULL request"
+        rows = expanded[-kwargs["count"]:]
         started = dict(ok=True, code=code, rqname=f"REAL-WINDOW-{len(calls)}",
             market_data_identity=f"{code}_AL", market_source="INTEGRATED", display_only=True,
             connection_epoch=7, login_session_id="offline", request_as_of=now.isoformat(),
@@ -762,19 +751,24 @@ def test_real_v5_checkbox_retoggle_keeps_native_original_and_stale_jobs_blocked(
 
     assert window.request_normal_base() is not None
     binding = wait_published()
-    assert calls == [5000 + warmup, len(expanded), 5000]  # Initial query, warmup, display sidecar.
+    assert calls == [5000 + warmup, 5000]  # Native FULL calculation and display sidecar.
     original_calls = list(calls)
     original_display = deepcopy(window._candles)
     original_calculation = deepcopy(window._calculation_candles)
-    assert len(original_display) == 3170
-    assert len(original_calculation) >= 3170 + warmup
+    assert len(original_display) == 5000
+    assert len(original_calculation) == 5000 + warmup
+    assert projection_inputs and projection_inputs[-1] == original_calculation
+    assert window.visualization_descriptors and window.visualization_cache.series
+    assert any(row["time"].endswith("080000") for row in original_calculation)
+    assert any(row["time"].endswith("154200") for row in original_calculation)
     original_pool = binding[0]
     for regular in (False, True):
         old = binding
         old_job = dict(window=window, session=old[1], pool=old[0], generation=old[2],
                        dispatch_publication=old[3])
         assert flow._prepare_request_is_current(old_job)
-        window.validation_regular_market_only_check.setChecked(regular)
+        window._restore_validation_preferences({"regular_market_only": regular})
+        window._on_validation_context_changed(normal_base=True, preserve_chart=True)
         assert flow._request_generation[id(window)] == old[2] + 2
         assert not flow._marking_publication_is_current(window, old)
         assert not flow._prepare_request_is_current(old_job)
@@ -785,6 +779,8 @@ def test_real_v5_checkbox_retoggle_keeps_native_original_and_stale_jobs_blocked(
         assert binding[1] is not old[1]
         assert binding[0]["candles"] == original_pool["candles"]
         assert binding[0]["direct_selected_query"] == original_pool["direct_selected_query"]
-        if regular:
-            assert window._candles == original_display
-            assert window._calculation_candles == original_calculation
+        assert window._candles == original_display
+        assert window._calculation_candles == original_calculation
+        assert projection_inputs[-1] == original_calculation
+        assert binding[1].request.settings_snapshot.to_dict()["validation_market_scope"] == {
+            "regular_market_only": False}

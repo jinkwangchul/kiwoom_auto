@@ -1,6 +1,6 @@
-"""V5 replay uses the selected calculation session and displayed bounds.
+"""V5 replay keeps acquired native FULL input and displayed bounds.
 
-FULL retains off-session bars; REG excludes them from evaluation and warmup.
+Legacy regular-only settings cannot exclude acquired off-session bars.
 No live feed, broker, or order is involved.
 """
 import pytest
@@ -61,7 +61,7 @@ def test_scope_projects_native_history_before_tail(key, regular_only):
     session, pool = _scoped_source(regular_only, key)
     original = _history()
     view = flow._validation_pool_for_session(session, pool, target_count=4)
-    indexes = (5, 6, 9, 10) if regular_only else (8, 9, 10, 11)
+    indexes = (8, 9, 10, 11)
     assert view["candles"] == [original[i] for i in indexes]
     assert view["display_candles"] == view["candles"]
     assert view["snapshot"].rows_count == 4
@@ -71,10 +71,10 @@ def test_scope_projects_native_history_before_tail(key, regular_only):
 
 @pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("ranged", [False, True])
-def test_reg_replay_excludes_off_session_interior_and_hidden_prefix(prepared, ranged):
+def test_legacy_scope_replay_keeps_full_interior_and_hidden_prefix(prepared, ranged):
     flow = _scoped_flow()
     session, pool = _scoped_source(True)
-    pool["display_candles"] = [pool["candles"][i] for i in (1, 2, 5, 6, 9, 10)]
+    pool["display_candles"] = [pool["candles"][i] for i in (8, 9, 10, 11)]
     result = flow._prepare_replay_result_from_pool(
         session, pool, history_target=4, evaluation_count=4,
         chart_range=(0, 3) if ranged else None,
@@ -83,13 +83,13 @@ def test_reg_replay_excludes_off_session_interior_and_hidden_prefix(prepared, ra
     assert result.ok and result.snapshot is not None
     snapshot = result.snapshot
     rows = snapshot.to_candles()
-    assert rows == [_history()[i] for i in (1, 2, 5, 6, 9, 10)]
+    assert rows == _history()
     assert rows[snapshot.evaluated_start_index:snapshot.evaluated_end_index + 1] == [
-        _history()[i] for i in (5, 6, 9, 10)
+        _history()[i] for i in (8, 9, 10, 11)
     ]
 
 
-def test_reg_normal_base_keeps_only_hidden_regular_warmup(monkeypatch):
+def test_legacy_scope_normal_base_keeps_full_warmup(monkeypatch):
     flow = _scoped_flow()
     session, pool = _scoped_source(True)
     monkeypatch.setattr(v5, "required_validation_history_context_bars", lambda _: 2)
@@ -97,20 +97,20 @@ def test_reg_normal_base_keeps_only_hidden_regular_warmup(monkeypatch):
     for prepared in (None, display_view):
         view, deficit = flow._normal_base_history_view(session, pool, 2, prepared)
         assert deficit == 0
-        assert view["candles"] == [_history()[i] for i in (5, 6, 9, 10)]
-        assert view["display_candles"] == [_history()[i] for i in (9, 10)]
+        assert view["candles"] == [_history()[i] for i in (8, 9, 10, 11)]
+        assert view["display_candles"] == [_history()[i] for i in (10, 11)]
         assert view["snapshot"].rows_count == 4
 
 
 @pytest.mark.parametrize("key", ["M1", "M3", "M5", "M10", "M15", "M30", "M60", "M120", "M240"])
-def test_reg_native_history_growth_counts_only_regular_warmup(key):
+def test_legacy_scope_native_history_growth_counts_full_warmup(key):
     flow = _scoped_flow()
     session, pool = _scoped_source(True, key)
     calculated = flow._normal_base_native_m5_calculation_rows(session, pool, pool["candles"])
-    assert calculated == [_history()[i] for i in (1, 2, 5, 6, 9, 10)]
+    assert calculated == _history()
 
 
-def test_reg_fallback_replay_excludes_hidden_off_session_bars(monkeypatch):
+def test_legacy_scope_fallback_replay_keeps_full_input(monkeypatch):
     from types import SimpleNamespace
 
     flow = _scoped_flow()
@@ -122,18 +122,56 @@ def test_reg_fallback_replay_excludes_hidden_off_session_bars(monkeypatch):
     flow._replay_from_pool(window, session, pool, evaluation_count=4)
     assert not errors
     assert len(received) == 1
-    assert received[0].to_candles() == [_history()[i] for i in (1, 2, 5, 6, 9, 10)]
+    snapshot = received[0]
+    assert snapshot.to_candles() == _history()
+    assert snapshot.to_candles()[snapshot.evaluated_start_index:snapshot.evaluated_end_index + 1] == [
+        _history()[i] for i in (8, 9, 10, 11)]
 
 
 @pytest.mark.parametrize("mutation", ["ohlcv", "display", "identity", "request"])
-def test_reg_projection_keeps_source_and_projection_guards(mutation):
+def test_full_display_axis_mutations_reach_their_own_guards(monkeypatch, mutation):
     from copy import deepcopy
+    from datetime import datetime
+    from types import SimpleNamespace
 
     flow = _scoped_flow()
-    session, pool = _scoped_source(True)
+    session, pool = _scoped_source(False)
     view = deepcopy(flow._validation_pool_for_session(session, pool, target_count=4))
+    view["display_candles"] = deepcopy(view["display_candles"])
+    assert view["candles"] == [_history()[i] for i in (8, 9, 10, 11)]
+    now = datetime.fromisoformat("2026-10-30T18:00:00+09:00")
+    flow._now_factory = lambda: now
+    window = SimpleNamespace(stock=session.request.stock,
+        validation_range=(0, 3), _validation_range_times=(TIMES[8], TIMES[11]),
+        _marking_current_settings=lambda: session.request.settings_snapshot)
+    session.source_selection = v5._select_v5_source(
+        window.stock, "M1", True, False, now, window_key=id(window), generation=3)
+    flow._open_windows[id(window)] = window
+    flow._historical_pools[id(window)] = view
+    flow._validation_sessions[id(window)] = session
+    flow._request_generation[id(window)] = 3
+    flow._pool_dispatch_snapshot(view)
+    publication = view["_dispatch_snapshot"]
+    window._v5_marking_display_publication = (view, session, 3, publication)
+    key_calls, identity_calls = [], []
+    def marking_key(settings, times):
+        key_calls.append(times)
+        return v5.IndicatorFollowSignalValidationV5Window._marking_source_key_for_candles(
+            window.stock.code, settings, times, regular_only=False,
+            calculation_candles=view["candles"], display_candles=view["display_candles"])
+    window._marking_source_key = marking_key
+    source_identity = flow._pool_computation_source_identity
+    def observe_identity(candidate):
+        identity = source_identity(candidate)
+        identity_calls.append((candidate, identity))
+        return identity
+    monkeypatch.setattr(flow, "_pool_computation_source_identity", observe_identity)
+    assert flow._selected_range_binding_identity(window) is not None
+    assert len(key_calls) == len(identity_calls) == 1
+    key_calls.clear()
+    identity_calls.clear()
+
     if mutation == "ohlcv":
-        view["candles"] = [dict(row) for row in view["candles"]]
         view["candles"][0]["close"] += 1
     elif mutation == "display":
         view["display_candles"] = [view["display_candles"][0]] * 4
@@ -141,11 +179,32 @@ def test_reg_projection_keeps_source_and_projection_guards(mutation):
         view["market_data_identity"] = "005930_NX"
     else:
         view["request_id"] = "ANOTHER_NATIVE_REQUEST"
-    with pytest.raises(ValueError, match="REGULAR_MINUTE_SOURCE_SUFFIX_UNVERIFIED"):
-        flow._sor_m1_calculation_view(session, pool, view, None)
+    assert "_regular_minute_source_view" not in view
+    assert flow._source_selection_is_current(session.source_selection)
+    assert flow._marking_publication_is_current(window, window._v5_marking_display_publication)
+    assert flow._selected_range_binding_identity(window) is None
+    assert len(identity_calls) == 1 and identity_calls[0][0] is view
+    if mutation == "display":
+        assert identity_calls[0][1] == publication[3]
+        assert key_calls == [(TIMES[8], TIMES[11])]
+    else:
+        assert identity_calls[0][1] != publication[3]
+        assert key_calls == []
+    assert publication[2]["candles"] == [_history()[i] for i in (8, 9, 10, 11)]
+    assert publication[2]["display_candles"] == [_history()[i] for i in (8, 9, 10, 11)]
 
 
-def test_reg_direct_current_receipt_survives_range_revalidation():
+def test_legacy_projected_minute_marker_is_rejected():
+    flow = _scoped_flow()
+    session, pool = _scoped_source(False)
+    view = flow._validation_pool_for_session(session, pool, target_count=4)
+    assert view["candles"] == [_history()[i] for i in (8, 9, 10, 11)]
+    legacy = dict(view, _regular_minute_source_view=pool)
+    with pytest.raises(ValueError, match="REGULAR_MINUTE_SOURCE_UNVERIFIED"):
+        flow._validation_pool_for_session(session, legacy, target_count=4)
+
+
+def test_legacy_scope_direct_current_receipt_survives_range_revalidation():
     from datetime import datetime
     from tests.test_v5_direct_forming_tail_20261026 import _result, ROWS
 
@@ -164,10 +223,10 @@ def test_reg_direct_current_receipt_survives_range_revalidation():
     frozen = flow._sor_m1_calculation_snapshot(session, pool)
     view = flow._validation_pool_for_session(session, pool, target_count=5900)
     current = flow._sor_m1_calculation_view(session, pool, view, frozen)
-    expected = rows[1:]
+    expected = rows
     assert current["candles"] == expected
     result = flow._prepare_replay_result_from_pool(
-        session, pool, history_target=3, chart_range=(0, 2),
+        session, pool, history_target=4, chart_range=(0, 3),
         prepared_view_pool=current, sor_m1_calculation_snapshot=frozen,
         expected_sor_m1_calculation=expected,
     )
@@ -176,14 +235,12 @@ def test_reg_direct_current_receipt_survives_range_revalidation():
 
 
 @pytest.mark.parametrize("regular_only", [True, False])
-def test_minute_toggle_requests_current_scope_recalculation(case, regular_only):
-    from PyQt5.QtCore import QSignalBlocker
+def test_minute_legacy_scope_reentry_requests_full(case, regular_only):
     from tests.test_indicator_follow_signal_validation_v5_baseline import window_for
     from tests.test_indicator_follow_signal_validation_v5_history_hash_ownership import _snapshot
 
     window = window_for(case)
-    with QSignalBlocker(window.validation_regular_market_only_check):
-        window.validation_regular_market_only_check.setChecked(not regular_only)
+    window._restore_validation_preferences({"regular_market_only": regular_only})
     rows = _history()
     window.set_historical_candle_pool(rows, chart_candle_count=len(rows))
     settings = window._signal_validation_seed.settings_snapshot
@@ -192,19 +249,19 @@ def test_minute_toggle_requests_current_scope_recalculation(case, regular_only):
     window.set_replay_snapshot(old)
     requests = []
     window.validation_run_requested.connect(requests.append)
-    window.validation_regular_market_only_check.setChecked(regular_only)
+    window._request_validation(normal_base=True)
     assert len(requests) == 1
     assert requests[0].settings_snapshot.to_dict()["validation_market_scope"] == {
-        "regular_market_only": regular_only,
+        "regular_market_only": False,
     }
     assert window.validation_range is None
-    assert not window.marking_display_check.isChecked()
-    assert window._replay_snapshot is not old
+    assert window._marking_times is None
+    assert window._replay_snapshot is old
+    assert window._pending_result_settings_snapshot is requests[0].settings_snapshot
     assert window.canvas._candles == window._candles
 
 
-def test_minute_toggle_replaces_inflight_scope_before_candles_arrive(case):
-    from PyQt5.QtCore import QSignalBlocker
+def test_minute_legacy_on_reentry_replaces_inflight_before_candles_arrive(case):
     from tests.test_indicator_follow_signal_validation_v5_baseline import window_for
 
     window = window_for(case)
@@ -212,12 +269,11 @@ def test_minute_toggle_replaces_inflight_scope_before_candles_arrive(case):
     assert previous is not None
     requests = []
     window.validation_run_requested.connect(requests.append)
-    with QSignalBlocker(window.validation_regular_market_only_check):
-        window.validation_regular_market_only_check.setChecked(True)
-    window._on_validation_regular_market_display_changed()
+    window._restore_validation_preferences({"regular_market_only": True})
+    window._request_validation(normal_base=True)
     assert len(requests) == 1
-    assert requests[0].settings_snapshot.rules_hash != previous.settings_snapshot.rules_hash
-    assert requests[0].settings_snapshot.to_dict()["validation_market_scope"]["regular_market_only"] is True
+    assert requests[0].settings_snapshot.rules_hash == previous.settings_snapshot.rules_hash
+    assert requests[0].settings_snapshot.to_dict()["validation_market_scope"]["regular_market_only"] is False
 
 
 @pytest.mark.parametrize(
