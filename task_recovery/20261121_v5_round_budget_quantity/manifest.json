@@ -1,0 +1,123 @@
+{
+  "task": "V5 ROUND/BUDGET quantity-first sizing",
+  "approval": "Latest user ㄱㄱ, 2026-11-21; approved_scope.md",
+  "status": "Focused implementation PASS; live GUI NOT_VERIFIED; whole-workspace preservation HOLD",
+  "artifact_kind": "Authorized before-relative patch only; unrelated WIP and runtime data are excluded",
+  "patch": "changes.patch",
+  "patch_sha256": "D74AC7848FFAD905BFF3F9CF3DBE192566194B23F69571BE59DEE6BDB2C16605",
+  "files": [
+    {
+      "path": "indicator_follow_signal_validation_execution.py",
+      "before_sha256": "8A091BDE7DD8FACAC67F531A9FD1146E3D7255B8B28E9FE93AD007A05275EFCE",
+      "after_sha256": "76DC89FFD3B82489F9668FE71B63A378A2FD091E014B95550352853ED508C161",
+      "patch_reconstructs_exact_bytes": true
+    },
+    {
+      "path": "indicator_follow_signal_validation_v5_limit.py",
+      "before_sha256": "5B676A436448EC8D3B1156D149A45F94B654097FA80823BD4EA2E20B56061FB8",
+      "after_sha256": "379F4122DC20BE716F81F197F6894D3D3CA8F0FF63995A90C87FD6BD13DC4E8F",
+      "patch_reconstructs_exact_bytes": true
+    },
+    {
+      "path": "tests/test_v5_lot_limit_execution.py",
+      "before_sha256": "181E50488E89074EE5A79F4DD21FAB07ADB6205D4A3823AB6D3F75615469EAC1",
+      "after_sha256": "AEB763842FE9B208622338AC239DA6260324494730A0F761C38E91C89367D95F",
+      "patch_reconstructs_exact_bytes": true
+    },
+    {
+      "path": "tests/test_v5_lot_limit_ui.py",
+      "before_sha256": "DC7C1960DF6A3A6F01C2F494299BE8E457BAB5C994B3C58F357967F89363414A",
+      "after_sha256": "C7F287B6FEEF98F012C85C1A63332021E32B081044BA34EBD4A318C04AF9B1EB",
+      "patch_reconstructs_exact_bytes": true
+    }
+  ],
+  "expected_example": {
+    "first_fill_quantity": 1,
+    "first_fill_price": 1941000,
+    "second_fill_price": 2022000,
+    "round_add_1_second_quantity": 2,
+    "budget_times_2_second_quantity": 2,
+    "second_amount": 4044000,
+    "total_quantity": 3,
+    "total_buy_cost": 5985000
+  },
+  "preserved": [
+    "ACTIVE_BUY",
+    "Non-V5/shared default policy",
+    "CLOSE/OHLC4/cross fill price",
+    "Fractional BUDGET target carry",
+    "Partial lot rewind and full reset"
+  ],
+  "verification": {
+    "final_log": "green_03.log",
+    "passed": 20,
+    "subtests_passed": 21,
+    "deselected": 113,
+    "seconds": 4.54,
+    "exit": 0,
+    "red": "25 failed, 2 passed, 44 deselected; genuine before-source-change assertions",
+    "first_green": "2 new fixture subfailures; corrected prices without changing expected results",
+    "audit": "Independent native Astra spec/quality PASS, C0 I0; native Terra report scope PASS"
+  },
+  "actual_sol": {
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "pid": 34836,
+    "session": "01a1f9a8-e389-7002-90a8-5928495bf086",
+    "native_exit": 0,
+    "process_exit": 0,
+    "seconds": 555.2
+  },
+  "base_head": "75296031aec709ef032e329db5c5af27a5d928e8",
+  "base_branch": "feat/restore-auto-trade-setting-ui",
+  "normal_index_sha256": "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+  "protected": [
+    {
+      "path": "buy_execution_policy.py",
+      "expected_sha256": "55A40FE7BF8DA412F2D9FA986462DD52400F7E3DF5969949FECCEC372FDCB6A8",
+      "actual_sha256": "55A40FE7BF8DA412F2D9FA986462DD52400F7E3DF5969949FECCEC372FDCB6A8",
+      "unchanged": true
+    },
+    {
+      "path": "gui_indicator_follow_signal_validation_v5_window.py",
+      "expected_sha256": "C788A2D5AD392639A39FC6C3FDD884F403678F5A01A693061B247BB4C6B80EAB",
+      "actual_sha256": "C788A2D5AD392639A39FC6C3FDD884F403678F5A01A693061B247BB4C6B80EAB",
+      "unchanged": true
+    },
+    {
+      "path": "gui_indicator_follow_signal_validation_v5_flow.py",
+      "expected_sha256": "5D0D22F5652201E1B04084F9DD7947D201D7C288D512A6B3A6CC4DDCFD1E8554",
+      "actual_sha256": "5D0D22F5652201E1B04084F9DD7947D201D7C288D512A6B3A6CC4DDCFD1E8554",
+      "unchanged": true
+    },
+    {
+      "path": "tests\\test_indicator_follow_signal_validation_execution.py",
+      "expected_sha256": "96224559A2883946DAC42627F345602E42C93506CCC09081845B57735E299D08",
+      "actual_sha256": "96224559A2883946DAC42627F345602E42C93506CCC09081845B57735E299D08",
+      "unchanged": true
+    },
+    {
+      "path": "tests\\test_v5_replay_sparse_display_axis_20261101.py",
+      "expected_sha256": "5BF24EC900B27D1F378CC6DE6C9CF08C6520B0E2904CD9FF538559AFB62AAB01",
+      "actual_sha256": "5BF24EC900B27D1F378CC6DE6C9CF08C6520B0E2904CD9FF538559AFB62AAB01",
+      "unchanged": true
+    }
+  ],
+  "unrelated_status_unchanged": false,
+  "unrelated_status_added": [
+    " D \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/config.json\"",
+    " D \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/orders.json\"",
+    " D \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/state.json\"",
+    "?? \"stocks/005935_\\354\\202\\274\\354\\204\\261\\354\\240\\204\\354\\236\\220\\354\\232\\260/\"",
+    "?? routine_instances/2003bb7c-4401-4d3f-8c32-6e653a7e22b1/"
+  ],
+  "unrelated_status_removed": [
+    " M \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/config.json\"",
+    " M \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/orders.json\"",
+    " M \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/state.json\"",
+    "?? \"stocks/000660_SK\\355\\225\\230\\354\\235\\264\\353\\213\\211\\354\\212\\244/candles.json\""
+  ],
+  "external_scope": "New directories predate first pytest; 000660 deletion time/actor remain unconfirmed. No restoration or staging of those paths.",
+  "live_gui": "User restart and live tooltip/summary verification pending",
+  "evidence_directory": "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_average_management_off_refresh_20261120\\round_budget_quantity_fix_20261121"
+}

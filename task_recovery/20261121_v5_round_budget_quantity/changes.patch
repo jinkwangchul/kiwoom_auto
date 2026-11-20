@@ -1,0 +1,324 @@
+--- a/indicator_follow_signal_validation_execution.py
++++ b/indicator_follow_signal_validation_execution.py
+@@ -69,6 +69,8 @@
+         for key in policy
+         if key in source
+     })
++    if source.get("_v5_quantity_first") is True:
++        policy["_v5_quantity_first"] = True
+     if "virtual_fill_price_basis" in source:
+         basis = str(source["virtual_fill_price_basis"] or "").strip().upper()
+         if basis not in {"CLOSE", "OHLC4"}:
+@@ -321,7 +323,8 @@
+         # Historical buy rounds stay intact; the next sizing step can rewind.
+         self._sizing_round = 0
+         self._sizing_previous_buy_budget = 0.0
+-        self._round_sizing_records: dict[int, tuple[int, float]] = {}
++        self._sizing_previous_share_target: Decimal | None = None
++        self._round_sizing_records: dict[int, tuple[int, float, Decimal | None]] = {}
+         self.buy_indexes: list[int] = []
+         self.average_price_series: list[float | None] = []
+         self.quantity_series: list[int] = []
+@@ -362,6 +365,7 @@
+         self.previous_buy_budget = 0.0
+         self._sizing_round = 0
+         self._sizing_previous_buy_budget = 0.0
++        self._sizing_previous_share_target = None
+         self._round_sizing_records.clear()
+         self.buy_indexes = []
+         self._limit_lots = []
+@@ -376,7 +380,7 @@
+         if high is None:
+             return
+         remaining = []
+-        sold_sizing_records: list[tuple[int, float]] = []
++        sold_sizing_records: list[tuple[int, float, Decimal | None]] = []
+         for lot in self._limit_lots:
+             # BUYs execute at CLOSE; their candle HIGH predates the order.
+             if lot.evaluation_index >= index or high < lot.price:
+@@ -399,12 +403,16 @@
+             if (sold_sizing_records and self.policy["enabled"]
+                     and self.policy["repeat_mode"] in {"ROUND", "BUDGET"}):
+                 # Multiple fills on one candle restart at the lowest sold step.
+-                sold_step, sold_budget = min(sold_sizing_records)
++                sold_step, sold_budget, sold_share_target = min(sold_sizing_records, key=lambda record: record[:2])
+                 if sold_step <= self._sizing_round:
+                     self._sizing_round = sold_step - 1
+                     if self.policy["repeat_mode"] == "BUDGET":
+                         self._sizing_previous_buy_budget = (
+                             sold_budget / self.policy["budget_ratio"] if sold_step > 1 else 0.0
++                        )
++                        self._sizing_previous_share_target = (
++                            sold_share_target / Decimal(str(self.policy["budget_ratio"]))
++                            if sold_step > 1 and sold_share_target is not None else None
+                         )
+         elif self._cycle_buy_quantity:
+             self._finish_limit_cycle(index)
+@@ -550,6 +558,7 @@
+         self.previous_buy_budget = 0.0
+         self._sizing_round = 0
+         self._sizing_previous_buy_budget = 0.0
++        self._sizing_previous_share_target = None
+         self._round_sizing_records.clear()
+         self.buy_indexes = []
+ 
+@@ -593,9 +602,33 @@
+             return
+ 
+         approved_budget_for_next: float | None = None
++        approved_share_target: Decimal | None = None
+         if self.policy["enabled"] is not True:
+             quantity = 1
+             reason = "AVERAGING_DISABLED_ONE_SHARE"
++        elif (self.policy.get("_v5_quantity_first") is True
++              and self.policy["repeat_mode"] in {"ROUND", "BUDGET"}):
++            if self._sizing_round == 0:
++                approved_share_target = Decimal(self.policy["first_buy_quantity"])
++                reason = "FIRST_BUY_STARTING_QUANTITY"
++            elif self.policy["repeat_mode"] == "ROUND":
++                factor = Decimal(str(self.policy["round_budget_value"]))
++                if factor <= 0:
++                    self.skipped.append((index, "ROUND_BUDGET_FACTOR_NOT_POSITIVE"))
++                    return
++                step = Decimal(self._sizing_round)
++                sizing = step + factor if self.policy["round_operator"] == "ADD" else step * factor
++                approved_share_target = sizing * self.policy["first_buy_quantity"]
++                reason = ("CONFIRMED_ROUND_PLUS_VALUE_X_STARTING_BUDGET"
++                          if self.policy["round_operator"] == "ADD"
++                          else "CONFIRMED_ROUND_X_VALUE_X_STARTING_BUDGET")
++            else:
++                approved_share_target = self._sizing_previous_share_target * Decimal(str(self.policy["budget_ratio"]))
++                reason = "PREVIOUS_BUDGET"
++            quantity = int(approved_share_target)
++            if quantity <= 0:
++                self.skipped.append((index, "ROUND_BUDGET_BELOW_ONE_SHARE"))
++                return
+         elif self.holding_quantity == 0:
+             quantity = int(self.policy["first_buy_quantity"])
+             reason = "FIRST_BUY_STARTING_QUANTITY"
+@@ -635,8 +668,9 @@
+         )
+         self._sizing_round += 1
+         self._sizing_previous_buy_budget = self.previous_buy_budget
++        self._sizing_previous_share_target = approved_share_target
+         self._round_sizing_records[self.confirmed_round] = (
+-            self._sizing_round, self._sizing_previous_buy_budget,
++            self._sizing_round, self._sizing_previous_buy_budget, approved_share_target,
+         )
+         self.buy_indexes.append(index)
+         self.fills.append(ValidationVirtualFill(
+--- a/indicator_follow_signal_validation_v5_limit.py
++++ b/indicator_follow_signal_validation_v5_limit.py
+@@ -26,6 +26,7 @@
+ 
+     def __init__(self, policy=None, *, stop_config=None, stop_price_basis="CLOSE",
+                  eligible_indices=None, buy_condition_events=(), buy_condition_candles=None):
++        policy = {**(policy or {}), "_v5_quantity_first": True}
+         super().__init__(policy)
+         self.stop_config = deepcopy(stop_config or {})
+         self.stop_price_basis = stop_price_basis
+@@ -241,6 +242,7 @@
+                                      eligible_indices=None, buy_condition_events=None,
+                                      buy_condition_candles=None):
+     from indicator_follow_signal_validation_execution import simulate_validation_execution
++    policy = {**(policy or {}), "_v5_quantity_first": True}
+     overrides = _v5_cross_fill_prices(candles, entries, policy) if isinstance(policy, dict) else {}
+     metadata = policy if isinstance(policy, dict) else {}
+     frozen_stop = stop_config if stop_config is not None else metadata.get("_v5_stop_config", {})
+@@ -283,9 +285,10 @@
+ 
+ def v5_signal_execution_policy(policy):
+     """Keep virtual limit fills out of V5 signal evaluation and performance."""
+-    if not isinstance(policy, dict) or policy.get("lot_limit_enabled") is not True:
+-        return policy
+-    return {**policy, "lot_limit_enabled": False}
++    copied = {**(policy or {}), "_v5_quantity_first": True}
++    if copied.get("lot_limit_enabled") is True:
++        copied["lot_limit_enabled"] = False
++    return copied
+ 
+ 
+ def project_v5_lot_limit_rules(rules, ui_state, *, instrument_type="STOCK"):
+--- a/tests/test_v5_lot_limit_execution.py
++++ b/tests/test_v5_lot_limit_execution.py
+@@ -23,6 +23,129 @@
+ 
+ 
+ class LotLimitExecutionTest(unittest.TestCase):
++    def test_v5_quantity_first_price_modes_and_legacy_parity(self):
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
++        rows = candles([1941000, 2022000, 2022000])
++        signals = entries(rows, ("BUY", 0), ("BUY", 1), ("SELL", 2))
++        for mode in ("ROUND", "BUDGET"):
++            with self.subTest(mode=mode):
++                policy = dict(enabled=True, repeat_mode=mode, round_budget_value=1, budget_ratio=2)
++                result = simulate(rows, signals, policy)
++                self.assertEqual([f.quantity for f in result.fills], [1, 2, 3])
++                self.assertEqual(result.fills[1].amount, 4044000)
++                self.assertEqual((result.cycles[0].buy_quantity, result.cycles[0].buy_cost),
++                                 (3, 5985000))
++                self.assertEqual([f.quantity for f in simulate_validation_execution(rows, signals, policy).fills],
++                                 [1, 1, 2])
++        rows = candles([100, 110, 120, 130])
++        result = simulate(rows, entries(rows, *(("BUY", i) for i in range(4))),
++                          dict(enabled=True, first_buy_quantity=3, round_operator="MULTIPLY",
++                               round_budget_value=2))
++        self.assertEqual([f.quantity for f in result.fills], [3, 6, 12, 18])
++        active = dict(enabled=True, repeat_mode="ACTIVE_BUY", active_direction="DOWN",
++                      active_ratio=10, active_compare=">=")
++        rows = candles([100, 80, 90])
++        signals = entries(rows, ("BUY", 0), ("BUY", 1), ("SELL", 2))
++        self.assertEqual(simulate(rows, signals, active), simulate_validation_execution(rows, signals, active))
++        self.assertEqual(simulate(rows, signals, {"enabled": False}),
++                         simulate_validation_execution(rows, signals, {"enabled": False}))
++
++    def test_v5_quantity_first_final_fill_prices(self):
++        from engines.condition_engine import parse_condition_expression
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
++        rows = candles([100, 103, 109])
++        rows[1].update(open=101, high=107, low=101)
++        rows[2].update(open=103, high=115, low=105)
++        policy = dict(enabled=True, repeat_mode="BUDGET", budget_ratio=2)
++        signals = entries(rows, ("BUY", 1), ("BUY", 2))
++        for basis, prices in (("CLOSE", [103, 109]), ("OHLC4", [103, 108])):
++            with self.subTest(basis=basis):
++                result = simulate(rows, signals, {**policy, "virtual_fill_price_basis": basis})
++                self.assertEqual([f.quantity for f in result.fills], [1, 2])
++                self.assertEqual([f.price for f in result.fills], prices)
++                self.assertEqual([f.amount for f in result.fills], [prices[0], 2 * prices[1]])
++        for signal, price in zip(signals, (101, 106)):
++            i = signal.evaluation_index
++            signal.signal_index, signal.signal_time = i, rows[i]["time"]
++            signal.details = ["filter_type=COMPOSITE enabled=True logic=EXPRESSION passed=True group_results=C:PASS"]
++            signal.trace = {"conditions": [dict(
++                path="buy.filters.moving_average.conditions[0]", operator="CROSS_UP",
++                negated=False, raw_result=True, final_result=True,
++                left_operand=dict(key="CLOSE", index=i),
++                right_operand=dict(key="MA30", index=i, value=price))]}
++        rules = {"buy": {"filters": {"composite": {"expression": {
++            "ast": parse_condition_expression("C", allowed_identifiers={"C"})["ast"]}}}}}
++        result = simulate(rows, signals, {**policy, "_v5_execution_rules": rules,
++                                         "_v5_execution_source_candles": rows})
++        self.assertEqual([(f.quantity, f.price, f.amount) for f in result.fills],
++                         [(1, 101, 101), (2, 106, 212)])
++
++    def test_v5_quantity_first_fractional_budget(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rows = candles([1941000, 0, 2022000, 1800000, 2200000])
++        tracker = V5ValidationPositionTracker(dict(enabled=True, repeat_mode="BUDGET", budget_ratio=1.3))
++        result = tracker.finalize(rows, entries(rows, *(("BUY", i) for i in range(5))))
++        self.assertEqual([(f.evaluation_index, f.quantity) for f in result.fills],
++                         [(0, 1), (2, 1), (3, 1), (4, 2)])
++        self.assertEqual(result.skipped_buys, ((1, "VALIDATION_VIRTUAL_FILL_PRICE_UNAVAILABLE"),))
++        self.assertEqual(result.confirmed_buy_round, 4)
++        self.assertEqual(tracker.cumulative_buy_cost, 10163000)
++        self.assertEqual([f.buy_round for f in result.fills], [1, 2, 3, 4])
++
++    def test_v5_quantity_first_partial_rewind(self):
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
++        cases = [
++            # Sell stage 3: restore its fractional predecessor, then reach 2.197 again.
++            ([200, 150, 100, 105, 109, 109, 109], 110, [3], [1, 1, 1, 2, 1, 2]),
++            # Two stages sell together: restart at the minimum sold stage (2).
++            ([200, 100, 105, 106, 107, 108, 109, 109], 116, [2, 3], [1, 1, 1, 2, 1, 1, 2]),
++            # Sold first stage restores BASE even while another lot remains.
++            ([100, 105, 106, 107, 109, 109, 109], 110, [1], [1, 1, 1, 2, 1, 1]),
++        ]
++        for prices, high, sold, expected in cases:
++            with self.subTest(sold=sold):
++                rows = candles(prices)
++                rows[4]["high"] = high
++                result = simulate(rows, entries(rows, *(("BUY", i) for i in range(len(rows)) if i != 4)),
++                                  {**ON, "enabled": True, "repeat_mode": "BUDGET", "budget_ratio": 1.3})
++                buys = [f for f in result.fills if f.side == "BUY"]
++                self.assertEqual([f.quantity for f in buys], expected)
++                self.assertEqual([f.buy_round for f in result.fills if f.side == "SELL"], sold)
++                self.assertEqual([f.buy_round for f in buys], list(range(1, len(buys) + 1)))
++                self.assertEqual(result.confirmed_buy_round, len(buys))
++        rows = candles([110, 100, 102, 105, 109, 109, 109])
++        rows[4]["high"] = 111
++        result = simulate(rows, entries(rows, *(("BUY", i) for i in (0, 1, 2, 3, 5, 6))),
++                          {**ON, "enabled": True, "round_budget_value": 1})
++        self.assertEqual([f.quantity for f in result.fills if f.side == "BUY"], [1, 2, 3, 4, 2, 3])
++
++    def test_v5_quantity_first_reset_and_zero_skip(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        for mode in ("ROUND", "BUDGET"):
++            for exit_kind in ("SELL", "LOT", "FORCED"):
++                with self.subTest(mode=mode, exit_kind=exit_kind):
++                    rows = candles([100, 105, 130, 140])
++                    policy = dict(enabled=True, repeat_mode=mode, round_budget_value=1, budget_ratio=2)
++                    if exit_kind == "LOT":
++                        policy.update(ON)
++                    tracker = V5ValidationPositionTracker(policy)
++                    signals = entries(rows, ("BUY", 0), ("BUY", 1))
++                    if exit_kind == "SELL":
++                        signals += entries(rows, ("SELL", 2))
++                    closed = tracker.finalize(rows[:3], signals, force_liquidation_at_end=exit_kind == "FORCED")
++                    self.assertEqual((closed.open_quantity, closed.confirmed_buy_round), (0, 0))
++                    self.assertEqual((closed.cycles[0].buy_quantity, closed.cycles[0].buy_cost), (3, 310))
++                    signals += entries(rows, ("BUY", 3))
++                    reopened = tracker.finalize(rows, signals)
++                    self.assertEqual((reopened.fills[-1].quantity, reopened.fills[-1].buy_round), (1, 1))
++                    self.assertEqual(reopened.cycles[0], closed.cycles[0])
++        rows = candles([100, 100, 1, 100, 100])
++        tracker = V5ValidationPositionTracker(dict(enabled=True, round_operator="MULTIPLY", round_budget_value=0.5))
++        result = tracker.finalize(rows, entries(rows, ("BUY", 0), ("BUY", 1), ("BUY", 2), ("SELL", 3), ("BUY", 4)))
++        self.assertEqual([(f.side, f.evaluation_index, f.quantity) for f in result.fills],
++                         [("BUY", 0, 1), ("SELL", 3, 1), ("BUY", 4, 1)])
++        self.assertEqual([i for i, _reason in result.skipped_buys], [1, 2])
++
+     def test_stop_selected_mean_and_close_thresholds_and_fill_prices(self):
+         from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
+         rows = candles([100, 88])
+--- a/tests/test_v5_lot_limit_ui.py
++++ b/tests/test_v5_lot_limit_ui.py
+@@ -22,6 +22,48 @@
+ 
+ 
+ class LotLimitUITest(unittest.TestCase):
++    def test_v5_quantity_first_context_and_result_paths(self):
++        import gui_indicator_follow_signal_validation_v5_flow as flow
++        import gui_indicator_follow_signal_validation_v5_window as ui
++        from indicator_follow_signal_validation_execution import normalize_validation_execution_policy
++        from indicator_follow_signal_validation_v5_limit import (
++            v5_signal_execution_policy, v5_lot_limit_marker_records,
++        )
++        rows = candles([1941000, 2022000, 2022000])
++        signals = entries(rows, ("BUY", 0), ("BUY", 1), ("SELL", 2))
++        for timeframe in ("M3", "M5"):
++            for stop in (False, True):
++                for mode in ("ROUND", "BUDGET"):
++                    with self.subTest(timeframe=timeframe, stop=stop, mode=mode):
++                        policy = {**ON, "enabled": True, "repeat_mode": mode,
++                                  "round_budget_value": 1, "budget_ratio": 2,
++                                  "_v5_execution_timeframe_key": timeframe,
++                                  "_v5_stop_config": {"enabled": stop, "loss_percent": 50}}
++                        original = deepcopy(policy)
++                        session = SimpleNamespace(request=SimpleNamespace(
++                            timeframe_key=timeframe,
++                            settings_snapshot=SimpleNamespace(to_dict=lambda: {"validation_execution": policy})))
++                        tracker = flow.IndicatorFollowSignalValidationV5Flow._context_provider_for_session(session)
++                        context = tracker.context_for(2, "SELL", rows, signals[:2])
++                        self.assertEqual(context["validation_trace_context"]["position_quantity"], 3)
++                        self.assertEqual(context["average_price"], 5985000 / 3)
++                        self.assertEqual([f.quantity for f in tracker.fills], [1, 2])
++                        signal_policy = v5_signal_execution_policy(policy)
++                        normalized = normalize_validation_execution_policy(
++                            normalize_validation_execution_policy(signal_policy))
++                        replay = simulate_validation_execution(rows, signals, normalized)
++                        self.assertEqual((replay.cycles[0].buy_quantity, replay.cycles[0].buy_cost), (3, 5985000))
++                        result = ui.simulate_validation_execution(rows, signals, policy)
++                        self.assertEqual([f.quantity for f in result.fills], [1, 2, 3])
++                        self.assertEqual([o.quantity for o in result.limit_orders], [1, 2])
++                        self.assertEqual((result.cycles[0].buy_quantity, result.cycles[0].buy_cost), (3, 5985000))
++                        records = v5_lot_limit_marker_records(result, (10, 11, 12))
++                        self.assertEqual([(r["evaluation_index"], r["quantity"]) for r in records if r["side"] == "BUY"],
++                                         [(10, 1), (11, 2)])
++                        self.assertEqual([(r["evaluation_index"], r["quantity"]) for r in records if r["side"] == "SELL"],
++                                         [(12, 3)])
++                        self.assertEqual(policy, original)
++
+     def test_cycle_summary_waits_for_configured_sell_signal(self):
+         import ast
+         from indicator_follow_signal_validation_v5_limit import v5_signal_execution_policy
