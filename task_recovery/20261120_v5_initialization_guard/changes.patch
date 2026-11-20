@@ -1,0 +1,100 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_window.py b/gui_indicator_follow_signal_validation_v5_window.py
+index 861c781..6f264f2 100644
+--- a/gui_indicator_follow_signal_validation_v5_window.py
++++ b/gui_indicator_follow_signal_validation_v5_window.py
+@@ -17053,7 +17053,9 @@ class IndicatorFollowSignalValidationV5Window(
+ 
+     def _on_validation_range_liquidation_changed(self, *_args) -> None:
+         self._refresh_validation_range_results(refresh_tooltips=False)
+-        self.canvas.set_marker_records(self._chart_marker_records())
++        canvas = getattr(self, "canvas", None)
++        if canvas is not None:
++            canvas.set_marker_records(self._chart_marker_records())
+ 
+     def _on_regular_session_marking_changed(self, checked: bool) -> None:
+         self._v5_regular_session_marking_only = bool(checked)
+diff --git a/tests/test_indicator_follow_signal_validation_v5_baseline.py b/tests/test_indicator_follow_signal_validation_v5_baseline.py
+index 8aab1e5..37f2938 100644
+--- a/tests/test_indicator_follow_signal_validation_v5_baseline.py
++++ b/tests/test_indicator_follow_signal_validation_v5_baseline.py
+@@ -98,6 +98,43 @@ def test_v5_virtual_price_badge_is_one_toggle_left_of_filter(case):
+         select.assert_called_once_with("OHLC4")
+ 
+ 
++@pytest.mark.parametrize("canvas_lifecycle", ["never_created", "cleared"])
++def test_v5_retained_ohlc4_restore_finishes_without_canvas(case, canvas_lifecycle):
++    from indicator_follow_signal_validation_preferences import (
++        IndicatorFollowSignalValidationPreferenceStore,
++    )
++
++    window = window_for(case)
++    assert not hasattr(window, "canvas")
++    if canvas_lifecycle == "cleared":
++        install(window, candles(5))
++        window._clear_validation_result("offline regression")
++        assert window.canvas is None
++    values = {}
++    store = IndicatorFollowSignalValidationPreferenceStore(settings=SimpleNamespace(
++        value=values.get, setValue=values.__setitem__,
++    ))
++    store.save_retained_settings({
++        "enabled": True,
++        "ui_state": window.collect_indicator_follow_ui_state(),
++        "display": {"virtual_price_basis": "OHLC4", "range_liquidation": True},
++    })
++    window.result_summary_label.setText("stale results")
++
++    window.set_validation_preferences_store(store)
++
++    assert window.validation_virtual_price_badge.text() == "평균"
++    assert window.validation_virtual_price_badge.isChecked()
++    assert window.validation_range_liquidation_check.isChecked()
++    assert window.validation_settings_keep_check.isChecked()
++    assert window.result_summary_label.text() != "stale results"
++    assert window.completed_cycles == ()
++    if canvas_lifecycle == "never_created":
++        assert not hasattr(window, "canvas")
++    else:
++        assert window.canvas is None
++
++
+ def test_v5_filter_mode_badge_cycles_all_valid_hidden(case):
+     window = window_for(case)
+     badge = window.filter_display_mode_badge
+@@ -2402,6 +2439,36 @@ def test_v5_executed_arrow_render_stack_hit_and_clipping(case, side, executed, c
+     assert canvas.marker_records() == markers
+ 
+ 
++def test_v5_canvas_republishes_execution_markers_on_price_and_liquidation_changes(case):
++    from tests.test_v5_lot_limit_execution import candles as price_candles
++
++    rows = price_candles([100, 110, 120, 130, 140])
++    rows[0].update(open=80, high=120, low=60)
++    window = _stop_display_window(
++        case, rows, (("BUY", 0), ("SELL", 2), ("BUY", 3)), {},
++    )
++    canvas = window.canvas
++    with patch.object(window_module.QTimer, "singleShot"):
++        for basis, buy_price in (("OHLC4", 90), ("CLOSE", 100)):
++            window._select_virtual_fill_price_basis(basis)
++            for liquidate in (True, False):
++                window.validation_range_liquidation_check.setChecked(liquidate)
++                records = canvas.marker_records()
++                ordinary = [r for r in records if r.get("ordinary_execution_fills")]
++                assert [(r["evaluation_index"], r["side"]) for r in ordinary] == [
++                    (0, "BUY"), (2, "SELL"), (3, "BUY"),
++                ]
++                assert [(f.price, f.quantity) for r in ordinary
++                        for f in r["ordinary_execution_fills"]] == [
++                    (buy_price, 1), (120, 1), (130, 1),
++                ]
++                assert canvas._liquidation_marker_records() == (
++                    [{"evaluation_index": 4, "side": "SELL", "virtual_liquidation": True}]
++                    if liquidate else []
++                )
++                assert len(window.completed_cycles) == (2 if liquidate else 1)
++
++
+ def test_v5_executed_arrow_label_cache_republication_and_reprojection(case):
+     from tests.test_v5_lot_limit_execution import candles as price_candles
+     rows = price_candles([100, 100, 100, 100, 90, 90, 110])
