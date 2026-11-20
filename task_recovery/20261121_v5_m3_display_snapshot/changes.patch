@@ -1,0 +1,167 @@
+--- a/gui_indicator_follow_signal_validation_v5_flow.py
++++ b/gui_indicator_follow_signal_validation_v5_flow.py
+@@ -17412,9 +17412,16 @@
+                 separators=(",", ":"), allow_nan=False,
+             ).encode("utf-8")).hexdigest())
+         direct_m1_receipt = self._direct_m1_cache_receipt(result, candles)
++        preserve_received_m3 = (
++            session.request.timeframe_key == result.snapshot.timeframe_key == "M3"
++            and result.snapshot.market_source == "INTEGRATED"
++            and result.snapshot.market_data_identity == f"{session.request.stock.code}_AL"
++            and getattr(session, "source_selection", None) is not None
++            and direct_query is not None
++        )
+         pool = self._pool_from_candles(
+             persistence_session,
+-            candles,
++            selected_candles if preserve_received_m3 else candles,
+             requested_count=requested_count,
+             request_id=result.snapshot.request_id,
+             market_data_identity=result.snapshot.market_data_identity,
+@@ -17454,17 +17461,25 @@
+         _v5_m5_entry_stamp(session, "source_snapshot_end")
+         if not history_browse and not incomplete_source_refresh:
+             _v5_m5_entry_stamp(session, "cache_persist_start")
++            storage_candles = pool["candles"]
++            storage_query = pool.get("direct_selected_query")
++            if preserve_received_m3:
++                # Memory keeps the received prefix; disk keeps its bounded content/proof.
++                storage_candles = candles
++                if storage_candles != selected_candles:
++                    storage_query = {key: value for key, value in storage_query.items()
++                                     if key != "terminal_history_receipt"}
+             self._persist_history(
+                 persistence_session.request.stock,
+                 persistence_session.request.timeframe_minutes,
+                 result.snapshot.timeframe_key,
+                 requested_count,
+-                pool["candles"],
++                storage_candles,
+                 market_data_identity=result.snapshot.market_data_identity,
+                 market_source=result.snapshot.market_source,
+                 direct_m1_receipt=direct_m1_receipt,
+                 native_source_receipt=pool.get("native_minute_receipt"),
+-                direct_selected_query=pool.get("direct_selected_query"),
++                direct_selected_query=storage_query,
+                 prior_verified_completed_count=prior_verified_completed_count,
+                 source_selection=getattr(persistence_session, "source_selection", None),
+             )
+--- a/tests/test_v5_tr_snapshot_freeze_20261111.py
++++ b/tests/test_v5_tr_snapshot_freeze_20261111.py
+@@ -53,7 +53,7 @@
+         return started
+     monkeypatch.setattr(c.flow._broker, "request_minute_candles_display_only_integrated", request)
+ 
+-    def start(key="M3", *, candles=None, as_of=None, seed=None):
++    def start(key="M3", *, candles=None, as_of=None, seed=None, delay_seconds=1):
+         from PyQt5.QtCore import QSignalBlocker
+         from indicator_follow_signal_validation_projection import IndicatorFollowSignalValidationRunRequest
+         with patch.object(v5.QTimer, "singleShot"):
+@@ -78,7 +78,7 @@
+             rows = [dict(time=(at - timedelta(days=2-i)).strftime("%Y%m%d%H%M%S"),
+                          open=100., high=102., low=99., close=100. + i / 2, volume=10. + i)
+                     for i in range(3)]
+-        c.clock[0] += timedelta(seconds=1)
++        c.clock[0] += timedelta(seconds=delay_seconds)
+         response = dict(call["started"], type="period_candles" if period else "minute_candles",
+             request_id=call["started"]["rqname"],
+             trcode={"D1": "opt10081", "W1": "opt10082", "MO1": "opt10083", "Y1": "opt10094"}.get(key, "opt10080"),
+@@ -103,6 +103,98 @@
+         return payloads.pop()
+ 
+     return SimpleNamespace(c=c, start=start, run=run, jobs=jobs, payloads=payloads)
++
++
++@pytest.fixture(autouse=True)
++def isolated_snapshot_state(no_external_effects, monkeypatch, tmp_path):
++    """Keep preferences and unconditional diagnostics isolated through teardown."""
++    import indicator_follow_signal_validation_preferences as preferences
++    import indicator_follow_signal_validation_runtime_trace as trace
++    values = {}
++    monkeypatch.setattr(preferences, "_default_settings", lambda: SimpleNamespace(
++        value=lambda key, default=None: values.get(key, default),
++        setValue=values.__setitem__, sync=lambda: None))
++    monkeypatch.setattr(trace, "_TRACE_PATH", tmp_path / "runtime_trace.jsonl")
++
++
++@pytest.mark.parametrize("forming,delay_seconds", [(False, 1), (True, 185)],
++                         ids=["5901-completed", "5900-plus-forming-delayed"])
++def test_integrated_m3_received_display_freeze_range_alignment(
++        supplied_projection, monkeypatch, tmp_path, forming, delay_seconds):
++    from pathlib import Path
++    from indicator_follow_signal_validation_historical_cache import (
++        IndicatorFollowSignalValidationHistoricalCache,
++    )
++    h = supplied_projection
++    c, f = h.c, h.c.flow
++    as_of = datetime.fromisoformat("2026-10-30T11:44:00+09:00")
++    at = as_of.replace(minute=42 if forming else 39)
++    stamps = []
++    while len(stamps) < 5901:
++        if at.weekday() < 5 and (9, 0) <= (at.hour, at.minute) <= (15, 15):
++            stamps.append(at.strftime("%Y%m%d%H%M%S"))
++        at -= timedelta(minutes=3)
++    rows = [dict(time=t, open=100., high=103., low=99., close=101., volume=10.)
++            for t in reversed(stamps)]
++    rows[-1].update(open=201., high=205., low=198., close=203., volume=37.)
++    seed = v5.IndicatorFollowSignalValidationSeed(v5.ValidationSettingsSnapshot({
++        "bar": {"bar_minutes": 3}, "validation_timeframe": {"key": "M3"},
++    }), {})
++    cache = IndicatorFollowSignalValidationHistoricalCache(tmp_path / "history")
++    monkeypatch.setattr(f, "_historical_cache", cache)
++    # Exercise the real cache content/sidecar writer, under the isolated root.
++    persisted = []
++    def persist(*args, **kwargs):
++        persisted.append((deepcopy(args), deepcopy(kwargs)))
++        return type(f)._persist_history(f, *args, **kwargs)
++    monkeypatch.setattr(f, "_persist_history", persist)
++    w, received = h.start(candles=rows, as_of=as_of, seed=seed,
++                          delay_seconds=delay_seconds)
++    expected = deepcopy(rows)  # Never derive the display expectation from the pool.
++    assert received == expected and w._calculation_candles == expected
++    assert len(w._candles) == 5000
++    f._on_signal_scan_completed(h.run())
++    assert w._normal_base_ready
++    session, pool = f._validation_sessions[id(w)], f._historical_pools[id(w)]
++    frozen = deepcopy(f._v5_tr_snapshots[pool["_v5_tr_snapshot"]])
++    c.clock[0] += timedelta(minutes=10)
++    ranges = []
++    monkeypatch.setattr(f, "_emit_range_replay_completed", ranges.append)
++    w._set_validation_range(4995, 4999)
++    with _frozen_source_plan() as root, patch("routine_signal_probe.PROJECT_ROOT", root):
++        f._run_cached_range_replay(w, 4995, 4999)
++        assert len(h.jobs) == 1
++        h.jobs.pop()()
++    assert len(ranges) == 1
++    assert not ranges[0].get("error"), ranges[0].get("error")
++    assert ranges[0]["snapshot"].to_candles() == expected
++    f._on_range_replay_completed(ranges.pop())
++    assert w._range_replay_entries_available
++    assert f._direct_tr_snapshot(session, pool)["candles"] == expected
++    assert pool["candles"] == (expected[:-1] if forming else expected)
++    assert w._calculation_candles == expected
++    assert f._v5_tr_snapshots[pool["_v5_tr_snapshot"]] == frozen
++    assert len(c.calls) == 1 and not h.jobs
++    assert c.calls[0]["options"]["count"] == 5900
++    assert len(persisted) == 1
++    args, kwargs = persisted[0]
++    stored = expected[:-1] if forming else expected[-5900:]
++    assert args[3] == 5900 and args[4] == stored
++    path = cache.path_for(c.stock.code, 3, 5900, "M3", market_data_identity="005930_AL")
++    document = json.loads(path.read_text(encoding="utf-8"))
++    marker = json.loads(Path(str(path) + ".market-source.json").read_text(encoding="utf-8"))
++    assert document["candles"] == stored and len(document["candles"]) == 5900
++    assert marker["candle_content_sha256"] == f._marking_revision_candle_identity(stored)
++    assert marker["direct_selected_query"] == kwargs["direct_selected_query"]
++    assert f._direct_selected_query_valid(marker["direct_selected_query"], c.stock,
++                                         "M3", 3, "005930_AL", stored)
++    assert marker["direct_selected_query"]["request_id"] == pool["request_id"]
++    terminal = marker["direct_selected_query"].get("terminal_history_receipt")
++    if terminal:
++        assert json.loads(terminal)["completed_content_sha256"] == marker["candle_content_sha256"]
++    if forming:
++        assert pool["selected_direct_forming_snapshot"]["candle"] == expected[-1]
++        assert w._calculation_candles[-1] == expected[-1]
+ 
+ 
+ @pytest.mark.parametrize("key", ["M1", "M3", "M5", "M10", "M15", "M30", "M60", "M120", "M240",

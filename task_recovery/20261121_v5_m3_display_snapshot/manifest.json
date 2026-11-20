@@ -1,0 +1,88 @@
+{
+  "task": "V5 verified integrated M3 original received-list preservation",
+  "artifact_kind": "Exact approved two-file delta only; not a runnable full checkout or full backup",
+  "recorded_at_kst": "2026-11-21T02:09:20.785136+09:00",
+  "files": [
+    {
+      "path": "gui_indicator_follow_signal_validation_v5_flow.py",
+      "before_sha256": "5D0D22F5652201E1B04084F9DD7947D201D7C288D512A6B3A6CC4DDCFD1E8554",
+      "after_sha256": "C6882F8155A62F0243755D44FC28FC4B8E56BEC13C6F705150D234C5E5780068",
+      "after_bytes": 1015010,
+      "source_mtime_ns": 1795193335606261600,
+      "added_lines": 18,
+      "removed_lines": 3,
+      "patch_reconstructs_exact_bytes": true
+    },
+    {
+      "path": "tests/test_v5_tr_snapshot_freeze_20261111.py",
+      "before_sha256": "C69AF8FB07708D154440E713B14E650F10E577170CD05BE9D11B0732B692CD65",
+      "after_sha256": "98CB0847A1F4FB3A733EB3BC4B9F9300EDCBD4DA64A51045C0A84CE23D704909",
+      "after_bytes": 164746,
+      "source_mtime_ns": 1795193296430508800,
+      "added_lines": 94,
+      "removed_lines": 2,
+      "patch_reconstructs_exact_bytes": true
+    }
+  ],
+  "protected": [
+    {
+      "path": "gui_indicator_follow_signal_validation_v5_window.py",
+      "expected_sha256": "C788A2D5AD392639A39FC6C3FDD884F403678F5A01A693061B247BB4C6B80EAB",
+      "actual_sha256": "C788A2D5AD392639A39FC6C3FDD884F403678F5A01A693061B247BB4C6B80EAB",
+      "unchanged": true
+    },
+    {
+      "path": "indicator_follow_signal_validation_execution.py",
+      "expected_sha256": "76DC89FFD3B82489F9668FE71B63A378A2FD091E014B95550352853ED508C161",
+      "actual_sha256": "76DC89FFD3B82489F9668FE71B63A378A2FD091E014B95550352853ED508C161",
+      "unchanged": true
+    },
+    {
+      "path": "indicator_follow_signal_validation_v5_limit.py",
+      "expected_sha256": "379F4122DC20BE716F81F197F6894D3D3CA8F0FF63995A90C87FD6BD13DC4E8F",
+      "actual_sha256": "379F4122DC20BE716F81F197F6894D3D3CA8F0FF63995A90C87FD6BD13DC4E8F",
+      "unchanged": true
+    },
+    {
+      "path": "buy_execution_policy.py",
+      "expected_sha256": "55A40FE7BF8DA412F2D9FA986462DD52400F7E3DF5969949FECCEC372FDCB6A8",
+      "actual_sha256": "55A40FE7BF8DA412F2D9FA986462DD52400F7E3DF5969949FECCEC372FDCB6A8",
+      "unchanged": true
+    },
+    {
+      "path": "indicator_follow_signal_validation_historical_cache.py",
+      "expected_sha256": "0E954F24D7666259EA8215BD66A1DBDFCFE27E7C5ED920A53E185782CA57BE29",
+      "actual_sha256": "0E954F24D7666259EA8215BD66A1DBDFCFE27E7C5ED920A53E185782CA57BE29",
+      "unchanged": true
+    },
+    {
+      "path": "tests/test_v5_lot_limit_execution.py",
+      "expected_sha256": "AEB763842FE9B208622338AC239DA6260324494730A0F761C38E91C89367D95F",
+      "actual_sha256": "AEB763842FE9B208622338AC239DA6260324494730A0F761C38E91C89367D95F",
+      "unchanged": true
+    },
+    {
+      "path": "tests/test_v5_lot_limit_ui.py",
+      "expected_sha256": "C7F287B6FEEF98F012C85C1A63332021E32B081044BA34EBD4A318C04AF9B1EB",
+      "actual_sha256": "C7F287B6FEEF98F012C85C1A63332021E32B081044BA34EBD4A318C04AF9B1EB",
+      "unchanged": true
+    }
+  ],
+  "patch_sha256": "B0165EF0ABCAD8B504ABFB4A54F0A190050B377CB824308CA30F9A126FEDA42B",
+  "base_head": "75296031aec709ef032e329db5c5af27a5d928e8",
+  "base_branch": "feat/restore-auto-trade-setting-ui",
+  "normal_index_sha256": "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+  "verification": {
+    "red": "1 failed original DISPLAYED_CALCULATION_CHANGED + 1 passed existing forming control; exit 1",
+    "green": "34 passed in 18.71s; exit 0",
+    "red_log_sha256": "3B95845C7DEAA3597E4DD7426B9E3EC37ECB93307EB0EA37DAF30FBA11CE604D",
+    "green_log_sha256": "EF3FF8D2D70B1810FB04BC7EDE569BE62929EE497E865CB439B6D94367C3C350",
+    "technical_audit": "Code/spec C0/I0; conditional pass with runtime-preservation HOLD",
+    "terminal_receipt_truncation_branch": "Static review only; no terminal exhaustion receipt in new fixture",
+    "live_m3_gui": "Pending approved restart and live verification",
+    "ini": "3 -> 5 observed with same live PID M5 transition; actor unconfirmed; not restored"
+  },
+  "checkpoint_authority": "Standing Workflow sections 10/12 DC-owned limited recovery policy; not an expansion of Codex Sol Git authority",
+  "concrete_recovery_need": "The current original HEAD does not represent the working baseline and 916 existing WIP status entries must not be staged/reset. Preserve the already-mutated, tested two-file before-relative delta with exact before/after identities as an isolated recovery boundary before live application verification. Entire application completion and environment invariance are not claimed.",
+  "restore_requirement": "Exact local before copies identified by before_sha256 are required to apply this delta faithfully"
+}
