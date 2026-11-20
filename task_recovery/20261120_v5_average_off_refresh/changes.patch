@@ -1,0 +1,288 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_window.py b/gui_indicator_follow_signal_validation_v5_window.py
+index 6f264f2..035780d 100644
+--- a/gui_indicator_follow_signal_validation_v5_window.py
++++ b/gui_indicator_follow_signal_validation_v5_window.py
+@@ -11294,6 +11294,15 @@ class IndicatorFollowSignalValidationV5Window(
+         projected = project_signal_validation_ui_state(ui_state)
+         # Timeframe changes already invalidate and reload the chart separately.
+         projected.get("basic", {}).pop("basic_signal_interval_combo", None)
++        execution = projected.get("validation_execution", {})
++        if execution.get("enabled") is False:
++            # Inactive averaging drafts are saved but do not change the chart.
++            for key in (
++                "first_buy_quantity", "repeat_mode", "round_operator",
++                "round_budget_value", "budget_ratio", "active_direction",
++                "active_ratio", "active_compare",
++            ):
++                execution.pop(key, None)
+         canonical = json.dumps(
+             projected,
+             ensure_ascii=False,
+diff --git a/tests/test_v5_chart_stabilization_20261027.py b/tests/test_v5_chart_stabilization_20261027.py
+index 381ef45..45d481f 100644
+--- a/tests/test_v5_chart_stabilization_20261027.py
++++ b/tests/test_v5_chart_stabilization_20261027.py
+@@ -357,10 +357,10 @@ def test_regular_toggle_preserves_unconfirmed_signal_or_execution_draft(market_w
+     window._begin_validation_range_drag(2)
+     window._complete_validation_range_drag(2, 6)
+ 
+-    assert invalidated == [True]
++    assert invalidated == ([] if draft == "execution" else [True])
+     assert ranges == [(2, 6)]
+     assert window.validation_range == (2, 6)
+-    assert window._confirmed_signal_ui_fingerprint != baseline
++    assert (window._confirmed_signal_ui_fingerprint == baseline) == (draft == "execution")
+ 
+ 
+ def test_regular_toggle_projection_failure_keeps_baseline_and_existing_cleanup(
+@@ -1311,9 +1311,14 @@ def test_entry_commit_does_not_acknowledge_later_edits(transition_window, edit):
+         assert len(marks) == 1
+     else:
+         assert window._flush_pending_signal_validation_ui_confirmation()
+-        assert window._validated_ui_fingerprint is None
+-        assert not window.marking_display_check.isChecked()
+-        assert window._confirmed_signal_ui_fingerprint != baseline
++        if edit == "execution":
++            assert window._validated_ui_fingerprint == "completed-validation"
++            assert window.marking_display_check.isChecked()
++            assert window._confirmed_signal_ui_fingerprint == baseline
++        else:
++            assert window._validated_ui_fingerprint is None
++            assert not window.marking_display_check.isChecked()
++            assert window._confirmed_signal_ui_fingerprint != baseline
+         assert len(marks) == 1
+ 
+ 
+@@ -1394,7 +1399,7 @@ def test_entry_commit_dependency_failure_preserves_original_baseline(
+     window.validation_first_buy_quantity_line.setText("7")
+     window._validated_ui_fingerprint = "completed-validation"
+     assert window._flush_pending_signal_validation_ui_confirmation()
+-    assert window._validated_ui_fingerprint is None
++    assert window._validated_ui_fingerprint == "completed-validation"
+     window.marking_display_check.click()
+     assert window.marking_display_check.isChecked()
+     assert len(marks) == 1
+@@ -1435,6 +1440,223 @@ def test_v5_policy_toggle_replays_frozen_range_without_native_tr(handler, has_fr
+         assert calls == [("tr", {"normal_base": True, "preserve_chart": True})]
+ 
+ 
++@pytest.fixture
++def inactive_averaging_window(case):
++    from copy import deepcopy
++    from indicator_follow_signal_validation_preferences import (
++        IndicatorFollowSignalValidationPreferenceStore,
++    )
++    from tests.test_indicator_follow_signal_validation_v5_baseline import (
++        _stop_display_window,
++    )
++    from tests.test_v5_lot_limit_execution import candles as price_candles
++
++    window = _stop_display_window(
++        case, price_candles([100, 110, 120, 130, 140]),
++        (("BUY", 0), ("SELL", 2), ("BUY", 3)), {},
++    )
++    values = {}
++    store = IndicatorFollowSignalValidationPreferenceStore(settings=SimpleNamespace(
++        value=values.get, setValue=values.__setitem__,
++    ))
++    store.save({
++        "averaging_enabled": False, "first_buy_quantity": "1",
++        "repeat_mode": "회차기준", "round_operator": "+", "round_value": "0.5",
++        "budget_ratio": "2", "active_direction": "상향", "active_ratio": "0.45",
++        "active_compare": "이상", "trading_cost_enabled": False,
++        "trading_cost_percent": "0.2",
++    })
++    window.set_validation_preferences_store(store)
++    window._restore_validation_preferences(store.load())
++    window.commit_entry_state()
++    window._on_validation_range_liquidation_changed()
++    window._validated_ui_fingerprint = "completed-validation"
++    window._set_time_view(0, 3, manually_adjusted=True)
++    window._apply_pan_chart_target(("price", 80.0, 160.0))
++    window._range_filter_edit_replay_timer.stop()
++    canvas = window.canvas
++    snapshot = lambda: deepcopy((
++        window._candles, window._calculation_candles, canvas.marker_records(),
++        window.completed_cycles, window.validation_range, window._validation_range_times,
++        window.visible_start_index, window.visible_candle_span, canvas.price_scale(),
++        window.estimated_return_label.text(), window.result_summary_label.text(),
++        [[window.completed_cycle_table.item(row, col).text()
++          if window.completed_cycle_table.item(row, col) else None
++          for col in range(window.completed_cycle_table.columnCount())]
++         for row in range(window.completed_cycle_table.rowCount())],
++        window._range_replay_entries, window._range_replay_settings_snapshot,
++        window._marking_generation, window._visualization_projection_generation,
++    ))
++    assert [(f.price, f.quantity) for record in canvas.marker_records()
++            for f in record.get("ordinary_execution_fills", ())] == [
++        (100, 1), (120, 1), (130, 1),
++    ]
++    assert window.completed_cycles[0].sell_index == 2
++    assert window.validation_range == (0, 4)
++    work = []
++    window.validation_range_evaluation_requested.connect(
++        lambda a, b: work.append(("range", a, b)))
++    window.validation_run_requested.connect(lambda request: work.append(("quote", request)))
++    window.historical_extension_requested.connect(lambda: work.append("history"))
++    window.chart_input_invalidated.connect(lambda: work.append("invalidated"))
++    flow = _flow()
++    window.validation_settings_confirmed.connect(
++        lambda: flow._resume_supplied_normal_base_prepare(window))
++    return window, store, snapshot, work, flow
++
++
++@pytest.mark.parametrize("confirmation", ["focus_out", "enter"])
++@pytest.mark.parametrize("control_name,save_key,edited,saved", [
++    ("first_buy_quantity_line", "first_buy_quantity", "7", "7"),
++    ("repeat_mode_combo", "repeat_mode", "예산기준", "예산기준"),
++    ("round_operator_combo", "round_operator", "x", "x"),
++    ("round_budget_line", "round_value", "3", "3.0"),
++    ("budget_ratio_line", "budget_ratio", "4", "4.0"),
++    ("active_direction_combo", "active_direction", "하향", "하향"),
++    ("active_ratio_line", "active_ratio", "0.7", "0.7"),
++    ("active_compare_combo", "active_compare", "이하", "이하"),
++])
++def test_inactive_averaging_confirmation_preserves_chart_and_saves_draft(
++        inactive_averaging_window, confirmation, control_name, save_key, edited, saved):
++    from PyQt5.QtGui import QFocusEvent, QKeyEvent
++
++    window, store, snapshot, work, flow = inactive_averaging_window
++    before = snapshot()
++    canvas = window.canvas
++    control = getattr(window, "validation_" + control_name)
++    if hasattr(control, "isReadOnly"):
++        assert not control.isReadOnly()
++        original = control.text()
++        edit = control.setText
++    else:
++        assert control.isEnabled()
++        original = control.currentText()
++        edit = control.setCurrentText
++    # Repeated edits and equal-state confirmations must not leave a suppression latch.
++    for value, expected in ((edited, saved), (original, store.load()[save_key]),
++                            (edited, saved)):
++        edit(value)
++        assert store.load()[save_key] == expected
++        for _ in range(2):
++            event = (QFocusEvent(QEvent.FocusOut) if confirmation == "focus_out" else
++                     QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier))
++            QApplication.sendEvent(control, event)
++            assert window._signal_ui_confirmation_queued
++            QApplication.processEvents()
++            QTest.qWait(220)
++            assert window.canvas is canvas
++            assert snapshot() == before
++            assert window._validated_ui_fingerprint == "completed-validation"
++            assert not window._range_filter_edit_replay_timer.isActive()
++            assert work == []
++            assert not flow._prepare_active and not flow._prepare_pending
++
++
++@pytest.mark.parametrize("independent", ["cost", "buy", "sell"])
++def test_inactive_averaging_draft_does_not_hide_independent_change(
++        inactive_averaging_window, independent):
++    window, store, snapshot, work, _flow_instance = inactive_averaging_window
++    before = snapshot()
++    window.validation_first_buy_quantity_line.setText("7")
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    assert snapshot() == before
++    window.validation_first_buy_quantity_line.setText("11")
++    if independent == "cost":
++        window.validation_trading_cost_percent_line.setText("0.35")
++    elif independent == "buy":
++        window.buy_signal_expr_line.setText("A or D")
++    else:
++        window.sell_signal_expr_line.setText("A or B")
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    QTest.qWait(220)
++    assert snapshot() != before
++    assert window._validated_ui_fingerprint is None
++    assert ("range", 0, 4) in work
++    assert store.load()["first_buy_quantity"] == "11"
++    assert not any(isinstance(item, tuple) and item[0] == "quote" for item in work)
++
++
++def test_inactive_averaging_saved_quantity_applies_on_enable_and_off_transition(
++        inactive_averaging_window):
++    from copy import deepcopy
++
++    window, store, _snapshot_state, work, _flow_instance = inactive_averaging_window
++    entries = deepcopy(window._range_replay_entries)
++    window.validation_first_buy_quantity_line.setText("7")
++    window.validation_repeat_mode_combo.setCurrentText("예산기준")
++    window.validation_round_operator_combo.setCurrentText("x")
++    window.validation_round_budget_line.setText("3")
++    window.validation_budget_ratio_line.setText("4")
++    window.validation_active_direction_combo.setCurrentText("하향")
++    window.validation_active_ratio_line.setText("0.7")
++    window.validation_active_compare_combo.setCurrentText("이하")
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    assert store.load()["first_buy_quantity"] == "7"
++    window.validation_averaging_enabled_check.setChecked(True)
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    QTest.qWait(220)
++    assert ("range", 0, 4) in work
++    assert window.validation_first_buy_quantity_line.isReadOnly()
++    policy = window._marking_current_settings().to_dict()["validation_execution"]
++    assert policy["enabled"] is True and policy["first_buy_quantity"] == 7
++    assert policy["repeat_mode"] == "BUDGET"
++    assert policy["round_operator"] == "MULTIPLY" and policy["round_budget_value"] == 3
++    assert policy["budget_ratio"] == 4 and policy["active_direction"] == "DOWN"
++    assert policy["active_ratio"] == 0.7 and policy["active_compare"] == "<="
++    window._range_replay_settings_snapshot = ValidationSettingsSnapshot({
++        "validation_execution": policy,
++    })
++    # Supply the offline range result after the legitimate ON reevaluation request.
++    window._range_replay_entries_available = True
++    window._range_replay_entries = entries
++    window._populate_completed_cycles()
++    assert len(window.completed_cycles) == 1
++    assert window.completed_cycles[0].buy_quantity == 7
++    work.clear()
++    window.validation_averaging_enabled_check.setChecked(False)
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    QTest.qWait(220)
++    assert ("range", 0, 4) in work
++    assert not window.validation_first_buy_quantity_line.isReadOnly()
++    assert store.load()["first_buy_quantity"] == "7"
++
++
++@pytest.mark.parametrize("edit", [False, True], ids=["ordinary_equal", "off_draft"])
++def test_inactive_averaging_confirmation_allows_existing_pending_completion(
++        inactive_averaging_window, monkeypatch, edit):
++    window, _store, _snapshot_state, work, flow = inactive_averaging_window
++    key = id(window)
++    request = {"generation": 17, "token": object()}
++    flow._supplied_normal_base_waiting = {key: request}
++    completed = []
++    # Hold the asynchronous publication boundary; the real resume owns pending state.
++    monkeypatch.setattr(flow, "_on_signal_scan_completed", completed.append)
++    if edit:
++        window.validation_first_buy_quantity_line.setText("7")
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    assert key not in flow._supplied_normal_base_waiting
++    assert len(completed) == 1
++    assert completed[0]["generation"] == 17
++    assert completed[0]["retry_after_invalid"] is True
++    assert completed[0]["prepare_token"] is flow._prepare_active[key]
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    QTest.qWait(220)
++    assert len(completed) == 1
++    assert work == []
++
++
++def test_inactive_averaging_missing_initial_baseline_still_confirms_settings(
++        inactive_averaging_window):
++    window, _store, _snapshot_state, work, _flow_instance = inactive_averaging_window
++    window._confirmed_signal_ui_fingerprint = None
++    window.validation_first_buy_quantity_line.setText("7")
++    assert window._flush_pending_signal_validation_ui_confirmation()
++    QTest.qWait(220)
++    assert window._confirmed_signal_ui_fingerprint is not None
++    assert window._validated_ui_fingerprint is None
++    assert ("range", 0, 4) in work
++
++
+ def test_v5_virtual_fill_price_badge_switch_recalculates_without_tr():
+     from gui_indicator_follow_signal_validation_v5_window import (
+         IndicatorFollowSignalValidationV5Window,

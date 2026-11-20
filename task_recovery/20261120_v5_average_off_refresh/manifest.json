@@ -1,0 +1,25 @@
+{
+    "task":  "v5_average_management_off_refresh_20261120",
+    "repository_kind":  "code",
+    "base_head":  "75296031aec709ef032e329db5c5af27a5d928e8",
+    "created_kst":  "2026-11-20 22:34:51",
+    "scope":  "Exact task delta only; apply to the recorded preimage hashes, not blindly to HEAD",
+    "files":  [
+                  {
+                      "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                      "before_sha256":  "7FCBAAEC19CACA94186B5B03D978DCD11246982FD3967E93AE9716B2C4D40C8A",
+                      "after_sha256":  "C788A2D5AD392639A39FC6C3FDD884F403678F5A01A693061B247BB4C6B80EAB",
+                      "replay_sha256":  "C788A2D5AD392639A39FC6C3FDD884F403678F5A01A693061B247BB4C6B80EAB"
+                  },
+                  {
+                      "path":  "tests/test_v5_chart_stabilization_20261027.py",
+                      "before_sha256":  "1750E41B461B360E72D2138DF4BC5EBD4993FCEDC4DCD9BF5114A8CB34B2C6BD",
+                      "after_sha256":  "979941D6C4AFB558824E7F5ABD378A3371791648434FFD8B22107E7E1603007B",
+                      "replay_sha256":  "979941D6C4AFB558824E7F5ABD378A3371791648434FFD8B22107E7E1603007B"
+                  }
+              ],
+    "patch_sha256":  "1E0D93089E74071CBE04202975A9559B6EB7163533989B56AD812F3779DBCE6E",
+    "replay_verified":  true,
+    "new_full_restore_point":  false,
+    "live_source_modified_by_packaging":  false
+}
