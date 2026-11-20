@@ -1,0 +1,169 @@
+{
+    "status":  "DELTA_REPLAY_VERIFIED",
+    "repository":  "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto",
+    "remote":  "https://github.com/jinkwangchul/kiwoom_auto.git",
+    "branch":  "feat/restore-auto-trade-setting-ui",
+    "head":  "75296031aec709ef032e329db5c5af27a5d928e8",
+    "baseline":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_execution_20261120\\code_before",
+    "snapshot":  "C:\\kiwoom_restore_points\\snapshots\\20261120_043757_766441_1d5391",
+    "limitation":  "Delta only. Exact baseline file contents are local, not included remotely. This is not a runnable integrated implementation commit or a full device-loss backup.",
+    "restore":  "Use disposable copies of exact baseline files, preserve bytes and relative paths, apply changes.patch with git apply --binary --whitespace=nowarn, verify every afterSha256. Do not apply to unrelated HEAD or overwrite live working files automatically.",
+    "encoding":  "Raw UTF-8 patch without BOM; source byte encoding and line endings verified by replay SHA256.",
+    "originalIndexSha256":  "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+    "protected":  [
+                      {
+                          "path":  "gui_auto_trade_setting_window.py",
+                          "sha256":  "925CF9978F17DF7B1C113ED83B23C9E30146298B54BB57918CEDD920273A11F6",
+                          "unchanged":  true
+                      },
+                      {
+                          "path":  "gui_indicator_follow_routine_settings_dialog.py",
+                          "sha256":  "2B2AEBA73BD8E5B41DBAF2A7BAF1FAF42EE099D7003AF95250C0C9F1FAEDD97E",
+                          "unchanged":  true
+                      },
+                      {
+                          "path":  "tests/test_auto_trade_setting_routine_tree.py",
+                          "sha256":  "2D431232BB4E8190D5C987E4E18D0E493FFC227FB1A595EAD8525D882894D443",
+                          "unchanged":  true
+                      },
+                      {
+                          "path":  "tests/test_indicator_follow_settings_validation_on_commit.py",
+                          "sha256":  "811CBF7530A82D2325ACA63A92DAA2546BAFCB4563844B8B5035F61DCD6BE9A3",
+                          "unchanged":  true
+                      },
+                      {
+                          "path":  "indicator_follow_settings_compatibility.py",
+                          "sha256":  "4AC06AF44C51074A7B5A443F6749941C83A73E3BFDADF7662248EC3A81C1D401",
+                          "unchanged":  true
+                      },
+                      {
+                          "path":  "indicator_follow_signal_validation_projection.py",
+                          "sha256":  "256581A3C6454F03EDABCAD58D6A4DEACA988CED14519B788065E330EB81CB19",
+                          "unchanged":  true
+                      }
+                  ],
+    "files":  [
+                  {
+                      "path":  "indicator_follow_signal_validation_v5_limit.py",
+                      "beforeSha256":  "A35C5EAB6F3EC3C37238E528498855F6691D8CA777C27407720AE26321E456FF",
+                      "afterSha256":  "5B676A436448EC8D3B1156D149A45F94B654097FA80823BD4EA2E20B56061FB8"
+                  },
+                  {
+                      "path":  "indicator_follow_signal_validation_execution.py",
+                      "beforeSha256":  "FF60351DB42C03AE547EB3CE244054F8AB7230100EC91D80A92DF51CA2A53F5A",
+                      "afterSha256":  "8A091BDE7DD8FACAC67F531A9FD1146E3D7255B8B28E9FE93AD007A05275EFCE"
+                  },
+                  {
+                      "path":  "routines/지표추종매매/routine_validation_replay.py",
+                      "beforeSha256":  "6E3679D31253801059A7F45270D01972622C6BA1A9D2752377E29862E6DA3594",
+                      "afterSha256":  "D2FDBCB7D29B6A1F2DDBBB81801A94AC326DDEA5AC229340F53A0C3596D6BB3E"
+                  },
+                  {
+                      "path":  "gui_indicator_follow_signal_validation_v5_flow.py",
+                      "beforeSha256":  "3D050387658AF886E5EF9BC094662315A965DAD2F12BE1C7B84D29768B1B382E",
+                      "afterSha256":  "5D0D22F5652201E1B04084F9DD7947D201D7C288D512A6B3A6CC4DDCFD1E8554"
+                  },
+                  {
+                      "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                      "beforeSha256":  "332EE5F7CED16EE73308C035AB6D33C4CEF80D8CFB81F4040329C15ABD36BD70",
+                      "afterSha256":  "AA1AD274E3543A014A875E8EFDEC48CE30C249588690DE1BD99F107AC85A736B"
+                  },
+                  {
+                      "path":  "routines/지표추종매매/routine_macd_engine.py",
+                      "beforeSha256":  "5B49ED554B99458AEE6251F9B4E2E5619458CEDEDC388F6531E6B82ABDBA622C",
+                      "afterSha256":  "CE6574D3B3F37225B6B006408853B2F5AED89E3783A26B29C42079942AE6CD02"
+                  },
+                  {
+                      "path":  "tests/test_v5_lot_limit_execution.py",
+                      "beforeSha256":  "A71DAD7130772766EC6E0D3266FDACE7FA75BAC21DE6056AAED7B28BDDB4C503",
+                      "afterSha256":  "181E50488E89074EE5A79F4DD21FAB07ADB6205D4A3823AB6D3F75615469EAC1"
+                  },
+                  {
+                      "path":  "tests/test_indicator_follow_validation_replay.py",
+                      "beforeSha256":  "87B7F0F4B39CE6F961278846635971F23AF78F13419B1E14DB461BF7C1463BD3",
+                      "afterSha256":  "85668FE72FBA1319B3CA91C484C2296D4F426F589B5FF67D667F21DD3757E98D"
+                  },
+                  {
+                      "path":  "tests/test_indicator_follow_signal_validation_execution.py",
+                      "beforeSha256":  "4A9BBE090123F987018A7E19BA95BE28183E8DAA92C1D45A24EE8A136F2159E0",
+                      "afterSha256":  "96224559A2883946DAC42627F345602E42C93506CCC09081845B57735E299D08"
+                  }
+              ],
+    "verification":  {
+                         "scope":  "Approved V5 virtual stop-loss implementation only. Not full-program readiness, live GUI, TR, account, or actual-order validation.",
+                         "authorSession":  "01a1f747-c246-7241-8453-c92dd084da6d",
+                         "finalWriter":  {
+                                             "pid":  61236,
+                                             "exitCode":  0,
+                                             "runtimeSeconds":  244.71,
+                                             "change":  "Only replay test:86 added lines,0removed. Six source files,six protected files,two other tests unchanged."
+                                         },
+                         "runtime":  "Python311-32; offscreen; bytecode and plugin autoload disabled; pytest cache provider disabled",
+                         "finalFocused":  {
+                                              "passed":  20,
+                                              "subtestsPassed":  14,
+                                              "deselected":  135,
+                                              "seconds":  5.21,
+                                              "exitCode":  0,
+                                              "tests":  "Existing19 focused cases plus invalid Stoch threshold event/lock regression"
+                                          },
+                         "directRegression":  {
+                                                  "passed":  1,
+                                                  "subtestsPassed":  7,
+                                                  "exitCode":  0,
+                                                  "oldEngineExpectedRed":  "Seven False is not None assertion failures; verified old engine loaded only in process memory, no project overwrite",
+                                                  "oldEngineSha256":  "C3B804441AF7ED72E874C4CB75C5B2C8BF49833ED75A7D091943B4AA3AEEEE4D"
+                                              },
+                         "earlierThreeFileRun":  {
+                                                     "passed":  153,
+                                                     "failed":  1,
+                                                     "subtestsPassed":  392,
+                                                     "exitCode":  1,
+                                                     "seconds":  65.42,
+                                                     "qualification":  "Before test-only addition; same final six sources. Existing CURRENT_PRICE byte-equivalence failure independently reproduced in original baseline under the same current fixture. It remains a failure."
+                                                 },
+                         "earlierAdjacentRun":  {
+                                                    "passed":  298,
+                                                    "failed":  9,
+                                                    "subtestsPassed":  511,
+                                                    "exitCode":  1,
+                                                    "seconds":  83.71,
+                                                    "qualification":  "Existing parity failure plus eight baseline-source/current-fixture mismatches. Not an all-PASS run. Historical entire test environment was not restored."
+                                                },
+                         "independentPrimary":  {
+                                                    "session":  "01a1f71f-a2b1-7b22-a981-107a5fb4e564",
+                                                    "pid":  59228,
+                                                    "exitCode":  0,
+                                                    "finding":  "Current invalid-threshold correction confirmed statically; eight adjacent failures trace to incomplete fixture globals/methods/timeframe, not missing actual production imports/ownership."
+                                                },
+                         "independentStaticAudit":  {
+                                                        "critical":  0,
+                                                        "important":  0,
+                                                        "result":  "PASS for this exact source delta and final added regression",
+                                                        "testRerunByReviewer":  false
+                                                    },
+                         "independentScopeAudit":  "PASS limited to approved six sources and three existing tests; no whole-program/GUI/order certification",
+                         "preservation":  {
+                                              "baselinePythonFiles":  2600,
+                                              "currentPythonFiles":  2600,
+                                              "modifiedPythonFiles":  9,
+                                              "outOfScope":  0,
+                                              "settingsUnchanged":  true,
+                                              "protectedFilesUnchanged":  6,
+                                              "realIndexUnchanged":  true,
+                                              "scopeScanSha256":  "E46756A14AC93730E725D1C6BB9B82C8D4202B0FC09EEFFD651AE52CAB76C8E9"
+                                          },
+                         "evidenceRoot":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_execution_20261120",
+                         "rawEvidence":  [
+                                             "initial_three_file_test_evidence.txt",
+                                             "baseline_parity_astra_analysis.txt",
+                                             "compatibility_initial_evidence.txt",
+                                             "pre_review_three_file_verification.txt",
+                                             "astra_review_and_fixture_classification.txt",
+                                             "implementation_before_edge_test_report.txt",
+                                             "invalid_stoch_red_green_evidence.txt",
+                                             "test_only_completion.txt",
+                                             "final_source_scope_scan_v2.json"
+                                         ]
+                     }
+}

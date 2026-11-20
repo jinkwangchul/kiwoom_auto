@@ -1,0 +1,1623 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_flow.py b/gui_indicator_follow_signal_validation_v5_flow.py
+index cf13b67..b1dd4b5 100644
+--- a/gui_indicator_follow_signal_validation_v5_flow.py
++++ b/gui_indicator_follow_signal_validation_v5_flow.py
+@@ -74,7 +74,9 @@ from gui_indicator_follow_signal_validation_v5_window import (
+     prepare_signal_validation_presentation,
+ )
+ from indicator_follow_signal_validation_execution import ValidationVirtualPositionTracker
+-from indicator_follow_signal_validation_v5_limit import v5_signal_execution_policy
++from indicator_follow_signal_validation_v5_limit import (
++    v5_signal_execution_policy, V5ValidationPositionTracker, BUY_CONDITION_PROTOCOL,
++)
+ from indicator_follow_backtest_parity import (
+     candle_projection_parity_report,
+     compare_signal_replay_entries,
+@@ -5659,6 +5661,14 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+     ) -> object:
+         rules = session.request.settings_snapshot.to_dict()
+         execution_policy = rules.get("validation_execution")
++        if isinstance(execution_policy, dict) and execution_policy.get("_v5_stop_config", {}).get("enabled") is True:
++            policy = dict(v5_signal_execution_policy(execution_policy))
++            policy["_v5_execution_timeframe_key"] = session.request.timeframe_key
++            basis = policy.get("_v5_stop_price_basis", "CLOSE")
++            policy["virtual_fill_price_basis"] = basis
++            tracker_type = (_V5M5VirtualPositionTracker if session.request.timeframe_key == "M5"
++                            else V5ValidationPositionTracker)
++            return tracker_type(policy, stop_config=policy["_v5_stop_config"], stop_price_basis=basis)
+         return (
+             (_V5M5VirtualPositionTracker if session.request.timeframe_key == "M5"
+              else ValidationVirtualPositionTracker)(v5_signal_execution_policy(execution_policy))
+@@ -9678,6 +9688,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+             dropped_raw_rows_count=snapshot.dropped_raw_rows_count,
+             candles=snapshot.to_candles(),
+             entries=snapshot.to_entries(),
++            buy_condition_events=snapshot.buy_condition_events,
++            buy_condition_protocol=snapshot.buy_condition_protocol,
+         )
+ 
+     @classmethod
+@@ -10047,6 +10059,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+         )
+         if (
+             isinstance(cached_cost_replay, ValidationReplaySnapshot)
++            and not (rules.get("validation_execution", {}).get("_v5_stop_config", {}).get("enabled") is True
++                     and (cached_cost_replay.buy_condition_protocol != BUY_CONDITION_PROTOCOL
++                          or [event["evaluation_index"] for event in cached_cost_replay.buy_condition_events]
++                          != list(range(cached_start, cached_end + 1))))
+             and cached_cost_replay.settings_hash
+             != session.request.settings_snapshot.rules_hash
+             and cached_cost_replay.stock == session.request.stock
+@@ -10233,6 +10249,7 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+         indexes = _v5_regular_marking_indexes(candles, session.request.timeframe_key)
+         selected = [local for local, index in enumerate(indexes) if start <= index <= end]
+         entries = []
++        buy_condition_events = []
+         dropped = 0
+         if cancel_predicate is not None and cancel_predicate():
+             raise ValueError("VALIDATION_REPLAY_CANCELLED")
+@@ -10260,6 +10277,10 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+             if not isinstance(result, ValidationReplayResult) or not result.ok or result.snapshot is None:
+                 raise ValueError(self._failure_text("REPLAY", result))
+             dropped = result.snapshot.dropped_raw_rows_count
++            buy_condition_events = [{**event,
++                "evaluation_index": indexes[event["evaluation_index"]],
++                "signal_index": None if event["signal_index"] is None else indexes[event["signal_index"]],
++            } for event in result.snapshot.buy_condition_events]
+             entries = [entry.remap_indexes(
+                 indexes[entry.evaluation_index],
+                 None if entry.signal_index is None else indexes[entry.signal_index],
+@@ -10274,6 +10295,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+             evaluated_start_index=start, evaluated_end_index=end,
+             dropped_raw_rows_count=dropped,
+             candles=candles, entries=entries,
++            buy_condition_events=buy_condition_events,
++            buy_condition_protocol=(result.snapshot.buy_condition_protocol if selected else ""),
+         ))
+ 
+     @staticmethod
+@@ -10291,6 +10314,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+             dropped_raw_rows_count=snapshot.dropped_raw_rows_count,
+             candles=snapshot.to_candles(),
+             entries=snapshot.to_entries(),
++            buy_condition_events=snapshot.buy_condition_events,
++            buy_condition_protocol=snapshot.buy_condition_protocol,
+         )
+ 
+     def _run_filter_valid_evidence(
+@@ -14061,6 +14086,9 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+                 )
+                 else None
+             )
++            if session.request.settings_snapshot.to_dict().get("validation_execution", {}).get("_v5_stop_config", {}).get("enabled") is True:
++                # Eventless scans cannot establish restart state; rebuild from this frozen view.
++                signal_entries = None
+             cost_prefix = self._trading_cost_reuse_prefix(session, view_pool)
+             cost_scan_key = (
+                 cost_prefix + (active_signal_signature,)
+@@ -14076,6 +14104,8 @@ class IndicatorFollowSignalValidationV5Flow(QObject):
+                 and cached_cost_scan[1] != settings_hash
+             ):
+                 signal_entries = cached_cost_scan[2]
++            if session.request.settings_snapshot.to_dict().get("validation_execution", {}).get("_v5_stop_config", {}).get("enabled") is True:
++                signal_entries = None
+             return (view_pool, historical_snapshot, active_signal_signature,
+                     tuple(signal_entries) if signal_entries is not None else None,
+                     cost_scan_key)
+diff --git a/gui_indicator_follow_signal_validation_v5_window.py b/gui_indicator_follow_signal_validation_v5_window.py
+index 243afd2..453e2c3 100644
+--- a/gui_indicator_follow_signal_validation_v5_window.py
++++ b/gui_indicator_follow_signal_validation_v5_window.py
+@@ -86,6 +86,7 @@ from indicator_follow_signal_validation_v5_limit import (
+     project_v5_lot_limit_rules,
+     v5_lot_limit_marker_records,
+     v5_signal_execution_policy,
++    V5ValidationPositionTracker,
+ )
+ from indicator_follow_signal_validation_presentation import (
+     canonical_validation_condition_key,
+@@ -193,7 +194,7 @@ def _v5_m5_nontradable_candle(candle):
+     return str(candle.get("time") or "").endswith("153500")
+ 
+ 
+-class _V5M5VirtualPositionTracker(ValidationVirtualPositionTracker):
++class _V5M5VirtualPositionTracker(V5ValidationPositionTracker):
+     """Keep the native calculation axis while excluding closing-price executions."""
+ 
+     def _touch_limits(self, index, candle):
+@@ -216,7 +217,12 @@ class _V5M5VirtualPositionTracker(ValidationVirtualPositionTracker):
+ 
+ def simulate_validation_execution(candles, entries, policy=None, *, force_liquidation_at_end=False):
+     if isinstance(policy, Mapping) and policy.get("_v5_execution_timeframe_key") == "M5":
+-        tracker = _V5M5VirtualPositionTracker(policy)
++        tracker = _V5M5VirtualPositionTracker(
++            policy, stop_config=policy.get("_v5_stop_config"),
++            stop_price_basis=policy.get("_v5_stop_price_basis", policy.get("virtual_fill_price_basis", "CLOSE")),
++            eligible_indices=policy.get("_v5_execution_eligible_indices"),
++            buy_condition_events=policy.get("_v5_buy_condition_events", ()),
++            buy_condition_candles=policy.get("_v5_buy_condition_candles"))
+         tracker._v5_virtual_fill_prices = _v5_cross_fill_prices(candles, entries, policy)
+         return tracker.finalize(candles, entries, force_liquidation_at_end=force_liquidation_at_end)
+     return _simulate_v5_validation_execution(
+@@ -12907,6 +12913,8 @@ class IndicatorFollowSignalValidationV5Window(
+         return build_signal_validation_snapshot(
+             preview["preview_rules"], ui_state=ui_state,
+             instrument_type=getattr(self, "_v5_limit_instrument_type", "STOCK"),
++            stop_price_basis=getattr(self, "_v5_virtual_fill_price_basis", "CLOSE"),
++            regular_only=getattr(self, "_v5_regular_session_marking_only", False),
+         )
+ 
+ 
+@@ -13776,6 +13784,8 @@ class IndicatorFollowSignalValidationV5Window(
+                 preview_rules,
+                 ui_state=ui_state,
+                 instrument_type=getattr(self, "_v5_limit_instrument_type", "STOCK"),
++                stop_price_basis=getattr(self, "_v5_virtual_fill_price_basis", "CLOSE"),
++                regular_only=getattr(self, "_v5_regular_session_marking_only", False),
+             )
+             run_request = IndicatorFollowSignalValidationRunRequest(
+                 snapshot,
+@@ -16394,6 +16404,8 @@ class IndicatorFollowSignalValidationV5Window(
+         self._range_replay_calculation_entries = list(calculation_entries)
+         self._range_replay_entries = list(chart_entries)
+         self._range_replay_settings_snapshot = settings_snapshot
++        self._range_replay_buy_condition_events = replay_snapshot.buy_condition_events
++        self._range_replay_stop_snapshot = replay_snapshot
+         self._range_replay_entries_available = True
+         self._range_replay_revalidation_pending = False
+         if self._normal_base_requested and self._normal_base_ready and self._replay_snapshot is None:
+@@ -16808,13 +16820,86 @@ class IndicatorFollowSignalValidationV5Window(
+                     if getattr(self, "_range_replay_entries_available", False)
+                     else getattr(self, "_result_settings_snapshot", None))
+         if snapshot is not None:
+-            policy["_v5_execution_rules"] = snapshot.to_dict()
++            rules = snapshot.to_dict()
++            policy["_v5_execution_rules"] = rules
++            frozen_policy = rules.get("validation_execution", {})
++            if frozen_policy.get("_v5_stop_config", {}).get("enabled") is True:
++                policy.update({key: deepcopy(value) for key, value in frozen_policy.items()
++                               if key.startswith("_v5_stop_")})
++                events = (getattr(self, "_range_replay_buy_condition_events", ())
++                          if getattr(self, "_range_replay_entries_available", False)
++                          else self._replay_snapshot.buy_condition_events if self._replay_snapshot else ())
++                policy["_v5_buy_condition_events"] = deepcopy(events)
++                event_snapshot = (getattr(self, "_range_replay_stop_snapshot", None)
++                                  if getattr(self, "_range_replay_entries_available", False)
++                                  else self._replay_snapshot)
++                policy["_v5_buy_condition_candles"] = event_snapshot.to_candles() if event_snapshot else []
+             policy["_v5_execution_source_candles"] = getattr(self, "_calculation_candles", ())
+         policy.pop("virtual_fill_price_basis", None)
+         if getattr(self, "_v5_virtual_fill_price_basis", "CLOSE") == "OHLC4":
+             policy["virtual_fill_price_basis"] = "OHLC4"
+         return policy
+ 
++    def _rebuild_v5_stop_from_frozen(self, settings_snapshot):
++        """Price mode changes replay the owned native snapshot, without a requester."""
++        from routines.지표추종매매.routine_validation_contract import ValidationRequest
++        from routines.지표추종매매.routine_validation_session import ValidationSession
++        from routines.지표추종매매.routine_validation_historical import ValidationHistoricalSnapshot
++        from routines.지표추종매매.routine_validation_replay import ValidationHistoricalReplay
++        from gui_indicator_follow_signal_validation_v5_flow import (
++            IndicatorFollowSignalValidationV5Flow, _V5M5HistoricalReplay)
++        is_range = getattr(self, "_range_replay_entries_available", False)
++        source = (getattr(self, "_range_replay_stop_snapshot", None) if is_range
++                  else getattr(self, "_replay_snapshot", None))
++        if source is None:
++            return
++        rules = settings_snapshot.to_dict()
++        policy = rules.setdefault("validation_execution", {})
++        policy["_v5_stop_price_basis"] = self._v5_virtual_fill_price_basis
++        policy["_v5_stop_regular_only"] = getattr(self, "_v5_regular_session_marking_only", False)
++        settings = ValidationSettingsSnapshot(rules)
++        session = ValidationSession(ValidationRequest(source.stock, settings, source.timeframe_minutes))
++        candles = source.to_candles()
++        indexes = (_v5_regular_marking_indexes(candles, source.timeframe_key)
++                   if is_range and getattr(self, "_v5_regular_session_marking_only", False)
++                   else tuple(range(len(candles))))
++        selected = [local for local, index in enumerate(indexes)
++                    if source.evaluated_start_index <= index <= source.evaluated_end_index]
++        if not selected:
++            return
++        replay_candles = [dict(candles[index]) for index in indexes]
++        historical = ValidationHistoricalSnapshot(
++            stock=source.stock, timeframe_minutes=source.timeframe_minutes,
++            timeframe_key=source.timeframe_key, requested_count=len(candles),
++            request_id=source.historical_request_id or "FROZEN",
++            rows=IndicatorFollowSignalValidationV5Flow._historical_rows_from_candles(replay_candles))
++        replay_type = _V5M5HistoricalReplay if source.timeframe_key == "M5" else ValidationHistoricalReplay
++        result = replay_type(session, readiness_safe=True).evaluate_with_context(
++            historical,
++            context_provider=IndicatorFollowSignalValidationV5Flow._context_provider_for_session(session),
++            start_index=selected[0], end_index=selected[-1], projected_candles_override=replay_candles)
++        if not result.ok or result.snapshot is None:
++            raise ValueError(result.error or result.reason or "V5_STOP_FROZEN_REPLAY_FAILED")
++        rebuilt = result.snapshot
++        if len(indexes) != len(candles):
++            rebuilt = ValidationReplaySnapshot(
++                stock=source.stock, timeframe_minutes=source.timeframe_minutes, timeframe_key=source.timeframe_key,
++                settings_hash=settings.rules_hash, historical_request_id=source.historical_request_id,
++                evaluated_start_index=source.evaluated_start_index, evaluated_end_index=source.evaluated_end_index,
++                dropped_raw_rows_count=source.dropped_raw_rows_count, candles=candles,
++                entries=[entry.remap_indexes(indexes[entry.evaluation_index],
++                         None if entry.signal_index is None else indexes[entry.signal_index])
++                         for entry in rebuilt.to_entries()],
++                buy_condition_events=[{**event, "evaluation_index": indexes[event["evaluation_index"]],
++                    "signal_index": None if event["signal_index"] is None else indexes[event["signal_index"]]}
++                    for event in rebuilt.buy_condition_events],
++                buy_condition_protocol=rebuilt.buy_condition_protocol)
++        if is_range:
++            self.apply_range_replay_snapshot(rebuilt, settings_snapshot=settings)
++        else:
++            self._result_settings_snapshot = settings
++            self.set_replay_snapshot(rebuilt, reuse_canvas=True)
++
+     def _select_virtual_fill_price_basis(self, price_basis: str) -> None:
+         selected = "OHLC4" if price_basis == "OHLC4" else "CLOSE"
+         previous = getattr(self, "_v5_virtual_fill_price_basis", "CLOSE")
+@@ -16828,6 +16913,14 @@ class IndicatorFollowSignalValidationV5Window(
+             else "가상 매수·매도가: (시가+고가+저가+종가)/4"
+         )
+         if selected != previous:
++            snapshot = (getattr(self, "_range_replay_settings_snapshot", None)
++                        if getattr(self, "_range_replay_entries_available", False)
++                        else getattr(self, "_result_settings_snapshot", None))
++            if (snapshot is not None and snapshot.to_dict().get("validation_execution", {})
++                    .get("_v5_stop_config", {}).get("enabled") is True):
++                self._signal_tooltip_provenance = None
++                self._rebuild_v5_stop_from_frozen(snapshot)
++                return
+             # Reprice the existing range without fetching or changing signals.
+             self._signal_tooltip_provenance = None
+             self._on_validation_range_liquidation_changed()
+@@ -16844,6 +16937,14 @@ class IndicatorFollowSignalValidationV5Window(
+         self._v5_regular_session_marking_only = bool(checked)
+         if self._effective_validation_range() is None:
+             return
++        snapshot = (getattr(self, "_range_replay_settings_snapshot", None)
++                    if getattr(self, "_range_replay_entries_available", False)
++                    else getattr(self, "_result_settings_snapshot", None))
++        if (snapshot is not None and snapshot.to_dict().get("validation_execution", {})
++                .get("_v5_stop_config", {}).get("enabled") is True):
++            self._rebuild_v5_stop_from_frozen(snapshot)
++            self._refresh_marking_projection()
++            return
+         self._signal_tooltip_provenance = None
+         self._refresh_validation_range_results()
+         self._refresh_marking_projection()
+diff --git a/indicator_follow_signal_validation_execution.py b/indicator_follow_signal_validation_execution.py
+index 95c2aca..cefaf7b 100644
+--- a/indicator_follow_signal_validation_execution.py
++++ b/indicator_follow_signal_validation_execution.py
+@@ -490,6 +490,7 @@ class ValidationVirtualPositionTracker:
+         fill_price: float,
+         *,
+         is_liquidation: bool = False,
++        close_reason: str | None = None,
+     ) -> None:
+         if self.policy.get("lot_limit_enabled"):
+             if self.holding_quantity > 0:
+@@ -497,7 +498,7 @@ class ValidationVirtualPositionTracker:
+                 self.fills.append(ValidationVirtualFill(
+                     "SELL", index, str(candle.get("time") or ""), fill_price,
+                     self.holding_quantity, amount, None,
+-                    "RANGE_END_LIQUIDATION" if is_liquidation else "INDICATOR_RESIDUAL",
++                    close_reason or ("RANGE_END_LIQUIDATION" if is_liquidation else "INDICATOR_RESIDUAL"),
+                     sum(lot.buy_price * lot.quantity for lot in self._limit_lots),
+                 ))
+                 self._cycle_sell_amount += amount
+@@ -523,7 +524,7 @@ class ValidationVirtualPositionTracker:
+             self.fills.append(ValidationVirtualFill(
+                 "SELL", index, str(candle.get("time") or ""), fill_price,
+                 sell_quantity, sell_amount, None,
+-                "RANGE_END_LIQUIDATION" if is_liquidation else "SINGLE_HOGA",
++                close_reason or ("RANGE_END_LIQUIDATION" if is_liquidation else "SINGLE_HOGA"),
+             ))
+             self.cycles.append(ValidationVirtualCycle(
+                 len(self.cycles) + 1,
+diff --git a/indicator_follow_signal_validation_v5_limit.py b/indicator_follow_signal_validation_v5_limit.py
+index 20170fd..891f317 100644
+--- a/indicator_follow_signal_validation_v5_limit.py
++++ b/indicator_follow_signal_validation_v5_limit.py
+@@ -4,6 +4,117 @@ from copy import deepcopy
+ import math
+ 
+ from engines.condition_engine import parse_condition_expression
++from indicator_follow_signal_validation_execution import (
++    ValidationVirtualPositionTracker, validation_virtual_fill_price,
++)
++
++
++BUY_CONDITION_PROTOCOL = "V5_BUY_CONDITION_V1"
++
++
++def v5_stop_execution_metadata(rules, *, price_basis="CLOSE", regular_only=False):
++    state = rules.get("indicator_follow_ui_state", {}).get("state", {})
++    stop = state.get("sell_ui", {}).get("stop_loss", rules.get("sell", {}).get("stop_loss", {}))
++    if not isinstance(stop, dict) or stop.get("enabled") is not True:
++        return {}
++    return {"_v5_stop_config": deepcopy(stop), "_v5_stop_protocol": BUY_CONDITION_PROTOCOL,
++            "_v5_stop_price_basis": price_basis, "_v5_stop_regular_only": bool(regular_only)}
++
++
++class V5ValidationPositionTracker(ValidationVirtualPositionTracker):
++    """V5 virtual stop precheck and same-cycle latch, independent of BUY sizing."""
++
++    def __init__(self, policy=None, *, stop_config=None, stop_price_basis="CLOSE",
++                 eligible_indices=None, buy_condition_events=(), buy_condition_candles=None):
++        super().__init__(policy)
++        self.stop_config = deepcopy(stop_config or {})
++        self.stop_price_basis = stop_price_basis
++        self.stop_enabled = self.stop_config.get("enabled") is True
++        source = policy if isinstance(policy, dict) else {}
++        self._stop_regular_only = source.get("_v5_stop_regular_only") is True
++        self._stop_timeframe = str(source.get("_v5_execution_timeframe_key") or "")
++        self.eligible_indices = None if eligible_indices is None else frozenset(eligible_indices)
++        self.buy_condition_events = deepcopy(list(buy_condition_events or ()))
++        self._condition_candles = deepcopy(buy_condition_candles)
++        self._stop_prechecked_through = -1
++        self._stop_indexes = set()
++        self._stop_index = -1
++        self._condition_through = -1
++        self._restart_false_index = None
++        self._restart_state = None
++        self._condition_event_count = 0
++        self._condition_observed_through = -1
++        self._condition_by_time = {}
++
++    def observe_buy_condition(self, event):
++        if self.stop_enabled:
++            self.buy_condition_events.append(deepcopy(event))
++
++    def _stop_eligible(self, index, candle):
++        time = str(candle.get("time") or "")
++        if self._stop_timeframe == "M5" and time.endswith("153500"):
++            return False
++        if (self._stop_regular_only and self._stop_timeframe.startswith("M")
++                and self._stop_timeframe[1:].isdigit()
++                and (len(time) != 14 or not time.isdigit() or not "0900" <= time[8:12] < "1520")):
++            return False
++        return ((self.eligible_indices is None or index in self.eligible_indices)
++                and validation_virtual_fill_price(candle, price_basis=self.stop_price_basis) is not None)
++
++    def _touch_limits(self, index, candle):
++        if self.stop_enabled and index > self._stop_prechecked_through:
++            self._stop_prechecked_through = index
++            if self._stop_eligible(index, candle) and self.holding_quantity > 0:
++                from decimal import Decimal, InvalidOperation
++                from fractions import Fraction
++                price = validation_virtual_fill_price(candle, price_basis=self.stop_price_basis)
++                magnitude = self.stop_config.get("loss_percent")
++                try:
++                    loss = Decimal(str(magnitude))
++                    average = Decimal(str(self.average_buy_price))
++                    triggered = (not isinstance(magnitude, bool) and loss.is_finite()
++                                 and 0 < loss <= 100 and average.is_finite() and average > 0
++                                 and Fraction(Decimal(str(price))) <= Fraction(average) * (1 - Fraction(loss) / 100))
++                except (InvalidOperation, TypeError, ValueError, OverflowError):
++                    triggered = False
++                if triggered:
++                    self._close_position(index, candle, price, close_reason="STOP_LOSS")
++                    self._stop_indexes.add(index)
++                    self._stop_index = index
++                    self._restart_state = "WAIT_FALSE"
++                    self._restart_false_index = None
++        if index not in self._stop_indexes:
++            super()._touch_limits(index, candle)
++
++    def _apply_index(self, index, candles, entries, *, signals_by_index=None):
++        if not self.stop_enabled:
++            return super()._apply_index(index, candles, entries, signals_by_index=signals_by_index)
++        from routines.지표추종매매.routine_validation_replay import valid_buy_condition_event
++        self._touch_limits(index, candles[index])
++        if index in self._stop_indexes:
++            return
++        for event in self.buy_condition_events[self._condition_event_count:]:
++            if (valid_buy_condition_event(event, self._condition_candles if self._condition_candles is not None else candles)
++                    and event["evaluation_index"] > self._condition_observed_through):
++                self._condition_observed_through = event["evaluation_index"]
++                self._condition_by_time[event["evaluation_time"]] = event
++        self._condition_event_count = len(self.buy_condition_events)
++        event = self._condition_by_time.pop(str(candles[index].get("time") or ""), None)
++        if (event is not None and self._stop_eligible(index, candles[index])
++                and index > max(self._condition_through, self._stop_index)
++                and event.get("status") == "EVALUATED"):
++            self._condition_through = index
++            if self._restart_state == "WAIT_FALSE" and event["buy_result"] is False:
++                self._restart_state = "WAIT_TRUE"
++                self._restart_false_index = index
++            elif (self._restart_state == "WAIT_TRUE" and event["buy_result"] is True
++                  and index > self._restart_false_index):
++                self._restart_state = None
++        signals = (set(signals_by_index.get(index, ())) if signals_by_index is not None
++                   else self._signals_at(index, candles, entries))
++        if self._restart_state is not None:
++            signals.discard("BUY")
++        super()._apply_index(index, candles, entries, signals_by_index={index: signals})
+ 
+ 
+ def _v5_positive_expression_ids(node, values):
+@@ -125,9 +236,23 @@ def _v5_cross_fill_prices(candles, entries, policy):
+     return prices
+ 
+ 
+-def simulate_v5_validation_execution(candles, entries, policy=None, *, force_liquidation_at_end=False):
++def simulate_v5_validation_execution(candles, entries, policy=None, *, force_liquidation_at_end=False,
++                                     stop_config=None, stop_price_basis=None,
++                                     eligible_indices=None, buy_condition_events=None,
++                                     buy_condition_candles=None):
+     from indicator_follow_signal_validation_execution import simulate_validation_execution
+     overrides = _v5_cross_fill_prices(candles, entries, policy) if isinstance(policy, dict) else {}
++    metadata = policy if isinstance(policy, dict) else {}
++    frozen_stop = stop_config if stop_config is not None else metadata.get("_v5_stop_config", {})
++    if frozen_stop.get("enabled") is True:
++        tracker = V5ValidationPositionTracker(
++            policy, stop_config=frozen_stop,
++            stop_price_basis=stop_price_basis or metadata.get("_v5_stop_price_basis", metadata.get("virtual_fill_price_basis", "CLOSE")),
++            eligible_indices=eligible_indices if eligible_indices is not None else metadata.get("_v5_execution_eligible_indices"),
++            buy_condition_events=buy_condition_events if buy_condition_events is not None else metadata.get("_v5_buy_condition_events", ()),
++            buy_condition_candles=buy_condition_candles if buy_condition_candles is not None else metadata.get("_v5_buy_condition_candles"))
++        tracker._v5_virtual_fill_prices = overrides
++        return tracker.finalize(candles, entries, force_liquidation_at_end=force_liquidation_at_end)
+     return simulate_validation_execution(
+         candles, entries, policy, force_liquidation_at_end=force_liquidation_at_end,
+         v5_virtual_fill_prices=overrides or None)
+@@ -234,13 +359,18 @@ def project_v5_lot_limit_rules(rules, ui_state, *, instrument_type="STOCK"):
+     return projected
+ 
+ 
+-def build_v5_signal_validation_snapshot(rules, *, ui_state=None, instrument_type="STOCK"):
++def build_v5_signal_validation_snapshot(rules, *, ui_state=None, instrument_type="STOCK",
++                                        stop_price_basis="CLOSE", regular_only=False):
+     from indicator_follow_signal_validation_projection import project_signal_validation_rules
+     from routines.지표추종매매.routine_validation_contract import ValidationSettingsSnapshot
+ 
+     projected = project_signal_validation_rules(rules, ui_state=ui_state)
+     state = ui_state if ui_state is not None else projected["indicator_follow_ui_state"]["state"]
+-    return ValidationSettingsSnapshot(project_v5_lot_limit_rules(projected, state, instrument_type=instrument_type))
++    projected = project_v5_lot_limit_rules(projected, state, instrument_type=instrument_type)
++    metadata = v5_stop_execution_metadata(projected, price_basis=stop_price_basis, regular_only=regular_only)
++    if metadata:
++        projected.setdefault("validation_execution", {}).update(metadata)
++    return ValidationSettingsSnapshot(projected)
+ 
+ 
+ def v5_lot_limit_marker_records(simulation, indexes):
+diff --git "a/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_macd_engine.py" "b/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_macd_engine.py"
+index 24482f5..0c2198f 100644
+--- "a/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_macd_engine.py"
++++ "b/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_macd_engine.py"
+@@ -452,6 +452,8 @@ def _evaluate_buy_rsi_filter(
+     threshold = _safe_float(raw_threshold)
+ 
+     if period is None or period <= 0:
++        if _readiness is not None:
++            _readiness["_validation_invalid_rsi"] = True
+         return False, _rsi_detail(
+             enabled=True,
+             period=raw_period,
+@@ -463,6 +465,8 @@ def _evaluate_buy_rsi_filter(
+             evaluation_index=evaluation_index,
+         )
+     if threshold is None:
++        if _readiness is not None:
++            _readiness["_validation_invalid_rsi"] = True
+         return False, _rsi_detail(
+             enabled=True,
+             period=period,
+@@ -474,6 +478,8 @@ def _evaluate_buy_rsi_filter(
+             evaluation_index=evaluation_index,
+         )
+     if operator is None:
++        if _readiness is not None:
++            _readiness["_validation_invalid_rsi"] = True
+         return False, _rsi_detail(
+             enabled=True,
+             period=period,
+@@ -603,6 +609,8 @@ def _evaluate_buy_moving_average_filter(
+             evaluation_index=evaluation_index,
+         )
+     if period is None or period <= 0:
++        if _readiness is not None:
++            _readiness["_validation_invalid_moving_average"] = True
+         return False, _moving_average_detail(
+             enabled=True,
+             period=raw_period,
+@@ -614,6 +622,8 @@ def _evaluate_buy_moving_average_filter(
+             evaluation_index=evaluation_index,
+         )
+     if condition.get("target", "CLOSE") != "CLOSE" or condition.get("compare_target", "MA") != "MA":
++        if _readiness is not None:
++            _readiness["_validation_invalid_moving_average"] = True
+         return False, _moving_average_detail(
+             enabled=True,
+             period=period,
+@@ -746,6 +756,8 @@ def _evaluate_buy_price_compare_filter(
+ 
+     conditions = filter_cfg.get("conditions")
+     if not isinstance(conditions, list) or not conditions:
++        if _readiness is not None:
++            _readiness["_validation_invalid_price_compare"] = True
+         return False, _price_compare_detail(
+             enabled=True,
+             target=None,
+@@ -766,6 +778,8 @@ def _evaluate_buy_price_compare_filter(
+         compare_target = condition.get("compare_target")
+         operator = condition.get("operator")
+         if target not in BUY_STRATEGY_PRICE_AXES or compare_target not in BUY_STRATEGY_PRICE_AXES:
++            if _readiness is not None:
++                _readiness["_validation_invalid_price_compare"] = True
+             return False, _price_compare_detail(
+                 enabled=True,
+                 target=target,
+@@ -798,6 +812,8 @@ def _evaluate_buy_price_compare_filter(
+         condition_results.append((condition, result))
+ 
+     if not condition_results:
++        if _readiness is not None:
++            _readiness["_validation_invalid_price_compare"] = True
+         return False, _price_compare_detail(
+             enabled=True,
+             target=None,
+@@ -885,6 +901,8 @@ def _evaluate_buy_bollinger_filter(
+ 
+     conditions = filter_cfg.get("conditions")
+     if not isinstance(conditions, list) or not conditions:
++        if _readiness is not None:
++            _readiness["_validation_invalid_bollinger"] = True
+         return False, _bollinger_detail(
+             enabled=True,
+             operator=None,
+@@ -899,6 +917,8 @@ def _evaluate_buy_bollinger_filter(
+     # Process only the first condition (similar to other filters)
+     condition = conditions[0] if conditions else {}
+     if not isinstance(condition, dict):
++        if _readiness is not None:
++            _readiness["_validation_invalid_bollinger"] = True
+         return False, _bollinger_detail(
+             enabled=True,
+             operator=None,
+@@ -934,6 +954,8 @@ def _evaluate_buy_bollinger_filter(
+     if raw_period is not None:
+         period = _safe_int(raw_period)
+         if period is None or period <= 0:
++            if _readiness is not None:
++                _readiness["_validation_invalid_bollinger"] = True
+             return False, _bollinger_detail(
+                 enabled=True,
+                 operator=operator,
+@@ -947,6 +969,8 @@ def _evaluate_buy_bollinger_filter(
+ 
+     # Validate operator
+     if operator not in {">", ">=", "<", "<="}:
++        if _readiness is not None:
++            _readiness["_validation_invalid_bollinger"] = True
+         return False, _bollinger_detail(
+             enabled=True,
+             operator=operator,
+@@ -963,6 +987,8 @@ def _evaluate_buy_bollinger_filter(
+     if compare_target == "BOLLINGER":
+         compare_target = "BOLLINGER_LOWER"
+     if compare_target not in {"BOLLINGER_LOWER", "BOLLINGER_UPPER"}:
++        if _readiness is not None:
++            _readiness["_validation_invalid_bollinger"] = True
+         return False, _bollinger_detail(
+             enabled=True,
+             operator=operator,
+@@ -978,6 +1004,8 @@ def _evaluate_buy_bollinger_filter(
+     # Validate value (offset from the band must be numeric when supplied)
+     value = _safe_float(raw_value)
+     if raw_value is not None and value is None:
++        if _readiness is not None:
++            _readiness["_validation_invalid_bollinger"] = True
+         return False, _bollinger_detail(
+             enabled=True,
+             operator=operator,
+@@ -1188,6 +1216,8 @@ def _evaluate_buy_ocr_filter(
+ 
+     conditions = filter_cfg.get("conditions")
+     if not isinstance(conditions, list) or not conditions:
++        if _readiness is not None:
++            _readiness["_validation_invalid_ocr"] = True
+         return False, _ocr_detail(
+             enabled=True,
+             logic=logic,
+@@ -1200,6 +1230,8 @@ def _evaluate_buy_ocr_filter(
+     condition_details: list[str] = []
+     for condition_index, condition in enumerate(conditions):
+         if not isinstance(condition, dict):
++            if _readiness is not None:
++                _readiness["_validation_invalid_ocr"] = True
+             return False, _ocr_detail(
+                 enabled=True,
+                 logic=logic,
+@@ -1212,6 +1244,8 @@ def _evaluate_buy_ocr_filter(
+         runtime_condition.setdefault("target", "OSC")
+         error = _ocr_condition_error(runtime_condition, series_map, evaluation_index)
+         if error is not None and not (_readiness is not None and error == "insufficient_data"):
++            if _readiness is not None:
++                _readiness["_validation_invalid_ocr"] = True
+             condition_details.append(
+                 f"{runtime_condition.get('target')} {runtime_condition.get('operator')} reason={error}"
+             )
+@@ -1235,6 +1269,8 @@ def _evaluate_buy_ocr_filter(
+         condition_details.append(("PASS " if result.passed else "FAIL ") + result.detail)
+ 
+     if not condition_results:
++        if _readiness is not None:
++            _readiness["_validation_invalid_ocr"] = True
+         return False, _ocr_detail(
+             enabled=True,
+             logic=logic,
+@@ -1295,11 +1331,15 @@ def _evaluate_buy_macd_filter(
+         return True, None
+     conditions = cfg.get("conditions")
+     if not isinstance(conditions, list) or not conditions:
++        if _readiness is not None:
++            _readiness["_validation_invalid_macd"] = True
+         return False, "filter_type=MACD passed=False reason=missing_conditions"
+     passed = True
+     unavailable = False
+     for index, condition in enumerate(conditions):
+         if not isinstance(condition, dict):
++            if _readiness is not None:
++                _readiness["_validation_invalid_macd"] = True
+             return False, "filter_type=MACD passed=False reason=invalid_condition"
+         error = _ocr_condition_error(condition, series_map, evaluation_index)
+         if error is not None:
+@@ -1307,6 +1347,8 @@ def _evaluate_buy_macd_filter(
+                 unavailable = True
+             passed = False
+             if error != "insufficient_data" or _readiness is None:
++                if _readiness is not None:
++                    _readiness["_validation_invalid_macd"] = True
+                 return False, f"filter_type=MACD passed=False reason={error}"
+             continue
+         result = evaluate_condition(
+@@ -1363,6 +1405,8 @@ def _evaluate_buy_stoch_rsi_filter(buy_cfg, series_map, evaluation_index, *, _re
+     threshold = _safe_float(cfg.get("threshold", 20))
+     value = _series_value_at(series_map, "STOCH_RSI_D", evaluation_index)
+     available = value is not None and isfinite(value) and 0 <= value <= 100
++    if _readiness is not None and (threshold is None or not isfinite(threshold) or not 0 <= threshold <= 100):
++        _readiness["_validation_invalid_stoch_rsi"] = True
+     if not available and _readiness is not None:
+         _readiness["stoch_rsi"] = False
+     operator = str(cfg.get("operator", "<=")).strip()
+@@ -1494,12 +1538,44 @@ def _omit_buy_target_percent(expression_ast):
+     return {**expression_ast, "left": left, "right": right}
+ 
+ 
++def _buy_truth(values, logic="AND"):
++    values = list(values)
++    if not values:
++        return None
++    if logic == "AND":
++        return False if False in values else (True if all(v is True for v in values) else None)
++    return True if True in values else (False if all(v is False for v in values) else None)
++
++
++def _observe_validation_buy(callback, candles, signal_index, truth, status=None):
++    if not callable(callback):
++        return
++    source = signal_index if type(signal_index) is int and 0 <= signal_index < len(candles) else None
++    callback(dict(
++        evaluation_index=len(candles) - 1,
++        evaluation_time=str(candles[-1].get("time") or "") if candles else "",
++        signal_index=source,
++        signal_time=str(candles[source].get("time") or "") if source is not None else None,
++        status=status or ("EVALUATED" if type(truth) is bool else "UNAVAILABLE"),
++        buy_result=truth if type(truth) is bool else None,
++    ))
++
++
++def _validation_filter_truth(name, passed, readiness):
++    if readiness is None or readiness.get(name) is False or readiness.get("_validation_invalid_" + name):
++        return None
++    return bool(passed)
++
++
+ def _evaluate_buy_composite_filter(
+     composite_cfg: dict[str, Any],
+     filter_results: dict[str, dict[str, Any]],
+     *,
+     _readiness: dict | None = None,
++    _validation_truth: dict | None = None,
+ ) -> tuple[bool, str | None]:
++    if _validation_truth is not None:
++        _validation_truth["result"] = None
+     if not composite_cfg or not bool(composite_cfg.get("enabled", False)):
+         return True, None
+ 
+@@ -1566,6 +1642,17 @@ def _evaluate_buy_composite_filter(
+             expression_ast = _omit_buy_target_percent(expression_ast)
+             evaluated = (evaluate_condition_expression(expression_ast, values)
+                          if expression_ast is not None else {"ok": True, "passed": False})
++        if _validation_truth is not None and evaluated.get("ok"):
++            observed_values = {}
++            for key in values:
++                name = str(identifier_map.get(key) or "")
++                result = filter_results[name]
++                observed_values[key] = (None if name == "target_percent" and result.get("unavailable")
++                                       else _validation_filter_truth(name, result["passed"], _readiness))
++            observed = (evaluate_condition_expression(expression_ast, observed_values, current_identity="__CURRENT__")
++                        if expression_ast is not None else {"ok": False})
++            _validation_truth["result"] = (observed["passed"] if observed.get("ok")
++                                           and not observed.get("unavailable") else None)
+         passed = bool(evaluated.get("passed")) if evaluated.get("ok") else False
+         return passed, _composite_detail(
+             enabled=True,
+@@ -1617,6 +1704,7 @@ def _evaluate_buy_composite_filter(
+     referenced_filters: list[str] = []
+     group_passes: list[bool] = []
+     group_results: list[str] = []
++    observed_groups = []
+ 
+     for group_index, group in enumerate(groups):
+         if not isinstance(group, dict):
+@@ -1657,6 +1745,7 @@ def _evaluate_buy_composite_filter(
+ 
+         seen_in_group: set[str] = set()
+         active_filter_passes: list[bool] = []
++        observed_filters = []
+         group_tokens: list[str] = []
+         for raw_name in filters:
+             name = str(raw_name or "").strip().lower()
+@@ -1719,6 +1808,7 @@ def _evaluate_buy_composite_filter(
+                 continue
+             passed = bool(result.get("passed", False))
+             active_filter_passes.append(passed)
++            observed_filters.append(_validation_filter_truth(name, passed, _readiness))
+             group_tokens.append(f"{name}:{'PASS' if passed else 'FAIL'}")
+ 
+         if not active_filter_passes:
+@@ -1734,6 +1824,7 @@ def _evaluate_buy_composite_filter(
+ 
+         group_passed = all(active_filter_passes) if group_logic == "AND" else any(active_filter_passes)
+         group_passes.append(group_passed)
++        observed_groups.append(_buy_truth(observed_filters, group_logic))
+         group_results.append(f"group{group_index}:{group_logic}:{'PASS' if group_passed else 'FAIL'}:{','.join(group_tokens)}")
+ 
+     if not active_group_seen:
+@@ -1758,6 +1849,12 @@ def _evaluate_buy_composite_filter(
+     ]
+     unreferenced_passed = all(bool(filter_results[name].get("passed", False)) for name in unreferenced_required)
+     passed = composite_passed and unreferenced_passed
++    if _validation_truth is not None:
++        _validation_truth["result"] = _buy_truth([
++            _buy_truth(observed_groups, top_logic),
++            *(_validation_filter_truth(name, filter_results[name].get("passed"), _readiness)
++              for name in unreferenced_required),
++        ])
+     if passed:
+         reason = "matched"
+     elif not composite_passed:
+@@ -1814,6 +1911,7 @@ def _evaluate_buy_expression_mode(
+     observer: Any,
+     *,
+     readiness_safe: bool = False,
++    validation_buy_observer=None,
+ ) -> RoutineSignal:
+     readiness = {} if readiness_safe else None
+     filter_cfgs = _buy_filter_config_map(cfg, buy_cfg)
+@@ -1897,11 +1995,15 @@ def _evaluate_buy_expression_mode(
+     if target_percent_result["detail"]:
+         details.append(target_percent_result["detail"])
+ 
++    condition_truth = {} if callable(validation_buy_observer) else None
+     composite_passed, composite_detail = _evaluate_buy_composite_filter(
+         composite_cfg,
+         filter_results,
+         _readiness=readiness,
++        _validation_truth=condition_truth,
+     )
++    _observe_validation_buy(validation_buy_observer, candles, buy_index,
++                            condition_truth.get("result") if condition_truth is not None else None)
+     if composite_detail:
+         details.append(composite_detail)
+     if not composite_passed:
+@@ -2815,11 +2917,14 @@ def evaluate_indicator_follow_routine(
+     ).strip().upper() if isinstance(context, dict) else ""
+     if isinstance(context, dict) and isinstance(context.get("candles"), list):
+         candles = context["candles"]
++    buy_observer = context.get("_validation_buy_condition_observer") if isinstance(context, dict) else None
+ 
+     if not cfg.get("enabled", True):
++        _observe_validation_buy(buy_observer, candles, None, None, "UNEVALUATED")
+         return RoutineSignal(None, "루틴 비활성", [], [], -1, 0)
+ 
+     if not candles or (not readiness_safe and len(candles) < 3):
++        _observe_validation_buy(buy_observer, candles, None, None)
+         return RoutineSignal(None, "봉데이터 부족", [], [], -1, 0)
+ 
+     if _base_series_map is None:
+@@ -2926,6 +3031,7 @@ def evaluate_indicator_follow_routine(
+     })
+ 
+     if sell_passed and evaluate_side != "BUY":
++        _observe_validation_buy(buy_observer, candles, None, None, "UNEVALUATED")
+         matched = [
+             result.group_name
+             for signal_name in causal_condition_sell_names
+@@ -2955,6 +3061,7 @@ def evaluate_indicator_follow_routine(
+ 
+     buy_index = _delay_index(candles, buy_delay)
+     if readiness_safe and buy_index < 0:
++        _observe_validation_buy(buy_observer, candles, None, None)
+         return RoutineSignal(None, "매수 지연봉 데이터 부족", [], [], buy_index, buy_delay)
+     composite_cfg = _buy_composite_filter_config(cfg, buy_cfg)
+     if _is_buy_expression_mode(composite_cfg):
+@@ -2968,6 +3075,7 @@ def evaluate_indicator_follow_routine(
+             buy_delay,
+             observer,
+             readiness_safe=readiness_safe,
++            validation_buy_observer=buy_observer,
+         )
+ 
+     buy_groups = buy_cfg.get("groups", []) if isinstance(buy_cfg.get("groups"), list) else []
+@@ -3080,7 +3188,11 @@ def evaluate_indicator_follow_routine(
+                 "configured": bool(macd_cfg), "enabled": bool(macd_cfg.get("enabled", False)),
+                 "unavailable": bool(macd_detail and "reason=insufficient_data" in macd_detail),
+             }
+-            composite_passed, composite_detail = _evaluate_buy_composite_filter(composite_cfg, filter_results, _readiness=readiness)
++            condition_truth = {} if callable(buy_observer) else None
++            composite_passed, composite_detail = _evaluate_buy_composite_filter(
++                composite_cfg, filter_results, _readiness=readiness, _validation_truth=condition_truth)
++            _observe_validation_buy(buy_observer, candles, buy_index,
++                                    condition_truth.get("result") if condition_truth is not None else None)
+             if composite_detail:
+                 details.append(composite_detail)
+             if not composite_passed:
+@@ -3093,6 +3205,7 @@ def evaluate_indicator_follow_routine(
+         if rsi_detail:
+             details.append(rsi_detail)
+         if not rsi_passed:
++            _observe_validation_buy(buy_observer, candles, buy_index, _validation_filter_truth("rsi", rsi_passed, readiness))
+             return RoutineSignal(None, "BUY RSI filter blocked", matched, details, buy_index, buy_delay)
+         ma_passed, ma_detail = _evaluate_buy_moving_average_filter(
+             cfg, buy_cfg, series_map, buy_index, observer, _readiness=readiness
+@@ -3100,6 +3213,7 @@ def evaluate_indicator_follow_routine(
+         if ma_detail:
+             details.append(ma_detail)
+         if not ma_passed:
++            _observe_validation_buy(buy_observer, candles, buy_index, _validation_filter_truth("moving_average", ma_passed, readiness))
+             return RoutineSignal(None, "BUY moving average filter blocked", matched, details, buy_index, buy_delay)
+         price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(
+             cfg, buy_cfg, series_map, buy_index, observer, _readiness=readiness
+@@ -3107,11 +3221,13 @@ def evaluate_indicator_follow_routine(
+         if price_compare_detail:
+             details.append(price_compare_detail)
+         if not price_compare_passed:
++            _observe_validation_buy(buy_observer, candles, buy_index, _validation_filter_truth("price_compare", price_compare_passed, readiness))
+             return RoutineSignal(None, "BUY price compare filter blocked", matched, details, buy_index, buy_delay)
+         bollinger_passed, bollinger_detail = _evaluate_buy_bollinger_filter(cfg, buy_cfg, series_map, buy_index, _readiness=readiness)
+         if bollinger_detail:
+             details.append(bollinger_detail)
+         if not bollinger_passed:
++            _observe_validation_buy(buy_observer, candles, buy_index, _validation_filter_truth("bollinger", bollinger_passed, readiness))
+             return RoutineSignal(None, "BUY bollinger filter blocked", matched, details, buy_index, buy_delay)
+         ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(
+             cfg, buy_cfg, series_map, buy_index, observer, _readiness=readiness
+@@ -3119,6 +3235,7 @@ def evaluate_indicator_follow_routine(
+         if ocr_detail:
+             details.append(ocr_detail)
+         if not ocr_passed:
++            _observe_validation_buy(buy_observer, candles, buy_index, _validation_filter_truth("ocr", ocr_passed, readiness))
+             return RoutineSignal(None, "BUY OCR filter blocked", matched, details, buy_index, buy_delay)
+         # E always checks the current candle, independently of the BUY/OCR delay.
+         stoch_passed, stoch_detail = _evaluate_buy_stoch_rsi_filter(
+@@ -3127,9 +3244,12 @@ def evaluate_indicator_follow_routine(
+         if stoch_detail:
+             details.append(stoch_detail)
+         if not stoch_passed:
++            _observe_validation_buy(buy_observer, candles, buy_index, _validation_filter_truth("stoch_rsi", stoch_passed, readiness))
+             return RoutineSignal(None, "BUY Stochastic RSI filter blocked", matched, details, buy_index, buy_delay)
++        _observe_validation_buy(buy_observer, candles, buy_index, True)
+         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
+ 
++    _observe_validation_buy(buy_observer, candles, buy_index, condition_results_truth(buy_results, "OR"))
+     sell_results = [
+         result
+         for results in condition_sell_results.values()
+diff --git "a/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_validation_replay.py" "b/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_validation_replay.py"
+index fc226ba..4200e14 100644
+--- "a/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_validation_replay.py"
++++ "b/routines/\354\247\200\355\221\234\354\266\224\354\242\205\353\247\244\353\247\244/routine_validation_replay.py"
+@@ -650,6 +650,25 @@ class ValidationReplayEntry:
+         return clone
+ 
+ 
++def valid_buy_condition_event(event, candles):
++    if not isinstance(event, dict):
++        return False
++    index = event.get("evaluation_index")
++    source = event.get("signal_index")
++    if (type(index) is not int or not 0 <= index < len(candles)
++            or event.get("evaluation_time") != str(candles[index].get("time") or "")):
++        return False
++    if source is None:
++        if event.get("signal_time") is not None or event.get("status") == "EVALUATED":
++            return False
++    elif (type(source) is not int or not 0 <= source <= index
++          or event.get("signal_time") != str(candles[source].get("time") or "")):
++        return False
++    status, truth = event.get("status"), event.get("buy_result")
++    return ((status == "EVALUATED" and type(truth) is bool)
++            or (status in {"UNAVAILABLE", "INVALID", "UNEVALUATED"} and truth is None))
++
++
+ @dataclass(frozen=True, slots=True, init=False)
+ class ValidationReplaySnapshot:
+     stock: ValidationStockRef
+@@ -663,6 +682,8 @@ class ValidationReplaySnapshot:
+     dropped_raw_rows_count: int
+     _candles_json: str
+     _entries: tuple[ValidationReplayEntry, ...]
++    _buy_condition_events_json: str
++    buy_condition_protocol: str
+ 
+     def __init__(
+         self,
+@@ -677,6 +698,8 @@ class ValidationReplaySnapshot:
+         dropped_raw_rows_count: int,
+         candles: list[dict[str, Any]],
+         entries: list[ValidationReplayEntry],
++        buy_condition_events=(),
++        buy_condition_protocol="",
+     ) -> None:
+         if not isinstance(stock, ValidationStockRef):
+             raise TypeError("stock must be ValidationStockRef")
+@@ -697,6 +720,10 @@ class ValidationReplaySnapshot:
+ 
+         candles_json = _canonical_json(candles)
+         copied_entries = tuple(_copy_entry(entry) for entry in entries)
++        if any(not valid_buy_condition_event(event, candles) for event in buy_condition_events):
++            raise ValueError("invalid BUY condition event provenance")
++        object.__setattr__(self, "_buy_condition_events_json", _canonical_json(list(buy_condition_events)))
++        object.__setattr__(self, "buy_condition_protocol", str(buy_condition_protocol))
+         resolved_timeframe = normalize_validation_timeframe(
+             timeframe_key or timeframe_minutes,
+             fallback_minutes=timeframe_minutes,
+@@ -720,6 +747,10 @@ class ValidationReplaySnapshot:
+     def to_candles(self) -> list[dict[str, Any]]:
+         return _fresh_json(self._candles_json)
+ 
++    @property
++    def buy_condition_events(self):
++        return _fresh_json(self._buy_condition_events_json)
++
+     def to_entries(self) -> list[ValidationReplayEntry]:
+         return [_copy_entry(entry) for entry in self._entries]
+ 
+@@ -912,6 +943,10 @@ class ValidationHistoricalReplay:
+         rules = request.settings_snapshot.to_dict()
+         history_target_bars = _required_validation_history_context_bars(rules)
+         entries: list[ValidationReplayEntry] = []
++        buy_condition_events = []
++        observe_buy_condition = getattr(context_provider, "observe_buy_condition", None)
++        capture_buy_condition = (callable(observe_buy_condition)
++                                 and getattr(context_provider, "stop_enabled", True) is True)
+         reuse_default_base_series = self._evaluator is evaluate_indicator_follow_routine
+         # Never retain this on the replay/session or pass it to process workers.
+         bollinger_calculator = (
+@@ -1121,6 +1156,9 @@ class ValidationHistoricalReplay:
+                         )
+                         timing_add("context", context_started)
+                     evaluator_started = timing_start()
++                    condition_observations = []
++                    if capture_buy_condition and side == "BUY":
++                        context["_validation_buy_condition_observer"] = condition_observations.append
+                     if base_series_map is None:
+                         signal = self._evaluator(
+                             prefix
+@@ -1148,6 +1186,16 @@ class ValidationHistoricalReplay:
+                         )
+                     evaluator_calls += 1
+                     timing_add("evaluator", evaluator_started)
++                    if capture_buy_condition and side == "BUY":
++                        for raw_event in condition_observations:
++                            event = dict(raw_event)
++                            event["evaluation_index"] += history_index_offset
++                            if event.get("signal_index") is not None:
++                                event["signal_index"] += history_index_offset
++                            if not valid_buy_condition_event(event, candles):
++                                raise ValueError("invalid BUY condition event provenance")
++                            buy_condition_events.append(event)
++                            observe_buy_condition(_fresh_json(_canonical_json(event)))
+                     entry_started = timing_start()
+                     entries.append(
+                         self._entry_from_signal(
+@@ -1215,6 +1263,8 @@ class ValidationHistoricalReplay:
+                 dropped_raw_rows_count=dropped_count,
+                 candles=candles,
+                 entries=entries,
++                buy_condition_events=buy_condition_events,
++                buy_condition_protocol="V5_BUY_CONDITION_V1" if capture_buy_condition else "",
+             )
+             timing_add("snapshot", snapshot_started)
+         except (TypeError, ValueError, OverflowError) as exc:
+@@ -1285,7 +1335,8 @@ class ValidationHistoricalReplay:
+         if not self._valid_range(start_index, final_index, len(candles)):
+             raise ValueError("signal scan range is invalid")
+ 
+-        if self._readiness_safe:
++        if self._readiness_safe or (callable(getattr(context_provider, "observe_buy_condition", None))
++                                   and getattr(context_provider, "stop_enabled", True) is True):
+             # The legacy batch compiler is two-valued. Reuse the optimized
+             # detailed evaluator until batch can prove every operand ready;
+             # never skip a valid OR branch based on an unknown prediction.
+diff --git a/tests/test_indicator_follow_signal_validation_execution.py b/tests/test_indicator_follow_signal_validation_execution.py
+index 7623250..7603a0c 100644
+--- a/tests/test_indicator_follow_signal_validation_execution.py
++++ b/tests/test_indicator_follow_signal_validation_execution.py
+@@ -36,6 +36,220 @@ def _entry(side, index, candles):
+ 
+ 
+ class ValidationVirtualExecutionTest(unittest.TestCase):
++    @staticmethod
++    def _v5_stop_replay_fixture():
++        from routines.지표추종매매.routine_validation_contract import (
++            ValidationStockRef, ValidationSettingsSnapshot, ValidationRequest)
++        from routines.지표추종매매.routine_validation_session import ValidationSession
++        from routines.지표추종매매.routine_validation_historical import ValidationHistoricalSnapshot
++        from routines.지표추종매매.routine_validation_replay import ValidationHistoricalReplay
++        from gui_indicator_follow_signal_validation_v5_flow import IndicatorFollowSignalValidationV5Flow as Flow
++        rules = {"enabled": True, "bar": {"bar_minutes": 3}, "bar_minutes": 3,
++                 "macd": {"fast": 2, "slow": 3, "signal": 2},
++                 "buy": {"delay_bar": 1, "groups": [{"enabled": True, "conditions": [
++                     {"enabled": True, "target": "CLOSE", "operator": ">=", "value": 95}]}]},
++                 "sell": {"signals": {}},
++                 "validation_execution": {"_v5_stop_config": {"enabled": True, "loss_percent": 10},
++                     "enabled": True, "first_buy_quantity": 1, "repeat_mode": "ROUND",
++                     "round_operator": "MULTIPLY", "round_budget_value": 0,
++                     "_v5_stop_price_basis": "CLOSE", "_v5_stop_protocol": "V5_BUY_CONDITION_V1",
++                     "trading_cost_enabled": False, "trading_cost_percent": 0}}
++        rows = _candles([100, 100, 90, 90, 100, 100])
++        rows[2].update(open=100, high=100, low=90)
++        stock = ValidationStockRef("005930", "fixture")
++        settings = ValidationSettingsSnapshot(rules)
++        session = ValidationSession(ValidationRequest(stock, settings, 3))
++        historical = ValidationHistoricalSnapshot(stock=stock, timeframe_minutes=3,
++            requested_count=len(rows), request_id="FROZEN-STOP", rows=[])
++        result = ValidationHistoricalReplay(session, readiness_safe=True).evaluate_with_context(
++            historical, context_provider=Flow._context_provider_for_session(session),
++            projected_candles_override=rows)
++        if not result.ok:
++            raise AssertionError(result)
++        return rules, rows, settings, session, result.snapshot
++
++    def test_actual_window_price_change_replays_frozen_context_events_without_tr(self):
++        from copy import deepcopy
++        from types import MethodType
++        from gui_indicator_follow_signal_validation_v5_window import IndicatorFollowSignalValidationV5Window as Window
++        from gui_indicator_follow_signal_validation_v5_window import simulate_validation_execution as simulate
++        rules, rows, settings, _, before = self._v5_stop_replay_fixture()
++        frozen_before = deepcopy(rows)
++        published = []
++        state = SimpleNamespace(_range_replay_entries_available=True,
++            _range_replay_stop_snapshot=before, _v5_virtual_fill_price_basis="CLOSE",
++            _range_replay_settings_snapshot=settings,
++            validation_virtual_price_badge=SimpleNamespace(
++                setText=lambda value: None, setChecked=lambda value: None, setToolTip=lambda value: None),
++            _v5_regular_session_marking_only=False,
++            apply_range_replay_snapshot=lambda snapshot, **kwargs: published.append((snapshot, kwargs["settings_snapshot"])))
++        state._rebuild_v5_stop_from_frozen = MethodType(Window._rebuild_v5_stop_from_frozen, state)
++        Window._select_virtual_fill_price_basis(state, "OHLC4")
++        self.assertEqual(len(published), 1)
++        after, after_settings = published[0]
++        self.assertNotEqual(before.settings_hash, after.settings_hash)
++        self.assertEqual(after.settings_hash, after_settings.rules_hash)
++        self.assertEqual(before.to_candles(), after.to_candles())
++        self.assertEqual(rows, frozen_before)
++        before_context = before.to_entries()[4].trace["evaluation_context"]
++        after_context = after.to_entries()[4].trace["evaluation_context"]
++        self.assertEqual(before_context["position_quantity"], 0)
++        self.assertEqual(after_context["position_quantity"], 1)
++        for snapshot, snap_settings, expected in [(before, settings, (2, 90)),
++                                                 (after, after_settings, (3, 90))]:
++            state._range_replay_settings_snapshot = snap_settings
++            state._range_replay_stop_snapshot = snapshot
++            state._range_replay_buy_condition_events = snapshot.buy_condition_events
++            state._v5_virtual_fill_price_basis = snap_settings.to_dict()["validation_execution"]["_v5_stop_price_basis"]
++            state._calculation_candles = rows
++            state._replay_snapshot = None
++            state._normal_base_timeframe_key = "M3"
++            policy = Window._v5_virtual_price_policy(state, snap_settings.to_dict()["validation_execution"])
++            result = simulate(rows, snapshot.to_entries(), policy)
++            stop = next(f for f in result.fills if f.reason == "STOP_LOSS")
++            self.assertEqual((stop.evaluation_index, stop.price), expected)
++        self.assertEqual(after.buy_condition_protocol, "V5_BUY_CONDITION_V1")
++
++    def test_actual_snapshot_copies_and_cache_keys_preserve_stop_identity(self):
++        from copy import deepcopy
++        from types import MethodType
++        from gui_indicator_follow_signal_validation_v5_flow import IndicatorFollowSignalValidationV5Flow as Flow
++        from routines.지표추종매매.routine_validation_replay import ValidationHistoricalReplay
++        from routines.지표추종매매.routine_validation_contract import ValidationSettingsSnapshot, ValidationRequest
++        from routines.지표추종매매.routine_validation_session import ValidationSession
++        rules, rows, _, session, snapshot = self._v5_stop_replay_fixture()
++        for copied in (Flow._detached_detail_replay_snapshot(snapshot),
++                       Flow._rebind_trading_cost_replay_snapshot(snapshot, "rebound")):
++            self.assertEqual(copied.buy_condition_events, snapshot.buy_condition_events)
++            self.assertEqual(copied.buy_condition_protocol, snapshot.buy_condition_protocol)
++            events = copied.buy_condition_events
++            events[1]["signal_time"] = "bad"
++            self.assertEqual(copied.buy_condition_events, snapshot.buy_condition_events)
++        owner = SimpleNamespace(_replay_factory=ValidationHistoricalReplay)
++        owner._trading_cost_reuse_prefix = MethodType(Flow._trading_cost_reuse_prefix, owner)
++        pool = {"request_id": "FROZEN-STOP", "timeframe_key": "M3"}
++        key = Flow._trading_cost_replay_key(owner, session, pool, rows, 0, len(rows) - 1)
++        self.assertIsNotNone(key)
++        for field, value in [("_v5_stop_price_basis", "OHLC4"),
++                             ("_v5_stop_config", {"enabled": True, "loss_percent": 5}),
++                             ("_v5_stop_protocol", "future")]:
++            changed = deepcopy(rules)
++            changed["validation_execution"][field] = value
++            changed_session = ValidationSession(ValidationRequest(session.request.stock,
++                ValidationSettingsSnapshot(changed), 3))
++            self.assertNotEqual(key, Flow._trading_cost_replay_key(
++                owner, changed_session, pool, rows, 0, len(rows) - 1))
++        changed_rows = deepcopy(rows)
++        changed_rows[2]["open"] += 1
++        self.assertNotEqual(key, Flow._trading_cost_replay_key(owner, session, pool, changed_rows, 0, len(rows) - 1))
++
++    def test_actual_old_eventless_cache_replays_frozen_candles_locally(self):
++        from types import MethodType
++        from unittest.mock import Mock
++        from gui_indicator_follow_signal_validation_v5_flow import IndicatorFollowSignalValidationV5Flow as Flow
++        from routines.지표추종매매.routine_validation_replay import ValidationHistoricalReplay, ValidationReplaySnapshot
++        _, rows, _, session, snapshot = self._v5_stop_replay_fixture()
++        owner = SimpleNamespace(_replay_factory=ValidationHistoricalReplay, _verified_sor_tail_provider=None,
++            _context_provider_for_session=Flow._context_provider_for_session,
++            _historical_rows_from_candles=Flow._historical_rows_from_candles,
++            _install_replay_cancel_predicate=Flow._install_replay_cancel_predicate,
++            _detail_range_parallel_workers=Flow._detail_range_parallel_workers,
++            _sor_m1_calculation_view=lambda session, pool, active, *a, **kw: active)
++        for name in ("_trading_cost_reuse_prefix", "_trading_cost_replay_key", "_new_replay"):
++            setattr(owner, name, MethodType(getattr(Flow, name), owner))
++        owner._rebind_trading_cost_replay_snapshot = Flow._rebind_trading_cost_replay_snapshot
++        owner._new_replay = Mock(wraps=owner._new_replay)
++        pool = {"request_id": "FROZEN-STOP", "timeframe_key": "M3", "candles": rows,
++                "market_source": "KRX", "market_data_identity": "005930",
++                "calculation_source": "SELECTED_DIRECT_TR_SNAPSHOT"}
++        key = owner._trading_cost_replay_key(session, pool, rows, 0, len(rows) - 1)
++        old = ValidationReplaySnapshot(stock=snapshot.stock, timeframe_minutes=3, timeframe_key="M3",
++            settings_hash="old-cost-only", historical_request_id=snapshot.historical_request_id,
++            evaluated_start_index=0, evaluated_end_index=len(rows) - 1, dropped_raw_rows_count=0,
++            candles=rows, entries=snapshot.to_entries())
++        rebuilt = Flow._prepare_replay_result_from_pool(owner, session, pool,
++            history_target=len(rows), evaluation_count=len(rows), chart_range=(0, len(rows) - 1),
++            prepared_view_pool=pool, reusable_cost_replays={key: old})
++        self.assertTrue(rebuilt.ok, rebuilt)
++        owner._new_replay.assert_called_once()
++        self.assertEqual(rebuilt.snapshot.buy_condition_events, snapshot.buy_condition_events)
++        self.assertEqual(rebuilt.snapshot.to_candles(), rows)
++        reusable = Flow._rebind_trading_cost_replay_snapshot(rebuilt.snapshot, "other-cost")
++        owner._new_replay.reset_mock()
++        cached = Flow._prepare_replay_result_from_pool(owner, session, pool,
++            history_target=len(rows), evaluation_count=len(rows), chart_range=(0, len(rows) - 1),
++            prepared_view_pool=pool, reusable_cost_replays={key: reusable})
++        owner._new_replay.assert_not_called()
++        self.assertEqual(cached.snapshot.buy_condition_events, snapshot.buy_condition_events)
++
++    def test_frozen_ui_stop_metadata_price_identity_and_off_transition(self):
++        from copy import deepcopy
++        from indicator_follow_signal_validation_v5_limit import build_v5_signal_validation_snapshot
++        rules, _, _, _, _ = self._v5_stop_replay_fixture()
++        state = {"basic": {"sell_signal_expr_line": ""},
++                 "sell_ui": {"stop_loss": {"enabled": True, "loss_percent": "10.00"}}}
++        original = deepcopy(state)
++        close = build_v5_signal_validation_snapshot(rules, ui_state=state, stop_price_basis="CLOSE")
++        mean = build_v5_signal_validation_snapshot(rules, ui_state=state, stop_price_basis="OHLC4")
++        self.assertNotEqual(close.rules_hash, mean.rules_hash)
++        state["sell_ui"]["stop_loss"]["loss_percent"] = "5.00"
++        self.assertEqual(close.to_dict()["validation_execution"]["_v5_stop_config"],
++                         original["sell_ui"]["stop_loss"])
++        state["sell_ui"]["stop_loss"]["enabled"] = False
++        off_close = build_v5_signal_validation_snapshot(close.to_dict(), ui_state=state, stop_price_basis="CLOSE")
++        off_mean = build_v5_signal_validation_snapshot(close.to_dict(), ui_state=state, stop_price_basis="OHLC4")
++        self.assertEqual(off_close.rules_hash, off_mean.rules_hash)
++        self.assertNotIn("_v5_stop_config", off_close.to_dict()["validation_execution"])
++
++    def test_actual_regular_replay_remaps_both_clocks_and_excludes_boundaries(self):
++        from types import MethodType
++        from gui_indicator_follow_signal_validation_v5_flow import IndicatorFollowSignalValidationV5Flow as Flow
++        from routines.지표추종매매.routine_validation_replay import ValidationHistoricalReplay
++        _, rows, _, session, _ = self._v5_stop_replay_fixture()
++        for row, time in zip(rows, ["085900", "090000", "090300", "151900", "152000", "153500"]):
++            row["time"] = "20260918" + time
++        owner = SimpleNamespace(_replay_factory=ValidationHistoricalReplay,
++            _context_provider_for_session=Flow._context_provider_for_session,
++            _historical_rows_from_candles=Flow._historical_rows_from_candles,
++            _install_replay_cancel_predicate=Flow._install_replay_cancel_predicate)
++        owner._new_replay = MethodType(Flow._new_replay, owner)
++        result = Flow._prepare_regular_session_range_replay(owner, session, {"request_id": "FROZEN"},
++            rows, 0, len(rows) - 1, None)
++        self.assertTrue(result.ok, result)
++        events = result.snapshot.buy_condition_events
++        self.assertEqual([e["evaluation_index"] for e in events], [1, 2, 3])
++        self.assertEqual([e["signal_index"] for e in events], [None, 1, 2])
++        for event in events:
++            self.assertEqual(event["evaluation_time"], rows[event["evaluation_index"]]["time"])
++            if event["signal_index"] is not None:
++                self.assertEqual(event["signal_time"], rows[event["signal_index"]]["time"])
++
++    def test_actual_v5_context_and_result_use_frozen_stop_and_m5_boundary(self):
++        from gui_indicator_follow_signal_validation_v5_flow import IndicatorFollowSignalValidationV5Flow
++        from gui_indicator_follow_signal_validation_v5_window import simulate_validation_execution as v5_simulate
++        from routines.지표추종매매.routine_validation_contract import (
++            ValidationStockRef, ValidationSettingsSnapshot, ValidationRequest)
++        from routines.지표추종매매.routine_validation_session import ValidationSession
++        policy = {"_v5_stop_config": {"enabled": True, "loss_percent": 10},
++                  "_v5_stop_price_basis": "CLOSE", "_v5_stop_protocol": "V5_BUY_CONDITION_V1",
++                  "_v5_execution_timeframe_key": "M5"}
++        rules = {"bar": {"bar_minutes": 5}, "validation_execution": policy}
++        session = ValidationSession(ValidationRequest(
++            ValidationStockRef("005930", "fixture"), ValidationSettingsSnapshot(rules), 5))
++        tracker = IndicatorFollowSignalValidationV5Flow._context_provider_for_session(session)
++        rows = _candles([100, 80, 90])
++        rows[1]["time"] = "20260918153500"
++        rows[2]["time"] = "20260918154000"
++        signals = [_entry("BUY", 0, rows)]
++        tracker.context_for(1, "SELL", rows, signals)
++        self.assertEqual(tracker.holding_quantity, 1)
++        tracker.context_for(2, "BUY", rows, signals)
++        self.assertEqual(tracker.holding_quantity, 0)
++        result = v5_simulate(rows, signals, policy)
++        self.assertEqual([(f.evaluation_index, f.reason) for f in result.fills],
++                         [(0, "AVERAGING_DISABLED_ONE_SHARE"), (2, "STOP_LOSS")])
++        self.assertEqual(tracker.finalize(rows, signals), result)
++
+     def test_v5_range_receipt_reconciles_existing_fills_once_without_gui(self):
+         import ast
+         from dataclasses import asdict, dataclass
+diff --git a/tests/test_indicator_follow_validation_replay.py b/tests/test_indicator_follow_validation_replay.py
+index 60ced48..b1eb1ea 100644
+--- a/tests/test_indicator_follow_validation_replay.py
++++ b/tests/test_indicator_follow_validation_replay.py
+@@ -51,6 +51,215 @@ def _canonical_replay_builder(candles, rules, *, _bollinger_calculator=None):
+ 
+ 
+ class ValidationHistoricalReplayTest(unittest.TestCase):
++    def test_invalid_stoch_threshold_events_cannot_unlock_stopped_v5_cycle(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rules = deepcopy(self.rules)
++        parsed = parse_condition_expression("E", allowed_identifiers={"E"})
++        rules["buy"]["filters"] = {
++            "stoch_rsi": {"enabled": True},
++            "composite": {"enabled": True, "expression": {
++                **parsed, "identifier_map": {"E": "stoch_rsi"}}},
++        }
++        rules["sell"] = {"signals": {}}
++        rows = project_validation_candles(self._initial_prefix_historical(40))[0]
++        for index, row in enumerate(rows):
++            price = 90 if index == 35 else 100
++            row.update(open=price, high=price, low=price, close=price)
++        series = {"CLOSE": [row["close"] for row in rows], "STOCH_RSI_D": [50.0] * len(rows)}
++        frozen_inputs = deepcopy((rules, rows, series))
++        omitted = object()
++
++        def evaluate(index, threshold=omitted, context=None):
++            config = deepcopy(rules)
++            if threshold is not omitted:
++                config["buy"]["filters"]["stoch_rsi"]["threshold"] = threshold
++            prefix = rows[:index + 1]
++            inputs = {key: values[:index + 1] for key, values in series.items()}
++            context = {**(context or {}), "_indicator_follow_evaluate_side": "BUY"}
++            ordinary = routine_macd_engine.evaluate_indicator_follow_routine(
++                prefix, config, context, _base_series_map=inputs, readiness_safe=True)
++            events = []
++            observed = routine_macd_engine.evaluate_indicator_follow_routine(
++                prefix, config, {**context, "_validation_buy_condition_observer": events.append},
++                _base_series_map=inputs, readiness_safe=True)
++            self.assertEqual(ordinary, observed)
++            self.assertEqual(len(events), 1)
++            event = events[0]
++            self.assertEqual((event["evaluation_index"], event["signal_index"]), (index, index))
++            self.assertEqual((event["evaluation_time"], event["signal_time"]),
++                             (rows[index]["time"], rows[index]["time"]))
++            return observed, event
++
++        # An omitted threshold uses 20; explicit None must not become that valid False.
++        _, default_event = evaluate(36)
++        self.assertEqual(default_event["status"], "EVALUATED")
++        self.assertIs(default_event["buy_result"], False)
++        for invalid in (None, "bad", -1, 101, math.nan, math.inf, -math.inf):
++            with self.subTest(threshold=invalid):
++                tracker = V5ValidationPositionTracker(
++                    {"enabled": True, "first_buy_quantity": 2},
++                    stop_config={"enabled": True, "loss_percent": 10},
++                    eligible_indices=range(len(rows)))
++                entries = []
++                for index, threshold in ((34, 60), (35, 60), (36, invalid),
++                                         (37, 60), (38, 40), (39, 60)):
++                    context = tracker.context_for(index, "BUY", rows[:index + 1], entries)
++                    signal, event = evaluate(index, threshold, context)
++                    if index == 36:
++                        self.assertIsNone(event["buy_result"])
++                        self.assertEqual(event["status"], "UNAVAILABLE")
++                    else:
++                        self.assertEqual(event["status"], "EVALUATED")
++                        self.assertIs(event["buy_result"], index != 38)
++                    tracker.observe_buy_condition(event)
++                    entry = ValidationHistoricalReplay._entry_from_signal(
++                        "BUY", index, rows[index]["time"], rows[:index + 1], signal, {})
++                    entries.append(entry)
++                    simulation = tracker.finalize(rows[:index + 1], entries)
++                    if index in (35, 36, 37, 38):
++                        self.assertEqual([(fill.side, fill.evaluation_index, fill.quantity)
++                                          for fill in simulation.fills],
++                                         [("BUY", 34, 2), ("SELL", 35, 2)])
++                        self.assertEqual(simulation.fills[-1].reason, "STOP_LOSS")
++                    if index == 37:
++                        self.assertEqual(entry.signal, "BUY")
++                        # The same actual BUY opens two shares when no stop lock exists.
++                        unlocked = V5ValidationPositionTracker(
++                            {"enabled": True, "first_buy_quantity": 2},
++                            stop_config={"enabled": True, "loss_percent": 10},
++                            eligible_indices=range(len(rows)))
++                        control = unlocked.finalize(rows[:index + 1], [entry])
++                        self.assertEqual([(fill.side, fill.evaluation_index, fill.quantity)
++                                          for fill in control.fills], [("BUY", 37, 2)])
++                self.assertEqual([(fill.side, fill.evaluation_index, fill.quantity)
++                                  for fill in simulation.fills],
++                                 [("BUY", 34, 2), ("SELL", 35, 2), ("BUY", 39, 2)])
++                self.assertEqual(simulation.open_quantity, 2)
++        self.assertEqual((rules, rows, series), frozen_inputs)
++
++    def test_real_replay_transports_frozen_buy_events_and_scan_falls_back(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rules = deepcopy(self.rules)
++        rules["buy"]["groups"][0]["conditions"][0]["value"] = 95
++        rules["sell"] = {"signals": {}}
++        session = ValidationSession(ValidationRequest(self.stock, ValidationSettingsSnapshot(rules), 3))
++        historical = self._historical(closes=(100, 100, 100, 90, 90, 100))
++        rows = project_validation_candles(historical)[0]
++        def tracker():
++            return V5ValidationPositionTracker(
++                {"enabled": True, "first_buy_quantity": 1, "repeat_mode": "ROUND",
++                 "round_operator": "MULTIPLY", "round_budget_value": 0},
++                stop_config={"enabled": True, "loss_percent": 10})
++        context = tracker()
++        replay = ValidationHistoricalReplay(session, readiness_safe=True)
++        result = replay.evaluate_with_context(historical, context_provider=context)
++        self.assertTrue(result.ok, result)
++        events = result.snapshot.buy_condition_events
++        self.assertEqual([e["buy_result"] for e in events], [True, True, True, False, False, True])
++        self.assertEqual(events, context.buy_condition_events)
++        simulation = context.finalize(rows, result.snapshot.to_entries())
++        # A budget/round rejection is still a real True; false on stopbar cannot unlock.
++        self.assertEqual([(f.side, f.evaluation_index) for f in simulation.fills],
++                         [("BUY", 0), ("SELL", 3), ("BUY", 5)])
++        self.assertEqual(simulation.fills[1].reason, "STOP_LOSS")
++        events[0]["buy_result"] = False
++        self.assertTrue(result.snapshot.buy_condition_events[0]["buy_result"])
++        scanned_context = tracker()
++        with patch.object(replay, "evaluate", wraps=replay.evaluate) as detailed:
++            scanned = replay.scan_signal_entries(historical, context_provider=scanned_context)
++        detailed.assert_called_once()
++        self.assertEqual(scanned_context.buy_condition_events, result.snapshot.buy_condition_events)
++        self.assertEqual([e.to_dict() for e in scanned],
++                         [e.to_dict() for e in result.snapshot.to_entries() if e.signal == e.evaluation_side])
++        off = ValidationHistoricalReplay(session, readiness_safe=True).evaluate_with_context(
++            historical, context_provider=ValidationVirtualPositionTracker())
++        self.assertTrue(off.ok, off)
++        self.assertEqual(off.snapshot.buy_condition_events, [])
++        # The stop protocol also guards the legacy scan when readiness_safe is OFF.
++        legacy_scan = ValidationHistoricalReplay(session)
++        with patch.object(legacy_scan, "evaluate", wraps=legacy_scan.evaluate) as detailed:
++            legacy_scan.scan_signal_entries(historical, context_provider=tracker())
++        detailed.assert_called_once()
++
++    def test_buy_events_remap_long_prefix_evaluation_and_delayed_source_separately(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rules = deepcopy(self.rules)
++        rules["buy"]["delay_bar"] = 1
++        session = ValidationSession(ValidationRequest(self.stock, ValidationSettingsSnapshot(rules), 3))
++        historical = self._initial_prefix_historical(910)
++        result = ValidationHistoricalReplay(session, readiness_safe=True).evaluate_with_context(
++            historical, start_index=903, end_index=905,
++            context_provider=V5ValidationPositionTracker(stop_config={"enabled": True, "loss_percent": 10}))
++        self.assertTrue(result.ok, result)
++        rows = result.snapshot.to_candles()
++        self.assertEqual([e["evaluation_index"] for e in result.snapshot.buy_condition_events], [903, 904, 905])
++        self.assertEqual([e["signal_index"] for e in result.snapshot.buy_condition_events], [902, 903, 904])
++        for event in result.snapshot.buy_condition_events:
++            self.assertEqual(event["evaluation_time"], rows[event["evaluation_index"]]["time"])
++            self.assertEqual(event["signal_time"], rows[event["signal_index"]]["time"])
++
++    def test_expression_buy_observation_keeps_final_truth_and_unavailable_before_fail_collapse(self):
++        rules = deepcopy(self.rules)
++        parsed = parse_condition_expression("C", allowed_identifiers={"C"})
++        rules["buy"]["filters"] = {
++            "moving_average": {"enabled": True, "conditions": [{"period": 3, "operator": ">="}]},
++            "composite": {"enabled": True, "expression": {**parsed, "identifier_map": {"C": "moving_average"}}}}
++        rules["sell"] = {"signals": {}}
++        rows = [dict(time=f"2026112009{i:02d}00", open=100, high=100, low=100,
++                     close=100, volume=1) for i in range(3)]
++        for ma, expected in [(110, False), (90, True), (None, None)]:
++            observations = []
++            routine_macd_engine.evaluate_indicator_follow_routine(
++                rows, rules, {"_indicator_follow_evaluate_side": "BUY",
++                              "_validation_buy_condition_observer": observations.append},
++                _base_series_map={"CLOSE": [100] * 3, "MA3": [None, None, ma]}, readiness_safe=True)
++            self.assertEqual(len(observations), 1)
++            self.assertIs(observations[0]["buy_result"], expected)
++        rules["buy"]["filters"]["moving_average"]["conditions"][0]["period"] = 0
++        observations = []
++        routine_macd_engine.evaluate_indicator_follow_routine(
++            rows, rules, {"_indicator_follow_evaluate_side": "BUY",
++                          "_validation_buy_condition_observer": observations.append},
++            _base_series_map={"CLOSE": [100] * 3}, readiness_safe=True)
++        self.assertIsNone(observations[0]["buy_result"])
++        # Losing a position does not make the AVG_PRICE-dependent BUY condition False.
++        parsed_g = parse_condition_expression("G", allowed_identifiers={"G"})
++        rules["buy"]["filters"] = {
++            "target_percent": {"conditions": [{"operator": "PERCENT_GAP", "target": "CURRENT_PRICE",
++                "compare_target": "AVG_PRICE", "direction": "DOWN", "value": 1}]},
++            "composite": {"enabled": True, "expression": {**parsed_g, "identifier_map": {"G": "target_percent"}}}}
++        observations = []
++        routine_macd_engine.evaluate_indicator_follow_routine(
++            rows, rules, {"_indicator_follow_evaluate_side": "BUY", "average_price": None,
++                          "_validation_buy_condition_observer": observations.append},
++            _base_series_map={"CLOSE": [100] * 3}, readiness_safe=True)
++        self.assertEqual(observations[0]["status"], "UNAVAILABLE")
++        self.assertIsNone(observations[0]["buy_result"])
++
++    def test_opt_in_buy_truth_distinguishes_false_unavailable_and_delay(self):
++        rules = deepcopy(self.rules)
++        rules["sell"] = {"signals": {}}
++        rules["buy"]["delay_bar"] = 1
++        rows = [dict(time=f"2026112009{i:02d}00", open=10, high=10, low=10,
++                     close=10, volume=1) for i in range(4)]
++        for value, expected in [(10, False), (15, True), (None, None)]:
++            series = {"CLOSE": [10, 10, value, 10]}
++            events = []
++            context = {"_indicator_follow_evaluate_side": "BUY"}
++            original = routine_macd_engine.evaluate_indicator_follow_routine(
++                rows, rules, context, _base_series_map=series, readiness_safe=True)
++            observed = routine_macd_engine.evaluate_indicator_follow_routine(
++                rows, rules, {**context, "_validation_buy_condition_observer": events.append},
++                _base_series_map=series, readiness_safe=True)
++            self.assertEqual(original, observed)
++            self.assertEqual(len(events), 1)
++            event = events[0]
++            self.assertIs(event["buy_result"], expected)
++            self.assertEqual(event["status"], "UNAVAILABLE" if expected is None else "EVALUATED")
++            self.assertEqual((event["evaluation_index"], event["signal_index"]), (3, 2))
++            self.assertEqual((event["evaluation_time"], event["signal_time"]),
++                             (rows[3]["time"], rows[2]["time"]))
++
+     def test_stoch_rsi_e_replay_preparation_matches_canonical_prefixes(self):
+         from engines.condition_engine import parse_condition_expression
+         rules = deepcopy(self.rules)
+diff --git a/tests/test_v5_lot_limit_execution.py b/tests/test_v5_lot_limit_execution.py
+index 912bcdf..7335ca9 100644
+--- a/tests/test_v5_lot_limit_execution.py
++++ b/tests/test_v5_lot_limit_execution.py
+@@ -23,6 +23,127 @@ ON = {"lot_limit_enabled": True, "lot_limit_percent": 10.0,
+ 
+ 
+ class LotLimitExecutionTest(unittest.TestCase):
++    def test_stop_selected_mean_and_close_thresholds_and_fill_prices(self):
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
++        rows = candles([100, 88])
++        rows[1].update(open=100, high=100, low=88)
++        buy = entries(rows, ("BUY", 0))
++        stop = {"enabled": True, "loss_percent": 10}
++        close = simulate(rows, buy, stop_config=stop, stop_price_basis="CLOSE")
++        mean = simulate(rows, buy, stop_config=stop, stop_price_basis="OHLC4")
++        self.assertEqual((close.fills[-1].reason, close.fills[-1].price), ("STOP_LOSS", 88))
++        self.assertEqual(mean.open_quantity, 1)
++        rows[1].update(open=80, high=100, low=80, close=96)
++        close = simulate(rows, buy, stop_config=stop, stop_price_basis="CLOSE")
++        mean = simulate(rows, buy, stop_config=stop, stop_price_basis="OHLC4")
++        self.assertEqual(close.open_quantity, 1)
++        self.assertEqual((mean.fills[-1].reason, mean.fills[-1].price), ("STOP_LOSS", 89))
++
++    def test_stop_off_parity_and_period_end_close_are_independent(self):
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
++        rows = candles([100, 88])
++        rows[1].update(open=100, high=100, low=88)
++        signals = entries(rows, ("BUY", 0))
++        off = simulate(rows, signals, stop_config={"enabled": False, "loss_percent": 10},
++                       force_liquidation_at_end=True)
++        self.assertEqual(off, simulate_validation_execution(rows, signals, force_liquidation_at_end=True))
++        mean = simulate(rows, signals, stop_config={"enabled": True, "loss_percent": 10},
++                        stop_price_basis="OHLC4", force_liquidation_at_end=True)
++        self.assertEqual((mean.fills[-1].reason, mean.fills[-1].price), ("RANGE_END_LIQUIDATION", 88))
++        self.assertTrue(mean.cycles[-1].is_liquidation)
++
++    def test_restart_observation_unlocks_without_forcing_a_buy(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rows = candles([100, 90, 90, 100, 100])
++        events_ = [dict(evaluation_index=i, evaluation_time=rows[i]["time"],
++                        signal_index=0, signal_time=rows[0]["time"], status="EVALUATED", buy_result=truth)
++                   for i, truth in [(2, False), (3, True)]]
++        tracker = V5ValidationPositionTracker(stop_config={"enabled": True, "loss_percent": 10},
++                                              buy_condition_events=events_)
++        result = tracker.finalize(rows, entries(rows, ("BUY", 0), ("BUY", 4)))
++        self.assertEqual([(f.side, f.evaluation_index) for f in result.fills],
++                         [("BUY", 0), ("SELL", 1), ("BUY", 4)])
++
++    def test_result_slice_retains_delayed_source_provenance_outside_execution_axis(self):
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution as simulate
++        source = candles([100, 100, 90, 90, 100, 100])
++        events_ = [dict(evaluation_index=i, evaluation_time=source[i]["time"],
++                        signal_index=0, signal_time=source[0]["time"],
++                        status="EVALUATED", buy_result=truth) for i, truth in [(3, False), (4, True)]]
++        local = source[1:]
++        result = simulate(local, entries(local, ("BUY", 0), ("BUY", 4)),
++            stop_config={"enabled": True, "loss_percent": 10},
++            buy_condition_events=events_, buy_condition_candles=source)
++        self.assertEqual([(f.side, f.evaluation_index) for f in result.fills],
++                         [("BUY", 0), ("SELL", 1), ("BUY", 4)])
++
++    def test_stop_after_partial_lot_sale_preserves_weighted_cost_proceeds_and_fee(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rows = candles([100, 90, 95, 80], [100, 90, 100, 120])
++        policy = {**ON, "trading_cost_enabled": True, "trading_cost_percent": 1}
++        tracker = V5ValidationPositionTracker(policy, stop_config={"enabled": True, "loss_percent": 20})
++        signals = entries(rows, ("BUY", 0), ("BUY", 1), ("SELL", 3), ("BUY", 3))
++        tracker.context_for(3, "SELL", rows, signals[:2])
++        self.assertEqual(tracker.holding_quantity, 0)
++        result = tracker.finalize(rows, signals, force_liquidation_at_end=True)
++        sells = [f for f in result.fills if f.side == "SELL"]
++        self.assertEqual([(f.reason, f.price, f.quantity, f.buy_cost) for f in sells],
++                         [("LOT_LIMIT_TARGET", 99, 1, 90), ("STOP_LOSS", 80, 1, 100)])
++        self.assertFalse(tracker._limit_lots)
++        self.assertFalse(result.cycles[0].is_liquidation)
++        self.assertAlmostEqual(result.cycles[0].trading_cost_amount, 1.9)
++        self.assertAlmostEqual(result.cycles[0].estimated_return_percent, (179 - 190 - 1.9) / 190 * 100)
++        self.assertEqual(result, tracker.finalize(rows, signals, force_liquidation_at_end=True))
++
++    def test_stop_ineligible_unknown_duplicate_and_out_of_order_never_unlock(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rows = candles([100, 90, 90, 90, 90, 90, 100])
++        def event(index, truth, **extra):
++            return dict(evaluation_index=index, evaluation_time=rows[index]["time"],
++                        signal_index=0, signal_time=rows[0]["time"],
++                        status="EVALUATED" if type(truth) is bool else "UNAVAILABLE",
++                        buy_result=truth, **extra)
++        cases = [
++            [event(1, False), event(2, True)],
++            [event(2, None), event(3, True)],
++            [event(2, False), event(2, True)],
++            [event(4, True), event(3, False), event(5, True)],
++            [{**event(2, False), "signal_time": "bad"}, event(3, True)],
++            [{**event(2, False), "buy_result": 0}, event(3, True)],
++            [{**event(2, False), "status": "UNEVALUATED", "buy_result": None}, event(3, True)],
++        ]
++        for events_ in cases:
++            with self.subTest(events=events_):
++                tracker = V5ValidationPositionTracker(
++                    stop_config={"enabled": True, "loss_percent": 10}, buy_condition_events=events_)
++                result = tracker.finalize(rows, entries(rows, ("BUY", 0), ("BUY", 6)))
++                self.assertEqual([f.evaluation_index for f in result.fills if f.side == "BUY"], [0])
++        tracker = V5ValidationPositionTracker(
++            stop_config={"enabled": True, "loss_percent": 10}, eligible_indices={0, 1, 3, 6},
++            buy_condition_events=[event(2, False), event(3, True)])
++        self.assertEqual(tracker.finalize(rows, entries(rows, ("BUY", 0), ("BUY", 6))).open_quantity, 0)
++
++    def test_stop_precheck_priority_price_and_later_condition_restart(self):
++        from indicator_follow_signal_validation_v5_limit import V5ValidationPositionTracker
++        rows = candles([100, 90, 90, 90, 100, 101])
++        signals = entries(rows, ("BUY", 0), ("SELL", 1), ("BUY", 1),
++                          ("BUY", 2), ("BUY", 3), ("BUY", 4))
++        events = [dict(evaluation_index=i, evaluation_time=rows[i]["time"],
++                       signal_index=max(0, i - 1), signal_time=rows[max(0, i - 1)]["time"],
++                       status="EVALUATED", buy_result=value)
++                  for i, value in [(1, False), (2, True), (3, False), (4, True)]]
++        tracker = V5ValidationPositionTracker(
++            ON, stop_config={"enabled": True, "loss_percent": 10},
++            stop_price_basis="CLOSE", buy_condition_events=events)
++        tracker._v5_virtual_fill_prices = {(1, "SELL"): 200}
++        tracker.context_for(1, "SELL", rows, signals[:1])
++        tracker.context_for(1, "BUY", rows, signals[:1])
++        result = tracker.finalize(rows, signals)
++        self.assertEqual([(f.side, f.evaluation_index, f.price) for f in result.fills],
++                         [("BUY", 0, 100), ("SELL", 1, 90), ("BUY", 4, 100)])
++        self.assertEqual(result.fills[1].reason, "STOP_LOSS")
++        self.assertEqual(tracker.finalize(rows, signals), result)
++
+     def test_v5_cross_prices_only_for_true_positive_branches_and_results(self):
+         from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution
+         from engines.condition_engine import parse_condition_expression
