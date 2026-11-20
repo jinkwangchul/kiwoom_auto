@@ -1,0 +1,241 @@
+diff --git a/gui_auto_trade_setting_window.py b/gui_auto_trade_setting_window.py
+index 624471f..9531122 100644
+--- a/gui_auto_trade_setting_window.py
++++ b/gui_auto_trade_setting_window.py
+@@ -4005,6 +4005,10 @@ def clone_routine_instance_with_existing_policy(
+             ui_root = rules.get("indicator_follow_ui_state", {})
+             state = ui_root.get("state", {}) if isinstance(ui_root, dict) else {}
+             sell_ui = state.get("sell_ui", {}) if isinstance(state, dict) else {}
++            if isinstance(sell_ui, dict) and "stop_loss" in sell_ui:
++                from indicator_follow_settings_compatibility import require_valid_sell_stop_loss
++
++                require_valid_sell_stop_loss(sell_ui["stop_loss"])
+             stop_loss = sell_ui.get("stop_loss", {}) if isinstance(sell_ui, dict) else {}
+             if isinstance(stop_loss, dict) and stop_loss.get("enabled") is True:
+                 from gui_indicator_follow_routine_settings_dialog import _settings_validation_user_reason
+diff --git a/gui_indicator_follow_routine_settings_dialog.py b/gui_indicator_follow_routine_settings_dialog.py
+index efdc0ce..fc664cd 100644
+--- a/gui_indicator_follow_routine_settings_dialog.py
++++ b/gui_indicator_follow_routine_settings_dialog.py
+@@ -85,11 +85,13 @@ from gui_indicator_follow_sell_controls import (
+     normalize_legacy_sell_bollinger_sign_ui_state,
+ )
+ from indicator_follow_settings_compatibility import (
++    DEFAULT_SELL_STOP_LOSS,
+     canonical_indicator_follow_ui_state,
+     SELL_SIGNAL_FORMAT,
+     get_canonical_fresh_defaults,
+     normalize_legacy_signal_price_ui_state,
+     normalize_sell_selected_set_authority,
++    require_valid_sell_stop_loss,
+ )
+ from gui_routine_registry import get_routine_records, normalize_routine_name
+ from gui_operation_ui_context import sync_auto_trade_monitoring_universe
+@@ -2585,6 +2587,34 @@ class IndicatorFollowRoutineSettingsDialog(
+             saved_session,
+         )
+         apply_preview = pipeline.get("apply_preview", {})
++        try:
++            candidate_rules = apply_preview["applied_rules_preview"]
++            candidate_state = candidate_rules.get("indicator_follow_ui_state", {}).get("state", {})
++            stop_loss = candidate_state.get("sell_ui", {}).get("stop_loss", DEFAULT_SELL_STOP_LOSS)
++            blocked_reasons = []
++            if isinstance(stop_loss, dict) and stop_loss.get("enabled") is True:
++                blocked_reasons.append("SELL_STOP_LOSS_LIVE_HOLD")
++            try:
++                require_valid_sell_stop_loss(stop_loss)
++            except ValueError as exc:
++                blocked_reasons.append(str(exc))
++            validation = {"valid": not blocked_reasons, "blocked_reasons": blocked_reasons}
++        except Exception as exc:
++            result["internal_error"] = str(exc)
++            result["blocked_reasons"] = [_SETTINGS_CHANGE_PROCESSING_FAILURE_MESSAGE]
++            return result
++        result["validation"] = validation
++        if validation.get("valid") is not True:
++            internal_reasons = list(
++                validation.get("blocked_reasons") or ["설정 검증이 실패했습니다."]
++            )
++            result["internal_blocked_reasons"] = internal_reasons
++            result["blocked_reasons"] = list(dict.fromkeys(
++                _settings_validation_user_reason(item, context="change")
++                for item in internal_reasons
++            ))
++            return result
++
+         commit_result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+             rules_path,
+             apply_preview,
+diff --git a/tests/test_auto_trade_setting_routine_tree.py b/tests/test_auto_trade_setting_routine_tree.py
+index a194ea5..5e91865 100644
+--- a/tests/test_auto_trade_setting_routine_tree.py
++++ b/tests/test_auto_trade_setting_routine_tree.py
+@@ -1210,6 +1210,49 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
+             )
+             self.assertEqual(before, rules_path.read_bytes())
+ 
++    def test_routine_instance_clone_stop_loss_schema_before_repository(self) -> None:
++        from gui_indicator_follow_routine_settings_dialog import register_routine_instance_snapshot
++
++        cases = (
++            ("null", {"stop_loss": None}, False),
++            ("integer", {"stop_loss": {"enabled": 1, "loss_percent": "2.5"}}, False),
++            ("string", {"stop_loss": {"enabled": "true", "loss_percent": "2.5"}}, False),
++            ("off", {"stop_loss": {"enabled": False, "loss_percent": "00.00"}}, True),
++            ("legacy", {}, True),
++        )
++        for name, sell_ui, reaches_repository in cases:
++            with self.subTest(case=name), TemporaryDirectory() as temp:
++                rules_path = Path(temp) / "rules.json"
++                rules = {"indicator_follow_ui_state": {"state": {"sell_ui": sell_ui}},
++                         "unrelated": {"keep": [1, 2]}}
++                rules_path.write_text(json.dumps(rules), encoding="utf-8")
++                before = rules_path.read_bytes()
++                instance = SimpleNamespace(instance_id="inst-a", definition_id="indicator_follow",
++                                           display_name="source", group_id="group-a", rules_path=rules_path)
++                definition = SimpleNamespace(definition_id="indicator_follow", display_name="indicator")
++                owner = SimpleNamespace()
++                registration_dialog = MagicMock()
++                registration_dialog.exec_.return_value = 1
++                metadata = {"row_kind": "instance", "group_id": "group-a", "instance_id": "inst-a"}
++                with (
++                    patch.object(setting_window, "routine_instance_by_id", return_value=instance),
++                    patch.object(setting_window, "routine_definition_by_id", return_value=definition),
++                    patch.object(setting_window, "group_record_by_id", return_value=SimpleNamespace(display_name="group")),
++                    patch.object(setting_window, "load_routine_callable", return_value=register_routine_instance_snapshot),
++                    patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=registration_dialog),
++                    patch("gui_indicator_follow_routine_settings_dialog.load_persisted_routine_instances", return_value=[]),
++                    patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository.create_instance",
++                          return_value=SimpleNamespace(success=False, instance=None)) as create,
++                    patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.critical"),
++                ):
++                    self.assertFalse(setting_window.clone_routine_instance_with_existing_policy(owner, metadata))
++                    if reaches_repository:
++                        create.assert_called_once_with(registration_dialog.registration_request, rules)
++                    else:
++                        create.assert_not_called()
++                        self.assertIn("sell stop loss enabled must be a boolean", owner._last_routine_registration_error)
++                    self.assertEqual(before, rules_path.read_bytes())
++
+     def test_routine_instance_clone_rejects_noncanonical_group_identity(self) -> None:
+         instance = SimpleNamespace(
+             instance_id="inst-a",
+diff --git a/tests/test_indicator_follow_settings_validation_on_commit.py b/tests/test_indicator_follow_settings_validation_on_commit.py
+index cfd41f8..0aae77e 100644
+--- a/tests/test_indicator_follow_settings_validation_on_commit.py
++++ b/tests/test_indicator_follow_settings_validation_on_commit.py
+@@ -12,7 +12,7 @@ import tempfile
+ import unittest
+ from unittest.mock import Mock, patch
+ 
+-from PyQt5.QtWidgets import QApplication, QDialog, QLabel
++from PyQt5.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
+ 
+ from candle_timeframe_aggregation import read_canonical_bar_minutes
+ from gui_indicator_follow_routine_settings_dialog import (
+@@ -573,6 +573,105 @@ class IndicatorFollowSettingsValidationOnCommitTest(unittest.TestCase):
+             self.assertEqual(message, _settings_validation_user_reason("SELL_STOP_LOSS_LIVE_HOLD", context=context))
+             self.assertNotIn("?", message)
+ 
++    def test_stop_loss_approved_commit_validates_actual_candidate_and_preserves_scope(self) -> None:
++        import rule_apply_commit_service
++        import rule_approval_session_file_service
++
++        source_before = self.source_rules_path.read_bytes()
++        writer = rule_apply_commit_service.commit_approved_rule_patch_to_rules
++        schema_error = "sell stop loss enabled must be a boolean"
++        live_hold = "SELL_STOP_LOSS_LIVE_HOLD"
++        cases = (
++            ("on", {"stop_loss": {"enabled": True, "loss_percent": "2.5"}}, [live_hold]),
++            ("off", {"stop_loss": {"enabled": False, "loss_percent": "2.5"}}, []),
++            ("legacy_missing", {}, []),
++            ("null", {"stop_loss": None}, [schema_error]),
++            ("missing_enabled", {"stop_loss": {}}, [schema_error]),
++            ("null_enabled", {"stop_loss": {"enabled": None}}, [schema_error]),
++            ("integer_enabled", {"stop_loss": {"enabled": 1}}, [schema_error]),
++            ("string_enabled", {"stop_loss": {"enabled": "true"}}, [schema_error]),
++            ("on_invalid_percent", {"stop_loss": {"enabled": True, "loss_percent": "-2.5"}},
++             [live_hold, "sell stop loss percent must be a positive finite unsigned decimal"]),
++        )
++        for name, candidate_sell_ui, reasons in cases:
++            with self.subTest(case=name), tempfile.TemporaryDirectory() as temp:
++                rules_path = Path(temp) / "rules.json"
++                rules_path.write_bytes(source_before)
++                dialog = self._dialog(rules_path, instance_id="instance-id")
++                try:
++                    base = deepcopy(dialog.rules_data)
++                    base["bar"]["bar_minutes"] = 1
++                    base["indicator_follow_ui_state"]["state"] = dialog.collect_indicator_follow_ui_state()
++                    base["indicator_follow_ui_state"]["state"]["basic"]["basic_signal_interval_combo"] = "1"
++                    candidate_state = base["indicator_follow_ui_state"]["state"]
++                    candidate_state["sell_ui"].pop("stop_loss", None)
++                    candidate_state["sell_ui"].update(deepcopy(candidate_sell_ui))
++                    if not reasons:
++                        candidate_state["buy_ui"]["signal_filter"].pop("buy_bollinger_sign_combo", None)
++                    rules_path.write_text(json.dumps(base, ensure_ascii=False), encoding="utf-8")
++                    before = rules_path.read_bytes()
++                    dialog.basic_signal_interval_combo.setCurrentText("5")
++                    dialog.sell_stop_loss_check.setChecked(not reasons)
++                    dialog.sell_stop_loss_percent_line.setText("3.5")
++                    ui_state = dialog.collect_indicator_follow_ui_state()
++                    self.assertNotEqual(base["indicator_follow_ui_state"]["state"], ui_state)
++                    mapper = dialog._load_indicator_follow_rule_mapper()
++                    preview = mapper.build_engine_rules_preview_from_ui_state(ui_state, base)
++                    session = mapper.build_rule_approval_session(preview, {"bar.bar_minutes": "APPROVED"})
++                    fingerprint = mapper.build_rule_approval_session_fingerprint(base, preview)
++                    session["fingerprint"] = fingerprint["fingerprint"]
++                    session["fingerprint_detail"] = fingerprint
++                    dialog._approval_session_path = Path(temp) / "approval_session.json"
++                    saved = rule_approval_session_file_service.save_rule_approval_session(
++                        session, dialog._approval_session_path,
++                    )
++                    self.assertTrue(saved["saved"], saved)
++                    expected = deepcopy(base)
++                    expected["bar"]["bar_minutes"] = 5
++                    final_writes = []
++
++                    def write_at_boundary(path, apply_preview, gate, context):
++                        if Path(path).resolve() == rules_path.resolve():
++                            final_writes.append(deepcopy(apply_preview))
++                            if reasons:
++                                return {"ok": False, "committed": False}
++                        return writer(path, apply_preview, gate, context)
++
++                    instance = SimpleNamespace(instance_id="instance-id", definition_id="indicator_follow",
++                                               rules_path=rules_path)
++                    with (
++                        patch("gui_indicator_follow_routine_settings_dialog.routine_instance_by_id",
++                              return_value=instance),
++                        patch.object(rule_apply_commit_service, "commit_approved_rule_patch_to_rules",
++                                     side_effect=write_at_boundary),
++                        patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.question",
++                              return_value=QMessageBox.Yes),
++                        patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.information") as information,
++                        patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.warning"),
++                    ):
++                        if reasons:
++                            result = dialog._handle_approved_rule_commit_clicked()
++                            information.assert_not_called()
++                        else:
++                            result = dialog.commit_saved_approved_rule_changes(manual_rule_commit_confirmed=True)
++                    self.assertTrue(result["dry_run_result"]["ok"], result)
++                    self.assertTrue(result["commit_gate"]["commit_allowed"], result)
++                    if reasons:
++                        self.assertEqual(0, len(final_writes))
++                        self.assertFalse(result["ok"])
++                        self.assertFalse(result["committed"])
++                        self.assertEqual(reasons, result["internal_blocked_reasons"])
++                        self.assertEqual(before, rules_path.read_bytes())
++                    else:
++                        self.assertTrue(result["ok"], result)
++                        self.assertTrue(result["committed"])
++                        self.assertEqual(1, len(final_writes))
++                        self.assertEqual(expected, final_writes[0]["applied_rules_preview"])
++                        self.assertEqual(expected, json.loads(rules_path.read_text(encoding="utf-8")))
++                finally:
++                    dialog.close()
++        self.assertEqual(source_before, self.source_rules_path.read_bytes())
++
+     def test_invalid_sell_selection_is_blocked_by_common_validator(self) -> None:
+         dialog = self._dialog(self.source_rules_path)
+         try:

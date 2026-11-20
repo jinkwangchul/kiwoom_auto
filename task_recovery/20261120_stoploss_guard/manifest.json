@@ -1,0 +1,33 @@
+{
+    "status":  "DELTA_REPLAY_VERIFIED",
+    "repository":  "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto",
+    "remote":  "https://github.com/jinkwangchul/kiwoom_auto.git",
+    "branch":  "feat/restore-auto-trade-setting-ui",
+    "head":  "75296031aec709ef032e329db5c5af27a5d928e8",
+    "baseline":  "C:\\kiwoom_restore_points\\snapshots\\20261120_035827_609761_49ab7b\\payload",
+    "limitation":  "Delta only. Baseline file contents are local, not included remotely. This is not a runnable integrated implementation commit or a full device-loss backup.",
+    "restore":  "Use a disposable copy of the exact baseline files, preserve bytes and relative paths, apply changes.patch with git apply --binary --whitespace=nowarn, verify every afterSha256. Do not apply to unrelated HEAD or overwrite live working files automatically.",
+    "encoding":  "Patch is raw UTF-8 without BOM; source byte encoding and line endings preserved and verified by replay SHA256.",
+    "files":  [
+                  {
+                      "path":  "gui_auto_trade_setting_window.py",
+                      "beforeSha256":  "EB8E8B9D3CAC47F3C1D30F5860F5DEBA421BE674AFDF212821102FBC47143E96",
+                      "afterSha256":  "925CF9978F17DF7B1C113ED83B23C9E30146298B54BB57918CEDD920273A11F6"
+                  },
+                  {
+                      "path":  "gui_indicator_follow_routine_settings_dialog.py",
+                      "beforeSha256":  "BFF56F0B8A582B0226A780F743D48E86148237D3714B99061D755F1B29A2A96E",
+                      "afterSha256":  "2B2AEBA73BD8E5B41DBAF2A7BAF1FAF42EE099D7003AF95250C0C9F1FAEDD97E"
+                  },
+                  {
+                      "path":  "tests/test_auto_trade_setting_routine_tree.py",
+                      "beforeSha256":  "D0F14F4D93884DE902A7DE5862FBD8F33147D245927C73611CB7E3F74097C28A",
+                      "afterSha256":  "2D431232BB4E8190D5C987E4E18D0E493FFC227FB1A595EAD8525D882894D443"
+                  },
+                  {
+                      "path":  "tests/test_indicator_follow_settings_validation_on_commit.py",
+                      "beforeSha256":  "DE99395515CC154A51E2A6F7879CFEEE1374415C820AA313DDDC7B13DE0070A1",
+                      "afterSha256":  "811CBF7530A82D2325ACA63A92DAA2546BAFCB4563844B8B5035F61DCD6BE9A3"
+                  }
+              ]
+}
