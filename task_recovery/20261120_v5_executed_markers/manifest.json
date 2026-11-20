@@ -1,0 +1,30 @@
+{
+    "createdUtc":  "2026-11-20T11:10:58.8109673Z",
+    "unit":  "20261120_v5_executed_markers",
+    "kind":  "code",
+    "authorization":  "User approved ordinary actual virtual executions as double arrows with outward stacking; exact existing special markers retained",
+    "repo":  "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto",
+    "remote":  "https://github.com/jinkwangchul/kiwoom_auto.git",
+    "branch":  "feat/restore-auto-trade-setting-ui",
+    "baseHead":  "75296031aec709ef032e329db5c5af27a5d928e8",
+    "realIndexSha256":  "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+    "files":  [
+                  {
+                      "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                      "beforeSha256":  "CAA5233A5F2FCB919D79E01AB2AD5984ABD0B4D1E89AEABE2DA9A5B3C949824B",
+                      "afterSha256":  "8A089AEDED3200FAB81A17F551286640A8B164BC02AB4A86878C66A9140EE309"
+                  },
+                  {
+                      "path":  "tests/test_indicator_follow_signal_validation_v5_baseline.py",
+                      "beforeSha256":  "52FC1CC09AF43FC840F383A9B7F897C6DA1CEC59C686023A74A9F823149BD68D",
+                      "afterSha256":  "D1B7F97D854C5B1FFF0D9689B0086B12E6099EC9A76CDB7171C0E583B02BD594"
+                  }
+              ],
+    "patchSha256":  "16E1FBCA6FCB1464915E9A6A70B51D1D46840FD5B6BF1917CB6271F632BDD3D0",
+    "replay":  "PASS: git -c core.autocrlf=false apply --check and apply --binary in disposable exact-baseline copy; every replay byte SHA equals after/live SHA",
+    "baseline":  "Exact scoped pre-change archived files. This is a delta requiring those exact before files; not a standalone runnable checkout or fresh full restore point.",
+    "restore":  "Use a disposable copy of exact before files outside any Git repository. Run git -c core.autocrlf=false apply --check --binary --whitespace=nowarn changes.patch, then apply --binary with the same config. Verify after SHA before any intentional live restoration.",
+    "evidenceRoot":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_executed_markers_20261120",
+    "verification":  "See final_validation.json and final_audits.json; source scope and preserved Git/INI in scope_check_final.json. No live GUI restart, TR, or orders.",
+    "scopeLimitation":  "Python path/length/mtime metadata check does not rule out same-length preserved-mtime content changes elsewhere."
+}

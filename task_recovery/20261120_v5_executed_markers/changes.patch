@@ -1,0 +1,339 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_window.py b/gui_indicator_follow_signal_validation_v5_window.py
+index 4ece66b..861c781 100644
+--- a/gui_indicator_follow_signal_validation_v5_window.py
++++ b/gui_indicator_follow_signal_validation_v5_window.py
+@@ -2256,8 +2256,11 @@ class IndicatorFollowSignalValidationChartCanvas(
+ 
+     def set_marker_records(self, markers: list[dict[str, Any]]) -> None:
+         """Publish marker ownership immediately, without rebuilding indicator series."""
++        self._cancel_cycle_label_preview()
+         self._markers = deepcopy(markers)
+         self._rebuild_marker_index()
++        self._static_chart_cache = None
++        self._static_chart_cache_key = None
+         valid_keys = {
+             (m["evaluation_index"], m["side"]) for m in self._markers
+             if isinstance(m.get("evaluation_index"), int)
+@@ -3189,7 +3192,9 @@ class IndicatorFollowSignalValidationChartCanvas(
+             if y is None:
+                 continue
+             x = self._x_for_index(index)
+-            blockers.append(QRectF(x - 10.0, y - 12.0, 20.0, 24.0))
++            glyph_ys = self._marker_glyph_ys(marker, scale)
++            blockers.append(QRectF(x - 10.0, min(glyph_ys) - 12.0,
++                                   20.0, max(glyph_ys) - min(glyph_ys) + 24.0))
+ 
+         price_legend_layout = self._price_legend_layout(scale, self.font())
+         if price_legend_layout:
+@@ -3353,7 +3358,8 @@ class IndicatorFollowSignalValidationChartCanvas(
+         content_key = (
+             tuple((candle.get("high"), candle.get("low"), candle.get("close"))
+                   for candle in self._candles[visible_start:visible_end]),
+-            tuple((type(marker.get("evaluation_index")), marker.get("evaluation_index"), marker.get("side"))
++            tuple((type(marker.get("evaluation_index")), marker.get("evaluation_index"), marker.get("side"),
++                   self._marker_glyph_ys(marker, resolved_scale))
+                   for marker in self._markers),
+             tuple(tuple(record.items()) for record in line_records),
+         )
+@@ -4489,6 +4495,22 @@ class IndicatorFollowSignalValidationChartCanvas(
+                 for _order, marker in self._markers_by_index.get(index, ())) else 0)
+         )
+ 
++    def _marker_glyph_ys(
++        self, marker: Mapping[str, Any], scale: _ValidationPriceScale | None,
++    ) -> tuple[float, ...]:
++        key = self._marker_key(marker)
++        if key is None:
++            return ()
++        index, side = key
++        y = self._marker_y(index, side, scale)
++        if y is None:
++            return ()
++        if (side in {"BUY", "SELL"} and marker.get("ordinary_execution_fills")
++                and not marker.get("virtual_liquidation")):
++            # Ten-pixel triangles have a 3px internal gap; type offsets stay separate.
++            return (y, y + (13.0 if side == "BUY" else -13.0))
++        return (y,)
++
+     def _marker_at(self, x: float, y: float) -> dict[str, Any] | None:
+         scale = self.price_scale()
+         if scale is None:
+@@ -4518,7 +4540,12 @@ class IndicatorFollowSignalValidationChartCanvas(
+             if marker_y is None:
+                 continue
+             marker_x = self._x_for_index(index)
+-            if abs(x - marker_x) <= 7 and abs(y - marker_y) <= 11:
++            glyph_ys = self._marker_glyph_ys(marker, scale)
++            top, bottom = marker_y - 11, marker_y + 11
++            if len(glyph_ys) == 2:
++                top = min(top, glyph_ys[1] - (8 if side == "BUY" else 2))
++                bottom = max(bottom, glyph_ys[1] + (2 if side == "BUY" else 8))
++            if abs(x - marker_x) <= 7 and top <= y <= bottom:
+                 return marker
+         return None
+ 
+@@ -7871,7 +7898,8 @@ class IndicatorFollowSignalValidationChartCanvas(
+             else:
+                 painter.setPen(marker_pens[marker_side])
+                 painter.setBrush(marker_brushes[marker_side])
+-            painter.drawPolygon(marker_shapes[marker_side].translated(x, y))
++            for glyph_y in self._marker_glyph_ys(marker, scale):
++                painter.drawPolygon(marker_shapes[marker_side].translated(x, glyph_y))
+         painter.restore()
+ 
+         self._draw_completed_cycle_average_labels(painter, scale)
+@@ -13068,12 +13096,12 @@ class IndicatorFollowSignalValidationV5Window(
+                     if self._range_replay_entries_available else self._result_settings_snapshot)
+         policy = snapshot.to_dict().get("validation_execution", {}) if snapshot is not None else {}
+         policy = self._v5_virtual_price_policy(policy)
++        candles, entries, indexes = self._validation_range_execution_projection()
++        simulation = simulate_validation_execution(
++            candles, entries, policy,
++            force_liquidation_at_end=self.validation_range_liquidation_check.isChecked(),
++        )
+         if policy.get("lot_limit_enabled"):
+-            candles, entries, indexes = self._validation_range_execution_projection()
+-            simulation = simulate_validation_execution(
+-                candles, entries, policy,
+-                force_liquidation_at_end=self.validation_range_liquidation_check.isChecked(),
+-            )
+             records = v5_lot_limit_marker_records(simulation, indexes)
+             existing_sells = {
+                 (record["evaluation_index"], record["side"])
+@@ -13095,15 +13123,32 @@ class IndicatorFollowSignalValidationV5Window(
+                     virtual_limit=False, provenance="configured_expression",
+                 ))
+                 existing_sells.add((display_index, "SELL"))
+-            return records
+-        manual_entries = self._marker_entries_for_display()
+-        if manual_entries:
+-            self._ensure_signal_tooltips_current()
+-        records = _marker_records(self._candles, manual_entries, self._signal_tooltips)
++        else:
++            manual_entries = self._marker_entries_for_display()
++            if manual_entries:
++                self._ensure_signal_tooltips_current()
++            records = _marker_records(self._candles, manual_entries, self._signal_tooltips)
++            for record in records:
++                record["provenance"] = "manual"
++                title, separator, rest = record["tooltip"].partition(" ")
++                record["tooltip"] = {"BUY": "\uB9E4\uC218", "SELL": "\uB9E4\uB3C4"}.get(title, title) + separator + rest
++        ordinary_fills: dict[tuple[int, str, str], list[Any]] = {}
++        for fill in simulation.fills:
++            local_index = fill.evaluation_index
++            if (fill.quantity <= 0 or isinstance(local_index, bool)
++                    or not isinstance(local_index, int) or not 0 <= local_index < len(indexes)
++                    or fill.side not in {"BUY", "SELL"}
++                    or (fill.side == "SELL" and fill.reason not in {"SINGLE_HOGA", "INDICATOR_RESIDUAL"})):
++                continue
++            display_index = indexes[local_index]
++            if str(self._candles[display_index].get("time") or "") != fill.evaluation_time:
++                continue
++            key = (display_index, fill.side, fill.evaluation_time)
++            ordinary_fills.setdefault(key, []).append(replace(fill, evaluation_index=display_index))
+         for record in records:
+-            record["provenance"] = "manual"
+-            title, separator, rest = record["tooltip"].partition(" ")
+-            record["tooltip"] = {"BUY": "\uB9E4\uC218", "SELL": "\uB9E4\uB3C4"}.get(title, title) + separator + rest
++            key = (record["evaluation_index"], record["side"], record.get("evaluation_time", ""))
++            if key in ordinary_fills:
++                record["ordinary_execution_fills"] = tuple(ordinary_fills[key])
+         return records
+ 
+     def _clip_comparison_cache(self, descriptors, cache):
+@@ -17008,10 +17053,7 @@ class IndicatorFollowSignalValidationV5Window(
+ 
+     def _on_validation_range_liquidation_changed(self, *_args) -> None:
+         self._refresh_validation_range_results(refresh_tooltips=False)
+-        snapshot = (self._range_replay_settings_snapshot
+-                    if self._range_replay_entries_available else self._result_settings_snapshot)
+-        if snapshot is not None and snapshot.to_dict().get("validation_execution", {}).get("lot_limit_enabled"):
+-            self.canvas.set_marker_records(self._chart_marker_records())
++        self.canvas.set_marker_records(self._chart_marker_records())
+ 
+     def _on_regular_session_marking_changed(self, checked: bool) -> None:
+         self._v5_regular_session_marking_only = bool(checked)
+diff --git a/tests/test_indicator_follow_signal_validation_v5_baseline.py b/tests/test_indicator_follow_signal_validation_v5_baseline.py
+index 4b19e69..8aab1e5 100644
+--- a/tests/test_indicator_follow_signal_validation_v5_baseline.py
++++ b/tests/test_indicator_follow_signal_validation_v5_baseline.py
+@@ -2277,6 +2277,179 @@ def test_v5_stop_loss_reason_survives_offset_sparse_and_frozen_rebuild(case):
+     assert window.canvas._liquidation_marker_records() == []
+ 
+ 
++@pytest.mark.parametrize("lot_enabled", [False, True])
++def test_v5_executed_arrow_projection_uses_positive_ordinary_fills(case, lot_enabled):
++    from dataclasses import replace
++    from tests.test_v5_lot_limit_execution import ON, candles as price_candles
++    rows = price_candles([100, 100, 100, 100, 90, 90, 100, 80, 80])
++    rows[3]["display_only_special"] = rows[5]["display_only_special"] = True
++    signals = (("BUY", 2), ("BUY", 4), ("SELL", 6), ("BUY", 7), ("SELL", 8))
++    window = _stop_display_window(case, rows, signals,
++                                  {**ON, "lot_limit_enabled": lot_enabled}, bounds=(2, 8))
++    financials = deepcopy(window.completed_cycles)
++    records = window._chart_marker_records()
++    ordinary = [r for r in records if r.get("ordinary_execution_fills")]
++    signals_to_keys = [(index, side) for side, index in signals]
++    assert {(r["evaluation_index"], r["side"]) for r in ordinary} == set(signals_to_keys)
++    assert len(ordinary) == len(signals_to_keys)
++    for record in ordinary:
++        for fill in record["ordinary_execution_fills"]:
++            assert (fill.evaluation_index, fill.side, fill.evaluation_time) == (
++                record["evaluation_index"], record["side"], rows[record["evaluation_index"]]["time"])
++            assert fill.quantity > 0
++            assert fill.reason not in {"LOT_LIMIT_TARGET", "STOP_LOSS", "RANGE_END_LIQUIDATION"}
++    assert [r["ordinary_execution_fills"][0].buy_round for r in ordinary if r["side"] == "BUY"] == [1, 2, 1]
++    assert window.completed_cycles == financials
++    if lot_enabled:
++        targets = [r for r in records if r["side"] == "LIMIT_SELL"]
++        assert len(targets) == 1 and targets[0]["evaluation_index"] == 6
++        assert targets[0]["quantity"] == 1 and not targets[0].get("ordinary_execution_fills")
++        assert any(r["evaluation_index"] == 6 and r["side"] == "SELL" for r in ordinary)
++        terminal = _stop_display_window(case, price_candles([100, 90]), (("BUY", 0),), ON, forced=True)
++        residual = next(r for r in terminal._chart_marker_records() if r["side"] == "SELL")
++        assert residual["virtual_residual"] and not residual.get("ordinary_execution_fills")
++        return
++    original = [{k: v for k, v in r.items() if k != "ordinary_execution_fills"} for r in records]
++    first = ordinary[0]["ordinary_execution_fills"][0]
++    sell = next(r for r in ordinary if r["side"] == "SELL")["ordinary_execution_fills"][0]
++    _, _, indexes = window._validation_range_execution_projection()
++    invalid = [replace(first, evaluation_index=indexes.index(first.evaluation_index), quantity=0),
++               replace(first, evaluation_index=indexes.index(first.evaluation_index), evaluation_time="wrong"),
++               *(replace(sell, evaluation_index=indexes.index(sell.evaluation_index), reason=reason)
++                 for reason in ("LOT_LIMIT_TARGET", "STOP_LOSS", "RANGE_END_LIQUIDATION"))]
++    with patch.object(window_module, "simulate_validation_execution",
++                      return_value=SimpleNamespace(fills=invalid)):
++        unfilled = window._chart_marker_records()
++    assert unfilled == original  # Same signals/tooltips; no false execution proof.
++
++
++@pytest.mark.parametrize("side", ["BUY", "SELL"])
++@pytest.mark.parametrize("executed", [False, True])
++@pytest.mark.parametrize("clip", ["none", "top", "bottom"])
++def test_v5_executed_arrow_render_stack_hit_and_clipping(case, side, executed, clip):
++    from PyQt5.QtGui import QPainter, QPixmap
++    from tests.test_v5_lot_limit_execution import candles as price_candles
++    rows = price_candles([100] * 8)
++    window = _stop_display_window(case, rows, (("BUY", 2), ("SELL", 6)), {})
++    record = deepcopy(next(r for r in window._chart_marker_records() if r["side"] == side))
++    if not executed:
++        record.pop("ordinary_execution_fills")
++    index = record["evaluation_index"]
++    markers = [record]
++    if side == "SELL":
++        markers.append(dict(evaluation_index=index, side="LIMIT_SELL", tooltip="target"))
++    canvas = window.canvas
++    canvas.resize(800, 400)
++    canvas.set_marker_records(markers)
++    scale = canvas.price_scale()
++    plot = canvas._price_plot_rect(scale)
++    anchor = {"none": plot.center().y(), "top": plot.top() + 10,
++              "bottom": plot.bottom() - 10}[clip]
++    original_y = canvas._marker_y
++    def fixed_y(i, kind, supplied_scale=None):
++        return anchor + (30 if kind == "LIMIT_SELL" else 0)
++    polygons, clips = [], []
++    class RecordingPainter(QPainter):
++        def setClipRect(self, rect, *args):
++            clips.append(QRectF(rect))
++            return super().setClipRect(rect, *args)
++        def drawPolygon(self, polygon):
++            polygons.append((self.brush().color().name(), [(p.x(), p.y()) for p in polygon]))
++            return super().drawPolygon(polygon)
++    pixmap = QPixmap(canvas.size())
++    pixmap.fill(window_module.Qt.transparent)
++    painter = RecordingPainter(pixmap)
++    with patch.object(canvas, "_marker_y", side_effect=fixed_y), \
++            patch.object(window_module, "simulate_validation_execution", side_effect=AssertionError("paint/hit simulation")):
++        try:
++            canvas._paint_static_chart(painter, scale)
++        finally:
++            painter.end()
++        color = (window_module._BUY if side == "BUY" else window_module._SELL).name()
++        arrows = [points for fill, points in polygons if fill == color]
++        assert len(arrows) == (2 if executed else 1)
++        x = canvas._x_for_index(index)
++        assert all(points[0][0] == x for points in arrows)
++        assert arrows[0][0][1] == anchor + (-8 if side == "BUY" else 8)
++        if executed:
++            shift = 13 if side == "BUY" else -13
++            assert arrows[1] == [(px, py + shift) for px, py in arrows[0]]
++            assert abs(arrows[1][0][1] - arrows[0][1][1]) == 3
++        white = [points for fill, points in polygons if fill == "#ffffff"]
++        assert len(white) == (1 if side == "SELL" else 0)
++        if side == "SELL":
++            assert min(py for _, py in white[0]) - max(py for _, py in arrows[0]) == 20
++            gap_y = anchor + 18
++            if plot.contains(window_module.QPointF(x, gap_y)):
++                assert canvas._marker_at(x, gap_y) is None
++        sample_ys = [anchor, *(py for points in arrows for _, py in points)]
++        if executed:
++            sample_ys.append(anchor + (3.5 if side == "BUY" else -3.5))
++        for y in sample_ys:
++            hit = canvas._marker_at(x, y)
++            if plot.contains(window_module.QPointF(x, y)):
++                assert hit is not None and canvas._marker_key(hit) == (index, side)
++                assert hit["tooltip"] == record["tooltip"]
++            else:
++                assert hit is None
++        assert plot in clips
++        if clip != "none":
++            image = pixmap.toImage()
++            for y in (int(plot.top()) - 1, int(plot.bottom()) + 1):
++                assert image.pixelColor(round(x), y).name() != color
++    if side == "SELL":
++        assert original_y(index, "SELL", scale) == original_y(index, "LIMIT_SELL", scale) - 30
++    assert canvas.marker_records() == markers
++
++
++def test_v5_executed_arrow_label_cache_republication_and_reprojection(case):
++    from tests.test_v5_lot_limit_execution import candles as price_candles
++    rows = price_candles([100, 100, 100, 100, 90, 90, 110])
++    rows[3]["display_only_special"] = rows[5]["display_only_special"] = True
++    window = _stop_display_window(case, rows, (("BUY", 2), ("BUY", 4), ("SELL", 6)), {}, bounds=(2, 6))
++    canvas = window.canvas
++    canvas.resize(800, 400)
++    records = window._chart_marker_records()
++    singles = [{k: v for k, v in r.items() if k != "ordinary_execution_fills"} for r in records]
++    canvas.set_marker_records(singles)
++    scale = canvas.price_scale()
++    canvas.completed_cycle_average_label_records(scale)
++    single_key = canvas._completed_cycle_label_cache_key
++    single_blockers = canvas._completed_cycle_label_blockers(scale)
++    canvas._static_chart_cache = object()
++    canvas._static_chart_cache_key = object()
++    canvas._pinned_marker_key = (2, "BUY")
++    canvas.set_marker_records(records)
++    assert canvas._static_chart_cache is None and canvas._static_chart_cache_key is None
++    assert canvas._pinned_marker_key == (2, "BUY")
++    canvas.completed_cycle_average_label_records(scale)
++    assert canvas._completed_cycle_label_cache_key != single_key
++    double_blockers = canvas._completed_cycle_label_blockers(scale)
++    for i in range(len(single_blockers)):
++        assert double_blockers[i].contains(single_blockers[i])
++    assert any(b.height() == a.height() + 13 for a, b in zip(single_blockers, double_blockers))
++    cycles = deepcopy(window.completed_cycles)
++    with patch.object(window_module.QTimer, "singleShot"):
++        window._on_validation_range_liquidation_changed()
++        assert canvas.marker_records() == records
++        window._select_virtual_fill_price_basis("OHLC4")
++        assert {(r["evaluation_index"], r["side"]) for r in canvas.marker_records()
++                if r.get("ordinary_execution_fills")} == {(2, "BUY"), (4, "BUY"), (6, "SELL")}
++    assert window.completed_cycles == cycles
++    window._refresh_marking_projection()
++    assert all(r.get("ordinary_execution_fills") for r in canvas.marker_records())
++    assert all(type(c.cycle_number) is int for c in window.completed_cycles)
++    window._set_validation_range(None, None)
++    assert not any(r.get("ordinary_execution_fills") for r in canvas.marker_records())
++    window._set_validation_range(2, 6)
++    window._range_replay_entries_available = True
++    window._range_replay_entries = _stop_display_entries(rows, ("BUY", 2), ("BUY", 4), ("SELL", 6))
++    window._range_replay_settings_snapshot = window_module.ValidationSettingsSnapshot({"validation_execution": {}})
++    window._refresh_marking_projection()
++    assert {(r["evaluation_index"], r["side"]) for r in canvas.marker_records()
++            if r.get("ordinary_execution_fills")} == {(2, "BUY"), (4, "BUY"), (6, "SELL")}
++
++
+ def test_v5_selected_end_time_label_uses_exact_bar_and_follows_view(case):
+     rows = candles(8)
+     rows[7]["time"] = "20261027163300"
