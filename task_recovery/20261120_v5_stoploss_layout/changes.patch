@@ -1,0 +1,60 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_window.py b/gui_indicator_follow_signal_validation_v5_window.py
+index 89850b2..4ece66b 100644
+--- a/gui_indicator_follow_signal_validation_v5_window.py
++++ b/gui_indicator_follow_signal_validation_v5_window.py
+@@ -9736,6 +9736,55 @@ class IndicatorFollowSignalValidationV5Window(
+             )
+             layout.insertWidget(layout.indexOf(clear), button)
+             setattr(self, f"{side}_expr_backspace_button", button)
++            if side == "sell":
++                from PyQt5.QtWidgets import QStyle, QStyleOptionButton
++
++                panel = self.sell_stop_loss_check.parentWidget()
++                check = self.sell_stop_loss_check
++                separator = self._new_basic_header_spaced_separator()
++                separator.setParent(header)
++                separator.ensurePolished()
++                clear.ensurePolished()
++                check.ensurePolished()
++                metrics = separator.fontMetrics()
++                bounds = metrics.tightBoundingRect("|")
++                glyph_left = (
++                    separator.contentsRect().left()
++                    + (separator.contentsRect().width() - metrics.horizontalAdvance("|")) // 2
++                    + bounds.left()
++                )
++                glyph_right = glyph_left + bounds.width()
++                clear_option = QStyleOptionButton()
++                clear.initStyleOption(clear_option)
++                clear_contents = clear.style().subElementRect(
++                    QStyle.SE_PushButtonContents, clear_option, clear)
++                clear_frame_width = clear.style().pixelMetric(
++                    QStyle.PM_DefaultFrameWidth, clear_option, clear)
++                clear_right_inset = (
++                    clear_option.rect.right() - clear_contents.right() - clear_frame_width
++                )
++                option = QStyleOptionButton()
++                check.initStyleOption(option)
++                indicator_left = check.style().subElementRect(
++                    QStyle.SE_CheckBoxIndicator, option, check).left()
++                group = QHBoxLayout()
++                group.setContentsMargins(0, 0, 0, 0)
++                group.setSpacing(0)
++                index = layout.indexOf(clear)
++                layout.removeWidget(clear)
++                layout.removeWidget(panel)
++                group.addWidget(clear)
++                # Gaps run from the button frame to pipe ink, then to the indicator.
++                group.addSpacing(
++                    clear.fontMetrics().horizontalAdvance("가" * 5)
++                    - clear_right_inset - glyph_left)
++                group.addWidget(separator)
++                group.addSpacing(
++                    check.fontMetrics().horizontalAdvance("가" * 3)
++                    - (separator.width() - glyph_right)
++                    - panel.layout().contentsMargins().left() - indicator_left)
++                group.addWidget(panel)
++                layout.insertLayout(index, group)
+ 
+     def _backspace_expression_token(self, line) -> None:
+         expression = line.text()

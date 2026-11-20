@@ -1,0 +1,305 @@
+{
+    "status":  "DELTA_REPLAY_VERIFIED",
+    "kind":  "code",
+    "createdUtc":  "2026-11-20T10:24:59.4358306Z",
+    "repository":  "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto",
+    "remote":  "https://github.com/jinkwangchul/kiwoom_auto.git",
+    "originalBranch":  "feat/restore-auto-trade-setting-ui",
+    "originalHead":  "75296031aec709ef032e329db5c5af27a5d928e8",
+    "originalIndexSha256":  "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+    "baseline":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_layout_20261120_5_3\\code_before",
+    "sourceBaselineReceipt":  {
+                                  "kind":  "exact_existing_archive_source_baseline_reuse",
+                                  "scopeCount":  1,
+                                  "files":  [
+                                                {
+                                                    "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                                                    "sha256":  "C58A229D4BB1C1E8E0A7D19F1AE1D4281534AB87F7B6813C7643905C398227AE",
+                                                    "archivedSource":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\code_delta_final\\after\\gui_indicator_follow_signal_validation_v5_window.py",
+                                                    "beforePath":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_layout_20261120_5_3\\code_before\\gui_indicator_follow_signal_validation_v5_window.py"
+                                                }
+                                            ],
+                                  "freshFullRestorePointCreated":  false,
+                                  "guiStopped":  false,
+                                  "iniPath":  "C:\\Users\\JIN KWANG CHUL\\AppData\\Roaming\\jinkwangchul\\kiwoom_auto.ini",
+                                  "iniSha256":  "CC9751497AA4FE190162FD44FB117EEA979A2091EE984B40DC71D33E5ECB5918",
+                                  "createdUtc":  "2026-11-20T09:47:23.2670037Z",
+                                  "scopeGuard":  "Before/after complete Python path/size/mtime inventory plus exact allowed source before/diff/SHA. Metadata cannot prove against same-size/same-mtime content tampering."
+                              },
+    "files":  [
+                  {
+                      "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                      "beforeSha256":  "C58A229D4BB1C1E8E0A7D19F1AE1D4281534AB87F7B6813C7643905C398227AE",
+                      "afterSha256":  "CAA5233A5F2FCB919D79E01AB2AD5984ABD0B4D1E89AEABE2DA9A5B3C949824B"
+                  }
+              ],
+    "patchSha256":  "B992CB5EE03F21C82584DCADBD8065B10BA658ADE61FA6A00AE4D74D5E11A18F",
+    "verification":  {
+                         "status":  "SCOPED_IMPLEMENTATION_AND_OFFLINE_VERIFICATION_PASS",
+                         "approval":  "구분자 | 넣고 구분자 좌측 5글자폭 우측 3글자폭으로 ㄱㄱ",
+                         "scope":  "One V5 sell-row layout branch; existing stop-loss panel after Clear, with 5-character gap, pipe, 3-character gap, then final stretch.",
+                         "primaryAnalysis":  {
+                                                 "actualCli":  true,
+                                                 "pid":  64028,
+                                                 "session":  "01a1f71f-a2b1-7b22-a981-107a5fb4e564",
+                                                 "model":  "gpt-6-astra",
+                                                 "effort":  "ultra",
+                                                 "mode":  "read-only",
+                                                 "exitCode":  0,
+                                                 "evidence":  "primary_plan_64028.txt"
+                                             },
+                         "firstAttempt":  {
+                                              "actualCli":  true,
+                                              "pid":  42244,
+                                              "session":  "01a1f85f-b7bd-7171-b3a9-c746fef27a42",
+                                              "model":  "gpt-6.1-sol",
+                                              "effort":  "high",
+                                              "processExitCode":  0,
+                                              "taskResult":  "FAILED_AND_OWN_DELTA_RESTORED",
+                                              "reportedSeconds":  324.87,
+                                              "existingTestExit":  1,
+                                              "geometryExit":  1,
+                                              "failure":  "ValueError min() arg is an empty sequence during creation",
+                                              "restoredSha256":  "C58A229D4BB1C1E8E0A7D19F1AE1D4281534AB87F7B6813C7643905C398227AE",
+                                              "doNotCountAsPass":  true
+                                          },
+                         "focusedFailureAnalysis":  {
+                                                        "actualCli":  true,
+                                                        "pid":  25356,
+                                                        "session":  "01a1f865-4047-75b2-b35d-08f85676c753",
+                                                        "model":  "gpt-6-astra",
+                                                        "effort":  "ultra",
+                                                        "mode":  "read-only",
+                                                        "evidence":  "failure_analysis.txt",
+                                                        "exitCode":  0,
+                                                        "reportedSeconds":  215.11,
+                                                        "finding":  "Empty sampled pixel-column list caused min() ValueError. Underlying alpha-capture reason was not established. Recommendation is to remove construction-time raster sampling and use polished font/style geometry in the same branch."
+                                                    },
+                         "limitations":  [
+                                             "Windows QImage/WA_DontShowOnScreen widget observation and construction regression only. No current live GUI layout verification; original PID2400 changed to9296 without an established initiator.",
+                                             "Existing stop-loss fixture with old label and last-item expectations is out of scope and not normalized.",
+                                             "No production, real order, TR or live GUI restart performed.",
+                                             "Selected exact source archive reused; not a newly created full restore point.",
+                                             "Scope guard uses Python path/size/mtime and exact selected-source SHA; equal-size preserved-mtime changes are not ruled out."
+                                         ],
+                         "correctedImplementation":  {
+                                                         "actualCli":  true,
+                                                         "pid":  57664,
+                                                         "session":  "01a1f85f-b7bd-7171-b3a9-c746fef27a42",
+                                                         "model":  "gpt-6.1-sol",
+                                                         "effort":  "high",
+                                                         "mode":  "workspace-write",
+                                                         "invocationEvidence":  "cli_execution_headers.txt",
+                                                         "exitCode":  1,
+                                                         "exitMeaning":  "Forced termination after geometry_5 had already completed and current source had been written; not reported as a normal successful writer exit.",
+                                                         "reportedSeconds":  355.92,
+                                                         "scope":  "V5 sell branch only, one diff hunk, 49 lines added",
+                                                         "diffEvidence":  "sell_layout_corrected_exact.diff",
+                                                         "diffSha256":  "42AB5BAFED29C72D817728D43C18BA21FD9D2FE69F14A31A3203145880287F5B"
+                                                     },
+                         "correctivePreaudit":  {
+                                                    "status":  "CONDITIONAL_PASS",
+                                                    "importantResolvedByInstruction":  "Astra analysis draft used Clear text ink; rejected that interpretation. Root/independent audit preserved Clear button visible outer-right boundary to pipe visible-left boundary for W5; no text-ink B subtraction.",
+                                                    "reviewer":  "/root/stoploss_layout_technical_audit",
+                                                    "scope":  "Review of failure_analysis.txt only, not final implementation"
+                                                },
+                         "finalSourceSha256":  "CAA5233A5F2FCB919D79E01AB2AD5984ABD0B4D1E89AEABE2DA9A5B3C949824B",
+                         "finalSourceAnalysis":  {
+                                                     "actualCli":  true,
+                                                     "pid":  14560,
+                                                     "session":  "01a1f865-4047-75b2-b35d-08f85676c753",
+                                                     "model":  "gpt-6-astra",
+                                                     "effort":  "ultra",
+                                                     "mode":  "read-only",
+                                                     "exitCode":  0,
+                                                     "seconds":  109.62,
+                                                     "evidence":  "boundary_analysis.txt",
+                                                     "verdict":  "No reason to modify the current sell branch further in the evidenced scope. One pixel is derived from button style contents rect and frame width, not rounding or arbitrary tolerance."
+                                                 },
+                         "finalTests":  [
+                                            {
+                                                "kind":  "Existing header pipe regression",
+                                                "pid":  22836,
+                                                "passed":  1,
+                                                "seconds":  1.69,
+                                                "exitCode":  0,
+                                                "evidence":  "header_test_final_dc_receipt.json",
+                                                "selector":  "tests/test_indicator_follow_signal_validation_v5_baseline.py::test_v5_header_pipes_share_spacing_and_separate_liquidation",
+                                                "sourceSha256":  "CAA5233A5F2FCB919D79E01AB2AD5984ABD0B4D1E89AEABE2DA9A5B3C949824B"
+                                            },
+                                            {
+                                                "kind":  "Windows QImage widget geometry with WA_DontShowOnScreen",
+                                                "passed":  true,
+                                                "exitCode":  0,
+                                                "targetPx":  [
+                                                                 80,
+                                                                 54
+                                                             ],
+                                                "observedPx":  [
+                                                                   80,
+                                                                   54
+                                                               ],
+                                                "residualPx":  [
+                                                                   0,
+                                                                   0
+                                                               ],
+                                                "environment":  "Windows, Gulim clear button 8pt / checkbox 9pt / separator 10pt, DPR=1",
+                                                "identityValuesReceiversPreserved":  true,
+                                                "signalsDuringMove":  [
+
+                                                                      ],
+                                                "orderAndStretchPreserved":  true,
+                                                "spacing":  {
+                                                                "header":  8,
+                                                                "local":  0,
+                                                                "panel":  4
+                                                            },
+                                                "separatorSize":  [
+                                                                      18,
+                                                                      30
+                                                                  ],
+                                                "evidence":  "sell_layout_corrected_geometry_5.json",
+                                                "sourceSha256":  "CAA5233A5F2FCB919D79E01AB2AD5984ABD0B4D1E89AEABE2DA9A5B3C949824B"
+                                            }
+                                        ],
+                         "intermediateGeometryFailures":  [
+                                                              "1: native offscreen plugin had no sampled glyph pixels; constructor and identity checks succeeded",
+                                                              "2: left gap 81 versus target80; right54 matched",
+                                                              "3: style layout-item rect was empty; left37 versus80",
+                                                              "4: left81 versus80"
+                                                          ],
+                         "independentTechnicalAudit":  {
+                                                           "reviewer":  "/root/stoploss_layout_technical_audit",
+                                                           "model":  "gpt-6-astra",
+                                                           "effort":  "ultra",
+                                                           "status":  "SCOPED_PASS",
+                                                           "critical":  0,
+                                                           "important":  0,
+                                                           "scope":  "Exact final diff, geometry5, existing test receipt, actual primary analysis. No source mutations or test execution by reviewer."
+                                                       },
+                         "guiProcessChange":  {
+                                                  "originalPid":  2400,
+                                                  "originalProcessPreserved":  false,
+                                                  "newPid":  9296,
+                                                  "newStartKst":  "2026-11-20 19:14:47",
+                                                  "parentPid":  62736,
+                                                  "parentName":  "explorer.exe",
+                                                  "initiatorAndReason":  "Not established",
+                                                  "iniHashUnchanged":  true,
+                                                  "coordinatorCommandAudit":  "37 actual CLI exec commands contained no gui_main launch, PID2400 termination, Stop-Process, taskkill or TerminateProcess; force_terminate target was 57664 only. This is a coordinator audit of recorded command logs."
+                                              },
+                         "independentScopeAudit":  {
+                                                       "status":  "SCOPED_PASS",
+                                                       "reviewer":  "/root/stoploss_layout_scope_audit",
+                                                       "model":  "gpt-6.1-terra",
+                                                       "effort":  "high",
+                                                       "scope":  "Contract, final source/settings/Git/process receipts and reporting boundaries. Not an independent implementation re-test.",
+                                                       "qualification":  "Reviewed test receipt exit0 and matching source SHA; detailed 1-passed timing output was verified by root/DC and technical auditor, not independently by this scope reviewer."
+                                                   },
+                         "completionBasis":  "Verified current source plus final geometry, DC existing regression, actual CLI Astra analysis and independent technical/scope audits; not the forced writer process exit status.",
+                         "administrativeCorrections":  [
+                                                           "PowerShell array-wrapper issue in metadata comparison corrected using the original before/after captures; no application files changed by the correction.",
+                                                           "Initial disposable patch replay used system core.autocrlf=true and converted LF to CRLF. Replayed from exact baseline with per-command core.autocrlf=false; byte-exact final SHA matched. No live files or Git configuration changed."
+                                                       ]
+                     },
+    "scopeCheck":  {
+                       "status":  "SCOPED_SOURCE_SETTINGS_AND_GIT_PASS_GUI_PROCESS_CHANGED",
+                       "createdUtc":  "2026-11-20T10:13:45.1206899Z",
+                       "sourcePath":  "gui_indicator_follow_signal_validation_v5_window.py",
+                       "sourceSha256":  "CAA5233A5F2FCB919D79E01AB2AD5984ABD0B4D1E89AEABE2DA9A5B3C949824B",
+                       "pythonMetadata":  {
+                                              "beforeCount":  2600,
+                                              "afterCount":  2600,
+                                              "added":  [
+
+                                                        ],
+                                              "removed":  [
+
+                                                          ],
+                                              "changed":  [
+                                                              {
+                                                                  "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                                                                  "beforeLength":  759619,
+                                                                  "afterLength":  762123,
+                                                                  "beforeLastWriteUtc":  "2026-11-20T08:49:57.0087158Z",
+                                                                  "afterLastWriteUtc":  "2026-11-20T10:10:03.2131199Z"
+                                                              }
+                                                          ],
+                                              "outsideScopeChanged":  [
+
+                                                                      ]
+                                          },
+                       "git":  [
+                                   {
+                                       "repository":  "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto",
+                                       "head":  "75296031aec709ef032e329db5c5af27a5d928e8",
+                                       "branch":  "feat/restore-auto-trade-setting-ui",
+                                       "indexSha256":  "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+                                       "headPreserved":  true,
+                                       "branchPreserved":  true,
+                                       "indexPreserved":  true,
+                                       "beforeStatusCount":  7760,
+                                       "afterStatusCount":  7760,
+                                       "statusDifferenceCount":  0,
+                                       "statusDifferences":  [
+
+                                                             ]
+                                   },
+                                   {
+                                       "repository":  "C:\\Users\\JIN KWANG CHUL\\Documents\\docs",
+                                       "head":  "d8667b52f3bdd362a3140f26a73369b7b1d5f6ca",
+                                       "branch":  "agent/project-prompt-standard",
+                                       "indexSha256":  "7BAE7B0654E85589D4EFD2DBDE45E789DAD54757BC9BF60D77705B72AAC7B1BA",
+                                       "headPreserved":  true,
+                                       "branchPreserved":  true,
+                                       "indexPreserved":  true,
+                                       "beforeStatusCount":  225,
+                                       "afterStatusCount":  225,
+                                       "statusDifferenceCount":  0,
+                                       "statusDifferences":  [
+
+                                                             ]
+                                   }
+                               ],
+                       "ini":  {
+                                   "path":  "C:\\Users\\JIN KWANG CHUL\\AppData\\Roaming\\jinkwangchul\\kiwoom_auto.ini",
+                                   "sha256":  "CC9751497AA4FE190162FD44FB117EEA979A2091EE984B40DC71D33E5ECB5918",
+                                   "unchanged":  true
+                               },
+                       "gui":  null,
+                       "originalGuiProcessPreserved":  false,
+                       "limitation":  "Python scope comparison uses path, length and mtime; it cannot detect content changes made with both equal size and preserved timestamp. Only selected source SHA and exact delta are content-verified.",
+                       "comparisonCorrection":  "Corrected PowerShell JSON array wrapping in administrative comparison only; reused the exact before/after metadata captures. No source, settings or Git changes.",
+                       "sourceSettingsGitPreservationPass":  true,
+                       "currentGuiObservation":  {
+                                                     "checkedUtc":  "2026-11-20T10:15:53.1970335Z",
+                                                     "oldPid2400Present":  false,
+                                                     "oldPidProcessName":  null,
+                                                     "currentProjectGuiProcesses":  [
+                                                                                        {
+                                                                                            "ProcessId":  9296,
+                                                                                            "ParentProcessId":  62736,
+                                                                                            "CreationDate":  "\/Date(1795169687381)\/",
+                                                                                            "CommandLine":  "\"C:\\Users\\JIN KWANG CHUL\\AppData\\Local\\Programs\\Python\\Python311-32\\pythonw.exe\" \"C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto\\gui_main.py\""
+                                                                                        }
+                                                                                    ],
+                                                     "action":  "Read-only process observation; no termination, launch, GUI interaction or settings action"
+                                                 },
+                       "guiChangeFollowup":  {
+                                                 "checkedUtc":  "2026-11-20T10:17:13.0035858Z",
+                                                 "guiParent":  {
+                                                                   "pid":  62736,
+                                                                   "name":  "explorer.exe",
+                                                                   "createdUtc":  "2026-11-18T23:43:26.8727380Z",
+                                                                   "commandLine":  "C:\\WINDOWS\\Explorer.EXE"
+                                                               },
+                                                 "iniPath":  "C:\\Users\\JIN KWANG CHUL\\AppData\\Roaming\\jinkwangchul\\kiwoom_auto.ini",
+                                                 "iniSha256":  "CC9751497AA4FE190162FD44FB117EEA979A2091EE984B40DC71D33E5ECB5918",
+                                                 "action":  "Read only"
+                                             },
+                       "guiChangeInterpretation":  "Original PID 2400 absent at the metadata check. New gui_main PID 9296 was observed after that check, created 2026-11-20 19:14:47 KST, with explorer.exe parent 62736. Initiator/reason is not established; original GUI process preservation is not claimed. No live UI verification is inferred from source/offscreen evidence.",
+                       "reconciledUtc":  "2026-11-20T10:18:33.3858675Z"
+                   },
+    "restore":  "Apply changes.patch to disposable copies of exact baseline files outside a Git worktree using git -c core.autocrlf=false apply --binary --whitespace=nowarn, then verify each after SHA256. Do not overwrite live files automatically.",
+    "limitation":  "Delta only; exact baseline contents remain local. Not a runnable integrated checkout, new full restore point, or complete device-loss backup."
+}
