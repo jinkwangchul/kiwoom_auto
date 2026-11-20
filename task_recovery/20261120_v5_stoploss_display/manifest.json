@@ -1,0 +1,247 @@
+{
+    "status":  "DELTA_REPLAY_VERIFIED",
+    "repository":  "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto",
+    "remote":  "https://github.com/jinkwangchul/kiwoom_auto.git",
+    "branch":  "feat/restore-auto-trade-setting-ui",
+    "head":  "75296031aec709ef032e329db5c5af27a5d928e8",
+    "baseline":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\code_before",
+    "snapshot":  null,
+    "sourceBaselineReceipt":  {
+                                  "kind":  "exact_existing_archive_source_baseline_reuse",
+                                  "createdUtc":  "2026-11-20T08:39:04.2108478Z",
+                                  "scopeCount":  3,
+                                  "sourceArchiveReused":  true,
+                                  "freshFullRestorePointCreated":  false,
+                                  "guiStopped":  false,
+                                  "previousGuiPid":  34092,
+                                  "previousGuiPidPresent":  false,
+                                  "currentProjectGuiProcesses":  [
+
+                                                                 ],
+                                  "iniPath":  "C:\\Users\\JIN KWANG CHUL\\AppData\\Roaming\\jinkwangchul\\kiwoom_auto.ini",
+                                  "iniSha256":  "CC9751497AA4FE190162FD44FB117EEA979A2091EE984B40DC71D33E5ECB5918",
+                                  "note":  "Source/test baseline copied only from existing exact-hash archives. Not a fresh project snapshot, GUI backup, or INI backup.",
+                                  "files":  [
+                                                {
+                                                    "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                                                    "sha256":  "AA1AD274E3543A014A875E8EFDEC48CE30C249588690DE1BD99F107AC85A736B",
+                                                    "archivedSource":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_execution_20261120\\code_delta_final\\replay\\gui_indicator_follow_signal_validation_v5_window.py",
+                                                    "beforePath":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\code_before\\gui_indicator_follow_signal_validation_v5_window.py"
+                                                },
+                                                {
+                                                    "path":  "tests\\test_v5_lot_limit_ui.py",
+                                                    "sha256":  "48B8956E2662AF8A4577575E4BD85CE2F2F3EFC6C8C85A91FBC01D4E1385EBD3",
+                                                    "archivedSource":  "C:\\kiwoom_restore_points\\snapshots\\20261116_215429_736685_d3eb9f\\payload\\tests\\test_v5_lot_limit_ui.py",
+                                                    "beforePath":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\code_before\\tests\\test_v5_lot_limit_ui.py"
+                                                },
+                                                {
+                                                    "path":  "tests\\test_indicator_follow_signal_validation_v5_baseline.py",
+                                                    "sha256":  "E0C758FEE4577403503F420DF6A54E72A9B0C321F58920FE4819887966EFBA48",
+                                                    "archivedSource":  "C:\\kiwoom_restore_points\\snapshots\\20261120_035827_609761_49ab7b\\payload\\tests\\test_indicator_follow_signal_validation_v5_baseline.py",
+                                                    "beforePath":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\code_before\\tests\\test_indicator_follow_signal_validation_v5_baseline.py"
+                                                }
+                                            ],
+                                  "primaryPlanPresent":  true
+                              },
+    "scopeProtectedUnchanged":  2597,
+    "limitation":  "Delta only. Exact baseline file contents are local, not included remotely. This is not a runnable integrated implementation commit or a full device-loss backup.",
+    "restore":  "Use disposable copies of exact baseline files, preserve bytes and relative paths, apply changes.patch with git apply --binary --whitespace=nowarn, verify every afterSha256. Do not apply to unrelated HEAD or overwrite live working files automatically.",
+    "encoding":  "Raw UTF-8 patch without BOM; source byte encoding and line endings verified by replay SHA256.",
+    "originalIndexSha256":  "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+    "verification":  {
+                         "unit":  "V5 actual STOP_LOSS red downward triangle and n [손절] cycle label",
+                         "status":  "SCOPED_IMPLEMENTATION_AND_OFFLINE_VERIFICATION_PASS",
+                         "approval":  "User ㄱㄱ after explicit display direction confirmation",
+                         "primaryAnalysis":  {
+                                                 "actualCli":  true,
+                                                 "pid":  53424,
+                                                 "model":  "gpt-6-astra",
+                                                 "effort":  "ultra",
+                                                 "mode":  "read-only",
+                                                 "exitCode":  0,
+                                                 "session":  "01a1f71f-a2b1-7b22-a981-107a5fb4e564",
+                                                 "evidence":  "primary_plan_53424.txt"
+                                             },
+                         "implementation":  {
+                                                "actualCli":  true,
+                                                "pid":  51060,
+                                                "model":  "gpt-6.1-sol",
+                                                "effort":  "high",
+                                                "mode":  "workspace-write",
+                                                "exitCode":  0,
+                                                "runtimeSeconds":  716.53,
+                                                "session":  "01a1f7a2-4238-79c2-8efa-13ae5275db84",
+                                                "evidence":  "sol_final_51060.txt"
+                                            },
+                         "focusedTestResults":  [
+                                                    {
+                                                        "suite":  "new projection and offscreen display regressions",
+                                                        "passed":  12,
+                                                        "subtestsPassed":  6,
+                                                        "deselected":  122,
+                                                        "exitCode":  0,
+                                                        "seconds":  14.12,
+                                                        "evidence":  "green_final_51060.txt",
+                                                        "selector":  "StopLossDisplayProjectionTest or stop_loss_display_labels or stop_loss_partial_sale_labels or stop_loss_red_glyph or stop_loss_reason_survives"
+                                                    },
+                                                    {
+                                                        "suite":  "existing adjacent liquidation regressions",
+                                                        "passed":  5,
+                                                        "exitCode":  0,
+                                                        "seconds":  4.06,
+                                                        "evidence":  "green_final_51060.txt",
+                                                        "overlapsFinalNewRegressions":  false
+                                                    }
+                                                ],
+                         "redEvidence":  [
+                                             {
+                                                 "pid":  51060,
+                                                 "offset":  3322,
+                                                 "length":  44,
+                                                 "selector":  "tests/test_v5_lot_limit_ui.py::StopLossDisplayProjectionTest",
+                                                 "reportedResult":  "6 failed, 2 passed, 2 subtests passed in 2.31s",
+                                                 "expectedFailBeforeSourceChange":  true,
+                                                 "subprocessExitCode":  1,
+                                                 "path":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\red_projection_51060.txt"
+                                             },
+                                             {
+                                                 "pid":  51060,
+                                                 "offset":  4256,
+                                                 "length":  65,
+                                                 "selector":  "stop_loss_display_labels or stop_loss_partial_sale_labels or stop_loss_red_glyph or stop_loss_reason_survives",
+                                                 "reportedResult":  "8 failed, 101 deselected in 5.59s",
+                                                 "subprocessExitCode":  1,
+                                                 "qualification":  "Seven display omissions and one newly added frozen-fixture settings identity mismatch; do not count all eight as reproduced product defects.",
+                                                 "path":  "C:\\Users\\JIN KWANG CHUL\\Documents\\project_backups\\v5_stoploss_display_20261120\\red_ui_51060.txt"
+                                             },
+                                             {
+                                                 "stage":  "combined intermediate",
+                                                 "failed":  2,
+                                                 "passed":  10,
+                                                 "subtestsPassed":  6,
+                                                 "deselected":  122,
+                                                 "exitCode":  1,
+                                                 "evidence":  "sol_final_51060.txt",
+                                                 "qualification":  "Two new offscreen fixture issues (viewport and explicit refresh) corrected; independent technical audit found original assertions preserved. Frozen identity setup issue also corrected without weakening production identity checks."
+                                             }
+                                         ],
+                         "independentReview":  {
+                                                   "technical":  {
+                                                                     "reviewer":  "/root/stoploss_guard_audit",
+                                                                     "verdict":  "PASS",
+                                                                     "critical":  0,
+                                                                     "important":  0,
+                                                                     "evidence":  "final_independent_audits.txt"
+                                                                 },
+                                                   "scope":  {
+                                                                 "reviewer":  "/root/stoploss_scope_audit",
+                                                                 "verdict":  "PASS_WITH_REPORTING_LIMITS",
+                                                                 "evidence":  "final_independent_audits.txt",
+                                                                 "qualification":  "Do not equate unchanged trading-rule source scope and offline parity with full runtime proof. Final GUI and Git publication are separate."
+                                                             }
+                                               },
+                         "sourceScopeEvidence":  "final_source_scope_scan.json",
+                         "sourceCountBefore":  2600,
+                         "sourceCountAfter":  2600,
+                         "approvedChangedFiles":  [
+                                                      {
+                                                          "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                                                          "sha256":  "C58A229D4BB1C1E8E0A7D19F1AE1D4281534AB87F7B6813C7643905C398227AE"
+                                                      },
+                                                      {
+                                                          "path":  "tests\\test_indicator_follow_signal_validation_v5_baseline.py",
+                                                          "sha256":  "52FC1CC09AF43FC840F383A9B7F897C6DA1CEC59C686023A74A9F823149BD68D"
+                                                      },
+                                                      {
+                                                          "path":  "tests\\test_v5_lot_limit_ui.py",
+                                                          "sha256":  "DC7C1960DF6A3A6F01C2F494299BE8E457BAB5C994B3C58F357967F89363414A"
+                                                      }
+                                                  ],
+                         "baselineType":  "Exact existing archive source copies reused and hash-matched; not a new full project snapshot",
+                         "configurationQualification":  "INI SHA256 remained CC9751497AA4FE190162FD44FB117EEA979A2091EE984B40DC71D33E5ECB5918. No GUI/configuration operations; no project gui_main.py process observed at final metadata check.",
+                         "runtimeQualification":  "Windows Python 3.11 32-bit and PyQt offscreen only. Frozen-rebuild evaluator result was fixed to test presentation transport. No actual visible GUI event flow, live orders, TR, production activation or whole-project PASS claimed.",
+                         "countingQualification":  "Final new 12 tests and existing adjacent 5 tests are disjoint. Earlier projection 4-test GREEN is contained in the final 12 and must not be added again."
+                     },
+    "scopeVerification":  {
+                              "status":  "SOURCE_SCOPE_PASS",
+                              "sourceScopePassed":  true,
+                              "beforeCount":  2600,
+                              "afterCount":  2600,
+                              "changed":  [
+                                              "gui_indicator_follow_signal_validation_v5_window.py",
+                                              "tests\\test_indicator_follow_signal_validation_v5_baseline.py",
+                                              "tests\\test_v5_lot_limit_ui.py"
+                                          ],
+                              "added":  [
+
+                                        ],
+                              "deleted":  [
+
+                                          ],
+                              "outsideApproved":  [
+
+                                                  ],
+                              "files":  [
+                                            {
+                                                "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                                                "beforeSha256":  "AA1AD274E3543A014A875E8EFDEC48CE30C249588690DE1BD99F107AC85A736B",
+                                                "afterSha256":  "C58A229D4BB1C1E8E0A7D19F1AE1D4281534AB87F7B6813C7643905C398227AE",
+                                                "lastWriteTimeUtc":  "2026-11-20T08:49:57.0087158Z"
+                                            },
+                                            {
+                                                "path":  "tests\\test_indicator_follow_signal_validation_v5_baseline.py",
+                                                "beforeSha256":  "E0C758FEE4577403503F420DF6A54E72A9B0C321F58920FE4819887966EFBA48",
+                                                "afterSha256":  "52FC1CC09AF43FC840F383A9B7F897C6DA1CEC59C686023A74A9F823149BD68D",
+                                                "lastWriteTimeUtc":  "2026-11-20T08:51:06.6093837Z"
+                                            },
+                                            {
+                                                "path":  "tests\\test_v5_lot_limit_ui.py",
+                                                "beforeSha256":  "48B8956E2662AF8A4577575E4BD85CE2F2F3EFC6C8C85A91FBC01D4E1385EBD3",
+                                                "afterSha256":  "DC7C1960DF6A3A6F01C2F494299BE8E457BAB5C994B3C58F357967F89363414A",
+                                                "lastWriteTimeUtc":  "2026-11-20T08:51:08.5171433Z"
+                                            }
+                                        ],
+                              "fullContentHashEvidence":  "sol_scope_proof_51060.txt; actual final CLI PID51060; fresh complete 2600-file comparison, followed by no further code writes",
+                              "orchestratorVerification":  "Reused fresh CLI whole-scope content proof; independently checked current full path inventory, three final file hashes, INI and Git metadata. Did not repeat whole-tree content hashing.",
+                              "iniSha256":  "CC9751497AA4FE190162FD44FB117EEA979A2091EE984B40DC71D33E5ECB5918",
+                              "iniUnchanged":  true,
+                              "configurationQualification":  "INI comparison is independent of source scope. No configuration or GUI mutations were performed by this task.",
+                              "currentProjectGuiProcesses":  [
+
+                                                             ],
+                              "workingState":  {
+                                                   "branch":  "feat/restore-auto-trade-setting-ui",
+                                                   "head":  "75296031aec709ef032e329db5c5af27a5d928e8",
+                                                   "remote":  "https://github.com/jinkwangchul/kiwoom_auto.git",
+                                                   "indexSha256":  "6EE3400A315CC4B8639AE76B1054B826336E70C04E5B5B389DB375CF0BF1A924",
+                                                   "stagedCount":  0,
+                                                   "statusBeforeCount":  7760,
+                                                   "statusAfterCount":  7760,
+                                                   "statusDifference":  [
+
+                                                                        ],
+                                                   "originalGitStatePreserved":  true
+                                               },
+                              "capturedUtc":  "2026-11-20T08:58:31.8117467Z"
+                          },
+    "protected":  [
+
+                  ],
+    "files":  [
+                  {
+                      "path":  "gui_indicator_follow_signal_validation_v5_window.py",
+                      "beforeSha256":  "AA1AD274E3543A014A875E8EFDEC48CE30C249588690DE1BD99F107AC85A736B",
+                      "afterSha256":  "C58A229D4BB1C1E8E0A7D19F1AE1D4281534AB87F7B6813C7643905C398227AE"
+                  },
+                  {
+                      "path":  "tests/test_v5_lot_limit_ui.py",
+                      "beforeSha256":  "48B8956E2662AF8A4577575E4BD85CE2F2F3EFC6C8C85A91FBC01D4E1385EBD3",
+                      "afterSha256":  "DC7C1960DF6A3A6F01C2F494299BE8E457BAB5C994B3C58F357967F89363414A"
+                  },
+                  {
+                      "path":  "tests/test_indicator_follow_signal_validation_v5_baseline.py",
+                      "beforeSha256":  "E0C758FEE4577403503F420DF6A54E72A9B0C321F58920FE4819887966EFBA48",
+                      "afterSha256":  "52FC1CC09AF43FC840F383A9B7F897C6DA1CEC59C686023A74A9F823149BD68D"
+                  }
+              ]
+}

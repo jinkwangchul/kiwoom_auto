@@ -1,0 +1,442 @@
+diff --git a/gui_indicator_follow_signal_validation_v5_window.py b/gui_indicator_follow_signal_validation_v5_window.py
+index 453e2c3..89850b2 100644
+--- a/gui_indicator_follow_signal_validation_v5_window.py
++++ b/gui_indicator_follow_signal_validation_v5_window.py
+@@ -955,6 +955,7 @@ class IndicatorFollowValidationCompletedCycle:
+     buy_cost: float = 0.0
+     trading_cost_amount: float = 0.0
+     is_liquidation: bool = False
++    close_reason: str = ""
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -1711,6 +1712,10 @@ def validation_execution_cycles(
+                 force_liquidation_at_end=force_liquidation_at_end,
+             )
+         )
++    closing_reasons: dict[int, list[str]] = {}
++    for fill in simulation.fills:
++        if fill.side == "SELL" and fill.quantity > 0 and fill.buy_round is None:
++            closing_reasons.setdefault(fill.evaluation_index, []).append(fill.reason)
+     return [
+         IndicatorFollowValidationCompletedCycle(
+             cycle_number=cycle.cycle_number,
+@@ -1726,6 +1731,8 @@ def validation_execution_cycles(
+             buy_cost=cycle.buy_cost,
+             trading_cost_amount=cycle.trading_cost_amount,
+             is_liquidation=cycle.is_liquidation,
++            close_reason=(closing_reasons[cycle.sell_index].pop(0)
++                          if closing_reasons.get(cycle.sell_index) else ""),
+         )
+         for cycle in simulation.cycles
+     ]
+@@ -1779,6 +1786,7 @@ def validation_lot_sell_cycles(
+             buy_cost=cost,
+             trading_cost_amount=trading_fee,
+             is_liquidation=fill.reason == "RANGE_END_LIQUIDATION",
++            close_reason=fill.reason if fill.buy_round is None else "",
+         ))
+     return sold_rows, tuple(active_lots.values())
+ 
+@@ -3028,14 +3036,30 @@ class IndicatorFollowSignalValidationChartCanvas(
+         if self._validation_range is None:
+             return []
+         start, end = self._validation_range
+-        return [
+-            {"evaluation_index": cycle.sell_index, "side": "SELL", "virtual_liquidation": True}
+-            for cycle in self._completed_cycle_average_lines
+-            if cycle.is_liquidation and start <= cycle.sell_index <= end
+-            and self._is_index_visible(cycle.sell_index)
+-            and not any(marker.get("virtual_residual") and marker.get("evaluation_index") == cycle.sell_index
+-                        for marker in self._markers)
+-        ]
++        stop_indexes = {cycle.sell_index for cycle in self._completed_cycle_average_lines
++                        if cycle.close_reason == "STOP_LOSS"}
++        records: list[dict[str, Any]] = []
++        displayed_stops: set[int] = set()
++        for cycle in self._completed_cycle_average_lines:
++            index = cycle.sell_index
++            if not start <= index <= end or not self._is_index_visible(index):
++                continue
++            if index in stop_indexes:
++                if index in displayed_stops:
++                    continue
++                displayed_stops.add(index)
++                marker = next((marker for marker in self._markers
++                               if marker.get("evaluation_index") == index
++                               and marker.get("side") == "SELL"),
++                              {"evaluation_index": index, "side": "SELL"})
++                records.append(dict(marker, virtual_liquidation=True,
++                                    virtual_residual=False, close_reason="STOP_LOSS"))
++            elif cycle.is_liquidation and not any(
++                marker.get("virtual_residual") and marker.get("evaluation_index") == index
++                for marker in self._markers
++            ):
++                records.append({"evaluation_index": index, "side": "SELL", "virtual_liquidation": True})
++        return records
+ 
+     def set_completed_cycle_average_lines(
+         self,
+@@ -7807,7 +7831,13 @@ class IndicatorFollowSignalValidationChartCanvas(
+         }
+         marker_pens = {side: QPen(color, 1) for side, color in (("BUY", _BUY), ("SELL", _SELL))}
+         marker_brushes = {side: QBrush(color) for side, color in (("BUY", _BUY), ("SELL", _SELL))}
+-        for marker in (*self._visible_marker_records(), *self._liquidation_marker_records()):
++        liquidation_markers = self._liquidation_marker_records()
++        stop_indexes = {marker["evaluation_index"] for marker in liquidation_markers
++                        if marker.get("close_reason") == "STOP_LOSS"}
++        display_markers = [marker for marker in self._visible_marker_records()
++                           if not (marker.get("side") == "SELL"
++                                   and marker.get("evaluation_index") in stop_indexes)]
++        for marker in (*display_markers, *liquidation_markers):
+             index = marker.get("evaluation_index")
+             side = marker.get("side")
+             if isinstance(index, bool) or not isinstance(index, int):
+@@ -16799,6 +16829,7 @@ class IndicatorFollowSignalValidationV5Window(
+             buy_cost=cycle.buy_cost,
+             trading_cost_amount=cycle.trading_cost_amount,
+             is_liquidation=cycle.is_liquidation,
++            close_reason=cycle.close_reason,
+         )
+ 
+     def _replay_timeframe_display_text(self) -> str:
+@@ -17624,7 +17655,8 @@ class IndicatorFollowSignalValidationV5Window(
+             invested_amount = _completed_cycle_invested_amount(cycle)
+             profit_amount = _completed_cycle_profit_amount(cycle)
+             values = (
+-                "청산" if cycle.is_liquidation else str(cycle.cycle_number),
++                (f"{cycle.cycle_number} [손절]" if cycle.close_reason == "STOP_LOSS"
++                 else "청산" if cycle.is_liquidation else str(cycle.cycle_number)),
+                 self._cycle_buy_range(cycle),
+                 str(cycle.buy_count),
+                 (
+@@ -17709,10 +17741,16 @@ class IndicatorFollowSignalValidationV5Window(
+     def _completed_cycle_column_minimum_widths(self) -> list[int]:
+         table = self.completed_cycle_table
+         metrics = QFontMetrics(table.horizontalHeader().font())
+-        return [
++        minimums = [
+             metrics.horizontalAdvance(table.horizontalHeaderItem(column).text()) + 16
+             for column in range(table.columnCount())
+         ]
++        label_metrics = QFontMetrics(table.font())
++        for row in range(table.rowCount()):
++            item = table.item(row, 0)
++            if item is not None:
++                minimums[0] = max(minimums[0], label_metrics.horizontalAdvance(item.text()) + 16)
++        return minimums
+ 
+     def _resize_completed_cycle_columns(self) -> None:
+         table = getattr(self, "completed_cycle_table", None)
+diff --git a/tests/test_indicator_follow_signal_validation_v5_baseline.py b/tests/test_indicator_follow_signal_validation_v5_baseline.py
+index 294e813..4b19e69 100644
+--- a/tests/test_indicator_follow_signal_validation_v5_baseline.py
++++ b/tests/test_indicator_follow_signal_validation_v5_baseline.py
+@@ -2084,6 +2084,199 @@ def test_v5_liquidation_sell_marker_is_visual_only_and_viewport_bound(case):
+     assert canvas.marker_records() == original
+ 
+ 
++def _stop_display_entries(rows, *signals):
++    return [window_module.ValidationReplayEntry(
++        evaluation_side=side, evaluation_index=index, evaluation_time=rows[index]["time"],
++        signal=side, reason="display fixture", signal_index=index,
++        signal_time=rows[index]["time"], delay_bar=0, matched_groups=[], details=[],
++        trace={"conditions": [], "groups": [], "aggregations": []},
++    ) for side, index in signals]
++
++
++def _stop_display_window(case, rows, signals, policy, *, bounds=None, forced=False):
++    window = window_for(case)
++    install(window, rows)
++    window._set_validation_range(*(bounds or (0, len(rows) - 1)))
++    snapshot = window_module.ValidationSettingsSnapshot({"validation_execution": policy})
++    window._range_replay_entries_available = True
++    window._range_replay_entries = _stop_display_entries(rows, *signals)
++    window._range_replay_settings_snapshot = snapshot
++    with QSignalBlocker(window.validation_range_liquidation_check):
++        window.validation_range_liquidation_check.setChecked(forced)
++    with patch.object(window_module.QTimer, "singleShot"):
++        window._populate_completed_cycles()
++    return window
++
++
++@pytest.mark.parametrize("lot_enabled", [False, True])
++def test_v5_stop_loss_display_labels_keep_financial_values(case, lot_enabled):
++    from dataclasses import asdict
++    from tests.test_v5_lot_limit_execution import ON, candles as price_candles
++    rows = price_candles([100, 88])
++    policy = {**ON, "lot_limit_enabled": lot_enabled,
++              "_v5_stop_config": {"enabled": True, "loss_percent": 10}}
++    signals = (("BUY", 0), ("SELL", 1))
++    stopped = _stop_display_window(case, rows, signals, policy)
++    ordinary = _stop_display_window(case, rows, signals, {**policy, "_v5_stop_config": {}})
++    assert stopped.completed_cycle_table.item(0, 0).text() == "1 [손절]"
++    assert ordinary.completed_cycle_table.item(0, 0).text() == "1"
++    assert not stopped.completed_cycles[0].is_liquidation
++    for window in (stopped, ordinary):
++        assert type(window.completed_cycles[0].cycle_number) is int
++        assert window.completed_cycle_table.item(0, 0).data(window_module.Qt.UserRole) == 1
++    assert [stopped.completed_cycle_table.item(0, col).text() for col in range(1, 9)] == [
++        ordinary.completed_cycle_table.item(0, col).text() for col in range(1, 9)]
++    assert {k: v for k, v in asdict(stopped.completed_cycles[0]).items() if k != "close_reason"} == {
++        k: v for k, v in asdict(ordinary.completed_cycles[0]).items() if k != "close_reason"}
++    period_end = _stop_display_window(case, rows, (("BUY", 0),),
++                                      {**policy, "_v5_stop_config": {}}, forced=True)
++    assert period_end.completed_cycle_table.item(0, 0).text() == "청산"
++    assert period_end.completed_cycles[0].is_liquidation
++    for raw_signals in ((("BUY", 0),), (("SELL", 1),)):
++        unfilled = _stop_display_window(case, rows, raw_signals, {**policy, "_v5_stop_config": {}})
++        assert unfilled.completed_cycles == ()
++        assert all("[손절]" not in unfilled.completed_cycle_table.item(row, 0).text()
++                   for row in range(unfilled.completed_cycle_table.rowCount()))
++
++
++def test_v5_stop_loss_partial_sale_labels_and_numeric_row_clicks(case):
++    from tests.test_v5_lot_limit_execution import ON, candles as price_candles
++    rows = price_candles([100, 90, 90, 70], [100, 90, 100, 70])
++    policy = {**ON, "_v5_stop_config": {"enabled": True, "loss_percent": 20}}
++    window = _stop_display_window(case, rows, (("BUY", 0), ("BUY", 1)), policy)
++    assert [window.completed_cycle_table.item(row, 0).text() for row in range(2)] == ["1", "2 [손절]"]
++    assert [(cycle.buy_quantity, cycle.buy_cost, cycle.sell_price) for cycle in window.completed_cycles] == [
++        (1, 90, 99), (1, 100, 70)]
++    rows = price_candles([value for n in range(10) for value in (100, 88 if n == 9 else 99)])
++    signals = tuple((side, 2 * n + offset) for n in range(10)
++                    for side, offset in (("BUY", 0), ("SELL", 1)))
++    window = _stop_display_window(case, rows, signals, {
++        "_v5_stop_config": {"enabled": True, "loss_percent": 10}})
++    assert [cycle.cycle_number for cycle in window.completed_cycles] == list(range(1, 11))
++    assert all(type(cycle.cycle_number) is int for cycle in window.completed_cycles)
++    labels = [window.completed_cycle_table.item(row, 0).text() for row in range(10)]
++    assert labels == [str(n) for n in range(1, 10)] + ["10 [손절]"]
++    window.completed_cycle_table.setFont(QFont(window.font().family(), 14))
++    window.completed_cycle_table.resize(1600, 400)
++    window.completed_cycle_table.viewport().resize(1600, 300)
++    window._resize_completed_cycle_columns()
++    metrics = window_module.QFontMetrics(window.completed_cycle_table.font())
++    assert window.completed_cycle_table.columnWidth(0) >= max(
++        metrics.horizontalAdvance(label) + 16 for label in labels)
++    with patch.object(window, "select_evaluation_index") as select:
++        for row, cycle in enumerate(window.completed_cycles):
++            window._completed_cycle_row_clicked(row, 0)
++            select.assert_called_with(cycle.sell_index)
++            assert window.canvas.selected_completed_cycle_number == cycle.cycle_number
++            assert window.completed_cycle_table.item(row, 0).data(window_module.Qt.UserRole) == cycle.sell_index
++
++
++@pytest.mark.parametrize("kind", ["absent", "signal", "residual", "limit"])
++def test_v5_stop_loss_red_glyph_uses_display_copies_and_cause_cache(case, kind):
++    from dataclasses import replace
++    from PyQt5.QtGui import QPainter, QPixmap
++    rows = candles(8)
++    markers = [{"evaluation_index": 2, "side": "BUY", "tooltip": "buy proof"}]
++    if kind != "absent":
++        markers.append({"evaluation_index": 7, "side": "SELL", "quantity": 0,
++                        "tooltip": "condition proof", "provenance": "configured_expression",
++                        "virtual_residual": kind == "residual"})
++    if kind == "limit":
++        markers += [{"evaluation_index": 7, "side": side, "tooltip": side}
++                    for side in ("LIMIT_ORDER", "LIMIT_SELL")]
++    canvas = window_module.IndicatorFollowSignalValidationChartCanvas(rows, markers, timeframe_key="M1")
++    case.widgets.append(canvas)
++    canvas.resize(800, 400)
++    canvas.set_validation_range(2, 7)
++    ordinary = window_module.IndicatorFollowValidationCompletedCycle(
++        1, (2,), 2, 2, 1, 100_002, 7, 100_007, 0)
++    canvas.set_completed_cycle_average_lines((ordinary,))
++    original = deepcopy(canvas.marker_records())
++    assert canvas._liquidation_marker_records() == []  # A raw SELL is not execution evidence.
++    stopped = replace(ordinary, close_reason="STOP_LOSS")
++    canvas._static_chart_cache = object()
++    canvas._static_chart_cache_key = object()
++    canvas.set_completed_cycle_average_lines((stopped, replace(stopped, cycle_number=2)))
++    assert canvas._static_chart_cache is None and canvas._static_chart_cache_key is None
++    red_records = canvas._liquidation_marker_records()
++    assert len(red_records) == 1
++    assert red_records[0]["side"] == "SELL" and red_records[0]["virtual_liquidation"]
++    assert not red_records[0].get("virtual_residual")
++    if kind != "absent":
++        assert red_records[0]["tooltip"] == "condition proof"
++        assert red_records[0]["provenance"] == "configured_expression"
++    polygons, ellipses = [], []
++    class RecordingPainter(QPainter):
++        def drawPolygon(self, polygon):
++            polygons.append((self.brush().color().name(), [(p.x(), p.y()) for p in polygon]))
++            return super().drawPolygon(polygon)
++        def drawEllipse(self, *args):
++            ellipses.append(self.brush().color().name())
++            return super().drawEllipse(*args)
++    pixmap = QPixmap(canvas.size())
++    painter = RecordingPainter(pixmap)
++    try:
++        canvas._paint_static_chart(painter, canvas.price_scale())
++    finally:
++        painter.end()
++    red = [points for color, points in polygons if color == "#ef4444"]
++    assert len(red) == 1
++    tip, left, right = red[0]
++    assert left == (tip[0] - 5, tip[1] - 10) and right == (tip[0] + 5, tip[1] - 10)
++    assert tip[1] - 8 == canvas._marker_y(7, "SELL", canvas.price_scale())
++    if kind == "limit":
++        assert "#ffffff" in ellipses
++        assert any(color == "#ffffff" for color, _points in polygons)
++    assert canvas.marker_records() == original and markers[0]["tooltip"] == "buy proof"
++    canvas._static_chart_cache = object()
++    canvas._static_chart_cache_key = object()
++    canvas.set_completed_cycle_average_lines((ordinary,))
++    assert canvas._static_chart_cache is None and canvas._static_chart_cache_key is None
++    assert canvas._liquidation_marker_records() == []
++    canvas.set_completed_cycle_average_lines((stopped,))
++    canvas.set_time_view(0, 5)
++    assert canvas._liquidation_marker_records() == []
++    canvas.set_validation_range(None, None)
++    assert canvas._liquidation_marker_records() == []
++    assert canvas.marker_records() == original
++
++
++def test_v5_stop_loss_reason_survives_offset_sparse_and_frozen_rebuild(case):
++    from tests.test_v5_lot_limit_execution import candles as price_candles
++    rows = price_candles([100, 100, 100, 100, 100, 88, 88])
++    rows[3]["display_only_special"] = rows[4]["display_only_special"] = True
++    policy = {"_v5_stop_config": {"enabled": True, "loss_percent": 10},
++              "_v5_stop_price_basis": "CLOSE", "_v5_stop_regular_only": False}
++    window = _stop_display_window(case, rows, (("BUY", 2), ("SELL", 5)), policy, bounds=(2, 5))
++    cycle = window.completed_cycles[0]
++    assert (cycle.buy_indexes, cycle.sell_index, cycle.close_reason) == ((2,), 5, "STOP_LOSS")
++    offset = window._offset_completed_cycle(cycle, 3)
++    assert (offset.buy_indexes, offset.sell_index, offset.close_reason) == ((5,), 8, "STOP_LOSS")
++    assert window.completed_cycle_table.item(0, 5).text() == window._cycle_time(rows[5]["time"])
++    settings = window._range_replay_settings_snapshot
++    frozen = window_module.ValidationReplaySnapshot(
++        stock=case.stock, timeframe_minutes=1, timeframe_key="M1", settings_hash=settings.rules_hash,
++        historical_request_id="offline-display", evaluated_start_index=2, evaluated_end_index=5,
++        dropped_raw_rows_count=0, candles=rows,
++        entries=_stop_display_entries(rows, ("BUY", 2), ("SELL", 5)))
++    frozen_before = (frozen.to_candles(), frozen.to_entries())
++    window._range_replay_stop_snapshot = frozen
++    from routines.지표추종매매.routine_validation_replay import ValidationHistoricalReplay
++    with patch.object(ValidationHistoricalReplay, "evaluate_with_context",
++                      return_value=SimpleNamespace(ok=True, snapshot=frozen)) as evaluate, \
++            patch.object(window_module.QTimer, "singleShot"):
++        window._rebuild_v5_stop_from_frozen(settings)
++    evaluate.assert_called_once()
++    assert (frozen.to_candles(), frozen.to_entries()) == frozen_before
++    assert window.completed_cycles == (cycle,)
++    assert window.completed_cycle_table.item(0, 0).text() == "1 [손절]"
++    window._set_validation_range(None, None)
++    with patch.object(window_module.QTimer, "singleShot"):
++        window._populate_completed_cycles()
++    assert window.completed_cycles == ()
++    assert window.canvas._liquidation_marker_records() == []
++
++
+ def test_v5_selected_end_time_label_uses_exact_bar_and_follows_view(case):
+     rows = candles(8)
+     rows[7]["time"] = "20261027163300"
+diff --git a/tests/test_v5_lot_limit_ui.py b/tests/test_v5_lot_limit_ui.py
+index 370ceea..8d114c2 100644
+--- a/tests/test_v5_lot_limit_ui.py
++++ b/tests/test_v5_lot_limit_ui.py
+@@ -469,7 +469,7 @@ class LotLimitUITest(unittest.TestCase):
+         self.assertGreaterEqual(min(abs(a-b) for i, a in enumerate(positions) for b in positions[i+1:]), 12)
+         liquidate = method("gui_indicator_follow_signal_validation_v5_window.py", "IndicatorFollowSignalValidationChartCanvas", "_liquidation_marker_records", {})
+         state._validation_range = (0, 0)
+-        state._completed_cycle_average_lines = [SimpleNamespace(is_liquidation=True, sell_index=0)]
++        state._completed_cycle_average_lines = [SimpleNamespace(is_liquidation=True, sell_index=0, close_reason="")]
+         state._is_index_visible = lambda i: True
+         state._markers = [dict(side="SELL", evaluation_index=0, virtual_residual=True)]
+         self.assertEqual(liquidate(state), [])
+@@ -598,5 +598,94 @@ class LotLimitUITest(unittest.TestCase):
+         self.assertAlmostEqual(record["summary"]["profit_amount"], 0.0)
+ 
+ 
++class StopLossDisplayProjectionTest(unittest.TestCase):
++    def setUp(self):
++        from dataclasses import dataclass
++        from indicator_follow_signal_validation_v5_limit import (
++            simulate_v5_validation_execution, v5_signal_execution_policy,
++        )
++        source = ROOT / "gui_indicator_follow_signal_validation_v5_window.py"
++        tree = ast.parse(source.read_text(encoding="utf-8-sig"))
++        names = {"IndicatorFollowValidationCompletedCycle", "validation_execution_cycles",
++                 "validation_lot_sell_cycles"}
++        self.scope = dict(dataclass=dataclass,
++                          simulate_validation_execution=simulate_v5_validation_execution,
++                          v5_signal_execution_policy=v5_signal_execution_policy)
++        module = ast.Module([
++            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
++            *[node for node in tree.body if getattr(node, "name", "") in names],
++        ], [])
++        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), self.scope)
++
++    def test_actual_stop_close_reason_with_lot_limits_off_and_on(self):
++        from dataclasses import asdict
++        for lot_enabled in (False, True):
++            with self.subTest(lot_enabled=lot_enabled):
++                rows = candles([100, 88])
++                policy = {**ON, "lot_limit_enabled": lot_enabled,
++                          "_v5_stop_config": {"enabled": True, "loss_percent": 10},
++                          "trading_cost_enabled": True, "trading_cost_percent": 1}
++                simulations = []
++                projected = self.scope["validation_execution_cycles"](
++                    rows, entries(rows, ("BUY", 0), ("SELL", 1)), policy,
++                    open_simulations=simulations)
++                self.assertEqual(len(projected), 1)
++                cycle = projected[0]
++                self.assertEqual(getattr(cycle, "close_reason", ""), "STOP_LOSS")
++                self.assertFalse(cycle.is_liquidation)
++                actual = asdict(simulations[0].cycles[0])
++                self.assertEqual({key: value for key, value in asdict(cycle).items()
++                                  if key != "close_reason"},
++                                 {key: actual[key] for key in asdict(cycle) if key != "close_reason"})
++
++    def test_ordinary_loss_period_end_unfilled_and_zero_holdings(self):
++        rows = candles([100, 88])
++        for signals, forced, expected_reason in (
++            ((("BUY", 0), ("SELL", 1)), False, "SINGLE_HOGA"),
++            ((("BUY", 0),), True, "RANGE_END_LIQUIDATION"),
++            ((("BUY", 0),), False, None),
++            ((("SELL", 1),), False, None),
++        ):
++            with self.subTest(signals=signals, forced=forced):
++                projected = self.scope["validation_execution_cycles"](
++                    rows, entries(rows, *signals), {}, force_liquidation_at_end=forced)
++                self.assertEqual(len(projected), 0 if expected_reason is None else 1)
++                if projected:
++                    self.assertEqual(getattr(projected[0], "close_reason", ""), expected_reason)
++                    self.assertLess(projected[0].estimated_return_percent, 0)
++                    self.assertEqual(projected[0].is_liquidation, forced)
++
++    def test_partial_limit_sale_then_remaining_stop_keeps_separate_rows(self):
++        from indicator_follow_signal_validation_v5_limit import simulate_v5_validation_execution
++        rows = candles([100, 90, 90, 70], [100, 90, 100, 70])
++        policy = {**ON, "_v5_stop_config": {"enabled": True, "loss_percent": 20}}
++        simulation = simulate_v5_validation_execution(
++            rows, entries(rows, ("BUY", 0), ("BUY", 1)), policy)
++        projected, active = self.scope["validation_lot_sell_cycles"](simulation, policy)
++        self.assertEqual([(c.sell_index, c.buy_quantity, c.buy_cost) for c in projected],
++                         [(2, 1, 90), (3, 1, 100)])
++        self.assertNotEqual(getattr(projected[0], "close_reason", ""), "STOP_LOSS")
++        self.assertEqual(getattr(projected[1], "close_reason", ""), "STOP_LOSS")
++        self.assertFalse(any(c.is_liquidation for c in projected))
++        self.assertEqual(active, ())
++
++    def test_same_index_partial_or_zero_fill_is_not_closing_cause(self):
++        from dataclasses import replace
++        from unittest.mock import patch
++        rows = candles([100, 88])
++        simulation = self.scope["simulate_validation_execution"](
++            rows, entries(rows, ("BUY", 0), ("SELL", 1)), {})
++        close = simulation.fills[-1]
++        extra = (replace(close, reason="STOP_LOSS", buy_round=1),
++                 replace(close, reason="STOP_LOSS", quantity=0))
++        mixed = replace(simulation, fills=simulation.fills[:-1] + extra + (close,))
++        with patch.dict(self.scope, simulate_validation_execution=lambda *_a, **_k: mixed):
++            projected = self.scope["validation_execution_cycles"](rows, [], {})
++        self.assertEqual(getattr(projected[0], "close_reason", ""), "SINGLE_HOGA")
++        lot_rows, _active = self.scope["validation_lot_sell_cycles"](mixed, {})
++        self.assertEqual(len(lot_rows), 1)
++        self.assertNotEqual(lot_rows[0].close_reason, "STOP_LOSS")
++
++
+ if __name__ == "__main__":
+     unittest.main()
